@@ -23,7 +23,7 @@ use crate::builder::{
 use crate::error::{HarvestError, HarvestResult, NonDeterministicDetails, PayloadKind};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
-use crate::replay::{HistoryMatch, HistoryMatcher};
+use crate::replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch};
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
@@ -3028,6 +3028,125 @@ impl WorkflowContext {
         }
 
         version
+    }
+
+    /// Boolean two-state code-evolution gate (issue #687) — the ergonomic
+    /// default over the multi-version [`version`](Self::version) escape hatch.
+    ///
+    /// Returns `true` when this execution is on the patched code path and
+    /// `false` when it is replaying pre-patch history. Backed by the **same**
+    /// `MarkerRecorded` event `ctx.version()` uses (`patch:{patch_id}` — no
+    /// new `WorkflowEvent` variant, no migration), so the append-only history
+    /// contract is untouched.
+    ///
+    /// - During **live execution** (past the end of recorded history):
+    ///   records a `patch:{patch_id}` marker and returns `true`.
+    /// - During **replay** with the marker at the cursor: consumes it and
+    ///   returns `true`.
+    /// - During **replay** without the marker (a pre-patch run): returns
+    ///   `false` without advancing the cursor, so the recorded event still
+    ///   matches the old branch's next command.
+    ///
+    /// # Three-phase lifecycle
+    ///
+    /// **Deploy 1 — introduce the patch.** Fence the change:
+    ///
+    /// ```rust,ignore
+    /// if ctx.patched("billing-v2") {
+    ///     ctx.execute_activity(&compute_tax_v2_info(), input).await?;
+    /// } else {
+    ///     ctx.execute_activity(&compute_tax_v1_info(), input).await?;
+    /// }
+    /// ```
+    ///
+    /// Pre-patch executions keep replaying the old branch deterministically;
+    /// new executions record the marker and take the new branch.
+    ///
+    /// **Deploy 2 — deprecate.** Once every *pre-patch* run has drained (see
+    /// `docs/runbooks/version-gate-retirement.md` for how to verify drain),
+    /// replace the branch with [`deprecate_patch`](Self::deprecate_patch) +
+    /// unconditional new code:
+    ///
+    /// ```rust,ignore
+    /// ctx.deprecate_patch("billing-v2");
+    /// ctx.execute_activity(&compute_tax_v2_info(), input).await?;
+    /// ```
+    ///
+    /// Marker-bearing (phase-1) histories replay cleanly: the deprecation
+    /// makes their marker transparent wherever it sits. New executions record
+    /// nothing.
+    ///
+    /// **Deploy 3 — remove.** Once every *marker-bearing* run has drained,
+    /// delete the `deprecate_patch` call entirely.
+    ///
+    /// # Interop with `version()`
+    ///
+    /// A history that recorded `version:{patch_id}` under the old
+    /// [`version`](Self::version) API is observed as patched — presence alone
+    /// decides, regardless of the recorded number, because `version()` only
+    /// ever records a marker when it returned `max` on live execution. You
+    /// can migrate a two-version `ctx.version(id, 1, 2)` gate to
+    /// `ctx.patched(id)` in place. `version()` remains the explicit escape
+    /// hatch for gates with **more than two** concurrent versions.
+    ///
+    /// # Residual-`patched` footgun
+    ///
+    /// After `deprecate_patch(id)`, a *residual* `patched(id)` call later in
+    /// the body stays deterministic (`true` for phase-1 histories, `false`
+    /// for phase-0 histories) — but it also returns `false` for **new
+    /// executions** started post-deprecation, and records nothing. If you
+    /// still branch on it, new runs take the *old* branch. The fix is to
+    /// delete the residual call when you deprecate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn patched(&self, patch_id: &str) -> bool {
+        match self.match_history(|m| m.match_patch_marker(patch_id)) {
+            PatchMarkerMatch::Recorded => true,
+            PatchMarkerMatch::Absent => false,
+            PatchMarkerMatch::NewlyPatched => {
+                // NewlyPatched is only ever returned when the matcher is past
+                // recorded history (live frontier) by construction — the
+                // marker is recorded exactly once per call site, never during
+                // a replay pass.
+                debug_assert!(
+                    !self.is_replaying(),
+                    "NewlyPatched must only be returned on the live frontier"
+                );
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: crate::replay::patch_marker_name(patch_id),
+                    details: Value::from(1u64),
+                });
+                true
+            }
+        }
+    }
+
+    /// Deprecate a [`patched`](Self::patched) gate (issue #687) — deploy 2 of
+    /// the three-phase lifecycle documented on `patched`.
+    ///
+    /// Makes every recorded `patch:{patch_id}` (or interop
+    /// `version:{patch_id}`) marker transparent to replay, wherever it sits
+    /// in history: a phase-1 run recorded the marker at the old `patched()`
+    /// call position, while this call usually sits earlier in the body, so
+    /// positional matching cannot apply — without deprecation the orphaned
+    /// marker would trip the next command's match as a divergence.
+    ///
+    /// Emits **no** commands and appends **no** events — on a live execution
+    /// this is a pure no-op. Idempotent within a replay cycle.
+    ///
+    /// Only call this once every pre-patch execution has drained (see
+    /// `docs/runbooks/version-gate-retirement.md`): a phase-0 history
+    /// replayed against unconditional new code diverges, by design.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub fn deprecate_patch(&self, patch_id: &str) {
+        self.match_history(|m| {
+            m.deprecate_patch(patch_id);
+        });
     }
 
     // ── Core activity dispatch ────────────────────────────────────────
@@ -9056,6 +9175,275 @@ mod tests {
         assert!(
             matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "version:billing_v2")
         );
+    }
+
+    // ── Patched / deprecate_patch (issue #687) ─────────────────────────────
+
+    #[test]
+    fn context_patched_records_marker_and_returns_true_on_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        assert!(ctx.patched("billing_v2"));
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "patch:billing_v2")
+        );
+    }
+
+    #[test]
+    fn context_patched_returns_true_on_replay_with_marker() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:billing_v2".into(),
+                details: serde_json::json!(1),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(ctx.patched("billing_v2"));
+
+        // No commands during replay.
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_patched_returns_false_on_replay_without_marker() {
+        let activity_id = crate::types::ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("ok"),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Pre-patch history: no marker at this position → old branch.
+        assert!(!ctx.patched("billing_v2"));
+        assert!(ctx.drain_commands().is_empty());
+
+        // The cursor was not advanced — the recorded activity still matches.
+        let output = ctx
+            .execute_activity_raw("some_activity", Value::Null, "default")
+            .await
+            .expect("activity at cursor must still match after patched() miss");
+        assert_eq!(output, serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn context_patched_observes_version_marker_as_patched() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "version:billing_v2".into(),
+                details: serde_json::json!(2),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Interop: a run recorded under the old ctx.version() API is patched.
+        assert!(ctx.patched("billing_v2"));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn context_deprecate_patch_emits_no_commands_on_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        ctx.deprecate_patch("x");
+        assert!(ctx.drain_commands().is_empty());
+
+        // The documented footgun, pinned deliberately: after deprecate_patch,
+        // a residual patched() call treats a NEW execution as unpatched and
+        // records nothing. The fix is to delete the residual call.
+        assert!(!ctx.patched("x"));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_deprecate_patch_consumes_marker_anywhere_and_residual_patched_returns_true() {
+        let activity_id = crate::types::ActivityExecId::new();
+        // Phase-1 history: the marker sits at the old patched() call position,
+        // BEFORE the activity — but phase-2 code deprecates first.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:x".into(),
+                details: serde_json::json!(1),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("ok"),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        ctx.deprecate_patch("x");
+
+        // The marker is transparent wherever it sits — the activity matches.
+        let output = ctx
+            .execute_activity_raw("some_activity", Value::Null, "default")
+            .await
+            .expect("activity must match cleanly past the deprecated marker");
+        assert_eq!(output, serde_json::json!("ok"));
+
+        // Residual patched() call stays deterministic: marker was present.
+        assert!(ctx.patched("x"));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_deprecate_patch_tolerates_pre_patch_history() {
+        let activity_id = crate::types::ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("ok"),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Phase-0 history has no marker: deprecation no-ops.
+        ctx.deprecate_patch("x");
+
+        let output = ctx
+            .execute_activity_raw("some_activity", Value::Null, "default")
+            .await
+            .expect("activity must match after a no-op deprecation");
+        assert_eq!(output, serde_json::json!("ok"));
+
+        assert!(!ctx.patched("x"));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_deprecate_patch_consumes_version_marker_interop() {
+        let activity_id = crate::types::ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "version:x".into(),
+                details: serde_json::json!(2),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("ok"),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        ctx.deprecate_patch("x");
+
+        let output = ctx
+            .execute_activity_raw("some_activity", Value::Null, "default")
+            .await
+            .expect("activity must match cleanly past the deprecated version marker");
+        assert_eq!(output, serde_json::json!("ok"));
+
+        assert!(ctx.patched("x"));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn context_patched_is_deterministic_across_repeated_calls() {
+        // Live: two calls → two markers, both true.
+        let ctx = WorkflowContext::new_test();
+        assert!(ctx.patched("x"));
+        assert!(ctx.patched("x"));
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 2);
+        assert!(
+            cmds.iter().all(
+                |c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "patch:x")
+            )
+        );
+
+        // Replay of a history with two markers → both calls true, no commands.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:x".into(),
+                details: serde_json::json!(1),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:x".into(),
+                details: serde_json::json!(1),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(ctx.patched("x"));
+        assert!(ctx.patched("x"));
+        assert!(ctx.drain_commands().is_empty());
     }
 
     #[test]

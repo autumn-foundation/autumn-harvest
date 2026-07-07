@@ -116,6 +116,82 @@ fn versioned_workflow_unfenced<'a>(
     })
 }
 
+/// Phase-1 workflow using `ctx.patched()` to gate a new code path (issue #687):
+/// pre-patch runs replay the old branch, marker-bearing runs take the new one.
+fn patched_workflow_gated<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if ctx.patched("gate") {
+            ctx.execute_activity_raw("new_activity", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"branch": "new"}))
+        } else {
+            ctx.execute_activity_raw("old_activity", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"branch": "old"}))
+        }
+    })
+}
+
+/// Broken phase-3 workflow: the `patched("gate")` call was deleted BEFORE all
+/// marker-bearing executions drained — the stale `patch:gate` marker is left
+/// unconsumed and must classify as `PatchMarkerMismatch`.
+fn patched_workflow_removed_gate<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("new_activity", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"branch": "new"}))
+    })
+}
+
+/// Phase-2 workflow: all pre-patch runs have drained, so the branch is gone —
+/// `deprecate_patch("gate")` makes the recorded marker transparent and the
+/// new code path runs unconditionally.
+fn patched_workflow_deprecated<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.deprecate_patch("gate");
+        ctx.execute_activity_raw("new_activity", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"branch": "new"}))
+    })
+}
+
+/// Phase-2 workflow with a *residual* `patched()` call left in place: the
+/// deprecation memo keeps the residual call deterministic — phase-1 histories
+/// (marker present) stay on the new branch, phase-0 histories (no marker)
+/// stay on the old branch.
+fn patched_workflow_deprecated_residual<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.deprecate_patch("gate");
+        if ctx.patched("gate") {
+            ctx.execute_activity_raw("new_activity", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"branch": "new"}))
+        } else {
+            ctx.execute_activity_raw("old_activity", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"branch": "old"}))
+        }
+    })
+}
+
 /// Workflow that calls `set_current_details` before, between, and after
 /// activities, including a trailing clear via an empty string (issue #593).
 /// It must replay against a history containing **only** the activity events
@@ -290,6 +366,16 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("reordered_workflow", reordered_workflow)
         .register_fn("versioned_workflow_fenced", versioned_workflow_fenced)
         .register_fn("versioned_workflow_unfenced", versioned_workflow_unfenced)
+        .register_fn("patched_workflow_gated", patched_workflow_gated)
+        .register_fn(
+            "patched_workflow_removed_gate",
+            patched_workflow_removed_gate,
+        )
+        .register_fn("patched_workflow_deprecated", patched_workflow_deprecated)
+        .register_fn(
+            "patched_workflow_deprecated_residual",
+            patched_workflow_deprecated_residual,
+        )
         .register_fn("timer_first_workflow", timer_first_workflow)
         .register_fn("jitter_timer_workflow", jitter_timer_workflow)
         .register_fn("current_details_workflow", current_details_workflow)
@@ -600,6 +686,223 @@ async fn replay_version_unfenced_detects_non_determinism() {
     assert!(
         matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "unfenced new code path must produce NonDeterminismDetected, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ctx.patched() / ctx.deprecate_patch() lifecycle (issue #687)
+// ---------------------------------------------------------------------------
+
+/// Phase-0 history: recorded by pre-patch code — old branch, no marker.
+fn pre_patch_history() -> Vec<WorkflowEvent> {
+    let id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "old_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: serde_json::json!("old_result"),
+        },
+    ]
+}
+
+/// Phase-1 history: recorded by patched code — `patch:gate` marker + new branch.
+fn post_patch_history() -> Vec<WorkflowEvent> {
+    let id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "patch:gate".into(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "new_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: serde_json::json!("new_result"),
+        },
+    ]
+}
+
+/// The success-metric money test: the SAME phase-1 handler replays a
+/// pre-patch history down the old branch and a post-patch history down the
+/// new branch, with zero integer bookkeeping. The branch-selection proof is
+/// structural: had either replay taken the wrong branch, the wrong activity
+/// name would have diverged against the recorded one.
+#[tokio::test]
+async fn replay_pre_patch_and_post_patch_histories_take_opposite_branches() {
+    let replayer = build_replayer();
+
+    let pre = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_gated",
+            ExecutionId::new(),
+            pre_patch_history(),
+        ))
+        .await;
+    assert!(
+        matches!(pre.status, ReplayStatus::ReplaySucceeded),
+        "pre-patch history must replay the OLD branch cleanly, got: {pre}"
+    );
+
+    let post = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_gated",
+            ExecutionId::new(),
+            post_patch_history(),
+        ))
+        .await;
+    assert!(
+        matches!(post.status, ReplayStatus::ReplaySucceeded),
+        "post-patch history must replay the NEW branch cleanly, got: {post}"
+    );
+}
+
+/// Deleting the `patched()` call before all marker-bearing runs drained leaves
+/// the recorded `patch:gate` marker unconsumed — the next command trips over
+/// it and the divergence classifies as `PatchMarkerMismatch`.
+#[tokio::test]
+async fn replay_removed_too_early_patch_call_classified_as_patch_marker_mismatch() {
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_removed_gate",
+            ExecutionId::new(),
+            post_patch_history(),
+        ))
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::PatchMarkerMismatch,
+                ..
+            }
+        ),
+        "a too-early gate removal must classify as PatchMarkerMismatch, got: {report}"
+    );
+}
+
+/// Interop: a history recorded by a `ctx.version("gate", 1, 2)`-style
+/// workflow (version marker + new-branch activity) replays cleanly against
+/// the `patched`-based handler, taking the new branch.
+#[tokio::test]
+async fn replay_version_recorded_history_against_patched_handler_succeeds() {
+    let id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "version:gate".into(),
+            details: serde_json::json!(2),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "new_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: serde_json::json!("new_result"),
+        },
+    ];
+
+    let replayer = build_replayer();
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_gated",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "version-marker history must interop with the patched handler, got: {report}"
+    );
+}
+
+/// AC-3 lifecycle, deploy 2: once pre-patch runs have DRAINED, the phase-2
+/// handler (`deprecate_patch` + unconditional new code) replays phase-1
+/// (marker-bearing) histories cleanly. Phase-0 histories are deliberately
+/// NOT covered here: deprecation is only safe after they drained — replaying
+/// one against unconditional new code diverges, as the lifecycle documents.
+#[tokio::test]
+async fn replay_deprecated_patch_phase2_handler_succeeds_for_phase1_history() {
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_deprecated",
+            ExecutionId::new(),
+            post_patch_history(),
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "phase-2 handler must replay a phase-1 history cleanly, got: {report}"
+    );
+}
+
+/// AC-3 lifecycle proof with a residual `patched()` call: the deprecation
+/// memo keeps the residual call deterministic for BOTH generations —
+/// phase-1 histories keep the new branch, phase-0 histories keep the old one.
+#[tokio::test]
+async fn replay_deprecate_patch_with_residual_patched_keeps_phase1_branch() {
+    let replayer = build_replayer();
+
+    let phase1 = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_deprecated_residual",
+            ExecutionId::new(),
+            post_patch_history(),
+        ))
+        .await;
+    assert!(
+        matches!(phase1.status, ReplayStatus::ReplaySucceeded),
+        "residual patched() must keep a phase-1 history on the new branch, got: {phase1}"
+    );
+
+    let phase0 = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_deprecated_residual",
+            ExecutionId::new(),
+            pre_patch_history(),
+        ))
+        .await;
+    assert!(
+        matches!(phase0.status, ReplayStatus::ReplaySucceeded),
+        "residual patched() must keep a phase-0 history on the old branch, got: {phase0}"
     );
 }
 

@@ -204,6 +204,42 @@ pub enum SignalOrTimerMatch {
     },
 }
 
+/// Result of matching a `patched()` call against recorded history (issue #687).
+///
+/// A deliberate three-state result rather than a bare `bool`: the caller
+/// ([`crate::context::WorkflowContext::patched`]) must distinguish "the marker
+/// was recorded" (return `true`, consume nothing new) from "we are on the live
+/// frontier" (return `true` AND record a fresh `patch:{id}` marker) from
+/// "replaying pre-patch history" (return `false`, record nothing). Collapsing
+/// the first two into one boolean would force the caller to re-derive the
+/// live-vs-replay distinction after the fact — the ambiguity `match_version`'s
+/// "return max and let the caller re-check `is_replaying()`" trick papers over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchMarkerMatch {
+    /// A `patch:{id}` (or interop `version:{id}`) marker was consumed at the
+    /// cursor — or the id was previously deprecated and the memo says a marker
+    /// was present in history. The caller takes the new branch.
+    Recorded,
+    /// Replaying, but no marker for this id at this position — pre-patch
+    /// history; the caller must take the old branch. The cursor is not
+    /// advanced, so the actual recorded event still matches the next command.
+    Absent,
+    /// Past recorded history — live frontier. The caller records a fresh
+    /// `patch:{id}` marker and takes the new branch.
+    NewlyPatched,
+}
+
+/// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
+pub(crate) fn patch_marker_name(patch_id: &str) -> String {
+    format!("patch:{patch_id}")
+}
+
+/// Marker name recorded by `ctx.version(change_id, ..)` — also consumed by the
+/// patch primitives for `version()` → `patched()` interop (issue #687).
+pub(crate) fn version_marker_name(change_id: &str) -> String {
+    format!("version:{change_id}")
+}
+
 /// Terminal outcome for an early-drained external signal.
 #[derive(Debug, Clone)]
 enum StashedSignalTerminal {
@@ -307,6 +343,18 @@ pub struct HistoryMatcher {
     /// verified guarantee rather than an implicit consequence of that
     /// scan-ordering detail.
     race_reserved_signal_events: HashSet<usize>,
+    /// Deprecated patch ids (issue #687), memoizing whether a `patch:{id}` /
+    /// `version:{id}` marker was present anywhere in this history. Populated
+    /// by [`Self::deprecate_patch`], which marks every such marker consumed
+    /// (positional matching cannot apply — phase-2 code calls
+    /// `deprecate_patch` at a different, usually earlier, position than the
+    /// phase-1 `patched()` call that recorded the marker, so the marker must
+    /// become transparent wherever it sits or it would trip the next
+    /// `match_*` as a divergence). The memo keeps a *residual* `patched(id)`
+    /// call after `deprecate_patch(id)` deterministic: `true` for phase-1
+    /// histories, `false` for phase-0 histories AND for new executions
+    /// started post-deprecation, on both live and replay passes.
+    deprecated_patches: HashMap<String, bool>,
 }
 
 impl HistoryMatcher {
@@ -364,6 +412,7 @@ impl HistoryMatcher {
             transparent_events,
             late_race_signal_events: HashSet::new(),
             race_reserved_signal_events,
+            deprecated_patches: HashMap::new(),
         }
     }
 
@@ -3491,6 +3540,117 @@ impl HistoryMatcher {
         }
     }
 
+    // ── Patch markers (issue #687) ────────────────────────────────────────
+
+    /// Match a `patched(patch_id)` call against recorded history.
+    ///
+    /// Mirrors [`Self::match_version`]'s scan discipline exactly, but returns
+    /// the three-state [`PatchMarkerMatch`] instead of a numeric version so
+    /// the caller never has to re-derive live-vs-replay after the fact:
+    ///
+    /// 1. If `patch_id` was previously deprecated (see
+    ///    [`Self::deprecate_patch`]), the memoized presence is returned
+    ///    immediately — [`PatchMarkerMatch::Recorded`] if a marker was in
+    ///    history, [`PatchMarkerMatch::Absent`] otherwise — WITHOUT touching
+    ///    the cursor. This is what keeps a residual `patched(id)` call after
+    ///    `deprecate_patch(id)` deterministic.
+    /// 2. Past the end of cursor-based history →
+    ///    [`PatchMarkerMatch::NewlyPatched`] (live frontier — the caller
+    ///    records a fresh marker).
+    /// 3. After draining early signal events, if only stashed signal events
+    ///    remained → [`PatchMarkerMatch::Absent`] (this is a recorded
+    ///    position; the old branch applies, nothing is recorded).
+    /// 4. A `MarkerRecorded` at the cursor named `patch:{id}` **or**
+    ///    `version:{id}` (interop: a run that recorded a version marker under
+    ///    the old `ctx.version()` API is observed as patched — presence alone
+    ///    decides, regardless of the recorded number, because `version()`
+    ///    only ever records a marker when it returned `max` on live
+    ///    execution) → consume it, return [`PatchMarkerMatch::Recorded`].
+    /// 5. Anything else at the cursor → [`PatchMarkerMatch::Absent`], cursor
+    ///    untouched.
+    pub fn match_patch_marker(&mut self, patch_id: &str) -> PatchMarkerMatch {
+        if let Some(&present) = self.deprecated_patches.get(patch_id) {
+            return if present {
+                PatchMarkerMatch::Recorded
+            } else {
+                PatchMarkerMatch::Absent
+            };
+        }
+
+        self.advance_to_next_unconsumed_event();
+
+        // Check BEFORE draining: if already past cursor-based history, this is
+        // a genuinely new code path → the caller records a fresh marker.
+        if !self.is_replaying() {
+            return PatchMarkerMatch::NewlyPatched;
+        }
+
+        // Now safe to drain ExternalSignal events that may precede this marker
+        // in a mixed batch (e.g. tokio::join!(ctx.patched(...), signal_external)).
+        self.drain_early_signals();
+
+        // After draining: if the cursor is past the end (only stashed signal
+        // events were the remaining history), this is an unpatched recorded
+        // position — take the old branch instead of recording a new marker.
+        if !self.is_replaying() {
+            return PatchMarkerMatch::Absent;
+        }
+
+        let patch_name = patch_marker_name(patch_id);
+        let version_name = version_marker_name(patch_id);
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, .. }
+                if *name == patch_name || *name == version_name =>
+            {
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                PatchMarkerMatch::Recorded
+            }
+            // No marker at the current position — pre-patch history.
+            // Don't advance the cursor.
+            _ => PatchMarkerMatch::Absent,
+        }
+    }
+
+    /// Deprecate a patch id (issue #687): make every recorded `patch:{id}` /
+    /// `version:{id}` marker transparent to all subsequent scans, and memoize
+    /// whether any such marker was present.
+    ///
+    /// Positional matching cannot apply here: a phase-1 run recorded the
+    /// marker at the old `patched()` call position, while phase-2 code calls
+    /// `deprecate_patch(id)` at a different (usually earlier) position — so
+    /// the marker must become transparent wherever it sits, or it would trip
+    /// the next `match_*` call as a divergence. The full-history scan marks
+    /// each matching marker's index consumed via the same consumed-index set
+    /// every scan loop already consults through [`Self::is_consumed`].
+    ///
+    /// Returns whether a marker was found (memoized — the call is
+    /// idempotent). The memo also drives [`Self::match_patch_marker`] so a
+    /// residual `patched(id)` call stays deterministic; note that on a NEW
+    /// execution (empty history) the memo is `false`, so a residual
+    /// `patched(id)` treats post-deprecation runs as unpatched — the
+    /// documented footgun whose fix is deleting the residual call.
+    pub fn deprecate_patch(&mut self, patch_id: &str) -> bool {
+        if let Some(&present) = self.deprecated_patches.get(patch_id) {
+            return present;
+        }
+
+        let patch_name = patch_marker_name(patch_id);
+        let version_name = version_marker_name(patch_id);
+        let mut present = false;
+        for (idx, event) in self.events.iter().enumerate() {
+            if let WorkflowEvent::MarkerRecorded { name, .. } = event
+                && (*name == patch_name || *name == version_name)
+            {
+                present = true;
+                self.consumed_out_of_order_events.insert(idx);
+            }
+        }
+        self.deprecated_patches
+            .insert(patch_id.to_string(), present);
+        present
+    }
+
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
 
     /// Match the count marker for a fan-out group against history.
@@ -4212,6 +4372,121 @@ mod tests {
         let mut matcher = HistoryMatcher::new(vec![]);
         let version = matcher.match_version("billing_v2", 1, 3);
         assert_eq!(version, 3);
+    }
+
+    // ── Patch markers (issue #687) ────────────────────────────────────────
+
+    #[test]
+    fn matcher_patch_marker_recorded_at_cursor() {
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "patch:billing_v2".into(),
+            details: serde_json::json!(1),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_patch_marker("billing_v2");
+        assert_eq!(result, PatchMarkerMatch::Recorded);
+        assert_eq!(matcher.position(), 1);
+    }
+
+    #[test]
+    fn matcher_patch_marker_absent_returns_absent_without_advancing() {
+        // Pre-patch history: a timer where the patched() call would look.
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("t1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t1"),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_patch_marker("billing_v2");
+        assert_eq!(result, PatchMarkerMatch::Absent);
+        // Cursor must NOT advance — the event isn't consumed …
+        assert_eq!(matcher.position(), 0);
+        // … so the actual event at the cursor still matches cleanly.
+        let timer = matcher.match_timer("t1");
+        assert!(matches!(timer, HistoryMatch::Matched { .. }));
+    }
+
+    #[test]
+    fn matcher_patch_marker_past_history_is_newly_patched() {
+        let mut matcher = HistoryMatcher::new(vec![]);
+        let result = matcher.match_patch_marker("billing_v2");
+        assert_eq!(result, PatchMarkerMatch::NewlyPatched);
+    }
+
+    #[test]
+    fn matcher_patch_marker_interop_consumes_version_marker() {
+        // A run that recorded a `version:` marker under the old ctx.version()
+        // API is observed as patched, regardless of the recorded number.
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "version:billing_v2".into(),
+            details: serde_json::json!(2),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_patch_marker("billing_v2");
+        assert_eq!(result, PatchMarkerMatch::Recorded);
+        assert_eq!(matcher.position(), 1);
+    }
+
+    #[test]
+    fn matcher_deprecate_patch_marks_all_matching_markers_consumed() {
+        // Two markers for the same id (patched() called twice in phase 1),
+        // one of them *later* in history than the cursor when deprecation
+        // runs — both must become transparent.
+        let events = vec![
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:x".into(),
+                details: serde_json::json!(1),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("t1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t1"),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:x".into(),
+                details: serde_json::json!(1),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(matcher.deprecate_patch("x"));
+        // The first marker is transparent — the timer matches at the cursor.
+        let timer = matcher.match_timer("t1");
+        assert!(matches!(timer, HistoryMatch::Matched { .. }));
+        // The trailing marker is transparent too — history is fully consumed.
+        assert!(!matcher.is_replaying());
+        // Idempotent: a second call reports the same memoized presence.
+        assert!(matcher.deprecate_patch("x"));
+    }
+
+    #[test]
+    fn matcher_deprecated_patch_memo_drives_match_patch_marker() {
+        // (a) History WITH a marker: deprecate first, then a residual
+        // patched() call → Recorded, without any cursor movement.
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "patch:x".into(),
+            details: serde_json::json!(1),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(matcher.deprecate_patch("x"));
+        let pos_before = matcher.position();
+        assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Recorded);
+        assert_eq!(matcher.position(), pos_before);
+
+        // (b) History WITHOUT a marker: memoized absence → Absent, even on
+        // the live frontier (no fresh marker may be recorded).
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert!(!matcher.deprecate_patch("x"));
+        assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Absent);
     }
 
     #[test]
