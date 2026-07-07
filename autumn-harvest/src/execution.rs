@@ -1471,13 +1471,57 @@ pub async fn pause_workflow_execution(
 /// Binds: `$1` = pause span in microseconds (`BIGINT`), `$2` = the resumed
 /// execution's UUID. Only `PENDING`/`RUNNING` rows that actually carry a
 /// deadline are touched, mirroring the scanner's enforcement scope.
+///
+/// **Frozen rows also get their `scheduled_at` shifted** (issue #609
+/// post-review hardening, finding 3, option (b)): a `PENDING` row whose
+/// pre-shift `schedule_to_close_at` has already elapsed was *frozen* for the
+/// remainder of the pause — unclaimable throughout (the claim query requires
+/// `schedule_to_close_at > NOW()`) and spared by both the pause-aware
+/// `ScheduleToClose` scanner and the frozen-row-aware `ScheduleToStart`
+/// scanner. Shifting its `scheduled_at` forward by the same span is harmless
+/// (nothing could have claimed it while frozen — claim ordering by
+/// `scheduled_at` is only perturbed for rows that were out of the running
+/// anyway) and restores both its `schedule_to_start` budget and its
+/// retry-backoff position relative to the resume instant; without it, the
+/// next `ScheduleToStart` scan would instantly kill the row post-resume
+/// because the pause consumed its entire `scheduled_at + schedule_to_start`
+/// window. The shift deliberately does NOT apply to unfrozen `PENDING` rows
+/// (they stayed claimable during the pause — activities are not pause-gated
+/// — so their queue position and genuine worker-capacity signal must stay
+/// untouched) nor to `RUNNING` rows (`scheduled_at` is meaningless
+/// in-flight). The `CASE` reads the pre-update `schedule_to_close_at` (SQL
+/// `UPDATE` semantics: every `SET` expression sees the old row), so the
+/// frozen test is evaluated against the pre-shift deadline.
 #[must_use]
 pub const fn shift_schedule_to_close_on_resume_query() -> &'static str {
     "UPDATE harvest_task_queue \
-     SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond') \
+     SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
+         scheduled_at = CASE \
+             WHEN state = 'PENDING' AND schedule_to_close_at <= NOW() \
+             THEN scheduled_at + ($1::bigint * INTERVAL '1 microsecond') \
+             ELSE scheduled_at END \
      WHERE workflow_exec_id = $2 \
      AND state IN ('PENDING', 'RUNNING') \
      AND schedule_to_close_at IS NOT NULL"
+}
+
+/// SQL to shift still-open **external** tasks' wall-clock deadline
+/// (`harvest_external_tasks.schedule_to_close_at`) forward by the pause span
+/// on resume (issue #609 post-review hardening, finding 2).
+///
+/// Binds: `$1` = pause span in microseconds (`BIGINT`), `$2` = the resumed
+/// execution's UUID. Mirrors [`shift_schedule_to_close_on_resume_query`] for
+/// the external-task table: only `PENDING` rows are open (every other
+/// external state — `COMPLETED`/`FAILED`/`TIMED_OUT`/`CANCELLED` — is
+/// terminal), and
+/// `schedule_to_close_at` is `NOT NULL` there, so no null guard is needed.
+#[must_use]
+pub const fn shift_external_schedule_to_close_on_resume_query() -> &'static str {
+    "UPDATE harvest_external_tasks \
+     SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
+         updated_at = NOW() \
+     WHERE workflow_exec_id = $2 \
+     AND state = 'PENDING'"
 }
 
 /// Resume-time pause-span and deadline arithmetic, extracted from
@@ -1532,8 +1576,13 @@ fn resume_deadline_shifts(
 
 /// AC5 (issue #609) × #378: pause also suspends the per-activity cross-retry
 /// wall-clock deadline. Shifts every still-open task row's
-/// `schedule_to_close_at` forward by the clamped pause span. Runs on the
-/// caller's connection so it joins the resume transaction.
+/// `schedule_to_close_at` forward by the clamped pause span — and, for
+/// pause-frozen `PENDING` rows, `scheduled_at` as well (see
+/// [`shift_schedule_to_close_on_resume_query`]) — plus the execution's
+/// still-`PENDING` external tasks' `schedule_to_close_at` (see
+/// [`shift_external_schedule_to_close_on_resume_query`]; issue #609
+/// post-review hardening, finding 2). Runs on the caller's connection so it
+/// joins the resume transaction.
 ///
 /// This mirrors `deadline_at`'s unconditional shift rather than
 /// `sla_deadline_at`'s elapsed-deadline carve-out: shifting by exactly the
@@ -1552,6 +1601,12 @@ async fn shift_schedule_to_close_for_resume(
     let pause_span_micros = pause_span.num_microseconds().unwrap_or(i64::MAX);
     if pause_span_micros > 0 {
         diesel::sql_query(shift_schedule_to_close_on_resume_query())
+            .bind::<diesel::sql_types::BigInt, _>(pause_span_micros)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        diesel::sql_query(shift_external_schedule_to_close_on_resume_query())
             .bind::<diesel::sql_types::BigInt, _>(pause_span_micros)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .execute(conn)
@@ -4304,7 +4359,10 @@ mod non_terminal_sql_tests {
 
 #[cfg(test)]
 mod pause_helper_tests {
-    use super::{pause_timeout_exceeded, shift_schedule_to_close_on_resume_query};
+    use super::{
+        pause_timeout_exceeded, shift_external_schedule_to_close_on_resume_query,
+        shift_schedule_to_close_on_resume_query,
+    };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
 
@@ -4329,6 +4387,59 @@ mod pause_helper_tests {
         assert!(
             sql.contains("workflow_exec_id = $2"),
             "the shift is scoped to the resumed execution"
+        );
+    }
+
+    #[test]
+    fn resume_shift_query_restores_scheduled_at_for_frozen_rows_only() {
+        // Finding 3 (issue #609 post-review hardening), option (b): a
+        // pause-frozen PENDING row — its pre-shift schedule_to_close_at
+        // already elapsed, so it was unclaimable for the pause's remainder —
+        // also gets scheduled_at shifted forward, restoring its
+        // schedule_to_start budget and retry-backoff position. Unfrozen
+        // PENDING rows (still claimable during the pause) and RUNNING rows
+        // must keep scheduled_at untouched.
+        let sql = shift_schedule_to_close_on_resume_query();
+        assert!(
+            sql.contains("scheduled_at = CASE"),
+            "scheduled_at must be shifted conditionally, never unconditionally"
+        );
+        assert!(
+            sql.contains("WHEN state = 'PENDING' AND schedule_to_close_at <= NOW()"),
+            "the frozen predicate is PENDING + pre-shift deadline already elapsed"
+        );
+        assert!(
+            sql.contains("THEN scheduled_at + ($1::bigint * INTERVAL '1 microsecond')"),
+            "frozen rows shift scheduled_at by exactly the pause span"
+        );
+        assert!(
+            sql.contains("ELSE scheduled_at END"),
+            "non-frozen rows must keep their scheduled_at"
+        );
+    }
+
+    #[test]
+    fn external_resume_shift_query_targets_open_external_tasks_only() {
+        // Finding 2 (issue #609 post-review hardening): resume also shifts
+        // the execution's still-open external tasks' wall-clock deadline by
+        // the pause span, mirroring the task-queue treatment.
+        let sql = shift_external_schedule_to_close_on_resume_query();
+        assert!(sql.contains("UPDATE harvest_external_tasks"));
+        assert!(
+            sql.contains("schedule_to_close_at = schedule_to_close_at +"),
+            "must shift the existing deadline, not overwrite it"
+        );
+        assert!(
+            sql.contains("state = 'PENDING'"),
+            "only PENDING external tasks are open; terminal rows stay untouched"
+        );
+        assert!(
+            sql.contains("workflow_exec_id = $2"),
+            "the shift is scoped to the resumed execution"
+        );
+        assert!(
+            sql.contains("updated_at = NOW()"),
+            "external-task mutations stamp updated_at"
         );
     }
 

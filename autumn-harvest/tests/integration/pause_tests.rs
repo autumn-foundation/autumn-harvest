@@ -653,6 +653,533 @@ async fn resume_shifts_schedule_to_close_at_by_pause_span() {
     );
 }
 
+/// Inserts a PENDING activity task with explicit queue-timing columns for the
+/// frozen-row tests (issue #609 post-review hardening, finding 3):
+/// `scheduled_at`, a `schedule_to_start` window in seconds, and an optional
+/// cross-retry deadline.
+async fn insert_pending_activity_task_with_schedule(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    schedule_to_close_at: Option<chrono::DateTime<chrono::Utc>>,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    schedule_to_start_secs: i64,
+) -> uuid::Uuid {
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input, state, \
+          attempt, max_attempts, schedule_to_close_at, scheduled_at, schedule_to_start) \
+         VALUES ($1, 'default', 'activity', $2, 'deadline_activity', $3, '{}'::jsonb, 'PENDING', \
+                 0, 10, $4, $5, $6::bigint * INTERVAL '1 second')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at)
+    .bind::<diesel::sql_types::BigInt, _>(schedule_to_start_secs)
+    .execute(conn)
+    .await
+    .expect("insert pending activity task with schedule");
+    task_id
+}
+
+/// Inserts a PENDING external activity task (`harvest_external_tasks`) with
+/// the given wall-clock deadline (issue #609 post-review hardening, finding 2).
+async fn insert_pending_external_task(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    schedule_to_close_at: chrono::DateTime<chrono::Utc>,
+) -> uuid::Uuid {
+    let ext_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_external_tasks \
+         (id, token, workflow_exec_id, activity_id, name, queue, state, \
+          schedule_to_close_at, schedule_to_close_secs) \
+         VALUES ($1, $2, $3, $4, 'external_review', 'default', 'PENDING', $5, 600)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ext_id)
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .execute(conn)
+    .await
+    .expect("insert pending external task");
+    ext_id
+}
+
+async fn task_timing_columns(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> (
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
+    use autumn_harvest::schema::harvest_task_queue as t;
+    t::table
+        .filter(t::id.eq(task_id))
+        .select((t::state, t::scheduled_at, t::schedule_to_close_at))
+        .first(conn)
+        .await
+        .expect("task must exist")
+}
+
+#[tokio::test]
+async fn external_task_timeout_scanner_skips_paused_executions() {
+    // Finding 2 (issue #609 post-review hardening): the external-task
+    // schedule_to_close scanner is pause-aware — an expired deadline on a
+    // PAUSED execution's external task must not be enforced mid-pause; after
+    // resume the (shifted) deadline applies again.
+    use autumn_harvest::timeout::enforce_external_task_timeouts;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "ext-pause-1").await;
+    let ext_id = insert_pending_external_task(
+        &mut conn,
+        exec_id,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("contain"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    let timed_out = enforce_external_task_timeouts(&mut conn)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(
+        timed_out, 0,
+        "an external task of a PAUSED execution must not be timed out mid-pause"
+    );
+
+    use autumn_harvest::schema::harvest_external_tasks as ext;
+    let state: String = ext::table
+        .filter(ext::id.eq(ext_id))
+        .select(ext::state)
+        .first(&mut conn)
+        .await
+        .expect("external task must exist");
+    assert_eq!(state, "PENDING", "the row must stay open while paused");
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "no ActivityTimedOut may be appended while the execution is paused"
+    );
+
+    // After resume the (shifted) deadline applies again. Force it back into
+    // the past so the post-resume enforcement branch is observable without
+    // waiting out a real pause span.
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+    diesel::sql_query(
+        "UPDATE harvest_external_tasks \
+         SET schedule_to_close_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ext_id)
+    .execute(&mut conn)
+    .await
+    .expect("backdate deadline");
+
+    let timed_out = enforce_external_task_timeouts(&mut conn)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(
+        timed_out, 1,
+        "a RUNNING execution's expired external deadline must still be enforced"
+    );
+    let state: String = ext::table
+        .filter(ext::id.eq(ext_id))
+        .select(ext::state)
+        .first(&mut conn)
+        .await
+        .expect("external task must exist");
+    assert_eq!(state, "TIMED_OUT");
+}
+
+#[tokio::test]
+async fn resume_shifts_external_task_schedule_to_close_by_pause_span() {
+    // Finding 2 (issue #609 post-review hardening): resume pushes each
+    // still-open external task's schedule_to_close_at forward by the clamped
+    // pause span, mirroring the harvest_task_queue treatment.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "ext-shift-1").await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    let now = chrono::Utc::now();
+    let deadline_before = now + chrono::Duration::minutes(10);
+    let ext_id = insert_pending_external_task(&mut conn, exec_id, deadline_before).await;
+
+    // Backdate the pause 30 minutes so the resume computes a deterministic,
+    // non-zero span (mirrors resume_shifts_schedule_to_close_at_by_pause_span).
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+    diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
+        .set(e::paused_at.eq(Some(now - chrono::Duration::minutes(30))))
+        .execute(&mut conn)
+        .await
+        .expect("backdate paused_at for test");
+
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+
+    use autumn_harvest::schema::harvest_external_tasks as ext;
+    let deadline_after: chrono::DateTime<chrono::Utc> = ext::table
+        .filter(ext::id.eq(ext_id))
+        .select(ext::schedule_to_close_at)
+        .first(&mut conn)
+        .await
+        .expect("external task must exist");
+    let shift = deadline_after - deadline_before;
+    assert!(
+        shift >= chrono::Duration::minutes(29) && shift <= chrono::Duration::minutes(31),
+        "external schedule_to_close_at must shift forward by the ~30-minute pause span, got {shift:?}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_to_start_scanner_spares_frozen_rows_but_enforces_unfrozen_paused_rows() {
+    // Finding 3 (issue #609 post-review hardening), option (b): a PENDING row
+    // of a PAUSED execution past its (unshifted) schedule_to_close deadline
+    // is frozen-unclaimable — the ScheduleToStart scanner must spare exactly
+    // that row. An unfrozen pending activity of the same paused execution is
+    // still claimable by design (activities are not pause-gated), so its
+    // schedule_to_start signal (worker capacity) remains genuine and MUST
+    // still be enforced — never a blanket paused-execution exclusion.
+    use autumn_harvest::timeout::{TimeoutReason, find_timed_out_tasks};
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "s2s-frozen-1").await;
+    let now = chrono::Utc::now();
+
+    // Frozen: deadline elapsed → unclaimable while paused.
+    let frozen_id = insert_pending_activity_task_with_schedule(
+        &mut conn,
+        exec_id,
+        Some(now - chrono::Duration::minutes(1)),
+        now - chrono::Duration::minutes(10),
+        60,
+    )
+    .await;
+    // Unfrozen: deadline still ahead → claimable despite the pause.
+    let unfrozen_id = insert_pending_activity_task_with_schedule(
+        &mut conn,
+        exec_id,
+        Some(now + chrono::Duration::minutes(10)),
+        now - chrono::Duration::minutes(10),
+        60,
+    )
+    .await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("contain"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    let timed_out = find_timed_out_tasks(&mut conn)
+        .await
+        .expect("scan should succeed");
+    assert!(
+        !timed_out.iter().any(|(t, _)| t.id == frozen_id),
+        "a frozen row (paused execution + elapsed deadline) must be spared \
+         by every scanner reason until resume shifts it"
+    );
+    assert!(
+        timed_out
+            .iter()
+            .any(|(t, r)| t.id == unfrozen_id && *r == TimeoutReason::ScheduleToStart),
+        "an unfrozen pending row of a paused execution is still claimable, \
+         so its expired schedule_to_start must still be enforced"
+    );
+}
+
+#[tokio::test]
+async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
+    // Finding 3 (issue #609 post-review hardening), option (b): on resume,
+    // exactly the frozen rows get scheduled_at shifted forward by the pause
+    // span — restoring their schedule_to_start budget and retry-backoff
+    // position — while unfrozen rows (claimable throughout the pause) keep
+    // their queue position untouched.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "s2s-shift-1").await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    let now = chrono::Utc::now();
+    let scheduled_before = now - chrono::Duration::minutes(40);
+    let frozen_id = insert_pending_activity_task_with_schedule(
+        &mut conn,
+        exec_id,
+        Some(now - chrono::Duration::minutes(5)),
+        scheduled_before,
+        60,
+    )
+    .await;
+    let unfrozen_id = insert_pending_activity_task_with_schedule(
+        &mut conn,
+        exec_id,
+        Some(now + chrono::Duration::minutes(10)),
+        scheduled_before,
+        60,
+    )
+    .await;
+
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+    diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
+        .set(e::paused_at.eq(Some(now - chrono::Duration::minutes(30))))
+        .execute(&mut conn)
+        .await
+        .expect("backdate paused_at for test");
+
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+
+    let (frozen_state, frozen_scheduled_at, frozen_deadline) =
+        task_timing_columns(&mut conn, frozen_id).await;
+    assert_eq!(frozen_state, "PENDING");
+    let frozen_shift = frozen_scheduled_at - scheduled_before;
+    assert!(
+        frozen_shift >= chrono::Duration::minutes(29)
+            && frozen_shift <= chrono::Duration::minutes(31),
+        "the frozen row's scheduled_at must shift by the ~30-minute pause span, got {frozen_shift:?}"
+    );
+    let frozen_deadline_shift =
+        frozen_deadline.expect("deadline must remain set") - (now - chrono::Duration::minutes(5));
+    assert!(
+        frozen_deadline_shift >= chrono::Duration::minutes(29)
+            && frozen_deadline_shift <= chrono::Duration::minutes(31),
+        "the frozen row's deadline still shifts like every open deadline, got {frozen_deadline_shift:?}"
+    );
+
+    let (unfrozen_state, unfrozen_scheduled_at, unfrozen_deadline) =
+        task_timing_columns(&mut conn, unfrozen_id).await;
+    assert_eq!(unfrozen_state, "PENDING");
+    assert!(
+        (unfrozen_scheduled_at - scheduled_before).abs() < chrono::Duration::seconds(1),
+        "an unfrozen row's scheduled_at (queue position) must stay untouched"
+    );
+    let unfrozen_deadline_shift = unfrozen_deadline.expect("deadline must remain set")
+        - (now + chrono::Duration::minutes(10));
+    assert!(
+        unfrozen_deadline_shift >= chrono::Duration::minutes(29)
+            && unfrozen_deadline_shift <= chrono::Duration::minutes(31),
+        "the unfrozen row's deadline still shifts forward, got {unfrozen_deadline_shift:?}"
+    );
+}
+
+// ── Finding 1 (issue #609 post-review hardening): stale claim-time snapshot ─
+
+/// Activity handler that simulates a pause→resume cycle completing while the
+/// attempt is in flight: it shifts its own task row's `schedule_to_close_at`
+/// forward (exactly what `resume_workflow_execution` does) and then fails
+/// retryably. The worker's retry path then holds a claim-time snapshot whose
+/// deadline is exceeded while the row-current deadline is comfortably ahead.
+fn deadline_shifting_activity<'a>(
+    _ctx: &'a autumn_harvest::ActivityContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let db_url = input
+            .get("db_url")
+            .and_then(Value::as_str)
+            .expect("test input must carry db_url")
+            .to_string();
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&db_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET schedule_to_close_at = NOW() + INTERVAL '1 hour' \
+             WHERE activity_name = 'deadline_shifting_activity'",
+        )
+        .execute(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+        Err("transient failure after the concurrent deadline shift".to_string())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
+    // Finding 1 (issue #609 post-review hardening, P1): the retry path's
+    // schedule_to_close gate evaluates the claim-time TaskQueueItem snapshot;
+    // resume_workflow_execution is the first post-enqueue mutator of that
+    // column. An attempt claimed pre/mid-pause whose deadline is shifted by a
+    // resume before it fails must be REQUEUED against the fresh (future)
+    // deadline — not terminally failed against the stale snapshot, which
+    // would charge paused wall-clock to the activity budget (AC5's exact
+    // failure mode). The in-transaction fresh re-read under the execution row
+    // lock is the guarantee; this test constructs the stale-snapshot state
+    // deterministically by letting the activity itself perform the shift
+    // mid-attempt.
+    use autumn_harvest::RetryPolicy;
+    use autumn_harvest::info::ActivityInfo;
+    use autumn_harvest::queue::{EnqueueParams, TaskType};
+    use autumn_harvest::types::ActivityExecId;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    // Execution row without a workflow task: this test drives only the
+    // activity retry path, so no workflow handler must ever run.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'wf', $2, 0, 'null'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+    .execute(&mut conn)
+    .await
+    .expect("insert execution row");
+
+    let activity_id = ActivityExecId::new();
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({}),
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "deadline_shifting_activity".to_string(),
+                input: serde_json::json!({"db_url": url}),
+                queue: "default".to_string(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append history");
+
+    // Claim-time snapshot: deadline 30s ahead (claimable), retry delay 300s —
+    // so the snapshot check is deterministically "exceeded" the moment the
+    // attempt fails, with no sleeping.
+    let mut params = EnqueueParams::new(
+        "default",
+        TaskType::Activity,
+        serde_json::json!({"db_url": url}),
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("deadline_shifting_activity".to_string());
+    params.activity_id = Some(activity_id.as_uuid());
+    params.max_attempts = 5;
+    params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+    params.retry_policy = Some(
+        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
+            .expect("retry policy serializes"),
+    );
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue activity task");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![],
+        vec![ActivityInfo {
+            name: "deadline_shifting_activity",
+            module: "pause_tests",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: deadline_shifting_activity,
+        }],
+    ));
+    let worker = Arc::new(make_worker(registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Wait for the attempt to fail and be re-resolved by the retry path: a
+    // requeue lands the row back in PENDING with the attempt's error stored
+    // (for `ActivityContext::previous_failure`) and a ~300s backoff, while
+    // the buggy path lands it in FAILED with an ActivityTimedOut event.
+    use autumn_harvest::schema::harvest_task_queue as t;
+    let poll_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (state, error, scheduled_at) = loop {
+        let (state, error, scheduled_at): (String, Option<String>, chrono::DateTime<chrono::Utc>) =
+            t::table
+                .filter(t::id.eq(task_id))
+                .select((t::state, t::error, t::scheduled_at))
+                .first(&mut conn)
+                .await
+                .expect("task must exist");
+        let resolved = state == "FAILED" || (state == "PENDING" && error.is_some());
+        if resolved || std::time::Instant::now() > poll_deadline {
+            break (state, error, scheduled_at);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        state, "PENDING",
+        "the task must be requeued against the fresh (shifted) deadline, \
+         not terminally failed against the stale claim-time snapshot"
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("transient failure after the concurrent deadline shift")),
+        "the requeued row must carry the attempt's error for the next attempt, got {error:?}"
+    );
+    assert!(
+        scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(200),
+        "the requeue must respect the retry policy's 300s backoff, got {scheduled_at}"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "no ActivityTimedOut {{ ScheduleToClose }} may be recorded when the \
+         row-current deadline is still ahead"
+    );
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "RUNNING",
+        "the owning execution must be unaffected"
+    );
+}
+
 #[tokio::test]
 async fn pause_is_idempotent() {
     let (url, _c) = setup().await;

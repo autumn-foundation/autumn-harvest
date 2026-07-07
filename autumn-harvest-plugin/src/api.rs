@@ -11018,7 +11018,7 @@ async fn terminate_workflow(
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
-        // Only a genuine state conflict (e.g. "already terminal" / "not paused"),
+        // Only a genuine state conflict (e.g. "already terminal"),
         // surfaced by the core as `Config`, maps to 409. Everything else —
         // NotFound (404), Database (500), etc. — flows through the normal mapper
         // so a real persistence failure is not masked as a state conflict.

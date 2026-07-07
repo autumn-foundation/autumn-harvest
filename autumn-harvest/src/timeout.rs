@@ -111,12 +111,39 @@ pub const fn start_to_close_timeout_query() -> &'static str {
 /// - `state = 'PENDING'`
 /// - `schedule_to_start IS NOT NULL`
 /// - `scheduled_at + schedule_to_start < NOW()`
+/// - the task is not **frozen** by a pause (see below)
+///
+/// Frozen-row carve-out (issue #609 post-review hardening): the pause ×
+/// `schedule_to_close` interaction created a new state this reason must not
+/// destroy — a PENDING row of a `PAUSED` execution whose (not-yet-shifted)
+/// `schedule_to_close_at` has elapsed. Such a row is unclaimable by
+/// construction (the claim query requires `schedule_to_close_at > NOW()`)
+/// and is deliberately spared by the pause-aware `ScheduleToClose` scanner,
+/// so it sits frozen until resume shifts its deadline forward. Its
+/// schedule-to-start clock is therefore *not* a genuine worker-capacity
+/// signal while frozen, and enforcing it would terminally kill a task the
+/// pause machinery explicitly preserved. The exclusion is scoped to exactly
+/// those frozen rows — a PENDING activity of a paused execution whose
+/// `schedule_to_close_at` is NULL or still ahead remains claimable by design
+/// (activities are not pause-gated), so its schedule-to-start signal stays
+/// genuine and stays enforced. On resume, `scheduled_at` is shifted forward
+/// by the pause span for exactly the frozen rows
+/// ([`crate::execution::shift_schedule_to_close_on_resume_query`]) so the
+/// row does not get instantly killed post-resume with a schedule-to-start
+/// budget the pause consumed.
 #[must_use]
 pub const fn schedule_to_start_timeout_query() -> &'static str {
-    "SELECT * FROM harvest_task_queue \
-     WHERE state = 'PENDING' \
-     AND schedule_to_start IS NOT NULL \
-     AND scheduled_at + schedule_to_start < NOW()"
+    "SELECT t.* FROM harvest_task_queue t \
+     WHERE t.state = 'PENDING' \
+     AND t.schedule_to_start IS NOT NULL \
+     AND t.scheduled_at + t.schedule_to_start < NOW() \
+     AND NOT (\
+         t.schedule_to_close_at IS NOT NULL \
+         AND t.schedule_to_close_at <= NOW() \
+         AND EXISTS (\
+             SELECT 1 FROM harvest_workflow_executions e \
+             WHERE e.id = t.workflow_exec_id \
+             AND e.state = 'PAUSED'))"
 }
 
 /// SQL query to find RUNNING or PENDING tasks that exceeded their total
@@ -135,11 +162,12 @@ pub const fn schedule_to_start_timeout_query() -> &'static str {
 /// Pause suspends the cross-retry deadline clock (issue #609, AC5): a task
 /// whose owning execution is `PAUSED` is excluded here — resume shifts its
 /// `schedule_to_close_at` forward by the pause span
-/// ([`crate::execution::shift_schedule_to_close_on_resume_query`]). This is
-/// deliberately scoped to this reason only: heartbeat, start-to-close, and
-/// schedule-to-start enforcement stay pause-blind because already-dispatched
+/// ([`crate::execution::shift_schedule_to_close_on_resume_query`]). Heartbeat
+/// and start-to-close enforcement stay pause-blind because already-dispatched
 /// work runs to completion under pause (issue #383), so a hung in-flight
-/// activity of a paused execution must still time out.
+/// activity of a paused execution must still time out. Schedule-to-start
+/// enforcement stays pause-blind except for the narrow frozen-row carve-out
+/// documented on [`schedule_to_start_timeout_query`].
 #[must_use]
 pub const fn schedule_to_close_timeout_query() -> &'static str {
     "SELECT t.* FROM harvest_task_queue t \
@@ -778,6 +806,18 @@ async fn enforce_workflow_timeout(
 ///
 /// Returns the number of external tasks that were timed out.
 ///
+/// Pause suspends this deadline clock too (issue #609 post-review
+/// hardening): external tasks whose owning execution is `PAUSED` are
+/// excluded, mirroring the task-queue `ScheduleToClose` treatment. This scan
+/// enforces *only* the `schedule_to_close_at` wall-clock deadline — external
+/// tasks have no heartbeat/start-to-close reason whose in-flight semantics
+/// would argue for pause-blind enforcement — so a blanket `PAUSED` exclusion
+/// is correct here. On resume, `resume_workflow_execution` shifts the
+/// execution's still-`PENDING` external tasks' `schedule_to_close_at`
+/// forward by the clamped pause span
+/// ([`crate::execution::shift_external_schedule_to_close_on_resume_query`])
+/// so paused wall-clock is never charged against the external deadline.
+///
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
@@ -785,6 +825,13 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
     let expired: Vec<ExternalTask> = harvest_external_tasks::table
         .filter(harvest_external_tasks::state.eq("PENDING"))
         .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now()))
+        .filter(diesel::dsl::not(diesel::dsl::exists(
+            harvest_workflow_executions::table
+                .filter(
+                    harvest_workflow_executions::id.eq(harvest_external_tasks::workflow_exec_id),
+                )
+                .filter(harvest_workflow_executions::state.eq("PAUSED")),
+        )))
         .select(ExternalTask::as_select())
         .load(conn)
         .await
@@ -805,16 +852,27 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         let result = conn
             .transaction::<(), HarvestError, _>(|conn| {
                 async move {
-                    // Guard against two races:
+                    // Guard against three races:
                     // 1. complete/fail landed after our scan → state != PENDING
-                    // 2. heartbeat extended the deadline after our scan →
+                    // 2. heartbeat (or a resume's pause-span shift, issue
+                    //    #609) extended the deadline after our scan →
                     //    schedule_to_close_at is now in the future
+                    // 3. a pause landed after our scan → the owning execution
+                    //    is now PAUSED and the deadline clock is suspended
                     // Either way, 0 rows updated means we skip the timeout event.
                     let rows = diesel::update(
                         harvest_external_tasks::table
                             .find(task_id)
                             .filter(harvest_external_tasks::state.eq("PENDING"))
-                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
+                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now()))
+                            .filter(diesel::dsl::not(diesel::dsl::exists(
+                                harvest_workflow_executions::table
+                                    .filter(
+                                        harvest_workflow_executions::id
+                                            .eq(harvest_external_tasks::workflow_exec_id),
+                                    )
+                                    .filter(harvest_workflow_executions::state.eq("PAUSED")),
+                            ))),
                     )
                     .set((
                         harvest_external_tasks::state.eq("TIMED_OUT"),
@@ -2134,12 +2192,45 @@ mod tests {
             sql.contains("NOT EXISTS"),
             "an orphan task (NULL workflow_exec_id) must remain enforceable"
         );
-        // The other three enforcement reasons deliberately stay pause-blind:
+        // The in-flight enforcement reasons deliberately stay pause-blind:
         // already-dispatched work runs to completion (issue #383), so a hung
         // in-flight activity of a paused execution must still time out.
+        // (schedule_to_start has its own narrowly-scoped frozen-row
+        // carve-out — see the dedicated test below.)
         assert!(!heartbeat_timeout_query().contains("PAUSED"));
         assert!(!start_to_close_timeout_query().contains("PAUSED"));
-        assert!(!schedule_to_start_timeout_query().contains("PAUSED"));
+    }
+
+    #[test]
+    fn schedule_to_start_timeout_query_excludes_only_frozen_paused_rows() {
+        // Finding 3 (issue #609 post-review hardening): the pause-aware
+        // ScheduleToClose treatment created a frozen state — a PENDING row of
+        // a PAUSED execution past its (unshifted) schedule_to_close deadline,
+        // unclaimable until resume shifts it. The ScheduleToStart scanner
+        // must spare exactly those frozen rows, and ONLY those: an unfrozen
+        // pending activity of a paused execution is still claimable by
+        // design (activities are not pause-gated), so its schedule_to_start
+        // signal (worker capacity) remains genuine and stays enforced.
+        let sql = schedule_to_start_timeout_query();
+        assert!(
+            sql.contains("PAUSED"),
+            "frozen rows of paused executions must be spared"
+        );
+        assert!(
+            sql.contains("schedule_to_close_at IS NOT NULL")
+                && sql.contains("schedule_to_close_at <= NOW()"),
+            "the exclusion must be scoped to rows past their (unshifted) \
+             cross-retry deadline — never a blanket paused-execution exclusion"
+        );
+        assert!(
+            sql.contains("NOT ("),
+            "the frozen-row predicate must negate the full conjunction so a \
+             claimable (unfrozen) row of a paused execution stays enforceable"
+        );
+        assert!(
+            sql.contains("EXISTS"),
+            "the freeze requires the owning execution to actually be PAUSED"
+        );
     }
 
     #[test]

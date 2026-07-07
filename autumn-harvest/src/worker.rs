@@ -5021,18 +5021,33 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
 }
 
 /// Returns `true` when the cross-retry wall-clock deadline would be exceeded
+/// before the next retry attempt could start (issue #378).
+///
+/// Pure so both the claim-time snapshot check and the in-transaction fresh
+/// re-check (issue #609 post-review hardening) share one decision rule.
+fn deadline_would_be_exceeded(
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    retry_delay: chrono::Duration,
+) -> bool {
+    deadline.is_some_and(|d| now + retry_delay >= d)
+}
+
+/// Returns `true` when the cross-retry wall-clock deadline would be exceeded
 /// before the next retry attempt could start.
 ///
 /// Used in the retry path to short-circuit requeue and instead emit a
-/// `ScheduleToClose` timeout (issue #378).
+/// `ScheduleToClose` timeout (issue #378). Evaluates the **claim-time task
+/// snapshot** — since a pause/resume cycle (issue #609) can shift the row's
+/// deadline while an attempt is in flight, a positive answer here is only a
+/// candidate: [`record_schedule_to_close_activity_timeout`] re-validates
+/// against the fresh row value under the execution row lock before failing
+/// the task terminally.
 fn schedule_to_close_deadline_exceeded(
     task: &TaskQueueItem,
     retry_delay: chrono::Duration,
 ) -> bool {
-    let Some(deadline) = task.schedule_to_close_at else {
-        return false;
-    };
-    chrono::Utc::now() + retry_delay >= deadline
+    deadline_would_be_exceeded(task.schedule_to_close_at, chrono::Utc::now(), retry_delay)
 }
 
 /// Non-locking read of whether the owning execution is currently `PAUSED`.
@@ -5062,16 +5077,66 @@ async fn owning_execution_is_paused(
     Ok(state.as_deref() == Some("PAUSED"))
 }
 
+/// Outcome of the retry path's `schedule_to_close` deadline enforcement
+/// attempt (issue #609 post-review hardening).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleToCloseTimeoutOutcome {
+    /// The timeout was recorded — or the task was concurrently resolved by
+    /// another writer — so the caller must not requeue.
+    Handled,
+    /// The row-current deadline is no longer exceeded: a pause/resume cycle
+    /// that completed while this attempt was in flight shifted
+    /// `schedule_to_close_at` forward by the pause span (issue #609, AC5).
+    /// The claim-time snapshot is stale; the caller must fall through to a
+    /// normal retry requeue instead of failing the task terminally.
+    DeadlineShifted,
+}
+
+/// Locked (`FOR UPDATE`) read of a task row's current state and
+/// `schedule_to_close_at`, so the retry path's deadline decision is made
+/// against the row-current value rather than the claim-time snapshot.
+async fn task_state_and_deadline_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<Option<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select((dsl::state, dsl::schedule_to_close_at))
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
 /// Append `ActivityTimedOut { ScheduleToClose }` and fail the task row.
 ///
 /// Called from the retry path when the cross-retry wall-clock deadline
-/// (`schedule_to_close_at`) would be exceeded before the next attempt starts.
+/// (`schedule_to_close_at`) of the **claim-time snapshot** would be exceeded
+/// before the next attempt starts.
+///
+/// The snapshot can be stale (issue #609 post-review hardening): the pause
+/// primitive introduced the first post-enqueue mutator of
+/// `schedule_to_close_at` — `resume_workflow_execution` shifts it forward by
+/// the pause span. An attempt claimed before (or during) a pause that fails
+/// after the matching resume would otherwise be deadline-failed against the
+/// pre-shift value, charging paused wall-clock to the activity budget (the
+/// exact outcome AC5 exists to prevent). This function therefore re-reads
+/// the row's current deadline **inside** its transaction — which takes the
+/// execution row lock via [`lock_workflow_execution_and_load_history`], the
+/// same lock `resume_workflow_execution` holds while shifting, so the read
+/// observes either the pre- or post-shift value, never a torn one — and
+/// returns [`ScheduleToCloseTimeoutOutcome::DeadlineShifted`] without
+/// mutating anything when the fresh deadline is no longer exceeded.
 async fn record_schedule_to_close_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
-) -> HarvestResult<()> {
+    retry_delay: chrono::Duration,
+) -> HarvestResult<ScheduleToCloseTimeoutOutcome> {
     let error = HarvestError::Timeout {
         timeout_type: crate::error::TimeoutType::ScheduleToClose,
         task_name: task
@@ -5081,15 +5146,24 @@ async fn record_schedule_to_close_activity_timeout(
     }
     .to_string();
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
+    conn.transaction::<ScheduleToCloseTimeoutOutcome, HarvestError, _>(|conn| {
         let error = error.clone();
         async move {
             let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
-            let Some(state) = task_state_for_update(conn, task.id).await? else {
-                return Ok(());
+            let Some((state, fresh_deadline)) =
+                task_state_and_deadline_for_update(conn, task.id).await?
+            else {
+                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
             };
             if state != "RUNNING" {
-                return Ok(());
+                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
+            }
+            // Fresh-deadline re-check under the execution row lock: if a
+            // concurrent resume shifted the deadline into the future, this
+            // attempt still has budget — abort the timeout and let the
+            // caller requeue normally.
+            if !deadline_would_be_exceeded(fresh_deadline, chrono::Utc::now(), retry_delay) {
+                return Ok(ScheduleToCloseTimeoutOutcome::DeadlineShifted);
             }
             let timeout_event = WorkflowEvent::ActivityTimedOut {
                 activity_id,
@@ -5097,7 +5171,8 @@ async fn record_schedule_to_close_activity_timeout(
             };
             store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
-            queue::wake_workflow_task(conn, exec_id).await
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(ScheduleToCloseTimeoutOutcome::Handled)
         }
         .scope_boxed()
     })
@@ -5153,13 +5228,22 @@ async fn handle_activity_result(
                 if schedule_to_close_deadline_exceeded(task, delay)
                     && !owning_execution_is_paused(conn, exec_id).await?
                 {
-                    return record_schedule_to_close_activity_timeout(
+                    match record_schedule_to_close_activity_timeout(
                         conn,
                         task,
                         exec_id,
                         activity_id,
+                        delay,
                     )
-                    .await;
+                    .await?
+                    {
+                        ScheduleToCloseTimeoutOutcome::Handled => return Ok(()),
+                        // Stale claim-time snapshot: a concurrent pause/resume
+                        // cycle shifted the row's deadline forward (issue #609
+                        // post-review hardening) — the attempt still has
+                        // budget, so fall through to the normal requeue below.
+                        ScheduleToCloseTimeoutOutcome::DeadlineShifted => {}
+                    }
                 }
                 // Store the human-readable error for ActivityContext::previous_failure()
                 // on the next attempt. Typed payloads are unwrapped to their message.
@@ -13316,5 +13400,41 @@ mod tests {
             }),
         };
         let _ = schedule_counter_action(&outcome);
+    }
+
+    // ── schedule_to_close retry-path deadline decision (issues #378 × #609) ─
+
+    #[test]
+    fn deadline_would_be_exceeded_none_is_unbounded() {
+        let now = chrono::Utc::now();
+        assert!(!deadline_would_be_exceeded(
+            None,
+            now,
+            chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn deadline_would_be_exceeded_true_when_retry_lands_past_deadline() {
+        let now = chrono::Utc::now();
+        assert!(deadline_would_be_exceeded(
+            Some(now + chrono::Duration::seconds(30)),
+            now,
+            chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn deadline_would_be_exceeded_false_after_a_resume_shift() {
+        // Finding 1 (issue #609 post-review hardening): a pause/resume cycle
+        // completing while the attempt was in flight shifts the row's
+        // deadline forward; the fresh (shifted) value must clear the check
+        // even though the stale claim-time snapshot would not.
+        let now = chrono::Utc::now();
+        let stale_snapshot = Some(now - chrono::Duration::seconds(1));
+        let shifted_fresh = Some(now + chrono::Duration::hours(1));
+        let delay = chrono::Duration::seconds(300);
+        assert!(deadline_would_be_exceeded(stale_snapshot, now, delay));
+        assert!(!deadline_would_be_exceeded(shifted_fresh, now, delay));
     }
 }

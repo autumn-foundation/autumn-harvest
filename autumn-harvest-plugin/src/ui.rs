@@ -1307,6 +1307,28 @@ async fn terminate_workflow_ui(
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
+/// Flash text for the pause action: an idempotent repeat (`newly_paused:
+/// false`) is called out so the operator isn't misled into thinking their
+/// click performed the transition (issue #609 post-review hardening).
+const fn pause_flash_message(newly_paused: bool) -> &'static str {
+    if newly_paused {
+        "Workflow paused"
+    } else {
+        "Workflow was already paused"
+    }
+}
+
+/// Flash text for the resume action: since issue #609, resuming a non-paused
+/// run is a success no-op (`newly_resumed: false`) — the flash must say so
+/// rather than claiming a resume happened.
+const fn resume_flash_message(newly_resumed: bool) -> &'static str {
+    if newly_resumed {
+        "Workflow resumed"
+    } else {
+        "Workflow was not paused; nothing to resume"
+    }
+}
+
 async fn pause_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -1331,7 +1353,11 @@ async fn pause_workflow_ui(
     let result =
         pause_workflow_execution(&mut conn, exec_id, reason, &actor, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &result {
-        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow paused")),
+        Ok(paused) => (
+            STATUS_SUCCEEDED,
+            None,
+            url_encode(pause_flash_message(paused.newly_paused)),
+        ),
         Err(e) => {
             let msg = e.to_string();
             (
@@ -1380,7 +1406,11 @@ async fn resume_workflow_ui(
         );
     let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &result {
-        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow resumed")),
+        Ok(resumed) => (
+            STATUS_SUCCEEDED,
+            None,
+            url_encode(resume_flash_message(resumed.newly_resumed)),
+        ),
         Err(e) => {
             let msg = e.to_string();
             (
@@ -7170,6 +7200,20 @@ mod tests {
         assert_eq!(dead_letter_task_kind_label("ACTIVITY"), "Activity");
         assert_eq!(dead_letter_task_kind_label("WORKFLOW"), "Workflow");
         assert_eq!(dead_letter_task_kind_label("TIMER"), "Unknown");
+    }
+
+    #[test]
+    fn pause_and_resume_flashes_distinguish_noops() {
+        // Issue #609 post-review hardening: a no-op resume (the run was not
+        // paused) must not flash "Workflow resumed", and an idempotent
+        // repeat pause must not claim it performed the transition.
+        assert_eq!(resume_flash_message(true), "Workflow resumed");
+        assert_eq!(
+            resume_flash_message(false),
+            "Workflow was not paused; nothing to resume"
+        );
+        assert_eq!(pause_flash_message(true), "Workflow paused");
+        assert_eq!(pause_flash_message(false), "Workflow was already paused");
     }
 
     #[test]
