@@ -24,7 +24,8 @@ CREATE INDEX IF NOT EXISTS harvest_task_queue_session_id_pending
 -- 3. Worker sessions: one row per open/closed session.
 CREATE TABLE IF NOT EXISTS harvest_sessions (
     id               UUID        PRIMARY KEY,
-    workflow_exec_id UUID        NOT NULL REFERENCES harvest_workflow_executions(id),
+    workflow_exec_id UUID        NOT NULL
+        REFERENCES harvest_workflow_executions(id) ON DELETE CASCADE,
     host_worker_id   TEXT        NOT NULL,
     queue_name       TEXT        NOT NULL,
     state            TEXT        NOT NULL DEFAULT 'ACTIVE',

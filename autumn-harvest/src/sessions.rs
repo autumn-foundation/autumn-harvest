@@ -99,6 +99,15 @@ pub enum BrokenSessionReason {
     HostWorkerLostHeartbeat,
     /// The host worker's status transitioned to `Draining` or `Stopped`.
     HostWorkerDraining,
+    /// The session's owning workflow execution already reached a terminal
+    /// state (completed, failed, cancelled, timed out, terminated, or
+    /// continued-as-new) without ever calling `Session::complete()` -- e.g.
+    /// a member activity error propagated via `?`, or an operator
+    /// cancelled/terminated the workflow mid-pipeline. The workflow can
+    /// never dispatch another member activity or a release for this
+    /// session, so waiting out the full lease would only delay reclaiming
+    /// the slot for no benefit.
+    OwningWorkflowTerminal,
     /// The session's lease (`expires_at`) elapsed — e.g. a wedged workflow
     /// that never called `Session::complete()`.
     LeaseExpired,
@@ -109,6 +118,9 @@ impl std::fmt::Display for BrokenSessionReason {
         match self {
             Self::HostWorkerLostHeartbeat => write!(f, "host worker lost heartbeat"),
             Self::HostWorkerDraining => write!(f, "host worker draining"),
+            Self::OwningWorkflowTerminal => {
+                write!(f, "owning workflow execution reached a terminal state")
+            }
             Self::LeaseExpired => write!(f, "session lease expired"),
         }
     }
@@ -117,19 +129,24 @@ impl std::fmt::Display for BrokenSessionReason {
 /// Pure decision: should an `ACTIVE` session be marked `BROKEN`?
 ///
 /// Checked in priority order — a dead host is reported before a merely
-/// draining one, and an expired lease is only reported once the host is
-/// confirmed live (a dead host's session is a liveness problem, not a lease
-/// problem). Returns `None` when none of the three conditions hold.
+/// draining one; a terminal owning workflow is reported next (it can never
+/// legitimately use or release this session again, regardless of host
+/// health or lease); an expired lease is checked last, and only once none
+/// of the above apply. Returns `None` when none of the conditions hold.
 #[must_use]
+#[allow(clippy::fn_params_excessive_bools)]
 pub const fn broken_session_reason(
     host_heartbeat_stale: bool,
     host_status_draining_or_stopped: bool,
+    owning_workflow_terminal: bool,
     lease_expired: bool,
 ) -> Option<BrokenSessionReason> {
     if host_heartbeat_stale {
         Some(BrokenSessionReason::HostWorkerLostHeartbeat)
     } else if host_status_draining_or_stopped {
         Some(BrokenSessionReason::HostWorkerDraining)
+    } else if owning_workflow_terminal {
+        Some(BrokenSessionReason::OwningWorkflowTerminal)
     } else if lease_expired {
         Some(BrokenSessionReason::LeaseExpired)
     } else {
@@ -589,12 +606,15 @@ pub async fn refresh_session_lease(
 pub const fn broken_session_candidates_query() -> &'static str {
     "SELECT s.* FROM harvest_sessions s \
      LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id \
+     LEFT JOIN harvest_workflow_executions e ON e.id = s.workflow_exec_id \
      WHERE s.state = 'ACTIVE' \
        AND ( \
          w.worker_id IS NULL \
          OR w.last_heartbeat_at <= NOW() - ($1::bigint * INTERVAL '1 second') \
          OR w.status IN ('Draining', 'Stopped') \
          OR s.expires_at < NOW() \
+         OR e.state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'TERMINATED', \
+                         'CONTINUED_AS_NEW') \
        )"
 }
 
@@ -613,6 +633,7 @@ async fn resolve_broken_reason(
     use diesel_async::RunQueryDsl;
 
     use crate::schema::harvest_workers::dsl as w;
+    use crate::schema::harvest_workflow_executions::dsl as e;
 
     let worker: Option<(chrono::DateTime<chrono::Utc>, String)> = w::harvest_workers
         .filter(w::worker_id.eq(&session.host_worker_id))
@@ -634,6 +655,24 @@ async fn resolve_broken_reason(
             )
         }
     };
+
+    // The owning workflow may have reached a terminal state without ever
+    // calling `Session::complete()` -- a member activity error propagated
+    // via `?`, or an operator cancelled/terminated the workflow mid-pipeline
+    // (issue #929 review). Such a workflow can never dispatch another
+    // member activity or a release for this session, so there is no reason
+    // to wait out the full lease before reclaiming the slot.
+    let owning_workflow_state: Option<String> = e::harvest_workflow_executions
+        .find(session.workflow_exec_id)
+        .select(e::state)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    let owning_workflow_terminal = owning_workflow_state
+        .as_deref()
+        .is_some_and(crate::erase::is_terminal_state);
+
     let lease_expired_naive = lease_expired(chrono::Utc::now(), session.expires_at);
 
     // A naive lease-expiry check alone would misclassify a healthy pipeline
@@ -664,6 +703,7 @@ async fn resolve_broken_reason(
     Ok(broken_session_reason(
         host_heartbeat_stale,
         host_status_draining_or_stopped,
+        owning_workflow_terminal,
         expired,
     ))
 }
@@ -889,14 +929,14 @@ mod tests {
 
     #[test]
     fn broken_session_reason_none_when_healthy_and_leased() {
-        assert_eq!(broken_session_reason(false, false, false), None);
+        assert_eq!(broken_session_reason(false, false, false, false), None);
     }
 
     #[test]
     fn broken_session_reason_stale_heartbeat_wins_priority() {
-        // All three conditions true -- heartbeat loss is reported first.
+        // All four conditions true -- heartbeat loss is reported first.
         assert_eq!(
-            broken_session_reason(true, true, true),
+            broken_session_reason(true, true, true, true),
             Some(BrokenSessionReason::HostWorkerLostHeartbeat)
         );
     }
@@ -904,7 +944,7 @@ mod tests {
     #[test]
     fn broken_session_reason_draining_reported_when_alive_but_draining() {
         assert_eq!(
-            broken_session_reason(false, true, false),
+            broken_session_reason(false, true, false, false),
             Some(BrokenSessionReason::HostWorkerDraining)
         );
     }
@@ -912,7 +952,7 @@ mod tests {
     #[test]
     fn broken_session_reason_lease_expired_reported_when_host_otherwise_fine() {
         assert_eq!(
-            broken_session_reason(false, false, true),
+            broken_session_reason(false, false, false, true),
             Some(BrokenSessionReason::LeaseExpired)
         );
     }
@@ -920,8 +960,32 @@ mod tests {
     #[test]
     fn broken_session_reason_draining_takes_priority_over_lease_expiry() {
         assert_eq!(
-            broken_session_reason(false, true, true),
+            broken_session_reason(false, true, false, true),
             Some(BrokenSessionReason::HostWorkerDraining)
+        );
+    }
+
+    #[test]
+    fn broken_session_reason_owning_workflow_terminal_reported_when_host_otherwise_fine() {
+        assert_eq!(
+            broken_session_reason(false, false, true, false),
+            Some(BrokenSessionReason::OwningWorkflowTerminal)
+        );
+    }
+
+    #[test]
+    fn broken_session_reason_draining_takes_priority_over_owning_workflow_terminal() {
+        assert_eq!(
+            broken_session_reason(false, true, true, false),
+            Some(BrokenSessionReason::HostWorkerDraining)
+        );
+    }
+
+    #[test]
+    fn broken_session_reason_owning_workflow_terminal_takes_priority_over_lease_expiry() {
+        assert_eq!(
+            broken_session_reason(false, false, true, true),
+            Some(BrokenSessionReason::OwningWorkflowTerminal)
         );
     }
 
@@ -934,6 +998,10 @@ mod tests {
         assert_eq!(
             BrokenSessionReason::HostWorkerDraining.to_string(),
             "host worker draining"
+        );
+        assert_eq!(
+            BrokenSessionReason::OwningWorkflowTerminal.to_string(),
+            "owning workflow execution reached a terminal state"
         );
         assert_eq!(
             BrokenSessionReason::LeaseExpired.to_string(),
@@ -1119,5 +1187,15 @@ mod tests {
         assert!(sql.contains("Stopped"));
         assert!(sql.contains("s.expires_at < NOW()"));
         assert!(sql.contains("LEFT JOIN harvest_workers"));
+    }
+
+    #[test]
+    fn broken_session_candidates_query_also_matches_sessions_whose_workflow_is_terminal() {
+        let sql = broken_session_candidates_query();
+        assert!(sql.contains("LEFT JOIN harvest_workflow_executions"));
+        assert!(sql.contains("e.id = s.workflow_exec_id"));
+        assert!(sql.contains("e.state IN"));
+        assert!(sql.contains("'COMPLETED'"));
+        assert!(sql.contains("'CONTINUED_AS_NEW'"));
     }
 }
