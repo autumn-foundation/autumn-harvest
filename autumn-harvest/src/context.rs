@@ -5264,6 +5264,257 @@ impl WorkflowContext {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn check_branch_history(
+        &self,
+        seq: u32,
+        index: usize,
+        branch: &RaceBranch,
+        resolved: &mut Vec<(usize, HarvestResult<Value>)>,
+        to_dispatch: &mut Vec<RaceDispatch>,
+    ) -> HarvestResult<()> {
+        match &branch.kind {
+            RaceBranchKind::Activity { name, input, .. } => {
+                let history_match = if self.strict_replay {
+                    self.match_history(|m| m.match_activity_strict(name, input))
+                } else {
+                    self.match_history(|m| m.match_activity(name))
+                };
+                match history_match {
+                    HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
+                    HistoryMatch::Failed {
+                        error,
+                        attempt,
+                        error_type,
+                        details,
+                    } => resolved.push((
+                        index,
+                        Err(HarvestError::ActivityFailed {
+                            name: name.clone(),
+                            attempt,
+                            error_type,
+                            details,
+                            source: error.into(),
+                        }),
+                    )),
+                    HistoryMatch::TimedOut { timeout_type } => resolved.push((
+                        index,
+                        Err(HarvestError::Timeout {
+                            timeout_type,
+                            task_name: name.clone(),
+                        }),
+                    )),
+                    HistoryMatch::Diverged {
+                        expected,
+                        actual,
+                        event_index,
+                    } => {
+                        return Err(self.nd_error(
+                            format!(
+                                "race #{seq} branch {index} ({name}): activity mismatch: \
+                                 expected {expected}, got {actual}"
+                            ),
+                            event_index,
+                            Some(expected),
+                            Some(actual),
+                        ));
+                    }
+                    HistoryMatch::ActivityInProgress { activity_id } => {
+                        to_dispatch.push(RaceDispatch {
+                            index,
+                            activity_id: Some(activity_id),
+                            child_id: None,
+                            is_new: false,
+                        });
+                    }
+                    HistoryMatch::NoMatch => {
+                        to_dispatch.push(RaceDispatch {
+                            index,
+                            activity_id: Some(self.next_activity_id()),
+                            child_id: None,
+                            is_new: true,
+                        });
+                    }
+                    _ => unreachable!("match_activity never returns this variant"),
+                }
+            }
+            RaceBranchKind::ChildWorkflow {
+                workflow_name,
+                input,
+            } => {
+                let history_match =
+                    self.match_history(|m| m.match_child_workflow(workflow_name, input));
+                match history_match {
+                    HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
+                    HistoryMatch::Failed {
+                        error,
+                        attempt,
+                        error_type,
+                        details,
+                    } => resolved.push((
+                        index,
+                        Err(HarvestError::ActivityFailed {
+                            name: format!("child-workflow:{workflow_name}"),
+                            attempt,
+                            error_type,
+                            details,
+                            source: error.into(),
+                        }),
+                    )),
+                    HistoryMatch::Diverged {
+                        expected,
+                        actual,
+                        event_index,
+                    } => {
+                        return Err(self.nd_error(
+                            format!(
+                                "race #{seq} branch {index} ({workflow_name}): child \
+                                 workflow mismatch: expected {expected}, got {actual}"
+                            ),
+                            event_index,
+                            Some(expected),
+                            Some(actual),
+                        ));
+                    }
+                    HistoryMatch::ChildInProgress { child_id } => {
+                        to_dispatch.push(RaceDispatch {
+                            index,
+                            activity_id: None,
+                            child_id: Some(child_id),
+                            is_new: false,
+                        });
+                    }
+                    HistoryMatch::NoMatch => {
+                        to_dispatch.push(RaceDispatch {
+                            index,
+                            activity_id: None,
+                            child_id: Some(ExecutionId::new()),
+                            is_new: true,
+                        });
+                    }
+                    _ => unreachable!("match_child_workflow never returns this variant"),
+                }
+            }
+            RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                unreachable!("timer/signal branches only occur in the paired shape")
+            }
+        }
+        Ok(())
+    }
+
+    fn check_branch_payload_caps(
+        &self,
+        dispatch: &RaceDispatch,
+        branch: &RaceBranch,
+    ) -> HarvestResult<()> {
+        if !dispatch.is_new {
+            return Ok(());
+        }
+        match &branch.kind {
+            RaceBranchKind::Activity { name, input, .. } => {
+                let effective_cap = {
+                    let global = self.payload_max_activity_input;
+                    self.activity_input_cap_overrides
+                        .get(name)
+                        .copied()
+                        .map_or(global, |ov| global.max(ov))
+                };
+                let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+                if effective_cap > 0
+                    && observed > effective_cap
+                    && !self.offload_will_apply(observed)
+                {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: PayloadKind::ActivityInput,
+                        observed_bytes: observed,
+                        cap_bytes: effective_cap,
+                        workflow_type: self.workflow_name.clone(),
+                        activity_name: Some(name.clone()),
+                    });
+                }
+            }
+            RaceBranchKind::ChildWorkflow { input, .. } => {
+                let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: PayloadKind::ChildWorkflowInput,
+                        observed_bytes: observed,
+                        cap_bytes: self.payload_max_workflow_input,
+                        workflow_type: self.workflow_name.clone(),
+                        activity_name: None,
+                    });
+                }
+            }
+            RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                unreachable!("timer/signal branches only occur in the paired shape")
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_branch(
+        &self,
+        dispatch: &RaceDispatch,
+        branch: &RaceBranch,
+        tx: oneshot::Sender<Result<Value, String>>,
+    ) {
+        match &branch.kind {
+            RaceBranchKind::Activity {
+                name,
+                input,
+                queue,
+                retry,
+                start_to_close,
+            } => {
+                let activity_id = dispatch
+                    .activity_id
+                    .expect("activity dispatch always carries an activity_id");
+                if dispatch.is_new {
+                    // Payload cap already validated in the pre-dispatch pass above.
+                    self.push_command(WorkflowCommand::ScheduleActivity {
+                        activity_id,
+                        name: name.clone(),
+                        input: input.clone(),
+                        queue: queue.clone(),
+                        retry_policy_override: retry.clone(),
+                        start_to_close_override: *start_to_close,
+                        session_id: None,
+                        session_worker_id: None,
+                        schedule_to_start_override: None,
+                        result_tx: tx,
+                    });
+                } else {
+                    self.push_command(WorkflowCommand::WaitForActivity {
+                        activity_id,
+                        result_tx: tx,
+                    });
+                }
+            }
+            RaceBranchKind::ChildWorkflow {
+                workflow_name,
+                input,
+            } => {
+                let child_id = dispatch
+                    .child_id
+                    .expect("child dispatch always carries a child_id");
+                // Payload cap already validated in the pre-dispatch pass above
+                // when dispatch.is_new (ChildWorkflowStarted is written to the
+                // parent's history via append_single_event, so the offload
+                // bypass never applies to this kind).
+                self.push_command(WorkflowCommand::StartChildWorkflow {
+                    child_id,
+                    workflow_name: workflow_name.clone(),
+                    input: input.clone(),
+                    result_tx: tx,
+                });
+            }
+            RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                unreachable!("timer/signal branches only occur in the paired shape")
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
         self.check_cancellation()?;
 
@@ -5308,6 +5559,7 @@ impl WorkflowContext {
         let seq = self.next_race_seq();
         let count = branches.len();
         let open_marker = format!("race:{seq}");
+
         // Deferred rather than pushed immediately: if a branch that is about
         // to be freshly dispatched fails its payload-cap check below, this
         // race must leave zero durable trace of the cycle (see the
@@ -5316,16 +5568,17 @@ impl WorkflowContext {
         // corresponding branch dispatch event, and replay would diverge
         // expecting ActivityScheduled/ChildWorkflowStarted but finding the
         // terminal event instead.
-        let needs_open_marker =
-            match self.match_history(|m| m.match_u64_marker(&open_marker, count as u64)) {
-                HistoryMatch::Matched { .. } => false,
-                HistoryMatch::NoMatch => true,
-                HistoryMatch::Diverged {
-                    expected,
-                    actual,
-                    event_index,
-                } => {
-                    return Err(self.nd_error(
+        let needs_open_marker = match self
+            .match_history(|m| m.match_u64_marker(&open_marker, count as u64))
+        {
+            HistoryMatch::Matched { .. } => false,
+            HistoryMatch::NoMatch => true,
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => {
+                return Err(self.nd_error(
                     format!(
                         "race #{seq}: history has {expected} but current code supplies {actual} \
                          — the branch count changed between deploy and replay; use ctx.version() \
@@ -5335,9 +5588,9 @@ impl WorkflowContext {
                     Some(expected),
                     Some(actual),
                 ));
-                }
-                _ => unreachable!("match_u64_marker only returns Matched, NoMatch, or Diverged"),
-            };
+            }
+            _ => unreachable!("match_u64_marker only returns Matched, NoMatch, or Diverged"),
+        };
 
         // Phase A: synchronously check every branch's history state without
         // pushing any command yet, so a branch that already has a terminal
@@ -5347,132 +5600,7 @@ impl WorkflowContext {
         let mut to_dispatch: Vec<RaceDispatch> = Vec::new();
 
         for (index, branch) in branches.iter().enumerate() {
-            match &branch.kind {
-                RaceBranchKind::Activity { name, input, .. } => {
-                    let history_match = if self.strict_replay {
-                        self.match_history(|m| m.match_activity_strict(name, input))
-                    } else {
-                        self.match_history(|m| m.match_activity(name))
-                    };
-                    match history_match {
-                        HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
-                        HistoryMatch::Failed {
-                            error,
-                            attempt,
-                            error_type,
-                            details,
-                        } => resolved.push((
-                            index,
-                            Err(HarvestError::ActivityFailed {
-                                name: name.clone(),
-                                attempt,
-                                error_type,
-                                details,
-                                source: error.into(),
-                            }),
-                        )),
-                        HistoryMatch::TimedOut { timeout_type } => resolved.push((
-                            index,
-                            Err(HarvestError::Timeout {
-                                timeout_type,
-                                task_name: name.clone(),
-                            }),
-                        )),
-                        HistoryMatch::Diverged {
-                            expected,
-                            actual,
-                            event_index,
-                        } => {
-                            return Err(self.nd_error(
-                                format!(
-                                    "race #{seq} branch {index} ({name}): activity mismatch: \
-                                     expected {expected}, got {actual}"
-                                ),
-                                event_index,
-                                Some(expected),
-                                Some(actual),
-                            ));
-                        }
-                        HistoryMatch::ActivityInProgress { activity_id } => {
-                            to_dispatch.push(RaceDispatch {
-                                index,
-                                activity_id: Some(activity_id),
-                                child_id: None,
-                                is_new: false,
-                            });
-                        }
-                        HistoryMatch::NoMatch => {
-                            to_dispatch.push(RaceDispatch {
-                                index,
-                                activity_id: Some(self.next_activity_id()),
-                                child_id: None,
-                                is_new: true,
-                            });
-                        }
-                        _ => unreachable!("match_activity never returns this variant"),
-                    }
-                }
-                RaceBranchKind::ChildWorkflow {
-                    workflow_name,
-                    input,
-                } => {
-                    let history_match =
-                        self.match_history(|m| m.match_child_workflow(workflow_name, input));
-                    match history_match {
-                        HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
-                        HistoryMatch::Failed {
-                            error,
-                            attempt,
-                            error_type,
-                            details,
-                        } => resolved.push((
-                            index,
-                            Err(HarvestError::ActivityFailed {
-                                name: format!("child-workflow:{workflow_name}"),
-                                attempt,
-                                error_type,
-                                details,
-                                source: error.into(),
-                            }),
-                        )),
-                        HistoryMatch::Diverged {
-                            expected,
-                            actual,
-                            event_index,
-                        } => {
-                            return Err(self.nd_error(
-                                format!(
-                                    "race #{seq} branch {index} ({workflow_name}): child \
-                                     workflow mismatch: expected {expected}, got {actual}"
-                                ),
-                                event_index,
-                                Some(expected),
-                                Some(actual),
-                            ));
-                        }
-                        HistoryMatch::ChildInProgress { child_id } => {
-                            to_dispatch.push(RaceDispatch {
-                                index,
-                                activity_id: None,
-                                child_id: Some(child_id),
-                                is_new: false,
-                            });
-                        }
-                        HistoryMatch::NoMatch => {
-                            to_dispatch.push(RaceDispatch {
-                                index,
-                                activity_id: None,
-                                child_id: Some(ExecutionId::new()),
-                                is_new: true,
-                            });
-                        }
-                        _ => unreachable!("match_child_workflow never returns this variant"),
-                    }
-                }
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
-                }
-            }
+            self.check_branch_history(seq, index, branch, &mut resolved, &mut to_dispatch)?;
         }
 
         // Validate payload caps for every branch about to be freshly
@@ -5481,50 +5609,7 @@ impl WorkflowContext {
         // Phase B). An oversized branch must abort this race with zero
         // durable trace -- see the comment on `needs_open_marker` above.
         for dispatch in &to_dispatch {
-            if !dispatch.is_new {
-                continue;
-            }
-            match &branches[dispatch.index].kind {
-                RaceBranchKind::Activity { name, input, .. } => {
-                    let effective_cap = {
-                        let global = self.payload_max_activity_input;
-                        self.activity_input_cap_overrides
-                            .get(name)
-                            .copied()
-                            .map_or(global, |ov| global.max(ov))
-                    };
-                    let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
-                    if effective_cap > 0
-                        && observed > effective_cap
-                        && !self.offload_will_apply(observed)
-                    {
-                        return Err(HarvestError::PayloadTooLarge {
-                            kind: PayloadKind::ActivityInput,
-                            observed_bytes: observed,
-                            cap_bytes: effective_cap,
-                            workflow_type: self.workflow_name.clone(),
-                            activity_name: Some(name.clone()),
-                        });
-                    }
-                }
-                RaceBranchKind::ChildWorkflow { input, .. } => {
-                    let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
-                    if self.payload_max_workflow_input > 0
-                        && observed > self.payload_max_workflow_input
-                    {
-                        return Err(HarvestError::PayloadTooLarge {
-                            kind: PayloadKind::ChildWorkflowInput,
-                            observed_bytes: observed,
-                            cap_bytes: self.payload_max_workflow_input,
-                            workflow_type: self.workflow_name.clone(),
-                            activity_name: None,
-                        });
-                    }
-                }
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
-                }
-            }
+            self.check_branch_payload_caps(dispatch, &branches[dispatch.index])?;
         }
 
         if needs_open_marker {
@@ -5545,63 +5630,11 @@ impl WorkflowContext {
         // already resolved by the time a later replay cycle checks them.
         let mut receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)> =
             Vec::with_capacity(to_dispatch.len());
+
         for dispatch in &to_dispatch {
             let branch = &branches[dispatch.index];
             let (tx, rx) = oneshot::channel();
-            match &branch.kind {
-                RaceBranchKind::Activity {
-                    name,
-                    input,
-                    queue,
-                    retry,
-                    start_to_close,
-                } => {
-                    let activity_id = dispatch
-                        .activity_id
-                        .expect("activity dispatch always carries an activity_id");
-                    if dispatch.is_new {
-                        // Payload cap already validated in the pre-dispatch pass above.
-                        self.push_command(WorkflowCommand::ScheduleActivity {
-                            activity_id,
-                            name: name.clone(),
-                            input: input.clone(),
-                            queue: queue.clone(),
-                            retry_policy_override: retry.clone(),
-                            start_to_close_override: *start_to_close,
-                            session_id: None,
-                            session_worker_id: None,
-                            schedule_to_start_override: None,
-                            result_tx: tx,
-                        });
-                    } else {
-                        self.push_command(WorkflowCommand::WaitForActivity {
-                            activity_id,
-                            result_tx: tx,
-                        });
-                    }
-                }
-                RaceBranchKind::ChildWorkflow {
-                    workflow_name,
-                    input,
-                } => {
-                    let child_id = dispatch
-                        .child_id
-                        .expect("child dispatch always carries a child_id");
-                    // Payload cap already validated in the pre-dispatch pass above
-                    // when dispatch.is_new (ChildWorkflowStarted is written to the
-                    // parent's history via append_single_event, so the offload
-                    // bypass never applies to this kind).
-                    self.push_command(WorkflowCommand::StartChildWorkflow {
-                        child_id,
-                        workflow_name: workflow_name.clone(),
-                        input: input.clone(),
-                        result_tx: tx,
-                    });
-                }
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
-                }
-            }
+            self.dispatch_branch(dispatch, branch, tx);
             receivers.push((dispatch.index, rx));
         }
 
