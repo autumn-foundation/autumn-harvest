@@ -169,7 +169,7 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     // issue #607: the start-throttle table under test.
-    include_str!("../../autumn-harvest/migrations/20260706000000_harvest_start_throttle/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260706000001_harvest_start_throttle/up.sql"),
     "\n",
     // issue #606: harvest_task_queue.session_id (worker sessions), merged in from trunk-dev.
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
@@ -699,5 +699,79 @@ async fn batch_start_results_include_workflow_id_for_every_outcome() {
     assert!(
         rejected.get("workflow_id").is_none(),
         "a pre-validation rejection for an omitted id has no resolved workflow_id: {rejected:?}"
+    );
+}
+
+/// Code-review fix (issue #607): a best-effort batch item for a throttled
+/// workflow whose input exceeds the effective byte cap must be rejected
+/// immediately, not durably deferred. Without the fix, an oversized item
+/// hitting an *empty* bucket would be written to `harvest_start_throttle`
+/// as `Deferred` -- a row that can never successfully fire (the throttle
+/// scanner's own cap enforcement rejects it every tick, forever) -- rather
+/// than failing fast with a clear per-item error and zero pending rows.
+#[tokio::test]
+async fn batch_start_rejects_oversized_item_before_deferring() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // burst = 1 -> the bucket is drained by the first (normal-sized) item,
+    // so the second (oversized) item would hit an empty bucket and -- absent
+    // the fix -- be durably deferred instead of rejected.
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+
+    let (drain_status, _) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({ "workflow_id": "drain-job", "input": { "tenant_id": "acme" } }),
+    )
+    .await;
+    assert_eq!(
+        drain_status,
+        StatusCode::CREATED,
+        "drain call consumes the sole token"
+    );
+
+    let oversized_input = "x".repeat(3 * 1024 * 1024);
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "oversized-batch-job",
+                    "input": { "tenant_id": "acme", "payload": oversized_input },
+                }
+            ],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "best-effort batch: {body:?}");
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["status"],
+        json!("rejected"),
+        "an oversized item must be rejected immediately, not deferred: {body:?}"
+    );
+    assert_eq!(results[0]["workflow_id"], json!("oversized-batch-job"));
+    let err = results[0]["error"].as_str().expect("error message");
+    assert!(
+        err.contains("exceeds cap"),
+        "rejection reason must name the byte-cap violation: {err}"
+    );
+
+    // No pending throttle row was ever written for the oversized item.
+    let (backlog_status, backlog) = get_json(&app, "/admin/start-throttle").await;
+    assert_eq!(backlog_status, StatusCode::OK);
+    let arr = backlog.as_array().expect("array");
+    let acme_backlog = arr
+        .iter()
+        .find(|e| e["throttle_key"] == json!("acme"))
+        .map_or(0, |e| e["deferred_count"].as_i64().unwrap_or(0));
+    assert_eq!(
+        acme_backlog, 0,
+        "no pending row should exist for the oversized item: {backlog:?}"
     );
 }

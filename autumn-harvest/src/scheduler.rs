@@ -2805,6 +2805,26 @@ async fn tick_one_workflow_schedule(
                     .map_or(registry.max_workflow_input_bytes, |per| {
                         per.max(registry.max_workflow_input_bytes)
                     });
+                // Fail fast on an oversized input rather than persisting a
+                // pending row that would fail at fire time on every scanner
+                // tick (code-review fix, issue #607). Returning the error here
+                // -- rather than falling through to defer -- mirrors the
+                // non-throttled path's `return Err(error)` a few lines below:
+                // `dispatched`/`last_dispatched_at`/`last_original_slot_dispatched`
+                // are never touched, so `last_run_at` is not advanced and the
+                // next tick retries the same firing.
+                if effective_cap > 0 {
+                    let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                    if observed > effective_cap {
+                        return Err(crate::error::HarvestError::PayloadTooLarge {
+                            kind: crate::error::PayloadKind::WorkflowInput,
+                            observed_bytes: observed,
+                            cap_bytes: effective_cap,
+                            workflow_type: wf_name.to_string(),
+                            activity_name: None,
+                        });
+                    }
+                }
                 let effective_retry = schedule
                     .retry_policy
                     .as_ref()
@@ -3812,6 +3832,17 @@ async fn drain_buffered_schedule_runs(
                 "harvest: dispatching buffered scheduled workflow run"
             );
 
+            // Effective per-workflow input cap (issue #607 code review): this
+            // loop previously enforced no cap at all on either the throttle or
+            // immediate path (`None`/`0` are both "no cap" sentinels to
+            // `StartWorkflowParams`/`DebounceStartOptions`). Mirrors the
+            // scheduler-tick path's `effective_cap` computation.
+            let effective_cap = wf_info
+                .and_then(|info| info.max_input_bytes)
+                .map_or(registry.max_workflow_input_bytes, |per| {
+                    per.max(registry.max_workflow_input_bytes)
+                });
+
             // Start-throttle admission (issue #607): pace buffered/backfilled fires,
             // defer the excess. A deferred fire counts as dispatched (advances the
             // slot) and is admitted later by the throttle scanner with its
@@ -3823,6 +3854,27 @@ async fn drain_buffered_schedule_runs(
                     |k| crate::throttle::resolve_throttle_key(k, &input),
                 );
                 if let Some(resolved_throttle_key) = throttle_key {
+                    // Fail fast on an oversized input rather than persisting a
+                    // pending row that would fail at fire time on every
+                    // scanner tick. `break` (not `return Err`) matches this
+                    // loop's own failure-handling convention below: drop this
+                    // and any remaining buffered slots this tick rather than
+                    // retrying a permanently-failing input forever.
+                    if effective_cap > 0 {
+                        let observed =
+                            serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                        if observed > effective_cap {
+                            tracing::warn!(
+                                workflow_name = %wf_name,
+                                workflow_id = %workflow_id,
+                                buffered_for = %scheduled_for,
+                                observed_bytes = observed,
+                                cap_bytes = effective_cap,
+                                "harvest: buffered scheduled workflow input exceeds cap; dropping slot"
+                            );
+                            break;
+                        }
+                    }
                     let effective_retry = schedule
                         .retry_policy
                         .as_ref()
@@ -3845,7 +3897,7 @@ async fn drain_buffered_schedule_runs(
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
                         max_execution_timeout_ceiling_secs: None,
-                        max_workflow_input_bytes: None,
+                        max_workflow_input_bytes: Some(effective_cap),
                         trace_context: None,
                         workflow_retry_policy: effective_retry,
                         max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
@@ -3907,7 +3959,7 @@ async fn drain_buffered_schedule_runs(
                     concurrency_key,
                     concurrency_limit,
                     priority: Priority::default(),
-                    max_workflow_input_bytes: 0,
+                    max_workflow_input_bytes: effective_cap,
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,

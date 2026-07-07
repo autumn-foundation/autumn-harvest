@@ -24,23 +24,32 @@
 //! - **Independent keys** — distinct keys throttle independently.
 //! - **Operator visibility** — the per-key backlog read returns the counts.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use autumn_harvest::debounce::DebounceStartOptions;
+use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::throttle::{
     AdmitThrottleParams, THROTTLE_FIRE_BATCH_SIZE, ThrottleAdmission, bucket_key,
     fire_due_throttled_starts, reserve_or_defer, throttle_backlog_by_key,
 };
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::{
+    DagCatalog, SchedulerMonitor, StartWorkflowParams, WorkflowContext,
+    start_or_load_workflow_execution, tick_once,
+};
+use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use uuid::Uuid;
 
 // All migrations up through the start-throttle table.
 const INIT_SQL: &str = concat!(
@@ -135,7 +144,7 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
     "\n",
     // issue #607: the start-throttle table under test.
-    include_str!("../../migrations/20260706000000_harvest_start_throttle/up.sql"),
+    include_str!("../../migrations/20260706000001_harvest_start_throttle/up.sql"),
     "\n",
     // issue #606: harvest_task_queue.session_id (worker sessions), merged in from trunk-dev.
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
@@ -1245,5 +1254,348 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
         throttle_row_count(&mut conn, hot_key).await,
         hot_backlog_size,
         "hot_key's backlog is examined (capped) but never fires without a token"
+    );
+}
+
+// ── Scheduler-tick oversized-input cap check (issue #607 code review) ───────
+
+fn noop_scheduler_handler<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+> {
+    Box::pin(async { Ok(serde_json::Value::Null) })
+}
+
+/// A throttled workflow. `max_input_bytes` only raises the registry-wide
+/// floor (`DEFAULT_MAX_WORKFLOW_INPUT_BYTES` = 2 MiB), so a real oversized
+/// test input must exceed that registry default, not this per-workflow value.
+fn make_throttled_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: workflow_name,
+            module: "throttle_tests",
+            handler: noop_scheduler_handler,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: Some(
+                autumn_harvest::throttle::ThrottlePolicy::from_rate_str(
+                    "100/m",
+                    Some(100.0),
+                    None,
+                    None,
+                )
+                .expect("valid rate"),
+            ),
+            max_input_bytes: Some(64),
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ))
+}
+
+fn make_scheduler_pool(url: &str) -> autumn_harvest::worker::DbPool {
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool")
+}
+
+/// Insert a due schedule row (interval:60, overdue by 5s) whose
+/// `workflow_input` is the caller-supplied JSON value.
+async fn insert_schedule_with_input(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    input: serde_json::Value,
+) -> Uuid {
+    use diesel_async::RunQueryDsl;
+    use harvest_schedules::dsl;
+    let now = chrono::Utc::now();
+    let id = Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:60"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(false),
+            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("skip"),
+            dsl::buffered_runs.eq(serde_json::json!([])),
+            dsl::buffer_all_max.eq(0),
+            dsl::skip_policy.eq("skip"),
+            dsl::workflow_input.eq(input),
+        ))
+        .execute(conn)
+        .await
+        .expect("insert schedule");
+    id
+}
+
+async fn schedule_row(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> (
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
+    use diesel_async::RunQueryDsl;
+    use harvest_schedules::dsl;
+    dsl::harvest_schedules
+        .filter(dsl::id.eq(id))
+        .select((dsl::last_run_at, dsl::next_run_at))
+        .first(conn)
+        .await
+        .expect("schedule row")
+}
+
+/// Code-review fix (issue #607): a scheduled fire whose input exceeds the
+/// effective byte cap must not be durably deferred by the throttle -- it
+/// must fail fast (before `reserve_or_defer` ever runs), leaving zero
+/// `harvest_start_throttle` rows and zero new executions, and must NOT
+/// advance `last_run_at`/`next_run_at` so the next tick retries the exact
+/// same slot rather than silently skipping it. Note: `tick_once` itself
+/// still returns `Ok(())` -- one schedule's dispatch failure is isolated
+/// from the rest of the tick by `tick_workflow_schedules`'s own per-schedule
+/// error handling (log + continue), so the fixed behavior is proven by the
+/// per-schedule assertions below, not by the tick's overall return value.
+#[tokio::test]
+async fn scheduler_tick_rejects_oversized_input_before_deferring() {
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "oversized_sched_wf";
+
+    // Per-workflow `max_input_bytes` only *raises* the registry-wide floor
+    // (`DEFAULT_MAX_WORKFLOW_INPUT_BYTES` = 2 MiB, via
+    // `effective_cap = max(per_workflow_cap, registry.max_workflow_input_bytes)`),
+    // so the input must exceed the 2 MiB registry default, not the small
+    // per-workflow cap configured above.
+    let oversized_input = serde_json::json!({ "payload": "x".repeat(3 * 1024 * 1024) });
+    let sched_id = insert_schedule_with_input(&mut conn, wf_name, oversized_input).await;
+    let (last_run_before, next_run_before) = schedule_row(&mut conn, sched_id).await;
+
+    // Drain the throttle bucket to zero tokens first (a throwaway seed call
+    // with burst=1, `ON CONFLICT DO NOTHING` on the bucket row means this
+    // first insert's burst wins), so that WITHOUT this fix the oversized
+    // fire would hit the `Deferred` branch and durably persist a pending
+    // row -- exactly the bug being tested. With a fresh, unconsumed bucket
+    // (the registered policy's burst=100), the oversized fire would instead
+    // reach `Reserved` and fall through to the pre-existing, already-correct
+    // immediate-path cap enforcement, which cannot distinguish this fix from
+    // its absence.
+    reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf_name,
+            throttle_key: "",
+            workflow_id: "seed",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("seed consumes the bucket's sole token");
+    drop(conn);
+
+    let pool = make_scheduler_pool(&url);
+    let registry = make_throttled_registry(wf_name);
+    let dags = Arc::new(DagCatalog::default());
+
+    // `tick_once` isolates one schedule's dispatch failure from the rest of
+    // the tick: `tick_workflow_schedules`'s per-schedule loop catches
+    // `tick_one_workflow_schedule`'s error, logs it, clears the schedule's
+    // fire claim, and continues to the next schedule -- it never propagates
+    // to `tick_once`'s own `Result` (so one misconfigured/oversized schedule
+    // can't halt every other schedule sharing the tick). The real proof that
+    // THIS schedule's dispatch failed-without-advancing lives in the
+    // execution/throttle-row/last_run_at assertions below, not in the tick's
+    // overall return value.
+    let result = tick_once(
+        pool.clone(),
+        registry.clone(),
+        dags.clone(),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "the tick as a whole must still succeed despite one schedule's oversized input: {result:?}"
+    );
+
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&url)
+        .await
+        .expect("reconnect");
+    assert_eq!(
+        throttle_row_count(&mut conn, "").await,
+        0,
+        "no pending throttle row should ever be written for an oversized input"
+    );
+    assert_eq!(
+        execution_count(&mut conn, wf_name).await,
+        0,
+        "no execution should be created for an oversized scheduled input"
+    );
+    let (last_run_after, next_run_after) = schedule_row(&mut conn, sched_id).await;
+    assert_eq!(
+        last_run_after, last_run_before,
+        "last_run_at must not advance on an oversized-input failure"
+    );
+    assert_eq!(
+        next_run_after, next_run_before,
+        "next_run_at must not advance -- the next tick retries the same overdue slot"
+    );
+}
+
+/// Insert a schedule row with a pre-populated `buffered_runs` slot (a single
+/// past fire time), the buffered/backfill drain path's trigger condition
+/// (`jsonb_array_length(buffered_runs) > 0`), whose `workflow_input` is the
+/// caller-supplied JSON value. `next_run_at` is left far in the future so
+/// only the buffered-drain path (not the normal tick path) can dispatch it.
+async fn insert_schedule_with_buffered_slot(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    input: serde_json::Value,
+) -> Uuid {
+    use diesel_async::RunQueryDsl;
+    use harvest_schedules::dsl;
+    let now = chrono::Utc::now();
+    let id = Uuid::new_v4();
+    let buffered_slot = now - chrono::Duration::seconds(30);
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:60"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(false),
+            dsl::next_run_at.eq(now + chrono::Duration::seconds(3600)),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("buffer_all"),
+            dsl::buffered_runs.eq(serde_json::json!([buffered_slot.to_rfc3339()])),
+            dsl::buffer_all_max.eq(10),
+            dsl::skip_policy.eq("skip"),
+            dsl::workflow_input.eq(input),
+        ))
+        .execute(conn)
+        .await
+        .expect("insert schedule");
+    id
+}
+
+async fn schedule_buffered_runs(conn: &mut AsyncPgConnection, id: Uuid) -> Vec<String> {
+    use diesel_async::RunQueryDsl;
+    use harvest_schedules::dsl;
+    let raw: serde_json::Value = dsl::harvest_schedules
+        .filter(dsl::id.eq(id))
+        .select(dsl::buffered_runs)
+        .first(conn)
+        .await
+        .expect("schedule row");
+    raw.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Code-review fix (issue #607, proactive): the buffered/backfill-fire loop
+/// previously enforced **no cap at all** on either its throttle or immediate
+/// path (`None`/`0` are both "no cap" sentinels). A buffered slot whose input
+/// exceeds the effective cap and whose throttle bucket is empty must be
+/// dropped (not durably deferred, not retried forever) -- mirroring the
+/// scheduler-tick fix above, but via this loop's own `break`-and-drop
+/// convention rather than `return Err`.
+#[tokio::test]
+async fn buffered_drain_drops_oversized_slot_before_deferring() {
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "oversized_buffered_wf";
+
+    let oversized_input = serde_json::json!({ "payload": "x".repeat(3 * 1024 * 1024) });
+    let sched_id = insert_schedule_with_buffered_slot(&mut conn, wf_name, oversized_input).await;
+
+    // Drain the throttle bucket first, exactly as in the scheduler-tick test:
+    // without this, a fresh bucket would let the oversized slot reach
+    // `Reserved` and fall through to the pre-existing immediate-path cap
+    // enforcement, making this test unable to distinguish the fix from its
+    // absence.
+    reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf_name,
+            throttle_key: "",
+            workflow_id: "seed",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("seed consumes the bucket's sole token");
+    drop(conn);
+
+    let pool = make_scheduler_pool(&url);
+    let registry = make_throttled_registry(wf_name);
+    let dags = Arc::new(DagCatalog::default());
+
+    let result = tick_once(
+        pool.clone(),
+        registry.clone(),
+        dags.clone(),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "the tick as a whole must still succeed despite one buffered slot's oversized input: {result:?}"
+    );
+
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&url)
+        .await
+        .expect("reconnect");
+    assert_eq!(
+        throttle_row_count(&mut conn, "").await,
+        0,
+        "no pending throttle row should ever be written for an oversized buffered slot"
+    );
+    assert_eq!(
+        execution_count(&mut conn, wf_name).await,
+        0,
+        "no execution should be created for an oversized buffered slot"
+    );
+    let remaining = schedule_buffered_runs(&mut conn, sched_id).await;
+    assert!(
+        remaining.is_empty(),
+        "the oversized slot must be dropped, not left in buffered_runs to retry forever: {remaining:?}"
     );
 }

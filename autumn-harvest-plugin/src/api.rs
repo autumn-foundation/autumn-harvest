@@ -9251,6 +9251,26 @@ async fn batch_start_workflows(
                     });
                     continue;
                 }
+                // Fail fast on an oversized input rather than persisting a
+                // pending row that would fail at fire time on every scanner
+                // tick (code-review fix, issue #607): mirrors the single-start
+                // throttle path's early cap check.
+                if effective_wf_cap > 0 {
+                    let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                    if observed > effective_wf_cap {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: None,
+                            error: Some(format!(
+                                "workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)"
+                            )),
+                        });
+                        continue;
+                    }
+                }
                 let start_options = autumn_harvest::debounce::DebounceStartOptions {
                     reuse_policy: None,
                     execution_timeout_secs: None,
