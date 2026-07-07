@@ -148,7 +148,12 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #605: harvest_completion_deliveries table + completion_callbacks
     // column on harvest_workflow_executions.
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql")
+    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+    "\n",
+    // issue #606: harvest_sessions table + session_id column on
+    // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
+    // harvest_workers.
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

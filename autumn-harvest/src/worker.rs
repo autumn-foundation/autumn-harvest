@@ -3725,14 +3725,15 @@ async fn persist_scheduled_activities(
     // activity-completion races, this is a *fresh* dispatch (the activities
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
-    let (deferred, had_wake_requested) = conn
+    let (deferred, had_wake_requested, synthesized_broken_session_failure) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
                     .await?;
                 detached_spawns.persist(conn, commands).await?;
+                let mut activity_task_ids = Vec::with_capacity(enqueued.len());
                 for params in &enqueued {
-                    queue::enqueue(conn, params).await?;
+                    activity_task_ids.push(queue::enqueue(conn, params).await?);
                 }
                 let mut race_next_event_id = next_event_id.saturating_add(events_len);
                 let deferred = apply_race_loser_cancellations(
@@ -3743,8 +3744,85 @@ async fn persist_scheduled_activities(
                     registry,
                 )
                 .await?;
+
+                // Worker sessions (issue #606): a member activity's session
+                // may have already left ACTIVE (the broken-session scanner
+                // reclaimed it) in the gap between the workflow's previous
+                // session activity call and this one -- the scanner only
+                // ever revisits `state = 'ACTIVE'` rows, so a freshly
+                // hard-pinned task enqueued here for an already-broken
+                // session would otherwise sit PENDING against a dead or
+                // draining host forever, with no future recovery path.
+                // Immediately fail any such task with the same
+                // ActivityFailed{SessionBroken} shape
+                // `break_session_and_fail_members` uses for in-flight
+                // tasks, so the workflow observes SessionBroken on its next
+                // decision cycle instead of hanging.
+                let session_ids: std::collections::HashSet<uuid::Uuid> = scheduled_activities
+                    .iter()
+                    .filter_map(|s| s.session_id.map(|id| id.as_uuid()))
+                    .collect();
+                let mut synthesized_broken_session_failure = false;
+                if !session_ids.is_empty() {
+                    use crate::schema::harvest_sessions::dsl as sess_dsl;
+                    let broken: std::collections::HashMap<uuid::Uuid, String> =
+                        sess_dsl::harvest_sessions
+                            .filter(sess_dsl::id.eq_any(&session_ids))
+                            .filter(sess_dsl::state.ne("ACTIVE"))
+                            .select((sess_dsl::id, sess_dsl::broken_reason))
+                            .load::<(uuid::Uuid, Option<String>)>(conn)
+                            .await
+                            .map_err(crate::error::database_error)?
+                            .into_iter()
+                            .map(|(id, reason)| {
+                                (
+                                    id,
+                                    reason.unwrap_or_else(|| {
+                                        "session is no longer ACTIVE".to_string()
+                                    }),
+                                )
+                            })
+                            .collect();
+
+                    if !broken.is_empty() {
+                        for (scheduled, activity_task_id) in
+                            scheduled_activities.iter().zip(activity_task_ids.iter())
+                        {
+                            let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid())
+                            else {
+                                continue;
+                            };
+                            let Some(reason) = broken.get(&session_uuid) else {
+                                continue;
+                            };
+                            let failed_event = WorkflowEvent::ActivityFailed {
+                                activity_id: scheduled.activity_id,
+                                error: reason.clone(),
+                                attempt: 1,
+                                error_type: crate::failure::ERROR_TYPE_SESSION_BROKEN.to_string(),
+                                non_retryable: true,
+                                details: None,
+                            };
+                            store::append_events(
+                                conn,
+                                exec_id,
+                                &[failed_event],
+                                race_next_event_id,
+                            )
+                            .await?;
+                            race_next_event_id = race_next_event_id.saturating_add(1);
+                            queue::fail_task(conn, *activity_task_id, reason).await?;
+                            synthesized_broken_session_failure = true;
+                        }
+                    }
+                }
+
                 let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
-                Ok((deferred, had_wake_requested))
+                Ok((
+                    deferred,
+                    had_wake_requested,
+                    synthesized_broken_session_failure,
+                ))
             }
             .scope_boxed()
         })
@@ -3754,7 +3832,12 @@ async fn persist_scheduled_activities(
         start.spawn();
     }
 
-    if had_wake_requested {
+    // The synthesized SessionBroken failure(s) above are not tied to any
+    // external wake source (they were resolved entirely within this
+    // transaction), so the workflow must be woken unconditionally to
+    // observe them on its next decision cycle -- `had_wake_requested` alone
+    // would miss this case.
+    if had_wake_requested || synthesized_broken_session_failure {
         queue::wake_workflow_task(conn, exec_id).await?;
     }
 
