@@ -634,7 +634,32 @@ async fn resolve_broken_reason(
             )
         }
     };
-    let expired = lease_expired(chrono::Utc::now(), session.expires_at);
+    let lease_expired_naive = lease_expired(chrono::Utc::now(), session.expires_at);
+
+    // A naive lease-expiry check alone would misclassify a healthy pipeline
+    // whose member activity legitimately runs longer than
+    // `SESSION_MEMBER_STICKY_TIMEOUT` (24h) as broken, since the lease is
+    // currently only refreshed on member *completion*
+    // (`refresh_session_lease`, called from `finalize_activity_completion`),
+    // never while a member is still executing. A currently-`RUNNING` member
+    // task is independent proof the pipeline is still making real progress,
+    // so only report `LeaseExpired` when no member task is in flight --
+    // this never masks a genuinely dead/draining host, since that check
+    // takes priority in `broken_session_reason` regardless of this flag.
+    let expired = if lease_expired_naive {
+        use crate::schema::harvest_task_queue::dsl as q;
+        let has_running_member: bool = diesel::select(diesel::dsl::exists(
+            q::harvest_task_queue
+                .filter(q::session_id.eq(Some(session.id)))
+                .filter(q::state.eq("RUNNING")),
+        ))
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        !has_running_member
+    } else {
+        false
+    };
 
     Ok(broken_session_reason(
         host_heartbeat_stale,
