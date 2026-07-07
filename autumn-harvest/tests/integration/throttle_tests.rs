@@ -746,3 +746,112 @@ async fn backlog_read_returns_per_key_counts() {
         4
     );
 }
+
+/// A retry of a request whose start is already durably deferred (e.g. a client
+/// timing out before it saw the first `202` and retrying) must not create a
+/// second independent pending row for the same `workflow_id` — it should land on
+/// the *same* queued admission (code-review fix, issue #607).
+#[tokio::test]
+async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key = "acme";
+    let wf_id = "retry-job";
+
+    // Empty the bucket so both the original request and its retry defer.
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            "seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed consumes the burst token");
+
+    let first = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({ "n": 1 }),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("first admission defers");
+    let first_outcome = match first {
+        ThrottleAdmission::Deferred(o) => o,
+        ThrottleAdmission::Reserved { .. } => panic!("expected Deferred"),
+    };
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+
+    // The client retries the identical request (same workflow_id) before ever
+    // observing the first response.
+    let retry = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({ "n": 1 }),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("retry admission defers");
+    let retry_outcome = match retry {
+        ThrottleAdmission::Deferred(o) => o,
+        ThrottleAdmission::Reserved { .. } => panic!("expected Deferred"),
+    };
+
+    // No second row was inserted.
+    assert_eq!(
+        throttle_row_count(&mut conn, key).await,
+        1,
+        "retry must not insert a second pending row for the same workflow_id"
+    );
+    assert_eq!(retry_outcome.workflow_id, first_outcome.workflow_id);
+
+    // The retry observed the ORIGINAL row's deferred_at (not a fresh insert): a
+    // third identical call must return the exact same DB-round-tripped
+    // timestamp as the retry did (both go through the idempotency lookup, so
+    // comparing them avoids an in-memory-vs-Postgres timestamp precision
+    // mismatch against `first_outcome`, whose `deferred_at` was captured
+    // client-side with nanosecond precision before Postgres's microsecond
+    // truncation on insert).
+    let third = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({ "n": 1 }),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("third admission also defers to the same row");
+    let third_outcome = match third {
+        ThrottleAdmission::Deferred(o) => o,
+        ThrottleAdmission::Reserved { .. } => panic!("expected Deferred"),
+    };
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+    assert_eq!(third_outcome.deferred_at, retry_outcome.deferred_at);
+}

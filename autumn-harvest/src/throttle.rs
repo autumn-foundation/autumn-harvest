@@ -55,6 +55,45 @@
 //! Throttling is a **pre-start admission gate** that runs *before*
 //! `WorkflowStarted` is appended. It introduces **no new `WorkflowEvent`
 //! variant** and has zero effect on replay determinism of started runs.
+//!
+//! # Known gaps — call-site duplication and ungated producers
+//!
+//! `reserve_or_defer` is invoked independently from **four** call sites (the
+//! HTTP start route and the batch-start handler in `autumn-harvest-plugin`'s
+//! `api.rs`, plus the scheduler-tick and scheduler-buffered/backfill-fire loops
+//! in `scheduler.rs`) rather than from one central choke point. This mirrors —
+//! and does not fix — the same duplication shape the admission-gate feature
+//! (#377, see `admission_gate.rs`'s own "Known gaps" section) already has. A
+//! consolidated design would thread throttle admission into
+//! `execution::start_or_load_workflow_execution_collect` itself so every
+//! current *and future* producer gets it for free; that refactor was judged
+//! out of proportion for this feature (it touches code every producer
+//! depends on) and is left as a follow-up. Until then, the following
+//! producers of workflow starts do **not** consult a workflow's
+//! [`ThrottlePolicy`] at all:
+//!
+//! * **`signal_with_start_workflow_execution` / `update_with_start_workflow_execution`**
+//!   (`execution.rs`): an entity-workflow pattern fed by signals/updates can
+//!   generate exactly the same kind of start burst an HTTP `POST .../start`
+//!   caller can, with zero pacing.
+//! * **Completion-trigger continuations** (`completion_trigger.rs`): a
+//!   terminal-state trigger that starts a follow-up workflow bypasses the
+//!   throttle the same way it bypasses the admission gate (#377's own gap).
+//! * **The outbox relay** (`autumn-harvest-plugin`'s `outbox.rs`): replays
+//!   workflow-start events durably queued before a bucket was ever consulted.
+//!
+//! A workflow author relying on `#[workflow(throttle(...))]` to bound a
+//! rate-limited downstream should confirm none of these paths can also start
+//! that workflow, or the effective admitted rate can exceed the declared one.
+//!
+//! Separately, the scanner (`fire_due_on_conn`/`fire_claimed_throttle_row`/
+//! `fire_due_throttled_starts`) is a near-total structural copy of
+//! `debounce.rs`'s equivalent (`fire_due_on_conn`/`fire_claimed_debounce_row`/
+//! `fire_due_debounced_starts`) rather than a shared generic scanner — a bug
+//! fix to the shared shape (the `to_regclass` missing-table tolerance, the
+//! `FOR UPDATE SKIP LOCKED` claim-batch transaction structure, or the
+//! spawn-after-commit pattern for deferred trigger-starts) must currently be
+//! applied in both places.
 
 use std::time::Duration;
 
@@ -350,6 +389,48 @@ async fn pending_backlog_exists(
     Ok(row.present)
 }
 
+/// Look up an already-pending row for this exact `(workflow_name, workflow_id)`,
+/// regardless of which bucket/key it was filed under.
+///
+/// `workflow_id` is the natural idempotency boundary the rest of the engine
+/// already keys on (reuse policies, uniqueness indexes); reusing it here makes a
+/// retried admission for a start that is already durably deferred land on the
+/// *same* pending row instead of silently queuing a second, independent one
+/// that a later `reject_duplicate` fire would drop with no signal back to the
+/// original (retried) caller.
+#[cfg(feature = "db")]
+async fn existing_pending_throttle_for_workflow_id(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> crate::error::HarvestResult<Option<ThrottleDeferOutcome>> {
+    use diesel::OptionalExtension;
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        throttle_key: String,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        deferred_at: DateTime<Utc>,
+    }
+    let row: Option<Row> = diesel::sql_query(
+        "SELECT throttle_key, deferred_at FROM harvest_start_throttle \
+         WHERE workflow_name = $1 AND workflow_id = $2 \
+         ORDER BY deferred_at ASC LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .bind::<diesel::sql_types::Text, _>(workflow_id)
+    .get_result(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+    Ok(row.map(|r| ThrottleDeferOutcome {
+        workflow_id: workflow_id.to_string(),
+        throttle_key: r.throttle_key,
+        deferred_at: r.deferred_at,
+    }))
+}
+
 /// Insert one durable pending-start row (defer branch).
 #[cfg(feature = "db")]
 async fn insert_pending_throttle_row(
@@ -396,8 +477,12 @@ async fn insert_pending_throttle_row(
 ///    ([`crate::queue::try_consume_rate_limit_token`]):
 ///    - success → [`ThrottleAdmission::Reserved`] (caller proceeds to start;
 ///      refunds on an id-reuse short-circuit);
-///    - failure (empty bucket) → insert a pending row and return
-///      [`ThrottleAdmission::Deferred`].
+///    - failure (empty bucket) → fall through to the defer step below.
+/// 3. **Defer, idempotently:** if a pending row already exists for this exact
+///    `workflow_id` (a retried admission for a start that is already durably
+///    queued), return *that* row's outcome rather than inserting a second one.
+///    Otherwise insert a fresh pending row and return
+///    [`ThrottleAdmission::Deferred`].
 ///
 /// Shard-local: every operation runs on the passed connection's shard.
 ///
@@ -428,6 +513,18 @@ pub async fn reserve_or_defer(
         if crate::queue::try_consume_rate_limit_token(conn, &key).await? {
             return Ok(ThrottleAdmission::Reserved { bucket_key: key });
         }
+    }
+
+    // Idempotency: a retry of a request whose start is already durably deferred
+    // (e.g. after a client-side timeout that never saw the first 202) must land
+    // on the *same* pending row rather than queue a second one for the same
+    // workflow_id — a second row can later be silently dropped by a
+    // reject_duplicate fire with no way for the retried caller to learn that.
+    if let Some(existing) =
+        existing_pending_throttle_for_workflow_id(conn, params.workflow_name, params.workflow_id)
+            .await?
+    {
+        return Ok(ThrottleAdmission::Deferred(existing));
     }
 
     // Defer: durably persist the start before any WorkflowStarted event exists.
@@ -528,8 +625,25 @@ async fn fire_claimed_throttle_row(
         return Ok(None);
     }
 
-    let opts: crate::debounce::DebounceStartOptions =
-        serde_json::from_value(row.start_options).unwrap_or_default();
+    // A deserialize failure here (e.g. a schema mismatch across a rolling deploy,
+    // or a corrupted row) must never crash the scanner — but silently falling
+    // back to defaults would also silently drop this row's schedule_id/
+    // scheduled_for/origin (breaking #488 carryover / #534 run-history
+    // attribution) and every other persisted option with zero signal. Log it so
+    // the loss is observable instead of invisible.
+    let opts: crate::debounce::DebounceStartOptions = serde_json::from_value(row.start_options)
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                workflow_name = %row.workflow_name,
+                throttle_key = %row.throttle_key,
+                workflow_id = %row.workflow_id,
+                error = %e,
+                "failed to deserialize persisted throttle start_options; falling back to \
+                 defaults (schedule attribution, memo, retry policy, and other options for \
+                 this fire will be lost)",
+            );
+            crate::debounce::DebounceStartOptions::default()
+        });
 
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);
@@ -537,7 +651,7 @@ async fn fire_claimed_throttle_row(
     let reuse_policy = opts
         .reuse_policy
         .as_deref()
-        .and_then(parse_reuse_policy)
+        .and_then(crate::debounce::parse_reuse_policy)
         .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
     let execution_timeout = opts
         .execution_timeout_secs
@@ -779,20 +893,6 @@ pub async fn fire_due_throttled_starts(
     }
 
     Ok(fired_count)
-}
-
-#[cfg(feature = "db")]
-fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReusePolicy> {
-    use crate::types::WorkflowIdReusePolicy::{
-        AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
-    };
-    match s {
-        "allow_duplicate" => Some(AllowDuplicate),
-        "reject_duplicate" => Some(RejectDuplicate),
-        "allow_duplicate_failed_only" => Some(AllowDuplicateFailedOnly),
-        "terminate_if_running" => Some(TerminateIfRunning),
-        _ => None,
-    }
 }
 
 /// List all pending throttle records on this shard (management API).

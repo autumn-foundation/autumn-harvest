@@ -815,8 +815,12 @@ async fn fire_claimed_debounce_row(
     }
 }
 
+/// Parse a persisted reuse-policy string back into its typed form.
+///
+/// Shared with `throttle.rs`, which persists the same string representation in
+/// its own deferred-start options blob (`DebounceStartOptions.reuse_policy`).
 #[cfg(feature = "db")]
-fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReusePolicy> {
+pub(crate) fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReusePolicy> {
     use crate::types::WorkflowIdReusePolicy::{
         AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
     };

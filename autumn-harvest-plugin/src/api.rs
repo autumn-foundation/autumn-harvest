@@ -9214,6 +9214,24 @@ async fn batch_start_workflows(
                 && let Some((throttle_policy, resolved_throttle_key)) =
                     workflow_resolving_throttle(&runtime.registry, &item.workflow_name, &input)
             {
+                // Mutual exclusion mirrors the single-start endpoint (issue #607):
+                // debounce collapses a burst into one run, throttle paces and
+                // defers every start — combining them has no coherent semantics.
+                // Reject the item explicitly rather than silently reserving (and
+                // then wasting) a throttle token that the debounce gate would
+                // reject the fresh start under anyway.
+                if workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input) {
+                    rejected_count += 1;
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(
+                            "start throttle is mutually exclusive with debounce".to_string(),
+                        ),
+                    });
+                    continue;
+                }
                 let start_options = autumn_harvest::debounce::DebounceStartOptions {
                     reuse_policy: None,
                     execution_timeout_secs: None,

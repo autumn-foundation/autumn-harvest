@@ -227,6 +227,21 @@ fn throttled_info(rate: &str, burst: f64) -> WorkflowInfo {
     }
 }
 
+/// A workflow with BOTH a throttle policy and a debounce policy configured
+/// (code-review fix, issue #607): the batch-start endpoint must reject items
+/// for this workflow with a clear mutual-exclusion error instead of silently
+/// wasting a reserved throttle token on a debounce rejection.
+fn throttled_and_debounced_info(rate: &str, burst: f64) -> WorkflowInfo {
+    let mut info = throttled_info(rate, burst);
+    info.name = "conflicting_policies";
+    info.debounce = Some(autumn_harvest::debounce::DebouncePolicy {
+        key_expr: "input.tenant_id",
+        window: std::time::Duration::from_secs(30),
+        max_wait: None,
+    });
+    info
+}
+
 fn build_app(pool: &DbPool, info: WorkflowInfo) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -382,5 +397,51 @@ async fn distinct_tenants_throttle_independently_over_http() {
         s3,
         StatusCode::CREATED,
         "a different tenant is unaffected by acme's bucket: {b3:?}"
+    );
+}
+
+/// A workflow with both a resolving throttle and a resolving debounce policy
+/// must be rejected per-item over the batch-start route with a clear
+/// mutual-exclusion error — not silently mishandled (reserving, then wasting, a
+/// throttle token on a debounce rejection). Code-review fix, issue #607.
+#[tokio::test]
+async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policies() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_and_debounced_info("100/m", 5.0));
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "conflicting_policies",
+                    "workflow_id": "job-1",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "best-effort batch: {body:?}");
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["status"], json!("rejected"));
+    assert_eq!(
+        results[0]["error"],
+        json!("start throttle is mutually exclusive with debounce")
+    );
+    // No throttle token was wasted: the bucket for this key is untouched (the
+    // guard fires before reserve_or_defer is ever called), so no pending row
+    // should exist either.
+    let (backlog_status, backlog) = get_json(&app, "/admin/start-throttle").await;
+    assert_eq!(backlog_status, StatusCode::OK);
+    assert_eq!(
+        backlog.as_array().map(Vec::len),
+        Some(0),
+        "no pending throttle row should be created for a rejected item: {backlog:?}"
     );
 }
