@@ -78,9 +78,10 @@ use autumn_web::session::Session;
 
 use crate::api::{
     HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
-    audit_decoded_read, db_conn_for_execution, db_conn_for_shard, decode_workflow_execution_fields,
-    load_execution, load_workflows, load_workflows_from_shards, map_error, parse_execution_id,
-    read_path_decoder, require_harvest_admin,
+    audit_decoded_read, db_conn_for_execution, db_conn_for_shard, decode_error_field,
+    decode_workflow_execution_fields, extension_session, load_execution, load_workflows,
+    load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
+    require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -1076,7 +1077,7 @@ async fn workflow_detail_ui(
         decode_and_audit_workflow_detail(
             &api_state,
             &headers,
-            maybe_session.map(|Extension(session)| session),
+            extension_session(maybe_session),
             exec_id,
             &mut execution,
             &mut event_copies,
@@ -1119,7 +1120,7 @@ async fn decode_and_audit_workflow_detail(
     let Some(codecs) = read_path_decoder(api_state, session).await else {
         return;
     };
-    let mut outcome = decode_workflow_execution_fields(execution, Some(&codecs));
+    let mut outcome = decode_workflow_execution_fields(execution, &codecs);
     for event in events.iter_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
     }
@@ -1745,8 +1746,7 @@ async fn list_dead_letters_ui(
 ) -> Result<Markup, AutumnError> {
     // Read-path payload decoding (issue #608): the page is admin-gated, so an
     // arriving request passes the same predicate the decoder re-checks.
-    let decoder =
-        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     let limit = params
         .limit
         .unwrap_or(DEFAULT_DLQ_PAGE_SIZE)
@@ -1811,12 +1811,7 @@ async fn list_dead_letters_ui(
         let mut outcome = LossyDecodeOutcome::default();
         for row in &mut page_rows {
             outcome = outcome.merged(codecs.decode_value_lossy(&mut row.dead_letter.input));
-            let (rewritten, error_outcome) =
-                codecs.decode_error_string_lossy(&row.dead_letter.error);
-            if let Some(rewritten) = rewritten {
-                row.dead_letter.error = rewritten;
-            }
-            outcome = outcome.merged(error_outcome);
+            outcome = outcome.merged(decode_error_field(codecs, &mut row.dead_letter.error));
             for event in &mut row.events {
                 outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
             }

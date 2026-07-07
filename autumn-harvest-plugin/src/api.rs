@@ -3313,6 +3313,17 @@ pub(crate) async fn read_path_decoder(
     Some(api_state.payload_codecs())
 }
 
+/// Unwrap the optional `Session` extension extractor that handlers feed into
+/// [`read_path_decoder`]. An absent extension (no session middleware
+/// installed) resolves to `None`, which the admin predicate treats as
+/// non-admin — never an error.
+// A named fn (not an inline `.map`) so the nine call sites share one place
+// documenting the absent-extension semantics.
+#[allow(clippy::single_option_map)]
+pub(crate) fn extension_session(maybe_session: Option<Extension<Session>>) -> Option<Session> {
+    maybe_session.map(|Extension(session)| session)
+}
+
 /// Best-effort: writes one [`OP_PAYLOAD_DECODE_READ`] audit row when
 /// `outcome.touched()` — i.e. when this request actually decoded or marked at
 /// least one codec envelope (issue #608, AC8). Never fails the read; never
@@ -3377,18 +3388,26 @@ pub(crate) fn sse_frame_data(
     )
 }
 
+/// Tolerantly decode a TEXT `error` field copy in place (issue #608):
+/// rewritten only when the stored string is exactly a serialized codec
+/// envelope ([`PayloadCodecs::decode_error_string_lossy`]); plain error text
+/// and non-envelope JSON stay byte-identical.
+pub(crate) fn decode_error_field(codecs: &PayloadCodecs, error: &mut String) -> LossyDecodeOutcome {
+    let (rewritten, outcome) = codecs.decode_error_string_lossy(error);
+    if let Some(rewritten) = rewritten {
+        *error = rewritten;
+    }
+    outcome
+}
+
 /// Tolerantly decode the payload-bearing fields of a workflow execution row
 /// copy for an admin read response (issue #608). JSONB columns walk through
 /// [`PayloadCodecs::decode_value_lossy`]; the TEXT `error` column goes
-/// through [`PayloadCodecs::decode_error_string_lossy`]. Returns the merged
-/// outcome; a `None` decoder is a no-op.
+/// through [`decode_error_field`]. Returns the merged outcome.
 pub(crate) fn decode_workflow_execution_fields(
     execution: &mut WorkflowExecution,
-    decoder: Option<&PayloadCodecs>,
+    codecs: &PayloadCodecs,
 ) -> LossyDecodeOutcome {
-    let Some(codecs) = decoder else {
-        return LossyDecodeOutcome::default();
-    };
     let mut outcome = codecs.decode_value_lossy(&mut execution.input);
     if let Some(output) = execution.output.as_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(output));
@@ -3399,12 +3418,8 @@ pub(crate) fn decode_workflow_execution_fields(
     if let Some(search_attrs) = execution.search_attrs.as_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(search_attrs));
     }
-    if let Some(error) = execution.error.as_deref() {
-        let (rewritten, error_outcome) = codecs.decode_error_string_lossy(error);
-        if let Some(rewritten) = rewritten {
-            execution.error = Some(rewritten);
-        }
-        outcome = outcome.merged(error_outcome);
+    if let Some(error) = execution.error.as_mut() {
+        outcome = outcome.merged(decode_error_field(codecs, error));
     }
     outcome
 }
@@ -5739,8 +5754,7 @@ async fn export_workflow_history(
             // so Redacted exports skip the decoder (and the audit) entirely.
             if query.payload_policy == HistoryPayloadPolicy::Full
                 && let Some(codecs) =
-                    read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session))
-                        .await
+                    read_path_decoder(&api_state, extension_session(maybe_session)).await
             {
                 let mut outcome = LossyDecodeOutcome::default();
                 for event in &mut document.events {
@@ -5780,8 +5794,7 @@ async fn export_workflow_histories(
             // audit row per request, accumulated across every export entry.
             if query.payload_policy == HistoryPayloadPolicy::Full
                 && let Some(codecs) =
-                    read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session))
-                        .await
+                    read_path_decoder(&api_state, extension_session(maybe_session)).await
             {
                 let mut outcome = LossyDecodeOutcome::default();
                 for export in &mut response.exports {
@@ -5814,8 +5827,7 @@ async fn get_workflow(
 ) -> Result<Json<WorkflowDetailsResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     // Read-path payload decoding (issue #608): decode-only-when-admin.
-    let decoder =
-        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
@@ -5884,19 +5896,15 @@ async fn get_workflow(
     if let Some(codecs) = decoder.as_ref() {
         // Decode the response copies only — stored rows are never touched
         // (issue #608). One audit row per request that touched ≥1 envelope.
-        let mut outcome = decode_workflow_execution_fields(&mut execution, decoder.as_ref());
+        let mut outcome = decode_workflow_execution_fields(&mut execution, codecs);
         for event in &mut events {
             outcome = outcome.merged(codecs.decode_value_lossy(event));
         }
         if let Some(carryover) = last_completion_result.as_mut() {
             outcome = outcome.merged(codecs.decode_value_lossy(carryover));
         }
-        if let Some(error) = last_error.as_deref() {
-            let (rewritten, error_outcome) = codecs.decode_error_string_lossy(error);
-            if let Some(rewritten) = rewritten {
-                last_error = Some(rewritten);
-            }
-            outcome = outcome.merged(error_outcome);
+        if let Some(error) = last_error.as_mut() {
+            outcome = outcome.merged(decode_error_field(codecs, error));
         }
         let target = exec_id.to_string();
         audit_decoded_read(
@@ -6015,8 +6023,7 @@ async fn get_workflow_history(
     let exec_id = parse_execution_id(&id)?;
     let (limit, after_id, event_types) = parse_workflow_history_query(&pairs)?;
     // Read-path payload decoding (issue #608): decode-only-when-admin.
-    let decoder =
-        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
 
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
@@ -6118,8 +6125,7 @@ async fn get_workflow_result(
         Err(error) => return error.into_response(),
     };
     // Read-path payload decoding (issue #608): decode-only-when-admin.
-    let decoder =
-        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     if wait.is_zero() {
         // Storage-only path: no listener/LISTEN-NOTIFY required.
         return match workflow_result_snapshot_following_can(&api_state, exec_id).await {
@@ -6347,17 +6353,13 @@ async fn respond_with_workflow_result(
     mut result: WorkflowResult,
     decoder: Option<&PayloadCodecs>,
 ) -> axum::response::Response {
-    let mut outcome = LossyDecodeOutcome::default();
     if let Some(codecs) = decoder {
+        let mut outcome = LossyDecodeOutcome::default();
         if let Some(output) = result.output.as_mut() {
             outcome = outcome.merged(codecs.decode_value_lossy(output));
         }
-        if let Some(error) = result.error.as_deref() {
-            let (rewritten, error_outcome) = codecs.decode_error_string_lossy(error);
-            if let Some(rewritten) = rewritten {
-                result.error = Some(rewritten);
-            }
-            outcome = outcome.merged(error_outcome);
+        if let Some(error) = result.error.as_mut() {
+            outcome = outcome.merged(decode_error_field(codecs, error));
         }
         let target = exec_id.to_string();
         audit_decoded_read(
@@ -7013,8 +7015,7 @@ async fn get_workflow_stack(
 ) -> Result<Json<WorkflowStackResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     // Read-path payload decoding (issue #608): decode-only-when-admin.
-    let decoder =
-        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     let exec_uuid = exec_id.as_uuid();
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
@@ -16448,8 +16449,7 @@ async fn list_dead_letters(
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     // Read-path payload decoding (issue #608): the route is admin-gated, so
     // an arriving request passes the same predicate the decoder re-checks.
-    let decoder =
-        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     let mut dead_letters =
         load_dead_letters_from_shards(&api_state, limit, query.owner.as_deref()).await?;
     if let Some(codecs) = decoder.as_ref() {
@@ -16458,11 +16458,7 @@ async fn list_dead_letters(
         let mut outcome = LossyDecodeOutcome::default();
         for dl in &mut dead_letters {
             outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
-            let (rewritten, error_outcome) = codecs.decode_error_string_lossy(&dl.error);
-            if let Some(rewritten) = rewritten {
-                dl.error = rewritten;
-            }
-            outcome = outcome.merged(error_outcome);
+            outcome = outcome.merged(decode_error_field(codecs, &mut dl.error));
         }
         audit_decoded_read(
             &api_state,
