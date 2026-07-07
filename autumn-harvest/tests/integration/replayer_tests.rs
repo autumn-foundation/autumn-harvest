@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::context::{SessionOptions, WorkflowContext};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
@@ -142,6 +142,30 @@ fn current_details_workflow<'a>(
     })
 }
 
+/// Worker-session pipeline (issue #606): open a session, run one member
+/// activity through it, then release. Proves AC6 -- session identity comes
+/// from the deterministic `session:{seq}` marker and the physical host
+/// worker binding comes from the acquire activity's recorded output, so
+/// replay succeeds identically regardless of which (if any) worker is
+/// available, and regardless of which worker actually hosted the session.
+fn session_pipeline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .map_err(|e| e.to_string())?;
+        let transcoded = session
+            .execute_activity_raw("transcode_chunk", Value::Null, "gpu-workers")
+            .await
+            .map_err(|e| e.to_string())?;
+        session.complete().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"transcoded": transcoded}))
+    })
+}
+
 /// Workflow that starts a timer before any activities.
 fn timer_first_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -269,6 +293,66 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("timer_first_workflow", timer_first_workflow)
         .register_fn("jitter_timer_workflow", jitter_timer_workflow)
         .register_fn("current_details_workflow", current_details_workflow)
+        .register_fn("session_pipeline_workflow", session_pipeline_workflow)
+}
+
+/// History for `session_pipeline_workflow`, parameterized by the recorded
+/// host worker id -- so the same shape can be replayed twice with two
+/// different hosts to prove AC6's "regardless of which worker" claim.
+fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let session_uuid = uuid::Uuid::new_v4();
+    let acquire_id = ActivityExecId::new();
+    let member_id = ActivityExecId::new();
+    let release_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "session:1".into(),
+            details: serde_json::json!(session_uuid.to_string()),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: acquire_id,
+            name: "__harvest_session_acquire".into(),
+            input: serde_json::json!(session_uuid.to_string()),
+            queue: "gpu-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: acquire_id,
+            output: serde_json::json!(host_worker_id),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: member_id,
+            name: "transcode_chunk".into(),
+            input: Value::Null,
+            queue: "gpu-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: member_id,
+            output: serde_json::json!("transcoded"),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: "__harvest_session_release".into(),
+            // `Session::complete()` dispatches the release activity with the
+            // session id (as a string) for input -- the worker-side handler
+            // parses it back out to know which `harvest_sessions` row to
+            // mark COMPLETED.
+            input: serde_json::json!(session_uuid.to_string()),
+            queue: "gpu-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: Value::Null,
+        },
+    ];
+    (exec_id, events)
 }
 
 /// Build a snapshot from a `(exec_id, events)` pair with a given workflow name.
@@ -328,6 +412,59 @@ async fn replay_workflow_with_current_details_calls_succeeds() {
         report.events_replayed > 0,
         "events_replayed must be positive"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (a3) Worker sessions replay with 100% fidelity regardless of which worker
+//      is available at replay time (issue #606 AC6 -- the headline claim:
+//      no new WorkflowEvent variant, session identity via MarkerRecorded,
+//      physical worker binding via the acquire activity's recorded output).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn replay_session_pipeline_workflow_succeeds() {
+    let (exec_id, events) = session_pipeline_history("worker-host-A");
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("session_pipeline_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a workflow using ctx.create_session()/Session must replay with 100% \
+         fidelity, got: {report}"
+    );
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
+}
+
+#[tokio::test]
+async fn replay_session_pipeline_workflow_succeeds_regardless_of_recorded_host_worker() {
+    // Same fixture shape, a *different* recorded host worker id -- proving
+    // replay is worker-independent: the session's physical binding is
+    // recovered purely from the acquire activity's recorded output, with no
+    // engine-level knowledge of which worker is live (or exists at all) at
+    // replay time.
+    let replayer = build_replayer();
+
+    for host in [
+        "worker-host-A",
+        "worker-host-B",
+        "a-totally-different-worker",
+    ] {
+        let (exec_id, events) = session_pipeline_history(host);
+        let report = replayer
+            .replay_from_snapshot(make_snapshot("session_pipeline_workflow", exec_id, events))
+            .await;
+
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "replay must succeed identically for recorded host '{host}', got: {report}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

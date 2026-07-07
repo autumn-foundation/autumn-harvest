@@ -130,6 +130,7 @@ async fn register_active_worker_with_build(
         build_id,
         Some("test-deploy"),
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .expect("worker registration should succeed");
@@ -1063,6 +1064,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1082,6 +1084,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             "v1",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -1213,6 +1216,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1232,6 +1236,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1305,6 +1310,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1324,6 +1330,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1365,6 +1372,7 @@ async fn test_worker_heartbeat_updates_labels() {
             "v1",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -1377,7 +1385,7 @@ async fn test_worker_heartbeat_updates_labels() {
 
     {
         let mut conn = pool.get().await.unwrap();
-        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json)
+        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json, 0)
             .await
             .unwrap();
         assert_eq!(affected, 1);

@@ -155,6 +155,13 @@ pub struct EnqueueParams {
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     pub context_headers: Option<serde_json::Value>,
+    /// Worker session this activity belongs to (issue #606). When `Some`,
+    /// combined with [`Self::sticky_worker_id`] the claim query **hard-pins**
+    /// this row to that worker -- unlike ordinary sticky routing, it never
+    /// fails over to a different worker even after the sticky lease expires,
+    /// since the session's local state only exists on that one worker.
+    /// `None` for an ordinary (non-session) activity.
+    pub session_id: Option<Uuid>,
 }
 
 impl EnqueueParams {
@@ -191,6 +198,7 @@ impl EnqueueParams {
             schedule_to_close_at: None,
             required_capabilities: None,
             context_headers: None,
+            session_id: None,
         }
     }
 
@@ -212,6 +220,16 @@ impl EnqueueParams {
     pub fn with_sticky(mut self, worker_id: impl Into<String>, timeout: StdDuration) -> Self {
         self.sticky_worker_id = Some(worker_id.into());
         self.sticky_timeout = Some(timeout);
+        self
+    }
+
+    /// Mark this task as belonging to worker session `session_id` (issue
+    /// #606). Combine with [`Self::with_sticky`] to hard-pin the row to the
+    /// session's host worker -- `claim_task`'s session gate ignores
+    /// `sticky_until` entirely for a session-tagged row.
+    #[must_use]
+    pub const fn with_session_id(mut self, session_id: Uuid) -> Self {
+        self.session_id = Some(session_id);
         self
     }
 
@@ -288,6 +306,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         schedule_to_close_at: params.schedule_to_close_at,
         required_capabilities: params.required_capabilities.clone(),
         context_headers: params.context_headers.clone(),
+        session_id: params.session_id,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -406,6 +425,15 @@ pub async fn claim_task(
     // deliveries, and activity-completion wakes uniformly while paused — no
     // workflow-author cooperation required. In-flight activity tasks are not
     // `task_type = 'workflow'` and so continue to run to completion.
+    //
+    // Worker-session hard pin (issue #606): a row with a non-NULL `session_id`
+    // is claimable *only* by its `sticky_worker_id` -- unlike the ordinary
+    // sticky gate above, this condition ignores `sticky_until` entirely, so a
+    // session member activity never fails over to a different worker even
+    // after the (purely bookkeeping) sticky lease expires. The session's
+    // local state (a downloaded file, GPU memory, ...) only exists on the
+    // host worker, so failover would silently produce wrong results rather
+    // than a safe-but-slow retry.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
@@ -428,6 +456,10 @@ pub async fn claim_task(
                    OR sticky_worker_id = $1 \
                    OR sticky_until IS NULL \
                    OR sticky_until <= NOW() \
+               ) \
+               AND ( \
+                   session_id IS NULL \
+                   OR sticky_worker_id = $1 \
                ) \
                AND ( \
                    concurrency_key IS NULL \

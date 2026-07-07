@@ -322,6 +322,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[String
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .expect("worker registration should succeed");

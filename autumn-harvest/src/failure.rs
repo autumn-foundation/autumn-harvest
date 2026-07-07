@@ -38,6 +38,15 @@ use crate::policy::RetryPolicy;
 /// in-flight attempt.
 pub const ERROR_TYPE_CIRCUIT_OPEN: &str = "CircuitOpen";
 
+/// Stable error-type name for worker-session breakage (issue #606).
+///
+/// Synthesised by the broken-session scanner for every PENDING/RUNNING
+/// member-activity task belonging to a session whose host worker died or
+/// drained (or whose lease expired). Always non-retryable — a hard-pinned
+/// session activity can never fail over to a different worker, so retrying
+/// in place would loop forever against a dead host.
+pub const ERROR_TYPE_SESSION_BROKEN: &str = "SessionBroken";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility

@@ -217,6 +217,7 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
+    include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
 );
 
 type HarvestApiApp = axum::Router;
@@ -297,6 +298,7 @@ fn build_worker() -> Arc<Worker> {
                 max_workflow_history_events: None,
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry(),
         )

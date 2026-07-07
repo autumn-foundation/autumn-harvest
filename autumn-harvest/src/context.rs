@@ -27,7 +27,7 @@ use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    IdempotencyKey, TimerId, UpdateId,
+    IdempotencyKey, SessionId, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -179,6 +179,26 @@ pub enum WorkflowCommand {
         retry_policy_override: Option<crate::policy::RetryPolicy>,
         /// Optional start-to-close timeout override from a DAG task definition.
         start_to_close_override: Option<std::time::Duration>,
+        /// Worker session this activity belongs to (issue #606). `Some` when
+        /// dispatched through `Session::execute_activity` or as the internal
+        /// session-acquire/release activities; `None` for an ordinary
+        /// activity. Never affects behavior when `None` — zero change for
+        /// existing dispatch.
+        session_id: Option<SessionId>,
+        /// The session's host worker id, resolved from the session-acquire
+        /// activity's recorded output (issue #606). When `Some`, the worker
+        /// hard-pins this task's `sticky_worker_id` so it can never fail over
+        /// to a different worker, even after the ordinary sticky lease
+        /// expires. `None` for a non-session activity.
+        session_worker_id: Option<String>,
+        /// Per-call `schedule_to_start` override (issue #606). Used
+        /// exclusively by the internal `__harvest_session_acquire` dispatch
+        /// to bound session acquisition by `SessionOptions::acquisition_timeout`
+        /// without adding a schedule-to-start override to the public
+        /// `execute_activity` surface. `None` for every ordinary activity
+        /// dispatch, which continues to use the activity's registered
+        /// `default_schedule_to_start`.
+        schedule_to_start_override: Option<std::time::Duration>,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -1080,6 +1100,274 @@ impl WorkflowLogger<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Worker sessions (issue #606)
+// ---------------------------------------------------------------------------
+
+/// Reserved activity name for a worker session's acquisition step.
+///
+/// Dispatched by [`WorkflowContext::create_session`] as an ordinary activity
+/// (reusing the full replay/suspend/persist machinery) so its recorded
+/// `ActivityCompleted { output }` — the host worker id — is what gives a
+/// session's physical binding replay determinism, with no engine-level
+/// special-casing in `replay.rs`. The worker intercepts this reserved name
+/// before regular handler dispatch (see `process_activity_task`).
+pub(crate) const SESSION_ACQUIRE_ACTIVITY_NAME: &str = "__harvest_session_acquire";
+
+/// Reserved activity name for a worker session's release step
+/// ([`Session::complete`]). Hard-pinned to the session's host worker exactly
+/// like a member activity, so only the host frees its own in-process slot.
+pub(crate) const SESSION_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_release";
+
+/// Returns `true` when `name` is one of the two reserved worker-session
+/// internal activity names (issue #606): `__harvest_session_acquire` or
+/// `__harvest_session_release`.
+///
+/// Both are always registered in `HandlerRegistry::activities` (so the
+/// enqueue-time handler lookup never hard-fails on them) with
+/// `default_queue: None`, but they are dispatched on the *caller-supplied*
+/// session queue (`SessionOptions::queue`) at the point `create_session`/
+/// `Session::complete` is called, never on a fixed queue of their own. A
+/// preflight/readiness check deriving "queues this deployment needs a
+/// worker listening on" from every registered activity's
+/// `default_queue.unwrap_or("default")` must exclude these two names —
+/// otherwise a deployment with no session-based workflow at all is
+/// spuriously reported as requiring a worker on `"default"`.
+#[must_use]
+pub fn is_reserved_session_activity_name(name: &str) -> bool {
+    name == SESSION_ACQUIRE_ACTIVITY_NAME || name == SESSION_RELEASE_ACTIVITY_NAME
+}
+
+/// Default session acquisition timeout.
+///
+/// Bounds how long [`WorkflowContext::create_session`] waits for a worker
+/// with a free session slot before failing with
+/// [`HarvestError::SessionAcquireTimeout`]. Override via
+/// [`SessionOptions::with_acquisition_timeout`].
+pub const DEFAULT_SESSION_ACQUISITION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Saturating `Duration` → milliseconds conversion for error reporting
+/// (a multi-year timeout would otherwise overflow `u64` millis on `as_millis`).
+fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Options for [`WorkflowContext::create_session`] (issue #606).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let session = ctx.create_session(
+///     SessionOptions::new("gpu-workers").with_acquisition_timeout(Duration::from_secs(60))
+/// ).await?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    /// The task queue the session-acquire activity is scheduled on. Member
+    /// activities dispatched via [`Session::execute_activity`] default to
+    /// this same queue unless their [`crate::info::ActivityInfo`] specifies
+    /// its own.
+    pub queue: String,
+    /// Maximum time to wait for a worker with a free session slot
+    /// (`WorkerConfig::max_concurrent_sessions`) before failing with
+    /// [`HarvestError::SessionAcquireTimeout`]. Defaults to
+    /// [`DEFAULT_SESSION_ACQUISITION_TIMEOUT`].
+    pub acquisition_timeout: std::time::Duration,
+}
+
+impl SessionOptions {
+    /// Session options targeting `queue`, with the default acquisition
+    /// timeout ([`DEFAULT_SESSION_ACQUISITION_TIMEOUT`]).
+    #[must_use]
+    pub fn new(queue: impl Into<String>) -> Self {
+        Self {
+            queue: queue.into(),
+            acquisition_timeout: DEFAULT_SESSION_ACQUISITION_TIMEOUT,
+        }
+    }
+
+    /// Override the acquisition timeout.
+    #[must_use]
+    pub const fn with_acquisition_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.acquisition_timeout = timeout;
+        self
+    }
+}
+
+impl Default for SessionOptions {
+    /// Targets the `"default"` queue with [`DEFAULT_SESSION_ACQUISITION_TIMEOUT`].
+    fn default() -> Self {
+        Self::new("default")
+    }
+}
+
+/// A handle to an open worker session (issue #606) returned by
+/// [`WorkflowContext::create_session`].
+///
+/// Activities dispatched through [`Self::execute_activity`] /
+/// [`Self::execute_activity_raw`] are guaranteed to run on the single worker
+/// that acquired the session, for its entire lifetime — see the "Fan-out vs
+/// worker sessions" decision matrix in the crate docs for when to reach for
+/// a session instead of a plain activity, a local activity, or claim-check
+/// payload offloading (issue #524).
+///
+/// Borrows the owning [`WorkflowContext`] for its lifetime, mirroring
+/// [`RaceBuilder`]'s shape — a session cannot outlive the workflow function
+/// invocation that created it.
+pub struct Session<'a> {
+    ctx: &'a WorkflowContext,
+    id: SessionId,
+    host_worker_id: String,
+    queue: String,
+}
+
+impl Session<'_> {
+    /// This session's deterministic identity.
+    #[must_use]
+    pub const fn id(&self) -> SessionId {
+        self.id
+    }
+
+    /// The worker id hosting this session.
+    #[must_use]
+    pub fn host_worker_id(&self) -> &str {
+        &self.host_worker_id
+    }
+
+    /// Execute a typed activity through this session, hard-pinned to the
+    /// session's host worker.
+    ///
+    /// Uses `info`'s registered retry policy and start-to-close timeout, and
+    /// its registered queue if set — otherwise falls back to the session's
+    /// own queue (the same default `execute_activity` uses relative to
+    /// `"default"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `input`/the result cannot
+    /// be (de)serialized. Returns [`HarvestError::SessionBroken`] if the
+    /// session's host worker died or drained before this activity completed.
+    /// Propagates all errors from [`Self::execute_activity_raw`].
+    pub async fn execute_activity<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        input: I,
+    ) -> HarvestResult<O>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
+        let queue = info.default_queue.unwrap_or(self.queue.as_str());
+        let raw = self
+            .ctx
+            .execute_activity_raw_full(
+                info.name,
+                json_input,
+                queue,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+                Some(self.id),
+                Some(self.host_worker_id.clone()),
+                None,
+            )
+            .await
+            .map_err(|err| self.broken_session_error(err))?;
+        serde_json::from_value(raw).map_err(HarvestError::Serialization)
+    }
+
+    /// Execute an untyped activity by name through this session, hard-pinned
+    /// to the session's host worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::SessionBroken`] if the session's host worker
+    /// died or drained before this activity completed. Propagates all other
+    /// errors from the underlying activity dispatch.
+    pub async fn execute_activity_raw(
+        &self,
+        name: &str,
+        input: Value,
+        queue: &str,
+    ) -> HarvestResult<Value> {
+        self.ctx
+            .execute_activity_raw_full(
+                name,
+                input,
+                queue,
+                None,
+                None,
+                Some(self.id),
+                Some(self.host_worker_id.clone()),
+                None,
+            )
+            .await
+            .map_err(|err| self.broken_session_error(err))
+    }
+
+    /// Rewrites a `SessionBroken`-typed `ActivityFailed` into
+    /// [`HarvestError::SessionBroken`], mirroring
+    /// [`WorkflowContext::create_session`]'s identical mapping for the
+    /// acquire step. Any other error passes through unchanged.
+    ///
+    /// This is the actually-reachable place a `SessionBroken` outcome is
+    /// first observed (member-activity or `complete()` failure, unlike
+    /// `create_session`'s own defensive mapping, which can never fire since
+    /// the acquire task never carries `session_id`), so the
+    /// `harvest.session.acquisition{outcome="broken"}` metric is emitted
+    /// here -- guarded on `!is_replaying()` so a replay of the same recorded
+    /// failure doesn't re-increment it.
+    fn broken_session_error(&self, err: HarvestError) -> HarvestError {
+        match err {
+            HarvestError::ActivityFailed {
+                error_type, source, ..
+            } if error_type == crate::failure::ERROR_TYPE_SESSION_BROKEN => {
+                if !self.ctx.is_replaying() {
+                    self.ctx.metrics.record_session_acquisition(
+                        &self.queue,
+                        crate::telemetry::SessionAcquisitionOutcome::Broken,
+                    );
+                }
+                HarvestError::SessionBroken {
+                    session_id: self.id,
+                    reason: source.to_string(),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// End the session, releasing the host worker's session slot.
+    ///
+    /// Dispatches the internal session-release activity, hard-pinned to the
+    /// host (only the host worker can free its own in-process slot).
+    /// Idempotent from the workflow's perspective — like any other activity,
+    /// a crash-and-replay before this completes safely re-dispatches once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::SessionBroken`] if the host worker died or
+    /// drained before release could complete — the slot is still reclaimed
+    /// by the broken-session scanner in that case.
+    pub async fn complete(self) -> HarvestResult<()> {
+        self.ctx
+            .execute_activity_raw_full(
+                SESSION_RELEASE_ACTIVITY_NAME,
+                Value::from(self.id.to_string()),
+                &self.queue,
+                None,
+                None,
+                Some(self.id),
+                Some(self.host_worker_id.clone()),
+                None,
+            )
+            .await
+            .map_err(|err| self.broken_session_error(err))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WorkflowContext
 // ---------------------------------------------------------------------------
 
@@ -1120,6 +1408,11 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming worker-session identity
+    /// markers (issue #606). Each `create_session()` call increments this once
+    /// so each session has a stable, unique `session:{seq}` marker name across
+    /// replays, mirroring `fan_out_seq`/`race_seq`.
+    session_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -1446,6 +1739,7 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
+            session_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1557,6 +1851,7 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
+            session_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1605,6 +1900,7 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
+            session_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2752,133 +3048,14 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
     pub async fn execute_activity_raw(
         &self,
         name: &str,
         input: Value,
         queue: &str,
     ) -> HarvestResult<Value> {
-        // Step 1: Match against history (lock is dropped before any .await).
-        let history_match = if self.strict_replay {
-            self.match_history(|m| m.match_activity_strict(name, &input))
-        } else {
-            self.match_history(|m| m.match_activity(name))
-        };
-
-        match history_match {
-            HistoryMatch::Matched { output } => Ok(output),
-
-            HistoryMatch::Failed {
-                error,
-                attempt,
-                error_type,
-                details,
-            } => Err(HarvestError::ActivityFailed {
-                name: name.to_string(),
-                attempt,
-                error_type,
-                details,
-                source: error.into(),
-            }),
-
-            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
-                timeout_type,
-                task_name: name.to_string(),
-            }),
-
-            HistoryMatch::Diverged {
-                expected,
-                actual,
-                event_index,
-            } => Err(self.nd_error(
-                format!("activity mismatch: expected {expected}, got {actual}"),
-                event_index,
-                Some(expected),
-                Some(actual),
-            )),
-
-            HistoryMatch::ActivityInProgress { activity_id } => {
-                let (tx, rx) = oneshot::channel();
-                self.push_command(WorkflowCommand::WaitForActivity {
-                    activity_id,
-                    result_tx: tx,
-                });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
-            }
-
-            HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. }
-            | HistoryMatch::ExternalSignalFailed { .. }
-            | HistoryMatch::ExternalCancelInProgress { .. }
-            | HistoryMatch::ExternalCancelFailed { .. }
-            | HistoryMatch::DetachedChildSpawned { .. } => {
-                unreachable!(
-                    "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
-                     LocalActivityInProgress, or ExternalSignalInProgress"
-                )
-            }
-
-            HistoryMatch::NoMatch => {
-                // Strict replay: a command with no matching history entry means
-                // the new code issues a command the recorded history never saw.
-                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
-
-                // Enforce activity input payload cap before scheduling.
-                let effective_cap = {
-                    let global = self.payload_max_activity_input;
-                    self.activity_input_cap_overrides
-                        .get(name)
-                        .copied()
-                        .map_or(global, |ov| global.max(ov))
-                };
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0
-                    && observed > effective_cap
-                    && !self.offload_will_apply(observed)
-                {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ActivityInput,
-                        observed_bytes: observed,
-                        cap_bytes: effective_cap,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: Some(name.to_string()),
-                    });
-                }
-
-                // Live execution: emit a ScheduleActivity command and suspend
-                // until the worker sends the result through the oneshot channel.
-                let activity_id = self.next_activity_id();
-                let (tx, rx) = oneshot::channel();
-
-                self.push_command(WorkflowCommand::ScheduleActivity {
-                    activity_id,
-                    name: name.to_string(),
-                    input,
-                    queue: queue.to_string(),
-                    retry_policy_override: None,
-                    start_to_close_override: None,
-                    result_tx: tx,
-                });
-
-                // Suspend the coroutine until the worker resolves this activity.
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
-            }
-        }
+        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None)
+            .await
     }
 
     /// Like [`execute_activity_raw`](Self::execute_activity_raw) but allows
@@ -2886,7 +3063,6 @@ impl WorkflowContext {
     /// Used by the DAG unified handler to honour task-level `.retry()` and
     /// `.start_to_close()` settings from the `DagBuilder`.
     #[doc(hidden)]
-    #[allow(clippy::too_many_lines)]
     pub async fn execute_activity_raw_with_opts(
         &self,
         name: &str,
@@ -2894,6 +3070,40 @@ impl WorkflowContext {
         queue: &str,
         retry_policy_override: Option<crate::policy::RetryPolicy>,
         start_to_close_override: Option<std::time::Duration>,
+    ) -> HarvestResult<Value> {
+        self.execute_activity_raw_full(
+            name,
+            input,
+            queue,
+            retry_policy_override,
+            start_to_close_override,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The full activity-dispatch state machine underlying
+    /// [`execute_activity_raw`](Self::execute_activity_raw),
+    /// [`execute_activity_raw_with_opts`](Self::execute_activity_raw_with_opts),
+    /// and [`Session`]'s session-scoped activity dispatch (issue #606).
+    ///
+    /// `session_id`/`session_worker_id`/`schedule_to_start_override` are
+    /// `None` for every ordinary (non-session) call site — passing `None`
+    /// for all three is byte-identical to the pre-#606 behavior of the two
+    /// public wrappers above.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn execute_activity_raw_full(
+        &self,
+        name: &str,
+        input: Value,
+        queue: &str,
+        retry_policy_override: Option<crate::policy::RetryPolicy>,
+        start_to_close_override: Option<std::time::Duration>,
+        session_id: Option<SessionId>,
+        session_worker_id: Option<String>,
+        schedule_to_start_override: Option<std::time::Duration>,
     ) -> HarvestResult<Value> {
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_activity_strict(name, &input))
@@ -2990,6 +3200,9 @@ impl WorkflowContext {
                     queue: queue.to_string(),
                     retry_policy_override,
                     start_to_close_override,
+                    session_id,
+                    session_worker_id,
+                    schedule_to_start_override,
                     result_tx: tx,
                 });
                 match rx.await {
@@ -5355,6 +5568,9 @@ impl WorkflowContext {
                             queue: queue.clone(),
                             retry_policy_override: retry.clone(),
                             start_to_close_override: *start_to_close,
+                            session_id: None,
+                            session_worker_id: None,
+                            schedule_to_start_override: None,
                             result_tx: tx,
                         });
                     } else {
@@ -5564,6 +5780,193 @@ impl WorkflowContext {
                 value: payload,
             },
         ))
+    }
+
+    // ── Worker sessions (issue #606) ────────────────────────────────────────
+
+    /// Generate the next worker-session sequence number for marker naming
+    /// (mirrors `next_fan_out_seq`/`next_race_seq`).
+    fn next_session_seq(&self) -> u32 {
+        let mut seq = self.session_seq.lock().expect("session_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Resolve a worker session's deterministic identity.
+    ///
+    /// On the **first live dispatch** (past end of history): generates a
+    /// fresh [`SessionId`] and pushes a `RecordMarker { name: "session:{seq}"
+    /// }` command so every future replay recovers the identical id. On
+    /// **replay**: returns the id previously recorded at this cursor
+    /// position.
+    ///
+    /// This is the entire determinism contract for worker sessions — **no
+    /// new `WorkflowEvent` variant is introduced**. The session's *physical
+    /// worker binding* is resolved separately (via the session-acquire
+    /// activity's recorded output) and is non-replayed runtime routing
+    /// state, exactly like activity placement today.
+    fn resolve_session_id(&self, seq: u32) -> HarvestResult<SessionId> {
+        let marker_result = self.match_history(|m| m.match_session_marker(seq));
+        match marker_result {
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!("MarkerRecorded(session:{seq})"))?;
+                let session_id = SessionId::new();
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: format!("session:{seq}"),
+                    details: Value::from(session_id.to_string()),
+                });
+                Ok(session_id)
+            }
+            HistoryMatch::Matched { output } => {
+                let uuid_str = output.as_str().ok_or_else(|| {
+                    self.nd_error(
+                        format!("session #{seq}: recorded marker value is not a string"),
+                        None,
+                        None,
+                        None,
+                    )
+                })?;
+                uuid_str.parse::<SessionId>().map_err(|e| {
+                    self.nd_error(
+                        format!(
+                            "session #{seq}: recorded marker value '{uuid_str}' is not a \
+                             valid UUID: {e}"
+                        ),
+                        None,
+                        None,
+                        None,
+                    )
+                })
+            }
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
+                    "session #{seq}: history has {expected} but current code supplies {actual}"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            _ => unreachable!("match_session_marker only returns Matched, NoMatch, or Diverged"),
+        }
+    }
+
+    /// Open a worker session (issue #606): route a group of activities to a
+    /// single physical worker for the life of the session, so they can share
+    /// machine-local state (a downloaded file, a warmed cache, GPU memory).
+    ///
+    /// Blocks (suspends the workflow) until a worker with a free session slot
+    /// (`WorkerConfig::max_concurrent_sessions`) acquires the session, or
+    /// fails with [`HarvestError::SessionAcquireTimeout`] if none does within
+    /// `options.acquisition_timeout`.
+    ///
+    /// # Determinism
+    ///
+    /// The session's identity is a [`SessionId`] recorded once via the
+    /// existing `MarkerRecorded` mechanism — **no new `WorkflowEvent`
+    /// variant**. The session's *physical worker binding* is resolved from
+    /// the internal `__harvest_session_acquire` activity's recorded output,
+    /// exactly like any other activity result: replay recovers the same
+    /// host worker id regardless of which (if any) worker is available at
+    /// replay time.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Cancelled`] if the workflow has been cancelled.
+    /// - [`HarvestError::SessionAcquireTimeout`] if no worker acquires the
+    ///   session within `options.acquisition_timeout`.
+    /// - [`HarvestError::SessionBroken`] if the session's host worker dies or
+    ///   drains before the acquire activity's result is recorded (surfaced
+    ///   identically to a broken session discovered later, mid-pipeline).
+    pub async fn create_session(&self, options: SessionOptions) -> HarvestResult<Session<'_>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_session_seq();
+        let session_id = self.resolve_session_id(seq)?;
+        let host_worker_id = self
+            .dispatch_session_acquire(session_id, &options)
+            .await
+            .map_err(|err| match err {
+                HarvestError::Timeout {
+                    timeout_type: crate::error::TimeoutType::ScheduleToStart,
+                    ..
+                } => {
+                    // Only the live discovery of the timeout should count --
+                    // a replay of the same recorded terminal outcome must not
+                    // re-increment the metric on every subsequent cycle.
+                    if !self.is_replaying() {
+                        self.metrics.record_session_acquisition(
+                            &options.queue,
+                            crate::telemetry::SessionAcquisitionOutcome::TimedOut,
+                        );
+                    }
+                    HarvestError::SessionAcquireTimeout {
+                        session_id,
+                        queue: options.queue.clone(),
+                        timeout_ms: duration_to_millis_saturating(options.acquisition_timeout),
+                    }
+                }
+                HarvestError::ActivityFailed {
+                    error_type, source, ..
+                } if error_type == crate::failure::ERROR_TYPE_SESSION_BROKEN => {
+                    // Defensive only -- the acquire task itself never carries
+                    // `session_id`, so the broken-session scanner can never
+                    // target it; this arm cannot actually be reached today.
+                    // The `Broken` metric is emitted from the genuinely
+                    // reachable path instead: `Session::broken_session_error`
+                    // (member-activity/`complete()` failures).
+                    HarvestError::SessionBroken {
+                        session_id,
+                        reason: source.to_string(),
+                    }
+                }
+                other => other,
+            })?;
+
+        Ok(Session {
+            ctx: self,
+            id: session_id,
+            host_worker_id,
+            queue: options.queue,
+        })
+    }
+
+    /// Dispatch the internal session-acquire activity and resolve it to a
+    /// host worker id. Not exposed to workflow authors — [`Self::create_session`]
+    /// is the public entry point.
+    async fn dispatch_session_acquire(
+        &self,
+        session_id: SessionId,
+        options: &SessionOptions,
+    ) -> HarvestResult<String> {
+        let raw = self
+            .execute_activity_raw_full(
+                SESSION_ACQUIRE_ACTIVITY_NAME,
+                serde_json::json!(session_id.to_string()),
+                &options.queue,
+                None,
+                None,
+                // The acquire task is never hard-pinned to a worker -- it has
+                // no resolved host yet; discovering one is its entire job.
+                None,
+                None,
+                Some(options.acquisition_timeout),
+            )
+            .await?;
+        raw.as_str().map(str::to_string).ok_or_else(|| {
+            self.nd_error(
+                format!(
+                    "session {session_id} acquire activity returned a non-string worker id: \
+                     {raw:?}"
+                ),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     // ── External activity completion ───────────────────────────────────
@@ -12523,5 +12926,531 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // ── Worker session marker resolution tests (issue #606) ──────────────────
+
+    #[test]
+    fn next_session_seq_increments_monotonically() {
+        let ctx = WorkflowContext::new_test();
+        assert_eq!(ctx.next_session_seq(), 1);
+        assert_eq!(ctx.next_session_seq(), 2);
+        assert_eq!(ctx.next_session_seq(), 3);
+    }
+
+    #[test]
+    fn resolve_session_id_on_live_execution_generates_and_records_marker() {
+        let ctx = WorkflowContext::new_test();
+        let session_id = ctx.resolve_session_id(1).expect("live resolve succeeds");
+
+        let commands = ctx.drain_commands();
+        let recorded = commands.iter().find_map(|c| match c {
+            WorkflowCommand::RecordMarker { name, details } if name == "session:1" => {
+                Some(details.clone())
+            }
+            _ => None,
+        });
+        let recorded = recorded.expect("a session:1 marker must be recorded on live dispatch");
+        assert_eq!(recorded, Value::from(session_id.to_string()));
+    }
+
+    #[test]
+    fn resolve_session_id_generates_distinct_ids_per_seq() {
+        let ctx = WorkflowContext::new_test();
+        let a = ctx.resolve_session_id(1).unwrap();
+        let b = ctx.resolve_session_id(2).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn resolve_session_id_on_replay_recovers_recorded_id() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let resolved = ctx.resolve_session_id(1).expect("replay resolve succeeds");
+        assert_eq!(resolved, SessionId::from_uuid(session_uuid));
+
+        // Replay must not re-push a RecordMarker command — the marker was
+        // already recorded.
+        let commands = ctx.drain_commands();
+        assert!(
+            !commands.iter().any(
+                |c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "session:1")
+            ),
+            "replay must not re-record an already-recorded session marker"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_diverges_when_history_disagrees() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("unrelated"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.resolve_session_id(1);
+        assert!(matches!(result, Err(HarvestError::NonDeterministic { .. })));
+    }
+
+    #[test]
+    fn resolve_session_id_two_sessions_get_distinct_markers_on_replay() {
+        let uuid1 = uuid::Uuid::new_v4();
+        let uuid2 = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(uuid1.to_string()),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:2".into(),
+                details: Value::from(uuid2.to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(
+            ctx.resolve_session_id(1).unwrap(),
+            SessionId::from_uuid(uuid1)
+        );
+        assert_eq!(
+            ctx.resolve_session_id(2).unwrap(),
+            SessionId::from_uuid(uuid2)
+        );
+    }
+
+    // ── ctx.create_session() / Session tests (issue #606) ────────────────────
+
+    #[test]
+    fn session_options_default_queue_and_timeout() {
+        let opts = SessionOptions::new("gpu-workers");
+        assert_eq!(opts.queue, "gpu-workers");
+        assert_eq!(
+            opts.acquisition_timeout,
+            DEFAULT_SESSION_ACQUISITION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn session_options_with_acquisition_timeout_overrides_default() {
+        let opts = SessionOptions::new("default")
+            .with_acquisition_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(opts.acquisition_timeout, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn session_options_impl_default_uses_default_queue() {
+        let opts = SessionOptions::default();
+        assert_eq!(opts.queue, "default");
+    }
+
+    #[tokio::test]
+    async fn create_session_live_emits_marker_then_acquire_activity_and_suspends() {
+        let ctx = WorkflowContext::new_test();
+        let opts = SessionOptions::new("gpu-workers")
+            .with_acquisition_timeout(std::time::Duration::from_secs(45));
+
+        let fut = ctx.create_session(opts);
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("create_session should suspend, not complete, with no acquire result in history"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            2,
+            "expected exactly [RecordMarker, ScheduleActivity]"
+        );
+        match &commands[0] {
+            WorkflowCommand::RecordMarker { name, .. } => assert_eq!(name, "session:1"),
+            other => panic!("expected RecordMarker first, got {other:?}"),
+        }
+        match &commands[1] {
+            WorkflowCommand::ScheduleActivity {
+                name,
+                queue,
+                session_id,
+                session_worker_id,
+                schedule_to_start_override,
+                ..
+            } => {
+                assert_eq!(name, SESSION_ACQUIRE_ACTIVITY_NAME);
+                assert_eq!(queue, "gpu-workers");
+                // The acquire task itself is never hard-pinned -- it has no
+                // resolved host yet; that's the whole point of dispatching it.
+                assert_eq!(*session_id, None);
+                assert_eq!(*session_worker_id, None);
+                assert_eq!(
+                    *schedule_to_start_override,
+                    Some(std::time::Duration::from_secs(45))
+                );
+            }
+            other => panic!("expected ScheduleActivity second, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_replay_recovers_host_worker_id_from_acquire_output() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .expect("replay resolves the session from recorded history");
+
+        assert_eq!(session.id(), SessionId::from_uuid(session_uuid));
+        assert_eq!(session.host_worker_id(), "worker-42");
+    }
+
+    #[tokio::test]
+    async fn create_session_maps_schedule_to_start_timeout_to_session_acquire_timeout() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToStart,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let Err(err) = ctx.create_session(SessionOptions::new("gpu-workers")).await else {
+            panic!("expected create_session to fail with SessionAcquireTimeout");
+        };
+        match err {
+            HarvestError::SessionAcquireTimeout {
+                session_id, queue, ..
+            } => {
+                assert_eq!(session_id, SessionId::from_uuid(session_uuid));
+                assert_eq!(queue, "gpu-workers");
+            }
+            other => panic!("expected SessionAcquireTimeout, got {other}"),
+        }
+    }
+
+    /// Test double counting `record_session_acquisition` calls by outcome.
+    #[derive(Default)]
+    struct SessionAcquisitionCounter {
+        acquired: std::sync::atomic::AtomicUsize,
+        timed_out: std::sync::atomic::AtomicUsize,
+        broken: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::telemetry::MetricsRecorder for SessionAcquisitionCounter {
+        fn record_session_acquisition(
+            &self,
+            _queue: &str,
+            outcome: crate::telemetry::SessionAcquisitionOutcome,
+        ) {
+            use crate::telemetry::SessionAcquisitionOutcome as O;
+            let counter = match outcome {
+                O::Acquired => &self.acquired,
+                O::TimedOut => &self.timed_out,
+                O::Broken => &self.broken,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The `TimedOut` metric fires when the `ActivityTimedOut` event is the
+    /// tail of recorded history (the cycle that first discovers it, where
+    /// `is_replaying()` becomes `false` right after the match) -- mirroring
+    /// the exactly-once-on-the-live-frontier contract `ctx.metrics()`
+    /// (issue #532) already documents.
+    #[tokio::test]
+    async fn create_session_emits_timed_out_metric_on_first_discovery() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToStart,
+            },
+        ];
+        let recorder = std::sync::Arc::new(SessionAcquisitionCounter::default());
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), events).with_metrics(recorder.clone());
+        let result = ctx.create_session(SessionOptions::new("gpu-workers")).await;
+        assert!(matches!(
+            result,
+            Err(HarvestError::SessionAcquireTimeout { .. })
+        ));
+        assert_eq!(
+            recorder.timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            recorder.acquired.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(recorder.broken.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A later replay of a history that already carries a further event past
+    /// the timeout (i.e. the cursor still has more to consume at the match
+    /// point) must not re-increment the metric -- `is_replaying()` is `true`
+    /// at that point, so the guard suppresses it.
+    #[tokio::test]
+    async fn create_session_does_not_reemit_timed_out_metric_on_later_replay() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToStart,
+            },
+            // A further recorded event past the timeout -- proves this
+            // history has already progressed beyond the point where the
+            // timeout was first discovered.
+            WorkflowEvent::WorkflowFailed {
+                error: "session acquisition timed out".to_string(),
+            },
+        ];
+        let recorder = std::sync::Arc::new(SessionAcquisitionCounter::default());
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), events).with_metrics(recorder.clone());
+        let _ = ctx.create_session(SessionOptions::new("gpu-workers")).await;
+        assert_eq!(
+            recorder.timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a replay that still has further recorded history ahead must not \
+             re-increment the metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_execute_activity_raw_hard_pins_to_host_worker() {
+        let host_activity_id = ActivityExecId::new();
+        let session_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: host_activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: host_activity_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let fut = session.execute_activity_raw("transcode_chunk", Value::Null, "gpu-workers");
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("member activity should suspend, not complete"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            WorkflowCommand::ScheduleActivity {
+                name,
+                session_id,
+                session_worker_id,
+                ..
+            } => {
+                assert_eq!(name, "transcode_chunk");
+                assert_eq!(*session_id, Some(SessionId::from_uuid(session_uuid)));
+                assert_eq!(session_worker_id.as_deref(), Some("worker-42"));
+            }
+            other => panic!("expected ScheduleActivity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_complete_dispatches_release_activity_hard_pinned_to_host() {
+        let host_activity_id = ActivityExecId::new();
+        let session_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: host_activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: host_activity_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let fut = session.complete();
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("complete() should suspend, not complete"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            WorkflowCommand::ScheduleActivity {
+                name,
+                session_id,
+                session_worker_id,
+                ..
+            } => {
+                assert_eq!(name, SESSION_RELEASE_ACTIVITY_NAME);
+                assert_eq!(*session_id, Some(SessionId::from_uuid(session_uuid)));
+                assert_eq!(session_worker_id.as_deref(), Some("worker-42"));
+            }
+            other => panic!("expected ScheduleActivity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_checks_cancellation_before_dispatch() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator cancel".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.create_session(SessionOptions::new("default")).await;
+        assert!(matches!(result, Err(HarvestError::Cancelled(_))));
+        // Cancellation must be checked before any command is pushed.
+        assert!(ctx.drain_commands().is_empty());
     }
 }

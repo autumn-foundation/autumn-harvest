@@ -60,15 +60,16 @@ use crate::telemetry::{
     METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_AUTO_PAUSED,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
     METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED,
-    METRIC_WEBHOOK_REJECTED, METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE,
-    METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT,
-    METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION,
-    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
-    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SlotType,
+    METRIC_SESSION_ACQUISITION, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION,
+    METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
+    METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
+    METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
+    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SessionAcquisitionOutcome, SlotType,
     TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
@@ -669,6 +670,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_session_acquisition(&self, queue: &str, outcome: SessionAcquisitionOutcome) {
+        counter!(
+            METRIC_SESSION_ACQUISITION,
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.as_str(),
+        )
+        .increment(1);
+    }
+
     fn record_user_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
         let ls: Vec<Label> = labels
             .iter()
@@ -791,6 +801,15 @@ mod tests {
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
+    }
+
+    #[test]
+    fn record_session_acquisition_does_not_panic_for_all_outcomes() {
+        use crate::telemetry::SessionAcquisitionOutcome;
+        let rec = MetricsRsRecorder;
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Acquired);
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::TimedOut);
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Broken);
     }
 
     #[test]

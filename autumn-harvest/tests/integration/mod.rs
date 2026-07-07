@@ -102,6 +102,7 @@ mod transactional_activity_tests;
 mod typed_stubs_tests;
 mod updt_with_start_tests;
 mod webhook_trigger_tests;
+mod worker_session_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
 mod workflow_logger_tests;

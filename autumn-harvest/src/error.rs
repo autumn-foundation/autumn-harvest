@@ -444,6 +444,40 @@ pub enum HarvestError {
         /// Machine-readable failure reason (`"target_unknown"` or `"self_cancel"`).
         reason_code: String,
     },
+
+    /// `ctx.create_session(...)` could not acquire a host worker within the
+    /// configured acquisition timeout (issue #606).
+    ///
+    /// No worker on `queue` advertised a free session slot
+    /// (`max_concurrent_sessions`) before the deadline. Author-catchable —
+    /// the workflow may retry `create_session` or fall back to plain
+    /// activities.
+    #[error("session {session_id} acquisition timed out after {timeout_ms}ms on queue '{queue}'")]
+    SessionAcquireTimeout {
+        /// The session identity that failed to acquire a host.
+        session_id: crate::types::SessionId,
+        /// The queue the acquisition was attempted on.
+        queue: String,
+        /// The configured acquisition timeout, in milliseconds.
+        timeout_ms: u64,
+    },
+
+    /// A worker session's host worker died or drained mid-session (issue
+    /// #606).
+    ///
+    /// Distinct from an ordinary activity failure: partial local state
+    /// (a downloaded file, a warmed cache) may be lost, so this is
+    /// deliberately never silently retried onto a different worker. The
+    /// workflow author must re-establish the session and restart the
+    /// affected steps.
+    #[error("session {session_id} broken: {reason}")]
+    SessionBroken {
+        /// The broken session's identity.
+        session_id: crate::types::SessionId,
+        /// Why the session was declared broken (e.g. "host worker lost
+        /// heartbeat", "host worker draining", "session lease expired").
+        reason: String,
+    },
 }
 
 impl HarvestError {
@@ -928,5 +962,54 @@ mod tests {
         };
         assert!(e.to_string().contains("target_unknown"));
         assert!(e.to_string().contains("notify"));
+    }
+
+    #[test]
+    fn harvest_error_session_acquire_timeout_display() {
+        use crate::types::SessionId;
+        let session_id = SessionId::new();
+        let e = HarvestError::SessionAcquireTimeout {
+            session_id,
+            queue: "gpu-workers".into(),
+            timeout_ms: 30_000,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("gpu-workers"));
+        assert!(msg.contains("30000") || msg.contains("30 s") || msg.contains("30000ms"));
+        assert!(msg.contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn harvest_error_session_broken_display() {
+        use crate::types::SessionId;
+        let session_id = SessionId::new();
+        let e = HarvestError::SessionBroken {
+            session_id,
+            reason: "host worker lost heartbeat".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("host worker lost heartbeat"));
+        assert!(msg.contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn session_acquire_timeout_is_distinct_from_session_broken() {
+        use crate::types::SessionId;
+        let session_id = SessionId::new();
+        let timeout = HarvestError::SessionAcquireTimeout {
+            session_id,
+            queue: "default".into(),
+            timeout_ms: 1000,
+        };
+        let broken = HarvestError::SessionBroken {
+            session_id,
+            reason: "reason".into(),
+        };
+        assert_ne!(timeout.to_string(), broken.to_string());
+        assert!(!matches!(
+            broken,
+            HarvestError::SessionAcquireTimeout { .. }
+        ));
+        assert!(!matches!(timeout, HarvestError::SessionBroken { .. }));
     }
 }

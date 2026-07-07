@@ -555,6 +555,52 @@ pub const METRIC_WEBHOOK_RECEIVED: &str = "harvest.webhook.received";
 /// counter.
 pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 
+/// Counter: incremented once per worker-session acquisition attempt (issue
+/// #606), i.e. once per `ctx.create_session(...)` call.
+///
+/// Labels: `queue` (the session's target task queue) and `outcome` (=
+/// [`METRIC_LABEL_OUTCOME`], one of [`SessionAcquisitionOutcome`]'s bounded
+/// values: `acquired`/`timed_out`/`broken`). Per ADR-0001 §7, `execution.id`
+/// is never a label -- a session's identity stays span-/log-only here.
+pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
+
+/// Bounded outcome classification for a worker-session acquisition attempt
+/// (issue #606).
+///
+/// Every value maps 1:1 to a distinct `create_session` result, so the set is
+/// closed by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAcquisitionOutcome {
+    /// A worker with a free session slot claimed the acquire task before the
+    /// caller's `acquisition_timeout` elapsed.
+    Acquired,
+    /// No worker had a free slot within `acquisition_timeout`; surfaced to
+    /// the caller as `HarvestError::SessionAcquireTimeout`.
+    TimedOut,
+    /// The session was reclaimed as broken (host died/drained or its lease
+    /// expired) before or during acquisition; surfaced as
+    /// `HarvestError::SessionBroken`.
+    Broken,
+}
+
+impl SessionAcquisitionOutcome {
+    /// Stable lower-case outcome string used as the `outcome` metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acquired => "acquired",
+            Self::TimedOut => "timed_out",
+            Self::Broken => "broken",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionAcquisitionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Metric label: the registered `#[webhook(path = ...)]` binding path
 /// (issue #344). Bounded cardinality: only registered webhook bindings ever
 /// appear, fixed at `HarvestPlugin::build` time.
@@ -1713,6 +1759,17 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (path, outcome);
     }
 
+    /// A worker session's acquisition attempt resolved to a terminal outcome
+    /// (issue #606): a worker claimed it, the caller's `acquisition_timeout`
+    /// elapsed first, or it was reclaimed as broken before/during
+    /// acquisition.
+    ///
+    /// Maps to the counter [`METRIC_SESSION_ACQUISITION`] with labels
+    /// `queue` and `outcome`.
+    fn record_session_acquisition(&self, queue: &str, outcome: SessionAcquisitionOutcome) {
+        let _ = (queue, outcome);
+    }
+
     /// An inbound webhook request was rejected (issue #344).
     ///
     /// Maps to the counter [`METRIC_WEBHOOK_REJECTED`] with labels `path`
@@ -2600,6 +2657,27 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_webhook_received("/hooks/orders", WebhookOutcome::Accepted);
         rec.record_webhook_rejected("/hooks/orders", WebhookOutcome::VerifyFailed);
+    }
+
+    #[test]
+    fn session_acquisition_outcome_stringifies_to_bounded_values() {
+        assert_eq!(SessionAcquisitionOutcome::Acquired.as_str(), "acquired");
+        assert_eq!(SessionAcquisitionOutcome::TimedOut.as_str(), "timed_out");
+        assert_eq!(SessionAcquisitionOutcome::Broken.as_str(), "broken");
+        assert_eq!(SessionAcquisitionOutcome::Acquired.to_string(), "acquired");
+    }
+
+    #[test]
+    fn metric_session_acquisition_name_is_stable() {
+        assert_eq!(METRIC_SESSION_ACQUISITION, "harvest.session.acquisition");
+    }
+
+    #[test]
+    fn noop_metrics_implements_session_acquisition_without_panicking() {
+        let rec = NoOpMetrics;
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Acquired);
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::TimedOut);
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Broken);
     }
 
     #[test]

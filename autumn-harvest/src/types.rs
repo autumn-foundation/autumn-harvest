@@ -557,6 +557,54 @@ impl FromStr for ExternalCancelId {
     }
 }
 
+/// Unique identifier for a worker session (issue #606).
+///
+/// Recorded deterministically via the existing `MarkerRecorded` mechanism when
+/// a workflow calls `ctx.create_session(...)` — the *identity* is replayed
+/// like any other marker, but the *physical worker binding* it resolves to is
+/// non-replayed runtime routing state, exactly like activity placement today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId(Uuid);
+
+impl SessionId {
+    /// Creates a new, random `SessionId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as a `SessionId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for SessionId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Durable timer handle within a workflow.
 ///
 /// ## Examples
@@ -1211,5 +1259,40 @@ mod tests {
         let json = serde_json::to_string(&n).unwrap();
         let back: DeploymentName = serde_json::from_str(&json).unwrap();
         assert_eq!(n, back);
+    }
+
+    #[test]
+    fn session_id_is_random_uuid() {
+        let a = SessionId::new();
+        let b = SessionId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_id_display_and_from_str_round_trip() {
+        let id = SessionId::new();
+        let s = id.to_string();
+        let parsed: SessionId = s.parse().unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn session_id_from_uuid_and_as_uuid_round_trip() {
+        let uuid = uuid::Uuid::new_v4();
+        let id = SessionId::from_uuid(uuid);
+        assert_eq!(id.as_uuid(), uuid);
+    }
+
+    #[test]
+    fn session_id_serde_round_trip() {
+        let id = SessionId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let back: SessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn session_id_invalid_str_fails_to_parse() {
+        assert!("not-a-valid-uuid".parse::<SessionId>().is_err());
     }
 }

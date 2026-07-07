@@ -148,7 +148,12 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #605: harvest_completion_deliveries table + completion_callbacks
     // column on harvest_workflow_executions.
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql")
+    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+    "\n",
+    // issue #606: harvest_sessions table + session_id column on
+    // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
+    // harvest_workers.
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -194,6 +199,7 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
     "\n",
     include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
     "\n",
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS schedule_to_close_at TIMESTAMPTZ NULL;\n",
     "\n",
@@ -835,6 +841,7 @@ fn build_runtime_worker_with_task_timeout(
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -1506,6 +1513,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -1637,6 +1645,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -1801,6 +1810,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -2030,6 +2040,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -2191,6 +2202,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         &[],
         None,
         None,
+        60,
     )
     .await
     .expect("timeout enforcement should succeed");
@@ -2285,6 +2297,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -2450,6 +2463,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -5749,6 +5763,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::clone(&registry),
         )
@@ -5875,6 +5890,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::clone(&registry),
         )
@@ -5990,6 +6006,7 @@ async fn workflow_schedule_pause_and_resume() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::clone(&registry),
         )
@@ -6551,6 +6568,7 @@ async fn drain_accepted_sets_status_to_draining() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6600,6 +6618,7 @@ async fn drain_already_draining_on_second_call() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6659,6 +6678,7 @@ async fn drain_already_stopped_after_transition() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6713,6 +6733,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6753,6 +6774,7 @@ async fn drain_preview_returns_active_workers() {
             "",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -8469,6 +8491,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         "v1",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -8505,6 +8528,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         "v1",
         None,
         &new_labels,
+        0,
     )
     .await
     .unwrap();

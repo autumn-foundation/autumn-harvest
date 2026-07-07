@@ -333,7 +333,15 @@ fn has_activity_terminal_event(
     })
 }
 
-fn pending_activity_id_for_task(
+/// Resolve the pending (non-terminal) `ActivityScheduled` id a task row
+/// corresponds to, if any.
+///
+/// `pub(crate)` so [`crate::sessions::enforce_broken_sessions`] (issue #606)
+/// can reuse the exact same resolution logic when failing a hard-pinned
+/// session-member task, rather than a fourth hand-rolled copy (this and
+/// `worker.rs`'s already-duplicated sibling are the established precedent
+/// for this small helper trio in this codebase).
+pub(crate) fn pending_activity_id_for_task(
     history: &[WorkflowEvent],
     task: &TaskQueueItem,
     activity_name: &str,
@@ -350,7 +358,7 @@ fn pending_activity_id_for_task(
     find_pending_scheduled_activity(history, activity_name).map(Some)
 }
 
-async fn lock_workflow_execution_and_load_history(
+pub(crate) async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
 ) -> HarvestResult<store::EventHistory> {
@@ -367,7 +375,7 @@ async fn lock_workflow_execution_and_load_history(
     store::load_history(conn, exec_id).await
 }
 
-async fn task_state_for_update(
+pub(crate) async fn task_state_for_update(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
 ) -> HarvestResult<Option<String>> {
@@ -1603,7 +1611,18 @@ pub async fn enforce_external_cancels_outbox(
     Ok(count)
 }
 
+/// Sweep every timeout-related enforcement pass in one connection.
+///
+/// `session_worker_stale_secs` bounds the worker-session broken-session scan
+/// (issue #606): a session's host is considered dead once its
+/// `harvest_workers` heartbeat is older than this many seconds. Mirrors the
+/// poison-pill reclaimer's `worker_stale_secs` convention (`2 ×
+/// worker_heartbeat_interval`, computed once by the caller).
+///
+/// # Errors
+///
 /// Returns the first database or persistence error encountered.
+#[allow(clippy::too_many_arguments)]
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
@@ -1612,6 +1631,7 @@ pub async fn enforce_timeouts_once(
     shard_assignments: &[crate::types::ShardId],
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
 ) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
@@ -1701,6 +1721,7 @@ pub async fn enforce_timeouts_once(
     if let Some(ceiling) = max_workflow_history_events {
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
+    count += crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs).await?;
     Ok(count)
 }
 
@@ -1722,6 +1743,7 @@ pub fn spawn_timeout_checker(
     shard_assignments: Vec<crate::types::ShardId>,
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
     max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1744,6 +1766,7 @@ pub fn spawn_timeout_checker(
                     &shard_assignments,
                     Some(&circuit_breakers),
                     max_workflow_history_events,
+                    session_worker_stale_secs,
                 )
                 .await
                 {

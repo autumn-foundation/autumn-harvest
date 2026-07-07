@@ -7876,6 +7876,7 @@ mod tests {
             context_headers: None,
             created_at: Some(now),
             wake_requested: false,
+            session_id: None,
         }
     }
 

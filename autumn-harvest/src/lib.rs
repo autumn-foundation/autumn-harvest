@@ -130,6 +130,8 @@ pub mod replay;
 pub mod reset;
 pub mod retention;
 pub mod saga;
+/// Worker session fleet-side registry and pure decision functions (issue #606).
+pub mod sessions;
 pub mod shard;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
@@ -224,8 +226,9 @@ pub use calendar::{
 };
 pub use completion_trigger::{CompletionTrigger, InputMapping, TerminalState};
 pub use context::{
-    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, RaceBuilder, RaceWinner,
-    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy,
+    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+    DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder, RaceWinner, Session, SessionOptions,
+    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -345,7 +348,7 @@ pub use testing::{
 };
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
-    ExternalSignalId, ParentClosePolicy, Priority, ShardId, TimerId, UpdateId, WorkerId,
+    ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, TimerId, UpdateId, WorkerId,
     WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
