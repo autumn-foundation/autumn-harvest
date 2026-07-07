@@ -394,10 +394,21 @@ async fn pause_then_resume_transitions_and_records_events() {
     .expect("pause should succeed");
     assert!(paused.newly_paused);
     assert_eq!(paused.state, "PAUSED");
+    assert!(
+        paused.paused_at.is_some(),
+        "pause result must report when the pause took effect (issue #609)"
+    );
     assert_eq!(get_state(&mut conn, exec_id).await, "PAUSED");
 
     let (paused_at, reason, actor) = pause_columns(&mut conn, exec_id).await;
-    assert!(paused_at.is_some(), "paused_at must be set");
+    let column_at = paused_at.expect("paused_at must be set");
+    // Tolerant comparison: the column round-trips through Postgres at
+    // microsecond precision while the result carries the in-memory instant.
+    let reported_at = paused.paused_at.expect("checked Some above");
+    assert!(
+        (reported_at - column_at).abs() < chrono::Duration::milliseconds(1),
+        "reported paused_at must match the persisted column"
+    );
     assert_eq!(reason.as_deref(), Some("investigating"));
     assert_eq!(actor.as_deref(), Some("oncall@example.com"));
 
@@ -412,6 +423,10 @@ async fn pause_then_resume_transitions_and_records_events() {
     let resumed = resume_workflow_execution(&mut conn, exec_id, "oncall@example.com", &NoOpMetrics)
         .await
         .expect("resume should succeed");
+    assert!(
+        resumed.newly_resumed,
+        "a genuine PAUSED → RUNNING transition must report newly_resumed"
+    );
     assert_eq!(resumed.state, "RUNNING");
     assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
 
@@ -509,6 +524,135 @@ async fn resume_without_deadline_leaves_it_null() {
     );
 }
 
+// ── schedule_to_close × pause (issue #609, AC5) ─────────────────────────────
+
+/// Inserts a PENDING activity task for `exec_id` carrying the given
+/// cross-retry deadline (`schedule_to_close_at`, issue #378).
+async fn insert_pending_activity_task(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    schedule_to_close_at: chrono::DateTime<chrono::Utc>,
+) -> uuid::Uuid {
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input, state, \
+          attempt, max_attempts, schedule_to_close_at) \
+         VALUES ($1, 'default', 'activity', $2, 'deadline_activity', $3, '{}'::jsonb, 'PENDING', \
+                 0, 10, $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .execute(conn)
+    .await
+    .expect("insert pending activity task");
+    task_id
+}
+
+#[tokio::test]
+async fn schedule_to_close_scanner_skips_paused_executions() {
+    // Pause suspends the cross-retry wall-clock deadline: an expired
+    // schedule_to_close_at on a PAUSED execution's task must not be enforced
+    // by the scanner, while a RUNNING execution's identical task must be.
+    use autumn_harvest::timeout::{TimeoutReason, find_timed_out_tasks};
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "s2c-pause-1").await;
+    let task_id = insert_pending_activity_task(
+        &mut conn,
+        exec_id,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("contain"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    let timed_out = find_timed_out_tasks(&mut conn)
+        .await
+        .expect("scan should succeed");
+    assert!(
+        !timed_out
+            .iter()
+            .any(|(t, r)| t.id == task_id && *r == TimeoutReason::ScheduleToClose),
+        "the cross-retry deadline must be suspended while the owning execution is PAUSED"
+    );
+
+    // After resume the (shifted) deadline applies again. Force it back into
+    // the past so the post-resume enforcement branch is observable without
+    // waiting out a real pause span.
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET schedule_to_close_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("backdate deadline");
+
+    let timed_out = find_timed_out_tasks(&mut conn)
+        .await
+        .expect("scan should succeed");
+    assert!(
+        timed_out
+            .iter()
+            .any(|(t, r)| t.id == task_id && *r == TimeoutReason::ScheduleToClose),
+        "a RUNNING execution's expired cross-retry deadline must still be enforced"
+    );
+}
+
+#[tokio::test]
+async fn resume_shifts_schedule_to_close_at_by_pause_span() {
+    // AC5 (issue #609) × #378: resume pushes each open task's
+    // schedule_to_close_at forward by the clamped pause span so paused
+    // wall-clock is not charged against the activity's cross-retry budget.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "s2c-shift-1").await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    let now = chrono::Utc::now();
+    let deadline_before = now + chrono::Duration::minutes(10);
+    let task_id = insert_pending_activity_task(&mut conn, exec_id, deadline_before).await;
+
+    // Backdate the pause 30 minutes so the resume computes a deterministic,
+    // non-zero span (mirrors resume_extends_deadline_by_pause_duration).
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+    diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
+        .set(e::paused_at.eq(Some(now - chrono::Duration::minutes(30))))
+        .execute(&mut conn)
+        .await
+        .expect("backdate paused_at for test");
+
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+
+    use autumn_harvest::schema::harvest_task_queue as t;
+    let deadline_after: Option<chrono::DateTime<chrono::Utc>> = t::table
+        .filter(t::id.eq(task_id))
+        .select(t::schedule_to_close_at)
+        .first(&mut conn)
+        .await
+        .expect("task must exist");
+    let deadline_after = deadline_after.expect("deadline must remain set");
+    let shift = deadline_after - deadline_before;
+    assert!(
+        shift >= chrono::Duration::minutes(29) && shift <= chrono::Duration::minutes(31),
+        "schedule_to_close_at must shift forward by the ~30-minute pause span, got {shift:?}"
+    );
+}
+
 #[tokio::test]
 async fn pause_is_idempotent() {
     let (url, _c) = setup().await;
@@ -523,6 +667,16 @@ async fn pause_is_idempotent() {
         .await
         .unwrap();
     assert!(!second.newly_paused, "second pause must be idempotent");
+    let first_at = first.paused_at.expect("fresh pause must report paused_at");
+    let second_at = second
+        .paused_at
+        .expect("an idempotent repeat must still report when the pause took effect");
+    // Tolerant comparison (µs column precision vs ns in-memory instant): the
+    // repeat must report the original pause instant, not its own timestamp.
+    assert!(
+        (second_at - first_at).abs() < chrono::Duration::milliseconds(1),
+        "expected the original pause instant, got {second_at} vs {first_at}"
+    );
 
     let pause_events = history(&mut conn, exec_id)
         .await
@@ -559,15 +713,75 @@ async fn pause_unknown_execution_is_not_found() {
 }
 
 #[tokio::test]
-async fn resume_requires_paused_state() {
+async fn resume_of_running_execution_is_a_success_noop() {
+    // AC7 (issue #609): resuming a non-paused run is a success no-op —
+    // an idempotent operator retry must not error.
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
     let exec_id = start(&mut conn, "wf", "r-running").await;
-    // RUNNING (not paused) → conflict.
-    let err = resume_workflow_execution(&mut conn, exec_id, "a", &NoOpMetrics)
+
+    let resumed = resume_workflow_execution(&mut conn, exec_id, "a", &NoOpMetrics)
         .await
-        .expect_err("resuming a non-paused execution must conflict");
-    assert!(matches!(err, HarvestError::Config(_)), "got {err:?}");
+        .expect("resuming a never-paused execution must be a success no-op");
+    assert!(!resumed.newly_resumed);
+    assert_eq!(resumed.state, "RUNNING");
+    assert!(resumed.pause_duration_secs.abs() < f64::EPSILON);
+
+    // Nothing was mutated: state unchanged, no WorkflowExecutionResumed event.
+    assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowExecutionResumed { .. })),
+        "a no-op resume must not append an event"
+    );
+}
+
+#[tokio::test]
+async fn resume_of_completed_execution_is_a_success_noop() {
+    // AC7 (issue #609): a resume retried after the run completed post-resume
+    // must not error either.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "r-completed").await;
+
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+    diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
+        .set((
+            e::state.eq("COMPLETED"),
+            e::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seal execution COMPLETED for test");
+
+    let resumed = resume_workflow_execution(&mut conn, exec_id, "a", &NoOpMetrics)
+        .await
+        .expect("resuming a terminal execution must be a success no-op");
+    assert!(!resumed.newly_resumed);
+    assert_eq!(resumed.state, "COMPLETED");
+    assert!(resumed.pause_duration_secs.abs() < f64::EPSILON);
+    assert_eq!(get_state(&mut conn, exec_id).await, "COMPLETED");
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowExecutionResumed { .. })),
+        "a no-op resume must not append an event"
+    );
+}
+
+#[tokio::test]
+async fn resume_of_unknown_execution_is_not_found() {
+    // Unknown ids stay a 404 — only *existing* non-paused runs no-op.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let missing = ExecutionId::new_for_shard(ShardId::new(0));
+    let err = resume_workflow_execution(&mut conn, missing, "a", &NoOpMetrics)
+        .await
+        .expect_err("resuming a missing execution must 404");
+    assert!(matches!(err, HarvestError::NotFound(_)), "got {err:?}");
 }
 
 #[tokio::test]

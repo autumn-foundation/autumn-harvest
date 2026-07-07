@@ -126,16 +126,30 @@ pub const fn schedule_to_start_timeout_query() -> &'static str {
 /// - `state IN ('RUNNING', 'PENDING')`
 /// - `schedule_to_close_at IS NOT NULL`
 /// - `schedule_to_close_at < NOW()`
+/// - the owning execution is not `PAUSED`
 ///
 /// Fires for in-flight executions (RUNNING) and tasks queued past their
 /// deadline (PENDING). The partial index on `schedule_to_close_at` makes
 /// this scan cheap.
+///
+/// Pause suspends the cross-retry deadline clock (issue #609, AC5): a task
+/// whose owning execution is `PAUSED` is excluded here — resume shifts its
+/// `schedule_to_close_at` forward by the pause span
+/// ([`crate::execution::shift_schedule_to_close_on_resume_query`]). This is
+/// deliberately scoped to this reason only: heartbeat, start-to-close, and
+/// schedule-to-start enforcement stay pause-blind because already-dispatched
+/// work runs to completion under pause (issue #383), so a hung in-flight
+/// activity of a paused execution must still time out.
 #[must_use]
 pub const fn schedule_to_close_timeout_query() -> &'static str {
-    "SELECT * FROM harvest_task_queue \
-     WHERE state IN ('RUNNING', 'PENDING') \
-     AND schedule_to_close_at IS NOT NULL \
-     AND schedule_to_close_at < NOW()"
+    "SELECT t.* FROM harvest_task_queue t \
+     WHERE t.state IN ('RUNNING', 'PENDING') \
+     AND t.schedule_to_close_at IS NOT NULL \
+     AND t.schedule_to_close_at < NOW() \
+     AND NOT EXISTS (\
+         SELECT 1 FROM harvest_workflow_executions e \
+         WHERE e.id = t.workflow_exec_id \
+         AND e.state = 'PAUSED')"
 }
 
 /// SQL query to find RUNNING workflow executions that have exceeded their
@@ -2099,6 +2113,33 @@ mod tests {
             "should reference schedule_to_close_at column"
         );
         assert!(sql.contains("NOW()"), "should compare against NOW()");
+    }
+
+    #[test]
+    fn schedule_to_close_timeout_query_excludes_paused_executions() {
+        // AC5 (issue #609): the cross-retry wall-clock deadline is suspended
+        // while the owning execution is PAUSED — the scanner must skip those
+        // tasks; resume shifts `schedule_to_close_at` forward by the pause
+        // span instead.
+        let sql = schedule_to_close_timeout_query();
+        assert!(
+            sql.contains("PAUSED"),
+            "must exclude tasks whose owning execution is PAUSED"
+        );
+        assert!(
+            sql.contains("harvest_workflow_executions"),
+            "must consult the owning execution's state"
+        );
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "an orphan task (NULL workflow_exec_id) must remain enforceable"
+        );
+        // The other three enforcement reasons deliberately stay pause-blind:
+        // already-dispatched work runs to completion (issue #383), so a hung
+        // in-flight activity of a paused execution must still time out.
+        assert!(!heartbeat_timeout_query().contains("PAUSED"));
+        assert!(!start_to_close_timeout_query().contains("PAUSED"));
+        assert!(!schedule_to_start_timeout_query().contains("PAUSED"));
     }
 
     #[test]

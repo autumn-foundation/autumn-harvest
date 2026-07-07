@@ -5035,6 +5035,33 @@ fn schedule_to_close_deadline_exceeded(
     chrono::Utc::now() + retry_delay >= deadline
 }
 
+/// Non-locking read of whether the owning execution is currently `PAUSED`.
+///
+/// Gates the retry path's `schedule_to_close` deadline check (issue #609,
+/// AC5): pause suspends the cross-retry deadline clock, so a failing activity
+/// of a paused execution is requeued normally instead of deadline-failed —
+/// resume shifts `schedule_to_close_at` forward by the pause span, and the
+/// requeued row is `PENDING` so the shift covers it. A pause landing after
+/// this read deadline-fails the task, consistent with the
+/// "already-dispatched work runs to completion" boundary in-flight
+/// enforcement has under pause (issue #383). Scoped: this extra indexed read
+/// runs only when the task carries a deadline *and* that deadline check
+/// already failed.
+async fn owning_execution_is_paused(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+    let state: Option<String> = exec_dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(exec_dsl::state)
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(state.as_deref() == Some("PAUSED"))
+}
+
 /// Append `ActivityTimedOut { ScheduleToClose }` and fail the task row.
 ///
 /// Called from the retry path when the cross-retry wall-clock deadline
@@ -5119,8 +5146,13 @@ async fn handle_activity_result(
             if let Some(delay) = delay {
                 // Pre-retry deadline check (issue #378): if the schedule_to_close
                 // wall-clock deadline would be exceeded before the next attempt
-                // starts, fail with ScheduleToClose instead of requeuing.
-                if schedule_to_close_deadline_exceeded(task, delay) {
+                // starts, fail with ScheduleToClose instead of requeuing — unless
+                // the owning execution is PAUSED (issue #609, AC5): the pause
+                // suspends the deadline clock, so requeue normally and let the
+                // resume-time shift push the deadline forward.
+                if schedule_to_close_deadline_exceeded(task, delay)
+                    && !owning_execution_is_paused(conn, exec_id).await?
+                {
                     return record_schedule_to_close_activity_timeout(
                         conn,
                         task,
