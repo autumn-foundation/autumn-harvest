@@ -213,6 +213,7 @@ fn minimal_registry() -> Arc<HandlerRegistry> {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,

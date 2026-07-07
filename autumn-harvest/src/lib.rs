@@ -143,6 +143,8 @@ pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+/// Workflow-start throttle — pace admissions, defer the excess (issue #607).
+pub mod throttle;
 pub mod types;
 pub mod update;
 /// Read-only per-tenant/per-workflow usage aggregation (issue #596).

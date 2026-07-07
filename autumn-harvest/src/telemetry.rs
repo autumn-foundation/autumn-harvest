@@ -423,6 +423,16 @@ pub const METRIC_WORKFLOW_DEBOUNCED: &str = "harvest.workflow.debounced";
 /// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
 pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
 
+/// Counter: incremented each time a workflow start is deferred by a start
+/// throttle because no token was available (issue #607).
+///
+/// Labeled by `workflow` (workflow type name) only. The resolved throttle key is
+/// high-cardinality (tenant/user input), so per ADR-0001 §7 it is deliberately
+/// **not** a metric label — per-key backlog is exposed via the
+/// `GET /admin/start-throttle` admin read instead. `execution.id` is span-only
+/// and must never appear here.
+pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_throttled";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
@@ -1683,6 +1693,16 @@ pub trait MetricsRecorder: Send + Sync {
     /// `workflow` and `queue`.
     fn record_debounce_fired(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A workflow start was deferred by a start throttle (issue #607).
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_START_THROTTLED`] with label
+    /// `workflow`. The resolved throttle key is deliberately **not** a label
+    /// (unbounded cardinality, ADR-0001 §7); per-key backlog is exposed via the
+    /// `GET /admin/start-throttle` admin read.
+    fn record_start_throttled(&self, workflow_name: &str) {
+        let _ = workflow_name;
     }
 
     /// A request reached an inbound webhook receiver route (issue #344).

@@ -245,6 +245,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -267,6 +268,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,

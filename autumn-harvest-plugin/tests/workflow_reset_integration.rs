@@ -551,6 +551,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,

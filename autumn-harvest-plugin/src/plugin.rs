@@ -1102,6 +1102,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             sla: None,
             owner: None,

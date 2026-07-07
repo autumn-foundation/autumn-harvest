@@ -861,6 +861,7 @@ fn make_workflow_info(name: &'static str) -> autumn_harvest::info::WorkflowInfo 
         concurrency: None,
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

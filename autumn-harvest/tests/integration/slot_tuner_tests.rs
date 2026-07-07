@@ -204,6 +204,7 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,

@@ -120,6 +120,11 @@ pub enum BatchStartItemStatus {
     /// The item was rejected (unknown workflow type, duplicate id, over-size
     /// payload, malformed input, etc.).
     Rejected,
+    /// The item was deferred by a start throttle (issue #607): no token was
+    /// available, so a durable pending-start row was written and the execution
+    /// will be admitted later by the throttle scanner. Not a failure — the item
+    /// is neither dropped nor rejected.
+    Deferred,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

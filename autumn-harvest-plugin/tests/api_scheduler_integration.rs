@@ -423,6 +423,7 @@ fn approval_registry() -> Arc<HandlerRegistry> {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -452,6 +453,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -474,6 +476,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2016,6 +2019,7 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -3068,6 +3072,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -3109,6 +3114,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -3193,6 +3199,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3253,6 +3260,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3322,6 +3330,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3378,6 +3387,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3443,6 +3453,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4074,6 +4085,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5015,6 +5027,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5130,6 +5143,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,

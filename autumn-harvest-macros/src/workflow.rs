@@ -76,6 +76,26 @@ struct BatchArgs {
     max_wait: String,
 }
 
+struct ThrottleArgs {
+    rate: String,
+    burst: Option<f64>,
+    key: Option<String>,
+    schedule_to_start: Option<String>,
+}
+
+/// Validate a rate string like `"100/m"` at macro-expansion time so a typo is a
+/// build error, not a registration-time panic from the emitted `.expect(...)`.
+/// Mirrors the runtime `autumn_harvest::throttle::parse_rate` grammar.
+fn is_valid_rate(s: &str) -> bool {
+    let Some((count, unit)) = s.split_once('/') else {
+        return false;
+    };
+    let Ok(n) = count.trim().parse::<f64>() else {
+        return false;
+    };
+    n > 0.0 && matches!(unit.trim(), "s" | "m" | "h")
+}
+
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
     /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
@@ -88,6 +108,9 @@ struct WorkflowAttrs {
     /// Event batching policy (issue #518). Parsed from
     /// `#[workflow(batch(key = "input.tenant_id", max_size = 10, max_wait = "30s"))]`.
     batch: Option<BatchArgs>,
+    /// Start-throttle policy (issue #607). Parsed from
+    /// `#[workflow(throttle(rate = "100/m", burst = 20, key = "input.tenant_id", schedule_to_start = "5m"))]`.
+    throttle: Option<ThrottleArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
@@ -115,6 +138,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         concurrency: None,
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook: None,
@@ -268,6 +292,71 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.batch = Some(BatchArgs { key_expr, max_size, max_wait });
             Ok(())
+        } else if meta.path.is_ident("throttle") {
+            let mut rate: Option<String> = None;
+            let mut burst: Option<f64> = None;
+            let mut key: Option<String> = None;
+            let mut schedule_to_start: Option<String> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("rate") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    if !is_valid_rate(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid throttle `rate`; expected \"<count>/<unit>\" with unit s, m, or h (e.g. \"100/m\")",
+                        ));
+                    }
+                    rate = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("burst") {
+                    // Accept an integer or float literal.
+                    let value: syn::Lit = inner.value()?.parse()?;
+                    let n = match value {
+                        syn::Lit::Int(i) => i.base10_parse::<f64>()?,
+                        syn::Lit::Float(f) => f.base10_parse::<f64>()?,
+                        other => {
+                            return Err(syn::Error::new_spanned(
+                                other,
+                                "throttle `burst` must be an integer or float",
+                            ))
+                        }
+                    };
+                    if n <= 0.0 {
+                        return Err(inner.error("throttle `burst` must be greater than zero"));
+                    }
+                    burst = Some(n);
+                    Ok(())
+                } else if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("schedule_to_start") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    if !is_valid_task_duration(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid throttle `schedule_to_start` duration; expected e.g. \"30s\", \"5m\", \"1h\"",
+                        ));
+                    }
+                    schedule_to_start = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(inner.error("expected `rate`, `burst`, `key`, or `schedule_to_start`"))
+                }
+            })?;
+            let rate = rate.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "throttle requires `rate = \"...\"` (e.g. `rate = \"100/m\"`)",
+                )
+            })?;
+            result.throttle = Some(ThrottleArgs {
+                rate,
+                burst,
+                key,
+                schedule_to_start,
+            });
+            Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
             result.allow_nondeterministic_apis = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
@@ -312,7 +401,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -543,6 +632,47 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit throttle as Option<ThrottlePolicy> (issue #607). All parsing is
+    // delegated to the core `from_rate_str` (single source of truth); the rate
+    // and durations are already compile-time validated above.
+    let throttle_expr = match attrs.throttle {
+        None => quote! { ::std::option::Option::None },
+        Some(ThrottleArgs {
+            rate,
+            burst,
+            key,
+            schedule_to_start,
+        }) => {
+            let burst_expr = burst.map_or_else(
+                || quote! { ::std::option::Option::None },
+                |b| quote! { ::std::option::Option::Some(#b) },
+            );
+            let key_expr = key.as_deref().map_or_else(
+                || quote! { ::std::option::Option::None },
+                |k| quote! { ::std::option::Option::Some(#k) },
+            );
+            let sts_expr = schedule_to_start.as_deref().map_or_else(
+                || quote! { ::std::option::Option::None },
+                |s| {
+                    quote! {
+                        ::std::option::Option::Some(
+                            ::autumn_harvest::task_duration(#s)
+                                .expect("throttle schedule_to_start must be a valid duration string")
+                        )
+                    }
+                },
+            );
+            quote! {
+                ::std::option::Option::Some(
+                    ::autumn_harvest::throttle::ThrottlePolicy::from_rate_str(
+                        #rate, #burst_expr, #key_expr, #sts_expr,
+                    )
+                    .expect("throttle rate must be a valid rate string")
+                )
+            }
+        }
+    };
+
     let max_input_bytes_expr = attrs
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
@@ -606,6 +736,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 concurrency: #concurrency_expr,
                 debounce: #debounce_expr,
                 batch: #batch_expr,
+                throttle: #throttle_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
@@ -697,6 +828,28 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "workflow '{0}' has a debounce policy; debounced starts \
                                      must use the HTTP start route POST /workflows/{0}/start \
                                      (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
+                    // Same rationale as debounce: a throttle defers excess starts,
+                    // which the typed client cannot express (no exec_id-keyed handle
+                    // exists for a deferred start). A keyed throttle applies only when
+                    // its key resolves; an unkeyed (global) throttle always applies.
+                    if let ::std::option::Option::Some(throttle_policy) = info.throttle {
+                        let throttle_applies = match throttle_policy.key_expr {
+                            ::std::option::Option::Some(k) => {
+                                ::autumn_harvest::throttle::resolve_throttle_key(k, &input).is_some()
+                            }
+                            ::std::option::Option::None => true,
+                        };
+                        if throttle_applies {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has a start-throttle policy; throttled starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred throttled start)",
                                     info.name,
                                 )),
                             );
@@ -844,6 +997,28 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "workflow '{0}' has a debounce policy; debounced starts \
                                      must use the HTTP start route POST /workflows/{0}/start \
                                      (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
+                    // Same rationale as debounce: a throttle defers excess starts,
+                    // which the typed client cannot express (no exec_id-keyed handle
+                    // exists for a deferred start). A keyed throttle applies only when
+                    // its key resolves; an unkeyed (global) throttle always applies.
+                    if let ::std::option::Option::Some(throttle_policy) = info.throttle {
+                        let throttle_applies = match throttle_policy.key_expr {
+                            ::std::option::Option::Some(k) => {
+                                ::autumn_harvest::throttle::resolve_throttle_key(k, &input).is_some()
+                            }
+                            ::std::option::Option::None => true,
+                        };
+                        if throttle_applies {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has a start-throttle policy; throttled starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred throttled start)",
                                     info.name,
                                 )),
                             );

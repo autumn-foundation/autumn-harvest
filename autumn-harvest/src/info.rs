@@ -187,6 +187,13 @@ pub struct WorkflowInfo {
     pub debounce: Option<crate::debounce::DebouncePolicy>,
     /// Optional batch policy for folding multiple trigger payloads into a single run (issue #518).
     pub batch: Option<crate::event_batch::BatchPolicy>,
+    /// Optional start-throttle policy to pace admissions and defer the excess (issue #607).
+    ///
+    /// When set, each qualifying start reserves one token from a per-key bucket;
+    /// excess starts (when the bucket is empty) are durably deferred and admitted
+    /// later by a scanner as tokens refill. `None` = no throttle; start behavior
+    /// is byte-for-byte unchanged.
+    pub throttle: Option<crate::throttle::ThrottlePolicy>,
     /// Per-workflow-type override for the workflow-input size cap (issue #252).
     ///
     /// When set, this raises (never lowers) the global `max_workflow_input_bytes`
@@ -259,6 +266,25 @@ impl WorkflowInfo {
     #[must_use]
     pub const fn with_debounce(mut self, policy: crate::debounce::DebouncePolicy) -> Self {
         self.debounce = Some(policy);
+        self
+    }
+
+    /// Attach a start-throttle policy to pace admissions and defer the excess (issue #607).
+    ///
+    /// Fluent builder method — call after the companion function:
+    /// ```rust,ignore
+    /// use autumn_harvest::throttle::ThrottlePolicy;
+    ///
+    /// .workflows(vec![
+    ///     sync_tenant_info().with_throttle(
+    ///         ThrottlePolicy::from_rate_str("100/m", Some(20.0), Some("input.tenant_id"), None)
+    ///             .expect("valid throttle rate"),
+    ///     )
+    /// ])
+    /// ```
+    #[must_use]
+    pub const fn with_throttle(mut self, policy: crate::throttle::ThrottlePolicy) -> Self {
+        self.throttle = Some(policy);
         self
     }
 
@@ -900,6 +926,7 @@ impl DagInfo {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: self.owner,
             runbook_url: self.runbook_url,
@@ -931,6 +958,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("concurrency", &self.concurrency)
             .field("debounce", &self.debounce)
             .field("batch", &self.batch)
+            .field("throttle", &self.throttle)
             .field("max_input_bytes", &self.max_input_bytes)
             .field("owner", &self.owner)
             .field("runbook_url", &self.runbook_url)
@@ -1040,6 +1068,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1069,6 +1098,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1095,6 +1125,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1121,6 +1152,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1152,6 +1184,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1181,6 +1214,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1227,6 +1261,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1265,6 +1300,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1300,6 +1336,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1343,6 +1380,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1379,6 +1417,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1410,6 +1449,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1636,6 +1676,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1709,6 +1750,7 @@ mod tests {
             concurrency: None,
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

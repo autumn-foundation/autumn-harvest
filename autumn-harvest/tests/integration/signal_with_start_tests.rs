@@ -639,6 +639,7 @@ fn wf_info_with_schema(name: &'static str) -> WorkflowInfo {
         concurrency: None,
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

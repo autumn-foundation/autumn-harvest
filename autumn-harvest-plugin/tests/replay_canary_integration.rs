@@ -238,6 +238,7 @@ fn activity_wf_info() -> autumn_harvest::info::WorkflowInfo {
         concurrency: None,
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

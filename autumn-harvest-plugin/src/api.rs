@@ -2960,6 +2960,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(debounce_status).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/start-throttle",
+            // Admin-gated: the response includes raw throttle_key values, which
+            // resolve from user/tenant-derived fields (issue #607). Parity with
+            // /admin/debounce and /admin/concurrency.
+            get(start_throttle_status).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/rate-limits",
             get(list_rate_limits).route_layer(require_admin.clone()),
         )
@@ -3288,6 +3295,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/concurrency"),
         ("GET", "/admin/usage"),
         ("GET", "/admin/debounce"),
+        ("GET", "/admin/start-throttle"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         ("GET", "/admin/circuits"),
@@ -4126,6 +4134,7 @@ pub const fn management_api_response_fields()
         ),
         ("GET", "/batches/pending", None),
         ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
+        ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
@@ -7031,6 +7040,31 @@ fn workflow_has_resolving_debounce(
         })
 }
 
+/// Resolve an applicable start-throttle policy for a workflow start (issue #607).
+///
+/// Returns `Some((policy, resolved_key))` when a throttle applies:
+/// - a **keyed** throttle applies only when its key resolves against the input
+///   (`resolved_key` = the resolved value);
+/// - an **unkeyed** (global-per-workflow) throttle always applies
+///   (`resolved_key` = `""`).
+///
+/// Returns `None` when there is no throttle policy, or a keyed throttle whose
+/// key does not resolve — in which case the start proceeds on the normal path.
+fn workflow_resolving_throttle(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+    input: &Value,
+) -> Option<(autumn_harvest::throttle::ThrottlePolicy, String)> {
+    let policy = *registry.workflows.get(workflow_name)?.throttle.as_ref()?;
+    policy.key_expr.map_or_else(
+        || Some((policy, String::new())),
+        |k| {
+            autumn_harvest::throttle::resolve_throttle_key(k, input)
+                .map(|resolved| (policy, resolved))
+        },
+    )
+}
+
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -7224,6 +7258,21 @@ pub(crate) async fn start_workflow(
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "debounce and batching are mutually exclusive" })),
+        )
+            .into_response();
+    }
+
+    // Start-throttle applicability (issue #607). A throttle is mutually exclusive
+    // with debounce/batch: those collapse a burst into one run, a throttle paces
+    // and defers every start — combining them has no coherent semantics.
+    let throttle_applies =
+        workflow_resolving_throttle(&runtime.registry, &workflow_name, &input).is_some();
+    if throttle_applies && (is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "start throttle is mutually exclusive with debounce and batching"
+            })),
         )
             .into_response();
     }
@@ -7846,6 +7895,9 @@ pub(crate) async fn start_workflow(
                     workflow_retry_policy: debounce_workflow_retry_policy,
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                     completion_callbacks: completion_callbacks.clone(),
+                    schedule_id: None,
+                    scheduled_for: None,
+                    origin: None,
                 },
             };
 
@@ -8142,6 +8194,9 @@ pub(crate) async fn start_workflow(
                 workflow_retry_policy: batch_workflow_retry_policy,
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                 completion_callbacks: completion_callbacks.clone(),
+                schedule_id: None,
+                scheduled_for: None,
+                origin: None,
             },
         };
 
@@ -8284,6 +8339,160 @@ pub(crate) async fn start_workflow(
                 .map_or(sla, |hard| sla.min(hard))
         });
 
+    // Start-throttle admission (issue #607): pace admissions, defer the excess.
+    // Runs after the admission gate (checked above) so halt (gate) always beats
+    // pace (throttle), and after the effective SLA/timeout are resolved so a
+    // deferred start carries the same effective options as an immediate one.
+    // On reserve the token is refunded below if the start short-circuits under a
+    // reuse policy (a start that consumed no admission consumes no token, AC-a).
+    let mut throttle_reserved: Option<String> = None;
+    if let Some((throttle_policy, resolved_throttle_key)) =
+        workflow_resolving_throttle(&runtime.registry, &workflow_name, &input)
+    {
+        // A throttle defers until a token frees, so an explicit scheduled start
+        // (start_at/delay) is contradictory — reject the combination.
+        if request.start_at.is_some() || delay.is_some() {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("throttle cannot be combined with start_at or delay"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return AutumnError::bad_request_msg(
+                "throttle cannot be combined with start_at or delay",
+            )
+            .into_response();
+        }
+        // Fail fast on an oversized input rather than persisting a pending row
+        // that would fail at fire time on every scanner tick.
+        if effective_wf_cap > 0 {
+            let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+            if observed > effective_wf_cap {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("workflow input exceeds cap"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return AutumnError::bad_request_msg(format!(
+                    "workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)",
+                ))
+                .into_response();
+            }
+        }
+
+        let start_options = autumn_harvest::debounce::DebounceStartOptions {
+            reuse_policy: request.reuse_policy.clone(),
+            execution_timeout_secs: request.execution_timeout_secs.or_else(|| {
+                info_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map(|d| d.num_seconds())
+            }),
+            memo: request.memo.clone(),
+            search_attrs: request.search_attrs.clone(),
+            sla_secs: effective_sla.map(|d| d.num_seconds()),
+            context_headers: None,
+            priority: None,
+            concurrency_key: concurrency_key.clone(),
+            concurrency_limit,
+            owner: owner.map(str::to_string),
+            runbook_url: runbook_url.map(str::to_string),
+            severity: severity.map(str::to_string),
+            max_execution_timeout_ceiling_secs: api_state
+                .max_workflow_execution_timeout()
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds()),
+            max_workflow_input_bytes: Some(effective_wf_cap),
+            trace_context: trace_ctx.clone(),
+            workflow_retry_policy: workflow_retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok()),
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            completion_callbacks: completion_callbacks.clone(),
+            schedule_id: None,
+            scheduled_for: None,
+            origin: None,
+        };
+
+        match autumn_harvest::throttle::reserve_or_defer(
+            &mut conn,
+            autumn_harvest::throttle::AdmitThrottleParams {
+                workflow_name: &workflow_name,
+                throttle_key: &resolved_throttle_key,
+                workflow_id: &workflow_id,
+                queue_name: &queue_name,
+                input: input.clone(),
+                start_options,
+                refill_per_sec: throttle_policy.refill_per_sec,
+                burst: throttle_policy.burst,
+                schedule_to_start: throttle_policy.schedule_to_start,
+                shard_id: shard.as_i32(),
+            },
+        )
+        .await
+        {
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(outcome)) => {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_start_throttled(&workflow_name);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(outcome.workflow_id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(error = %audit_err, "audit insert failed for throttled workflow.start");
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "throttled": true,
+                        "workflow_name": workflow_name,
+                        "workflow_id": outcome.workflow_id,
+                        "throttle_key": outcome.throttle_key,
+                        "deferred_at": outcome.deferred_at,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                throttle_reserved = Some(bucket_key);
+                // Fall through to the normal start on the same connection.
+            }
+            Err(e) => return map_error(e).into_response(),
+        }
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
@@ -8338,6 +8547,11 @@ pub(crate) async fn start_workflow(
         }) => {
             // AlreadyExists is a non-error outcome for some reuse policies;
             // record it as a failed audit so the caller can see the conflict.
+            // AC-a: an id-reuse short-circuit consumed no admission — refund the
+            // throttle token reserved above.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
             let exec_id_str = existing_exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -8363,6 +8577,11 @@ pub(crate) async fn start_workflow(
                 .into_response()
         }
         Err(e) => {
+            // The start failed for an unrelated reason; no run was admitted, so
+            // refund the reserved throttle token.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
             let err_str = e.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -8381,6 +8600,13 @@ pub(crate) async fn start_workflow(
             map_error(e).into_response()
         }
         Ok(start) => {
+            // AC-a: a start that attached to an existing run (rather than
+            // creating one) consumed no admission — refund the reserved token.
+            if !start.created
+                && let Some(ref bucket) = throttle_reserved
+            {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
             let exec_id_str = start.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -8976,6 +9202,91 @@ async fn batch_start_workflows(
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
             let item_workflow_retry_policy = info_retry_policy;
 
+            // Start-throttle admission (issue #607) — best-effort batches only.
+            // Atomic batches are all-or-nothing synchronous inserts, which is
+            // fundamentally incompatible with pacing/deferral, so throttle does
+            // not apply to them. On defer, the item is reported `deferred` (not a
+            // failure) and the durable pending row is admitted later by the
+            // scanner. On reserve, the token is refunded below if the start
+            // short-circuits (AC-a).
+            let mut item_throttle_bucket: Option<String> = None;
+            if !request.atomic
+                && let Some((throttle_policy, resolved_throttle_key)) =
+                    workflow_resolving_throttle(&runtime.registry, &item.workflow_name, &input)
+            {
+                let start_options = autumn_harvest::debounce::DebounceStartOptions {
+                    reuse_policy: None,
+                    execution_timeout_secs: None,
+                    memo: None,
+                    search_attrs: item.search_attributes.clone(),
+                    sla_secs: sla.map(|d| d.num_seconds()),
+                    context_headers: None,
+                    priority: None,
+                    concurrency_key: concurrency_key.clone(),
+                    concurrency_limit,
+                    owner: owner.map(str::to_string),
+                    runbook_url: runbook_url.map(str::to_string),
+                    severity: severity.map(str::to_string),
+                    max_execution_timeout_ceiling_secs: max_exec_timeout_ceiling
+                        .map(|d| d.num_seconds()),
+                    max_workflow_input_bytes: Some(effective_wf_cap),
+                    trace_context: trace_ctx.clone(),
+                    workflow_retry_policy: item_workflow_retry_policy
+                        .as_ref()
+                        .and_then(|p| serde_json::to_value(p).ok()),
+                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                    completion_callbacks: None,
+                    schedule_id: None,
+                    scheduled_for: None,
+                    origin: None,
+                };
+                match autumn_harvest::throttle::reserve_or_defer(
+                    &mut conn,
+                    autumn_harvest::throttle::AdmitThrottleParams {
+                        workflow_name: &item.workflow_name,
+                        throttle_key: &resolved_throttle_key,
+                        workflow_id,
+                        queue_name: &queue_name,
+                        input: input.clone(),
+                        start_options,
+                        refill_per_sec: throttle_policy.refill_per_sec,
+                        burst: throttle_policy.burst,
+                        schedule_to_start: throttle_policy.schedule_to_start,
+                        shard_id: shard.as_i32(),
+                    },
+                )
+                .await
+                {
+                    Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(_)) => {
+                        runtime
+                            .registry
+                            .telemetry()
+                            .metrics
+                            .record_start_throttled(&item.workflow_name);
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            status: BatchStartItemStatus::Deferred,
+                            execution_id: None,
+                            error: None,
+                        });
+                        continue;
+                    }
+                    Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                        item_throttle_bucket = Some(bucket_key);
+                    }
+                    Err(e) => {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: None,
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                }
+            }
+
             // Debounced item: AllowDuplicate returns an existing run unchanged
             // (idempotent retry — allowed), but a *fresh* start must go through
             // debounce admission. reject_fresh_if_debounced makes the start path
@@ -9070,6 +9381,12 @@ async fn batch_start_workflows(
                             error: None,
                         });
                     } else {
+                        // AC-a: attached to an existing run — no admission, refund.
+                        if let Some(ref bucket) = item_throttle_bucket {
+                            let _ =
+                                autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
+                                    .await;
+                        }
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,
@@ -9105,6 +9422,11 @@ async fn batch_start_workflows(
                     }
                 }
                 Err(e) => {
+                    // The start failed — no run admitted, refund the reserved token.
+                    if let Some(ref bucket) = item_throttle_bucket {
+                        let _ =
+                            autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+                    }
                     rejected_count += 1;
                     let err_str = e.to_string();
                     results.push(BatchStartItemResult {
@@ -17450,6 +17772,34 @@ async fn debounce_status(
     Ok(Json(all_records))
 }
 
+/// `GET /admin/start-throttle` — per-`(workflow, throttle_key)` deferred-start
+/// backlog, so an operator can confirm a throttle is active and watch the
+/// backlog drain (issue #607). Cross-shard: sums the per-shard aggregates.
+async fn start_throttle_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::throttle::ThrottleBacklogEntry>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut all: Vec<autumn_harvest::throttle::ThrottleBacklogEntry> = Vec::new();
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let rows = autumn_harvest::throttle::throttle_backlog_by_key(&mut conn)
+            .await
+            .map_err(map_error)?;
+        all.extend(rows);
+    }
+
+    // Descending by backlog size, then a stable key order for a deterministic view.
+    all.sort_by(|a, b| {
+        b.deferred_count
+            .cmp(&a.deferred_count)
+            .then(a.workflow_name.cmp(&b.workflow_name))
+            .then(a.throttle_key.cmp(&b.throttle_key))
+    });
+
+    Ok(Json(all))
+}
+
 async fn pending_event_batches(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<autumn_harvest::event_batch::PendingEventBatchRecord>>, AutumnError> {
@@ -23959,6 +24309,7 @@ mod tests {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 sla: None,
                 owner: None,
@@ -25850,6 +26201,7 @@ mod tests {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,
@@ -25871,6 +26223,7 @@ mod tests {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,

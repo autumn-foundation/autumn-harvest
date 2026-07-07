@@ -166,6 +166,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
