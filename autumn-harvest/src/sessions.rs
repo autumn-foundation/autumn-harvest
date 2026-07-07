@@ -1189,6 +1189,7 @@ mod tests {
         assert!(sql.contains("LEFT JOIN harvest_workers"));
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn broken_session_candidates_query_also_matches_sessions_whose_workflow_is_terminal() {
         let sql = broken_session_candidates_query();

@@ -5290,39 +5290,43 @@ async fn handle_session_acquire(
         return Err(HarvestError::Config(error));
     };
 
+    // Bound total elapsed time against `options.acquisition_timeout`
+    // (carried as this task's `schedule_to_start`) *before* attempting to
+    // claim a slot at all -- not only when this worker happens to be full.
+    // `queue::claim_task` never filters out schedule-to-start-expired rows,
+    // so a worker with a free slot that claims this task after the deadline
+    // already elapsed (e.g. no session-capable worker was polling for a
+    // while, or the timeout scanner hasn't caught up yet) must still reject
+    // it rather than silently succeeding (issue #929 review). Comparing
+    // directly against the task's original eligibility anchor (`created_at`,
+    // falling back to `scheduled_at` for pre-#501 rows) also keeps the
+    // deadline fixed regardless of how many times this task has deferred --
+    // `defer_rate_limited_task` rewrites `scheduled_at` to `now + backoff`
+    // on every call, and the generic schedule-to-start timeout scanner
+    // computes its deadline as `scheduled_at + schedule_to_start`, so
+    // relying on that scanner here would let every defer push the effective
+    // deadline forward, making `acquisition_timeout` unbounded whenever
+    // every worker on the queue is at session capacity (or has the default
+    // `max_concurrent_sessions = 0`) for longer than one backoff interval.
+    let eligible_since = task.created_at.unwrap_or(task.scheduled_at);
+    let acquisition_timeout_exceeded = task
+        .schedule_to_start
+        .is_some_and(|budget| chrono::Utc::now() >= eligible_since + budget);
+    if acquisition_timeout_exceeded {
+        return record_session_acquire_schedule_to_start_timeout(
+            &mut conn,
+            task,
+            exec_id,
+            activity_id,
+        )
+        .await;
+    }
+
     if !crate::sessions::try_acquire_session_slot(
         session_slots_in_use,
         max_concurrent_sessions,
         session_id,
     ) {
-        // Bound total elapsed time against `options.acquisition_timeout`
-        // (carried as this task's `schedule_to_start`) *before* deferring
-        // again. `defer_rate_limited_task` rewrites `scheduled_at` to
-        // `now + backoff` on every call, and the generic schedule-to-start
-        // timeout scanner computes its deadline as `scheduled_at +
-        // schedule_to_start` -- so relying on that scanner here would let
-        // every defer push the effective deadline forward, making
-        // `acquisition_timeout` unbounded whenever every worker on the
-        // queue is at session capacity (or has the default
-        // `max_concurrent_sessions = 0`) for longer than one backoff
-        // interval (issue #929 review). Comparing directly against the
-        // task's original eligibility anchor (`created_at`, falling back to
-        // `scheduled_at` for pre-#501 rows) keeps the deadline fixed
-        // regardless of how many times this task defers.
-        let eligible_since = task.created_at.unwrap_or(task.scheduled_at);
-        let acquisition_timeout_exceeded = task
-            .schedule_to_start
-            .is_some_and(|budget| chrono::Utc::now() >= eligible_since + budget);
-        if acquisition_timeout_exceeded {
-            return record_session_acquire_schedule_to_start_timeout(
-                &mut conn,
-                task,
-                exec_id,
-                activity_id,
-            )
-            .await;
-        }
-
         // Lost the race: this worker is at its advertised session
         // capacity (or sessions are disabled: max_concurrent_sessions <= 0,
         // so every acquire loses). Reschedule with a randomized backoff so
