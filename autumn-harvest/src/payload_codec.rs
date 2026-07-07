@@ -39,6 +39,89 @@ use serde_json::Value;
 
 use crate::error::{HarvestError, HarvestResult};
 
+/// Marker key for a payload field the read path could not decode (issue #608).
+///
+/// Sibling discriminator of `_harvest_codec_envelope`,
+/// `_harvest_offload_envelope` (issue #524), and `_harvest_erased`
+/// (issue #495).
+pub const UNDECODABLE_MARKER_KEY: &str = "_harvest_undecodable";
+
+/// Undecodable reason: the envelope names a codec that is not registered.
+pub const UNDECODABLE_REASON_UNKNOWN_CODEC: &str = "unknown_codec";
+/// Undecodable reason: the envelope's `data` field is not valid base64.
+pub const UNDECODABLE_REASON_INVALID_BASE64: &str = "invalid_base64";
+/// Undecodable reason: the codec's `decode` returned an error (bad key,
+/// corrupt ciphertext). The codec's own error text is deliberately **not**
+/// embedded — it could carry key material.
+pub const UNDECODABLE_REASON_CODEC_ERROR: &str = "codec_error";
+/// Undecodable reason: the decoded plaintext bytes are not valid JSON.
+pub const UNDECODABLE_REASON_INVALID_JSON: &str = "invalid_json";
+
+/// Builds the typed graceful-degrade marker for a payload field the read
+/// path could not decode (issue #608):
+/// `{"_harvest_undecodable": {"codec_id": <id>, "reason": <reason>}}`.
+///
+/// `reason` is one of the bounded `UNDECODABLE_REASON_*` strings — the marker
+/// never echoes ciphertext or codec error text.
+#[must_use]
+pub fn undecodable_marker(codec_id: &str, reason: &str) -> Value {
+    serde_json::json!({
+        UNDECODABLE_MARKER_KEY: {
+            "codec_id": codec_id,
+            "reason": reason,
+        }
+    })
+}
+
+/// Outcome of a tolerant read-path decode walk (issue #608).
+///
+/// Counts only — never payload content — so it is safe to thread into audit
+/// records and logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LossyDecodeOutcome {
+    /// Number of codec envelopes successfully decoded in place.
+    pub decoded: usize,
+    /// Number of envelopes replaced with an [`UNDECODABLE_MARKER_KEY`] marker.
+    pub failed: usize,
+}
+
+impl LossyDecodeOutcome {
+    /// Whether the walk decoded or marked at least one envelope.
+    #[must_use]
+    pub const fn touched(&self) -> bool {
+        self.decoded + self.failed > 0
+    }
+
+    /// Saturating merge for multi-field / multi-row accumulation.
+    #[must_use]
+    pub const fn merged(self, other: Self) -> Self {
+        Self {
+            decoded: self.decoded.saturating_add(other.decoded),
+            failed: self.failed.saturating_add(other.failed),
+        }
+    }
+}
+
+/// The exact codec-envelope shape check shared by the strict
+/// (`decode_payload`) and lossy (`decode_value_lossy`) read paths, so the two
+/// can never disagree about what an envelope is: an object with **exactly**
+/// three keys — `_harvest_codec_envelope == 1`, string `codec_id`, and string
+/// `data`. Returns `(codec_id, base64_data)` for an envelope, `None` for
+/// anything else (offload envelopes, erase tombstones, business data carrying
+/// a `codec_id` field, malformed near-envelopes).
+fn codec_envelope_parts(payload: &Value) -> Option<(&str, &str)> {
+    let obj = payload.as_object()?;
+    if obj.get("_harvest_codec_envelope").and_then(Value::as_i64) != Some(1) {
+        return None;
+    }
+    let codec_id = obj.get("codec_id").and_then(Value::as_str)?;
+    let encoded_b64 = obj.get("data").and_then(Value::as_str)?;
+    if obj.len() != 3 {
+        return None;
+    }
+    Some((codec_id, encoded_b64))
+}
+
 /// A trait for intercepting and transforming raw payload bytes.
 ///
 /// Implementations of this trait are used by the [`PayloadCodecs`] registry
@@ -237,25 +320,9 @@ impl PayloadCodecs {
     }
 
     fn decode_payload(&self, payload: &Value) -> HarvestResult<Value> {
-        let Some(obj) = payload.as_object() else {
+        let Some((codec_id, encoded_b64)) = codec_envelope_parts(payload) else {
             return Ok(payload.clone());
         };
-        let Some(envelope_version) = obj.get("_harvest_codec_envelope").and_then(Value::as_i64)
-        else {
-            return Ok(payload.clone());
-        };
-        if envelope_version != 1 {
-            return Ok(payload.clone());
-        }
-        let Some(codec_id) = obj.get("codec_id").and_then(Value::as_str) else {
-            return Ok(payload.clone());
-        };
-        let Some(encoded_b64) = obj.get("data").and_then(Value::as_str) else {
-            return Ok(payload.clone());
-        };
-        if obj.len() != 3 {
-            return Ok(payload.clone());
-        }
         let codec = self
             .codecs
             .get(codec_id)
@@ -269,6 +336,130 @@ impl PayloadCodecs {
             .decode(&encoded)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
         Ok(serde_json::from_slice(&decoded)?)
+    }
+
+    /// Decode one already-shape-verified envelope, mapping every failure mode
+    /// to the typed [`undecodable_marker`] instead of an error (issue #608).
+    ///
+    /// `Ok(plaintext)` on success, `Err(marker)` on failure — the caller
+    /// substitutes whichever it gets, so a bad key / rotated-away codec can
+    /// never fail the surrounding response.
+    fn decode_envelope_lossy(&self, codec_id: &str, encoded_b64: &str) -> Result<Value, Value> {
+        let Some(codec) = self.codecs.get(codec_id) else {
+            return Err(undecodable_marker(
+                codec_id,
+                UNDECODABLE_REASON_UNKNOWN_CODEC,
+            ));
+        };
+        let Ok(encoded) = base64::engine::general_purpose::STANDARD.decode(encoded_b64) else {
+            return Err(undecodable_marker(
+                codec_id,
+                UNDECODABLE_REASON_INVALID_BASE64,
+            ));
+        };
+        let Ok(decoded) = codec.decode(&encoded) else {
+            return Err(undecodable_marker(codec_id, UNDECODABLE_REASON_CODEC_ERROR));
+        };
+        serde_json::from_slice(&decoded)
+            .map_err(|_| undecodable_marker(codec_id, UNDECODABLE_REASON_INVALID_JSON))
+    }
+
+    /// Tolerantly decode every codec envelope found anywhere inside `value`,
+    /// in place, for the operator read path (issue #608).
+    ///
+    /// Infallible: a per-envelope failure replaces that one field with an
+    /// [`UNDECODABLE_MARKER_KEY`] marker (bounded `UNDECODABLE_REASON_*`
+    /// reason, never ciphertext or codec error text) and the walk continues —
+    /// one un-decryptable field never fails the surrounding response.
+    ///
+    /// Single-pass: a decoded result is **never** re-scanned, so
+    /// envelope-shaped plaintext (business data, a frozen
+    /// `last_completion_result` copy) is preserved verbatim as data. Offload
+    /// envelopes (`_harvest_offload_envelope`), erase tombstones
+    /// (`_harvest_erased`), and malformed near-envelopes pass through
+    /// untouched, exactly as the strict `decode_event` path tolerates them.
+    ///
+    /// This is a read-path helper for in-memory response copies only — it
+    /// must never be applied to values that are written back to storage.
+    pub fn decode_value_lossy(&self, value: &mut Value) -> LossyDecodeOutcome {
+        let mut outcome = LossyDecodeOutcome::default();
+        self.decode_value_lossy_inner(value, &mut outcome);
+        outcome
+    }
+
+    fn decode_value_lossy_inner(&self, value: &mut Value, outcome: &mut LossyDecodeOutcome) {
+        let replacement = codec_envelope_parts(value)
+            .map(|(codec_id, encoded_b64)| self.decode_envelope_lossy(codec_id, encoded_b64));
+        if let Some(result) = replacement {
+            match result {
+                Ok(plaintext) => {
+                    outcome.decoded = outcome.decoded.saturating_add(1);
+                    *value = plaintext;
+                }
+                Err(marker) => {
+                    outcome.failed = outcome.failed.saturating_add(1);
+                    *value = marker;
+                }
+            }
+            // Single-pass rule: never recurse into a decoded result.
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    self.decode_value_lossy_inner(child, outcome);
+                }
+            }
+            Value::Array(items) => {
+                for child in items.iter_mut() {
+                    self.decode_value_lossy_inner(child, outcome);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Tolerant decode for TEXT columns (execution / dead-letter `error`)
+    /// that may carry a serialized codec envelope (issue #608).
+    ///
+    /// Returns `(Some(decoded), outcome)` only when `raw` parses as JSON and
+    /// that JSON is **exactly** a codec envelope; `(None, default)` means
+    /// "leave the original string untouched" (plain error text, or JSON that
+    /// is not an envelope). A decoded plain-string payload is returned
+    /// unwrapped (the original error was a plain string before encoding);
+    /// any other decoded JSON is returned serialized. A decode failure
+    /// returns the [`undecodable_marker`] serialized to a string, counted in
+    /// the outcome as `failed`.
+    #[must_use]
+    pub fn decode_error_string_lossy(&self, raw: &str) -> (Option<String>, LossyDecodeOutcome) {
+        let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+            return (None, LossyDecodeOutcome::default());
+        };
+        let Some((codec_id, encoded_b64)) = codec_envelope_parts(&parsed) else {
+            return (None, LossyDecodeOutcome::default());
+        };
+        match self.decode_envelope_lossy(codec_id, encoded_b64) {
+            Ok(plaintext) => {
+                let decoded = match plaintext {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                (
+                    Some(decoded),
+                    LossyDecodeOutcome {
+                        decoded: 1,
+                        failed: 0,
+                    },
+                )
+            }
+            Err(marker) => (
+                Some(marker.to_string()),
+                LossyDecodeOutcome {
+                    decoded: 0,
+                    failed: 1,
+                },
+            ),
+        }
     }
 }
 
@@ -437,7 +628,7 @@ mod tests {
     }
 
     /// Builds a well-formed codec envelope for `plain` under `codec_id`,
-    /// using ReverseCodec's byte-reversal for the ciphertext.
+    /// using `ReverseCodec`'s byte-reversal for the ciphertext.
     fn reverse_envelope(plain: &Value) -> Value {
         let mut bytes = serde_json::to_vec(plain).expect("serialize plain");
         bytes.reverse();
@@ -550,7 +741,7 @@ mod tests {
             "input": {
                 "_harvest_codec_envelope": 1,
                 "codec_id": "failing",
-                "data": ciphertext_b64.clone(),
+                "data": ciphertext_b64,
             }
         });
 

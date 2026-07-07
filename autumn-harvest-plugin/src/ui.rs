@@ -39,8 +39,8 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
     OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_API, SOURCE_UI, STATUS_FAILED,
-    STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
-    insert_audit,
+    STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE,
+    TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -52,6 +52,7 @@ use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
+use autumn_harvest::payload_codec::LossyDecodeOutcome;
 use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
@@ -73,10 +74,13 @@ use autumn_harvest::{
     terminate_workflow_execution,
 };
 
+use autumn_web::session::Session;
+
 use crate::api::{
     HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
-    db_conn_for_execution, db_conn_for_shard, load_execution, load_workflows,
-    load_workflows_from_shards, map_error, parse_execution_id, require_harvest_admin,
+    audit_decoded_read, db_conn_for_execution, db_conn_for_shard, decode_workflow_execution_fields,
+    load_execution, load_workflows, load_workflows_from_shards, map_error, parse_execution_id,
+    read_path_decoder, require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -938,10 +942,13 @@ async fn list_workflows_ui(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     Query(params): Query<WorkflowDetailParams>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let exec_uuid = exec_id.as_uuid();
@@ -1055,6 +1062,29 @@ async fn workflow_detail_ui(
         .ok()
         .map(|r| r.registry().history_policy().continue_as_new_threshold());
 
+    // Read-path payload decoding (issue #608): decode the loaded copies only
+    // (stored rows are never touched); one best-effort audit row per page
+    // render that decoded or marked ≥1 envelope.
+    let mut execution = execution;
+    let mut page_events = page_events;
+    {
+        let mut event_copies: Vec<&mut HarvestEvent> = page_events
+            .iter_mut()
+            .chain(activity_events.iter_mut())
+            .chain(signal_update_events.iter_mut())
+            .collect();
+        decode_and_audit_workflow_detail(
+            &api_state,
+            &headers,
+            maybe_session.map(|Extension(session)| session),
+            exec_id,
+            &mut execution,
+            &mut event_copies,
+            &mut blocked_on,
+        )
+        .await;
+    }
+
     Ok(render_workflow_detail(
         &execution,
         total_events,
@@ -1068,6 +1098,51 @@ async fn workflow_detail_ui(
         params.flash.as_deref(),
         continue_as_new_threshold,
     ))
+}
+
+/// Read-path payload decoding for the workflow-detail page (issue #608):
+/// resolves the decode-only-when-admin gate ([`read_path_decoder`]) and, when
+/// active, tolerantly decodes the loaded copies — the execution row's payload
+/// fields, every timeline/attempts/signals-panel event, and the blocked-on
+/// panel's activity inputs, heartbeat checkpoints, and signal payloads — then
+/// writes the page's single best-effort audit row when ≥1 envelope was
+/// touched. Operates on in-memory copies only; stored rows are untouched.
+async fn decode_and_audit_workflow_detail(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    session: Option<Session>,
+    exec_id: HarvestExecutionId,
+    execution: &mut WorkflowExecution,
+    events: &mut [&mut HarvestEvent],
+    blocked_on: &mut BlockedOnData,
+) {
+    let Some(codecs) = read_path_decoder(api_state, session).await else {
+        return;
+    };
+    let mut outcome = decode_workflow_execution_fields(execution, Some(&codecs));
+    for event in events.iter_mut() {
+        outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
+    }
+    for task in &mut blocked_on.activities {
+        outcome = outcome.merged(codecs.decode_value_lossy(&mut task.input));
+        if let Some(checkpoint) = task.heartbeat_details.as_mut() {
+            outcome = outcome.merged(codecs.decode_value_lossy(checkpoint));
+        }
+    }
+    for signal in &mut blocked_on.signals {
+        outcome = outcome.merged(codecs.decode_value_lossy(&mut signal.payload));
+    }
+    let target = exec_id.to_string();
+    audit_decoded_read(
+        api_state,
+        headers,
+        TARGET_WORKFLOW,
+        Some(&target),
+        "GET /ui/workflows/{id}",
+        Some(exec_id.shard()),
+        outcome,
+    )
+    .await;
 }
 
 fn is_terminal_workflow_state(state: &str) -> bool {
@@ -1665,7 +1740,13 @@ async fn trigger_update_ui(
 async fn list_dead_letters_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<DeadLetterListParams>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
+    // Read-path payload decoding (issue #608): the page is admin-gated, so an
+    // arriving request passes the same predicate the decoder re-checks.
+    let decoder =
+        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
     let limit = params
         .limit
         .unwrap_or(DEFAULT_DLQ_PAGE_SIZE)
@@ -1717,11 +1798,41 @@ async fn list_dead_letters_ui(
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_next = total_for_pagination > offset_usize.saturating_add(limit_usize);
-    let page_rows = all_rows
+    let mut page_rows = all_rows
         .into_iter()
         .skip(offset_usize)
         .take(limit_usize)
         .collect::<Vec<_>>();
+
+    if let Some(codecs) = decoder.as_ref() {
+        // Read-path payload decoding (issue #608): decode each rendered row's
+        // JSONB input, TEXT error, and last-events copies; one best-effort
+        // audit row per page render that touched ≥1 envelope.
+        let mut outcome = LossyDecodeOutcome::default();
+        for row in &mut page_rows {
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut row.dead_letter.input));
+            let (rewritten, error_outcome) =
+                codecs.decode_error_string_lossy(&row.dead_letter.error);
+            if let Some(rewritten) = rewritten {
+                row.dead_letter.error = rewritten;
+            }
+            outcome = outcome.merged(error_outcome);
+            for event in &mut row.events {
+                outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
+            }
+        }
+        audit_decoded_read(
+            &api_state,
+            &headers,
+            TARGET_DEAD_LETTER,
+            None,
+            "GET /ui/dead-letters",
+            None,
+            outcome,
+        )
+        .await;
+    }
+    let page_rows = page_rows;
 
     let shard_errors: Vec<(ShardId, &str)> = shard_results
         .iter()

@@ -183,7 +183,7 @@ type HarvestApiApp = axum::Router;
 
 // ── Test codec + envelope fixtures ───────────────────────────────────────────
 
-/// Byte-reversal "encryption" — mirrors payload_codec.rs's own test codec.
+/// Byte-reversal "encryption" — mirrors `payload_codec.rs`'s own test codec.
 #[derive(Debug)]
 struct ReverseCodec;
 
@@ -267,7 +267,7 @@ struct AppConfig<'a> {
     /// (`set_admin_auth_boundary(true)`); `false` ⇒ requests carry no session
     /// and are non-admin.
     admin: bool,
-    /// Register the ReverseCodec registry on the api state.
+    /// Register the `ReverseCodec` registry on the api state.
     codecs: bool,
     /// Enable the issue-#608 opt-in.
     decode_on_read: bool,
@@ -474,7 +474,7 @@ async fn append_events(
         .expect("append events");
 }
 
-/// Audit rows for OP_PAYLOAD_DECODE_READ, as `(target_id, route_or_command,
+/// Audit rows for `OP_PAYLOAD_DECODE_READ`, as `(target_id, route_or_command,
 /// error_summary)` triples, oldest first.
 async fn decode_audit_rows(
     conn: &mut AsyncPgConnection,
@@ -865,8 +865,8 @@ async fn dead_letters_list_decodes_input_and_error() {
 }
 
 /// AC4 (SSE): the live event stream emits decoded frames, and one
-/// payload.decode_read audit row is written at stream open when decode mode
-/// is active (mirrors the OP_EXECUTION_STREAM_OPEN one-row-per-stream shape).
+/// `payload.decode_read` audit row is written at stream open when decode mode
+/// is active (mirrors the `OP_EXECUTION_STREAM_OPEN` one-row-per-stream shape).
 #[tokio::test]
 async fn sse_stream_emits_decoded_frames_and_writes_decode_audit_at_open() {
     let (url, _container) = setup_database().await;

@@ -38,15 +38,15 @@ use autumn_harvest::audit::{
     OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
     OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
-    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
-    TARGET_WORKER, TARGET_WORKFLOW,
+    OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
+    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY,
+    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
+    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE,
+    TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -76,6 +76,7 @@ use autumn_harvest::models::{
     NewAuditRecord, NewBackfillLogRow, NewCompletionTriggerDb, RateLimitBucket, ScheduleDecision,
     WorkflowExecution,
 };
+use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
     Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
 };
@@ -337,6 +338,14 @@ pub struct HarvestApiState {
     /// HTTP start route can validate a per-execution target the same way
     /// `enqueue_completion_deliveries` re-validates at delivery time.
     completion_callback_ssrf_policy: Arc<Mutex<autumn_harvest::completion_callback::SsrfPolicy>>,
+    /// Codec registry mirrored from `BuiltHarvest::payload_codecs()` at
+    /// startup (issue #608) so admin read surfaces can decode envelopes.
+    /// Defaults to the identity-only registry.
+    payload_codecs: Arc<Mutex<autumn_harvest::payload_codec::PayloadCodecs>>,
+    /// Deployment-level opt-in for read-path payload decoding (issue #608).
+    /// Default **off**: responses are byte-for-byte identical to a build
+    /// without the feature.
+    decode_payloads_on_read: Arc<Mutex<bool>>,
 }
 
 impl Default for HarvestApiState {
@@ -376,6 +385,10 @@ impl Default for HarvestApiState {
             completion_callback_ssrf_policy: Arc::new(Mutex::new(
                 autumn_harvest::completion_callback::SsrfPolicy::default(),
             )),
+            payload_codecs: Arc::new(Mutex::new(
+                autumn_harvest::payload_codec::PayloadCodecs::default(),
+            )),
+            decode_payloads_on_read: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -511,6 +524,65 @@ impl HarvestApiState {
             .lock()
             .expect("harvest api state lock poisoned")
             .clone()
+    }
+
+    /// Mirror the codec registry configured on the builder into the API
+    /// state (issue #608). Call this during startup from the plugin with
+    /// `BuiltHarvest::payload_codecs()` so admin read surfaces can decode
+    /// stored envelopes. Mirroring the registry alone changes nothing —
+    /// decoding also requires the [`Self::set_decode_payloads_on_read`]
+    /// opt-in and harvest-admin access on the request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_payload_codecs(&self, codecs: autumn_harvest::payload_codec::PayloadCodecs) {
+        *self
+            .payload_codecs
+            .lock()
+            .expect("harvest api state lock poisoned") = codecs;
+    }
+
+    /// Snapshot of the mirrored codec registry (issue #608).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub(crate) fn payload_codecs(&self) -> autumn_harvest::payload_codec::PayloadCodecs {
+        self.payload_codecs
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
+    }
+
+    /// Enable or disable read-path payload decoding (issue #608).
+    ///
+    /// Default **off**: with the flag off, no handler consults the codec
+    /// registry and responses are byte-for-byte identical to a deployment
+    /// that never heard of this feature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_decode_payloads_on_read(&self, enabled: bool) {
+        *self
+            .decode_payloads_on_read
+            .lock()
+            .expect("harvest api state lock poisoned") = enabled;
+    }
+
+    /// Whether read-path payload decoding is enabled (issue #608).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn decode_payloads_on_read(&self) -> bool {
+        *self
+            .decode_payloads_on_read
+            .lock()
+            .expect("harvest api state lock poisoned")
     }
 
     /// Set the hard ceiling on per-execution event count (issue #493).
@@ -1219,6 +1291,13 @@ struct PendingActivity {
     max_attempts: i32,
     task_status: String,
     claimed_by_worker_id: Option<String>,
+    /// The pending task's input payload, tolerantly decoded (issue #608).
+    /// Present **only** when read-path payload decoding is active for this
+    /// request (deployment opt-in + harvest-admin access) — omitted
+    /// otherwise, so flag-off responses stay byte-identical to pre-#608
+    /// builds. `None` for external-handoff rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<serde_json::Value>,
     last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Latest heartbeat checkpoint payload reported by the activity via
     /// `ctx.heartbeat(...)` — the current value of
@@ -3197,6 +3276,137 @@ pub(crate) async fn has_harvest_admin_access(
 
         is_harvest_admin || is_admin || is_admin_role
     }
+}
+
+// ── Read-path payload decoding (issue #608) ───────────────────────────────────
+
+/// The pure decode-eligibility predicate (issue #608, AC1 + AC6): the
+/// read-path decoder is obtainable only when the deployment-level opt-in
+/// flag is set **and** the request has harvest-admin access. Kept as a
+/// standalone `const fn` so the security decision is pinned by a truth-table
+/// unit test without a session harness.
+pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
+    flag && is_admin
+}
+
+/// Resolve the codec registry for read-path decoding, or `None` when this
+/// request must see today's bytes (issue #608).
+///
+/// This is the **only** way handlers obtain a decoder: it requires both the
+/// deployment opt-in ([`HarvestApiState::decode_payloads_on_read`]) and the
+/// exact same admin predicate the `require_admin` layer uses
+/// ([`has_harvest_admin_access`]), so ungated describe routes are never
+/// retro-gated — a non-admin caller simply receives the stored (possibly
+/// ciphertext) payloads, exactly as before.
+pub(crate) async fn read_path_decoder(
+    api_state: &HarvestApiState,
+    session: Option<Session>,
+) -> Option<PayloadCodecs> {
+    let flag = api_state.decode_payloads_on_read();
+    if !flag {
+        return None;
+    }
+    let is_admin = has_harvest_admin_access(api_state, session).await;
+    if !decode_gate(flag, is_admin) {
+        return None;
+    }
+    Some(api_state.payload_codecs())
+}
+
+/// Best-effort: writes one [`OP_PAYLOAD_DECODE_READ`] audit row when
+/// `outcome.touched()` — i.e. when this request actually decoded or marked at
+/// least one codec envelope (issue #608, AC8). Never fails the read; never
+/// records payload content (the outcome carries counts only, and none of the
+/// recorded fields derive from payload bytes).
+pub(crate) async fn audit_decoded_read(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    target_type: &'static str,
+    target_id: Option<&str>,
+    route: &'static str,
+    shard: Option<ShardId>,
+    outcome: LossyDecodeOutcome,
+) {
+    if !outcome.touched() {
+        return;
+    }
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let shard = shard.unwrap_or_else(|| pool.sharded_pool().default_shard());
+    let Ok(mut conn) = acquire_conn(pool.pool_for(shard)).await else {
+        return;
+    };
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let record = NewAuditRecord {
+        actor: &actor,
+        operation: OP_PAYLOAD_DECODE_READ,
+        target_type,
+        target_id,
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(shard.as_i32()),
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &record).await;
+}
+
+/// Build the `data:` payload for one SSE frame from a stored
+/// `harvest_events.event_data` value (issue #324 stream; issue #608 decode).
+///
+/// Extracts the inner payload from the adjacently-tagged envelope
+/// `{"type":"…","data":{…}}` (the `event:` field already carries the type).
+/// With no decoder this is byte-identical to the pre-#608 `sse_data`
+/// closure; with an active decoder the frame's payload copy is tolerantly
+/// decoded in place — the stored row is never touched.
+pub(crate) fn sse_frame_data(
+    event_data: &serde_json::Value,
+    decoder: Option<&PayloadCodecs>,
+) -> String {
+    let inner = event_data.get("data").unwrap_or(event_data);
+    decoder.map_or_else(
+        || serde_json::to_string(inner).unwrap_or_default(),
+        |codecs| {
+            let mut copy = inner.clone();
+            codecs.decode_value_lossy(&mut copy);
+            serde_json::to_string(&copy).unwrap_or_default()
+        },
+    )
+}
+
+/// Tolerantly decode the payload-bearing fields of a workflow execution row
+/// copy for an admin read response (issue #608). JSONB columns walk through
+/// [`PayloadCodecs::decode_value_lossy`]; the TEXT `error` column goes
+/// through [`PayloadCodecs::decode_error_string_lossy`]. Returns the merged
+/// outcome; a `None` decoder is a no-op.
+pub(crate) fn decode_workflow_execution_fields(
+    execution: &mut WorkflowExecution,
+    decoder: Option<&PayloadCodecs>,
+) -> LossyDecodeOutcome {
+    let Some(codecs) = decoder else {
+        return LossyDecodeOutcome::default();
+    };
+    let mut outcome = codecs.decode_value_lossy(&mut execution.input);
+    if let Some(output) = execution.output.as_mut() {
+        outcome = outcome.merged(codecs.decode_value_lossy(output));
+    }
+    if let Some(memo) = execution.memo.as_mut() {
+        outcome = outcome.merged(codecs.decode_value_lossy(memo));
+    }
+    if let Some(search_attrs) = execution.search_attrs.as_mut() {
+        outcome = outcome.merged(codecs.decode_value_lossy(search_attrs));
+    }
+    if let Some(error) = execution.error.as_deref() {
+        let (rewritten, error_outcome) = codecs.decode_error_string_lossy(error);
+        if let Some(rewritten) = rewritten {
+            execution.error = Some(rewritten);
+        }
+        outcome = outcome.merged(error_outcome);
+    }
+    outcome
 }
 
 /// Canonical `(METHOD, path-template)` list for every route in `harvest_api_router`.
@@ -5498,6 +5708,8 @@ async fn export_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
@@ -5521,7 +5733,33 @@ async fn export_workflow_history(
     };
 
     match export_history_for_execution(&execution, history.events, &query) {
-        Ok(document) => Json(document).into_response(),
+        Ok(mut document) => {
+            // Read-path payload decoding (issue #608): Full policy only —
+            // decoding only to redact would be pointless plaintext exposure,
+            // so Redacted exports skip the decoder (and the audit) entirely.
+            if query.payload_policy == HistoryPayloadPolicy::Full
+                && let Some(codecs) =
+                    read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session))
+                        .await
+            {
+                let mut outcome = LossyDecodeOutcome::default();
+                for event in &mut document.events {
+                    outcome = outcome.merged(codecs.decode_value_lossy(event));
+                }
+                let target = exec_id.to_string();
+                audit_decoded_read(
+                    &api_state,
+                    &headers,
+                    TARGET_WORKFLOW,
+                    Some(&target),
+                    "GET /workflows/{id}/history/export",
+                    Some(exec_id.shard()),
+                    outcome,
+                )
+                .await;
+            }
+            Json(document).into_response()
+        }
         Err(error) => history_export_error_response(error),
     }
 }
@@ -5529,13 +5767,41 @@ async fn export_workflow_history(
 async fn export_workflow_histories(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
     let query = match parse_history_batch_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
     match load_history_exports_from_shards(&api_state, &query).await {
-        Ok(response) => Json(response).into_response(),
+        Ok(mut response) => {
+            // Read-path payload decoding (issue #608): Full policy only; one
+            // audit row per request, accumulated across every export entry.
+            if query.payload_policy == HistoryPayloadPolicy::Full
+                && let Some(codecs) =
+                    read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session))
+                        .await
+            {
+                let mut outcome = LossyDecodeOutcome::default();
+                for export in &mut response.exports {
+                    for event in &mut export.events {
+                        outcome = outcome.merged(codecs.decode_value_lossy(event));
+                    }
+                }
+                audit_decoded_read(
+                    &api_state,
+                    &headers,
+                    TARGET_WORKFLOW,
+                    None,
+                    "GET /admin/history/exports",
+                    None,
+                    outcome,
+                )
+                .await;
+            }
+            Json(response).into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -5543,8 +5809,13 @@ async fn export_workflow_histories(
 async fn get_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<WorkflowDetailsResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
+    // Read-path payload decoding (issue #608): decode-only-when-admin.
+    let decoder =
+        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
@@ -5605,6 +5876,40 @@ async fn get_workflow(
         .into_iter()
         .map(ExternalHandoffResponse::from)
         .collect();
+
+    let mut execution = execution;
+    let mut events = events;
+    let mut last_completion_result = last_completion_result;
+    let mut last_error = last_error;
+    if let Some(codecs) = decoder.as_ref() {
+        // Decode the response copies only — stored rows are never touched
+        // (issue #608). One audit row per request that touched ≥1 envelope.
+        let mut outcome = decode_workflow_execution_fields(&mut execution, decoder.as_ref());
+        for event in &mut events {
+            outcome = outcome.merged(codecs.decode_value_lossy(event));
+        }
+        if let Some(carryover) = last_completion_result.as_mut() {
+            outcome = outcome.merged(codecs.decode_value_lossy(carryover));
+        }
+        if let Some(error) = last_error.as_deref() {
+            let (rewritten, error_outcome) = codecs.decode_error_string_lossy(error);
+            if let Some(rewritten) = rewritten {
+                last_error = Some(rewritten);
+            }
+            outcome = outcome.merged(error_outcome);
+        }
+        let target = exec_id.to_string();
+        audit_decoded_read(
+            &api_state,
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            "GET /workflows/{id}",
+            Some(exec_id.shard()),
+            outcome,
+        )
+        .await;
+    }
 
     Ok(Json(WorkflowDetailsResponse {
         parent_id: execution.parent_id,
@@ -5704,9 +6009,14 @@ async fn get_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<WorkflowHistoryPage>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let (limit, after_id, event_types) = parse_workflow_history_query(&pairs)?;
+    // Read-path payload decoding (issue #608): decode-only-when-admin.
+    let decoder =
+        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
 
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
@@ -5763,6 +6073,26 @@ async fn get_workflow_history(
         });
     }
 
+    if let Some(codecs) = decoder.as_ref() {
+        // Decode the page's event payload copies (issue #608); one bad
+        // envelope degrades to a marker and the page still returns 200.
+        let mut outcome = LossyDecodeOutcome::default();
+        for entry in &mut entries {
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut entry.data));
+        }
+        let target = exec_id.to_string();
+        audit_decoded_read(
+            &api_state,
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            "GET /workflows/{id}/history",
+            Some(exec_id.shard()),
+            outcome,
+        )
+        .await;
+    }
+
     Ok(Json(WorkflowHistoryPage {
         events: entries,
         next_cursor: page.next_cursor.map(|c| c.to_string()),
@@ -5775,6 +6105,8 @@ async fn get_workflow_result(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
@@ -5785,10 +6117,22 @@ async fn get_workflow_result(
         Ok(wait) => wait,
         Err(error) => return error.into_response(),
     };
+    // Read-path payload decoding (issue #608): decode-only-when-admin.
+    let decoder =
+        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
     if wait.is_zero() {
         // Storage-only path: no listener/LISTEN-NOTIFY required.
         return match workflow_result_snapshot_following_can(&api_state, exec_id).await {
-            Ok(snapshot) => workflow_result_response(snapshot),
+            Ok(snapshot) => {
+                respond_with_workflow_result(
+                    &api_state,
+                    &headers,
+                    exec_id,
+                    snapshot,
+                    decoder.as_ref(),
+                )
+                .await
+            }
             Err(error) => error.into_response(),
         };
     }
@@ -5817,13 +6161,27 @@ async fn get_workflow_result(
             Ok(None) => return workflow_result_pending_response(),
             // Successor row gone mid-chain — return the last CAN sentinel.
             Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return workflow_result_response(last_can_snapshot.unwrap());
+                return respond_with_workflow_result(
+                    &api_state,
+                    &headers,
+                    exec_id,
+                    last_can_snapshot.unwrap(),
+                    decoder.as_ref(),
+                )
+                .await;
             }
             Err(error) => return map_error(error).into_response(),
             Ok(Some(snapshot)) => {
                 use autumn_harvest::WorkflowResultState;
                 if snapshot.state != WorkflowResultState::ContinuedAsNew {
-                    return workflow_result_response(snapshot);
+                    return respond_with_workflow_result(
+                        &api_state,
+                        &headers,
+                        exec_id,
+                        snapshot,
+                        decoder.as_ref(),
+                    )
+                    .await;
                 }
                 // result_snapshot_with_wait follows retry_of_exec_id internally, so
                 // the ContinuedAsNew event may live on the retried execution rather
@@ -5838,7 +6196,16 @@ async fn get_workflow_result(
                 match load_continue_as_new_successor(&api_state, effective_id).await {
                     Ok(Some(next_id)) => current_id = next_id,
                     // Successor not locatable — return the sentinel as-is.
-                    Ok(None) => return workflow_result_response(snapshot),
+                    Ok(None) => {
+                        return respond_with_workflow_result(
+                            &api_state,
+                            &headers,
+                            exec_id,
+                            snapshot,
+                            decoder.as_ref(),
+                        )
+                        .await;
+                    }
                     Err(error) => return error.into_response(),
                 }
             }
@@ -5966,6 +6333,45 @@ async fn load_continue_as_new_successor(
         }
     });
     Ok(successor)
+}
+
+/// Decode the compact result's `output` (JSONB) and `error` (TEXT) fields
+/// when read-path decoding is active, write the best-effort
+/// `payload.decode_read` audit row when ≥1 envelope was touched, and build
+/// the HTTP response (issue #608). A `None` decoder is byte-identical to
+/// calling [`workflow_result_response`] directly.
+async fn respond_with_workflow_result(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    exec_id: ExecutionId,
+    mut result: WorkflowResult,
+    decoder: Option<&PayloadCodecs>,
+) -> axum::response::Response {
+    let mut outcome = LossyDecodeOutcome::default();
+    if let Some(codecs) = decoder {
+        if let Some(output) = result.output.as_mut() {
+            outcome = outcome.merged(codecs.decode_value_lossy(output));
+        }
+        if let Some(error) = result.error.as_deref() {
+            let (rewritten, error_outcome) = codecs.decode_error_string_lossy(error);
+            if let Some(rewritten) = rewritten {
+                result.error = Some(rewritten);
+            }
+            outcome = outcome.merged(error_outcome);
+        }
+        let target = exec_id.to_string();
+        audit_decoded_read(
+            api_state,
+            headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            "GET /workflows/{id}/result",
+            Some(exec_id.shard()),
+            outcome,
+        )
+        .await;
+    }
+    workflow_result_response(result)
 }
 
 fn workflow_result_response(result: WorkflowResult) -> axum::response::Response {
@@ -6602,8 +7008,13 @@ fn unavailable_shards_summary(shards: &[UnavailableShard]) -> String {
 async fn get_workflow_stack(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<WorkflowStackResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
+    // Read-path payload decoding (issue #608): decode-only-when-admin.
+    let decoder =
+        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
     let exec_uuid = exec_id.as_uuid();
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
@@ -6692,9 +7103,26 @@ async fn get_workflow_stack(
     // Snapshot the current time once above the loop so all tasks in the same
     // response are judged against a consistent instant (Finding 7 / #516).
     let now = chrono::Utc::now();
+    // Accumulated across every decoded field on this response (issue #608).
+    let mut decode_outcome = LossyDecodeOutcome::default();
     let pending_activities = tasks
         .into_iter()
         .map(|t| {
+            // Read-path payload decoding (issue #608): the task input is
+            // surfaced (decoded) only when the decoder is active for this
+            // request; heartbeat checkpoints are decoded in place before the
+            // cap projection. Both operate on the response copy only.
+            let mut heartbeat_details = t.heartbeat_details;
+            let input = if let Some(codecs) = decoder.as_ref() {
+                if let Some(checkpoint) = heartbeat_details.as_mut() {
+                    decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(checkpoint));
+                }
+                let mut input = t.input;
+                decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(&mut input));
+                Some(input)
+            } else {
+                None
+            };
             // Populate next_retry_at for backing-off tasks (issue #516): a
             // PENDING task whose scheduled_at is in the future AND that is not
             // gated by a rate-limit bucket is waiting out a retry backoff.
@@ -6734,7 +7162,7 @@ async fn get_workflow_stack(
                     rt.registry.activity_result_cap(name)
                 });
             let (heartbeat_details, heartbeat_details_truncated, heartbeat_details_bytes) =
-                project_heartbeat_details(t.heartbeat_details, heartbeat_cap);
+                project_heartbeat_details(heartbeat_details, heartbeat_cap);
             PendingActivity {
                 activity_exec_id: t.id.to_string(),
                 activity_name: t.activity_name.unwrap_or_default(),
@@ -6744,6 +7172,7 @@ async fn get_workflow_stack(
                 max_attempts: t.max_attempts,
                 task_status,
                 claimed_by_worker_id: t.worker_id,
+                input,
                 last_heartbeat_at: t.last_heartbeat_at,
                 heartbeat_details,
                 heartbeat_details_truncated,
@@ -6784,6 +7213,7 @@ async fn get_workflow_stack(
             max_attempts: 1,
             task_status: task.state.clone(),
             claimed_by_worker_id: None,
+            input: None,
             last_heartbeat_at: None,
             heartbeat_details: None,
             heartbeat_details_truncated: false,
@@ -6941,6 +7371,21 @@ async fn get_workflow_stack(
             },
         )
         .collect::<Vec<_>>();
+    if decoder.is_some() {
+        // One best-effort audit row per stack read that decoded ≥1 envelope
+        // (issue #608); audit_decoded_read no-ops on an untouched outcome.
+        let target = exec_id.to_string();
+        audit_decoded_read(
+            &api_state,
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            "GET /workflows/{id}/stack",
+            Some(exec_id.shard()),
+            decode_outcome,
+        )
+        .await;
+    }
     Ok(Json(WorkflowStackResponse {
         exec_id: exec_id.to_string(),
         workflow_id: execution.workflow_id,
@@ -15997,10 +16442,40 @@ struct DeadLetterResponse {
 async fn list_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
     Query(query): Query<DeadLetterListQuery>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<Vec<DeadLetterResponse>>, AutumnError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let dead_letters =
+    // Read-path payload decoding (issue #608): the route is admin-gated, so
+    // an arriving request passes the same predicate the decoder re-checks.
+    let decoder =
+        read_path_decoder(&api_state, maybe_session.map(|Extension(session)| session)).await;
+    let mut dead_letters =
         load_dead_letters_from_shards(&api_state, limit, query.owner.as_deref()).await?;
+    if let Some(codecs) = decoder.as_ref() {
+        // Decode each row's JSONB input and TEXT error on the response copy
+        // only; one audit row per request that touched ≥1 envelope.
+        let mut outcome = LossyDecodeOutcome::default();
+        for dl in &mut dead_letters {
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
+            let (rewritten, error_outcome) = codecs.decode_error_string_lossy(&dl.error);
+            if let Some(rewritten) = rewritten {
+                dl.error = rewritten;
+            }
+            outcome = outcome.merged(error_outcome);
+        }
+        audit_decoded_read(
+            &api_state,
+            &headers,
+            TARGET_DEAD_LETTER,
+            None,
+            "GET /dead-letters",
+            None,
+            outcome,
+        )
+        .await;
+    }
+    let dead_letters = dead_letters;
 
     let mut runbooks = std::collections::HashMap::new();
     let exec_ids: Vec<uuid::Uuid> = dead_letters
@@ -19299,9 +19774,14 @@ async fn stream_execution_events(
     };
 
     // Auth check — rejects unauthenticated requests with 401 (issue #174)
-    if !has_harvest_admin_access(&api_state, session.map(|s| s.0)).await {
+    let session = session.map(|s| s.0);
+    if !has_harvest_admin_access(&api_state, session.clone()).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
     }
+
+    // Read-path payload decoding (issue #608). Resolved once at stream setup;
+    // both the backfill and live loops build frames through sse_frame_data.
+    let decoder = read_path_decoder(&api_state, session).await;
 
     // Extract Last-Event-ID for resume (harvest_events.id BIGSERIAL cursor).
     // An absent header means "start from the beginning" (cursor = -1).
@@ -19400,6 +19880,26 @@ async fn stream_execution_events(
             source: &audit_source,
         };
         let _ = audit::insert_audit(&mut conn, &ar).await;
+        // Decode audit (issue #608): frame counts are unknowable up front on
+        // a stream, so one payload.decode_read row is written at stream open
+        // whenever decode mode is active — a deliberate, documented superset
+        // of the ≥1-envelope predicate the request/response surfaces use.
+        if decoder.is_some() {
+            let decode_ar = NewAuditRecord {
+                actor: &audit_actor,
+                operation: OP_PAYLOAD_DECODE_READ,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(target.as_str()),
+                route_or_command: "GET /executions/{exec_id}/events/stream",
+                request_id: audit_request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard.as_i32()),
+                source: &audit_source,
+            };
+            let _ = audit::insert_audit(&mut conn, &decode_ar).await;
+        }
     }
 
     // Release the pooled DB connection — SSE streams must not hold connections while idle
@@ -19417,13 +19917,10 @@ async fn stream_execution_events(
     tokio::spawn(async move {
         use autumn_harvest::audit::OP_EXECUTION_STREAM_CLOSE;
 
-        // Helper: extract the inner payload from the adjacently-tagged envelope
-        // `{"type":"...","data":{...}}` — the `event:` field already carries the
-        // type, so `data:` should contain only the payload object.
-        let sse_data = |event_data: &serde_json::Value| -> String {
-            let inner = event_data.get("data").unwrap_or(event_data);
-            serde_json::to_string(inner).unwrap_or_default()
-        };
+        // Frames are built by sse_frame_data: the inner payload of the
+        // adjacently-tagged envelope `{"type":"...","data":{...}}` — the
+        // `event:` field already carries the type — tolerantly decoded when
+        // read-path payload decoding is active (issue #608).
 
         // Helper: flush a slice of DB rows into the SSE channel.
         // Returns the last `row.id` seen and the first terminal state name found,
@@ -19440,7 +19937,7 @@ async fn stream_execution_events(
                     let sse_event = Event::default()
                         .id(row.id.to_string())
                         .event(row.event_type.as_str())
-                        .data(sse_data(&row.event_data));
+                        .data(sse_frame_data(&row.event_data, decoder.as_ref()));
                     if tx.try_send(Ok(sse_event)).is_err() {
                         return (cur_last_seen, None, true);
                     }
@@ -19462,7 +19959,7 @@ async fn stream_execution_events(
             let sse_event = Event::default()
                 .id(row.id.to_string())
                 .event(row.event_type.as_str())
-                .data(sse_data(&row.event_data));
+                .data(sse_frame_data(&row.event_data, decoder.as_ref()));
             if tx.send(Ok(sse_event)).await.is_err() {
                 // Client disconnected during backfill — skip straight to close audit
                 if let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await {
@@ -23840,6 +24337,7 @@ mod tests {
             attempt: 0,
             max_attempts: 1,
             task_status: "RUNNING".to_string(),
+            input: None,
             claimed_by_worker_id: None,
             last_heartbeat_at: None,
             heartbeat_details: bytes.map(|_| serde_json::json!({"k": "v"})),
@@ -24812,6 +25310,8 @@ mod tests {
             Extension(state),
             Path(exec_id.to_string()),
             Query(Vec::new()),
+            axum::http::HeaderMap::new(),
+            None,
         )
         .await;
 
