@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::Priority;
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Default maximum number of items allowed in a single batch-start request.
@@ -85,6 +87,14 @@ pub struct BatchStartItem {
     /// returned without inserting a duplicate row.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+
+    /// Caller-supplied trace/correlation headers threaded onto the execution row.
+    #[serde(default)]
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
+
+    /// Dispatch priority for this item's tasks. Omitted defaults to `Normal`.
+    #[serde(default)]
+    pub priority: Option<Priority>,
 }
 
 // ── Per-item result ───────────────────────────────────────────────────────────
@@ -94,6 +104,15 @@ pub struct BatchStartItem {
 pub struct BatchStartItemResult {
     /// Zero-based index of this item in the original request.
     pub index: usize,
+
+    /// The workflow instance id this item resolved to — the caller's
+    /// explicit `workflow_id`, or the server-generated UUID when omitted.
+    ///
+    /// `None` only for a rejection produced during pre-validation, before any
+    /// id is resolved (e.g. an unregistered workflow name) — no id was ever
+    /// generated or used for such an item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
 
     /// Whether the execution was successfully inserted or rejected.
     pub status: BatchStartItemStatus,
@@ -167,6 +186,11 @@ mod tests {
             input: Some(json!({"user_id": 42})),
             search_attributes: Some(json!({"tenant": "acme"})),
             idempotency_key: Some("idem-key-1".to_string()),
+            context_headers: Some(std::collections::HashMap::from([(
+                "trace-id".to_string(),
+                "abc123".to_string(),
+            )])),
+            priority: Some(Priority::High),
         };
         let serialised = serde_json::to_value(&item).unwrap();
         let back: BatchStartItem = serde_json::from_value(serialised).unwrap();
@@ -177,12 +201,14 @@ mod tests {
     fn batch_start_item_result_started_serialises() {
         let result = BatchStartItemResult {
             index: 0,
+            workflow_id: Some("user-42".to_string()),
             status: BatchStartItemStatus::Started,
             execution_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             error: None,
         };
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["status"], "started");
+        assert_eq!(v["workflow_id"], "user-42");
         assert_eq!(v["execution_id"], "00000000-0000-4000-8000-000000000001");
         assert!(
             v.get("error").is_none(),
@@ -191,9 +217,26 @@ mod tests {
     }
 
     #[test]
+    fn batch_start_item_result_workflow_id_skipped_when_none() {
+        let result = BatchStartItemResult {
+            index: 2,
+            workflow_id: None,
+            status: BatchStartItemStatus::Rejected,
+            execution_id: None,
+            error: Some("unregistered".to_string()),
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert!(
+            v.get("workflow_id").is_none(),
+            "workflow_id should be skipped when None"
+        );
+    }
+
+    #[test]
     fn batch_start_item_result_rejected_serialises() {
         let result = BatchStartItemResult {
             index: 1,
+            workflow_id: None,
             status: BatchStartItemStatus::Rejected,
             execution_id: None,
             error: Some("workflow 'unknown_wf' is not registered".to_string()),

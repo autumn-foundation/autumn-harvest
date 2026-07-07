@@ -2866,6 +2866,11 @@ async fn tick_one_workflow_schedule(
                     Ok(crate::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
                         scheduled_throttle_bucket = Some(bucket_key);
                     }
+                    Ok(crate::throttle::ThrottleAdmission::Bypassed) => {
+                        // Active execution already resolves this reuse policy as a
+                        // no-op/immediate reject; no token reserved, fall through to
+                        // the normal start below.
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -3873,6 +3878,11 @@ async fn drain_buffered_schedule_runs(
                         }
                         Ok(crate::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
                             buffered_throttle_bucket = Some(bucket_key);
+                        }
+                        Ok(crate::throttle::ThrottleAdmission::Bypassed) => {
+                            // Active execution already resolves this reuse policy as a
+                            // no-op/immediate reject; no token reserved, fall through to
+                            // the normal start below.
                         }
                         Err(e) => return Err(e),
                     }

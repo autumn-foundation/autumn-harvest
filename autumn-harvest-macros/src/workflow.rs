@@ -93,7 +93,7 @@ fn is_valid_rate(s: &str) -> bool {
     let Ok(n) = count.trim().parse::<f64>() else {
         return false;
     };
-    n > 0.0 && matches!(unit.trim(), "s" | "m" | "h")
+    n.is_finite() && n > 0.0 && matches!(unit.trim(), "s" | "m" | "h")
 }
 
 struct WorkflowAttrs {
@@ -1156,6 +1156,35 @@ mod duration_validation_tests {
                 continue;
             }
             assert!(!is_valid_task_duration(s), "should reject '{s}'");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_validation_tests {
+    use super::is_valid_rate;
+
+    #[test]
+    fn accepts_valid_rates() {
+        for s in ["100/m", "1/s", "3600/h", "0.5/s"] {
+            assert!(is_valid_rate(s), "should accept '{s}'");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rates() {
+        for s in [
+            "100",
+            "abc/m",
+            "100/x",
+            "0/m",
+            "-5/m",
+            "inf/m",
+            "infinity/s",
+            "-inf/m",
+            "nan/m",
+        ] {
+            assert!(!is_valid_rate(s), "should reject '{s}'");
         }
     }
 }

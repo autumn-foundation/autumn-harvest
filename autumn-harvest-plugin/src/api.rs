@@ -1759,6 +1759,10 @@ pub(crate) struct StartWorkflowRequest {
     /// before the workflow is admitted; a non-allowlisted target rejects the
     /// start with `422` and a machine-readable reason.
     completion_callbacks: Option<Value>,
+    /// Caller-supplied trace/correlation headers threaded onto the execution row.
+    context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
+    priority: Option<autumn_harvest::types::Priority>,
 }
 
 impl StartWorkflowRequest {
@@ -1786,6 +1790,8 @@ impl StartWorkflowRequest {
             batch_max_size: None,
             batch_max_wait: None,
             completion_callbacks: None,
+            context_headers: None,
+            priority: None,
         }
     }
 
@@ -1822,6 +1828,8 @@ impl StartWorkflowRequest {
             batch_max_size: None,
             batch_max_wait: None,
             completion_callbacks: None,
+            context_headers: None,
+            priority: None,
         }
     }
 }
@@ -7882,8 +7890,8 @@ pub(crate) async fn start_workflow(
                     memo: request.memo.clone(),
                     search_attrs: request.search_attrs.clone(),
                     sla_secs: effective_sla_secs,
-                    context_headers: None,
-                    priority: None,
+                    context_headers: request.context_headers.clone(),
+                    priority: request.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
                     owner: info_owner.map(str::to_string),
@@ -8181,8 +8189,8 @@ pub(crate) async fn start_workflow(
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
                 sla_secs: effective_sla_secs,
-                context_headers: None,
-                priority: None,
+                context_headers: request.context_headers.clone(),
+                priority: request.priority.map(Priority::as_i32),
                 concurrency_key: concurrency_key.clone(),
                 concurrency_limit,
                 owner: info_owner.map(str::to_string),
@@ -8407,8 +8415,8 @@ pub(crate) async fn start_workflow(
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
             sla_secs: effective_sla.map(|d| d.num_seconds()),
-            context_headers: None,
-            priority: None,
+            context_headers: request.context_headers.clone(),
+            priority: request.priority.map(Priority::as_i32),
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
             owner: owner.map(str::to_string),
@@ -8489,6 +8497,11 @@ pub(crate) async fn start_workflow(
                 throttle_reserved = Some(bucket_key);
                 // Fall through to the normal start on the same connection.
             }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                // Active execution already resolves this reuse policy as a
+                // no-op/immediate reject; no token reserved, fall through to
+                // the normal start below.
+            }
             Err(e) => return map_error(e).into_response(),
         }
     }
@@ -8517,7 +8530,7 @@ pub(crate) async fn start_workflow(
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
-            priority: Priority::default(),
+            priority: request.priority.unwrap_or_default(),
             max_workflow_input_bytes: effective_wf_cap,
             start_at: request.start_at,
             delay,
@@ -8525,7 +8538,7 @@ pub(crate) async fn start_workflow(
             owner,
             runbook_url,
             severity,
-            context_headers: None,
+            context_headers: request.context_headers.clone(),
             sla: effective_sla,
             schedule_id: None,
             scheduled_for: None,
@@ -8779,6 +8792,7 @@ async fn batch_start_workflows(
         if let Some(reason) = err {
             pre_rejected.push(BatchStartItemResult {
                 index: idx,
+                workflow_id: item.workflow_id.clone(),
                 status: BatchStartItemStatus::Rejected,
                 execution_id: None,
                 error: Some(reason),
@@ -8943,6 +8957,7 @@ async fn batch_start_workflows(
                 .record_admission_blocked(scope_kind, reason_label);
             gate_rejected.push(BatchStartItemResult {
                 index: idx,
+                workflow_id: Some(workflow_id.clone()),
                 status: BatchStartItemStatus::Rejected,
                 execution_id: None,
                 error: Some(format!(
@@ -9006,7 +9021,7 @@ async fn batch_start_workflows(
     // failure returns 409 after items 0..N-1 were already started.
     if request.atomic {
         let mut schema_violations: Vec<BatchStartItemResult> = Vec::new();
-        for (idx, _) in shard_groups.values().flatten() {
+        for (idx, workflow_id) in shard_groups.values().flatten() {
             let item = &request.items[*idx];
             let input = item.input.clone().unwrap_or(Value::Null);
             if let Some(info) = runtime.registry.workflows.get(&item.workflow_name)
@@ -9024,6 +9039,7 @@ async fn batch_start_workflows(
                     .join("; ");
                 schema_violations.push(BatchStartItemResult {
                     index: *idx,
+                    workflow_id: Some(workflow_id.clone()),
                     status: BatchStartItemStatus::Rejected,
                     execution_id: None,
                     error: Some(format!("input validation failed: {err_msg}")),
@@ -9065,10 +9081,11 @@ async fn batch_start_workflows(
             Err(e) => {
                 // All items on this shard are rejected due to connection failure.
                 let err_str = e.to_string();
-                for (idx, _) in shard_items {
+                for (idx, workflow_id) in shard_items {
                     rejected_count += 1;
                     results.push(BatchStartItemResult {
                         index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
                         status: BatchStartItemStatus::Rejected,
                         execution_id: None,
                         error: Some(err_str.clone()),
@@ -9119,6 +9136,7 @@ async fn batch_start_workflows(
                     .join("; ");
                 results.push(BatchStartItemResult {
                     index: *idx,
+                    workflow_id: Some(workflow_id.clone()),
                     status: BatchStartItemStatus::Rejected,
                     execution_id: None,
                     error: Some(format!("input validation failed: {err_msg}")),
@@ -9224,6 +9242,7 @@ async fn batch_start_workflows(
                     rejected_count += 1;
                     results.push(BatchStartItemResult {
                         index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
                         status: BatchStartItemStatus::Rejected,
                         execution_id: None,
                         error: Some(
@@ -9238,8 +9257,8 @@ async fn batch_start_workflows(
                     memo: None,
                     search_attrs: item.search_attributes.clone(),
                     sla_secs: sla.map(|d| d.num_seconds()),
-                    context_headers: None,
-                    priority: None,
+                    context_headers: item.context_headers.clone(),
+                    priority: item.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
                     owner: owner.map(str::to_string),
@@ -9283,6 +9302,7 @@ async fn batch_start_workflows(
                             .record_start_throttled(&item.workflow_name);
                         results.push(BatchStartItemResult {
                             index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
                             status: BatchStartItemStatus::Deferred,
                             execution_id: None,
                             error: None,
@@ -9292,10 +9312,16 @@ async fn batch_start_workflows(
                     Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
                         item_throttle_bucket = Some(bucket_key);
                     }
+                    Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                        // Active execution already resolves this reuse policy as a
+                        // no-op/immediate reject; no token reserved, fall through to
+                        // the normal start below.
+                    }
                     Err(e) => {
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
                             status: BatchStartItemStatus::Rejected,
                             execution_id: None,
                             error: Some(e.to_string()),
@@ -9329,7 +9355,7 @@ async fn batch_start_workflows(
                     max_execution_timeout_ceiling: max_exec_timeout_ceiling,
                     concurrency_key,
                     concurrency_limit,
-                    priority: Priority::default(),
+                    priority: item.priority.unwrap_or_default(),
                     max_workflow_input_bytes: effective_wf_cap,
                     start_at: None,
                     delay: None,
@@ -9337,7 +9363,7 @@ async fn batch_start_workflows(
                     owner,
                     runbook_url,
                     severity,
-                    context_headers: None,
+                    context_headers: item.context_headers.clone(),
                     sla,
                     schedule_id: None,
                     scheduled_for: None,
@@ -9394,6 +9420,7 @@ async fn batch_start_workflows(
                     if started.created {
                         results.push(BatchStartItemResult {
                             index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
                             status: BatchStartItemStatus::Started,
                             execution_id: Some(started.exec_id.to_string()),
                             error: None,
@@ -9408,6 +9435,7 @@ async fn batch_start_workflows(
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
                             status: BatchStartItemStatus::Rejected,
                             execution_id: Some(started.exec_id.to_string()),
                             error: Some(format!(
@@ -9449,6 +9477,7 @@ async fn batch_start_workflows(
                     let err_str = e.to_string();
                     results.push(BatchStartItemResult {
                         index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
                         status: BatchStartItemStatus::Rejected,
                         execution_id: None,
                         error: Some(err_str.clone()),
@@ -17792,7 +17821,9 @@ async fn debounce_status(
 
 /// `GET /admin/start-throttle` — per-`(workflow, throttle_key)` deferred-start
 /// backlog, so an operator can confirm a throttle is active and watch the
-/// backlog drain (issue #607). Cross-shard: sums the per-shard aggregates.
+/// backlog drain (issue #607). Cross-shard: concatenates each shard's
+/// per-key rows (not summed — a key's backlog on shard A and shard B remain
+/// separate entries, each keeping its own `shard_id`).
 async fn start_throttle_status(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<autumn_harvest::throttle::ThrottleBacklogEntry>>, AutumnError> {

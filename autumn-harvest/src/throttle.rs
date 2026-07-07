@@ -106,6 +106,14 @@ pub const THROTTLE_BUCKET_PREFIX: &str = "start-throttle";
 /// Maximum number of pending-start rows fired per scanner tick, per shard.
 pub const THROTTLE_FIRE_BATCH_SIZE: i64 = 100;
 
+/// Maximum number of rows drained from a single `bucket_key` in one scanner tick.
+///
+/// Regardless of how large that key's backlog is (fairness fix, issue #607
+/// code review), this bounds one hot/starving key to at most this fraction of
+/// a tick's [`THROTTLE_FIRE_BATCH_SIZE`] budget so newer rows under *other*
+/// keys are never starved by an unbounded single-key backlog.
+pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
+
 /// Maximum allowed byte length for a resolved throttle key.
 ///
 /// Keys longer than this are rejected at admission with
@@ -194,11 +202,15 @@ pub fn parse_rate(s: &str) -> Result<RateSpec, String> {
         .trim()
         .parse()
         .map_err(|_| format!("throttle rate count '{}' is not a number", count_str.trim()))?;
-    // `parse::<f64>()` accepts "nan"/"inf" literals, so reject NaN explicitly
-    // rather than `!(count > 0.0)` (NaN comparisons are always false, which
-    // would make the negation silently pass NaN through as "valid").
-    if count.is_nan() || count <= 0.0 {
-        return Err(format!("throttle rate count must be > 0, got {count}"));
+    // `parse::<f64>()` accepts "nan"/"inf"/"infinity" literals, so reject
+    // both explicitly via `!is_finite()` rather than `!(count > 0.0)` (NaN
+    // comparisons are always false, which would make the negation silently
+    // pass NaN through as "valid"; infinity would otherwise pass `> 0.0` and
+    // produce an unbounded refill rate/burst that defeats the throttle).
+    if !count.is_finite() || count <= 0.0 {
+        return Err(format!(
+            "throttle rate count must be a finite number > 0, got {count}"
+        ));
     }
 
     let divisor = match unit_str.trim() {
@@ -311,6 +323,16 @@ pub enum ThrottleAdmission {
     /// No token was available: a durable pending-start row was written. The
     /// caller must **not** start; over HTTP it returns `202 Accepted`.
     Deferred(ThrottleDeferOutcome),
+    /// An active execution already exists for this `(workflow_name,
+    /// workflow_id)` under a reuse policy that makes admission a no-op
+    /// (`AllowDuplicate`, `RejectDuplicate`) or resolves against a
+    /// non-terminal prior (`AllowDuplicateFailedOnly` when the existing row
+    /// isn't FAILED/CANCELLED). No token was reserved and no pending row was
+    /// written — the caller must proceed straight to
+    /// `start_or_load_workflow_execution*`, which resolves the reuse policy
+    /// itself (returns the existing run, or rejects it under
+    /// `RejectDuplicate`).
+    Bypassed,
 }
 
 /// A pending throttle record surfaced by the management API.
@@ -470,19 +492,29 @@ async fn insert_pending_throttle_row(
 /// The admission primitive shared by every producer (HTTP start, batch, and the
 /// scheduler/backfill fires). Behaviour:
 ///
-/// 1. **FIFO fast-path guard:** if a pending backlog already exists for this
+/// 0. **Active-execution bypass:** unless the caller's reuse policy is
+///    `TerminateIfRunning` (which always starts fresh), look up whether an
+///    active execution already exists for `(workflow_name, workflow_id)`. If
+///    the reuse policy makes this admission a no-op or an immediate reject —
+///    `AllowDuplicate`/`RejectDuplicate` (any existing state), or
+///    `AllowDuplicateFailedOnly` against a non-terminal prior — skip throttle
+///    admission entirely and return [`ThrottleAdmission::Bypassed`]: no token
+///    reserved, no pending row written. The caller proceeds straight to the
+///    normal start, which resolves the reuse policy itself.
+/// 1. **Idempotency, checked next:** if a pending row already exists for this
+///    exact `workflow_id` (a retried admission for a start that is already
+///    durably queued — possibly under a *different* throttle key than this
+///    call resolves to), return *that* row's outcome rather than reserving a
+///    fresh token under the new key and leaving the old row orphaned.
+/// 2. **FIFO fast-path guard:** if a pending backlog already exists for this
 ///    key, defer (append) so a new start cannot jump ahead of older waiters or
 ///    starve them.
-/// 2. Otherwise ensure the bucket exists and attempt a single-token debit
+/// 3. Otherwise ensure the bucket exists and attempt a single-token debit
 ///    ([`crate::queue::try_consume_rate_limit_token`]):
 ///    - success → [`ThrottleAdmission::Reserved`] (caller proceeds to start;
 ///      refunds on an id-reuse short-circuit);
-///    - failure (empty bucket) → fall through to the defer step below.
-/// 3. **Defer, idempotently:** if a pending row already exists for this exact
-///    `workflow_id` (a retried admission for a start that is already durably
-///    queued), return *that* row's outcome rather than inserting a second one.
-///    Otherwise insert a fresh pending row and return
-///    [`ThrottleAdmission::Deferred`].
+///    - failure (empty bucket) → insert a fresh pending row and return
+///      [`ThrottleAdmission::Deferred`].
 ///
 /// Shard-local: every operation runs on the passed connection's shard.
 ///
@@ -502,29 +534,59 @@ pub async fn reserve_or_defer(
         )));
     }
 
-    let key = bucket_key(params.workflow_name, params.throttle_key);
-    let now = Utc::now();
-
-    // (1) FIFO fast-path guard: an existing backlog means we must append, not
-    // jump the queue.
-    if !pending_backlog_exists(conn, &key).await? {
-        // (2) No backlog — ensure the bucket and try to reserve a token.
-        ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
-        if crate::queue::try_consume_rate_limit_token(conn, &key).await? {
-            return Ok(ThrottleAdmission::Reserved { bucket_key: key });
+    // (0) Bypass entirely when an active execution already makes this
+    // admission a no-op or an immediate reject under the caller's reuse
+    // policy. TerminateIfRunning always starts fresh (cancel + replace), so
+    // it's excluded from the lookup and always proceeds to normal pacing.
+    let reuse_policy = params
+        .start_options
+        .reuse_policy
+        .as_deref()
+        .and_then(crate::debounce::parse_reuse_policy)
+        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
+    if !matches!(
+        reuse_policy,
+        crate::types::WorkflowIdReusePolicy::TerminateIfRunning
+    ) && let Some(existing) =
+        crate::execution::try_load_by_key(conn, params.workflow_name, params.workflow_id).await?
+    {
+        let bypass = matches!(
+            reuse_policy,
+            crate::types::WorkflowIdReusePolicy::AllowDuplicate
+                | crate::types::WorkflowIdReusePolicy::RejectDuplicate
+        ) || (reuse_policy
+            == crate::types::WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+            && !matches!(existing.state.as_str(), "FAILED" | "CANCELLED"));
+        if bypass {
+            return Ok(ThrottleAdmission::Bypassed);
         }
     }
 
-    // Idempotency: a retry of a request whose start is already durably deferred
-    // (e.g. after a client-side timeout that never saw the first 202) must land
-    // on the *same* pending row rather than queue a second one for the same
-    // workflow_id — a second row can later be silently dropped by a
-    // reject_duplicate fire with no way for the retried caller to learn that.
+    let key = bucket_key(params.workflow_name, params.throttle_key);
+    let now = Utc::now();
+
+    // (1) Idempotency: a retry of a request whose start is already durably
+    // deferred (e.g. after a client-side timeout that never saw the first
+    // 202) must land on the *same* pending row rather than queue a second one
+    // for the same workflow_id. Checked *before* attempting a fresh token
+    // reservation: otherwise a retry that resolves to a *different* throttle
+    // key with an available token could win Reserved while the original
+    // pending row under the old key sits orphaned.
     if let Some(existing) =
         existing_pending_throttle_for_workflow_id(conn, params.workflow_name, params.workflow_id)
             .await?
     {
         return Ok(ThrottleAdmission::Deferred(existing));
+    }
+
+    // (2) FIFO fast-path guard: an existing backlog means we must append, not
+    // jump the queue.
+    if !pending_backlog_exists(conn, &key).await? {
+        // (3) No backlog — ensure the bucket and try to reserve a token.
+        ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
+        if crate::queue::try_consume_rate_limit_token(conn, &key).await? {
+            return Ok(ThrottleAdmission::Reserved { bucket_key: key });
+        }
     }
 
     // Defer: durably persist the start before any WorkflowStarted event exists.
@@ -770,18 +832,35 @@ async fn fire_due_on_conn(
 ) -> crate::error::HarvestResult<Vec<FiredThrottle>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
-    // Tolerate a missing table (mixed-schema fixtures / un-migrated deployment).
+    // Both queries return a single `present` boolean; share one row type.
     #[derive(diesel::QueryableByName)]
-    struct TableExists {
+    struct Present {
         #[diesel(sql_type = diesel::sql_types::Bool)]
         present: bool,
     }
-    let exists: TableExists =
+
+    // Tolerate a missing table (mixed-schema fixtures / un-migrated deployment).
+    let exists: Present =
         diesel::sql_query("SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present")
             .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
     if !exists.present {
+        return Ok(Vec::new());
+    }
+
+    // Cheap emptiness pre-check: skip opening a claim transaction entirely
+    // when there is nothing pending (the common steady-state case). A row
+    // inserted in the gap between this check and the next tick is simply
+    // picked up then -- identical to today's behavior when the claim query
+    // itself already returns zero rows.
+    let has_rows: Present = diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present",
+    )
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if !has_rows.present {
         return Ok(Vec::new());
     }
 
@@ -791,15 +870,37 @@ async fn fire_due_on_conn(
         .transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(|conn| {
             Box::pin(async move {
                 let now = Utc::now();
+                // Per-key-fair claim (code review P1, issue #607): a flat
+                // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
+                // large backlog monopolize every scanner tick (its rows are
+                // always the globally oldest), starving newer rows under other
+                // keys indefinitely. The `candidates` CTE caps how many rows a
+                // single `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
+                // before the outer LIMIT applies. Postgres forbids `FOR UPDATE`
+                // in the same query block as a window function, so the lock
+                // must be taken on the outer, window-function-free SELECT
+                // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
                 let due_sql = "
-                    SELECT id, workflow_name, throttle_key, bucket_key, workflow_id,
-                           queue_name, input, start_options, expires_at, shard_id
-                    FROM harvest_start_throttle
-                    ORDER BY deferred_at ASC
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
+                    WITH candidates AS (
+                        SELECT id, deferred_at,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY bucket_key ORDER BY deferred_at ASC
+                               ) AS rn
+                        FROM harvest_start_throttle
+                    ),
+                    selected AS (
+                        SELECT id FROM candidates WHERE rn <= $1
+                        ORDER BY deferred_at ASC LIMIT $2
+                    )
+                    SELECT t.id, t.workflow_name, t.throttle_key, t.bucket_key, t.workflow_id,
+                           t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id
+                    FROM harvest_start_throttle t
+                    JOIN selected s ON s.id = t.id
+                    ORDER BY t.deferred_at ASC
+                    FOR UPDATE OF t SKIP LOCKED
                 ";
                 let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                    .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
                     .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
                     .load(conn)
                     .await
@@ -1057,6 +1158,17 @@ mod tests {
     #[test]
     fn parse_rate_rejects_negative() {
         assert!(parse_rate("-5/m").is_err());
+    }
+
+    #[test]
+    fn parse_rate_rejects_infinity() {
+        assert!(parse_rate("inf/m").is_err());
+        assert!(parse_rate("infinity/s").is_err());
+    }
+
+    #[test]
+    fn parse_rate_rejects_negative_infinity() {
+        assert!(parse_rate("-inf/m").is_err());
     }
 
     // ── ThrottlePolicy::from_rate_str ────────────────────────────────────────

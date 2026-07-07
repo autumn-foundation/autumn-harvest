@@ -30,8 +30,8 @@ use std::time::Duration;
 use autumn_harvest::debounce::DebounceStartOptions;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::throttle::{
-    AdmitThrottleParams, ThrottleAdmission, bucket_key, fire_due_throttled_starts,
-    reserve_or_defer, throttle_backlog_by_key,
+    AdmitThrottleParams, THROTTLE_FIRE_BATCH_SIZE, ThrottleAdmission, bucket_key,
+    fire_due_throttled_starts, reserve_or_defer, throttle_backlog_by_key,
 };
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -139,6 +139,11 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #606: harvest_task_queue.session_id (worker sessions), merged in from trunk-dev.
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
+    // issue #607 code review: companion index for the per-key-fair scanner query.
+    include_str!(
+        "../../migrations/20260707000000_harvest_start_throttle_bucket_deferred_idx/up.sql"
+    ),
 );
 
 // ── Metrics recorder ─────────────────────────────────────────────────────────
@@ -226,6 +231,21 @@ async fn execution_count(conn: &mut AsyncPgConnection, wf: &str) -> i64 {
     .await
     .expect("exec count")
     .n
+}
+
+/// Force an existing execution's state to FAILED (simulates a terminal run
+/// for `allow_duplicate_failed_only` bypass-decision tests).
+async fn mark_execution_failed(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str) {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state='FAILED', completed_at=NOW() \
+         WHERE workflow_name=$1 AND workflow_id=$2",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(wf_id)
+    .execute(conn)
+    .await
+    .expect("mark failed");
 }
 
 /// Force a bucket's token balance (simulates refill deterministically).
@@ -377,6 +397,7 @@ async fn burst_paces_and_all_eventually_run() {
                 deferred += 1;
                 metrics.record_start_throttled(wf);
             }
+            ThrottleAdmission::Bypassed => panic!("no prior execution exists for this workflow_id"),
         }
     }
 
@@ -480,12 +501,15 @@ async fn deferred_starts_survive_restart() {
     assert_eq!(throttle_row_count(&mut conn2, key).await, 0);
 }
 
-/// AC-a: an id-reuse short-circuit at fire time consumes no token — the reserved
-/// token is refunded and no run is created.
+/// AC-a / bypass: a `reject_duplicate` admission for a `workflow_id` that
+/// already has an active execution is bypassed immediately at
+/// `reserve_or_defer` time — no token consumed, no pending row ever written.
+/// (Prior to the bypass fix this deferred and only short-circuited at fire
+/// time; the bypass check now closes the window where the caller was told
+/// `202 throttled` for a start that could never be admitted.)
 #[tokio::test]
-async fn id_reuse_short_circuit_refunds_token() {
+async fn reject_duplicate_bypasses_throttle_when_execution_already_active() {
     let (mut conn, _url, _c) = setup_db().await;
-    let metrics = RecordingMetrics::default();
     let wf = "sync_tenant";
     let key = "acme";
     let bkey = bucket_key(wf, key);
@@ -495,8 +519,153 @@ async fn id_reuse_short_circuit_refunds_token() {
     start(&mut conn, wf, wf_id, serde_json::json!({})).await;
     let execs_before = execution_count(&mut conn, wf).await;
 
-    // Defer a start for the SAME workflow_id under reject_duplicate.
-    // Empty the bucket first (seed consumes the burst token).
+    // Empty the bucket first (seed consumes the burst token) so a non-bypassed
+    // admission would have had to defer.
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            "seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed");
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            Some("reject_duplicate"),
+        ),
+    )
+    .await
+    .expect("bypass");
+    assert!(
+        matches!(admit, ThrottleAdmission::Bypassed),
+        "an already-active workflow_id under reject_duplicate must bypass throttle, got {admit:?}"
+    );
+
+    assert_eq!(
+        throttle_row_count(&mut conn, key).await,
+        0,
+        "no pending row written for a bypassed admission"
+    );
+    assert_eq!(
+        execution_count(&mut conn, wf).await,
+        execs_before,
+        "no new execution created by the bypass check itself"
+    );
+    // No token was ever touched by the bypassed admission (still at 0 from
+    // the seed consuming the sole burst token — a bypass neither reserves
+    // nor needs to refund).
+    assert!(
+        bucket_tokens(&mut conn, &bkey).await < 0.01,
+        "bypass must not touch the token bucket"
+    );
+}
+
+/// `allow_duplicate_failed_only` does NOT bypass when the existing execution
+/// is still non-terminal (e.g. RUNNING) relative to that policy's own
+/// "only replace a FAILED/CANCELLED prior" semantics... actually it DOES
+/// bypass (any non-terminal-per-`try_load_by_key` state under this policy
+/// resolves to "return existing unchanged" except FAILED/CANCELLED, which is
+/// a genuine fresh start). This test locks in that FAILED/CANCELLED does NOT
+/// bypass -- it's the one state pair where a fresh admission is genuinely
+/// needed and throttle pacing must still apply.
+#[tokio::test]
+async fn allow_duplicate_failed_only_does_not_bypass_a_failed_prior() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key = "acme";
+    let wf_id = "retry-job";
+
+    start(&mut conn, wf, wf_id, serde_json::json!({})).await;
+    mark_execution_failed(&mut conn, wf, wf_id).await;
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            100.0,
+            10.0,
+            None,
+            Some("allow_duplicate_failed_only"),
+        ),
+    )
+    .await
+    .expect("admit");
+    assert!(
+        matches!(admit, ThrottleAdmission::Reserved { .. }),
+        "a FAILED prior under allow_duplicate_failed_only is a genuine fresh \
+         start and must still go through throttle pacing, got {admit:?}"
+    );
+}
+
+/// `terminate_if_running` never bypasses, even when an active execution
+/// exists -- it always starts fresh (cancel + replace), so it must still
+/// consume throttle pacing like any other genuine admission.
+#[tokio::test]
+async fn terminate_if_running_never_bypasses() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key = "acme";
+    let wf_id = "force-restart-job";
+
+    start(&mut conn, wf, wf_id, serde_json::json!({})).await;
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            100.0,
+            10.0,
+            None,
+            Some("terminate_if_running"),
+        ),
+    )
+    .await
+    .expect("admit");
+    assert!(
+        matches!(admit, ThrottleAdmission::Reserved { .. }),
+        "terminate_if_running always starts fresh and must never bypass \
+         throttle pacing, got {admit:?}"
+    );
+}
+
+/// AC-a residual case: a row genuinely deferred (no active execution existed
+/// at admission time, so the bypass check did not fire) can still race
+/// against a *concurrent, unrelated* start for the same `workflow_id` landing
+/// before the scanner fires it. The fire-time `AlreadyExists` short-circuit
+/// must still refund the token and drop the row without creating a second
+/// execution.
+#[tokio::test]
+async fn fire_time_already_exists_still_refunds_token() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+    let key = "acme";
+    let bkey = bucket_key(wf, key);
+    let wf_id = "race-job";
+
+    // No active execution yet -- this genuinely defers (bypass does not fire).
     reserve_or_defer(
         &mut conn,
         params(
@@ -526,8 +695,13 @@ async fn id_reuse_short_circuit_refunds_token() {
         ),
     )
     .await
-    .expect("defer dup");
+    .expect("defer");
     assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+
+    // A concurrent, unrelated start now claims the same workflow_id before
+    // the scanner drains the deferred row.
+    start(&mut conn, wf, wf_id, serde_json::json!({})).await;
+    let execs_before = execution_count(&mut conn, wf).await;
 
     // Refill exactly 1 token and drain: the fire consumes it, start_or_load
     // returns AlreadyExists, the row is dropped, and the token is refunded.
@@ -540,10 +714,9 @@ async fn id_reuse_short_circuit_refunds_token() {
         execs_before,
         "no new execution created"
     );
-    // Token refunded: balance is back at ~1 (a short-circuit consumed nothing).
     assert!(
         bucket_tokens(&mut conn, &bkey).await >= 0.99,
-        "token refunded after id-reuse short-circuit"
+        "token refunded after fire-time id-reuse short-circuit"
     );
 }
 
@@ -796,6 +969,7 @@ async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
     let first_outcome = match first {
         ThrottleAdmission::Deferred(o) => o,
         ThrottleAdmission::Reserved { .. } => panic!("expected Deferred"),
+        ThrottleAdmission::Bypassed => panic!("no prior execution exists for this workflow_id"),
     };
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
 
@@ -819,6 +993,7 @@ async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
     let retry_outcome = match retry {
         ThrottleAdmission::Deferred(o) => o,
         ThrottleAdmission::Reserved { .. } => panic!("expected Deferred"),
+        ThrottleAdmission::Bypassed => panic!("no prior execution exists for this workflow_id"),
     };
 
     // No second row was inserted.
@@ -854,7 +1029,221 @@ async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
     let third_outcome = match third {
         ThrottleAdmission::Deferred(o) => o,
         ThrottleAdmission::Reserved { .. } => panic!("expected Deferred"),
+        ThrottleAdmission::Bypassed => panic!("no prior execution exists for this workflow_id"),
     };
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
     assert_eq!(third_outcome.deferred_at, retry_outcome.deferred_at);
+}
+
+/// Code-review fix (issue #607): a retry carrying the same `workflow_id` but
+/// resolving to a *different* throttle key must still land on the original
+/// pending row -- even when the new key's bucket has an available token --
+/// rather than winning `Reserved` under the new key and leaving the old
+/// pending row orphaned (silently dropped later as a duplicate).
+#[tokio::test]
+async fn retry_resolving_to_a_different_key_still_defers_to_the_original_row() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key1 = "tenant-a";
+    let key2 = "tenant-b";
+    let wf_id = "cross-key-retry-job";
+
+    // key1's bucket is empty -- the original admission genuinely defers.
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key1,
+            "seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed consumes key1's burst token");
+    let first = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key1,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("first admission defers under key1");
+    let first_outcome = match first {
+        ThrottleAdmission::Deferred(o) => o,
+        other => panic!("expected Deferred, got {other:?}"),
+    };
+    assert_eq!(first_outcome.throttle_key, key1);
+
+    // The retry resolves to key2 (e.g. the resolved-key expression's input
+    // changed between attempts), whose bucket has a fresh, available token.
+    let retry = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key2,
+            wf_id,
+            serde_json::json!({}),
+            100.0,
+            10.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("retry resolves to key2");
+    let retry_outcome = match retry {
+        ThrottleAdmission::Deferred(o) => o,
+        other => panic!(
+            "expected Deferred referencing the original key1 row, got {other:?} -- \
+             the retry must not win Reserved under the newly-resolved key2"
+        ),
+    };
+    assert_eq!(
+        retry_outcome.throttle_key, key1,
+        "retry must land on the ORIGINAL pending row (key1), not reserve fresh under key2"
+    );
+    assert_eq!(retry_outcome.workflow_id, first_outcome.workflow_id);
+    assert_eq!(
+        throttle_row_count(&mut conn, key1).await,
+        1,
+        "exactly one pending row exists, under key1"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, key2).await,
+        0,
+        "no row was ever inserted under key2"
+    );
+}
+
+/// P1 code-review fix: a single throttle key whose backlog exceeds
+/// `THROTTLE_FIRE_BATCH_SIZE` must not starve a *different* key's newer,
+/// ready-to-fire row. Before the fix the scanner's claim query was a flat
+/// `ORDER BY deferred_at ASC LIMIT THROTTLE_FIRE_BATCH_SIZE` — with more than
+/// `THROTTLE_FIRE_BATCH_SIZE` older rows all under one exhausted key, the
+/// claim would select *only* that key's rows every tick, never reaching a
+/// newer row under any other key. The per-key-fair CTE caps how many rows one
+/// `bucket_key` can contribute per tick (`THROTTLE_FIRE_PER_KEY_CAP`),
+/// guaranteeing headroom for other keys within the same batch limit.
+#[tokio::test]
+async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+    let hot_key = "hot-tenant";
+    let cold_key = "cold-tenant";
+
+    // hot_key: seed its bucket empty, then defer strictly more rows than
+    // THROTTLE_FIRE_BATCH_SIZE -- all older than cold_key's row below, and its
+    // bucket is never refilled (rate ~0), so none of them can ever fire.
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            hot_key,
+            "hot-seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("hot_key seed consumes its burst token");
+    let hot_backlog_size = THROTTLE_FIRE_BATCH_SIZE + 5;
+    for i in 0..hot_backlog_size {
+        let wf_id = format!("hot-job-{i}");
+        let admit = reserve_or_defer(
+            &mut conn,
+            params(
+                wf,
+                hot_key,
+                &wf_id,
+                serde_json::json!({ "n": i }),
+                0.0001,
+                1.0,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("hot_key backlog row defers");
+        assert!(
+            matches!(admit, ThrottleAdmission::Deferred(_)),
+            "every hot_key row must defer (its bucket is permanently empty)"
+        );
+    }
+    assert_eq!(
+        throttle_row_count(&mut conn, hot_key).await,
+        hot_backlog_size
+    );
+
+    // cold_key: one newer row (deferred strictly after all of hot_key's rows),
+    // whose bucket DOES have an available token by the time the scanner runs.
+    let cold_bucket_key = bucket_key(wf, cold_key);
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            cold_key,
+            "cold-seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("cold_key seed consumes its burst token");
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            cold_key,
+            "cold-job",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("cold_key row defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+    // Give cold_key's bucket a token so the scanner can admit it this tick --
+    // this is the "ready to fire" newer row that must not be starved.
+    set_bucket_tokens(&mut conn, &cold_bucket_key, 1.0).await;
+
+    // One scanner tick.
+    let fired = drain(&mut conn, &metrics).await;
+    assert!(
+        fired >= 1,
+        "cold_key's ready row must fire despite hot_key's much larger, older backlog"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, cold_key).await,
+        0,
+        "cold_key's ready row must have fired this tick, proving it wasn't starved"
+    );
+    // hot_key's bucket never had a token, so its per-key-capped candidates
+    // (at most THROTTLE_FIRE_PER_KEY_CAP of them) are examined and left in
+    // place, not deleted -- the whole backlog survives untouched.
+    assert_eq!(
+        throttle_row_count(&mut conn, hot_key).await,
+        hot_backlog_size,
+        "hot_key's backlog is examined (capped) but never fires without a token"
+    );
 }

@@ -1,5 +1,6 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::items_after_statements)]
 //! HTTP integration tests for the workflow-start throttle (issue #607).
 //!
 //! Exercises the plugin `POST /workflows/{name}/start` throttle admission path
@@ -25,6 +26,7 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
@@ -171,6 +173,11 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #606: harvest_task_queue.session_id (worker sessions), merged in from trunk-dev.
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
+    // issue #607 code review: companion index for the per-key-fair scanner query.
+    include_str!(
+        "../../autumn-harvest/migrations/20260707000000_harvest_start_throttle_bucket_deferred_idx/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -446,5 +453,251 @@ async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policie
         backlog.as_array().map(Vec::len),
         Some(0),
         "no pending throttle row should be created for a rejected item: {backlog:?}"
+    );
+}
+
+/// Code-review fix (issue #607, items 1 & 2): `context_headers`/`priority`
+/// submitted on `POST /workflows/{name}/start` must round-trip onto the
+/// resulting execution/task, on BOTH the immediate path (this test) and the
+/// throttle-deferred path (below) -- previously both were silently hardcoded
+/// to `None`/default regardless of what the caller sent.
+#[tokio::test]
+async fn context_headers_and_priority_round_trip_on_immediate_start() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // Generous burst so this start is always immediate (201).
+    let app = build_app(&pool, throttled_info("100/m", 100.0));
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({
+            "workflow_id": "ctx-job",
+            "input": { "tenant_id": "acme" },
+            "context_headers": { "trace-id": "abc123" },
+            "priority": "high",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "immediate start: {body:?}");
+    let exec_id = body["execution_id"].as_str().expect("execution_id");
+
+    // context_headers persisted onto the execution row. NOT verified via the
+    // GET /workflows/{id} describe response: WorkflowExecution.context_headers
+    // is deliberately `#[serde(skip)]`d from every management-API response
+    // (raw header values may carry auth tokens/tenant secrets) -- verify the
+    // stored column directly instead.
+    let mut conn = pool.get().await.expect("conn");
+    #[derive(diesel::QueryableByName)]
+    struct CtxRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        context_headers: Option<serde_json::Value>,
+    }
+    let ctx_row: CtxRow =
+        diesel::sql_query("SELECT context_headers FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::parse_str(exec_id).unwrap())
+            .get_result(&mut conn)
+            .await
+            .expect("execution row");
+    assert_eq!(
+        ctx_row
+            .context_headers
+            .as_ref()
+            .and_then(|v| v.get("trace-id"))
+            .cloned(),
+        Some(json!("abc123")),
+        "context_headers must round-trip onto the execution row"
+    );
+
+    // priority persisted onto the initial workflow task's queue row.
+    #[derive(diesel::QueryableByName)]
+    struct P {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        priority: i32,
+    }
+    let row: P = diesel::sql_query(
+        "SELECT priority FROM harvest_task_queue WHERE workflow_exec_id = $1 \
+         AND task_type = 'workflow' LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::parse_str(exec_id).unwrap())
+    .get_result(&mut conn)
+    .await
+    .expect("task queue row");
+    assert_eq!(
+        row.priority,
+        autumn_harvest::types::Priority::High.as_i32(),
+        "priority must round-trip onto the initial workflow task"
+    );
+}
+
+/// Same round-trip guarantee on the throttle-deferred path: the deferred
+/// start's `context_headers`/`priority` must survive the
+/// defer -> `DebounceStartOptions` -> scanner-fire round trip, not just the
+/// immediate path.
+#[tokio::test]
+async fn context_headers_and_priority_round_trip_on_deferred_start() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // burst = 1 -> the second start for the same tenant defers.
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+
+    let (s1, _) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({ "workflow_id": "seed", "input": { "tenant_id": "acme" } }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({
+            "workflow_id": "ctx-deferred-job",
+            "input": { "tenant_id": "acme" },
+            "context_headers": { "trace-id": "def456" },
+            "priority": "critical",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "deferred start: {body:?}");
+
+    // Drive the scanner: refill the bucket and fire.
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET tokens = 1.0, last_refilled_at = NOW() \
+         WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>("start-throttle:sync_tenant:acme")
+    .execute(&mut conn)
+    .await
+    .expect("refill bucket");
+    let fired = autumn_harvest::throttle::fire_due_throttled_starts(
+        &mut conn,
+        &None,
+        &[] as &[autumn_harvest::types::ShardId],
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("fire due");
+    assert_eq!(fired, 1, "the deferred start must fire this tick");
+
+    // Find the execution that was created for ctx-deferred-job.
+    #[derive(diesel::QueryableByName)]
+    struct ExecRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        context_headers: Option<serde_json::Value>,
+    }
+    let exec: ExecRow = diesel::sql_query(
+        "SELECT id, context_headers FROM harvest_workflow_executions \
+         WHERE workflow_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>("ctx-deferred-job")
+    .get_result(&mut conn)
+    .await
+    .expect("execution row");
+    assert_eq!(
+        exec.context_headers
+            .as_ref()
+            .and_then(|v| v.get("trace-id"))
+            .cloned(),
+        Some(json!("def456")),
+        "context_headers must survive the defer -> fire round trip"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct P {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        priority: i32,
+    }
+    let row: P = diesel::sql_query(
+        "SELECT priority FROM harvest_task_queue WHERE workflow_exec_id = $1 \
+         AND task_type = 'workflow' LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.id)
+    .get_result(&mut conn)
+    .await
+    .expect("task queue row");
+    assert_eq!(
+        row.priority,
+        autumn_harvest::types::Priority::Critical.as_i32(),
+        "priority must survive the defer -> fire round trip"
+    );
+}
+
+/// Code-review fix (issue #607, item 9): every batch-start result -- `started`,
+/// `rejected`, and `deferred` alike -- must include the `workflow_id` the item
+/// resolved to (caller-supplied, or server-generated when omitted), so a
+/// caller can poll/cancel/correlate the eventual run even for a deferred item
+/// that has no `execution_id` yet.
+#[tokio::test]
+async fn batch_start_results_include_workflow_id_for_every_outcome() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // burst = 1 -> the second item for the same tenant defers.
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "batch-started-job",
+                    "input": { "tenant_id": "acme" },
+                },
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "batch-deferred-job",
+                    "input": { "tenant_id": "acme" },
+                },
+                {
+                    "workflow_name": "unregistered_workflow",
+                    "input": { "tenant_id": "acme" },
+                },
+            ],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "best-effort batch: {body:?}");
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+
+    let started = results
+        .iter()
+        .find(|r| r["status"] == json!("started"))
+        .expect("one started result");
+    assert_eq!(
+        started["workflow_id"],
+        json!("batch-started-job"),
+        "started result: {started:?}"
+    );
+
+    let deferred = results
+        .iter()
+        .find(|r| r["status"] == json!("deferred"))
+        .expect("one deferred result");
+    assert_eq!(
+        deferred["workflow_id"],
+        json!("batch-deferred-job"),
+        "deferred result must include workflow_id so the caller can correlate \
+         the eventual run: {deferred:?}"
+    );
+
+    // The pre-validation rejection (unregistered workflow name) never resolves
+    // a workflow_id at all (no explicit id was given, and none is generated
+    // for an item rejected before Phase 1) -- workflow_id is correctly absent.
+    let rejected = results
+        .iter()
+        .find(|r| r["status"] == json!("rejected"))
+        .expect("one rejected result");
+    assert!(
+        rejected.get("workflow_id").is_none(),
+        "a pre-validation rejection for an omitted id has no resolved workflow_id: {rejected:?}"
     );
 }
