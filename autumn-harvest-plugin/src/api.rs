@@ -1573,6 +1573,9 @@ struct PauseWorkflowResponse {
     reason: Option<String>,
     actor: String,
     newly_paused: bool,
+    /// When the pause took effect (issue #609): this request's timestamp for a
+    /// fresh pause, the original pause instant for an idempotent repeat.
+    paused_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1582,6 +1585,9 @@ struct ResumeWorkflowResponse {
     state: String,
     actor: String,
     pause_duration_secs: f64,
+    /// `false` when the execution was not paused and nothing was mutated —
+    /// resume is an idempotent success no-op for non-paused runs (issue #609).
+    newly_resumed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3827,6 +3833,7 @@ pub const fn management_api_response_fields()
                 "reason",
                 "actor",
                 "newly_paused",
+                "paused_at",
             ]),
         ),
         (
@@ -3838,6 +3845,7 @@ pub const fn management_api_response_fields()
                 "state",
                 "actor",
                 "pause_duration_secs",
+                "newly_resumed",
             ]),
         ),
         (
@@ -11096,6 +11104,7 @@ async fn pause_workflow(
                 reason: paused.reason,
                 actor: paused.actor,
                 newly_paused: paused.newly_paused,
+                paused_at: paused.paused_at,
             }),
         )),
         Err(e) => Err(conflict_from(e)),
@@ -11103,8 +11112,11 @@ async fn pause_workflow(
 }
 
 /// `POST /workflows/{id}/resume` — re-arm a paused execution (issue #383).
-/// Returns 200 on success, 409 if the workflow is not in the `Paused` state,
-/// 404 if not found.
+/// Returns 200 on success and 404 if not found. Resuming a non-paused
+/// execution (running or terminal) is a 200 success no-op reporting
+/// `newly_resumed: false` (issue #609, AC7) so an operator retry after the
+/// run already resumed — or completed post-resume — never errors, mirroring
+/// terminate's `newly_terminated: false` precedent.
 async fn resume_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -11152,6 +11164,7 @@ async fn resume_workflow(
                 state: resumed.state,
                 actor: resumed.actor,
                 pause_duration_secs: resumed.pause_duration_secs,
+                newly_resumed: resumed.newly_resumed,
             }),
         )),
         Err(e) => Err(conflict_from(e)),
