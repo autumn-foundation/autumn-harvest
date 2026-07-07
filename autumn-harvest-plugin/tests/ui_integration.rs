@@ -3146,3 +3146,224 @@ async fn load_latest_workflow_execution_by_name_from_url(
         .optional()
         .expect("failed to load workflow rows by workflow name")
 }
+
+// ── Read-path payload decoding in the Vantage UI (issue #608) ────────────────
+//
+// Seeding note: engine write paths use identity codecs, so envelope-bearing
+// rows are synthesized directly (an envelope is just JSON; identity
+// persistence stores it verbatim). No Docker in the authoring sandbox — these
+// tests are compile-checked only, per the #543/#544/#601 precedent.
+
+#[derive(Debug)]
+struct ReverseCodec608;
+
+impl autumn_harvest::payload_codec::PayloadCodec for ReverseCodec608 {
+    fn codec_id(&self) -> &'static str {
+        "reverse"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        let mut v = raw.to_vec();
+        v.reverse();
+        Ok(v)
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        let mut v = encoded.to_vec();
+        v.reverse();
+        Ok(v)
+    }
+}
+
+fn decode_test_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+    let mut codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs.set_default(Arc::new(ReverseCodec608));
+    codecs
+}
+
+/// Builds a well-formed `reverse` codec envelope for `plain` via the public
+/// `encode_event` round-trip (no base64 dep needed in this test crate).
+fn envelope_608(plain: &Value) -> Value {
+    let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+        output: plain.clone(),
+    };
+    let encoded = decode_test_codecs()
+        .encode_event(&event)
+        .expect("encode event");
+    encoded["data"]["output"].clone()
+}
+
+/// Single-shard API+UI app with read-path decoding enabled (issue #608):
+/// admin boundary + codec registry mirrored + the opt-in flag set.
+fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    // NEW API (issue #608): codec registry mirror + deployment opt-in.
+    api_state.set_payload_codecs(decode_test_codecs());
+    api_state.set_decode_payloads_on_read(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_test_pool(database_url)));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+
+    autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database())
+}
+
+async fn count_decode_audit_rows(database_url: &str) -> i64 {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for audit count");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_PAYLOAD_DECODE_READ))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count decode audit rows")
+}
+
+/// Issue #608 (DLQ UI): the dead-letter page renders the decoded task input
+/// and error instead of ciphertext, and the plaintext page render is audited.
+#[tokio::test]
+async fn dlq_ui_page_renders_decoded_payloads_and_audits() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    // Seed one dead letter whose input is a codec envelope and whose TEXT
+    // error is a stringified envelope.
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "encrypted_workflow",
+        "dlq-decode-1",
+    )
+    .await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for dead-letter insert");
+    autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(exec_id.as_uuid()),
+            activity_name: Some("charge_card".to_string()),
+            input: envelope_608(&json!({"card": "pii-dlq-input"})),
+            error: serde_json::to_string(&envelope_608(&json!("declined: pii-dlq-error")))
+                .expect("serialize envelope"),
+            attempts: 3,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed");
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/ui/dead-letters").await;
+    assert_eq!(status, StatusCode::OK, "DLQ page should render: {html}");
+    assert!(
+        html.contains("pii-dlq-input"),
+        "DLQ row input must render decoded plaintext: {html}"
+    );
+    assert!(
+        html.contains("pii-dlq-error"),
+        "DLQ row error must render decoded plaintext: {html}"
+    );
+    assert!(
+        !html.contains("_harvest_codec_envelope"),
+        "DLQ page must not render raw envelopes: {html}"
+    );
+
+    assert!(
+        count_decode_audit_rows(&database_url).await >= 1,
+        "a DLQ page render that decoded payloads must write a payload.decode_read audit row"
+    );
+}
+
+/// Issue #608 (workflow detail UI): the detail page renders the decoded
+/// workflow input instead of the stored envelope.
+#[tokio::test]
+async fn workflow_detail_ui_renders_decoded_input() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    // A workflow whose stored input is a codec envelope (identity persistence
+    // stores the envelope object verbatim).
+    let input_envelope = envelope_608(&json!({"user": "pii-detail-input"}));
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "encrypted_workflow",
+            workflow_id: "detail-decode-1",
+            exec_id,
+            input: input_envelope.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .expect("workflow insert should succeed");
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("pii-detail-input"),
+        "workflow detail must render the decoded input: {html}"
+    );
+    assert!(
+        !html.contains("_harvest_codec_envelope"),
+        "workflow detail must not render the raw envelope: {html}"
+    );
+
+    // The stored row keeps its ciphertext (read-path only, append-only safe).
+    let stored_input: Value = autumn_harvest::schema::harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::schema::harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("load stored input");
+    assert_eq!(
+        stored_input, input_envelope,
+        "stored input must remain ciphertext after the decoded render"
+    );
+}

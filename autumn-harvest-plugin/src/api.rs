@@ -26210,4 +26210,95 @@ mod tests {
             "no pagination params → paginated must be false"
         );
     }
+
+    // ── Read-path payload decoding (issue #608) ──────────────────────────────
+
+    #[test]
+    fn decode_gate_requires_flag_and_admin() {
+        // AC1 + AC6 truth table: the decoder is obtainable only when the
+        // deployment-level opt-in flag is set AND the request has
+        // harvest-admin access. Any refactor flipping either leg is a
+        // security regression.
+        assert!(decode_gate(true, true), "flag on + admin ⇒ decode");
+        assert!(
+            !decode_gate(true, false),
+            "flag on + non-admin ⇒ NEVER decode (ungated describe routes)"
+        );
+        assert!(
+            !decode_gate(false, true),
+            "flag off ⇒ byte-identical responses even for admins"
+        );
+        assert!(!decode_gate(false, false));
+    }
+
+    #[test]
+    fn api_state_decode_payloads_on_read_defaults_off() {
+        // The opt-in must default off by construction: a fresh
+        // HarvestApiState (standalone runner, or plugin without the flag)
+        // never decodes.
+        let state = HarvestApiState::new();
+        assert!(
+            !state.decode_payloads_on_read(),
+            "decode_payloads_on_read must default to false (issue #608 AC1)"
+        );
+        state.set_decode_payloads_on_read(true);
+        assert!(state.decode_payloads_on_read());
+        state.set_decode_payloads_on_read(false);
+        assert!(!state.decode_payloads_on_read());
+    }
+
+    #[test]
+    fn sse_frame_data_decodes_envelope_when_decoder_active_and_is_identity_when_none() {
+        use autumn_harvest::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
+
+        #[derive(Debug)]
+        struct ReverseCodec;
+        impl PayloadCodec for ReverseCodec {
+            fn codec_id(&self) -> &'static str {
+                "reverse"
+            }
+            fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+                let mut v = raw.to_vec();
+                v.reverse();
+                Ok(v)
+            }
+            fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+                let mut v = encoded.to_vec();
+                v.reverse();
+                Ok(v)
+            }
+        }
+
+        // Build an envelope-bearing serialized event exactly the shape the
+        // SSE producer reads from harvest_events.event_data.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+        let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"answer": 42}),
+        };
+        let event_data = codecs.encode_event(&event).expect("encode event");
+        assert_eq!(
+            event_data["data"]["output"]["_harvest_codec_envelope"], 1,
+            "fixture sanity: the stored frame carries a codec envelope"
+        );
+
+        // Decoder inactive (flag off / non-admin): identical to today's
+        // sse_data closure — the raw inner `data` object, envelope included.
+        let raw_frame = sse_frame_data(&event_data, None);
+        let raw: serde_json::Value = serde_json::from_str(&raw_frame).expect("frame is JSON");
+        assert_eq!(
+            raw["output"]["_harvest_codec_envelope"], 1,
+            "with no decoder the frame must carry the stored ciphertext"
+        );
+
+        // Decoder active: the frame's payload fields are decoded in place.
+        let decoded_frame = sse_frame_data(&event_data, Some(&codecs));
+        let decoded: serde_json::Value =
+            serde_json::from_str(&decoded_frame).expect("frame is JSON");
+        assert_eq!(decoded["output"], serde_json::json!({"answer": 42}));
+        assert!(
+            !decoded_frame.contains("_harvest_codec_envelope"),
+            "decoded frame must not leak the envelope: {decoded_frame}"
+        );
+    }
 }

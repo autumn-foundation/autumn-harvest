@@ -1077,6 +1077,22 @@ mod tests {
     }
 
     #[test]
+    fn payload_decode_read_op_is_registered_in_audited_operations() {
+        // Issue #608: operator read-path decoding of codec-encrypted payloads
+        // writes one best-effort audit row per request that decoded/marked
+        // ≥1 envelope (SSE: one row at stream open when decode mode is
+        // active). It is a *read* audit like OP_EXECUTION_STREAM_OPEN — no
+        // CLASSIFIED_ROUTES/ALL_MUTATION_ROUTES change (no route mutates and
+        // no new route exists), but the operation name itself must be in the
+        // registry so audit consumers can enumerate it.
+        assert_eq!(OP_PAYLOAD_DECODE_READ, "payload.decode_read");
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_PAYLOAD_DECODE_READ),
+            "OP_PAYLOAD_DECODE_READ must appear in AUDITED_OPERATIONS (issue #608)"
+        );
+    }
+
+    #[test]
     fn all_classified_routes_are_in_route_manifest() {
         let manifest: std::collections::HashSet<&str> =
             ALL_MUTATION_ROUTES.iter().map(|(r, _)| *r).collect();

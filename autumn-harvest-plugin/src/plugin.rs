@@ -1276,6 +1276,25 @@ mod tests {
         assert!(!mcp_tools_unprotected(false, true));
     }
 
+    /// Issue #608: read-path payload decoding is a deliberate, explicit
+    /// opt-in (mirrors the `mcp_tools()` const-fn flag precedent). The flag
+    /// must default off so a plugin that never mentions it produces
+    /// byte-for-byte identical responses to today.
+    #[test]
+    fn decode_payloads_on_read_flag_defaults_off_and_sets_on_builder() {
+        let plugin = HarvestPlugin::new();
+        assert!(
+            !plugin.decode_payloads_on_read,
+            "decode_payloads_on_read must default to false (issue #608 AC1)"
+        );
+
+        let plugin = plugin.decode_payloads_on_read();
+        assert!(
+            plugin.decode_payloads_on_read,
+            "HarvestPlugin::decode_payloads_on_read() must set the opt-in flag"
+        );
+    }
+
     #[test]
     fn harvest_plugin_build_registers_startup_and_shutdown_hooks() {
         let app = autumn_web::app().plugin(

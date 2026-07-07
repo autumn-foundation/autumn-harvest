@@ -402,4 +402,507 @@ mod tests {
         let err = codecs.decode_event(bad).expect_err("must fail");
         assert!(matches!(err, HarvestError::UnknownPayloadCodec { .. }));
     }
+
+    // ── Tolerant read-path decode (issue #608) ────────────────────────────────
+    //
+    // `decode_value_lossy` / `decode_error_string_lossy` are the operator
+    // read-path siblings of the strict `decode_event`: infallible, recursive,
+    // per-field graceful degrade via the `_harvest_undecodable` marker.
+    // (`base64::Engine` is already in scope via `use super::*`.)
+
+    /// A codec whose `decode` always fails — exercises the graceful-degrade
+    /// marker path (bad key / corrupt ciphertext at read time).
+    #[derive(Debug)]
+    struct FailingCodec;
+
+    impl PayloadCodec for FailingCodec {
+        fn codec_id(&self) -> &'static str {
+            "failing"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(raw.to_vec())
+        }
+        fn decode(&self, _encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Err(CodecError("simulated bad key".to_string()))
+        }
+    }
+
+    /// Registry with `ReverseCodec` + `FailingCodec` registered (identity is
+    /// always present); default stays identity so encoding elsewhere is inert.
+    fn lossy_test_codecs() -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.register(Arc::new(ReverseCodec));
+        codecs.register(Arc::new(FailingCodec));
+        codecs
+    }
+
+    /// Builds a well-formed codec envelope for `plain` under `codec_id`,
+    /// using ReverseCodec's byte-reversal for the ciphertext.
+    fn reverse_envelope(plain: &Value) -> Value {
+        let mut bytes = serde_json::to_vec(plain).expect("serialize plain");
+        bytes.reverse();
+        serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "reverse",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+
+    /// An envelope naming a codec that is not registered anywhere.
+    fn unknown_codec_envelope() -> Value {
+        serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "kms-rotated-away",
+            "data": "e30=",
+        })
+    }
+
+    #[test]
+    fn decode_value_lossy_decodes_envelope_in_place() {
+        let codecs = lossy_test_codecs();
+        let plain = serde_json::json!({"user": "alice", "ssn": "s3cret-pii"});
+        let mut value = serde_json::json!({
+            "input": reverse_envelope(&plain),
+            "meta": "untouched",
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value["input"], plain, "envelope must decode in place");
+        assert_eq!(value["meta"], "untouched");
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 0
+            }
+        );
+        assert!(outcome.touched());
+    }
+
+    #[test]
+    fn decode_value_lossy_identity_envelope_round_trips() {
+        // The identity codec is always registered, so an identity envelope
+        // (written by a future/foreign path) must round-trip on read.
+        let codecs = PayloadCodecs::default();
+        let plain = serde_json::json!({"n": 42});
+        let raw = serde_json::to_vec(&plain).unwrap();
+        let mut value = serde_json::json!({
+            "output": {
+                "_harvest_codec_envelope": 1,
+                "codec_id": "identity",
+                "data": base64::engine::general_purpose::STANDARD.encode(raw),
+            }
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value["output"], plain);
+        assert_eq!(outcome.decoded, 1);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[test]
+    fn decode_value_lossy_unknown_codec_id_yields_undecodable_marker_not_error() {
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({"input": unknown_codec_envelope()});
+
+        // Infallible by signature: no Result to unwrap.
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 0,
+                failed: 1
+            }
+        );
+        let marker = &value["input"][UNDECODABLE_MARKER_KEY];
+        assert_eq!(marker["codec_id"], "kms-rotated-away");
+        assert_eq!(marker["reason"], UNDECODABLE_REASON_UNKNOWN_CODEC);
+    }
+
+    #[test]
+    fn decode_value_lossy_bad_base64_yields_marker() {
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "input": {
+                "_harvest_codec_envelope": 1,
+                "codec_id": "reverse",
+                "data": "!!!not-base64!!!",
+            }
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.decoded, 0);
+        let marker = &value["input"][UNDECODABLE_MARKER_KEY];
+        assert_eq!(marker["codec_id"], "reverse");
+        assert_eq!(marker["reason"], UNDECODABLE_REASON_INVALID_BASE64);
+    }
+
+    #[test]
+    fn decode_value_lossy_codec_decode_failure_yields_marker() {
+        let codecs = lossy_test_codecs();
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(b"ciphertext-bytes");
+        let mut value = serde_json::json!({
+            "input": {
+                "_harvest_codec_envelope": 1,
+                "codec_id": "failing",
+                "data": ciphertext_b64.clone(),
+            }
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(outcome.failed, 1);
+        let marker = &value["input"][UNDECODABLE_MARKER_KEY];
+        assert_eq!(marker["codec_id"], "failing");
+        assert_eq!(marker["reason"], UNDECODABLE_REASON_CODEC_ERROR);
+        // The marker must never echo the ciphertext (or the codec's own error
+        // text, which could carry key material) back to the caller.
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(
+            !serialized.contains(&ciphertext_b64),
+            "marker must not echo ciphertext: {serialized}"
+        );
+        assert!(
+            !serialized.contains("simulated bad key"),
+            "marker must not embed codec error text: {serialized}"
+        );
+    }
+
+    #[test]
+    fn decode_value_lossy_invalid_decoded_json_yields_marker() {
+        // ReverseCodec decodes fine, but the plaintext bytes are not JSON.
+        let codecs = lossy_test_codecs();
+        let mut bytes = b"this is not json".to_vec();
+        bytes.reverse();
+        let mut value = serde_json::json!({
+            "output": {
+                "_harvest_codec_envelope": 1,
+                "codec_id": "reverse",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(outcome.failed, 1);
+        let marker = &value["output"][UNDECODABLE_MARKER_KEY];
+        assert_eq!(marker["reason"], UNDECODABLE_REASON_INVALID_JSON);
+    }
+
+    #[test]
+    fn decode_value_lossy_non_envelope_values_pass_through_untouched() {
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "string": "plain",
+            "number": 42,
+            "bool": true,
+            "null": null,
+            "array": [1, {"nested": "obj"}, [2, 3]],
+            "object": {"deep": {"deeper": {"leaf": "x"}}},
+        });
+        let pristine = value.clone();
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value, pristine, "non-envelope JSON must be byte-identical");
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+        assert!(!outcome.touched());
+    }
+
+    #[test]
+    fn decode_value_lossy_ignores_offload_envelope() {
+        // The claim-check reference envelope (issue #524) has a different
+        // discriminator key — it must pass through untouched.
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "output": {
+                "_harvest_offload_envelope": 1,
+                "store_id": "s3-main",
+                "key": "blob/abc",
+                "len": 2048,
+                "checksum": "deadbeef",
+            }
+        });
+        let pristine = value.clone();
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value, pristine);
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn decode_value_lossy_ignores_erasure_tombstone() {
+        // The PII-erasure tombstone (issue #495) must pass through untouched.
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({"input": {"_harvest_erased": true}});
+        let pristine = value.clone();
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value, pristine);
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn decode_value_lossy_ignores_non_envelope_object_with_codec_id_key() {
+        // Same semantics as the strict decoder: business data that happens to
+        // carry a `codec_id` field is not an envelope.
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "output": {"codec_id": "business-field", "value": 1}
+        });
+        let pristine = value.clone();
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value, pristine);
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn decode_value_lossy_passes_through_malformed_envelope_variants() {
+        // Near-envelopes must pass through untouched (same tolerance as the
+        // strict `decode_payload`), never decode and never mark.
+        let codecs = lossy_test_codecs();
+        let malformed = [
+            // Wrong version.
+            serde_json::json!({
+                "_harvest_codec_envelope": 2,
+                "codec_id": "reverse",
+                "data": "e30=",
+            }),
+            // Four keys.
+            serde_json::json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "reverse",
+                "data": "e30=",
+                "extra": true,
+            }),
+            // Non-string data.
+            serde_json::json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "reverse",
+                "data": 42,
+            }),
+            // Non-string codec_id.
+            serde_json::json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": 7,
+                "data": "e30=",
+            }),
+            // Missing data field entirely (only 2 keys).
+            serde_json::json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "reverse",
+            }),
+        ];
+
+        for near_envelope in malformed {
+            let mut value = serde_json::json!({"input": near_envelope});
+            let pristine = value.clone();
+            let outcome = codecs.decode_value_lossy(&mut value);
+            assert_eq!(value, pristine, "malformed variant must pass through");
+            assert_eq!(outcome, LossyDecodeOutcome::default());
+        }
+    }
+
+    #[test]
+    fn decode_value_lossy_does_not_rescan_decoded_plaintext_for_envelopes() {
+        // Single-pass rule: decoded plaintext that is itself envelope-shaped
+        // (business data, or a frozen last_completion_result copy) must be
+        // preserved verbatim — never decoded a second time, never marked.
+        let codecs = lossy_test_codecs();
+        let envelope_shaped_plaintext = unknown_codec_envelope();
+        let mut value = serde_json::json!({
+            "output": reverse_envelope(&envelope_shaped_plaintext),
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(
+            value["output"], envelope_shaped_plaintext,
+            "decoded plaintext must be preserved as data, not re-scanned"
+        );
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decode_value_lossy_recurses_into_arrays_and_nested_objects() {
+        let codecs = lossy_test_codecs();
+        let plain_a = serde_json::json!("alpha");
+        let plain_b = serde_json::json!({"b": 2});
+        let plain_c = serde_json::json!([3, 3, 3]);
+        let mut value = serde_json::json!({
+            "events": [
+                {"data": {"input": reverse_envelope(&plain_a)}},
+                {"data": {"output": reverse_envelope(&plain_b)}},
+            ],
+            "nested": {"deep": [reverse_envelope(&plain_c)]},
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value["events"][0]["data"]["input"], plain_a);
+        assert_eq!(value["events"][1]["data"]["output"], plain_b);
+        assert_eq!(value["nested"]["deep"][0], plain_c);
+        assert_eq!(outcome.decoded, 3);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[test]
+    fn decode_value_lossy_mixed_good_and_bad_envelopes_decodes_good_marks_bad() {
+        // The per-field tolerance AC: one bad envelope never poisons its
+        // siblings — the good field decodes, the bad one degrades to a marker.
+        let codecs = lossy_test_codecs();
+        let plain = serde_json::json!({"ok": true});
+        let mut value = serde_json::json!({
+            "good": reverse_envelope(&plain),
+            "bad": unknown_codec_envelope(),
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value["good"], plain);
+        assert_eq!(
+            value["bad"][UNDECODABLE_MARKER_KEY]["reason"],
+            UNDECODABLE_REASON_UNKNOWN_CODEC
+        );
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn decode_value_lossy_counts_decoded_and_failed_fields() {
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "a": reverse_envelope(&serde_json::json!(1)),
+            "b": reverse_envelope(&serde_json::json!(2)),
+            "c": reverse_envelope(&serde_json::json!(3)),
+            "d": unknown_codec_envelope(),
+            "e": unknown_codec_envelope(),
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 3,
+                failed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn decode_error_string_lossy_decodes_stringified_envelope() {
+        // TEXT error columns can carry a serialized envelope. A decoded
+        // string plain payload is returned unwrapped (the original error was
+        // a plain string before encoding).
+        let codecs = lossy_test_codecs();
+        let envelope = reverse_envelope(&serde_json::json!("boom"));
+        let raw = serde_json::to_string(&envelope).unwrap();
+
+        let (decoded, outcome) = codecs.decode_error_string_lossy(&raw);
+
+        assert_eq!(decoded.as_deref(), Some("boom"));
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decode_error_string_lossy_leaves_plain_error_text_untouched() {
+        let codecs = lossy_test_codecs();
+
+        let (decoded, outcome) =
+            codecs.decode_error_string_lossy("activity failed: connection refused");
+
+        assert_eq!(decoded, None, "plain error text must be left untouched");
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn decode_error_string_lossy_leaves_non_envelope_json_untouched() {
+        let codecs = lossy_test_codecs();
+
+        let (decoded, outcome) =
+            codecs.decode_error_string_lossy(r#"{"code": 500, "message": "downstream"}"#);
+
+        assert_eq!(
+            decoded, None,
+            "JSON that is not exactly a codec envelope must be left untouched"
+        );
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn undecodable_marker_shape_and_reasons_are_stable() {
+        // Pins the marker key, the exact marker shape, and the four bounded
+        // reason strings — the operator-facing degrade contract (issue #608).
+        assert_eq!(UNDECODABLE_MARKER_KEY, "_harvest_undecodable");
+        assert_eq!(UNDECODABLE_REASON_UNKNOWN_CODEC, "unknown_codec");
+        assert_eq!(UNDECODABLE_REASON_INVALID_BASE64, "invalid_base64");
+        assert_eq!(UNDECODABLE_REASON_CODEC_ERROR, "codec_error");
+        assert_eq!(UNDECODABLE_REASON_INVALID_JSON, "invalid_json");
+
+        let marker = undecodable_marker("kms-v1", UNDECODABLE_REASON_CODEC_ERROR);
+        assert_eq!(
+            marker,
+            serde_json::json!({
+                UNDECODABLE_MARKER_KEY: {
+                    "codec_id": "kms-v1",
+                    "reason": "codec_error",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn lossy_decode_outcome_merged_and_touched_semantics() {
+        let zero = LossyDecodeOutcome::default();
+        assert!(!zero.touched());
+
+        let decoded_only = LossyDecodeOutcome {
+            decoded: 2,
+            failed: 0,
+        };
+        assert!(decoded_only.touched());
+
+        let failed_only = LossyDecodeOutcome {
+            decoded: 0,
+            failed: 1,
+        };
+        assert!(failed_only.touched(), "a marked field is still a touch");
+
+        let merged = decoded_only.merged(failed_only);
+        assert_eq!(
+            merged,
+            LossyDecodeOutcome {
+                decoded: 2,
+                failed: 1
+            }
+        );
+        assert_eq!(zero.merged(zero), zero);
+    }
 }
