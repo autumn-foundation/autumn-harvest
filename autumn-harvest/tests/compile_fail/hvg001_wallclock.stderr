@@ -1,20 +1,20 @@
 error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.
        Alternative: Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. "skip the notification if the event is older than 24h *now*"), use ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.
- --> tests/compile_fail/hvg001_wallclock.rs:5:26
+ --> tests/compile_fail/hvg001_wallclock.rs:6:26
   |
-5 |     let _ = chrono::Utc::now();
+6 |     let _ = chrono::Utc::now();
   |                          ^^^
 
 error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.
        Alternative: Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. "skip the notification if the event is older than 24h *now*"), use ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.
- --> tests/compile_fail/hvg001_wallclock.rs:6:28
+ --> tests/compile_fail/hvg001_wallclock.rs:7:28
   |
-6 |     let _ = chrono::Local::now();
+7 |     let _ = chrono::Local::now();
   |                            ^^^
 
 error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.
        Alternative: Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. "skip the notification if the event is older than 24h *now*"), use ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.
- --> tests/compile_fail/hvg001_wallclock.rs:7:20
+ --> tests/compile_fail/hvg001_wallclock.rs:8:20
   |
-7 |     let _ = Local::now();
+8 |     let _ = Local::now();
   |                    ^^^

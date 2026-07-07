@@ -578,6 +578,7 @@ mod db_tests {
         include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
         "\n",
         include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+        include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -611,6 +612,7 @@ mod db_tests {
             "v1.0",
             Some("prod-blue"),
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .expect("register_worker");
@@ -641,6 +643,7 @@ mod db_tests {
             "v1.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -655,6 +658,7 @@ mod db_tests {
             "v2.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -914,6 +918,7 @@ mod db_tests {
             "v1.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -928,6 +933,7 @@ mod db_tests {
             "v2.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();

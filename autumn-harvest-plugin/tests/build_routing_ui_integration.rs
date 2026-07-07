@@ -170,6 +170,7 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
+    include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -435,6 +436,7 @@ async fn workers_page_nav_includes_build_routing() {
         "sha-v1",
         Some("prod-v1"),
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -1051,6 +1053,7 @@ async fn workers_page_build_id_filter_works() {
         "sha-v1",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -1065,6 +1068,7 @@ async fn workers_page_build_id_filter_works() {
         "sha-v2",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();

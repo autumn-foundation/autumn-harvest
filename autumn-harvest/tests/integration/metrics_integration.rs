@@ -126,6 +126,7 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -427,6 +428,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -2405,6 +2407,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         shard_notification_database_urls: Vec::new(),
         sharded_pool: None,
         slot_tuner: None,
+        max_concurrent_sessions: 0,
     };
     let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
     let pool = build_test_pool(&database_url);

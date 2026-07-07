@@ -12,7 +12,9 @@ pub use crate::circuit_breaker::{
     AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
     DispatchDecision, DispatchToken,
 };
-pub use crate::context::{ActivityContext, WorkflowContext};
+pub use crate::context::{
+    ActivityContext, DEFAULT_SESSION_ACQUISITION_TIMEOUT, Session, SessionOptions, WorkflowContext,
+};
 pub use crate::dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
     DagTask, DagTaskRef,
@@ -47,7 +49,7 @@ pub use crate::telemetry::{
 };
 pub use crate::types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalSignalId, IdempotencyKey,
-    Priority, TimerId, WorkerId, WorkflowId,
+    Priority, SessionId, TimerId, WorkerId, WorkflowId,
 };
 pub use crate::webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookTarget, WebhookTriggerInfo, validate_webhook_triggers,
