@@ -3022,7 +3022,7 @@ impl WorkflowContext {
         // history), emit a marker so future replays see this version.
         if !self.is_replaying() && version == max {
             self.push_command(WorkflowCommand::RecordMarker {
-                name: format!("version:{change_id}"),
+                name: crate::replay::version_marker_name(change_id),
                 details: Value::from(u64::from(max)),
             });
         }
@@ -3105,8 +3105,11 @@ impl WorkflowContext {
     ///
     /// # Panics
     ///
-    /// Panics if the internal matcher or commands mutex is poisoned.
+    /// Panics if `patch_id` is empty (a programmer error, mirroring the
+    /// [`version`](Self::version) argument asserts), or if the internal
+    /// matcher or commands mutex is poisoned.
     pub fn patched(&self, patch_id: &str) -> bool {
+        assert!(!patch_id.is_empty(), "patch id must not be empty");
         match self.match_history(|m| m.match_patch_marker(patch_id)) {
             PatchMarkerMatch::Recorded => true,
             PatchMarkerMatch::Absent => false,
@@ -3147,8 +3150,11 @@ impl WorkflowContext {
     ///
     /// # Panics
     ///
-    /// Panics if the internal matcher mutex is poisoned.
+    /// Panics if `patch_id` is empty (a programmer error, mirroring the
+    /// [`version`](Self::version) argument asserts), or if the internal
+    /// matcher mutex is poisoned.
     pub fn deprecate_patch(&self, patch_id: &str) {
+        assert!(!patch_id.is_empty(), "patch id must not be empty");
         self.match_history(|m| {
             m.deprecate_patch(patch_id);
         });
@@ -9411,6 +9417,22 @@ mod tests {
 
         assert!(ctx.patched("x"));
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    /// An empty patch id is a programmer error — must panic immediately with
+    /// a clear message (mirrors `version_panics_when_min_exceeds_max`).
+    #[test]
+    #[should_panic(expected = "patch id must not be empty")]
+    fn patched_panics_on_empty_patch_id() {
+        let ctx = WorkflowContext::new_test();
+        ctx.patched("");
+    }
+
+    #[test]
+    #[should_panic(expected = "patch id must not be empty")]
+    fn deprecate_patch_panics_on_empty_patch_id() {
+        let ctx = WorkflowContext::new_test();
+        ctx.deprecate_patch("");
     }
 
     #[test]

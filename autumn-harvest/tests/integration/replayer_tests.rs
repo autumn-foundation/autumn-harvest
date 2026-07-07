@@ -934,6 +934,101 @@ async fn replay_deprecate_patch_with_residual_patched_keeps_phase1_branch() {
     );
 }
 
+/// Phase-2 history: recorded by deprecated-gate code (`deprecate_patch` +
+/// unconditional new code) — new branch, **no** marker.
+fn phase2_marker_less_history() -> Vec<WorkflowEvent> {
+    let id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "new_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: serde_json::json!("new_result"),
+        },
+    ]
+}
+
+/// Gate-free workflow that makes no ctx calls at all — phase 3 of the
+/// lifecycle after even the `deprecate_patch` call was deleted.
+fn gate_free_noop_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(Value::Null) })
+}
+
+/// Positive phase-3 proof: a history recorded by phase-2 code (deprecated
+/// gate → no marker) replays cleanly against gate-free phase-3 code, i.e.
+/// deleting the `deprecate_patch` call after marker-bearing runs drained is
+/// safe for the marker-less generation.
+#[tokio::test]
+async fn replay_phase3_gate_free_code_replays_marker_less_phase2_history() {
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            // Gate-free handler running new_activity unconditionally.
+            "patched_workflow_removed_gate",
+            ExecutionId::new(),
+            phase2_marker_less_history(),
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "gate-free phase-3 code must replay a marker-less phase-2 history cleanly, got: {report}"
+    );
+}
+
+/// A stale `patch:{id}` marker as the FINAL history event, replayed against
+/// code with no ctx calls left at all, surfaces loudly — but as the generic
+/// `EarlyCompletion` (unconsumed trailing history), not `PatchMarkerMismatch`:
+/// no subsequent command ever trips over the marker, the completed-history
+/// check reports it instead. Pinned so the classification is deliberate.
+#[tokio::test]
+async fn replay_trailing_stale_patch_marker_classifies_as_early_completion() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "patch:gate".into(),
+            details: serde_json::json!(1),
+        },
+    ];
+
+    let replayer = WorkflowReplayer::new().register_fn("gate_free_noop", gate_free_noop_workflow);
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("gate_free_noop", ExecutionId::new(), events))
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::EarlyCompletion,
+                ..
+            }
+        ),
+        "a trailing stale patch marker must classify as EarlyCompletion, got: {report}"
+    );
+}
+
 /// Sandwich-flip money test (issue #687 review finding F1): the history a
 /// fixed live pass of the sandwich handler produces — `patched("gate")`
 /// records exactly one marker, `deprecate_patch` + residual `patched` add

@@ -4518,6 +4518,63 @@ mod tests {
     }
 
     #[test]
+    fn matcher_patch_marker_trailing_signal_history_is_absent() {
+        // Pinned deliberately (review finding F3, exact parity with
+        // match_version): a fresh execution whose first-task history ends in
+        // un-awaited signals at the gate point — canonically EVERY
+        // signal-with-start run, since the signal is staged before first
+        // dispatch — drains the signal, lands past cursor-based history, and
+        // must conservatively take the OLD branch (Absent, no marker
+        // recorded). The history is ambiguous with a phase-0 run parked at a
+        // first-line wait_for_signal, so this is not treated as a live
+        // frontier.
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "kick".into(),
+            payload: serde_json::json!({"n": 1}),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_patch_marker("billing_v2"),
+            PatchMarkerMatch::Absent,
+            "a trailing-signal history must be treated as a recorded, \
+             unpatched position — never as the live frontier"
+        );
+    }
+
+    #[test]
+    fn matcher_patch_marker_later_marker_does_not_match_at_cursor() {
+        // Positional-semantics pin (review finding F5): the marker lookup is
+        // cursor-based, not a whole-history scan. A `patch:x` marker recorded
+        // LATER in history must not satisfy a patched() call at an earlier
+        // position.
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("t1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t1"),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "patch:x".into(),
+                details: serde_json::json!(1),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Absent);
+        // Cursor untouched — the timer at position 0 still matches.
+        assert_eq!(matcher.position(), 0);
+        let timer = matcher.match_timer("t1");
+        assert!(matches!(timer, HistoryMatch::Matched { .. }));
+        // The trailing marker was left unconsumed: a patched() call at ITS
+        // position still consumes it.
+        assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Recorded);
+        assert_eq!(matcher.position(), 3);
+    }
+
+    #[test]
     fn matcher_deprecate_patch_sees_marker_recorded_this_cycle() {
         // The sandwich flip (review finding F1): on the LIVE cycle a
         // `patched(id)` call records its marker only as a pending
