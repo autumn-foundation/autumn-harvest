@@ -985,7 +985,7 @@
           {
             "name": "reason",
             "required": false,
-            "description": "Human-readable pause reason (max 500 chars) recorded in audit log."
+            "description": "Human-readable pause reason (max 500 chars) recorded on the execution row (pause_reason) and the WorkflowExecutionPaused history event."
           }
         ]
       },

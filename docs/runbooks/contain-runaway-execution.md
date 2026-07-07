@@ -21,8 +21,24 @@ curl -sS -X POST "$HARVEST_URL/api/harvest/workflows/$EXEC_ID/resume"
 ```
 
 Both routes are admin-guarded and audited (`workflow.pause` /
-`workflow.resume` audit operations, with your actor identity and the reason on
-the record).
+`workflow.resume` audit operations, with your actor identity and request id on
+the audit row; the pause **reason** is recorded on the execution row
+(`pause_reason`) and the appended `WorkflowExecutionPaused` history event —
+not in the audit log).
+
+> **Pause is an orchestration freeze, not an activity kill switch.** Pause
+> stops new workflow *decision cycles*; it does not reach into the activity
+> layer. An activity task that was already scheduled before the pause is
+> still claimed and executed, an in-flight attempt runs to completion, and a
+> **failing activity keeps retrying** through its `RetryPolicy` attempt
+> budget while the execution is paused (for an activity with no
+> `schedule_to_close` and a generous attempt budget, pause does *not* stop a
+> retry loop hammering a downstream — an activity with a `schedule_to_close`
+> freezes once that deadline elapses mid-pause). If the incident is exactly
+> that retry loop, pair the pause with a circuit-breaker force-open
+> (`POST /admin/circuits/{activity}/force-open`, issue #369) for immediate
+> downstream relief. See
+> [What pause does and does not stop](#what-pause-does-and-does-not-stop).
 
 ---
 
@@ -60,8 +76,9 @@ curl -sS -X POST "$HARVEST_URL/api/harvest/workflows/$EXEC_ID/pause" \
 
 The body is optional — a bare `POST` with no body pauses with no reason. The
 `reason` is capped at 500 characters (`400` if over) and lands on the
-execution row (`pause_reason`), in the appended history event, and in the
-audit trail — always include the incident ticket.
+execution row (`pause_reason`) and in the appended `WorkflowExecutionPaused`
+history event (the audit row records the actor, route, and request id, not
+the reason) — always include the incident ticket.
 
 Response (`200 OK`):
 
@@ -139,6 +156,8 @@ cooperation is needed and no code path in the workflow body runs while paused.
 |---|---|
 | Workflow decision tasks | **Never claimed.** A parked task woken by a timer fire, signal arrival, or activity completion stays `PENDING` until resume. |
 | Already-dispatched activities | **Run to completion.** Pause does not reach into in-flight work; results are recorded normally and queue behind the pause. |
+| Activity tasks enqueued before the pause but not yet claimed | **Still claimed and executed.** The claim-layer pause gate is scoped to workflow tasks (`task_type = 'workflow'`) — activity rows of a paused execution stay claimable. |
+| Activity retries of an already-scheduled activity | **Continue while paused**, bounded only by the activity's `RetryPolicy` attempt budget; once the activity's `schedule_to_close_at` elapses mid-pause the row becomes frozen (unclaimable) until resume shifts the deadline. An activity with no `schedule_to_close` keeps retrying for its whole attempt budget — pair pause with a circuit-breaker force-open (#369) if the retries are the problem. |
 | New activity dispatch | None — new activities are only scheduled by workflow decision cycles, which don't run. |
 | Timers | The timer row still fires, but the workflow does not advance on it until resume (then fires immediately, in order). |
 | Signals | Accepted and durable; delivered in order on resume. |
@@ -161,21 +180,48 @@ spent paused:
   the breach (which genuinely occurred while `RUNNING`) is still observed and
   counted after resume rather than silently pushed into the future.
 - **Activity `schedule_to_close_at` (#378, closed by issue #609)** — the
-  cross-retry wall-clock deadline on the execution's deadline-bearing
-  `PENDING`/`RUNNING` activity task rows is shifted forward by the pause span
-  on resume, the `ScheduleToClose` timeout scanner skips tasks whose owning
-  execution is `PAUSED`, and the worker's pre-requeue deadline check requeues
-  (instead of deadline-failing) a retry whose owning execution is paused.
-  Unlike the SLA deadline above, this shift is **unconditional** — it needs
-  no elapsed-before-pause carve-out, because shifting by exactly the pause
-  span never grants extra budget: a deadline already elapsed before the pause
-  began is still elapsed after resume by arithmetic, and the scanner times it
-  out on its next tick.
+  cross-retry wall-clock deadline is pause-aware end to end:
+  - The `ScheduleToClose` timeout scanner skips tasks whose owning execution
+    is `PAUSED` — both ordinary task-queue rows and external
+    (`harvest_external_tasks`) tasks.
+  - The worker's pre-requeue deadline check requeues (instead of
+    deadline-failing) a retry whose owning execution is paused, and before
+    ever failing a task terminally it re-validates the row-*current* deadline
+    under the execution row lock — so a resume that shifted the deadline
+    while an attempt was in flight can never deadline-fail it against the
+    stale pre-shift value.
+  - On resume, every still-open deadline-bearing row — `PENDING`/`RUNNING`
+    task-queue rows and `PENDING` external tasks — has `schedule_to_close_at`
+    shifted forward by the pause span.
+  - A `PENDING` row whose deadline elapses *during* the pause becomes
+    **frozen**: unclaimable (the claim query requires
+    `schedule_to_close_at > NOW()`) and spared by the scanners until resume
+    shifts the deadline. Resume also shifts a frozen row's `scheduled_at`
+    forward by the pause span, restoring its `schedule_to_start` budget and
+    retry-backoff position so the first post-resume scan doesn't instantly
+    kill it.
 
-Deliberately **unchanged** (the scanner exclusion is `ScheduleToClose`-only):
-per-attempt `start_to_close`, `heartbeat_timeout`, and `schedule_to_start`
-enforcement stay pause-blind. In-flight work still times out on its own
-merits — pause governs orchestration progress, not a hung activity attempt.
+  Unlike the SLA deadline above, this shift is **unconditional** — no
+  elapsed-before-pause carve-out. The shift itself never revives a deadline
+  that had already elapsed before the pause began (still elapsed after resume
+  by arithmetic; the scanner times it out on its next tick), and a deadline
+  still ahead at pause time retains exactly its remaining budget. Be aware of
+  what that means combined with the table above: because activity tasks stay
+  claimable during a pause, an activity whose deadline was still ahead when
+  the pause landed can run and retry *during* the pause **and** keep its full
+  remaining budget after the shift — so its total runnable wall-clock can
+  exceed the configured `schedule_to_close` by up to the budget that remained
+  at pause time.
+
+Deliberately **unchanged**: per-attempt `start_to_close` and
+`heartbeat_timeout` enforcement stay pause-blind — in-flight work still times
+out on its own merits; pause governs orchestration progress, not a hung
+activity attempt. `schedule_to_start` enforcement also stays live for a
+paused execution's ordinary (unfrozen) pending activities — they remain
+claimable, so their schedule-to-start clock is still a genuine
+worker-capacity signal — with exactly one carve-out: the frozen rows above
+(paused owner + elapsed `schedule_to_close_at`) are spared, since they are
+unclaimable by construction until resume shifts them.
 
 ## The pause is not indefinite: the auto-resume ceiling
 
@@ -205,7 +251,7 @@ Per-execution pause is the **narrowest** containment lever. Reach for it when
 | One specific execution is misbehaving | **This runbook** — `POST /workflows/{id}/pause` |
 | A schedule keeps firing new runs you don't want | Schedule pause (#229): `POST /admin/schedules/{id}/pause` — stops future firings; already-running executions are untouched |
 | New *starts* of a workflow type / queue must stop (deploy freeze, incident) | Admission gates (#377) — reject or defer new starts at the API boundary; in-flight runs are untouched |
-| One activity's downstream dependency is down, fleet-wide | Circuit breaker (#369): `POST /admin/circuits/{activity}/force-open` — fast-fails that activity's dispatch everywhere |
+| One activity's downstream dependency is down, fleet-wide — or a paused run's own activity retries are still hammering it | Circuit breaker (#369): `POST /admin/circuits/{activity}/force-open` — fast-fails that activity's dispatch everywhere, immediately. Pause does **not** stop activity claiming or retries (see above), so for immediate downstream relief pair the two. |
 | The run is wedged and must die | Terminate (#504): `POST /workflows/{id}/terminate` |
 
 These compose: during a serious incident it is normal to pause the schedule
@@ -216,27 +262,36 @@ execution under investigation.
 
 1. **State and metadata** — `GET /api/harvest/workflows/{id}`: the embedded
    execution object shows `state: "PAUSED"` plus `paused_at`, `pause_reason`,
-   and `pause_actor`. The history tail shows the appended
-   `WorkflowExecutionPaused` event.
+   and `pause_actor`. The history shows the appended
+   `WorkflowExecutionPaused` event (activity results recorded during the
+   pause may append after it).
 2. **Fleet view** — `GET /api/harvest/workflows?state=PAUSED` lists every
    currently paused run (the filter composes with `workflow_name=`,
    pagination, etc.).
 3. **No forward progress** — `harvest workflow stack <execution_id>` (or
    `GET /workflows/{id}/stack`) is frozen; the event count only grows by
-   in-flight activity completions that were already dispatched, never by new
-   `ActivityScheduled` / `TimerStarted` events. The parked workflow task row
-   stays `PENDING`.
+   terminal activity outcomes of already-scheduled activities (completions,
+   terminal failures, per-attempt timeouts — including activities claimed or
+   retried *during* the pause), never by new `ActivityScheduled` /
+   `TimerStarted` events. The parked workflow task row sits idle at `PENDING`
+   (a task woken by a timer/signal/activity completion and deferred by the
+   pause), or at `RUNNING` with `worker_id IS NULL` for a signal-parked or
+   pause-discarded decision task — a `RUNNING` row with no `worker_id` is
+   parked, not executing; don't misread it as a live decision cycle.
 4. **Metrics** — `harvest.workflow.paused{workflow, queue}` incremented once
    on the pause; `harvest.workflow.pause_duration{workflow, queue}` records
    the span on resume. A sustained non-zero `PAUSED` population is worth a
    dashboard panel so forgotten pauses surface before the 24h auto-resume
    does it for you.
 5. **Audit** — one `workflow.pause` (and later `workflow.resume`) row with
-   actor, reason, and request id.
+   actor and request id. The pause *reason* is not on the audit row — read it
+   from the execution row (`pause_reason`) or the `WorkflowExecutionPaused`
+   history event.
 
 After resume, confirm the run advances again (state back to `RUNNING`, new
-events appending) and — for a run with deadlines — that `deadline_at` /
-`sla_deadline_at` moved forward by roughly `pause_duration_secs`.
+events appending) and — for a run with deadlines — that `deadline_at` (and
+`sla_deadline_at`, if it was still ahead when the pause began) moved forward
+by roughly `pause_duration_secs`.
 
 ## Related
 

@@ -74,9 +74,14 @@ it complete un-paused; record its output. Pause the first run mid-flight with
 `POST /workflows/{id}/pause`), wait at least two poll intervals, and confirm
 zero further dispatch progress: `state` is `PAUSED` on
 `GET /workflows/{id}` with `paused_at`/`pause_reason`/`pause_actor` set, the
-parked workflow task row stays `PENDING`, and the event history gains no new
-`ActivityScheduled`/`TimerStarted` events (an activity that was already
-in-flight at pause time may still record its completion — that is expected).
+parked workflow task row is idle (`PENDING`, or `RUNNING` with
+`worker_id IS NULL` for a parked decision task — parked rows carry no
+worker), and the event history gains no new
+`ActivityScheduled`/`TimerStarted` events (activity-layer work that was
+already scheduled at pause time still runs: an in-flight attempt records its
+completion, an enqueued-but-unclaimed activity task is still claimed and
+executed, and a failing activity's retries continue and record their
+outcomes — all expected; only new workflow-driven dispatch must stop).
 Then resume with `harvest workflow resume <execution_id>` and let the run
 finish.
 
