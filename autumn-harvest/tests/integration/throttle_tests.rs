@@ -136,6 +136,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #607: the start-throttle table under test.
     include_str!("../../migrations/20260706000000_harvest_start_throttle/up.sql"),
+    "\n",
+    // issue #606: harvest_task_queue.session_id (worker sessions), merged in from trunk-dev.
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
 );
 
 // ── Metrics recorder ─────────────────────────────────────────────────────────
