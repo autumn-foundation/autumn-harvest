@@ -123,12 +123,19 @@ Retire the gate with a three-deploy sequence:
 
 1. **Introduce** — the `if ctx.patched(id) { new } else { old }` fence above.
    New executions record a `patch:{id}` marker and take the new branch;
-   pre-patch executions keep replaying the old branch.
-2. **Deprecate** — once every pre-patch run has drained (see
-   `docs/runbooks/version-gate-retirement.md`), replace the fence with
-   `ctx.deprecate_patch(id);` followed by the unconditional new code. The
-   recorded markers become transparent to replay, so marker-bearing runs
-   still replay cleanly.
+   pre-patch executions keep replaying the old branch. One caveat: a fresh
+   run whose first-task history ends in un-awaited signals at the gate point
+   — canonically every **signal-with-start** run, whose signal is staged
+   before first dispatch — takes the *old* branch and records no marker
+   (deliberate parity with `ctx.version()`), so drain checks must count
+   these marker-less runs too.
+2. **Deprecate** — once every pre-patch run has drained (see the "Patched
+   gates" section of `docs/runbooks/version-gate-retirement.md` — the
+   runbook's `version-usage` / retirement-check CLI tooling only sees
+   `version:` markers, **not** patch gates; use that section's raw SQL
+   drain queries), replace the fence with `ctx.deprecate_patch(id);`
+   followed by the unconditional new code. The recorded markers become
+   transparent to replay, so marker-bearing runs still replay cleanly.
 3. **Remove** — once every marker-bearing run has drained, delete the
    `deprecate_patch` call entirely.
 

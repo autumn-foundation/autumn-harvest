@@ -3002,6 +3002,10 @@ impl WorkflowContext {
 
     /// Query or record a versioned code path.
     ///
+    /// For the common two-state before/after change prefer
+    /// [`patched`](Self::patched) — `version()` is the escape hatch for
+    /// gates with **more than two** concurrent versions.
+    ///
     /// During **replay**, returns the version recorded in the marker event
     /// (or `min` if no marker exists for old workflows).
     ///
@@ -3060,11 +3064,16 @@ impl WorkflowContext {
     /// ```
     ///
     /// Pre-patch executions keep replaying the old branch deterministically;
-    /// new executions record the marker and take the new branch.
+    /// new executions record the marker and take the new branch (with the
+    /// signal-with-start exception below).
     ///
     /// **Deploy 2 — deprecate.** Once every *pre-patch* run has drained (see
-    /// `docs/runbooks/version-gate-retirement.md` for how to verify drain),
-    /// replace the branch with [`deprecate_patch`](Self::deprecate_patch) +
+    /// the "Patched gates" section of
+    /// `docs/runbooks/version-gate-retirement.md` — note that the runbook's
+    /// `harvest version-usage` / `version-gate-retirement --check` CLI
+    /// tooling only sees `version:` markers and does **not** cover patch
+    /// gates; use that section's raw SQL drain queries instead), replace the
+    /// branch with [`deprecate_patch`](Self::deprecate_patch) +
     /// unconditional new code:
     ///
     /// ```rust,ignore
@@ -3079,6 +3088,30 @@ impl WorkflowContext {
     /// **Deploy 3 — remove.** Once every *marker-bearing* run has drained,
     /// delete the `deprecate_patch` call entirely.
     ///
+    /// # Signal-with-start / trailing-signal caveat
+    ///
+    /// A fresh execution whose first-task history ends in **un-awaited
+    /// signals** at the gate point takes the **old** branch: `patched()`
+    /// returns `false` and records **no** marker — forever, deterministically
+    /// for that execution. Canonically this is **every signal-with-start
+    /// run**, whose signal is staged before first dispatch, so the history at
+    /// the gate is `[WorkflowStarted, SignalReceived]`. This is deliberate,
+    /// conservative parity with [`version`](Self::version): after draining
+    /// the trailing signals the history is indistinguishable from a phase-0
+    /// run parked at a first-line `wait_for_signal`, so the ambiguity
+    /// resolves to the old branch. Consequence: drain verification before
+    /// deploy 2 must use the "no marker" inverse query in the runbook's
+    /// "Patched gates" section — a marker-presence query can never find
+    /// these runs.
+    ///
+    /// # Per-call-site answer
+    ///
+    /// `patched()` answers per **call site**, not per run: an in-flight
+    /// phase-0 execution resuming under phase-1 code with two gated sites can
+    /// get `false` at site 1 (recorded history) and `true` at site 2 (live
+    /// frontier). Don't split one logical change across multiple gates of the
+    /// same id; the answer is per call site.
+    ///
     /// # Interop with `version()`
     ///
     /// A history that recorded `version:{patch_id}` under the old
@@ -3088,6 +3121,14 @@ impl WorkflowContext {
     /// can migrate a two-version `ctx.version(id, 1, 2)` gate to
     /// `ctx.patched(id)` in place. `version()` remains the explicit escape
     /// hatch for gates with **more than two** concurrent versions.
+    ///
+    /// **Shared namespace warning:** patch ids and version change-ids share
+    /// **one namespace** — [`deprecate_patch`](Self::deprecate_patch)
+    /// interop-consumes `version:{id}` markers, so never call
+    /// `deprecate_patch(id)` while a `ctx.version(id, ..)` gate for the same
+    /// id is still in the code: the still-live gate would then read `min`
+    /// (its marker was consumed) and take the wrong branch, diverging as
+    /// non-determinism.
     ///
     /// # Residual-`patched` footgun
     ///
@@ -3144,9 +3185,20 @@ impl WorkflowContext {
     /// Emits **no** commands and appends **no** events — on a live execution
     /// this is a pure no-op. Idempotent within a replay cycle.
     ///
-    /// Only call this once every pre-patch execution has drained (see
-    /// `docs/runbooks/version-gate-retirement.md`): a phase-0 history
-    /// replayed against unconditional new code diverges, by design.
+    /// Only call this once every pre-patch execution has drained (see the
+    /// "Patched gates" section of
+    /// `docs/runbooks/version-gate-retirement.md` — the runbook's
+    /// `version-usage` / retirement-check CLI tooling does **not** see
+    /// `patch:` markers; use that section's raw SQL drain queries): a
+    /// phase-0 history replayed against unconditional new code diverges, by
+    /// design.
+    ///
+    /// **Shared namespace warning:** patch ids and version change-ids share
+    /// **one namespace** — this call also consumes `version:{patch_id}`
+    /// markers (interop). Never call `deprecate_patch(id)` while a
+    /// `ctx.version(id, ..)` gate for the same id is still in the code: the
+    /// still-live gate would read `min` after its marker was consumed and
+    /// take the wrong branch, diverging as non-determinism.
     ///
     /// # Panics
     ///

@@ -27,9 +27,11 @@
 //! migration) and take the new branch. Pre-patch executions replay the old
 //! branch deterministically.
 //!
-//! **Deploy 2 — deprecate.** Once every *pre-patch* run has drained (see
-//! `docs/runbooks/version-gate-retirement.md` for verifying drain), drop the
-//! old branch and make the recorded markers transparent:
+//! **Deploy 2 — deprecate.** Once every *pre-patch* run has drained (see the
+//! "Patched gates" section of `docs/runbooks/version-gate-retirement.md` —
+//! the `version-usage`/retirement-check CLI tooling does NOT see `patch:`
+//! markers; use that section's raw SQL drain queries), drop the old branch
+//! and make the recorded markers transparent:
 //!
 //! ```rust,ignore
 //! ctx.deprecate_patch("discount-v2");
