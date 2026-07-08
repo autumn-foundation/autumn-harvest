@@ -418,6 +418,60 @@ async fn throttle_row_count(conn: &mut diesel_async::AsyncPgConnection, wf_name:
     .count
 }
 
+/// Like `insert_workflow_schedule`, but with a caller-specified
+/// `max_active_runs` (issue #607 round 5: `schedule_backfill`'s own
+/// `max_active_runs` overlap gate must count pending throttled slots left
+/// over from an earlier, separate backfill call, not just RUNNING/PAUSED
+/// executions).
+async fn insert_workflow_schedule_with_max_active(
+    conn: &mut diesel_async::AsyncPgConnection,
+    wf_name: &str,
+    input: Value,
+    max_active_runs: i32,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules \
+         (id, workflow_name, schedule_expr, timezone, catchup, max_active_runs, \
+          is_paused, jitter_secs, overlap_policy, buffered_runs, buffer_all_max, \
+          skip_policy, workflow_input) \
+         VALUES ($1, $2, 'interval:3600', 'UTC', false, $4, false, 0, 'skip', \
+          '[]'::jsonb, 0, 'skip', $3)",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(wf_name)
+    .bind::<Jsonb, _>(input)
+    .bind::<diesel::sql_types::Integer, _>(max_active_runs)
+    .execute(conn)
+    .await
+    .expect("insert workflow schedule");
+    id
+}
+
+/// Directly seed a `harvest_rate_limit_buckets` row with zero tokens and zero
+/// refill, so the very first admission attempt against `(wf_name,
+/// resolved_key)` finds the bucket already empty and defers immediately --
+/// without first needing to consume (and thereby start a real execution for)
+/// a token, which would confound a test that wants to isolate "a pending
+/// throttle row with no corresponding execution" from "a genuinely-started
+/// execution".
+async fn seed_empty_bucket(
+    conn: &mut diesel_async::AsyncPgConnection,
+    wf_name: &str,
+    resolved_key: &str,
+) {
+    let key = autumn_harvest::throttle::bucket_key(wf_name, resolved_key);
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets \
+         (key, refill_rate, burst, tokens, last_refilled_at) \
+         VALUES ($1, 0.0, 1.0, 0.0, NOW())",
+    )
+    .bind::<Text, _>(key)
+    .execute(conn)
+    .await
+    .expect("seed empty bucket");
+}
+
 /// Issue #607 round 4: `schedule_backfill`'s workflow branch previously
 /// admitted every backfilled slot immediately, bypassing throttle pacing
 /// entirely -- an operator backfilling hundreds of slots for a throttled
@@ -525,6 +579,111 @@ async fn schedule_backfill_skips_oversized_input_before_deferring() {
     assert_eq!(
         pending_rows, 0,
         "no pending throttle row should exist for the oversized slot"
+    );
+}
+
+/// Code-review fix (issue #607 round 5): a throttled scheduled fire durably
+/// defers before any `harvest_workflow_executions` row exists, so a *second,
+/// separate* `schedule_backfill` request recomputing `running_at_start` from
+/// `query_running_count` alone would not see an earlier request's still-
+/// pending deferred slot and could dispatch (and again defer) past
+/// `max_active_runs` -- the throttle scanner would later fire both pending
+/// rows without ever re-checking the schedule's overlap gate. Verifies the
+/// fix: with `max_active_runs = 1` and an already-empty bucket, a first
+/// backfill call defers its one slot into a pending throttle row (no
+/// execution), and a *second* backfill call for a different slot is skipped
+/// with `skipped_reasons["max_active_runs"]` instead of writing a second
+/// pending row.
+#[tokio::test]
+async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_runs() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    // Pre-empty the bucket so the very first planned slot defers immediately,
+    // rather than consuming the sole token and becoming a real (RUNNING)
+    // execution -- isolating "a pending row with no execution" from
+    // `query_running_count`'s own, already-correct RUNNING/PAUSED count.
+    seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
+
+    let schedule_id = insert_workflow_schedule_with_max_active(
+        &mut conn,
+        "sync_tenant",
+        json!({ "tenant_id": "acme" }),
+        1,
+    )
+    .await;
+
+    let now = chrono::Utc::now();
+    let (status1, body1) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/backfill"),
+        json!({ "from": now, "to": now }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::OK, "first backfill call: {body1:?}");
+    assert_eq!(body1["total"], json!(1), "{body1:?}");
+    assert_eq!(
+        body1["dispatched"],
+        json!(1),
+        "the slot is consumed (durably deferred): {body1:?}"
+    );
+    assert_eq!(body1["skipped"], json!(0), "{body1:?}");
+
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        0,
+        "the sole slot must have been deferred, not started"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        1,
+        "exactly one pending throttle row after the first call"
+    );
+
+    // A second, separate backfill call for a *different* slot (a different
+    // hour, so it plans to a distinct workflow_id and isn't rejected as an
+    // already-existing run) must see the first call's still-pending deferred
+    // slot counted against max_active_runs=1, and skip rather than defer a
+    // second row.
+    let next_hour = now + chrono::Duration::hours(1);
+    let (status2, body2) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/backfill"),
+        json!({ "from": next_hour, "to": next_hour }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK, "second backfill call: {body2:?}");
+    assert_eq!(body2["total"], json!(1), "{body2:?}");
+    assert_eq!(
+        body2["dispatched"],
+        json!(0),
+        "the second slot must NOT be dispatched: {body2:?}"
+    );
+    assert_eq!(
+        body2["skipped"],
+        json!(1),
+        "the second slot must be skipped by the max_active_runs gate: {body2:?}"
+    );
+    let reasons2 = body2["skipped_reasons"]
+        .as_object()
+        .expect("skipped_reasons object");
+    assert_eq!(
+        reasons2.get("max_active_runs"),
+        Some(&json!(1)),
+        "skip reason must name max_active_runs, not silently defer again: {body2:?}"
+    );
+
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        0,
+        "still no execution should have started"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        1,
+        "no second pending throttle row should have been created for the second call"
     );
 }
 
@@ -658,6 +817,117 @@ async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policie
         backlog.as_array().map(Vec::len),
         Some(0),
         "no pending throttle row should be created for a rejected item: {backlog:?}"
+    );
+}
+
+/// Code-review fix (issue #607 round 5): an atomic batch is an all-or-nothing
+/// synchronous insert with no way to represent a `Deferred` outcome. Before
+/// this fix, `atomic=true` items skipped the throttle admission check
+/// entirely, letting a client bypass a workflow's rate policy simply by
+/// submitting an atomic batch instead of a plain start. Verifies an atomic
+/// item for a throttled workflow is rejected outright, in pre-validation --
+/// before any token is ever reserved or pending row written.
+#[tokio::test]
+async fn atomic_batch_rejects_item_for_a_throttled_workflow() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 5.0));
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": true,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "atomic-job-1",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "atomic batch: {body:?}");
+    let rejected = body["rejected"].as_array().expect("rejected array");
+    assert_eq!(rejected.len(), 1, "{body:?}");
+    let err = rejected[0]["error"].as_str().expect("error message");
+    assert!(
+        err.contains("start-throttle policy"),
+        "rejection reason must name the throttle policy, not a generic error: {err}"
+    );
+
+    // Confirm the bypass is actually closed, not just re-labeled: no token
+    // was ever reserved and no execution or pending row exists for this item.
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        0,
+        "an atomic-rejected item must never start an execution"
+    );
+    let (backlog_status, backlog) = get_json(&app, "/admin/start-throttle").await;
+    assert_eq!(backlog_status, StatusCode::OK);
+    assert_eq!(
+        backlog.as_array().map(Vec::len),
+        Some(0),
+        "no pending throttle row should be created for a pre-validation-rejected \
+         atomic item: {backlog:?}"
+    );
+}
+
+/// A non-atomic (best-effort) batch is unaffected by the atomic-rejection fix
+/// above: a throttled item still goes through the normal admission path and
+/// is durably deferred when the bucket is empty, exactly like a standalone
+/// start.
+#[tokio::test]
+async fn non_atomic_batch_still_throttles_normally() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+
+    let (status1, body1) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "non-atomic-job-1",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::OK, "{body1:?}");
+    assert_eq!(
+        body1["results"][0]["status"],
+        json!("started"),
+        "first item consumes the sole token: {body1:?}"
+    );
+
+    let (status2, body2) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "non-atomic-job-2",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK, "{body2:?}");
+    assert_eq!(
+        body2["results"][0]["status"],
+        json!("deferred"),
+        "second item for the same key finds the bucket empty: {body2:?}"
     );
 }
 

@@ -8798,6 +8798,37 @@ async fn batch_start_workflows(
                  debounced start must use POST /workflows/{0}/start",
                 item.workflow_name
             ))
+        } else if request.atomic
+            && workflow_resolving_throttle(
+                &runtime.registry,
+                &item.workflow_name,
+                item.input.as_ref().unwrap_or(&Value::Null),
+            )
+            .is_some()
+        {
+            // A start-throttle admission (issue #607) can durably defer before any
+            // execution row exists, and the per-item throttle block below reports a
+            // deferral as `Deferred`, not `Started`/`Rejected` -- a third outcome
+            // atomic batches have no way to express (they are all-or-nothing
+            // synchronous inserts; a deferral is neither a commit nor a rejection).
+            // Unlike debounce (rejected only when a fresh start is certain, i.e. no
+            // workflow_id), determining whether a throttled item would attach to an
+            // already-active execution (bypassing the bucket, same as a plain start)
+            // versus admit fresh requires a DB lookup this in-memory pre-validation
+            // pass deliberately doesn't perform (issue #357) -- so every atomic item
+            // for a throttled workflow is rejected unconditionally, the conservative
+            // choice that closes the bypass without a false admit. Reject here (not
+            // silently skip the throttle check as before) so an atomic batch can
+            // never circumvent a workflow's rate policy by simply setting
+            // atomic=true; use a non-atomic (atomic=false) batch or the standalone
+            // start route instead, both of which honor the throttle.
+            Some(format!(
+                "workflow '{0}' has a start-throttle policy; a throttled start \
+                 cannot be expressed atomically (it may durably defer rather than \
+                 start or fail) — use POST /workflows/{0}/start or a non-atomic \
+                 batch (atomic=false) instead",
+                item.workflow_name
+            ))
         } else {
             // Debounce for an explicit-id item is NOT rejected here: an idempotent
             // retry (existing workflow_id) must still return the existing run.
@@ -15558,6 +15589,76 @@ async fn schedule_backfill(
             }));
         }
     };
+    // A throttled scheduled/backfill fire (issue #607) durably defers before any
+    // `harvest_workflow_executions` row exists, so `running_at_start` above alone
+    // undercounts a workflow schedule's true in-flight commitment: a separate,
+    // later backfill request recomputing it from scratch would not see an
+    // earlier request's still-pending deferred slots (they never became a
+    // RUNNING/PAUSED execution) and could dispatch past `max_active_runs` --
+    // the throttle scanner later fires those pending rows without re-checking
+    // the schedule's overlap gate, so the violation would otherwise go uncaught
+    // (code review, issue #607). DAG schedules have no throttle field at all
+    // (`DagInfo` carries none), so this only applies to workflow schedules,
+    // matching the earlier fix's precedent of scoping throttle-aware overlap
+    // counting (`tick_one_workflow_schedule`/`drain_buffered_schedule_runs` in
+    // scheduler.rs) to workflows only.
+    let running_at_start = if kind == ScheduleKind::Workflow {
+        match query_pending_throttle_count(&pool, &name).await {
+            Ok(pending) => running_at_start + pending,
+            Err(count_failures) => {
+                let status = "partial";
+                let error_summary = Some("one or more shard failures");
+                write_backfill_log(
+                    &pool,
+                    schedule_id,
+                    &actor,
+                    &source,
+                    request.from,
+                    request.to,
+                    false,
+                    total,
+                    0,
+                    0,
+                    total,
+                    status,
+                    error_summary,
+                    started_at,
+                )
+                .await;
+                let id_str = schedule_id.to_string();
+                write_audit(
+                    &pool,
+                    &actor,
+                    &source,
+                    req_id.as_deref(),
+                    route,
+                    &id_str,
+                    STATUS_FAILED,
+                    error_summary,
+                )
+                .await;
+
+                return Ok(Json(ScheduleBackfillResponse {
+                    status: status.to_string(),
+                    schedule_id,
+                    kind,
+                    name,
+                    from: request.from,
+                    to: request.to,
+                    planned_timestamps: fire_times.clone(),
+                    total,
+                    dispatched: 0,
+                    skipped: 0,
+                    failed: total,
+                    skipped_reasons,
+                    partial_shard_failures: count_failures,
+                    paused_schedule_warning,
+                }));
+            }
+        }
+    } else {
+        running_at_start
+    };
     let mut dispatched_this_call: i64 = 0;
 
     match kind {
@@ -16319,6 +16420,44 @@ async fn query_running_count_best_effort(
     name: &str,
 ) -> i64 {
     query_running_count(pool, kind, name).await.unwrap_or(0)
+}
+
+/// Fan out across shards summing pending (not-yet-fired) start-throttle rows
+/// (issue #607) for workflow `name`, mirroring `query_running_count`'s shape
+/// and shard scope. Used to fold a workflow schedule's already-deferred
+/// backfill slots into `running_at_start` so a subsequent, separate backfill
+/// request can't dispatch (and defer) past `max_active_runs` while an earlier
+/// request's deferred slots are still sitting in the throttle queue, never
+/// having become a real execution `query_running_count` alone would see.
+async fn query_pending_throttle_count(
+    pool: &HarvestDbPool,
+    name: &str,
+) -> Result<i64, Vec<BackfillShardFailure>> {
+    let mut total = 0i64;
+    let mut failures = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            failures.push(BackfillShardFailure {
+                shard_id: shard_id.as_i32(),
+                reason: "failed to acquire connection while counting pending throttled \
+                         backfill slots"
+                    .to_string(),
+            });
+            continue;
+        };
+        match autumn_harvest::throttle::pending_throttle_count_for_workflow(&mut conn, name).await {
+            Ok(count) => total += count,
+            Err(e) => failures.push(BackfillShardFailure {
+                shard_id: shard_id.as_i32(),
+                reason: format!("failed to count pending throttled backfill slots: {e}"),
+            }),
+        }
+    }
+    if failures.is_empty() {
+        Ok(total)
+    } else {
+        Err(failures)
+    }
 }
 
 /// Count how many of the planned timestamps already have an execution or DAG run.
