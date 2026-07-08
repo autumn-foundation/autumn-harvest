@@ -1018,6 +1018,35 @@ mod tests {
     }
 
     #[test]
+    fn schedule_update_route_is_classified_mutating() {
+        // The in-place schedule update (issue #771) is a mutating, audited
+        // operator route. This pinned test — not just the general
+        // exhaustiveness guards below, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
+        // than against the live router — is what actually catches the route
+        // being dropped from BOTH lists at once.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "PATCH /admin/schedules/{id}" && *c == RouteClass::Mutating),
+            "PATCH /admin/schedules/{{id}} must be classified RouteClass::Mutating in \
+             CLASSIFIED_ROUTES (issue #771)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "PATCH /admin/schedules/{id}"
+                    && *op == Some(OP_SCHEDULE_UPDATE)),
+            "PATCH /admin/schedules/{{id}} must appear in ALL_MUTATION_ROUTES mapped to \
+             OP_SCHEDULE_UPDATE (issue #771)"
+        );
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_SCHEDULE_UPDATE),
+            "schedule.update must be a registered audited operation (issue #771)"
+        );
+    }
+
+    #[test]
     fn usage_report_route_is_classified_read_only() {
         // The historical per-tenant usage report (issue #596) is a read-only
         // fan-out aggregation, no different from workflow_count / debounce /

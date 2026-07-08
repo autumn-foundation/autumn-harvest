@@ -2247,6 +2247,10 @@ struct ScheduleEntry {
     max_active_runs: i32,
     catchup: bool,
     last_backfill: Option<BackfillSummary>,
+    /// Stored workflow input dispatched with every scheduled run (issue #771
+    /// AC10: an in-place input edit must be visible on the list/get/patch
+    /// responses immediately). `null` when the schedule row carries none.
+    workflow_input: Option<serde_json::Value>,
     /// Maximum jitter window in seconds. 0 means no jitter.
     jitter_secs: i64,
     /// Effective next fire time = `next_run_at` + deterministic jitter offset.
@@ -2413,8 +2417,15 @@ where
 /// double-`Option` PATCH idiom: the outer `Option` distinguishes an absent
 /// field from an explicit JSON `null`, mirroring the core
 /// `WorkflowSchedulePatch` contract.
+///
+/// `deny_unknown_fields`: because every field is optional, a typo'd field
+/// name (`"scheduleexpr"`) would otherwise deserialize to an all-`None` body
+/// and 200-no-op with a SUCCEEDED audit row — a silent failure. The rejection
+/// surfaces as a 400 via the handler's `Result<Json<…>, JsonRejection>`
+/// extractor (see [`update_schedule_handler`]).
 #[allow(clippy::option_option)]
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateWorkflowScheduleRequest {
     /// NOT editable — present in the struct only to produce a targeted 400.
     workflow_name: Option<String>,
@@ -4681,6 +4692,7 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "workflow_input",
                 "catchup_policy_effective",
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
@@ -4704,6 +4716,7 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "workflow_input",
                 "catchup_policy_effective",
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
@@ -4727,6 +4740,7 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "workflow_input",
                 "catchup_policy_effective",
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
@@ -14762,6 +14776,7 @@ fn schedule_entry_from_row(
         max_active_runs: s.max_active_runs,
         catchup: s.catchup,
         last_backfill,
+        workflow_input: s.workflow_input,
         overlap_policy: s.overlap_policy,
         buffered_count,
         buffer_all_max: s.buffer_all_max,
@@ -14801,7 +14816,7 @@ async fn update_schedule_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<UpdateWorkflowScheduleRequest>,
+    request: Result<Json<UpdateWorkflowScheduleRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ScheduleEntry>, AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
@@ -14821,6 +14836,30 @@ async fn update_schedule_handler(
         }
     };
     let id_str_owned = id.to_string();
+
+    // Body deserialization is unwrapped in-handler (rather than by a bare
+    // `Json` extractor) so a rejected body — most importantly an unknown
+    // field, rejected via `deny_unknown_fields` since every real field is
+    // optional and a typo'd name would otherwise silently no-op — surfaces
+    // as this route's structured 400 JSON error with a failed audit row,
+    // never as axum's default plain-text 422 (a status this route's contract
+    // does not document) and never as a 200 no-op.
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
 
     // Workflow type is NOT editable: a different workflow is a different
     // schedule, not an edit.
@@ -14894,12 +14933,39 @@ async fn update_schedule_handler(
             }
         }
         (None, Some(tz)) => {
-            // Timezone-only edit: re-anchor the stored cron expression.
-            let existing_schedule = existing
-                .schedule_expr
-                .as_deref()
-                .and_then(parse_schedule_from_expr_pub)
-                .unwrap_or(Schedule::Manual);
+            // Timezone-only edit: re-anchor the stored cron expression. A
+            // stored expression that is NULL or unparseable is rejected
+            // rather than leniently coerced to Manual — the coercion would
+            // silently rewrite the corrupt row to `manual` and NULL its
+            // `next_run_at` as a side effect of an edit that never asked to
+            // change the cadence. The operator repairs the row by sending
+            // `schedule_expr` explicitly.
+            let parsed_stored = match existing.schedule_expr.as_deref() {
+                // "manual" deliberately has no parse_schedule_from_expr
+                // mapping (the tick treats it as "no automatic slot"); a
+                // timezone edit is a documented no-op for it, matching the
+                // interval case in `reanchor_schedule_timezone`.
+                Some("manual") => Some(Schedule::Manual),
+                Some(stored) => parse_schedule_from_expr_pub(stored),
+                None => None,
+            };
+            let Some(existing_schedule) = parsed_stored else {
+                let err_summary = format!(
+                    "stored schedule expression {:?} is unparseable; provide schedule_expr \
+                     explicitly to repair it before (or while) changing the timezone",
+                    existing.schedule_expr
+                );
+                schedule_update_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str_owned,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            };
             let reanchored = reanchor_schedule_timezone(&existing_schedule, tz);
             if let Err(e) = autumn_harvest::validate_schedule(&reanchored) {
                 let err_summary = format!("invalid timezone: {e}");
@@ -14991,7 +15057,29 @@ async fn update_schedule_handler(
         Some(None) => Some(None),
         None => match request.catchup_window_secs {
             Some(window) if existing.catchup_policy.as_deref() == Some("window") => {
-                Some(autumn_harvest::CatchupPolicy::from_user_input("window", Some(window)).ok())
+                // Re-window an already-"window" policy. `from_user_input` is
+                // currently infallible for the "window" mode, but match the
+                // sibling branch's explicit 400 rather than `.ok()` — an
+                // `.ok()` here would produce `Some(None)` on a future
+                // validation failure, silently CLEARING the stored policy.
+                match autumn_harvest::CatchupPolicy::from_user_input("window", Some(window)) {
+                    Ok(p) => Some(Some(p)),
+                    Err(v) => {
+                        let err_summary = format!(
+                            "invalid catchup_window_secs for stored 'window' catchup policy: '{v}'"
+                        );
+                        schedule_update_audit_failed(
+                            &api_state,
+                            &actor,
+                            &source,
+                            request_id.as_deref(),
+                            &id_str_owned,
+                            &err_summary,
+                        )
+                        .await;
+                        return Err(AutumnError::bad_request_msg(err_summary));
+                    }
+                }
             }
             _ => None,
         },
@@ -25908,6 +25996,64 @@ mod tests {
             .collect()
     }
 
+    /// A typo'd field name on the PATCH body must be a deserialization error
+    /// (`deny_unknown_fields`), never a silent all-`None` no-op body. The
+    /// handler maps this rejection to a 400 with a failed audit row.
+    #[test]
+    fn update_schedule_request_rejects_unknown_fields() {
+        let err = serde_json::from_value::<UpdateWorkflowScheduleRequest>(serde_json::json!({
+            "scheduleexpr": "interval:30"
+        }))
+        .expect_err("a typo'd field name must be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must name the unknown field: {err}"
+        );
+    }
+
+    /// `deny_unknown_fields` must not break the tri-state
+    /// (`deserialize_with = deserialize_tristate`) fields: absent = outer
+    /// `None`, explicit JSON `null` = `Some(None)`, value = `Some(Some(v))`.
+    #[test]
+    fn update_schedule_request_tristate_fields_survive_deny_unknown_fields() {
+        let absent: UpdateWorkflowScheduleRequest =
+            serde_json::from_value(serde_json::json!({})).expect("empty body must parse");
+        assert!(absent.end_at.is_none());
+        assert!(absent.max_runs.is_none());
+        assert!(absent.calendar.is_none());
+        assert!(absent.retry_policy.is_none());
+
+        let cleared: UpdateWorkflowScheduleRequest = serde_json::from_value(serde_json::json!({
+            "end_at": null,
+            "max_runs": null,
+            "calendar": null,
+            "catchup_policy": null,
+            "consecutive_failure_limit": null,
+            "retry_policy": null,
+        }))
+        .expect("explicit nulls must parse");
+        assert_eq!(cleared.end_at, Some(None));
+        assert_eq!(cleared.max_runs, Some(None));
+        assert_eq!(cleared.calendar, Some(None));
+        assert_eq!(cleared.catchup_policy, Some(None));
+        assert_eq!(cleared.consecutive_failure_limit, Some(None));
+        assert!(matches!(cleared.retry_policy, Some(None)));
+
+        let set: UpdateWorkflowScheduleRequest = serde_json::from_value(serde_json::json!({
+            "max_runs": 7,
+            "calendar": "us-holidays",
+            "workflow_name": "still_parses_for_targeted_400",
+        }))
+        .expect("values must parse");
+        assert_eq!(set.max_runs, Some(Some(7)));
+        assert_eq!(set.calendar, Some(Some("us-holidays".to_string())));
+        assert_eq!(
+            set.workflow_name.as_deref(),
+            Some("still_parses_for_targeted_400"),
+            "workflow_name must remain a declared field so its targeted 400 still fires"
+        );
+    }
+
     #[test]
     fn merge_drain_responses_aggregates_across_shards() {
         use autumn_harvest::workers::{DrainOutcome, DrainResponse};
@@ -27477,6 +27623,7 @@ mod tests {
             max_active_runs: 1,
             catchup: false,
             last_backfill: None,
+            workflow_input: None,
             jitter_secs: 0,
             effective_fire_time: None,
             overlap_policy: "skip".to_string(),

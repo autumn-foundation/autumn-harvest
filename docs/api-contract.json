@@ -3961,6 +3961,7 @@
           "max_active_runs",
           "catchup",
           "last_backfill",
+          "workflow_input",
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
@@ -4063,6 +4064,7 @@
           "max_active_runs",
           "catchup",
           "last_backfill",
+          "workflow_input",
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
@@ -4085,7 +4087,7 @@
       "path": "/admin/schedules/{id}",
       "category": "schedule",
       "read_only": false,
-      "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at.",
+      "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
       "idempotency": "Idempotent for identical bodies: re-applying the same partial update converges on the same row state. Returns 409 while a scheduler replica holds a live fire claim on the row (the claim lease is bounded at ~30 s); retry shortly.",
       "params": [
         {
@@ -4112,7 +4114,7 @@
           {
             "name": "input",
             "required": false,
-            "description": "New workflow input payload (any JSON value)."
+            "description": "New workflow input payload: any non-null JSON value. JSON null leaves the input unchanged (null is the one JSON value that cannot be stored as the input via this route)."
           },
           {
             "name": "catchup",
@@ -4202,6 +4204,7 @@
           "max_active_runs",
           "catchup",
           "last_backfill",
+          "workflow_input",
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
@@ -4211,7 +4214,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Malformed schedule id, workflow_name present in the body (not editable), DAG schedule row, invalid cron/interval expression or timezone, unknown overlap/skip/catchup policy, or unknown calendar. Nothing is written."
+          "description": "Malformed schedule id, unknown/typo'd body field (the body is rejected with deny-unknown-fields semantics), workflow_name present in the body (not editable), DAG schedule row, invalid cron/interval expression or timezone, unknown overlap/skip/catchup policy, unknown calendar, or a timezone-only patch on a row whose stored schedule expression is unparseable. Nothing is written."
         },
         {
           "status": 404,

@@ -1201,7 +1201,9 @@ enum ScheduleCommand {
         /// New IANA timezone for the cron expression (e.g. `"America/New_York"`).
         #[arg(long)]
         tz: Option<String>,
-        /// New inline JSON input passed to each scheduled run.
+        /// New inline JSON input passed to each scheduled run. Any non-null
+        /// JSON value; a literal `null` leaves the stored input unchanged
+        /// (null is the one JSON value that cannot be set as the input).
         #[arg(long, value_name = "JSON")]
         input_json: Option<String>,
         /// New task queue name for scheduled runs.

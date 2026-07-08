@@ -7,13 +7,19 @@
 //! #478 exhaustion reconciliation in both directions, the #350 fire-claim
 //! anti-race gate, and validate-before-commit atomicity.
 
+use std::sync::Arc;
+
 use autumn_harvest::models::HarvestSchedule;
 use autumn_harvest::policy::{OverlapPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::register_workflow_schedules;
 use autumn_harvest::scheduler::{
-    ScheduleUpdateOutcome, WorkflowSchedulePatch, update_workflow_schedule,
+    DagCatalog, ScheduleUpdateOutcome, WorkflowSchedulePatch, claim_and_fire_workflow_schedule,
+    update_workflow_schedule,
 };
-use autumn_harvest::schema::harvest_schedules;
+use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
+use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+use autumn_harvest::types::ShardId;
+use autumn_harvest::worker::HandlerRegistry;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -635,4 +641,364 @@ async fn tristate_clear_and_absence_semantics() {
     assert!(row.calendar_name.is_none(), "calendar must be cleared");
     assert!(row.end_at.is_none(), "end_at must be cleared");
     assert!(row.max_runs.is_none(), "max_runs must be cleared");
+}
+
+/// Cadence-kind transition: cron → manual must NULL `next_run_at` (a manual
+/// schedule has no automatic next slot).
+#[tokio::test]
+async fn cron_to_manual_nulls_next_run_at() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new("upd_cron_to_manual_wf", Schedule::Cron("0 3 * * *".into()));
+    let before = register_and_load(&mut conn, &ws).await;
+    assert!(before.next_run_at.is_some(), "cron seed must have a slot");
+
+    let patch = WorkflowSchedulePatch {
+        schedule: Some(Schedule::Manual),
+        ..Default::default()
+    };
+    let row = expect_updated(
+        update_workflow_schedule(&mut conn, before.id, &patch)
+            .await
+            .expect("update must succeed"),
+    );
+    assert_eq!(row.schedule_expr.as_deref(), Some("manual"));
+    assert!(
+        row.next_run_at.is_none(),
+        "manual schedules must have no automatic next slot"
+    );
+}
+
+/// Cadence-kind transition: manual → cron must populate `next_run_at`.
+#[tokio::test]
+async fn manual_to_cron_populates_next_run_at() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new("upd_manual_to_cron_wf", Schedule::Manual);
+    let before = register_and_load(&mut conn, &ws).await;
+    assert!(
+        before.next_run_at.is_none(),
+        "manual seed must have no slot"
+    );
+
+    let patch = WorkflowSchedulePatch {
+        schedule: Some(Schedule::Cron("*/5 * * * *".into())),
+        ..Default::default()
+    };
+    let row = expect_updated(
+        update_workflow_schedule(&mut conn, before.id, &patch)
+            .await
+            .expect("update must succeed"),
+    );
+    assert_eq!(row.schedule_expr.as_deref(), Some("cron:*/5 * * * *"));
+    let next = row.next_run_at.expect("next_run_at must be populated");
+    assert!(next > Utc::now(), "next slot must be in the future");
+}
+
+/// An auto-paused schedule (issue #360): an unrelated patch preserves
+/// `auto_paused_at`; disabling the limit (`Some(None)`) clears it.
+#[tokio::test]
+async fn autopaused_schedule_patch_preserves_then_clears_auto_paused_at() {
+    use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new(
+        "upd_autopause_wf",
+        Schedule::Interval(std::time::Duration::from_secs(600)),
+    );
+    let before = register_and_load(&mut conn, &ws).await;
+    let auto_paused = Utc::now() - chrono::Duration::minutes(3);
+    diesel::update(harvest_schedules::table.find(before.id))
+        .set((
+            dsl::consecutive_failure_limit.eq(Some(3)),
+            dsl::consecutive_failure_count.eq(3),
+            dsl::auto_paused_at.eq(Some(auto_paused)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed auto-pause state");
+
+    // Unrelated patch: auto_paused_at (and the failure counter) preserved.
+    let row = expect_updated(
+        update_workflow_schedule(
+            &mut conn,
+            before.id,
+            &WorkflowSchedulePatch {
+                input: Some(serde_json::json!({"edited": true})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update must succeed"),
+    );
+    assert_eq!(
+        row.auto_paused_at.map(|t| t.timestamp()),
+        Some(auto_paused.timestamp()),
+        "an unrelated patch must not clear auto_paused_at"
+    );
+    assert_eq!(row.consecutive_failure_count, 3);
+    assert_eq!(row.consecutive_failure_limit, Some(3));
+
+    // Disabling the limit clears the auto-pause (the #360 clear rule).
+    let row = expect_updated(
+        update_workflow_schedule(
+            &mut conn,
+            before.id,
+            &WorkflowSchedulePatch {
+                consecutive_failure_limit: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update must succeed"),
+    );
+    assert!(row.consecutive_failure_limit.is_none());
+    assert!(
+        row.auto_paused_at.is_none(),
+        "disabling the failure limit must clear auto_paused_at"
+    );
+}
+
+/// P1 regression (AC7 for non-cadence edits): the tick must fire from a fresh
+/// post-claim read of the row, never from its pre-claim due-list snapshot.
+///
+/// An input/queue-only PATCH that commits between the tick's due-list SELECT
+/// and its HA claim leaves `next_run_at` unchanged, so the claim still
+/// succeeds — the fire must nevertheless dispatch the NEW input on the NEW
+/// queue. Driven deterministically by handing
+/// `claim_and_fire_workflow_schedule` a deliberately stale snapshot while the
+/// DB row already carries the edited values.
+#[tokio::test]
+async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
+    use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new(
+        "upd_stale_snapshot_wf",
+        Schedule::Interval(std::time::Duration::from_secs(3600)),
+    )
+    .with_input(serde_json::json!({"env": "OLD"}));
+    let before = register_and_load(&mut conn, &ws).await;
+
+    // Arm the slot in the past so it is due.
+    let slot = Utc::now() - chrono::Duration::seconds(60);
+    diesel::update(harvest_schedules::table.find(before.id))
+        .set(dsl::next_run_at.eq(Some(slot)))
+        .execute(&mut conn)
+        .await
+        .expect("arm slot");
+
+    // The tick's due-list SELECT happens "now": capture the stale snapshot.
+    let stale_snapshot = load_by_id(&mut conn, before.id).await;
+    assert_eq!(
+        stale_snapshot.workflow_input,
+        Some(serde_json::json!({"env": "OLD"}))
+    );
+
+    // A non-cadence PATCH commits between the due-list SELECT and the claim:
+    // input + queue change, next_run_at untouched (still the armed slot).
+    let patched = expect_updated(
+        update_workflow_schedule(
+            &mut conn,
+            before.id,
+            &WorkflowSchedulePatch {
+                input: Some(serde_json::json!({"env": "NEW"})),
+                queue_name: Some("edited-queue".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("concurrent edit must succeed"),
+    );
+    assert_eq!(
+        patched.next_run_at.map(|t| t.timestamp_micros()),
+        Some(slot.timestamp_micros()),
+        "a non-cadence edit must leave the armed slot in place"
+    );
+
+    // Fire from the STALE snapshot — the claim's next_run_at guard passes.
+    let registry = HandlerRegistry::new(vec![], vec![]);
+    let metrics: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+    claim_and_fire_workflow_schedule(
+        &mut conn,
+        &stale_snapshot,
+        Utc::now(),
+        ShardId::new(0),
+        &DagCatalog::default(),
+        &registry,
+        &metrics,
+        &[],
+    )
+    .await
+    .expect("claim-and-fire must succeed");
+
+    // Exactly one execution (no double fire), started with the NEW input on
+    // the NEW queue.
+    let rows: Vec<(serde_json::Value, String)> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::dsl::workflow_name.eq("upd_stale_snapshot_wf"))
+        .select((
+            harvest_workflow_executions::dsl::input,
+            harvest_workflow_executions::dsl::queue_name,
+        ))
+        .load(&mut conn)
+        .await
+        .expect("load executions");
+    assert_eq!(rows.len(), 1, "exactly one execution must be started");
+    assert_eq!(
+        rows[0].0,
+        serde_json::json!({"env": "NEW"}),
+        "the fire must use the post-edit input, not the pre-claim snapshot's"
+    );
+    assert_eq!(
+        rows[0].1, "edited-queue",
+        "the fire must use the post-edit queue, not the pre-claim snapshot's"
+    );
+
+    // The finalize advanced next_run_at and released the claim.
+    let after = load_by_id(&mut conn, before.id).await;
+    assert!(after.fire_claim_token.is_none(), "claim must be released");
+    assert!(
+        after.next_run_at.is_some_and(|t| t > slot),
+        "next_run_at must advance past the fired slot"
+    );
+}
+
+/// P2 regression: `update_workflow_schedule`'s initial load takes the row
+/// lock (`FOR UPDATE`), so a PATCH blocks behind a concurrent transaction
+/// holding the row (a tick's claim/advance/finalize cycle) and then applies
+/// against the POST-commit row — never writing back a stale `next_run_at`
+/// (which would re-arm an already-fired slot → double fire).
+#[tokio::test]
+async fn patch_blocks_on_row_lock_and_applies_against_post_commit_row() {
+    use diesel_async::SimpleAsyncConnection as _;
+    use harvest_schedules::dsl;
+
+    let (mut conn, url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new(
+        "upd_row_lock_wf",
+        Schedule::Interval(std::time::Duration::from_secs(3600)),
+    );
+    let before = register_and_load(&mut conn, &ws).await;
+
+    // conn2 simulates a mid-flight tick: hold the row lock in an explicit
+    // transaction while advancing next_run_at (the pause_tests
+    // hold_execution_row_lock precedent).
+    let mut conn2 = AsyncPgConnection::establish(&url).await.expect("conn2");
+    conn2.batch_execute("BEGIN").await.expect("begin");
+    let advanced_slot = Utc::now() + chrono::Duration::seconds(999);
+    diesel::update(harvest_schedules::table.find(before.id))
+        .set(dsl::next_run_at.eq(Some(advanced_slot)))
+        .execute(&mut conn2)
+        .await
+        .expect("advance under lock");
+
+    // The PATCH must block on the FOR UPDATE row lock while conn2 holds it.
+    let patch_url = url.clone();
+    let id = before.id;
+    let patch_task = tokio::spawn(async move {
+        let mut c = AsyncPgConnection::establish(&patch_url)
+            .await
+            .expect("patch conn");
+        update_workflow_schedule(
+            &mut c,
+            id,
+            &WorkflowSchedulePatch {
+                input: Some(serde_json::json!({"locked": true})),
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !patch_task.is_finished(),
+        "the PATCH must block on the row lock; without FOR UPDATE it would \
+         read the pre-commit row and write back a stale next_run_at"
+    );
+
+    conn2.batch_execute("COMMIT").await.expect("commit");
+    let row = expect_updated(
+        patch_task
+            .await
+            .expect("join")
+            .expect("patch must succeed after the lock is released"),
+    );
+    assert_eq!(
+        row.next_run_at.map(|t| t.timestamp_micros()),
+        Some(advanced_slot.timestamp_micros()),
+        "the PATCH must merge against the post-commit row: the concurrently \
+         advanced next_run_at must survive the edit"
+    );
+    assert_eq!(
+        row.workflow_input,
+        Some(serde_json::json!({"locked": true}))
+    );
+}
+
+/// P2 regression: a PATCH that proceeds past an EXPIRED fire claim must fence
+/// the stale token (NULL it) so a straggler fire's token-guarded finalize
+/// matches zero rows and cannot clobber the edited row with old-spec values.
+#[tokio::test]
+async fn patch_on_expired_claim_fences_straggler_finalize() {
+    use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new(
+        "upd_fence_wf",
+        Schedule::Interval(std::time::Duration::from_secs(60)),
+    );
+    let before = register_and_load(&mut conn, &ws).await;
+
+    let stale_token = Uuid::new_v4();
+    diesel::update(harvest_schedules::table.find(before.id))
+        .set((
+            dsl::fire_claim_token.eq(Some(stale_token)),
+            dsl::fire_claimed_until.eq(Some(Utc::now() - chrono::Duration::seconds(5))),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed expired claim");
+
+    let row = expect_updated(
+        update_workflow_schedule(
+            &mut conn,
+            before.id,
+            &WorkflowSchedulePatch {
+                input: Some(serde_json::json!({"fenced": true})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("expired claim must not block the edit"),
+    );
+    assert!(
+        row.fire_claim_token.is_none(),
+        "the expired claim token must be fenced (nulled) by the edit"
+    );
+    assert!(row.fire_claimed_until.is_none());
+
+    // A straggler fire's finalize UPDATE is guarded on its own token — it
+    // must now match zero rows instead of clobbering the edited next_run_at.
+    let old_spec_next = Utc::now() - chrono::Duration::seconds(30);
+    let straggler_rows = diesel::update(
+        harvest_schedules::table
+            .find(before.id)
+            .filter(dsl::fire_claim_token.eq(Some(stale_token))),
+    )
+    .set((
+        dsl::next_run_at.eq(Some(old_spec_next)),
+        dsl::fire_claim_token.eq(None::<Uuid>),
+        dsl::fire_claimed_until.eq(None::<DateTime<Utc>>),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("straggler finalize");
+    assert_eq!(
+        straggler_rows, 0,
+        "a straggler finalize using the fenced token must match zero rows"
+    );
+    let after = load_by_id(&mut conn, before.id).await;
+    assert_ne!(
+        after.next_run_at.map(|t| t.timestamp_micros()),
+        Some(old_spec_next.timestamp_micros()),
+        "the straggler must not have clobbered next_run_at"
+    );
 }

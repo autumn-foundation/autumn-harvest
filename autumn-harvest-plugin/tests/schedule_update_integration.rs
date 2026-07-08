@@ -13,7 +13,9 @@ use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::HarvestSchedule;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor, tick_once};
-use autumn_harvest::schema::{harvest_audit_log, harvest_schedules, harvest_workflow_executions};
+use autumn_harvest::schema::{
+    harvest_audit_log, harvest_events, harvest_schedules, harvest_workflow_executions,
+};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetentionConfig, WorkflowContext};
@@ -178,6 +180,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    // 20260706000001_harvest_start_throttle is deliberately omitted: the tick's
+    // dispatch path probes `to_regclass('harvest_start_throttle')` and treats a
+    // missing table as "no pending throttled starts" (see
+    // `throttle::pending_throttle_count_for_workflow`), so scheduler-driven
+    // tests run correctly without it.
 );
 
 type HarvestApiApp = axum::Router;
@@ -423,6 +430,7 @@ async fn tick(pool: &DbPool, registry: &Arc<HandlerRegistry>) {
 /// The AC11 money test: create → run once → PATCH cron+input → the id is
 /// unchanged, #488 carryover from the pre-edit run resolves on the next fire,
 /// and the next fire uses the new cadence + new input.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn patch_preserves_identity_and_carryover_across_the_edit() {
     let (url, _container) = setup_test_database_url().await;
@@ -445,6 +453,14 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
     let run1_ids = wait_for_completed(&url, wf_name, 1).await;
     assert_eq!(run1_ids.len(), 1);
 
+    // AC9 baseline: a PATCH must write nothing to harvest_events.
+    let mut conn = connect(&url).await;
+    let events_before_patch: i64 = harvest_events::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count events before patch");
+
     // ── PATCH cron + input ───────────────────────────────────────────────────
     let (status, patched) = patch_json(
         &app,
@@ -460,7 +476,19 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
     );
     assert_eq!(patched["schedule_expr"], "interval:120");
 
-    // GET /admin/schedules reflects the update immediately (AC10).
+    // AC9: zero harvest_events writes across the PATCH.
+    let events_after_patch: i64 = harvest_events::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count events after patch");
+    assert_eq!(
+        events_after_patch, events_before_patch,
+        "a schedule PATCH must never write to harvest_events (AC9)"
+    );
+
+    // GET /admin/schedules reflects the update immediately (AC10): not just
+    // the expression — the recomputed next_run_at and the new input too.
     let (list_status, list) = get_json(&app, "/admin/schedules").await;
     assert_eq!(list_status, StatusCode::OK);
     let entry = list
@@ -471,23 +499,38 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
         .cloned()
         .expect("edited schedule must be listed");
     assert_eq!(entry["schedule_expr"], "interval:120");
+    assert!(
+        !entry["next_run_at"].is_null(),
+        "the list must reflect a recomputed next_run_at (AC10): {entry}"
+    );
+    assert_eq!(
+        entry["next_run_at"], patched["next_run_at"],
+        "the list must reflect the same recomputed next_run_at the PATCH returned (AC10)"
+    );
+    assert_eq!(
+        entry["workflow_input"],
+        json!({"env": "B"}),
+        "the list must reflect the edited input (AC10)"
+    );
 
     // ── Run 2 under the post-edit spec ───────────────────────────────────────
+    let t_before_tick2 = Utc::now();
     arm_slot(&url, id, 200).await;
     tick(&pool, &registry).await;
     let completed_ids = wait_for_completed(&url, wf_name, 2).await;
     let run2_id = *completed_ids.iter().find(|r| **r != run1_ids[0]).unwrap();
 
-    let mut conn = connect(&url).await;
-    let (run2_input, run2_output): (Value, Option<Value>) = harvest_workflow_executions::table
-        .find(run2_id)
-        .select((
-            harvest_workflow_executions::dsl::input,
-            harvest_workflow_executions::dsl::output,
-        ))
-        .first(&mut conn)
-        .await
-        .expect("load run 2");
+    let (run2_input, run2_output, run2_workflow_id): (Value, Option<Value>, String) =
+        harvest_workflow_executions::table
+            .find(run2_id)
+            .select((
+                harvest_workflow_executions::dsl::input,
+                harvest_workflow_executions::dsl::output,
+                harvest_workflow_executions::dsl::workflow_id,
+            ))
+            .first(&mut conn)
+            .await
+            .expect("load run 2");
     assert_eq!(
         run2_input,
         json!({"env": "B"}),
@@ -497,6 +540,30 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
         run2_output,
         Some(json!({"value": 2})),
         "#488 carryover from the pre-edit run must resolve on the next fire (AC11b)"
+    );
+    assert!(
+        run2_workflow_id.starts_with(&format!("sched:{id}:")),
+        "the post-edit run must stay in the sched:{{schedule_id}}: workflow-id \
+         namespace (AC6), got {run2_workflow_id}"
+    );
+
+    // AC11c strengthening: the advanced next_run_at must reflect the NEW
+    // 120 s interval. Non-catchup dispatch advances to
+    // next_run_after(schedule, tick_now) = tick_now + 120 with
+    // tick_now >= t_before_tick2; under the OLD 60 s interval it would be
+    // tick_now + 60 < t_before_tick2 + 120 (the tick starts immediately).
+    let row_after_run2 = load_schedule_row(&url, id).await;
+    let advanced = row_after_run2
+        .next_run_at
+        .expect("next_run_at must be advanced after the fire");
+    assert!(
+        advanced >= t_before_tick2 + chrono::Duration::seconds(120),
+        "the advanced next_run_at must be driven by the NEW 120s interval \
+         (got {advanced}, tick started {t_before_tick2})"
+    );
+    assert!(
+        advanced <= Utc::now() + chrono::Duration::seconds(121),
+        "the advanced next_run_at must be ~tick_now + 120s, got {advanced}"
     );
 
     worker.shutdown();
@@ -613,8 +680,6 @@ async fn unknown_or_malformed_id_is_rejected() {
     let pool = build_test_pool(&url);
     let registry = etl_registry("sched_upd_404_wf");
     let app = build_app(&pool, registry);
-    // Touch the URL so the container stays alive via `url` usage.
-    let _ = load_missing(&url).await;
 
     let unknown = Uuid::new_v4();
     let (status, _) = patch_json(
@@ -627,16 +692,6 @@ async fn unknown_or_malformed_id_is_rejected() {
 
     let (status, _) = patch_json(&app, "/admin/schedules/not-a-uuid", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-async fn load_missing(url: &str) -> bool {
-    let mut conn = connect(url).await;
-    let count: i64 = harvest_schedules::table
-        .count()
-        .get_result(&mut conn)
-        .await
-        .expect("count");
-    count >= 0
 }
 
 /// A DAG schedule row is owned by `PATCH /dags/{dag_name}` — this route
@@ -840,4 +895,377 @@ async fn explicit_null_clears_and_absence_preserves_nullable_fields() {
     assert_eq!(status, StatusCode::OK, "{patched}");
     assert_eq!(patched["jitter_secs"], 3);
     let _ = load_schedule_row(&url, id).await;
+}
+
+/// Write-path coverage for every remaining AC2 field: each PATCH round-trips
+/// through the row so a field silently dropped by the merge/changeset can't
+/// hide behind response-echo only.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn patch_covers_every_editable_field_write_path() {
+    use harvest_schedules::dsl;
+
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let registry = etl_registry("sched_upd_fields_wf");
+    let app = build_app(&pool, registry);
+
+    let id = create_schedule(
+        &app,
+        "sched_upd_fields_wf",
+        json!({"schedule_expr": "0 3 * * *", "overlap_policy": "buffer_all"}),
+    )
+    .await;
+
+    // buffer_all_max: seed three buffered slots, tighten the cap to 2 and
+    // assert the stored buffer is trimmed with it (#241 trim interaction).
+    let mut conn = connect(&url).await;
+    diesel::update(harvest_schedules::table.find(id))
+        .set(dsl::buffered_runs.eq(json!([
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            "2026-01-01T02:00:00Z"
+        ])))
+        .execute(&mut conn)
+        .await
+        .expect("seed buffered runs");
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"buffer_all_max": 2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["buffer_all_max"], 2);
+    assert_eq!(
+        patched["buffered_count"], 2,
+        "tightening buffer_all_max must trim the stored buffer: {patched}"
+    );
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(row.buffer_all_max, 2);
+    assert_eq!(
+        row.buffered_runs.as_array().map(Vec::len),
+        Some(2),
+        "the stored buffered_runs must be trimmed to the new cap"
+    );
+
+    // queue_name.
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"queue_name": "edited-queue"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(row.queue_name.as_deref(), Some("edited-queue"));
+
+    // skip_policy.
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"skip_policy": "run_next_business_day"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["skip_policy"], "run_next_business_day");
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(row.skip_policy, "run_next_business_day");
+
+    // Legacy catchup bool (no catchup_policy stored → the bool governs).
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"catchup": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["catchup"], true);
+    let row = load_schedule_row(&url, id).await;
+    assert!(row.catchup, "legacy catchup bool must be persisted");
+    assert!(
+        row.catchup_policy.is_none(),
+        "a legacy-bool edit must not mint an explicit catchup policy"
+    );
+
+    // consecutive_failure_limit.
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"consecutive_failure_limit": 4}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["consecutive_failure_limit"], 4);
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(row.consecutive_failure_limit, Some(4));
+
+    // retry_policy: set…
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"retry_policy": {
+            "max_attempts": 3,
+            "initial_interval": {"secs": 1, "nanos": 0},
+            "backoff_coefficient": 2.0,
+            "max_interval": {"secs": 60, "nanos": 0},
+            "non_retryable_errors": []
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["retry_policy"]["max_attempts"], 3);
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(
+        row.retry_policy
+            .as_ref()
+            .and_then(|v| v.get("max_attempts"))
+            .and_then(Value::as_i64),
+        Some(3),
+        "retry_policy must be persisted"
+    );
+
+    // …and clear (explicit JSON null).
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"retry_policy": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert!(patched["retry_policy"].is_null());
+    let row = load_schedule_row(&url, id).await;
+    assert!(row.retry_policy.is_none(), "retry_policy must be cleared");
+
+    // timezone-only PATCH on a cron schedule: the stored expression becomes
+    // cron_tz:… AND next_run_at is recomputed (the cadence changed).
+    let before = load_schedule_row(&url, id).await;
+    assert_eq!(before.schedule_expr.as_deref(), Some("cron:0 3 * * *"));
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"timezone": "America/New_York"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(
+        patched["schedule_expr"], "cron_tz:America/New_York:0 3 * * *",
+        "a timezone-only patch must re-anchor the stored cron expression"
+    );
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(
+        row.schedule_expr.as_deref(),
+        Some("cron_tz:America/New_York:0 3 * * *")
+    );
+    assert_eq!(row.timezone, "America/New_York");
+    assert_ne!(
+        row.next_run_at, before.next_run_at,
+        "re-anchoring the cron timezone changes the cadence and must recompute next_run_at"
+    );
+    assert!(
+        row.next_run_at.is_some(),
+        "the re-anchored cron must have a next slot"
+    );
+}
+
+/// A timezone-only PATCH on an interval schedule is a no-op (the timezone is
+/// meaningless for interval cadence), mirroring the create path's semantics.
+#[tokio::test]
+async fn timezone_only_patch_is_noop_for_interval_schedules() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let registry = etl_registry("sched_upd_tz_interval_wf");
+    let app = build_app(&pool, registry);
+
+    let id = create_schedule(&app, "sched_upd_tz_interval_wf", json!({})).await;
+    let before = load_schedule_row(&url, id).await;
+
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"timezone": "Europe/Berlin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let after = load_schedule_row(&url, id).await;
+    assert_eq!(
+        after.schedule_expr.as_deref(),
+        Some("interval:60"),
+        "the interval cadence must be untouched"
+    );
+    assert_eq!(
+        after.next_run_at, before.next_run_at,
+        "a timezone no-op must preserve the pending next_run_at"
+    );
+    assert_eq!(
+        after.timezone, "UTC",
+        "interval schedules always store UTC (the timezone is ignored)"
+    );
+}
+
+/// A `catchup_window_secs`-only PATCH re-windows a stored `window` catchup
+/// policy (and leaves the mode as `window`).
+#[tokio::test]
+async fn catchup_window_only_patch_rewindows_stored_window_policy() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let registry = etl_registry("sched_upd_rewindow_wf");
+    let app = build_app(&pool, registry);
+
+    let id = create_schedule(
+        &app,
+        "sched_upd_rewindow_wf",
+        json!({"catchup_policy": "window", "catchup_window_secs": 3600}),
+    )
+    .await;
+    let before = load_schedule_row(&url, id).await;
+    assert_eq!(before.catchup_policy.as_deref(), Some("window"));
+    assert_eq!(before.catchup_window_secs, Some(3600));
+
+    let (status, patched) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"catchup_window_secs": 7200}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["catchup_policy_effective"], "window");
+    assert_eq!(patched["catchup_window_secs"], 7200);
+    let row = load_schedule_row(&url, id).await;
+    assert_eq!(row.catchup_policy.as_deref(), Some("window"));
+    assert_eq!(row.catchup_window_secs, Some(7200));
+}
+
+/// Invalid overlap/skip/catchup policy values are rejected with 400 and the
+/// row is byte-for-byte unchanged.
+#[tokio::test]
+async fn invalid_policy_values_are_rejected_with_400_and_write_nothing() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let registry = etl_registry("sched_upd_badpolicy_wf");
+    let app = build_app(&pool, registry);
+
+    let id = create_schedule(&app, "sched_upd_badpolicy_wf", json!({})).await;
+    let before = load_schedule_row(&url, id).await;
+
+    for (field, body) in [
+        ("overlap_policy", json!({"overlap_policy": "bogus"})),
+        ("skip_policy", json!({"skip_policy": "bogus"})),
+        ("catchup_policy", json!({"catchup_policy": "bogus"})),
+    ] {
+        let (status, resp) = patch_json(&app, format!("/admin/schedules/{id}"), body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "invalid {field} must 400: {resp}"
+        );
+        assert!(
+            resp.to_string().contains(field),
+            "the 400 must name the invalid field {field}: {resp}"
+        );
+        let after = load_schedule_row(&url, id).await;
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "a rejected {field} patch must write nothing"
+        );
+    }
+}
+
+/// `deny_unknown_fields`: a typo'd field name is rejected with 400 rather
+/// than silently deserializing to an all-`None` no-op body that 200s with a
+/// SUCCEEDED audit row.
+#[tokio::test]
+async fn unknown_body_field_is_rejected_with_400_not_silently_ignored() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let registry = etl_registry("sched_upd_typo_wf");
+    let app = build_app(&pool, registry);
+
+    let id = create_schedule(&app, "sched_upd_typo_wf", json!({})).await;
+    let before = load_schedule_row(&url, id).await;
+
+    let (status, body) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"scheduleexpr": "interval:30"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a typo'd field must be rejected, not ignored: {body}"
+    );
+    assert!(
+        body.to_string().contains("unknown field"),
+        "the 400 must explain the unknown field: {body}"
+    );
+
+    let after = load_schedule_row(&url, id).await;
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "a rejected body must write nothing"
+    );
+}
+
+/// A timezone-only PATCH on a row whose stored schedule expression is
+/// unparseable returns 400 (repair by sending `schedule_expr` explicitly)
+/// instead of leniently coercing the row to `manual` and `NULL`ing
+/// `next_run_at` as a side effect. A stored `"manual"` expression remains a
+/// legitimate timezone no-op.
+#[tokio::test]
+async fn timezone_only_patch_on_unparseable_stored_expr_returns_400() {
+    use harvest_schedules::dsl;
+
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let registry = etl_registry("sched_upd_corrupt_expr_wf");
+    let app = build_app(&pool, registry);
+
+    let id = create_schedule(&app, "sched_upd_corrupt_expr_wf", json!({})).await;
+    let mut conn = connect(&url).await;
+    diesel::update(harvest_schedules::table.find(id))
+        .set(dsl::schedule_expr.eq(Some("interval:not-a-number")))
+        .execute(&mut conn)
+        .await
+        .expect("corrupt the stored expression");
+    let before = load_schedule_row(&url, id).await;
+
+    let (status, body) = patch_json(
+        &app,
+        format!("/admin/schedules/{id}"),
+        json!({"timezone": "America/New_York"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("unparseable"),
+        "the 400 must explain the stored expression is unparseable: {body}"
+    );
+    let after = load_schedule_row(&url, id).await;
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "the corrupt row must be left untouched (no lenient manual coercion)"
+    );
+
+    // A stored "manual" expression is parseable-by-convention: the timezone
+    // edit is a documented no-op for it.
+    let manual_registry = etl_registry("sched_upd_manual_tz_wf");
+    let manual_app = build_app(&pool, manual_registry);
+    let manual_id = create_schedule(
+        &manual_app,
+        "sched_upd_manual_tz_wf",
+        json!({"schedule_expr": "manual"}),
+    )
+    .await;
+    let (status, patched) = patch_json(
+        &manual_app,
+        format!("/admin/schedules/{manual_id}"),
+        json!({"timezone": "America/New_York"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["schedule_expr"], "manual");
 }

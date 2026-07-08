@@ -1301,17 +1301,31 @@ async fn apply_workflow_schedule_update(
     );
     if guard_live_fire_claim {
         // Anti-race with the scheduler tick (issue #350 / #771 AC7): refuse to
-        // rewrite a row whose fire claim is currently live. The tick's own
-        // claim UPDATE guards on its `next_run_at` snapshot, so a successful
-        // edit here invalidates any stale pre-claim snapshot symmetrically.
+        // rewrite a row whose fire claim is currently live. The tick's claim
+        // UPDATE and its finalize both evaluate claim expiry against the DB
+        // clock (`NOW()`), so this guard uses `diesel::dsl::now` rather than
+        // the app clock — a skewed API host must never judge a claim expired
+        // that the #350 machinery still considers live (or vice versa).
+        //
+        // When the guard passes because the claim has *expired* (crashed or
+        // straggling replica left a stale token behind), the token is also
+        // nulled out here: a straggler fire's finalize UPDATEs are guarded by
+        // `fire_claim_token = $its_token`, so fencing the token guarantees a
+        // late finalize matches zero rows and can never clobber the edited
+        // `next_run_at`/`buffered_runs` with old-spec values — exactly the
+        // fencing a peer replica's claim-steal performs.
         let rows_updated = diesel::update(
             dsl::harvest_schedules.find(existing.id).filter(
                 dsl::fire_claim_token
                     .is_null()
-                    .or(dsl::fire_claimed_until.lt(now)),
+                    .or(dsl::fire_claimed_until.lt(diesel::dsl::now)),
             ),
         )
-        .set(changeset)
+        .set((
+            changeset,
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+        ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1502,6 +1516,14 @@ pub enum ScheduleUpdateOutcome {
 /// the stored row (`schedule_expr` is re-parsed with the same lenient rules
 /// the tick loop uses, so an unparseable/NULL expression is treated as
 /// `Schedule::Manual`).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the row has no `workflow_name` (not
+/// a workflow schedule) or when the patch leaves `retry_policy` untouched but
+/// the stored `retry_policy` JSON does not deserialize as a `RetryPolicy` —
+/// erroring loudly instead of silently dropping the stored policy to NULL on
+/// an unrelated edit (repair by explicitly setting or clearing it).
 fn merge_schedule_patch(
     existing: &HarvestSchedule,
     patch: &WorkflowSchedulePatch,
@@ -1527,10 +1549,26 @@ fn merge_schedule_patch(
             existing.catchup,
         )
     });
-    let existing_retry_policy: Option<crate::policy::RetryPolicy> = existing
-        .retry_policy
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    // Resolve the retry policy the merged spec carries. When the patch does
+    // not touch `retry_policy`, the stored JSON must round-trip through the
+    // typed struct (the shared update body re-serializes it); a stored value
+    // that fails to deserialize is surfaced as an error rather than silently
+    // dropped to NULL by an unrelated patch — the operator repairs the row by
+    // explicitly setting or clearing `retry_policy`.
+    let merged_retry_policy: Option<crate::policy::RetryPolicy> = match patch.retry_policy.as_ref()
+    {
+        Some(new) => new.clone(),
+        None => match existing.retry_policy.as_ref() {
+            Some(stored) => Some(serde_json::from_value(stored.clone()).map_err(|e| {
+                HarvestError::Config(format!(
+                    "stored retry_policy for schedule {} is not a valid RetryPolicy ({e}); \
+                         set or clear retry_policy explicitly in the patch to repair it",
+                    existing.id
+                ))
+            })?),
+            None => None,
+        },
+    };
 
     Ok(WorkflowSchedule {
         workflow_name,
@@ -1589,10 +1627,7 @@ fn merge_schedule_patch(
             |new| new.filter(|&n| n > 0),
         ),
         catchup_policy: patch.catchup_policy.unwrap_or(existing_catchup_policy),
-        retry_policy: patch
-            .retry_policy
-            .as_ref()
-            .map_or(existing_retry_policy, Clone::clone),
+        retry_policy: merged_retry_policy,
     })
 }
 
@@ -1628,9 +1663,19 @@ pub async fn update_workflow_schedule(
 
     conn.transaction(|conn| {
         async move {
+            // FOR UPDATE: serialize this PATCH against a concurrent scheduler
+            // tick (whose claim/advance/finalize UPDATEs take the row lock)
+            // and against peer PATCHes. Without the lock, a full
+            // claim→advance→clear-claim cycle could commit between this
+            // SELECT and the guarded UPDATE below, and the merge would write
+            // back the *stale* `next_run_at` (re-arming an already-fired slot
+            // → double fire), stale `buffered_runs`, and a stale `runs_started`
+            // basis for the #478 exhaustion reconciliation; two concurrent
+            // PATCHes would likewise silently lose one side's fields.
             let existing: Option<HarvestSchedule> = dsl::harvest_schedules
                 .find(schedule_id)
                 .select(HarvestSchedule::as_select())
+                .for_update()
                 .first(conn)
                 .await
                 .optional()
@@ -1834,9 +1879,6 @@ async fn tick_workflow_schedules(
         let Some(ref wf_name) = schedule.workflow_name else {
             continue;
         };
-        let Some(logical_date) = schedule.next_run_at else {
-            continue;
-        };
 
         if let Some(ref dag_name) = schedule.dag_name
             && !registered_dags.contains_key(dag_name)
@@ -1873,170 +1915,260 @@ async fn tick_workflow_schedules(
                 .map_err(crate::error::database_error)?;
             continue;
         }
-        // Parse the schedule expression stored in the DB row. This covers both
-        // in-process registered schedules and schedules created via the API
-        // (which are DB-only and do not appear in the in-memory list).
-        let parsed_schedule = schedule
-            .schedule_expr
-            .as_deref()
-            .and_then(parse_schedule_from_expr);
-        let catchup_policy = crate::policy::CatchupPolicy::from_db(
-            schedule.catchup_policy.as_deref(),
-            schedule.catchup_window_secs,
-            schedule.catchup,
-        );
 
-        // ── HA claim (issue #350) ─────────────────────────────────────────────
-        // Atomically claim this due slot so concurrent replicas in a multi-
-        // replica deployment never double-fire the same schedule.
-        //
-        // The UPDATE guards on both the claim expiry (fire_claim_token IS NULL
-        // OR fire_claimed_until < NOW()) AND the logical slot (next_run_at =
-        // logical_date). The next_run_at guard prevents a stale-snapshot race:
-        // if a peer has already fired this slot and advanced next_run_at, our
-        // claim UPDATE matches zero rows and we skip cleanly.
-        //
-        // We generate the token client-side so we can reference it in the error
-        // cleanup path — preventing a slow late-running tick from clearing a
-        // successor replica's live claim after the 30 s TTL has expired.
-        //
-        // Crash-recovery window: if this replica crashes after claiming but
-        // before advancing next_run_at, the claim expires after 30 s and any
-        // healthy peer retries the slot on its next tick.
-        let my_claim_token = uuid::Uuid::new_v4();
-        let claim_rows_affected: usize = diesel::sql_query(
-            "UPDATE harvest_schedules \
-             SET fire_claim_token = $1, \
-                 fire_claimed_until = NOW() + INTERVAL '30 seconds' \
-             WHERE id = $2 \
-               AND next_run_at = $3 \
-               AND (fire_claim_token IS NULL OR fire_claimed_until < NOW())",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
-        .bind::<diesel::sql_types::Uuid, _>(schedule.id)
-        .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-        if claim_rows_affected == 0 {
-            metrics.record_schedule_fire_attempt(wf_name, "lost_race");
-            tracing::debug!(
-                schedule_id = %schedule.id,
-                workflow_name = %wf_name,
-                "harvest: schedule slot claim lost to peer replica; skipping this tick"
-            );
-            continue;
-        }
-        metrics.record_schedule_fire_attempt(wf_name, "claimed");
-
-        // issue #377: gate check runs AFTER the HA claim to prevent every
-        // replica from independently recording a skip metric and advancing
-        // next_run_at for the same slot. Only the replica that wins the claim
-        // skips or fires the slot.
-        {
-            let queue_name = schedule.queue_name.as_deref().unwrap_or("default");
-            // Use dag_name (not wf_name) when looking up DAG metadata so that an
-            // owner-scoped gate is matched even when the workflow name differs from
-            // the DAG name (e.g. unified DAG aliases).
-            let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
-            let owner = registry
-                .workflows
-                .get(wf_name.as_str())
-                .and_then(|i| i.owner)
-                .or_else(|| {
-                    registered_dags
-                        .get(dag_lookup_key)
-                        .and_then(|d| d.owner.as_deref())
-                });
-            if let Some(gate) = crate::admission_gate::check_admission(
-                active_gates,
-                wf_name,
-                queue_name,
-                current_shard.as_i32(),
-                owner,
-            ) {
-                let gate_id_str = gate.id.to_string();
-                tracing::info!(
-                    workflow_name = %wf_name,
-                    gate_id = %gate_id_str,
-                    reason = %gate.reason,
-                    "harvest: schedule fire skipped due to admission gate"
-                );
-                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
-                crate::schedule_decision::record_decision_graceful(
-                    conn,
-                    Some(&**metrics),
-                    Some(schedule.id),
-                    wf_name,
-                    "workflow",
-                    "skipped",
-                    "admission_blocked",
-                    Some(serde_json::json!({
-                        "gate_id": gate_id_str,
-                        "reason": gate.reason,
-                    })),
-                    now,
-                    now,
-                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
-                )
-                .await;
-                // Advance next_run_at and clear the claim token so the next
-                // tick can re-claim this schedule immediately. Without clearing
-                // the token, the claim would block other replicas for up to the
-                // full 30 s TTL before they could re-examine the slot.
-                let next_run = next_run_after(parsed_schedule.as_ref(), now);
-                let _ = diesel::sql_query(
-                    "UPDATE harvest_schedules \
-                     SET next_run_at = $1, \
-                         updated_at = $2, \
-                         fire_claim_token = NULL, \
-                         fire_claimed_until = NULL \
-                     WHERE id = $3 AND fire_claim_token = $4",
-                )
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run)
-                .bind::<diesel::sql_types::Timestamptz, _>(now)
-                .bind::<diesel::sql_types::Uuid, _>(schedule.id)
-                .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
-                .execute(conn)
-                .await;
-                continue;
-            }
-        }
-
-        if let Err(error) = tick_one_workflow_schedule(
+        claim_and_fire_workflow_schedule(
             conn,
-            wf_name,
-            catchup_policy,
-            parsed_schedule.as_ref(),
             &schedule,
-            logical_date,
             now,
             current_shard,
-            my_claim_token,
             registered_dags,
             registry,
             metrics,
+            active_gates,
         )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Claim one due workflow-schedule slot (issue #350 HA claim) and fire it from
+/// a **fresh post-claim read** of the row (issue #771 AC7).
+///
+/// `snapshot` is the row as loaded by the caller's due-list SELECT and may be
+/// stale by the time the claim is attempted: an in-place edit
+/// (`PATCH /admin/schedules/{id}`, issue #771) that does not rewrite
+/// `next_run_at` — an input/queue/policy-only edit — can commit between the
+/// due-list SELECT and the claim UPDATE without invalidating the claim's
+/// `next_run_at` guard. Firing from the pre-claim snapshot would then dispatch
+/// the slot with the pre-edit input/queue/policies. So after winning the claim
+/// this function re-reads the row and re-derives everything the fire consumes
+/// (input, queue, parsed schedule expression, catchup/overlap/retry policies)
+/// from the fresh row. Edits arriving *after* the claim are fenced by the
+/// PATCH's own live-claim guard (`ClaimLive` → 409), so the fresh row is
+/// authoritative for the whole fire. Cadence edits (which rewrite
+/// `next_run_at`) were already fenced by the claim's `next_run_at` guard.
+///
+/// This mirrors the pre-existing fresh re-read of `consecutive_failure_count`
+/// / `auto_paused_at` inside `tick_one_workflow_schedule`, which exists for
+/// exactly this stale-snapshot bug class (issue #360 / Codex #1928).
+///
+/// Exposed `#[doc(hidden)] pub` so the stale-snapshot race can be driven
+/// deterministically from integration tests (a test hands in a deliberately
+/// stale snapshot while the DB row already carries the edited values).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the claim UPDATE or the post-claim
+/// re-read fails; a `tick_one_workflow_schedule` failure is logged and the
+/// claim released (matching the caller's pre-existing continue-to-next-schedule
+/// semantics) rather than propagated.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn claim_and_fire_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    snapshot: &HarvestSchedule,
+    now: DateTime<Utc>,
+    current_shard: ShardId,
+    registered_dags: &DagCatalog,
+    registry: &crate::worker::HandlerRegistry,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    active_gates: &[crate::admission_gate::AdmissionGate],
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let Some(snapshot_wf_name) = snapshot.workflow_name.as_deref() else {
+        return Ok(());
+    };
+    let Some(logical_date) = snapshot.next_run_at else {
+        return Ok(());
+    };
+
+    // ── HA claim (issue #350) ─────────────────────────────────────────────
+    // Atomically claim this due slot so concurrent replicas in a multi-
+    // replica deployment never double-fire the same schedule.
+    //
+    // The UPDATE guards on both the claim expiry (fire_claim_token IS NULL
+    // OR fire_claimed_until < NOW()) AND the logical slot (next_run_at =
+    // logical_date). The next_run_at guard prevents a stale-snapshot race:
+    // if a peer has already fired this slot and advanced next_run_at, our
+    // claim UPDATE matches zero rows and we skip cleanly.
+    //
+    // We generate the token client-side so we can reference it in the error
+    // cleanup path — preventing a slow late-running tick from clearing a
+    // successor replica's live claim after the 30 s TTL has expired.
+    //
+    // Crash-recovery window: if this replica crashes after claiming but
+    // before advancing next_run_at, the claim expires after 30 s and any
+    // healthy peer retries the slot on its next tick.
+    let my_claim_token = uuid::Uuid::new_v4();
+    let claim_rows_affected: usize = diesel::sql_query(
+        "UPDATE harvest_schedules \
+         SET fire_claim_token = $1, \
+             fire_claimed_until = NOW() + INTERVAL '30 seconds' \
+         WHERE id = $2 \
+           AND next_run_at = $3 \
+           AND (fire_claim_token IS NULL OR fire_claimed_until < NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
+    .bind::<diesel::sql_types::Uuid, _>(snapshot.id)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if claim_rows_affected == 0 {
+        metrics.record_schedule_fire_attempt(snapshot_wf_name, "lost_race");
+        tracing::debug!(
+            schedule_id = %snapshot.id,
+            workflow_name = %snapshot_wf_name,
+            "harvest: schedule slot claim lost to peer replica; skipping this tick"
+        );
+        return Ok(());
+    }
+    metrics.record_schedule_fire_attempt(snapshot_wf_name, "claimed");
+
+    // ── Post-claim refresh (issue #771 AC7) ───────────────────────────────
+    // Never fire from the pre-claim snapshot: re-read the row now that the
+    // claim is held so a non-cadence edit that committed between the due-list
+    // SELECT and the claim is picked up by this very fire.
+    let fresh: Option<HarvestSchedule> = dsl::harvest_schedules
+        .find(snapshot.id)
+        .select(HarvestSchedule::as_select())
+        .first(conn)
         .await
-        {
-            tracing::warn!(
-                error = %error, workflow_name = %wf_name,
-                "harvest: workflow schedule tick failed; continuing to next schedule"
+        .optional()
+        .map_err(crate::error::database_error)?;
+    let Some(schedule) = fresh else {
+        // The row was deleted between the claim and the re-read; the claim
+        // died with the row and there is nothing to fire or release.
+        return Ok(());
+    };
+    let schedule = &schedule;
+    let Some(ref wf_name) = schedule.workflow_name else {
+        // Defensive only: workflow_name is immutable through every mutation
+        // path (the PATCH route rejects it as not editable).
+        return Ok(());
+    };
+    // Parse the schedule expression stored in the DB row. This covers both
+    // in-process registered schedules and schedules created via the API
+    // (which are DB-only and do not appear in the in-memory list).
+    let parsed_schedule = schedule
+        .schedule_expr
+        .as_deref()
+        .and_then(parse_schedule_from_expr);
+    let catchup_policy = crate::policy::CatchupPolicy::from_db(
+        schedule.catchup_policy.as_deref(),
+        schedule.catchup_window_secs,
+        schedule.catchup,
+    );
+
+    // issue #377: gate check runs AFTER the HA claim to prevent every
+    // replica from independently recording a skip metric and advancing
+    // next_run_at for the same slot. Only the replica that wins the claim
+    // skips or fires the slot.
+    {
+        let queue_name = schedule.queue_name.as_deref().unwrap_or("default");
+        // Use dag_name (not wf_name) when looking up DAG metadata so that an
+        // owner-scoped gate is matched even when the workflow name differs from
+        // the DAG name (e.g. unified DAG aliases).
+        let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
+        let owner = registry
+            .workflows
+            .get(wf_name.as_str())
+            .and_then(|i| i.owner)
+            .or_else(|| {
+                registered_dags
+                    .get(dag_lookup_key)
+                    .and_then(|d| d.owner.as_deref())
+            });
+        if let Some(gate) = crate::admission_gate::check_admission(
+            active_gates,
+            wf_name,
+            queue_name,
+            current_shard.as_i32(),
+            owner,
+        ) {
+            let gate_id_str = gate.id.to_string();
+            tracing::info!(
+                workflow_name = %wf_name,
+                gate_id = %gate_id_str,
+                reason = %gate.reason,
+                "harvest: schedule fire skipped due to admission gate"
             );
-            // Clear our own claim on error so a peer can retry promptly. Guard
-            // on the token so a slow late-running tick doesn't clear a
-            // successor's live claim if the 30 s TTL has already expired.
+            metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+            crate::schedule_decision::record_decision_graceful(
+                conn,
+                Some(&**metrics),
+                Some(schedule.id),
+                wf_name,
+                "workflow",
+                "skipped",
+                "admission_blocked",
+                Some(serde_json::json!({
+                    "gate_id": gate_id_str,
+                    "reason": gate.reason,
+                })),
+                now,
+                now,
+                i16::try_from(current_shard.as_i32()).unwrap_or(0),
+            )
+            .await;
+            // Advance next_run_at and clear the claim token so the next
+            // tick can re-claim this schedule immediately. Without clearing
+            // the token, the claim would block other replicas for up to the
+            // full 30 s TTL before they could re-examine the slot.
+            let next_run = next_run_after(parsed_schedule.as_ref(), now);
             let _ = diesel::sql_query(
                 "UPDATE harvest_schedules \
-                 SET fire_claim_token = NULL, fire_claimed_until = NULL \
-                 WHERE id = $1 AND fire_claim_token = $2",
+                 SET next_run_at = $1, \
+                     updated_at = $2, \
+                     fire_claim_token = NULL, \
+                     fire_claimed_until = NULL \
+                 WHERE id = $3 AND fire_claim_token = $4",
             )
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
             .bind::<diesel::sql_types::Uuid, _>(schedule.id)
             .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
             .execute(conn)
             .await;
+            return Ok(());
         }
+    }
+
+    if let Err(error) = tick_one_workflow_schedule(
+        conn,
+        wf_name,
+        catchup_policy,
+        parsed_schedule.as_ref(),
+        schedule,
+        logical_date,
+        now,
+        current_shard,
+        my_claim_token,
+        registered_dags,
+        registry,
+        metrics,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %error, workflow_name = %wf_name,
+            "harvest: workflow schedule tick failed; continuing to next schedule"
+        );
+        // Clear our own claim on error so a peer can retry promptly. Guard
+        // on the token so a slow late-running tick doesn't clear a
+        // successor's live claim if the 30 s TTL has already expired.
+        let _ = diesel::sql_query(
+            "UPDATE harvest_schedules \
+             SET fire_claim_token = NULL, fire_claimed_until = NULL \
+             WHERE id = $1 AND fire_claim_token = $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+        .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
+        .execute(conn)
+        .await;
     }
 
     Ok(())
@@ -4874,6 +5006,58 @@ mod tests {
         let err =
             merge_schedule_patch(&row, &WorkflowSchedulePatch::default()).expect_err("must reject");
         assert!(matches!(err, HarvestError::Config(_)));
+    }
+
+    /// A stored `retry_policy` JSON blob that fails to deserialize must fail
+    /// an UNRELATED patch loudly instead of being silently round-tripped to
+    /// NULL (which would destroy the stored policy as a side effect of, say,
+    /// an input-only edit).
+    #[test]
+    fn merge_schedule_patch_corrupt_stored_retry_policy_errors_on_unrelated_patch() {
+        let mut row = merge_base_row();
+        row.retry_policy = Some(serde_json::json!({"not": "a retry policy"}));
+        let patch = WorkflowSchedulePatch {
+            input: Some(serde_json::json!({"unrelated": true})),
+            ..Default::default()
+        };
+        let err = merge_schedule_patch(&row, &patch)
+            .expect_err("corrupt stored retry_policy must not be silently dropped");
+        match err {
+            HarvestError::Config(msg) => {
+                assert!(
+                    msg.contains("retry_policy"),
+                    "error must name retry_policy: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// The corrupt-row error is repairable: a patch that explicitly sets or
+    /// clears `retry_policy` bypasses the stored blob entirely.
+    #[test]
+    fn merge_schedule_patch_corrupt_stored_retry_policy_repairable_by_set_or_clear() {
+        let mut row = merge_base_row();
+        row.retry_policy = Some(serde_json::json!({"not": "a retry policy"}));
+
+        let clear = WorkflowSchedulePatch {
+            retry_policy: Some(None),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &clear).expect("explicit clear must repair");
+        assert!(merged.retry_policy.is_none());
+
+        let replacement =
+            crate::policy::RetryPolicy::exponential(3, std::time::Duration::from_secs(1));
+        let set = WorkflowSchedulePatch {
+            retry_policy: Some(Some(replacement.clone())),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &set).expect("explicit set must repair");
+        assert_eq!(
+            serde_json::to_value(merged.retry_policy).unwrap(),
+            serde_json::to_value(Some(replacement)).unwrap()
+        );
     }
 
     #[cfg(all(feature = "db", not(feature = "unified-dag-execution")))]

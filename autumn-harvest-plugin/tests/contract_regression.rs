@@ -162,6 +162,31 @@ fn completion_delivery_routes_are_classified() {
     );
 }
 
+/// `PATCH /admin/schedules/{id}` (issue #771) must be registered in the
+/// management route list AND classified in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: the audit-side mutual
+/// cross-check (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if
+/// a route is dropped from BOTH lists, so this test pins the route against
+/// the live router registry.
+#[test]
+fn schedule_update_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let route = "PATCH /admin/schedules/{id}";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == route),
+        "{route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {
