@@ -270,13 +270,37 @@ A condition-skip is **resolved-skipped**, not silently dropped:
 ### Fail-closed on invalid stored conditions
 
 If a stored `condition` no longer parses (or violates the caps — e.g. a row written by a
-different build during a mixed-version deploy), the trigger **fails closed, retryably**: the
-fire is skipped with the distinct reason `condition_invalid`, a warning is logged, and — unlike
-a `condition_unmet` skip — **no fires row is written** (mirroring the `validation_failed`
-precedent). "This binary cannot understand the guard" is an inherently transient state, so a
-later redelivery re-evaluates the pair once the fleet is upgraded or the operator repairs the
-condition, instead of being permanently wedged by a decision made during the skew window.
-Harvest never fires on an unintelligible guard and never errors the source's terminal commit.
+different build during a mixed-version deploy), the trigger **fails closed**: the fire is
+skipped with the distinct reason `condition_invalid`, a warning is logged, and — unlike a
+`condition_unmet` skip — **no fires row is written** (mirroring the `validation_failed`
+precedent), so the pair is left *unresolved* rather than durably suppressed. Harvest never
+fires on an unintelligible guard and never errors the source's terminal commit — a corrupt
+trigger condition must never wedge unrelated workflow closes.
+
+**Honest recovery contract.** Trigger evaluation runs only inside a source workflow's
+terminal commit; there is no background scanner that re-visits unresolved pairs. A
+re-evaluation for an already-terminal execution therefore only happens if some later path
+re-enters `evaluate_triggers_for_execution` for that execution (e.g. a parent-close-cascade
+race) — which is **not guaranteed**. Without such a re-entry, the fire is **lost for that
+terminal**, even after the fleet is upgraded or the condition repaired. What "no fires row"
+buys you is that a re-entry, if one happens, *can* still fire (the pair was never durably
+resolved) — it is not an automatic retry.
+
+Operational guidance:
+
+* **Detection:** alert on `harvest.completion_trigger.skipped{reason="condition_invalid"}`
+  (and the paired `tracing::warn!`, which names the `trigger_id` and `source_exec_id`).
+  Each such skip should be treated as a lost fire: start the target workflow by hand (the
+  fires-row PK path means a manual start cannot double-fire a later re-entry — the re-entry
+  would insert the fires row; hand-started targets use their own workflow ids).
+* **Prevention:** the mixed-version window is *new-binary registrations racing old-binary
+  workers*. During a rolling deploy, register (or update) conditions that use newly added
+  operators only **after** the whole fleet runs the new binary; conditions using only
+  operators every deployed build understands are safe to register at any time.
+
+A durable re-evaluation queue for `condition_invalid` pairs is a named follow-up (see the
+PR #972 review thread); it is deliberately not built here to keep the guard slice
+self-contained ahead of issue #748.
 
 ### Re-registering a trigger replaces the whole definition
 
@@ -370,7 +394,7 @@ Completion triggers emit the `harvest.completion_trigger.fires` metric counter t
 | Metric | Instrument | Labels | Description |
 |--------|------------|--------|-------------|
 | `harvest.completion_trigger.fires` | Counter | `trigger`, `outcome` | Emitted on every completion-trigger evaluation. See the `outcome` values below. |
-| `harvest.completion_trigger.skipped` | Counter | `trigger`, `reason` | Emitted on output-guard skips (issue #810). `reason` is `condition_unmet` (guard evaluated false; emitted once per fresh skip — a redelivered, already-resolved skip records `deduped` on the fires counter instead) or `condition_invalid` (stored condition unparseable/over-cap — retryable fail-closed, no fires row, so it re-emits on every redelivery until the condition is fixed). |
+| `harvest.completion_trigger.skipped` | Counter | `trigger`, `reason` | Emitted on output-guard skips (issue #810). `reason` is `condition_unmet` (guard evaluated false; emitted once per fresh skip — a redelivered, already-resolved skip records `deduped` on the fires counter instead) or `condition_invalid` (stored condition unparseable/over-cap — fail-closed, no fires row; the fire is lost for that terminal unless evaluation re-enters, so treat each occurrence as an alert to re-trigger the target by hand — see "Fail-closed on invalid stored conditions"). |
 
 The `outcome` label takes one of:
 

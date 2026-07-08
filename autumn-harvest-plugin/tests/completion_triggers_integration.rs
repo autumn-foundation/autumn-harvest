@@ -2869,11 +2869,15 @@ async fn test_condition_gate_fire_skip_and_exactly_once() {
 
 /// issue #810 fail-closed contract: an unparseable stored condition never
 /// fires the target — the skip increments the counter with the distinct
-/// `condition_invalid` reason and the terminal commit never errors. The
-/// fail-closed decision is **retryable** (no fires row is written, mirroring
-/// the `validation_failed` precedent), so once the condition is repaired a
-/// redelivery re-evaluates and can still fire — a mixed-version deploy
-/// window can never permanently resolve the pair.
+/// `condition_invalid` reason and the terminal commit never errors. No fires
+/// row is written (mirroring the `validation_failed` precedent), so the pair
+/// is left *unresolved* rather than durably suppressed: a later re-entry into
+/// evaluation re-evaluates it and can still fire once the condition is
+/// repaired — a mixed-version deploy window can never durably resolve the
+/// pair. Note the honest recovery contract (PR #972 review): production has
+/// no scanner that re-visits unresolved pairs, so such a re-entry is NOT
+/// guaranteed — this test invokes evaluation again by hand to pin that a
+/// re-entry, when one happens, is never wedged by the earlier skip.
 #[tokio::test]
 async fn test_invalid_stored_condition_fails_closed() {
     let _lock = TEST_MUTEX
@@ -2915,8 +2919,8 @@ async fn test_invalid_stored_condition_fails_closed() {
         .await
         .unwrap();
 
-    // No target start, no fires row (the skip is retryable, not a permanent
-    // resolution), but the skip counter fired with the distinct reason.
+    // No target start, no fires row (the pair stays unresolved, not durably
+    // suppressed), but the skip counter fired with the distinct reason.
     assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 0);
     assert!(
         load_fire_row(&mut conn, source, trigger_id).await.is_none(),
@@ -2928,9 +2932,11 @@ async fn test_invalid_stored_condition_fails_closed() {
         vec![(trigger_id.to_string(), "condition_invalid".to_string())]
     );
 
-    // Re-entry after the operator repairs the condition (or the fleet is
-    // upgraded to a build that understands it): the pair is still
+    // Manual re-entry after the operator repairs the condition (or the fleet
+    // is upgraded to a build that understands it): the pair is still
     // re-evaluable and fires normally — never wedged by the earlier skip.
+    // (Production offers no guaranteed re-entry for an already-terminal
+    // execution; this pins the *can still fire* half of the contract.)
     {
         use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
         diesel::update(triggers_dsl::harvest_completion_triggers.find(trigger_id))

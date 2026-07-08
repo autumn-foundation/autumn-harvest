@@ -291,14 +291,25 @@ pub enum ConditionGate {
     /// row), do not start.
     Unmet,
     /// Stored condition failed to deserialize or violates the boundedness
-    /// caps: **fail closed, retryably** — skip with a distinct reason and a
-    /// warning, never fire on an unintelligible guard, never error the
-    /// terminal commit. Unlike `Unmet` (a final, correct decision over
-    /// recorded output), `Invalid` means "this binary cannot understand the
-    /// guard" — inherently transient (mixed-version deploy skew, operator
-    /// repair), so **no fires row is written** (mirroring the
-    /// `validation_failed` precedent) and a later redelivery re-evaluates
-    /// once the fleet/condition is fixed.
+    /// caps: **fail closed** — skip with a distinct reason and a warning,
+    /// never fire on an unintelligible guard, never error the terminal
+    /// commit. Unlike `Unmet` (a final, correct decision over recorded
+    /// output), `Invalid` means "this binary cannot understand the guard"
+    /// (mixed-version deploy skew, corrupt row), so **no fires row is
+    /// written** (mirroring the `validation_failed` precedent): the pair is
+    /// left *unresolved* rather than durably suppressed, and a later
+    /// re-entry into trigger evaluation re-evaluates it. **Recovery limit
+    /// (honest contract):** trigger evaluation runs only inside a source
+    /// terminal commit and no scanner re-visits unresolved pairs, so a
+    /// re-entry for an already-terminal execution is rare (e.g. a
+    /// parent-close-cascade race) and NOT guaranteed — without one, the
+    /// fire is lost for that terminal. Treat every `condition_invalid`
+    /// skip (warn log + the `harvest.completion_trigger.skipped{reason=
+    /// "condition_invalid"}` counter) as a fire to re-trigger by hand, and
+    /// avoid the window entirely by registering conditions that use newly
+    /// added operators only after the whole fleet runs the new binary. A
+    /// durable re-evaluation queue is a named follow-up (issue #810 /
+    /// PR #972 review).
     Invalid,
 }
 
@@ -806,20 +817,28 @@ pub fn evaluate_triggers_for_execution<'a>(
             // output and is recorded as resolved through the same
             // ON CONFLICT DO NOTHING fires-row PK path as a real fire (AC5),
             // so cascade re-entry dedupes identically. An unparseable or
-            // over-cap stored condition FAILS CLOSED but RETRYABLY: skip
-            // with the distinct `condition_invalid` reason and NO fires row
-            // (mirroring the `validation_failed` precedent below), so a
-            // later redelivery re-evaluates once the fleet is upgraded or
-            // the operator repairs the condition — a "this binary cannot
-            // understand the guard" state must never permanently resolve
-            // the pair. Neither case fires or errors the terminal commit.
+            // over-cap stored condition FAILS CLOSED: skip with the
+            // distinct `condition_invalid` reason and NO fires row
+            // (mirroring the `validation_failed` precedent below) — a
+            // "this binary cannot understand the guard" state must never
+            // durably resolve the pair, so a re-entry into evaluation
+            // re-evaluates it once the fleet is upgraded or the operator
+            // repairs the condition. Honest recovery contract (PR #972
+            // review): evaluation runs only inside a source terminal
+            // commit and no scanner re-visits unresolved pairs, so such a
+            // re-entry is NOT guaranteed — without one the fire is lost
+            // for this terminal; the warn + counter below are the
+            // operator's detection signal (see ConditionGate::Invalid).
+            // Neither case fires or errors the terminal commit.
             match gate_stored_condition(trigger_db.condition.as_ref(), &source_output) {
                 ConditionGate::Pass => {}
                 ConditionGate::Invalid => {
                     tracing::warn!(
                         trigger_id = %trigger_db.id,
+                        source_exec_id = %exec_id,
                         "Completion trigger has an unparseable/invalid stored condition; \
-                         failing closed (retryable skip, no fires row)."
+                         failing closed (no fires row — the fire is lost for this terminal \
+                         unless evaluation re-enters; re-trigger the target by hand)."
                     );
                     if let Some(m) = metrics {
                         m.record_completion_trigger_skipped(&trigger_name, "condition_invalid");
