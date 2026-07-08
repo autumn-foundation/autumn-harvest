@@ -554,3 +554,50 @@ Looks up the result of an admitted update. Returns:
   "workflow_state": "FAILED"
 }
 ```
+
+## Signal delivery (`POST /workflows/{id}/signal/{signal_name}`)
+
+Delivers a named signal to a running workflow execution. The request body is
+the signal payload itself (free-form JSON) — nothing else is ever smuggled
+into it.
+
+### Idempotent delivery (issues #521 / #753)
+
+Webhook and event sources deliver at-least-once. To make duplicate deliveries
+land **exactly one** `SignalReceived` event, supply an exactly-once key
+out-of-band:
+
+- `Idempotency-Key:` request header (wins when both are present), or
+- `?idempotency_key=` query parameter.
+
+A present `Idempotency-Key` header that is empty or not valid UTF-8 is
+rejected with `400 Bad Request` rather than silently degraded to
+at-least-once. Dedupe scope is shard-local, keyed on
+`(execution_id, idempotency_key)` — the same upstream event id may safely
+target different executions. Omitting the key preserves the legacy
+at-least-once contract exactly: every call delivers a distinct signal event.
+
+### Response
+
+```
+202 Accepted
+{ "ok": true, "signal_delivered": true }   // freshly queued
+{ "ok": true, "signal_delivered": false }  // deduplicated retry — idempotent replay, not an error
+```
+
+Signalling a terminal execution returns the existing terminal/404 error
+semantics unchanged, whether or not a key is supplied; `404` for an unknown
+execution id.
+
+### CLI usage
+
+```bash
+harvest workflow signal <exec-id> approval \
+  --payload-json '{"approved": true}' \
+  --idempotency-key evt_abc123
+```
+
+`--idempotency-key` maps onto the `?idempotency_key=` query parameter of this
+route. See `docs/getting-started/04-signals.md` for the full walkthrough and
+`docs/getting-started/06-idempotency.md` for the surrounding idempotency
+story (including `signal-with-start` for the first-delivery case).

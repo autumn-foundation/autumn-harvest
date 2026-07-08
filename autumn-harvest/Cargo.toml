@@ -89,6 +89,9 @@ name = "fanout_child_workflows"
 name = "schema_workflow"
 required-features = ["schema"]
 
+[[example]]
+name = "business_metrics"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }

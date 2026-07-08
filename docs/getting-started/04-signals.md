@@ -254,6 +254,20 @@ Dedupe scope is shard-local, keyed on `(execution_id, idempotency_key)`
 (matching signal-with-start, #244). Omitting the key reproduces the legacy
 at-least-once behavior exactly — every call delivers a distinct signal event.
 
+The CLI reaches parity with the same flag (issue #753) — it maps onto the
+`?idempotency_key=` query parameter of the same route:
+
+```bash
+harvest workflow signal <exec-id> approval \
+  --payload-json '{"approved": true}' \
+  --idempotency-key evt_abc123
+```
+
+Signalling a terminal execution returns the existing terminal/404 error
+semantics unchanged, whether or not a key is supplied. See also the
+[idempotency chapter](06-idempotency.md#idempotent-signal-delivery) and the
+signal-delivery section of `docs/management-api.md`.
+
 ### The saga-choreography example
 
 `examples/saga-choreography/` shows the complete "tenant cancel notifies all

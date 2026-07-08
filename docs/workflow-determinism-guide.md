@@ -207,9 +207,24 @@ I/O is non-idempotent: replaying it sends duplicate requests, corrupts database 
 | **Disallowed** | `static COUNTER: AtomicU64 = AtomicU64::new(0); COUNTER.fetch_add(1, Ordering::Relaxed);` |
 | **Disallowed** | `lazy_static! { static ref REGISTRY: Mutex<Vec<String>> = ...; } REGISTRY.lock().push(...)` |
 | **Allowed** | Accumulate state in local variables across `ctx.timer()` and activity boundaries |
-| **Allowed** | Emit metrics/updates inside activities, not in workflow code |
+| **Allowed** | `ctx.metrics().counter(...)` / `ctx.metrics().histogram(...)` (replay-safe) for workflow-body metrics |
 
 Global mutations are re-applied on every replay, causing double-counting or inconsistent state across workers.
+
+For business metrics specifically, do **not** reach for a global registry or a
+raw `metrics::counter!(...)` call — use the sanctioned replay-safe primitive
+instead: `ctx.metrics().counter/gauge/histogram` on both `WorkflowContext` and
+`ActivityContext` (issue #532). Workflow-side emission is suppressed while
+`ctx.is_replaying()` is true, so a counter incremented once in workflow code
+increments the backend exactly once no matter how many replay cycles the
+executor runs; activity-side emission fires on every attempt (each retry is a
+separate execution). Names are auto-namespaced under `harvest.user.*`, label
+keys must stay low-cardinality (`execution.id`/`workflow.id` as a label is a
+rejected anti-pattern, ADR-0001 §7), and delivery is best-effort
+at-least-once across a worker crash — a crash after the emission but before
+the next event commits re-emits for the re-executed segment. See the "Custom
+workflow/activity metrics" section of `docs/telemetry.md` and
+`examples/business_metrics.rs`.
 
 ---
 

@@ -44,6 +44,33 @@ create_db_user(&user_id, key.subkey("db").as_str()).await?;
 send_welcome_email(&user_id, key.subkey("email").as_str()).await?;
 ```
 
+## Idempotent signal delivery
+
+Idempotency also matters in the other direction: webhook and event sources
+(Stripe, GitHub, SQS) deliver **at-least-once**, so the same logical event can
+reach a running workflow twice. Supplying an idempotency key with the signal
+collapses duplicate deliveries into exactly one `SignalReceived` event — no
+hand-rolled "seen event ids" dedup set in the workflow body (issues #521/#753):
+
+- **HTTP** — `POST /workflows/{id}/signal/{signal_name}` with an
+  `Idempotency-Key:` header (or `?idempotency_key=` query param; the header
+  wins when both are present).
+- **CLI** — `harvest workflow signal <exec-id> <name> --idempotency-key <key>`.
+- **Typed client stub** — the `#[signal]` macro generates a
+  `signal_{name}_idempotent(...)` sibling method.
+- **Untyped client** — `signal::send_signal_idempotent(conn, exec_id, name,
+  payload, Some(key))`.
+- **First delivery for a workflow** — `signal-with-start` carries its own
+  `idempotency_key` field (issue #244); the surfaces above cover the
+  steady-state "signal an already-running workflow" case.
+
+Dedupe scope is per execution — `(execution_id, idempotency_key)` — so the
+same upstream event id may safely target different executions. A deduplicated
+delivery returns 2xx with `signal_delivered: false`, and omitting the key
+preserves the legacy at-least-once behavior exactly. Full contract and curl
+examples: [signals chapter](04-signals.md#idempotent-standalone-signals-over-http-issue-521)
+and the signal-delivery section of `docs/management-api.md`.
+
 ---
 
 [← Child workflows](05-child-workflows.md) · [Index](README.md) · [Next: Reliability knobs →](07-reliability-knobs.md)

@@ -923,6 +923,15 @@ enum WorkflowCommand {
         /// File containing JSON signal payload. Use `-` for stdin.
         #[arg(long, value_name = "PATH", conflicts_with = "payload_json")]
         payload_file: Option<PathBuf>,
+        /// Exactly-once delivery key (issue #753). Repeated deliveries with
+        /// the same key for the same execution land exactly one
+        /// `SignalReceived` event; the response reports
+        /// `signal_delivered=false` for the deduped retries. Omit to keep the
+        /// legacy at-least-once behavior (every call delivers a distinct
+        /// signal event). Typically a stable upstream event id (e.g. a Stripe
+        /// event id or SQS message id).
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
     },
     /// Query workflow state.
     Query {
@@ -3807,6 +3816,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             signal_name,
             payload_json,
             payload_file,
+            idempotency_key,
         } => {
             let payload = parse_json_source(
                 payload_json.as_deref(),
@@ -3814,9 +3824,16 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 "signal payload",
             )?
             .unwrap_or_else(|| json!({}));
+            // The exactly-once delivery key rides the ?idempotency_key= query
+            // param (issue #521's out-of-band surface) — the request body must
+            // stay the raw signal payload, so the key is never smuggled into it.
+            let suffix = idempotency_key
+                .as_deref()
+                .map(|key| format!("?idempotency_key={}", query_encode(key)))
+                .unwrap_or_default();
             Ok(ApiRequest::post(
                 format!(
-                    "/workflows/{}/signal/{}",
+                    "/workflows/{}/signal/{}{suffix}",
                     path_segment(execution_id),
                     path_segment(signal_name)
                 ),
