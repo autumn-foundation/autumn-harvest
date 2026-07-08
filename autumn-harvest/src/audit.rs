@@ -58,6 +58,8 @@ pub const OP_DAG_RETRY: &str = "dag.retry";
 pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
+/// Audit operation: Edited an existing workflow schedule in place (issue #771).
+pub const OP_SCHEDULE_UPDATE: &str = "schedule.update";
 /// Audit operation: Paused an active workflow schedule.
 pub const OP_SCHEDULE_PAUSE: &str = "schedule.pause";
 /// Audit operation: Resumed a paused workflow schedule.
@@ -376,6 +378,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("POST /admin/retention/run-now", RouteClass::Mutating),
     ("POST /admin/schedules/workflow", RouteClass::Mutating),
+    ("PATCH /admin/schedules/{id}", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/backfill", RouteClass::Mutating),
@@ -452,6 +455,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
+    OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME,
     OP_SCHEDULE_DELETE,
@@ -637,6 +641,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/schedules", None),
     ("GET /admin/rate-limits", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
+    ("PATCH /admin/schedules/{id}", Some(OP_SCHEDULE_UPDATE)),
     ("POST /admin/schedules/{id}/pause", Some(OP_SCHEDULE_PAUSE)),
     (
         "POST /admin/schedules/{id}/resume",
@@ -1009,6 +1014,35 @@ mod tests {
                 .any(|(r, op)| *r == "GET /workflows/count" && op.is_none()),
             "GET /workflows/count must appear in ALL_MUTATION_ROUTES with no audit \
              operation (issue #544)"
+        );
+    }
+
+    #[test]
+    fn schedule_update_route_is_classified_mutating() {
+        // The in-place schedule update (issue #771) is a mutating, audited
+        // operator route. This pinned test — not just the general
+        // exhaustiveness guards below, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
+        // than against the live router — is what actually catches the route
+        // being dropped from BOTH lists at once.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "PATCH /admin/schedules/{id}" && *c == RouteClass::Mutating),
+            "PATCH /admin/schedules/{{id}} must be classified RouteClass::Mutating in \
+             CLASSIFIED_ROUTES (issue #771)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "PATCH /admin/schedules/{id}"
+                    && *op == Some(OP_SCHEDULE_UPDATE)),
+            "PATCH /admin/schedules/{{id}} must appear in ALL_MUTATION_ROUTES mapped to \
+             OP_SCHEDULE_UPDATE (issue #771)"
+        );
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_SCHEDULE_UPDATE),
+            "schedule.update must be a registered audited operation (issue #771)"
         );
     }
 

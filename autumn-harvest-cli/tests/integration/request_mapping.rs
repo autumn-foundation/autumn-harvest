@@ -1233,6 +1233,219 @@ fn schedule_runs_threads_filters_into_query() {
     assert!(path.contains("limit=50"), "path was {path}");
 }
 
+// ── schedule update (issue #771) ─────────────────────────────────────────────
+
+#[test]
+fn schedule_update_maps_to_patch_route_with_partial_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "update",
+        "00000000-0000-0000-0000-000000000042",
+        "--cron",
+        "0 3 * * *",
+        "--tz",
+        "America/New_York",
+        "--input-json",
+        r#"{"env":"prod"}"#,
+    ])
+    .expect("schedule update args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule update request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(
+        request.path,
+        "/admin/schedules/00000000-0000-0000-0000-000000000042"
+    );
+    let body = request.body.expect("update request must have a body");
+    assert_eq!(body["schedule_expr"], "0 3 * * *");
+    assert_eq!(body["timezone"], "America/New_York");
+    assert_eq!(body["input"], json!({"env": "prod"}));
+    // Only provided flags appear in the body — partial semantics.
+    let obj = body.as_object().expect("body must be an object");
+    assert!(
+        !obj.contains_key("queue_name"),
+        "absent flags must be omitted"
+    );
+    assert!(!obj.contains_key("max_active_runs"));
+    assert!(
+        !obj.contains_key("workflow_name"),
+        "workflow_name is not editable"
+    );
+}
+
+#[test]
+fn schedule_update_interval_and_clear_flags_map_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "update",
+        "00000000-0000-0000-0000-000000000042",
+        "--interval-secs",
+        "120",
+        "--clear-calendar",
+        "--clear-end-at",
+        "--clear-max-runs",
+        "--queue",
+        "etl-workers",
+        "--jitter-secs",
+        "30",
+        "--max-active-runs",
+        "4",
+        "--overlap-policy",
+        "buffer_all",
+        "--buffer-all-max",
+        "12",
+        "--catchup-policy",
+        "window",
+        "--catchup-window-secs",
+        "7200",
+    ])
+    .expect("schedule update interval args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule update request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    let body = request.body.expect("update request must have a body");
+    assert_eq!(body["schedule_expr"], "interval:120");
+    assert_eq!(body["queue_name"], "etl-workers");
+    assert_eq!(body["jitter_secs"], 30);
+    assert_eq!(body["max_active_runs"], 4);
+    assert_eq!(body["overlap_policy"], "buffer_all");
+    assert_eq!(body["buffer_all_max"], 12);
+    assert_eq!(body["catchup_policy"], "window");
+    assert_eq!(body["catchup_window_secs"], 7200);
+    // --clear-* flags send explicit JSON null (tri-state clear).
+    let obj = body.as_object().expect("body must be an object");
+    assert!(obj.contains_key("calendar") && body["calendar"].is_null());
+    assert!(obj.contains_key("end_at") && body["end_at"].is_null());
+    assert!(obj.contains_key("max_runs") && body["max_runs"].is_null());
+}
+
+#[test]
+fn schedule_update_manual_and_bounds_map_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "update",
+        "00000000-0000-0000-0000-000000000042",
+        "--manual",
+        "--calendar",
+        "us-holidays",
+        "--end-at",
+        "2030-01-01T00:00:00Z",
+        "--max-runs",
+        "24",
+    ])
+    .expect("schedule update manual args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule update request should build");
+
+    let body = request.body.expect("update request must have a body");
+    assert_eq!(body["schedule_expr"], "manual");
+    assert_eq!(body["calendar"], "us-holidays");
+    assert_eq!(body["end_at"], "2030-01-01T00:00:00Z");
+    assert_eq!(body["max_runs"], 24);
+}
+
+#[test]
+fn schedule_update_no_flags_sends_empty_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "update",
+        "00000000-0000-0000-0000-000000000042",
+    ])
+    .expect("schedule update args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule update request should build");
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn schedule_update_conflicting_expr_flags_are_rejected_by_clap() {
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "schedule",
+            "update",
+            "00000000-0000-0000-0000-000000000042",
+            "--cron",
+            "0 3 * * *",
+            "--interval-secs",
+            "60",
+        ])
+        .is_err(),
+        "--cron and --interval-secs must conflict"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "schedule",
+            "update",
+            "00000000-0000-0000-0000-000000000042",
+            "--manual",
+            "--cron",
+            "0 3 * * *",
+        ])
+        .is_err(),
+        "--manual and --cron must conflict"
+    );
+}
+
+#[test]
+fn schedule_update_set_and_clear_flags_conflict() {
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "schedule",
+            "update",
+            "00000000-0000-0000-0000-000000000042",
+            "--calendar",
+            "us-holidays",
+            "--clear-calendar",
+        ])
+        .is_err(),
+        "--calendar and --clear-calendar must conflict"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "schedule",
+            "update",
+            "00000000-0000-0000-0000-000000000042",
+            "--end-at",
+            "2030-01-01T00:00:00Z",
+            "--clear-end-at",
+        ])
+        .is_err(),
+        "--end-at and --clear-end-at must conflict"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "schedule",
+            "update",
+            "00000000-0000-0000-0000-000000000042",
+            "--max-runs",
+            "5",
+            "--clear-max-runs",
+        ])
+        .is_err(),
+        "--max-runs and --clear-max-runs must conflict"
+    );
+}
+
 #[test]
 fn canary_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([

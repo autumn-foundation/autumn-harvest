@@ -77,6 +77,7 @@ mod saga_tests;
 mod schedule_decisions;
 mod schedule_runs_tests;
 mod schedule_to_close_tests;
+mod schedule_update_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod scheduled_time_tests;
 mod scheduler_auto_pause_tests;

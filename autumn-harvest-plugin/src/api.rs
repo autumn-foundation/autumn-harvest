@@ -40,9 +40,9 @@ use autumn_harvest::audit::{
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
-    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
     OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY,
     TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
     TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE,
@@ -88,9 +88,10 @@ use autumn_harvest::reset::{
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
-    BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag, SchedulerMonitor,
-    SchedulerSnapshot, ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag,
+    BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
+    ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
+    ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -2246,6 +2247,10 @@ struct ScheduleEntry {
     max_active_runs: i32,
     catchup: bool,
     last_backfill: Option<BackfillSummary>,
+    /// Stored workflow input dispatched with every scheduled run (issue #771
+    /// AC10: an in-place input edit must be visible on the list/get/patch
+    /// responses immediately). `null` when the schedule row carries none.
+    workflow_input: Option<serde_json::Value>,
     /// Maximum jitter window in seconds. 0 means no jitter.
     jitter_secs: i64,
     /// Effective next fire time = `next_run_at` + deterministic jitter offset.
@@ -2382,6 +2387,77 @@ struct CreateWorkflowScheduleRequest {
     /// workflow-type default); send it explicitly to retain a schedule policy.
     #[serde(default)]
     retry_policy: Option<autumn_harvest::RetryPolicy>,
+}
+
+/// Deserialize helper for tri-state PATCH fields: a field that is absent from
+/// the JSON body deserializes to `None` (via `#[serde(default)]`, "leave
+/// unchanged"), while an explicit JSON `null` deserializes to `Some(None)`
+/// ("clear to NULL") and a value to `Some(Some(v))`.
+#[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
+fn deserialize_tristate<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// Request body for `PATCH /admin/schedules/{id}` (issue #771).
+///
+/// Every field is optional — only provided fields change. Nullable fields
+/// (`calendar`, `consecutive_failure_limit`, `end_at`, `max_runs`,
+/// `catchup_policy`, `retry_policy`) are tri-state: absent = unchanged,
+/// explicit JSON `null` = clear.
+///
+/// `workflow_name` is accepted structurally only so the handler can reject it
+/// with a targeted 400 — the workflow type bound to a schedule is not
+/// editable (that is a new schedule, not an edit).
+///
+/// `Option<Option<T>>` (`clippy::option_option`) is the standard serde
+/// double-`Option` PATCH idiom: the outer `Option` distinguishes an absent
+/// field from an explicit JSON `null`, mirroring the core
+/// `WorkflowSchedulePatch` contract.
+///
+/// `deny_unknown_fields`: because every field is optional, a typo'd field
+/// name (`"scheduleexpr"`) would otherwise deserialize to an all-`None` body
+/// and 200-no-op with a SUCCEEDED audit row — a silent failure. The rejection
+/// surfaces as a 400 via the handler's `Result<Json<…>, JsonRejection>`
+/// extractor (see [`update_schedule_handler`]).
+#[allow(clippy::option_option)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateWorkflowScheduleRequest {
+    /// NOT editable — present in the struct only to produce a targeted 400.
+    workflow_name: Option<String>,
+    /// New schedule expression, mirroring the create vocabulary:
+    /// bare cron / `cron:<expr>` / `cron_tz:<tz>:<expr>` / `interval:<secs>` /
+    /// `manual`.
+    schedule_expr: Option<String>,
+    /// New IANA timezone for the cron expression. When provided without
+    /// `schedule_expr`, the stored cron expression is re-anchored in this
+    /// timezone. Ignored for interval/manual schedules (mirrors create).
+    timezone: Option<String>,
+    input: Option<serde_json::Value>,
+    catchup: Option<bool>,
+    max_active_runs: Option<u32>,
+    queue_name: Option<String>,
+    jitter_secs: Option<u64>,
+    overlap_policy: Option<String>,
+    buffer_all_max: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    calendar: Option<Option<String>>,
+    skip_policy: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    consecutive_failure_limit: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    end_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    max_runs: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    catchup_policy: Option<Option<String>>,
+    catchup_window_secs: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    retry_policy: Option<Option<autumn_harvest::RetryPolicy>>,
 }
 
 fn default_queue_name() -> String {
@@ -3177,6 +3253,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(trigger_schedule_now).route_layer(require_admin.clone()),
         )
         .route("/admin/schedules/{id}", delete(delete_schedule))
+        // In-place partial schedule update (issue #771).
+        .route("/admin/schedules/{id}", patch(update_schedule_handler))
         .route(
             "/admin/schedules/{id}/runs",
             get(list_schedule_runs_handler).route_layer(require_admin.clone()),
@@ -3659,6 +3737,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/schedules"),
         ("GET", "/admin/schedules/{id}"),
         ("POST", "/admin/schedules/workflow"),
+        ("PATCH", "/admin/schedules/{id}"),
         ("POST", "/admin/schedules/{id}/pause"),
         ("POST", "/admin/schedules/{id}/resume"),
         ("POST", "/admin/schedules/{id}/backfill"),
@@ -3934,6 +4013,29 @@ pub const fn management_api_request_fields()
                 "skip_policy",
                 "catchup_policy",
                 "catchup_window_secs",
+            ]),
+        ),
+        (
+            "PATCH",
+            "/admin/schedules/{id}",
+            Some(&[
+                "schedule_expr",
+                "timezone",
+                "input",
+                "catchup",
+                "max_active_runs",
+                "queue_name",
+                "jitter_secs",
+                "overlap_policy",
+                "buffer_all_max",
+                "calendar",
+                "skip_policy",
+                "consecutive_failure_limit",
+                "end_at",
+                "max_runs",
+                "catchup_policy",
+                "catchup_window_secs",
+                "retry_policy",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
@@ -4590,6 +4692,7 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "workflow_input",
                 "catchup_policy_effective",
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
@@ -4613,6 +4716,31 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "workflow_input",
+                "catchup_policy_effective",
+                "catchup_window_secs",
+                "catchup_dropped_last_recovery",
+                "last_catchup_at",
+            ]),
+        ),
+        (
+            "PATCH",
+            "/admin/schedules/{id}",
+            Some(&[
+                "id",
+                "kind",
+                "name",
+                "schedule_expr",
+                "is_paused",
+                "paused_at",
+                "paused_by",
+                "pause_reason",
+                "next_run_at",
+                "last_run_at",
+                "max_active_runs",
+                "catchup",
+                "last_backfill",
+                "workflow_input",
                 "catchup_policy_effective",
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
@@ -13901,69 +14029,11 @@ async fn list_schedules(
     let entries = schedules
         .into_iter()
         .map(|s| {
-            let (kind, name) = if let Some(ref dag_name) = s.dag_name {
-                (ScheduleKind::Dag, dag_name.clone())
-            } else if let Some(ref wf_name) = s.workflow_name {
-                (ScheduleKind::Workflow, wf_name.clone())
-            } else {
-                // Should not occur given the CHECK constraint, but handle gracefully.
-                (ScheduleKind::Dag, String::new())
-            };
             let last_backfill = recent_backfills
                 .get(&s.id)
                 .cloned()
                 .map(BackfillSummary::from);
-            let eft = effective_fire_time(s.id, s.next_run_at, s.jitter_secs);
-            let buffered_count =
-                autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-            let remaining_runs = s
-                .max_runs
-                .map(|max| remaining_runs_budget(max, s.runs_started));
-            let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
-                s.catchup_policy.as_deref(),
-                s.catchup_window_secs,
-                s.catchup,
-            );
-            ScheduleEntry {
-                id: s.id,
-                kind,
-                name,
-                schedule_expr: s.schedule_expr,
-                timezone: s.timezone,
-                is_paused: s.is_paused,
-                paused_at: s.paused_at,
-                paused_by: s.paused_by,
-                pause_reason: s.pause_reason,
-                next_run_at: s.next_run_at,
-                last_run_at: s.last_run_at,
-                max_active_runs: s.max_active_runs,
-                catchup: s.catchup,
-                last_backfill,
-                jitter_secs: s.jitter_secs,
-                effective_fire_time: eft,
-                overlap_policy: s.overlap_policy,
-                buffered_count,
-                buffer_all_max: s.buffer_all_max,
-                calendar_name: s.calendar_name,
-                skip_policy: s.skip_policy,
-                consecutive_failure_limit: s.consecutive_failure_limit,
-                consecutive_failure_count: s.consecutive_failure_count,
-                auto_paused_at: s.auto_paused_at,
-                end_at: s.end_at,
-                max_runs: s.max_runs,
-                runs_started: s.runs_started,
-                remaining_runs,
-                exhausted_at: s.exhausted_at,
-                exhausted_reason: s.exhausted_reason,
-                catchup_policy_effective: effective_policy.as_str().to_string(),
-                catchup_window_secs: s.catchup_window_secs,
-                catchup_dropped_last_recovery: s.last_catchup_dropped,
-                last_catchup_at: s.last_catchup_at,
-                retry_policy: s
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
-            }
+            schedule_entry_from_row(s, last_backfill)
         })
         .collect();
     Ok(Json(entries))
@@ -13997,68 +14067,12 @@ async fn get_schedule(
 
     let s = found.ok_or_else(|| AutumnError::not_found_msg(format!("schedule {id}")))?;
 
-    let (kind, name) = if let Some(ref dag_name) = s.dag_name {
-        (ScheduleKind::Dag, dag_name.clone())
-    } else if let Some(ref wf_name) = s.workflow_name {
-        (ScheduleKind::Workflow, wf_name.clone())
-    } else {
-        (ScheduleKind::Dag, String::new())
-    };
-
     let last_backfill = load_recent_backfills(&api_state, std::slice::from_ref(&s.id))
         .await
         .remove(&s.id)
         .map(BackfillSummary::from);
 
-    let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-    let remaining_runs = s
-        .max_runs
-        .map(|max| remaining_runs_budget(max, s.runs_started));
-    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
-        s.catchup_policy.as_deref(),
-        s.catchup_window_secs,
-        s.catchup,
-    );
-    Ok(Json(ScheduleEntry {
-        effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
-        jitter_secs: s.jitter_secs,
-        id: s.id,
-        kind,
-        name,
-        schedule_expr: s.schedule_expr,
-        timezone: s.timezone,
-        is_paused: s.is_paused,
-        paused_at: s.paused_at,
-        paused_by: s.paused_by,
-        pause_reason: s.pause_reason,
-        next_run_at: s.next_run_at,
-        last_run_at: s.last_run_at,
-        max_active_runs: s.max_active_runs,
-        catchup: s.catchup,
-        last_backfill,
-        overlap_policy: s.overlap_policy.clone(),
-        buffered_count,
-        buffer_all_max: s.buffer_all_max,
-        calendar_name: s.calendar_name.clone(),
-        skip_policy: s.skip_policy.clone(),
-        consecutive_failure_limit: s.consecutive_failure_limit,
-        consecutive_failure_count: s.consecutive_failure_count,
-        auto_paused_at: s.auto_paused_at,
-        end_at: s.end_at,
-        max_runs: s.max_runs,
-        runs_started: s.runs_started,
-        remaining_runs,
-        exhausted_at: s.exhausted_at,
-        exhausted_reason: s.exhausted_reason,
-        catchup_policy_effective: effective_policy.as_str().to_string(),
-        catchup_window_secs: s.catchup_window_secs,
-        catchup_dropped_last_recovery: s.last_catchup_dropped,
-        last_catchup_at: s.last_catchup_at,
-        retry_policy: s
-            .retry_policy
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-    }))
+    Ok(Json(schedule_entry_from_row(s, last_backfill)))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -14458,56 +14472,9 @@ async fn upsert_workflow_schedule_and_read_back(
         .await
         .map_err(database_error)
         .map_err(map_error)?;
-    let buffered_count =
-        autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
-    let remaining_runs = row
-        .max_runs
-        .map(|max| remaining_runs_budget(max, row.runs_started));
-    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
-        row.catchup_policy.as_deref(),
-        row.catchup_window_secs,
-        row.catchup,
-    );
-    Ok(ScheduleEntry {
-        effective_fire_time: effective_fire_time(row.id, row.next_run_at, row.jitter_secs),
-        jitter_secs: row.jitter_secs,
-        id: row.id,
-        kind: ScheduleKind::Workflow,
-        name: ws.workflow_name.clone(),
-        schedule_expr: row.schedule_expr,
-        timezone: row.timezone,
-        is_paused: row.is_paused,
-        paused_at: row.paused_at,
-        paused_by: row.paused_by,
-        pause_reason: row.pause_reason,
-        next_run_at: row.next_run_at,
-        last_run_at: row.last_run_at,
-        max_active_runs: row.max_active_runs,
-        catchup: row.catchup,
-        last_backfill: None, // newly created; no backfill history yet
-        overlap_policy: row.overlap_policy,
-        buffered_count,
-        buffer_all_max: row.buffer_all_max,
-        calendar_name: row.calendar_name,
-        skip_policy: row.skip_policy,
-        consecutive_failure_limit: row.consecutive_failure_limit,
-        consecutive_failure_count: row.consecutive_failure_count,
-        auto_paused_at: row.auto_paused_at,
-        end_at: row.end_at,
-        max_runs: row.max_runs,
-        runs_started: row.runs_started,
-        remaining_runs,
-        exhausted_at: row.exhausted_at,
-        exhausted_reason: row.exhausted_reason,
-        catchup_policy_effective: effective_policy.as_str().to_string(),
-        catchup_window_secs: row.catchup_window_secs,
-        catchup_dropped_last_recovery: row.last_catchup_dropped,
-        last_catchup_at: row.last_catchup_at,
-        retry_policy: row
-            .retry_policy
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-    })
+    // Newly created/updated via the registration upsert; no backfill history
+    // is loaded here (mirrors the pre-existing behavior).
+    Ok(schedule_entry_from_row(row, None))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -14717,6 +14684,531 @@ async fn create_workflow_schedule(
         .map_err(map_error)?;
 
     Ok((axum::http::StatusCode::CREATED, Json(entry)))
+}
+
+/// Best-effort failed-audit row for `PATCH /admin/schedules/{id}` rejections
+/// (mirrors [`schedule_create_audit_failed`]).
+async fn schedule_update_audit_failed(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    schedule_id: &str,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_UPDATE,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(schedule_id),
+        route_or_command: "PATCH /admin/schedules/{id}",
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+/// Rebuild a cron schedule in a different IANA timezone, preserving the cron
+/// expression. Interval/manual schedules are returned unchanged (the
+/// timezone is meaningless for them, mirroring the create path's semantics).
+fn reanchor_schedule_timezone(existing: &Schedule, tz: &str) -> Schedule {
+    match existing {
+        Schedule::Cron(expr) | Schedule::CronInTimezone { expr, .. } => {
+            if tz == "UTC" {
+                Schedule::Cron(expr.clone())
+            } else {
+                Schedule::CronInTimezone {
+                    expr: expr.clone(),
+                    tz: tz.to_string(),
+                }
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Build a [`ScheduleEntry`] from a raw `harvest_schedules` row.
+fn schedule_entry_from_row(
+    s: HarvestSchedule,
+    last_backfill: Option<BackfillSummary>,
+) -> ScheduleEntry {
+    let (kind, name) = if let Some(ref dag_name) = s.dag_name {
+        (ScheduleKind::Dag, dag_name.clone())
+    } else if let Some(ref wf_name) = s.workflow_name {
+        (ScheduleKind::Workflow, wf_name.clone())
+    } else {
+        // Should not occur given the CHECK constraint, but handle gracefully.
+        (ScheduleKind::Dag, String::new())
+    };
+    let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
+    let remaining_runs = s
+        .max_runs
+        .map(|max| remaining_runs_budget(max, s.runs_started));
+    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
+        s.catchup_policy.as_deref(),
+        s.catchup_window_secs,
+        s.catchup,
+    );
+    ScheduleEntry {
+        effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
+        jitter_secs: s.jitter_secs,
+        id: s.id,
+        kind,
+        name,
+        schedule_expr: s.schedule_expr,
+        timezone: s.timezone,
+        is_paused: s.is_paused,
+        paused_at: s.paused_at,
+        paused_by: s.paused_by,
+        pause_reason: s.pause_reason,
+        next_run_at: s.next_run_at,
+        last_run_at: s.last_run_at,
+        max_active_runs: s.max_active_runs,
+        catchup: s.catchup,
+        last_backfill,
+        workflow_input: s.workflow_input,
+        overlap_policy: s.overlap_policy,
+        buffered_count,
+        buffer_all_max: s.buffer_all_max,
+        calendar_name: s.calendar_name,
+        skip_policy: s.skip_policy,
+        consecutive_failure_limit: s.consecutive_failure_limit,
+        consecutive_failure_count: s.consecutive_failure_count,
+        auto_paused_at: s.auto_paused_at,
+        end_at: s.end_at,
+        max_runs: s.max_runs,
+        runs_started: s.runs_started,
+        remaining_runs,
+        exhausted_at: s.exhausted_at,
+        exhausted_reason: s.exhausted_reason,
+        catchup_policy_effective: effective_policy.as_str().to_string(),
+        catchup_window_secs: s.catchup_window_secs,
+        catchup_dropped_last_recovery: s.last_catchup_dropped,
+        last_catchup_at: s.last_catchup_at,
+        retry_policy: s
+            .retry_policy
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+    }
+}
+
+/// `PATCH /admin/schedules/{id}` — partial in-place update of an existing
+/// workflow schedule (issue #771).
+///
+/// Only provided fields change; the `schedule_id` (and therefore #488
+/// carryover lineage, the `sched:{schedule_id}:…` workflow-id namespace, and
+/// #534 run history) is never changed. `workflow_name` is not editable
+/// (400). DAG schedule rows are owned by `PATCH /dags/{dag_name}` (400).
+/// The merged spec is validated before any write (400 writes nothing), and a
+/// live #350 fire claim yields 409 so an edit never races an in-flight fire.
+#[allow(clippy::too_many_lines)]
+async fn update_schedule_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Result<Json<UpdateWorkflowScheduleRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ScheduleEntry>, AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let id = match parse_uuid(&id_str, "schedule id") {
+        Ok(u) => u,
+        Err(e) => {
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str,
+                "malformed schedule id",
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    let id_str_owned = id.to_string();
+
+    // Body deserialization is unwrapped in-handler (rather than by a bare
+    // `Json` extractor) so a rejected body — most importantly an unknown
+    // field, rejected via `deny_unknown_fields` since every real field is
+    // optional and a typo'd name would otherwise silently no-op — surfaces
+    // as this route's structured 400 JSON error with a failed audit row,
+    // never as axum's default plain-text 422 (a status this route's contract
+    // does not document) and never as a 200 no-op.
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
+
+    // Workflow type is NOT editable: a different workflow is a different
+    // schedule, not an edit.
+    if request.workflow_name.is_some() {
+        let err_summary =
+            "workflow_name is not editable; create a new schedule to target a different workflow";
+        schedule_update_audit_failed(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &id_str_owned,
+            err_summary,
+        )
+        .await;
+        return Err(AutumnError::bad_request_msg(err_summary));
+    }
+
+    // Locate the row and its owning shard.
+    let (existing, shard) = match load_schedule_by_id_with_shard(&api_state, id).await {
+        Ok(found) => found,
+        Err(e) => {
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                "schedule not found",
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    if existing.dag_name.is_some() || existing.workflow_name.is_none() {
+        let err_summary =
+            format!("schedule {id} is a DAG schedule; manage it via PATCH /dags/{{dag_name}}");
+        schedule_update_audit_failed(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &id_str_owned,
+            &err_summary,
+        )
+        .await;
+        return Err(AutumnError::bad_request_msg(err_summary));
+    }
+
+    // Merge + validate the schedule expression against the MERGED timezone
+    // (new expr + existing tz, or existing expr + new tz) before any write.
+    let schedule_patch: Option<Schedule> = match (&request.schedule_expr, &request.timezone) {
+        (None, None) => None,
+        (Some(expr), tz) => {
+            let effective_tz = tz.as_deref().unwrap_or(existing.timezone.as_str());
+            match parse_schedule_expr_with_tz(expr, effective_tz) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    let err_summary = format!("invalid schedule_expr: {e}");
+                    schedule_update_audit_failed(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        &id_str_owned,
+                        &err_summary,
+                    )
+                    .await;
+                    return Err(AutumnError::bad_request_msg(err_summary));
+                }
+            }
+        }
+        (None, Some(tz)) => {
+            // Timezone-only edit: re-anchor the stored cron expression. A
+            // stored expression that is NULL or unparseable is rejected
+            // rather than leniently coerced to Manual — the coercion would
+            // silently rewrite the corrupt row to `manual` and NULL its
+            // `next_run_at` as a side effect of an edit that never asked to
+            // change the cadence. The operator repairs the row by sending
+            // `schedule_expr` explicitly.
+            let parsed_stored = match existing.schedule_expr.as_deref() {
+                // "manual" deliberately has no parse_schedule_from_expr
+                // mapping (the tick treats it as "no automatic slot"); a
+                // timezone edit is a documented no-op for it, matching the
+                // interval case in `reanchor_schedule_timezone`.
+                Some("manual") => Some(Schedule::Manual),
+                Some(stored) => parse_schedule_from_expr_pub(stored),
+                None => None,
+            };
+            let Some(existing_schedule) = parsed_stored else {
+                let err_summary = format!(
+                    "stored schedule expression {:?} is unparseable; provide schedule_expr \
+                     explicitly to repair it before (or while) changing the timezone",
+                    existing.schedule_expr
+                );
+                schedule_update_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str_owned,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            };
+            let reanchored = reanchor_schedule_timezone(&existing_schedule, tz);
+            if let Err(e) = autumn_harvest::validate_schedule(&reanchored) {
+                let err_summary = format!("invalid timezone: {e}");
+                schedule_update_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str_owned,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+            Some(reanchored)
+        }
+    };
+
+    // Reject unknown overlap_policy strings with 400 before storing (create parity).
+    let overlap_policy = match request.overlap_policy.as_deref() {
+        Some(raw) => match autumn_harvest::OverlapPolicy::from_user_input(raw) {
+            Ok(p) => Some(p),
+            Err(v) => {
+                let err_summary = format!(
+                    "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+                );
+                schedule_update_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str_owned,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+        },
+        None => None,
+    };
+    let skip_policy = match request.skip_policy.as_deref() {
+        Some(raw) => match SkipPolicy::from_user_input(raw) {
+            Ok(p) => Some(p),
+            Err(v) => {
+                let err_summary = format!(
+                    "invalid skip_policy '{v}'; valid values: skip, run_next_business_day, run_prev_business_day"
+                );
+                schedule_update_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str_owned,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+        },
+        None => None,
+    };
+
+    // Catchup policy (issue #484): tri-state with window merging — a provided
+    // mode picks up the provided window, falling back to the stored one; a
+    // window-only change re-windows an already-"window" policy and is ignored
+    // otherwise (create parity: window_secs is ignored for other modes).
+    let catchup_policy = match &request.catchup_policy {
+        Some(Some(mode)) => {
+            let window = request.catchup_window_secs.or(existing.catchup_window_secs);
+            match autumn_harvest::CatchupPolicy::from_user_input(mode, window) {
+                Ok(p) => Some(Some(p)),
+                Err(v) => {
+                    let err_summary = format!(
+                        "invalid catchup_policy '{v}'; valid values: skip_all, most_recent, window, unbounded"
+                    );
+                    schedule_update_audit_failed(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        &id_str_owned,
+                        &err_summary,
+                    )
+                    .await;
+                    return Err(AutumnError::bad_request_msg(err_summary));
+                }
+            }
+        }
+        Some(None) => Some(None),
+        None => match request.catchup_window_secs {
+            Some(window) if existing.catchup_policy.as_deref() == Some("window") => {
+                // Re-window an already-"window" policy. `from_user_input` is
+                // currently infallible for the "window" mode, but match the
+                // sibling branch's explicit 400 rather than `.ok()` — an
+                // `.ok()` here would produce `Some(None)` on a future
+                // validation failure, silently CLEARING the stored policy.
+                match autumn_harvest::CatchupPolicy::from_user_input("window", Some(window)) {
+                    Ok(p) => Some(Some(p)),
+                    Err(v) => {
+                        let err_summary = format!(
+                            "invalid catchup_window_secs for stored 'window' catchup policy: '{v}'"
+                        );
+                        schedule_update_audit_failed(
+                            &api_state,
+                            &actor,
+                            &source,
+                            request_id.as_deref(),
+                            &id_str_owned,
+                            &err_summary,
+                        )
+                        .await;
+                        return Err(AutumnError::bad_request_msg(err_summary));
+                    }
+                }
+            }
+            _ => None,
+        },
+    };
+
+    // Validate calendar existence on the owning shard (create parity: 400 for
+    // NotFound so clients distinguish invalid input from transient failures).
+    let mut conn = db_conn_for_shard(&api_state, shard).await?;
+    if let Some(Some(cal_name)) = &request.calendar {
+        match get_calendar(&mut conn, cal_name).await {
+            Ok(_) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                let err_summary = format!(
+                    "calendar '{cal_name}' not found; create it first with POST /calendars"
+                );
+                schedule_update_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str_owned,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+            Err(e) => return Err(map_error(e)),
+        }
+    }
+
+    let patch = WorkflowSchedulePatch {
+        schedule: schedule_patch,
+        input: request.input.clone(),
+        queue_name: request.queue_name.clone(),
+        catchup: request.catchup,
+        max_active_runs: request.max_active_runs,
+        jitter: request.jitter_secs.map(std::time::Duration::from_secs),
+        overlap_policy,
+        buffer_all_max: request.buffer_all_max,
+        calendar: request.calendar.clone(),
+        skip_policy,
+        consecutive_failure_limit: request.consecutive_failure_limit,
+        end_at: request.end_at,
+        // Normalize 0 → None: callers passing max_runs=0 intend "no limit".
+        max_runs: request.max_runs.map(|inner| inner.filter(|&n| n > 0)),
+        catchup_policy,
+        retry_policy: request.retry_policy.clone(),
+    };
+
+    match update_workflow_schedule(&mut conn, id, &patch).await {
+        Ok(ScheduleUpdateOutcome::Updated(row)) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_UPDATE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str_owned.as_str()),
+                route_or_command: "PATCH /admin/schedules/{id}",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
+
+            let last_backfill = load_recent_backfills(&api_state, std::slice::from_ref(&row.id))
+                .await
+                .remove(&row.id)
+                .map(BackfillSummary::from);
+            Ok(Json(schedule_entry_from_row(*row, last_backfill)))
+        }
+        Ok(ScheduleUpdateOutcome::NotFound) => {
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                "schedule not found",
+            )
+            .await;
+            Err(AutumnError::not_found_msg(format!("schedule {id}")))
+        }
+        Ok(ScheduleUpdateOutcome::DagSchedule) => {
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                "dag schedules use PATCH /dags/{dag_name}",
+            )
+            .await;
+            Err(AutumnError::bad_request_msg(format!(
+                "schedule {id} is a DAG schedule; manage it via PATCH /dags/{{dag_name}}"
+            )))
+        }
+        Ok(ScheduleUpdateOutcome::ClaimLive) => {
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                "schedule is firing right now (live fire claim)",
+            )
+            .await;
+            Err(AutumnError::bad_request_msg(format!(
+                "schedule {id} is firing right now (a scheduler replica holds the fire claim); retry shortly"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT))
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            schedule_update_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str_owned,
+                &err_str,
+            )
+            .await;
+            Err(map_error(e))
+        }
+    }
 }
 
 async fn pause_schedule(
@@ -25504,6 +25996,64 @@ mod tests {
             .collect()
     }
 
+    /// A typo'd field name on the PATCH body must be a deserialization error
+    /// (`deny_unknown_fields`), never a silent all-`None` no-op body. The
+    /// handler maps this rejection to a 400 with a failed audit row.
+    #[test]
+    fn update_schedule_request_rejects_unknown_fields() {
+        let err = serde_json::from_value::<UpdateWorkflowScheduleRequest>(serde_json::json!({
+            "scheduleexpr": "interval:30"
+        }))
+        .expect_err("a typo'd field name must be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must name the unknown field: {err}"
+        );
+    }
+
+    /// `deny_unknown_fields` must not break the tri-state
+    /// (`deserialize_with = deserialize_tristate`) fields: absent = outer
+    /// `None`, explicit JSON `null` = `Some(None)`, value = `Some(Some(v))`.
+    #[test]
+    fn update_schedule_request_tristate_fields_survive_deny_unknown_fields() {
+        let absent: UpdateWorkflowScheduleRequest =
+            serde_json::from_value(serde_json::json!({})).expect("empty body must parse");
+        assert!(absent.end_at.is_none());
+        assert!(absent.max_runs.is_none());
+        assert!(absent.calendar.is_none());
+        assert!(absent.retry_policy.is_none());
+
+        let cleared: UpdateWorkflowScheduleRequest = serde_json::from_value(serde_json::json!({
+            "end_at": null,
+            "max_runs": null,
+            "calendar": null,
+            "catchup_policy": null,
+            "consecutive_failure_limit": null,
+            "retry_policy": null,
+        }))
+        .expect("explicit nulls must parse");
+        assert_eq!(cleared.end_at, Some(None));
+        assert_eq!(cleared.max_runs, Some(None));
+        assert_eq!(cleared.calendar, Some(None));
+        assert_eq!(cleared.catchup_policy, Some(None));
+        assert_eq!(cleared.consecutive_failure_limit, Some(None));
+        assert!(matches!(cleared.retry_policy, Some(None)));
+
+        let set: UpdateWorkflowScheduleRequest = serde_json::from_value(serde_json::json!({
+            "max_runs": 7,
+            "calendar": "us-holidays",
+            "workflow_name": "still_parses_for_targeted_400",
+        }))
+        .expect("values must parse");
+        assert_eq!(set.max_runs, Some(Some(7)));
+        assert_eq!(set.calendar, Some(Some("us-holidays".to_string())));
+        assert_eq!(
+            set.workflow_name.as_deref(),
+            Some("still_parses_for_targeted_400"),
+            "workflow_name must remain a declared field so its targeted 400 still fires"
+        );
+    }
+
     #[test]
     fn merge_drain_responses_aggregates_across_shards() {
         use autumn_harvest::workers::{DrainOutcome, DrainResponse};
@@ -27073,6 +27623,7 @@ mod tests {
             max_active_runs: 1,
             catchup: false,
             last_backfill: None,
+            workflow_input: None,
             jitter_secs: 0,
             effective_fire_time: None,
             overlap_policy: "skip".to_string(),

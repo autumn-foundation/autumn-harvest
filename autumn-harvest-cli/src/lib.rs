@@ -1185,6 +1185,67 @@ enum ScheduleCommand {
         #[arg(long)]
         paused: bool,
     },
+    /// Edit an existing schedule in place — partial update, `schedule_id` preserved (issue #771).
+    Update {
+        /// Schedule row ID (UUID).
+        id: String,
+        /// New cron expression (e.g. `"0 3 * * *"`).
+        #[arg(long, conflicts_with_all = ["interval_secs", "manual"])]
+        cron: Option<String>,
+        /// New interval in seconds.
+        #[arg(long, conflicts_with_all = ["cron", "manual"])]
+        interval_secs: Option<u64>,
+        /// Switch the schedule to manual-only firing.
+        #[arg(long, conflicts_with_all = ["cron", "interval_secs"])]
+        manual: bool,
+        /// New IANA timezone for the cron expression (e.g. `"America/New_York"`).
+        #[arg(long)]
+        tz: Option<String>,
+        /// New inline JSON input passed to each scheduled run. Any non-null
+        /// JSON value; a literal `null` leaves the stored input unchanged
+        /// (null is the one JSON value that cannot be set as the input).
+        #[arg(long, value_name = "JSON")]
+        input_json: Option<String>,
+        /// New task queue name for scheduled runs.
+        #[arg(long)]
+        queue: Option<String>,
+        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`.
+        #[arg(long)]
+        overlap_policy: Option<String>,
+        /// New maximum buffered slots under `buffer_all`.
+        #[arg(long)]
+        buffer_all_max: Option<u32>,
+        /// New catchup policy: `skip_all`, `most_recent`, window, unbounded.
+        #[arg(long)]
+        catchup_policy: Option<String>,
+        /// Window length in seconds for `catchup_policy` = window.
+        #[arg(long)]
+        catchup_window_secs: Option<i64>,
+        /// New jitter window in seconds (0 disables jitter).
+        #[arg(long)]
+        jitter_secs: Option<u64>,
+        /// New maximum concurrent in-flight runs.
+        #[arg(long)]
+        max_active_runs: Option<u32>,
+        /// Attach a named calendar.
+        #[arg(long, conflicts_with = "clear_calendar")]
+        calendar: Option<String>,
+        /// Detach the calendar (sends an explicit JSON null).
+        #[arg(long)]
+        clear_calendar: bool,
+        /// New absolute UTC cutoff, RFC 3339 (e.g. 2030-01-01T00:00:00Z).
+        #[arg(long, conflicts_with = "clear_end_at")]
+        end_at: Option<String>,
+        /// Remove the `end_at` cutoff (sends an explicit JSON null).
+        #[arg(long)]
+        clear_end_at: bool,
+        /// New total run budget.
+        #[arg(long, conflicts_with = "clear_max_runs")]
+        max_runs: Option<u32>,
+        /// Remove the run budget (sends an explicit JSON null).
+        #[arg(long)]
+        clear_max_runs: bool,
+    },
     /// Backfill missed scheduled runs over an explicit time window.
     Backfill {
         /// Schedule row ID (UUID).
@@ -4184,6 +4245,89 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
                 "/admin/schedules/workflow",
                 Some(Value::Object(body)),
             ))
+        }
+        ScheduleCommand::Update {
+            id,
+            cron,
+            interval_secs,
+            manual,
+            tz,
+            input_json,
+            queue,
+            overlap_policy,
+            buffer_all_max,
+            catchup_policy,
+            catchup_window_secs,
+            jitter_secs,
+            max_active_runs,
+            calendar,
+            clear_calendar,
+            end_at,
+            clear_end_at,
+            max_runs,
+            clear_max_runs,
+        } => {
+            let mut body = Map::new();
+            // Exactly one of --cron / --interval-secs / --manual (clap enforces
+            // the mutual exclusion); all optional — omitting keeps the cadence.
+            if let Some(expr) = cron {
+                body.insert("schedule_expr".to_string(), Value::String(expr.clone()));
+            } else if let Some(secs) = interval_secs {
+                body.insert(
+                    "schedule_expr".to_string(),
+                    Value::String(format!("interval:{secs}")),
+                );
+            } else if *manual {
+                body.insert("schedule_expr".to_string(), Value::String("manual".into()));
+            }
+            if let Some(tz) = tz {
+                body.insert("timezone".to_string(), Value::String(tz.clone()));
+            }
+            if let Some(input) = parse_json_source(input_json.as_deref(), None, "input")? {
+                body.insert("input".to_string(), input);
+            }
+            if let Some(queue) = queue {
+                body.insert("queue_name".to_string(), Value::String(queue.clone()));
+            }
+            if let Some(policy) = overlap_policy {
+                body.insert("overlap_policy".to_string(), Value::String(policy.clone()));
+            }
+            if let Some(max) = buffer_all_max {
+                body.insert("buffer_all_max".to_string(), json!(max));
+            }
+            if let Some(policy) = catchup_policy {
+                body.insert("catchup_policy".to_string(), Value::String(policy.clone()));
+            }
+            if let Some(secs) = catchup_window_secs {
+                body.insert("catchup_window_secs".to_string(), json!(secs));
+            }
+            if let Some(secs) = jitter_secs {
+                body.insert("jitter_secs".to_string(), json!(secs));
+            }
+            if let Some(max) = max_active_runs {
+                body.insert("max_active_runs".to_string(), json!(max));
+            }
+            // Tri-state nullable fields: --clear-* sends an explicit JSON null.
+            if let Some(name) = calendar {
+                body.insert("calendar".to_string(), Value::String(name.clone()));
+            } else if *clear_calendar {
+                body.insert("calendar".to_string(), Value::Null);
+            }
+            if let Some(ts) = end_at {
+                body.insert("end_at".to_string(), Value::String(ts.clone()));
+            } else if *clear_end_at {
+                body.insert("end_at".to_string(), Value::Null);
+            }
+            if let Some(max) = max_runs {
+                body.insert("max_runs".to_string(), json!(max));
+            } else if *clear_max_runs {
+                body.insert("max_runs".to_string(), Value::Null);
+            }
+            Ok(ApiRequest {
+                method: ApiMethod::Patch,
+                path: format!("/admin/schedules/{}", path_segment(id)),
+                body: Some(Value::Object(body)),
+            })
         }
         ScheduleCommand::Pause { id } => Ok(ApiRequest::post(
             format!("/admin/schedules/{}/pause", path_segment(id)),
