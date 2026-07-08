@@ -17669,12 +17669,16 @@ async fn schedule_backfill(
             // unique index on (workflow_name, workflow_id) prevents the scheduler from
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
-            // Budget-connection selection (Codex F4): the workflow exec shard is the
-            // default shard. When it equals the schedule shard, budget ops run on the
+            // Budget-connection selection (Codex F4): the per-slot exec `conn` is drawn
+            // from `pool.default_pool()`, which is backed by the pool's own default
+            // shard — source `exec_shard` from there (not the router's default shard, a
+            // separate field not asserted equal) so `same_pool` compares against the
+            // shard that actually backs `conn`, keeping this arm self-consistent with
+            // the DAG arm. When it equals the schedule shard, budget ops run on that
             // per-slot exec `conn` (pool-size-1 safe); otherwise hold a separate
             // schedule-pool connection across the loop (a distinct pool, safe to hold
             // concurrently with the exec pool).
-            let exec_shard = runtime.router.default_shard();
+            let exec_shard = pool.sharded_pool().default_shard();
             let same_pool = schedule_shard == exec_shard;
             let mut sched_conn_opt = if same_pool {
                 None
