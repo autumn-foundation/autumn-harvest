@@ -412,7 +412,7 @@ The determinism rule catalog is an early-stage guardrail, not the final proof of
 1. **Determinism check** (this catalog): catch obvious footguns before any workflow has history.
 2. **History export** ([issue #169](https://github.com/madmax983/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
 3. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence.
-4. **Version gate** (`ctx.version()`): use version gates for intentional non-determinism across deploys, and retire old gates after the fleet has fully rolled forward.
+4. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
 5. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
 
 Each layer catches a different class of problem. All five together provide defence-in-depth for safe rolling deploys.
