@@ -1482,7 +1482,12 @@ mod tests {
         handle.await.expect("tuner loop task must not panic");
     }
 
-    #[tokio::test]
+    // `start_paused` makes the tick count deterministic: with tokio's virtual
+    // clock, the loop's `sleep(20ms)` fires at exactly t=20/40/60/80/100 before
+    // the test's own `sleep(110ms)` wakes, regardless of how slow the host is.
+    // The previous wall-clock version of this test flaked on a slow Windows CI
+    // runner (only 2 real ticks elapsed in 110ms of wall time).
+    #[tokio::test(start_paused = true)]
     async fn tuner_loop_samples_pool_pressure_once_per_tick_for_both_slot_types() {
         // Regression test: pool pressure must be sampled ONCE per tick and
         // shared between the workflow and activity decisions, not sampled
@@ -1513,12 +1518,14 @@ mod tests {
         cancel.cancel();
         handle.await.expect("tuner loop task must not panic");
 
-        // ~5 ticks elapsed (110ms / 20ms); pool_pressure must be called
-        // exactly once per tick, not twice (once per slot type).
+        // Exactly 5 ticks elapsed on the paused clock (t=20..=100 within the
+        // 110ms window); pool_pressure must be called exactly once per tick,
+        // not twice (once per slot type) — a per-slot-type sample would
+        // observe 10 here.
         let observed = calls.load(Ordering::Relaxed);
-        assert!(
-            (3..=7).contains(&observed),
-            "expected ~5 pool_pressure calls (one per tick), got {observed}"
+        assert_eq!(
+            observed, 5,
+            "expected exactly 5 pool_pressure calls (one per tick), got {observed}"
         );
     }
 }

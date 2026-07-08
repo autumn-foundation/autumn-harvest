@@ -397,3 +397,14 @@ rate(harvest_worker_tuner_decisions_total{decision!="hold"}[5m])
 # Effective schedule run rate (runs - skips)
 rate(harvest_schedule_runs_total[1h]) - rate(harvest_schedule_skipped_total[1h])
 ```
+
+## Full importable dashboard pack
+
+The queries above are seed examples. A complete, versioned, importable
+Grafana dashboard covering **the full metric catalogue** (every `METRIC_*`
+constant in `telemetry.rs`, plus the literal-named concurrency gauges) ships
+at `docs/dashboards/starter-pack-v0.1.0.json`, with import instructions,
+prerequisites, and the alert-rule ↔ panel mapping table in
+`docs/dashboards/README.md`. Coverage is CI-enforced by
+`autumn-harvest/tests/integration/dashboard_pack_docs.rs`: a new `METRIC_*`
+constant with no dashboard panel turns the test red.

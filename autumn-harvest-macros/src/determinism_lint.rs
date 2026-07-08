@@ -1,6 +1,6 @@
 use proc_macro2::Span;
 use std::collections::HashMap;
-use syn::{Expr, visit::Visit};
+use syn::{Expr, spanned::Spanned as _, visit::Visit};
 
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
@@ -23,6 +23,35 @@ pub struct DeterminismVisitor {
     catalog: HashMap<String, RuleInfo>,
     in_await_condition_closure: bool,
     pub context_param_name: Option<String>,
+    /// HVG011 (issue #785): lexical scope stack of local bindings, ident →
+    /// is-hash. Lookup walks innermost-out; a `false` entry MASKS an outer
+    /// tracked binding (shadowing) rather than deleting it, so scope exit
+    /// (block/arm/closure/for-pattern) restores the outer state — the flat
+    /// function-wide set this replaces caused `HardBlocker` false positives on
+    /// pattern-shadowed idents and inner-block bindings (PR #970 review, P1-A).
+    /// Last-binding-wins within a scope; unknown shapes default to not-tracked.
+    hash_scopes: Vec<HashMap<String, bool>>,
+}
+
+/// Collects every ident bound by a pattern (match arm, destructuring `let`,
+/// closure input, for-loop pattern) so it can be masked in the current HVG011
+/// scope. Over-collection is safe: masking means "not hash", so at worst a
+/// legitimate finding is missed, never a false positive introduced.
+struct PatIdentCollector {
+    idents: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for PatIdentCollector {
+    fn visit_pat_ident(&mut self, i: &'ast syn::PatIdent) {
+        self.idents.push(i.ident.to_string());
+        syn::visit::visit_pat_ident(self, i);
+    }
+}
+
+fn pattern_idents(pat: &syn::Pat) -> Vec<String> {
+    let mut collector = PatIdentCollector { idents: Vec::new() };
+    collector.visit_pat(pat);
+    collector.idents
 }
 
 impl DeterminismVisitor {
@@ -33,10 +62,68 @@ impl DeterminismVisitor {
             catalog,
             in_await_condition_closure: false,
             context_param_name: None,
+            hash_scopes: vec![HashMap::new()],
+        }
+    }
+
+    fn push_hash_scope(&mut self) {
+        self.hash_scopes.push(HashMap::new());
+    }
+
+    fn pop_hash_scope(&mut self) {
+        if self.hash_scopes.len() > 1 {
+            self.hash_scopes.pop();
+        }
+    }
+
+    /// Innermost-out lookup: the nearest binding of `ident` decides. Missing
+    /// everywhere means not tracked.
+    fn ident_is_tracked_hash(&self, ident: &str) -> bool {
+        for scope in self.hash_scopes.iter().rev() {
+            if let Some(&is_hash) = scope.get(ident) {
+                return is_hash;
+            }
+        }
+        false
+    }
+
+    fn bind_in_current_scope(&mut self, ident: String, is_hash: bool) {
+        if let Some(scope) = self.hash_scopes.last_mut() {
+            scope.insert(ident, is_hash);
+        }
+    }
+
+    /// Masks (insert `false` for) every ident bound by `pat` in the current
+    /// scope — shadowing, not removal, so outer state is restored on scope exit.
+    fn mask_pattern_idents(&mut self, pat: &syn::Pat) {
+        for ident in pattern_idents(pat) {
+            self.bind_in_current_scope(ident, false);
         }
     }
 
     fn add_finding(&mut self, rule_id: &str, span: Span) {
+        self.push_finding(rule_id, span, None);
+    }
+
+    /// Like [`Self::add_finding`] but overrides the catalog severity.
+    ///
+    /// Used by HVG011's command-aware downgrade: the catalog severity is the
+    /// class's worst case (`HardBlocker` — a command-emitting loop); a
+    /// command-free loop is surfaced as a Warning instead. Kept as a separate
+    /// path so the HVG008 rewrite logic in [`Self::push_finding`] is untouched.
+    ///
+    /// CONTRACT NOTES: the override string must exactly match `"HardBlocker"`
+    /// or `"Warning"` — workflow.rs's severity dispatch is an exact string
+    /// match, so any other spelling silently falls through to the warning
+    /// path. And this method must never be used for HVG001/HVG002 findings:
+    /// those two IDs are remapped to HVG008 inside `await_condition` closures
+    /// by [`Self::push_finding`], and an override would pin the pre-remap
+    /// rule's severity onto the remapped HVG008 finding.
+    fn add_finding_with_severity(&mut self, rule_id: &str, span: Span, severity: &str) {
+        self.push_finding(rule_id, span, Some(severity));
+    }
+
+    fn push_finding(&mut self, rule_id: &str, span: Span, severity_override: Option<&str>) {
         let actual_rule_id =
             if self.in_await_condition_closure && (rule_id == "HVG001" || rule_id == "HVG002") {
                 "HVG008"
@@ -46,13 +133,200 @@ impl DeterminismVisitor {
         if let Some(rule) = self.catalog.get(actual_rule_id) {
             self.findings.push(LinterFinding {
                 rule_id: rule.id.clone(),
-                severity: rule.severity.clone(),
+                severity: severity_override
+                    .map_or_else(|| rule.severity.clone(), ToString::to_string),
                 message: rule.explanation.clone(),
                 alternative: rule.alternative.clone(),
                 span,
             });
         }
     }
+
+    /// HVG011: returns the tracked ident when `expr` (a `for` loop's iterated
+    /// expression) iterates a locally-bound `HashMap`/`HashSet`.
+    ///
+    /// Deliberately narrow (issue #785's explicit syntactic boundary): only a
+    /// bare tracked ident, `&ident` / `&mut ident`, or a SINGLE
+    /// argument-free iteration method call on a tracked ident matches. Longer
+    /// chains (`map.keys().sorted()`, `.collect::<Vec<_>>()`) are never
+    /// flagged — that is how "already-sorted iterators are never flagged"
+    /// holds — and function parameters/fields are never tracked.
+    fn iterated_hash_local(&self, expr: &syn::Expr) -> Option<String> {
+        let path_ident = |e: &syn::Expr| -> Option<String> {
+            if let Expr::Path(p) = e {
+                p.path.get_ident().map(ToString::to_string)
+            } else {
+                None
+            }
+        };
+        let ident = match expr {
+            Expr::Path(_) => path_ident(expr)?,
+            Expr::Reference(r) => path_ident(&r.expr)?,
+            Expr::MethodCall(mc)
+                if mc.args.is_empty()
+                    && mc.turbofish.is_none()
+                    && HASH_ITER_METHODS.contains(&mc.method.to_string().as_str()) =>
+            {
+                path_ident(&mc.receiver)?
+            }
+            _ => return None,
+        };
+        self.ident_is_tracked_hash(&ident).then_some(ident)
+    }
+}
+
+/// Iteration methods on `HashMap`/`HashSet` whose order is hash-randomized.
+const HASH_ITER_METHODS: &[&str] = &[
+    "iter",
+    "iter_mut",
+    "keys",
+    "values",
+    "values_mut",
+    "drain",
+    "into_iter",
+    "into_keys",
+    "into_values",
+];
+
+fn is_hash_collection_name(ident: &syn::Ident) -> bool {
+    ident == "HashMap" || ident == "HashSet"
+}
+
+/// `true` when a type annotation's path ends in `HashMap`/`HashSet`
+/// (any prefix, e.g. `std::collections::HashMap<K, V>`).
+fn type_is_hash_collection(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        tp.path
+            .segments
+            .last()
+            .is_some_and(|seg| is_hash_collection_name(&seg.ident))
+    } else {
+        false
+    }
+}
+
+/// `true` when a `.collect` turbofish argument produces a `HashMap`/`HashSet`,
+/// including the fallible/optional forms `Result<HashMap<..>, E>` and
+/// `Option<HashMap<..>>` (PR #970 review, P2-C): the wrapper's FIRST generic
+/// type argument is checked recursively. Pinned contract: the wrapper form is
+/// accepted both behind a `?` (the realistic `.collect::<Result<..>>()?`) and
+/// unwrapped.
+fn collect_target_is_hash(ty: &syn::Type) -> bool {
+    if type_is_hash_collection(ty) {
+        return true;
+    }
+    if let syn::Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && (seg.ident == "Result" || seg.ident == "Option")
+        && let syn::PathArguments::AngleBracketed(ab) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(first)) = ab
+            .args
+            .iter()
+            .find(|arg| matches!(arg, syn::GenericArgument::Type(_)))
+    {
+        return collect_target_is_hash(first);
+    }
+    false
+}
+
+/// `true` when a `let` initializer expression produces a `HashMap`/`HashSet`:
+/// a constructor call (`HashMap::new()`, `HashSet::from(..)`, `default`,
+/// `with_capacity` variants — any path prefix) or a chain ending in
+/// `.collect::<HashMap<..>>()` / `.collect::<HashSet<..>>()` (also the
+/// `Result`/`Option`-wrapped turbofish forms — see [`collect_target_is_hash`]).
+fn init_is_hash_collection(expr: &syn::Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            if let Expr::Path(p) = &*call.func {
+                let segments: Vec<_> = p.path.segments.iter().collect();
+                if segments.len() >= 2 {
+                    let ctor = segments[segments.len() - 1].ident.to_string();
+                    let collection = &segments[segments.len() - 2].ident;
+                    return is_hash_collection_name(collection)
+                        && matches!(
+                            ctor.as_str(),
+                            "new"
+                                | "from"
+                                | "from_iter"
+                                | "with_capacity"
+                                | "with_hasher"
+                                | "with_capacity_and_hasher"
+                                | "default"
+                        );
+                }
+            }
+            false
+        }
+        Expr::MethodCall(mc) if mc.method == "collect" => mc.turbofish.as_ref().is_some_and(|tf| {
+            tf.args.iter().any(
+                |arg| matches!(arg, syn::GenericArgument::Type(ty) if collect_target_is_hash(ty)),
+            )
+        }),
+        // `..collect::<Result<HashMap<..>, E>>()?` — unwrap the try.
+        Expr::Try(t) => init_is_hash_collection(&t.expr),
+        _ => false,
+    }
+}
+
+/// Extracts the bound ident (and whether its explicit type annotation is a
+/// hash collection) from a `let` pattern. Tuple/struct destructuring returns
+/// `None` — unknown binding shapes default to NOT tracking (false positives
+/// are the top risk for a `HardBlocker` lint).
+fn local_binding_target(pat: &syn::Pat) -> Option<(String, bool)> {
+    match pat {
+        syn::Pat::Ident(pi) => Some((pi.ident.to_string(), false)),
+        syn::Pat::Type(pt) => {
+            if let syn::Pat::Ident(pi) = &*pt.pat {
+                Some((pi.ident.to_string(), type_is_hash_collection(&pt.ty)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Command-call predicate for HVG011's severity decision: method names on the
+/// workflow context that schedule durable commands (history-ordered work).
+fn is_ctx_command_method(name: &str) -> bool {
+    name.starts_with("execute_activity")
+        || name.starts_with("spawn_child_workflow")
+        || name.starts_with("execute_local_activity")
+        || name == "timer"
+        || name == "side_effect"
+        // ctx.race() schedules durable commands per branch (issue #600).
+        || name == "race"
+}
+
+/// Nested scan of a `for` loop body for command calls on the context param.
+struct CtxCommandFinder<'a> {
+    ctx_name: &'a str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for CtxCommandFinder<'_> {
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        if self.found {
+            return;
+        }
+        if let Expr::Path(p) = &*i.receiver
+            && p.path.is_ident(self.ctx_name)
+            && is_ctx_command_method(&i.method.to_string())
+        {
+            self.found = true;
+            return;
+        }
+        syn::visit::visit_expr_method_call(self, i);
+    }
+}
+
+fn block_contains_ctx_command(block: &syn::Block, ctx_name: &str) -> bool {
+    let mut finder = CtxCommandFinder {
+        ctx_name,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
 }
 
 fn path_to_string(path: &syn::Path) -> String {
@@ -179,6 +453,98 @@ fn is_io_path(path_str: &str) -> bool {
 }
 
 impl<'ast> Visit<'ast> for DeterminismVisitor {
+    fn visit_local(&mut self, i: &'ast syn::Local) {
+        // HVG011 binding tracking: mark `let` bindings that are hash-typed via
+        // an explicit type annotation, a `HashMap::new()`-style constructor
+        // call, or a `.collect::<HashMap<..>>()` turbofish. Last-binding-wins
+        // within a scope: re-binding the same ident to a non-hash type masks
+        // it. Unknown binding shapes (destructuring, let-else patterns, enum
+        // variants) mask EVERY ident they bind — shadowing, never tracking —
+        // so an outer tracked binding cannot bleed through a pattern re-bind
+        // (PR #970 review, P1-A).
+        if let Some((name, annotated_hash)) = local_binding_target(&i.pat) {
+            let init_hash = i
+                .init
+                .as_ref()
+                .is_some_and(|init| init_is_hash_collection(&init.expr));
+            self.bind_in_current_scope(name, annotated_hash || init_hash);
+        } else {
+            self.mask_pattern_idents(&i.pat);
+        }
+
+        // Delegate to nested traversal
+        syn::visit::visit_local(self, i);
+    }
+
+    fn visit_block(&mut self, i: &'ast syn::Block) {
+        // HVG011: every block is a lexical scope — bindings made inside it
+        // must not survive block exit (inner-block leak, PR #970 P1-A(b)).
+        self.push_hash_scope();
+        syn::visit::visit_block(self, i);
+        self.pop_hash_scope();
+    }
+
+    fn visit_arm(&mut self, i: &'ast syn::Arm) {
+        // HVG011: a match arm's pattern bindings shadow outer idents for the
+        // guard + body extent.
+        self.push_hash_scope();
+        self.mask_pattern_idents(&i.pat);
+        syn::visit::visit_arm(self, i);
+        self.pop_hash_scope();
+    }
+
+    fn visit_expr_closure(&mut self, i: &'ast syn::ExprClosure) {
+        // HVG011: closure parameters shadow outer idents for the closure body.
+        // NOTE: the ctx.side_effect(..) closure-skip in visit_expr_method_call
+        // never reaches this method (it visits the closure's input pats
+        // directly and skips the body), so that escape hatch is unaffected.
+        self.push_hash_scope();
+        for input in &i.inputs {
+            self.mask_pattern_idents(input);
+        }
+        syn::visit::visit_expr_closure(self, i);
+        self.pop_hash_scope();
+    }
+
+    fn visit_expr_for_loop(&mut self, i: &'ast syn::ExprForLoop) {
+        // HVG011: NonDeterministicIteration (issue #785; the issue proposed
+        // HVG010, permanently taken by SelectMacro/#600, hence HVG011).
+        // Command-aware severity: a loop body that schedules commands on the
+        // context param is a HardBlocker (the recorded command order would
+        // follow the randomized hash order and diverge on replay); a
+        // command-free loop is downgraded to a Warning.
+        //
+        // The check runs against the OUTER scopes — the iterated expression is
+        // evaluated before the loop pattern binds.
+        if self.iterated_hash_local(&i.expr).is_some() {
+            let ctx_name = self.context_param_name.clone();
+            let has_command =
+                block_contains_ctx_command(&i.body, ctx_name.as_deref().unwrap_or("ctx"));
+            let span = i.expr.span();
+            if has_command {
+                self.add_finding("HVG011", span);
+            } else {
+                self.add_finding_with_severity("HVG011", span, "Warning");
+            }
+        }
+
+        // Manual traversal (mirrors syn::visit::visit_expr_for_loop's order)
+        // so the loop pattern's bindings shadow outer idents for the body
+        // extent only (PR #970 P1-A(a): `for m in &lists { for x in m … }`).
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(label) = &i.label {
+            self.visit_label(label);
+        }
+        self.visit_expr(&i.expr);
+        self.push_hash_scope();
+        self.mask_pattern_idents(&i.pat);
+        self.visit_pat(&i.pat);
+        self.visit_block(&i.body);
+        self.pop_hash_scope();
+    }
+
     #[allow(clippy::too_many_lines)]
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
         if let Expr::Path(expr_path) = &*i.func {
@@ -491,10 +857,689 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
             explanation: "Using tokio::select!, futures::select!, or futures::select_biased! to race concurrent ctx-managed operations (activities, timers, signals, child workflows) inside a workflow body is a double footgun: (1) the winning branch depends on non-deterministic poll/arrival order, so a replay can pick a different branch than the original run and diverge; (2) the dropped loser branches do not durably cancel the underlying work -- a scheduled activity keeps running on a worker and a durable timer row stays live, leaking state that is never cleaned up.".to_string(),
             alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive (issue #600). It records the winning branch durably via a MarkerRecorded event so replay always resolves the same winner, and durably cancels every losing branch (activity task rows, child-workflow executions, or a losing durable timer) so no leaked in-flight work remains. For a single signal bounded by a deadline, ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive ctx.race()'s timer-plus-signal shape wraps.".to_string(),
         },
+        // HVG011 (issue #785; the issue proposed HVG010, permanently taken by
+        // SelectMacro/#600 — IDs are never reused). Text must stay
+        // byte-identical to the guardrail.rs CATALOG entry.
+        RuleInfo {
+            id: "HVG011".to_string(),
+            severity: "HardBlocker".to_string(),
+            explanation: "Iterating a std::collections::HashMap or HashSet directly inside a workflow body observes the hash-iteration order, which is randomized per process (RandomState seeds differ across workers and restarts), so a replay can visit the entries in a different order than the original run. When the loop body schedules commands (ctx.execute_activity*, ctx.spawn_child_workflow*, ctx.execute_local_activity*, ctx.timer, ctx.side_effect), the command sequence is recorded in history in iteration order -- a reordered replay produces a different command sequence and diverges (non-determinism error / nd-block). Even a command-free loop can leak the non-deterministic order into workflow-local state and flip a later branch.".to_string(),
+            alternative: "Use a BTreeMap/BTreeSet (deterministic iteration order) for any collection a workflow iterates, or collect the keys into a Vec and sort() it before iterating: let mut keys: Vec<_> = map.keys().cloned().collect(); keys.sort(); for k in keys { ... }. Collections that are only ever point-looked-up (never iterated) are fine to keep as HashMap/HashSet.".to_string(),
+        },
     ];
 
     for entry in entries {
         rules.insert(entry.id.clone(), entry);
     }
     rules
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod hvg011_tests {
+    //! Visitor-level tests for HVG011 (issue #785): HashMap/HashSet
+    //! iteration-order determinism.
+    //!
+    //! NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
+    //! already permanently assigned to SelectMacro (issue #600) and rule IDs
+    //! are never reused, so the iteration-order rule ships as HVG011.
+
+    use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
+    use syn::visit::Visit as _;
+
+    fn lint_with_ctx(src: &str, ctx_name: &str) -> Vec<LinterFinding> {
+        let item_fn: syn::ItemFn = syn::parse_str(src).expect("test source must parse");
+        let mut visitor = DeterminismVisitor::new(load_catalog_metadata());
+        visitor.context_param_name = Some(ctx_name.to_string());
+        visitor.visit_item_fn(&item_fn);
+        visitor.findings
+    }
+
+    fn lint(src: &str) -> Vec<LinterFinding> {
+        lint_with_ctx(src, "ctx")
+    }
+
+    fn hvg011_severities(findings: &[LinterFinding]) -> Vec<String> {
+        findings
+            .iter()
+            .filter(|f| f.rule_id == "HVG011")
+            .map(|f| f.severity.clone())
+            .collect()
+    }
+
+    #[test]
+    fn command_emitting_hashmap_loop_is_hard_blocker() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut m: HashMap<String, u64> = HashMap::new();
+                for (k, v) in &m {
+                    ctx.execute_activity_raw("debit", input, "default").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "command-emitting HashMap loop must be a HardBlocker"
+        );
+    }
+
+    #[test]
+    fn command_free_hashmap_loop_is_warning() {
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut m: HashMap<String, u64> = HashMap::new();
+                let mut total = 0u64;
+                for (_k, v) in &m {
+                    total += v;
+                }
+                Ok(())
+            }
+            ",
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["Warning".to_string()],
+            "command-free HashMap loop must be downgraded to Warning"
+        );
+    }
+
+    #[test]
+    fn fully_qualified_hashset_new_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut s = std::collections::HashSet::new();
+                for item in s.iter() {
+                    ctx.spawn_child_workflow_raw("child", item).await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
+    }
+
+    #[test]
+    fn iteration_method_forms_are_flagged() {
+        for method in [
+            "iter()",
+            "iter_mut()",
+            "keys()",
+            "values()",
+            "values_mut()",
+            "drain()",
+            "into_iter()",
+            "into_keys()",
+            "into_values()",
+        ] {
+            let src = format!(
+                r#"
+                async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{
+                    let mut m: HashMap<String, u64> = HashMap::new();
+                    for x in m.{method} {{
+                        ctx.execute_activity_raw("a", x, "q").await?;
+                    }}
+                    Ok(())
+                }}
+                "#
+            );
+            let findings = lint(&src);
+            assert_eq!(
+                hvg011_severities(&findings).len(),
+                1,
+                "`for x in m.{method}` must be flagged exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn mut_borrow_iteration_is_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut m: HashMap<String, u64> = HashMap::new();
+                for (_k, v) in &mut m {
+                    ctx.timer("t", 1).await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_turbofish_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = items.into_iter().collect::<std::collections::HashMap<String, u64>>();
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
+    }
+
+    #[test]
+    fn hashmap_from_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = HashMap::from([("a", 1u64)]);
+                for (k, _v) in &m {
+                    ctx.execute_local_activity_raw("a", k).await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
+    }
+
+    #[test]
+    fn shadowing_with_vec_untracks_the_ident() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let m: Vec<u64> = m.values().copied().collect();
+                for v in &m {
+                    ctx.execute_activity_raw("a", v, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "a later non-hash binding of the same ident must untrack it"
+        );
+    }
+
+    #[test]
+    fn ordered_collections_and_params_are_never_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext, param_map: HashMap<String, u64>) -> Result<(), String> {
+                let b: BTreeMap<String, u64> = BTreeMap::new();
+                for (k, _v) in &b {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                let v: Vec<u64> = Vec::new();
+                for x in &v {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                for (k, _v) in &param_map {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "BTreeMap/Vec/function-parameter iteration must never be flagged"
+        );
+    }
+
+    #[test]
+    fn sorted_keys_vec_and_longer_chains_are_never_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let mut keys: Vec<String> = m.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                for k in m.keys().sorted() {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "sorted-keys Vec and multi-call iterator chains must never be flagged"
+        );
+    }
+
+    #[test]
+    fn iteration_inside_side_effect_closure_is_not_flagged() {
+        // The side_effect closure subtree is deliberately not visited (the
+        // existing escape hatch) — iteration inside it must not be flagged.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let _ = ctx.side_effect("sum", || {
+                    let mut total = 0u64;
+                    for (_k, v) in &m {
+                        total += v;
+                    }
+                    total
+                });
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "iteration inside a ctx.side_effect closure must not be flagged"
+        );
+    }
+
+    // ── P1-A regression pins (PR #970 review): scope-aware binding tracking ──
+    // Four confirmed false-positive shapes under the old flat function-wide
+    // `hash_locals` set, plus the symmetric legit case. Each FP shape must
+    // produce ZERO HVG011 findings.
+
+    #[test]
+    fn match_arm_pattern_binding_shadows_tracked_hash_ident() {
+        // `Some(m)` re-binds `m` to a non-hash value inside the arm; iterating
+        // it there must not be flagged even though an outer `m` is hash-typed.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                match resolve() {
+                    Some(m) => {
+                        for item in &m {
+                            ctx.execute_activity_raw("a", item, "q").await?;
+                        }
+                    }
+                    None => {}
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "a match-arm pattern binding must shadow the tracked hash ident"
+        );
+    }
+
+    #[test]
+    fn destructuring_let_masks_tracked_hash_ident() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let (m, n) = split();
+                for v in &m {
+                    ctx.execute_activity_raw("a", v, "q").await?;
+                }
+                let _ = n;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "a destructuring `let` must mask the tracked hash ident"
+        );
+    }
+
+    #[test]
+    fn closure_param_shadows_tracked_hash_ident() {
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let mut total = 0u64;
+                let f = |m: &Vec<u64>| {
+                    for v in m {
+                        total += v;
+                    }
+                };
+                f(&Vec::new());
+                Ok(())
+            }
+            ",
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "a closure parameter must shadow the tracked hash ident"
+        );
+    }
+
+    #[test]
+    fn for_loop_pattern_shadows_tracked_hash_ident() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let lists: Vec<Vec<u64>> = Vec::new();
+                for m in &lists {
+                    for x in m {
+                        ctx.execute_activity_raw("a", x, "q").await?;
+                    }
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "a for-loop pattern binding must shadow the tracked hash ident"
+        );
+    }
+
+    #[test]
+    fn inner_block_hash_binding_does_not_leak_past_block_exit() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: Vec<u64> = Vec::new();
+                {
+                    let m: HashMap<String, u64> = HashMap::new();
+                    let _ = m.len();
+                }
+                for v in &m {
+                    ctx.execute_activity_raw("a", v, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "an inner-block hash binding must not leak past the block exit"
+        );
+    }
+
+    #[test]
+    fn same_scope_hash_binding_still_fires_after_an_inner_block() {
+        // Symmetric legit case: the hash `let` and the loop share a scope; an
+        // intervening inner block must not swallow the tracked binding.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                {
+                    let other: Vec<u64> = Vec::new();
+                    let _ = other;
+                }
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "hash let in the same scope with a later loop must still fire"
+        );
+    }
+
+    // ── P2-C: fallible collect (`.collect::<Result<HashMap<..>, E>>()?`) ─────
+
+    #[test]
+    fn collect_result_turbofish_with_try_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = items
+                    .into_iter()
+                    .collect::<Result<HashMap<String, u64>, String>>()?;
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            ".collect::<Result<HashMap<..>, E>>()? must be tracked"
+        );
+    }
+
+    #[test]
+    fn collect_option_turbofish_without_try_is_tracked() {
+        // The Result/Option unwrapping is accepted with or without the `?` —
+        // pinned contract (see PR #970 review, P2-C).
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = items.into_iter().collect::<Option<HashMap<String, u64>>>();
+                let m = m.unwrap_or_default();
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        // NOTE: the second `let m = m.unwrap_or_default();` re-binding is NOT
+        // hash-tracked (unknown shape) so this asserts the tracking happens on
+        // the collect line and is then masked — zero findings is the honest
+        // outcome for this exact shape; assert instead on a direct iteration.
+        let findings_direct = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = items.into_iter().collect::<Option<HashMap<String, u64>>>();
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "re-binding via unwrap_or_default() untracks the ident"
+        );
+        assert_eq!(
+            hvg011_severities(&findings_direct),
+            vec!["HardBlocker".to_string()],
+            ".collect::<Option<HashMap<..>>>() (unwrapped) must be tracked"
+        );
+    }
+
+    // ── P2-F: Gemini bot coverage (default ctor, ctx.race) ──────────────────
+
+    #[test]
+    fn hashmap_default_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = HashMap::default();
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                let s = std::collections::HashSet::default();
+                for x in &s {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string(), "HardBlocker".to_string()],
+            "HashMap::default()/HashSet::default() bindings must be tracked"
+        );
+    }
+
+    #[test]
+    fn ctx_race_in_loop_body_is_a_command() {
+        // ctx.race() schedules durable commands (issue #600) — a race inside a
+        // hash-ordered loop must be a HardBlocker, not a Warning.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                for (k, _v) in &m {
+                    let _ = ctx.race().activity_raw("a", k, "q");
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "ctx.race() in a loop body must make the finding a HardBlocker"
+        );
+    }
+
+    // ── P3 polish pins: test-matrix holes + negative controls ───────────────
+
+    #[test]
+    fn bare_by_move_iteration_is_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashSet<String> = HashSet::new();
+                for x in m {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "bare by-move `for x in m` must be flagged"
+        );
+    }
+
+    #[test]
+    fn collect_hashset_turbofish_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let s = items.into_iter().collect::<HashSet<String>>();
+                for x in &s {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            ".collect::<HashSet<..>>() must be tracked"
+        );
+    }
+
+    #[test]
+    fn fan_out_helper_in_loop_body_is_a_command() {
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                for (_k, v) in &m {
+                    let _ = ctx.execute_activity_fan_out(&info(), vec![v]).await;
+                }
+                Ok(())
+            }
+            ",
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "execute_activity_fan_out in a loop body must be a HardBlocker"
+        );
+    }
+
+    #[test]
+    fn ctx_side_effect_in_loop_body_is_a_command() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                for (_k, v) in &m {
+                    let _ = ctx.side_effect("draw", || *v);
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "ctx.side_effect in a loop body must be a HardBlocker"
+        );
+    }
+
+    #[test]
+    fn indexmap_btreeset_and_arrays_are_never_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let im: IndexMap<String, u64> = IndexMap::new();
+                for (k, _v) in &im {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                let bs: BTreeSet<String> = BTreeSet::new();
+                for x in &bs {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                let arr = [1u64, 2, 3];
+                for x in arr {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "IndexMap/BTreeSet/array iteration must never be flagged"
+        );
+    }
+
+    #[test]
+    fn renamed_context_param_is_used_for_command_detection() {
+        let findings = lint_with_ctx(
+            r#"
+            async fn wf(wf_ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                for (k, _v) in &m {
+                    wf_ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+            "wf_ctx",
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "command detection must respect the renamed context param"
+        );
+    }
 }

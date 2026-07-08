@@ -36,8 +36,8 @@ let rule = rule_by_id("HVG001").unwrap();
 
 Since version 0.3.0, the `#[workflow]` attribute macro automatically scans the annotated function body at compile-time to enforce these guardrails:
 
-- **Hard Blockers** (`HVG001` through `HVG008`, `HVG010`): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
-- **Warnings** (`HVG009`): Emit standard deprecation compiler warnings (`note = "..."`) at the exact log macro site to encourage migration without breaking CI or blocking local development.
+- **Hard Blockers** (`HVG001` through `HVG008`, `HVG010`, and `HVG011` when the flagged loop schedules commands): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
+- **Warnings** (`HVG009`, and `HVG011` when the flagged loop is command-free): Emit standard deprecation compiler warnings (`note = "..."`) at the exact site to encourage migration without breaking CI or blocking local development.
 
 ### Suppressing compile-time guardrails
 
@@ -356,6 +356,78 @@ async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, Str
 #### Guardrail severity
 
 HVG010 is a **HardBlocker**: an unguarded `select!` over ctx-managed awaitables can silently diverge a replay or leak in-flight activities/timers, both of which are worse than a build failure.
+
+---
+
+### HVG011 — `HashMap`/`HashSet` iteration order (HardBlocker*, command-aware)
+
+> **Rule-ID note:** issue #785's text proposed HVG010, but HVG010 was already permanently assigned to SelectMacro (issue #600) and rule IDs are never reused — the iteration-order rule ships as **HVG011** in the catalog/macro lint and **DET010** in `det_check`.
+
+| | Example |
+|---|---|
+| **Disallowed** | `for (k, v) in &my_hash_map { ctx.execute_activity_raw(...).await?; }` |
+| **Disallowed** | `for key in my_hash_map.keys() { ... }` (also `.values()`, `.iter()`, `.drain()`, `.into_iter()`, `.into_keys()`, `.into_values()`) |
+| **Allowed** | Iterate a `BTreeMap`/`BTreeSet` instead — deterministic key order |
+| **Allowed** | `let mut keys: Vec<_> = map.keys().cloned().collect(); keys.sort(); for k in keys { ... }` |
+| **Allowed** | Point lookups on a `HashMap`/`HashSet` that is never iterated |
+
+`HashMap`/`HashSet` iteration order is hash-randomized per process (`RandomState` seeds differ across workers and restarts), so a replay on another worker can visit the entries in a different order than the original run. When the loop body schedules commands (`ctx.execute_activity*`, `ctx.spawn_child_workflow*`, `ctx.execute_local_activity*`, `ctx.timer`, `ctx.side_effect`), the command sequence is recorded in history **in iteration order** — a reordered replay produces a different command sequence and diverges (non-determinism error / nd-block, issue #603 semantics).
+
+#### Guardrail severity
+
+HVG011 is command-aware: the macro lint and `det_check` inspect the loop body. A loop that schedules commands (`ctx.execute_activity*`, `ctx.spawn_child_workflow*`, `ctx.execute_local_activity*`, `ctx.timer`, `ctx.side_effect`, `ctx.race`) is a **HardBlocker** (compile error / `DetSeverity::Error`); a command-free loop is downgraded to a **Warning** (deprecation-note mechanism, like HVG009), since it only risks leaking the non-deterministic order into workflow-local state that a later branch might observe.
+
+**Syntactic boundary (deliberately narrow, false positives are the top risk):** only *locally `let`-bound* collections are tracked — hash-typed via an explicit type annotation whose root type is `HashMap`/`HashSet` (`let m: HashMap<K, V> = …`; a nested mention like `Vec<HashMap<..>>` or `Option<HashMap<..>>` does not track), a constructor call (`HashMap::new()`, `HashSet::from(..)`, `default`, `with_capacity` variants), or a `.collect::<HashMap<..>>()` turbofish (including the fallible `.collect::<Result<HashMap<..>, E>>()?` / `Option`-wrapped forms). Binding tracking is **lexically scoped**: re-binding the same ident to a non-hash type shadows it for that binding's scope, an inner-block hash binding never leaks past the block exit, and (in the macro lint) match-arm patterns, closure parameters, destructuring `let`s, and for-loop patterns all shadow outer tracked idents. Only a bare tracked ident, `&ident` / `&mut ident`, or exactly one argument-free iteration method call on it is flagged — longer chains (`map.keys().sorted()`) are never flagged, so already-sorted iterators always pass. Function parameters and struct fields are never flagged.
+
+**Surface divergences (line-based `det_check` vs. syn-based macro lint):** the macro lint is scope-exact; `det_check`'s line-based pass can still over-flag an ident re-bound by a *match-arm pattern* or a *closure parameter* (pattern masking there is not tractable line-by-line — suppress with `// harvest-suppress: DET010 "reason"` when intended), and misses a `for` header split across lines (`for (k, v) in` / `&m`) — the macro lint catches that shape. `det_check` also shares the pre-existing DET001–DET009 lexer caveat that the continuation lines of a multi-line string literal are lexed as code and can perturb binding tracking.
+
+**Migration example:**
+
+```rust
+// Before — breaks replay: debit order follows the randomized hash order
+#[workflow]
+async fn settle(ctx: &WorkflowContext, input: Value) -> Result<(), String> {
+    let mut amounts: HashMap<String, u64> = HashMap::new();
+    // ... populate from input ...
+    for (account, amount) in &amounts {                          // ← HVG011
+        ctx.execute_activity_raw("debit", json!({ "account": account, "amount": amount }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// After (option A) — BTreeMap: deterministic key order
+#[workflow]
+async fn settle(ctx: &WorkflowContext, input: Value) -> Result<(), String> {
+    let mut amounts: BTreeMap<String, u64> = BTreeMap::new();
+    // ... populate from input ...
+    for (account, amount) in &amounts {                          // deterministic ✓
+        ctx.execute_activity_raw("debit", json!({ "account": account, "amount": amount }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// After (option B) — keep the HashMap, iterate sorted keys
+#[workflow]
+async fn settle(ctx: &WorkflowContext, input: Value) -> Result<(), String> {
+    let mut amounts: HashMap<String, u64> = HashMap::new();
+    // ... populate from input ...
+    let mut accounts: Vec<String> = amounts.keys().cloned().collect();
+    accounts.sort();
+    for account in accounts {                                    // deterministic ✓
+        let amount = amounts[&account];
+        ctx.execute_activity_raw("debit", json!({ "account": account, "amount": amount }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+```
+
+**Suppression:** in `det_check`, place `// harvest-suppress: DET010 "reason"` — or the guardrail-catalog spelling `// harvest-suppress: HVG011 "reason"`, honored as an alias — on the `for` line or the standalone comment line above it (echoed into `DetCheckReport::suppressions` with whichever id you wrote, for auditability). The macro lint has no per-site suppression — only the whole-function `#[workflow(allow_nondeterministic_apis)]` escape hatch, which bypasses HVG011 like every other rule. Iteration inside a `ctx.side_effect(..)` closure is not flagged by the compile-time macro lint (the closure's value is recorded once and replayed verbatim); the `det_check` scanner may still surface a DET010 Warning there — suppress with `// harvest-suppress: DET010 "reason"` if intended.
 
 ---
 
