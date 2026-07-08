@@ -313,25 +313,29 @@ const RULES: &[Rule] = &[
             // or line start is a boundary and still matches.
             "select!",
             "select_biased!",
-            // Combinator FUNCTIONS. `future::select(` covers the plain-select
-            // combinator in BOTH its qualified (`futures::future::select(`) and
-            // short (`use futures::future; future::select(`) forms — the short
-            // form is a genuine suffix of the qualified one, so the single
-            // pattern matches both without a second entry (and, since the engine
-            // emits at most one finding per rule per line, never double-counts a
-            // qualified call). This matches the AST macro visitor, which
-            // recognizes the `future::select` short form too. The bare
-            // distinctive forms (`select_all(`/`select_ok(`/`try_select(`) are
-            // specific enough to futures that a *free-function* call by any of
-            // these three is, in practice, the combinator. All four are matched
-            // only at a call-position boundary (see
-            // `DET011_CALL_BOUNDARY_PATTERNS`): a preceding `.` (method call,
-            // e.g. `q.select_all()` / a hypothetical `.future::select(`) or
-            // identifier char (a longer name like `my_future::select(`) excludes
-            // the match, mirroring the AST macro visitor's structural exclusion
-            // of method calls. Bare `select(` is deliberately omitted entirely
-            // (it would match `.select(` query-builder method calls even at a
-            // boundary — too common).
+            // Combinator FUNCTIONS. These candidate patterns cheaply locate a
+            // possible combinator call; the actual decision is made by the
+            // path-precise `matches_futures_combinator_pattern` (see
+            // `DET011_COMBINATOR_FN_PATTERNS`), which extracts the FULL
+            // qualified path ending at the call and matches it exactly against
+            // the same allowed-path set as the compile-time HVG010 guardrail's
+            // `is_select_combinator_path`. That precision is required so a
+            // qualified call by an UNRELATED helper of the same tail name is
+            // NOT flagged: `crate::future::select(`, `my_dsl::select_all(`,
+            // `bar::future::select_ok(`, and `foo::try_select(` all resolve to
+            // paths outside the allowed set and are rejected, exactly as the
+            // macro lint rejects them. The allowed set is: the
+            // `futures`-anchored qualified forms (`futures::future::{select,
+            // select_all, select_ok, try_select}`), their `future::…` short
+            // forms (the idiomatic `use futures::future;` spelling), and the
+            // genuinely BARE distinctive names `select_all`/`select_ok`/
+            // `try_select` (a bare free-fn call by any of these three is, in
+            // practice, always the futures combinator via
+            // `use futures::future::select_all;`). Bare `select(` is
+            // deliberately NOT in the allowed set (`select` is a common
+            // free-fn / query-builder name), and a preceding `.` (method call,
+            // e.g. `q.select_all()`) is rejected — mirroring the AST macro
+            // visitor's structural exclusion of method calls.
             "future::select(",
             "select_all(",
             "select_ok(",
@@ -528,8 +532,8 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
 
         'rules: for rule in RULES {
             for &pattern in rule.patterns {
-                let matched = if DET011_CALL_BOUNDARY_PATTERNS.contains(&pattern) {
-                    matches_at_call_boundary(&code_part, pattern)
+                let matched = if DET011_COMBINATOR_FN_PATTERNS.contains(&pattern) {
+                    matches_futures_combinator_pattern(&code_part, pattern)
                 } else if DET011_MACRO_BOUNDARY_PATTERNS.contains(&pattern) {
                     matches_at_ident_boundary(&code_part, pattern)
                 } else {
@@ -836,28 +840,80 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// DET011 patterns matched only at a call-position boundary — the futures
-/// combinator functions. A preceding `.` (method call) or identifier char (a
-/// longer name that merely ends in the pattern text) excludes the match, so
-/// `q.select_all()` / `x.try_select(a, b)` / `my_future::select(` are not
-/// flagged, mirroring the AST macro visitor's structural exclusion of method
-/// calls (#799 P2 review). `future::select(` here matches both the short form
-/// (`future::select(`, at a boundary) and the qualified form
-/// (`futures::future::select(`, where the substring is preceded by `:`, which
-/// is neither `.` nor an identifier byte).
-const DET011_CALL_BOUNDARY_PATTERNS: &[&str] = &[
+/// DET011 candidate patterns for the futures combinator FUNCTIONS. Each is a
+/// cheap substring locator; the accept/reject decision is made by the
+/// path-precise [`matches_futures_combinator_pattern`], which extracts the
+/// full qualified path ending at the call and matches it exactly against the
+/// allowed set. This keeps `det_check` in lock-step with the compile-time HVG010
+/// guardrail's `is_select_combinator_path`, which matches whole paths exactly
+/// (#980 Codex P2 review).
+const DET011_COMBINATOR_FN_PATTERNS: &[&str] = &[
     "future::select(",
     "select_all(",
     "select_ok(",
     "try_select(",
 ];
 
-/// True if `pattern` occurs in `code` at a call-position boundary: the byte
-/// immediately preceding a match is neither `.` nor an identifier byte.
-fn matches_at_call_boundary(code: &str, pattern: &str) -> bool {
+/// The exact set of paths that name a futures wait-first combinator FUNCTION.
+///
+/// This mirrors, case-for-case, `is_select_combinator_path` in the macro
+/// crate's `determinism_lint.rs`: the `futures`-anchored qualified forms, their
+/// `future::…` short forms, and the genuinely bare distinctive names
+/// `select_all`/`select_ok`/`try_select`. A qualified path with any OTHER root
+/// (`crate::future::select`, `my_dsl::select_all`, `bar::future::select_ok`,
+/// `foo::try_select`) is deliberately absent, and bare `select` is deliberately
+/// absent (too ambiguous a free-fn / query-builder name to hard-block).
+fn is_allowed_combinator_path(path: &str) -> bool {
+    matches!(
+        path,
+        "futures::future::select"
+            | "futures::future::select_all"
+            | "futures::future::select_ok"
+            | "futures::future::try_select"
+            | "future::select"
+            | "future::select_all"
+            | "future::select_ok"
+            | "future::try_select"
+            | "select_all"
+            | "select_ok"
+            | "try_select"
+    )
+}
+
+/// True if a candidate combinator `pattern` occurs in `code` as a genuine
+/// futures combinator call. For each occurrence of `pattern` (which ends in the
+/// `(` of the call), the full qualified path ending at that call is extracted by
+/// walking backward over the contiguous run of path bytes (identifier bytes and
+/// `:`), then matched exactly against [`is_allowed_combinator_path`]. A match
+/// whose path run is immediately preceded by `.` is a method call and is
+/// rejected. This is path-precise, so an unrelated helper of the same tail name
+/// under a different root (`crate::future::select(`, `my_dsl::select_all(`) is
+/// never flagged — mirroring the macro lint's exact-path matching (#980 P2).
+fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
     let bytes = code.as_bytes();
-    code.match_indices(pattern)
-        .any(|(pos, _)| pos == 0 || (bytes[pos - 1] != b'.' && !is_ident_byte(bytes[pos - 1])))
+    // `name_len` = pattern length minus the trailing `(`.
+    let name_len = pattern.len() - 1;
+    code.match_indices(pattern).any(|(pos, _)| {
+        // `name_end` is the byte index just past the last char of the call
+        // name (i.e. the position of the `(`).
+        let name_end = pos + name_len;
+        // Walk backward over the contiguous path run (ident bytes and `:`).
+        let mut run_start = pos;
+        while run_start > 0 {
+            let b = bytes[run_start - 1];
+            if is_ident_byte(b) || b == b':' {
+                run_start -= 1;
+            } else {
+                break;
+            }
+        }
+        // A `.` immediately before the path run is a method call — reject.
+        if run_start > 0 && bytes[run_start - 1] == b'.' {
+            return false;
+        }
+        let path = &code[run_start..name_end];
+        is_allowed_combinator_path(path)
+    })
 }
 
 /// DET011 macro patterns matched only at an identifier boundary — the select
@@ -867,8 +923,7 @@ fn matches_at_call_boundary(code: &str, pattern: &str) -> bool {
 /// HVG010 guardrail, which matches macro paths exactly and accepts those
 /// unrelated macros (#799 P2 review). A preceding `::` (as in `tokio::select!`
 /// / `futures::select!`), brace, whitespace, or line start is a boundary and
-/// still matches. Unlike [`DET011_CALL_BOUNDARY_PATTERNS`] there is no `.`
-/// exclusion (a `.select!` method-position macro call is not valid Rust).
+/// still matches.
 const DET011_MACRO_BOUNDARY_PATTERNS: &[&str] = &["select!", "select_biased!"];
 
 /// True if `pattern` occurs in `code` at an identifier boundary: the byte

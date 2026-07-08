@@ -1527,6 +1527,65 @@ fn det011_flags_bare_distinctive_combinators() {
 }
 
 #[test]
+fn det011_does_not_flag_qualified_non_futures_combinator_paths() {
+    // A qualified call whose full path is outside the futures allowed set must
+    // NOT be flagged — det_check now extracts the FULL path ending at the call
+    // and matches it exactly against the same set as the macro lint's
+    // `is_select_combinator_path`, so a same-tail-name helper under a different
+    // root is rejected exactly as the compile-time HVG010 guardrail rejects it
+    // (#980 Codex P2 review).
+    for call in [
+        "let _ = crate::future::select(a, b).await;",
+        "let _ = my_dsl::select_all(v);",
+        "let _ = foo::try_select(a, b);",
+        "let _ = bar::future::select_ok(v);",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "qualified non-futures path `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_flags_futures_qualified_and_short_form_combinators() {
+    // The `futures`-anchored qualified forms and their `future::…` short forms
+    // for every distinctive name must all be flagged (#980 Codex P2). Bare
+    // `select(` remains unflagged (deliberately not in the allowed set).
+    for call in [
+        "let _ = futures::future::select(a, b).await;",
+        "let _ = future::select(a, b).await;",
+        "let _ = futures::future::select_all(v).await;",
+        "let _ = future::select_all(v).await;",
+        "let _ = futures::future::select_ok(v).await;",
+        "let _ = future::select_ok(v).await;",
+        "let _ = futures::future::try_select(a, b).await;",
+        "let _ = future::try_select(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "futures combinator `{call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+    // Bare `select(...)` is deliberately NOT flagged.
+    let src = wf("let _ = select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "bare `select(..)` must NOT be flagged, got: {report:?}"
+    );
+}
+
+#[test]
 fn det011_does_not_flag_method_call_forms_of_combinators() {
     // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
     // free-function combinators — they must not be flagged, mirroring the AST
