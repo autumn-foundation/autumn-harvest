@@ -596,6 +596,33 @@ mod tests {
         assert!(matches!(err, HarvestError::UnknownPayloadCodec { .. }));
     }
 
+    #[test]
+    fn codec_envelope_survives_plain_event_serde_round_trip() {
+        // Mechanism behind `store::load_history_undecoded` (issue #608,
+        // PR #936 review): payload fields on `WorkflowEvent` are opaque
+        // `Value`s, so a stored non-identity envelope deserializes — and
+        // re-serializes — verbatim when no codec transform is applied. This
+        // is what lets the export handlers load an encrypted history without
+        // the strict identity-only decode erroring `UnknownPayloadCodec`.
+        let envelope = serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "kms-prod",
+            "data": "bm90LXJlYWwtY2lwaGVydGV4dA==",
+        });
+        let stored = serde_json::json!({
+            "type": "WorkflowCompleted",
+            "data": { "output": envelope },
+        });
+
+        let event: crate::event::WorkflowEvent =
+            serde_json::from_value(stored.clone()).expect("envelope must deserialize as-is");
+        let round_tripped = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            round_tripped, stored,
+            "an undecoded load must preserve the envelope byte-identical"
+        );
+    }
+
     // ── Tolerant read-path decode (issue #608) ────────────────────────────────
     //
     // `decode_value_lossy` / `decode_error_string_lossy` are the operator

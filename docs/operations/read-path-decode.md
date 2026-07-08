@@ -51,6 +51,17 @@ whole management API, not a new widening.
 | `GET /workflows/{id}/result` | `output` (JSONB) + `error` (TEXT) — both the zero-wait snapshot and the long-poll path |
 | `GET /workflows/{id}/history/export` | **`payload_policy=full` only** — a Redacted export never decodes (decoding only to redact would be pointless plaintext exposure) and writes no decode audit row |
 | `GET /admin/history/exports` | Same Full-only rule; one audit row per request across all export entries |
+
+Both export routes load the stored history **raw** (`store::load_history_undecoded`)
+rather than through the strict identity-only decode path, so an encrypted
+deployment can always export: with the flag off (or a non-admin caller) a
+Full export carries the stored envelopes verbatim — the same ciphertext the
+describe/history/SSE surfaces already show — and a Redacted export replaces
+each payload field wholesale (envelope included; its `payload_digest` hashes
+the stored, possibly-ciphertext bytes). Before this fix (PR #936 review) the
+strict loader failed the whole export with `UnknownPayloadCodec` before
+either policy could run. Identity-codec deployments store no envelopes, so
+their exports are byte-identical to before.
 | `GET /workflows/{id}` (describe) | execution `input`/`output`/`memo`/`search_attrs`/`error`, embedded history page, `last_completion_result`/`last_error` |
 | `GET /workflows/{id}/history` | each event's `data` payload |
 | `GET /workflows/{id}/stack` | pending-activity heartbeat checkpoints, plus a decoded `input` field on each pending activity that is present **only** when decoding is active for the request |

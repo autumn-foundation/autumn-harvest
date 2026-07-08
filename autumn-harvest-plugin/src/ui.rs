@@ -1075,6 +1075,7 @@ async fn workflow_detail_ui(
             .collect();
         decode_and_audit_workflow_detail(
             &api_state,
+            &mut conn,
             &headers,
             extension_session(maybe_session),
             exec_id,
@@ -1107,8 +1108,14 @@ async fn workflow_detail_ui(
 /// panel's activity inputs, heartbeat checkpoints, and signal payloads — then
 /// writes the page's single best-effort audit row when ≥1 envelope was
 /// touched. Operates on in-memory copies only; stored rows are untouched.
+///
+/// `conn` is the page handler's own (execution-shard) pooled connection —
+/// the audit row is written through it rather than acquiring a second
+/// connection while the caller's is still live (PR #936 review).
+#[allow(clippy::too_many_arguments)]
 async fn decode_and_audit_workflow_detail(
     api_state: &HarvestApiState,
+    conn: &mut AsyncPgConnection,
     headers: &axum::http::HeaderMap,
     session: Option<Session>,
     exec_id: HarvestExecutionId,
@@ -1135,6 +1142,7 @@ async fn decode_and_audit_workflow_detail(
     let target = exec_id.to_string();
     audit_decoded_read(
         api_state,
+        Some(conn),
         headers,
         TARGET_WORKFLOW,
         Some(&target),
@@ -1816,8 +1824,12 @@ async fn list_dead_letters_ui(
                 outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
             }
         }
+        // No live connection here: the per-shard DLQ loads are scoped inside
+        // their `_from_shards_for_ui` helpers, so the pool-acquiring branch
+        // is safe (PR #936 review).
         audit_decoded_read(
             &api_state,
+            None,
             &headers,
             TARGET_DEAD_LETTER,
             None,

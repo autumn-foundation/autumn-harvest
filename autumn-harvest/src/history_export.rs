@@ -1252,4 +1252,76 @@ mod tests {
         };
         let _ = exporter.handle_update_event(&event);
     }
+
+    // ── Codec-envelope-bearing histories (issue #608, PR #936 review) ─────────
+    //
+    // The export handlers load history *raw* (`store::load_history_undecoded`)
+    // so a non-identity codec envelope reaches `export_history` verbatim as an
+    // opaque `Value` inside the event's payload field. These tests pin the two
+    // downstream policy legs: Full passes the envelope through byte-identical
+    // (the read-path decoder — when active — decodes it afterwards), and
+    // Redacted replaces the payload field wholesale, envelope included,
+    // without ever needing a codec.
+
+    fn codec_envelope_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "aes-256-gcm",
+            "data": "bm90LXJlYWwtY2lwaGVydGV4dA==",
+        })
+    }
+
+    #[test]
+    fn full_history_export_preserves_codec_envelopes_verbatim() {
+        use crate::types::ExecutionId;
+
+        let envelope = codec_envelope_fixture();
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "encrypted_flow".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "COMPLETED".to_string(),
+            events: vec![WorkflowEvent::WorkflowCompleted {
+                output: envelope.clone(),
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+        })
+        .expect("an envelope-bearing history must export under Full");
+
+        assert_eq!(
+            document.events[0]["data"]["output"], envelope,
+            "Full export must carry the stored envelope byte-identical — \
+             decoding (or erroring) is the read-path decoder's job, not the export's"
+        );
+    }
+
+    #[test]
+    fn redacted_history_export_replaces_codec_envelopes_without_decoding() {
+        use crate::types::ExecutionId;
+
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "encrypted_flow".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "COMPLETED".to_string(),
+            events: vec![WorkflowEvent::WorkflowCompleted {
+                output: codec_envelope_fixture(),
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Redacted,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+        })
+        .expect("an envelope-bearing history must export under Redacted");
+
+        let json = serde_json::to_string(&document).expect("serialize");
+        assert!(
+            !json.contains("_harvest_codec_envelope") && !json.contains("bm90LXJlYWwt"),
+            "Redacted export must replace the payload field wholesale, envelope included: {json}"
+        );
+        assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
+    }
 }

@@ -3338,9 +3338,22 @@ pub(crate) fn extension_session(maybe_session: Option<Extension<Session>>) -> Op
 /// provenance is not header-derived: ui.rs call sites pass
 /// `Some(SOURCE_UI)` (matching every other audit row that file writes);
 /// API handlers pass `None` to keep the header-derived default.
+///
+/// # Connection discipline (PR #936 review)
+///
+/// `conn` is the caller's already-held pooled connection, when it has one:
+/// the audit row is written through it, mirroring how the SSE stream-open
+/// audit reuses its handler's connection. A caller passing `Some` **must**
+/// hold a connection to the shard named by `shard` (every such caller reads
+/// the execution through `db_conn_for_execution` and passes
+/// `exec_id.shard()`). A caller passing `None` **must not** hold a live
+/// pooled connection across this await — with a pool sized to one connection
+/// the second acquire would stall until the pool timeout and then silently
+/// skip the audit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn audit_decoded_read(
     api_state: &HarvestApiState,
+    conn: Option<&mut AsyncPgConnection>,
     headers: &axum::http::HeaderMap,
     target_type: &'static str,
     target_id: Option<&str>,
@@ -3352,13 +3365,14 @@ pub(crate) async fn audit_decoded_read(
     if !outcome.touched() {
         return;
     }
-    let Ok(pool) = api_state.storage_pool() else {
-        return;
-    };
-    let shard = shard.unwrap_or_else(|| pool.sharded_pool().default_shard());
-    let Ok(mut conn) = acquire_conn(pool.pool_for(shard)).await else {
-        return;
-    };
+    // The record's shard column: the explicit target shard, else the default
+    // shard the pool-acquiring branch below writes through.
+    let resolved_shard = shard.or_else(|| {
+        api_state
+            .storage_pool()
+            .ok()
+            .map(|pool| pool.sharded_pool().default_shard())
+    });
     let (actor, source, request_id) = audit_context(headers, api_state);
     let source = source_override.map_or(source, str::to_string);
     let record = NewAuditRecord {
@@ -3371,8 +3385,21 @@ pub(crate) async fn audit_decoded_read(
         idempotency_key: None,
         status: STATUS_SUCCEEDED,
         error_summary: None,
-        shard_id: Some(shard.as_i32()),
+        shard_id: resolved_shard.map(ShardId::as_i32),
         source: &source,
+    };
+    if let Some(conn) = conn {
+        let _ = audit::insert_audit(conn, &record).await;
+        return;
+    }
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Some(shard) = resolved_shard else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.pool_for(shard)).await else {
+        return;
     };
     let _ = audit::insert_audit(&mut conn, &record).await;
 }
@@ -5754,7 +5781,14 @@ async fn export_workflow_history(
         Ok(execution) => execution,
         Err(error) => return map_error(error).into_response(),
     };
-    let history = match store::load_history(&mut conn, exec_id).await {
+    // Load raw (codec-untransformed) history: the export policy is applied
+    // downstream — Redacted replaces payload fields wholesale (envelope
+    // included) and Full + read-path decoder decodes tolerantly — so the
+    // strict identity-only `load_history` must not pre-empt either with an
+    // `UnknownPayloadCodec` error on an encrypted deployment (PR #936
+    // review). Identity deployments store no envelopes, so this is
+    // byte-identical to the strict loader for them.
+    let history = match store::load_history_undecoded(&mut conn, exec_id).await {
         Ok(history) => history,
         Err(error) => return map_error(error).into_response(),
     };
@@ -5773,8 +5807,12 @@ async fn export_workflow_history(
                     outcome = outcome.merged(codecs.decode_value_lossy(event));
                 }
                 let target = exec_id.to_string();
+                // Reuse the handler's own (execution-shard) connection — a
+                // second pool acquire while it is live can stall a size-1
+                // pool (PR #936 review).
                 audit_decoded_read(
                     &api_state,
+                    Some(&mut conn),
                     &headers,
                     TARGET_WORKFLOW,
                     Some(&target),
@@ -5815,8 +5853,12 @@ async fn export_workflow_histories(
                         outcome = outcome.merged(codecs.decode_value_lossy(event));
                     }
                 }
+                // No live connection here: the per-shard export loads are
+                // scoped inside `load_history_exports_from_shards`, so the
+                // pool-acquiring branch is safe (PR #936 review).
                 audit_decoded_read(
                     &api_state,
+                    None,
                     &headers,
                     TARGET_WORKFLOW,
                     None,
@@ -5921,8 +5963,10 @@ async fn get_workflow(
             outcome = outcome.merged(decode_error_field(codecs, error));
         }
         let target = exec_id.to_string();
+        // Reuse the handler's own (execution-shard) connection (PR #936 review).
         audit_decoded_read(
             &api_state,
+            Some(&mut conn),
             &headers,
             TARGET_WORKFLOW,
             Some(&target),
@@ -6103,8 +6147,10 @@ async fn get_workflow_history(
             outcome = outcome.merged(codecs.decode_value_lossy(&mut entry.data));
         }
         let target = exec_id.to_string();
+        // Reuse the handler's own (execution-shard) connection (PR #936 review).
         audit_decoded_read(
             &api_state,
+            Some(&mut conn),
             &headers,
             TARGET_WORKFLOW,
             Some(&target),
@@ -6344,7 +6390,11 @@ async fn load_continue_as_new_successor(
     exec_id: ExecutionId,
 ) -> Result<Option<ExecutionId>, AutumnError> {
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
-    let history = store::load_history(&mut conn, exec_id)
+    // Raw (codec-untransformed) load: only the typed `new_exec_id` field is
+    // read here — never a payload field — so codec envelopes ride along as
+    // opaque `Value`s and an encrypted history cannot fail the `/result` /
+    // MCP status chain walk with `UnknownPayloadCodec` (PR #936 review).
+    let history = store::load_history_undecoded(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
     let successor = history.events.into_iter().find_map(|event| {
@@ -6383,8 +6433,12 @@ async fn respond_with_workflow_result(
         // (same logical run, same shard). Documented in the audit-contract
         // section of docs/operations/read-path-decode.md.
         let target = exec_id.to_string();
+        // No caller of this helper holds a live pooled connection at this
+        // point (the chain-walk helpers scope theirs internally), so the
+        // pool-acquiring branch is safe (PR #936 review).
         audit_decoded_read(
             api_state,
+            None,
             headers,
             TARGET_WORKFLOW,
             Some(&target),
@@ -7398,8 +7452,10 @@ async fn get_workflow_stack(
         // One best-effort audit row per stack read that decoded ≥1 envelope
         // (issue #608); audit_decoded_read no-ops on an untouched outcome.
         let target = exec_id.to_string();
+        // Reuse the handler's own (execution-shard) connection (PR #936 review).
         audit_decoded_read(
             &api_state,
+            Some(&mut conn),
             &headers,
             TARGET_WORKFLOW,
             Some(&target),
@@ -16483,8 +16539,12 @@ async fn list_dead_letters(
             outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut dl.error));
         }
+        // No live connection here: the per-shard DLQ loads are scoped inside
+        // `load_dead_letters_from_shards`, so the pool-acquiring branch is
+        // safe (PR #936 review).
         audit_decoded_read(
             &api_state,
+            None,
             &headers,
             TARGET_DEAD_LETTER,
             None,
@@ -19322,7 +19382,11 @@ async fn export_history_candidate(
             return;
         }
     };
-    let history = match store::load_history(&mut conn, exec_id).await {
+    // Raw (codec-untransformed) load, mirroring the single-execution export
+    // handler: the batch export applies the same downstream payload policy,
+    // so an encrypted history must not fail the whole entry with
+    // `UnknownPayloadCodec` before that policy runs (PR #936 review).
+    let history = match store::load_history_undecoded(&mut conn, exec_id).await {
         Ok(history) => history,
         Err(error) => {
             work.failures.push(HistoryExportFailure {

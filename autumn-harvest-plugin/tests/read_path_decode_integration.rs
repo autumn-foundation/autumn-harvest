@@ -469,7 +469,9 @@ async fn append_events(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) {
-    let history = store::load_history(conn, exec_id).await.unwrap();
+    // Raw load: the seeded history may already carry non-identity envelopes,
+    // which the strict identity-only `load_history` would refuse to load.
+    let history = store::load_history_undecoded(conn, exec_id).await.unwrap();
     store::append_events(conn, exec_id, events, history.next_event_id)
         .await
         .expect("append events");
@@ -1312,5 +1314,135 @@ async fn read_with_decode_leaves_stored_rows_untouched() {
     assert_eq!(
         completed["data"]["output"], output_envelope,
         "stored event payload must remain ciphertext byte-for-byte"
+    );
+}
+
+/// PR #936 review (P1): the export path must load history *raw* so an
+/// encrypted deployment can still export with the flag off — the stored
+/// envelopes ride along verbatim (the same ciphertext describe/history/SSE
+/// already surface) instead of the whole export failing `UnknownPayloadCodec`
+/// before any policy runs. No decode happened, so no decode-audit row either.
+#[tokio::test]
+async fn history_export_flag_off_returns_stored_envelopes_verbatim() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_flag_off_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "export-flag-off", json!({})).await;
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: envelope_for(&json!({"pii": "pii-alpha"})),
+        }],
+    )
+    .await;
+    mark_completed(&mut conn, exec_id, json!(null)).await;
+
+    // Full: envelopes pass through byte-identical (ciphertext, no plaintext).
+    let (status, bytes) = get_raw(
+        &app,
+        &format!("/workflows/{exec_id}/history/export?payload_policy=full"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an encrypted history must still export with the flag off"
+    );
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body.contains("_harvest_codec_envelope"),
+        "flag-off full export must carry the stored envelope verbatim: {body}"
+    );
+    assert!(
+        !body.contains("pii-alpha"),
+        "flag-off full export must never contain plaintext: {body}"
+    );
+
+    // Redacted: the payload field is replaced wholesale — no envelope, no
+    // plaintext — without ever needing a codec.
+    let (status, bytes) = get_raw(
+        &app,
+        &format!("/workflows/{exec_id}/history/export?payload_policy=redacted"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        !body.contains("_harvest_codec_envelope") && !body.contains("pii-alpha"),
+        "flag-off redacted export must carry neither envelope nor plaintext: {body}"
+    );
+
+    let audit = decode_audit_rows(&mut conn).await;
+    assert!(
+        audit.is_empty(),
+        "flag-off exports must not write payload.decode_read audit rows: {audit:?}"
+    );
+}
+
+/// PR #936 review (P2): the decode audit row is written through the caller's
+/// already-held connection. With a pool sized to exactly one connection, a
+/// decoded read that acquired a *second* connection for the audit would stall
+/// until the pool timeout and silently skip the row — so this pins both the
+/// prompt 200 and the audit row's presence under a size-1 pool.
+#[tokio::test]
+async fn decode_audit_reuses_callers_connection_under_single_connection_pool() {
+    let (url, _container) = setup_database().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool should build");
+    let app = build_decode_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "single-conn-pool", json!({})).await;
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: envelope_for(&json!({"pii": "pii-alpha"})),
+        }],
+    )
+    .await;
+    mark_completed(
+        &mut conn,
+        exec_id,
+        envelope_for(&json!({"pii": "pii-alpha"})),
+    )
+    .await;
+
+    // Exercise every surface whose handler holds its read connection across
+    // the decode-audit await (describe, /history, /history/export, /stack).
+    let deadline = std::time::Duration::from_secs(10);
+    for uri in [
+        format!("/workflows/{exec_id}"),
+        format!("/workflows/{exec_id}/history"),
+        format!("/workflows/{exec_id}/history/export?payload_policy=full"),
+        format!("/workflows/{exec_id}/stack"),
+    ] {
+        let (status, bytes) = tokio::time::timeout(deadline, get_raw(&app, &uri))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("decoded read of {uri} stalled — audit must reuse the caller's connection")
+            });
+        assert_eq!(status, StatusCode::OK, "read {uri}");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("_harvest_codec_envelope"),
+            "decoded read of {uri} must not leak the envelope: {body}"
+        );
+    }
+
+    // The audit rows landed (they were not silently skipped on a pool stall):
+    // describe, /history, and the export each decoded ≥1 envelope. (/stack
+    // found none for this fixture — its predicate keeps it audit-silent.)
+    let audit = decode_audit_rows(&mut conn).await;
+    assert_eq!(
+        audit.len(),
+        3,
+        "one decode-audit row per decoding read must land: {audit:?}"
     );
 }
