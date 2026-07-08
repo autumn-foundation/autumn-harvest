@@ -82,6 +82,37 @@ async fn checkout(ctx: &WorkflowContext, order: Order) -> Result<(), String> {
 without running compensations.  Use it for fast-exit points where no
 compensations are registered yet.
 
+### Known limitation — durable compensations cannot run after cancellation
+
+Once the `WorkflowCancelled` event is recorded in history, a compensation
+that dispatches an activity (`ctx.execute_activity_raw(...)` inside the
+compensation closure, as in the example above) **cannot actually run**: the
+cancel event has no workflow-command counterpart, so the compensation's
+dispatch diverges (`expected ActivityScheduled(..), got WorkflowCancelled`)
+and the unwind fails with `SagaCompensationFailed` instead of scheduling the
+activity.  This is a **pre-existing engine limitation** — verified empirically
+against pre-#801 builds, where the identical flow fails with the identical
+error — and is consistent with cancellation being a *terminal seal*: the
+engine will not schedule new durable work for a CANCELLED execution.
+
+Consequences for the cancel-and-compensate branch specifically:
+
+- **In-memory compensation closures run fine** after cancellation (the
+  canonical pattern locked in by `saga_compensate_all_on_cancel_pattern`).
+- A **durable** compensation in the cancel branch fails the unwind; the
+  workflow observes `SagaCompensationFailed`, and the
+  `harvest.saga.compensation_failed` page fires — correctly, since the state
+  is genuinely dangling.  Remediation is manual reconciliation (or reset,
+  issue #148), the same as any durable-compensation failure.
+- Durable compensations in the **step-failure rollback path**
+  (`rollback_after`, triggered by a forward step's error while the run is
+  still live) are unaffected — the limitation is specific to unwinding after
+  a recorded `WorkflowCancelled`.
+
+Pinned by
+`known_limitation_durable_compensation_after_recorded_cancel_fails_and_is_counted`
+in `tests/integration/saga_tests.rs`.
+
 ---
 
 ## Idempotency contract
@@ -197,6 +228,17 @@ dashboards never divide by zero or exceed 100%). Two concrete consequences:
   not a live unwind: the observe layer suppresses the frontier arms in probe
   contexts, so old cancelled histories are never counted retroactively and
   the strict replayer never sees a fresh marker command.
+- **Cancel + durable compensation** (round-3 review): the marker
+  transparency is saga-marker-local — `match_activity` still (and
+  deliberately) diverges on the unconsumed `WorkflowCancelled`, so a
+  cancel-branch unwind whose compensations are activity-backed fails at its
+  first dispatch (the pre-existing limitation documented in the
+  cancellation section above; baseline-identical on pre-#801 builds). Such
+  an unwind counts **both** `compensated` (it began) and
+  `compensation_failed` (it failed) — the truthful pair, and precisely the
+  dangling-state page the failure counter exists for. The counted-but-
+  cannot-proceed combination is therefore not a metric bug: the alert that
+  fires is the correct one.
 
 **Accepted edges** (documented deliberately):
 
@@ -255,6 +297,7 @@ lock in these semantics:
 | `trailing_unawaited_signal_does_not_suppress_the_failure_counter` | A counted unwind's failure fires exactly once even with a trailing un-awaited signal at the failed-unwind end (post-review P2-1) |
 | `signal_with_start_shape_keeps_the_failed_counter_coupled_to_compensated` | An uncounted (drained-signal-frontier) unwind's failure stays uncounted — `failed ≤ compensated` holds per unwind (post-review P2-2) |
 | `two_saga_unwinds_in_one_workflow_count_independently` | Two compensation sequences in one workflow allocate distinct seq markers and each count exactly once |
+| `known_limitation_durable_compensation_after_recorded_cancel_fails_and_is_counted` | A durable (activity-backed) compensation after a recorded `WorkflowCancelled` fails at dispatch (pre-existing engine limitation, baseline-identical on pre-#801 builds) and the unwind truthfully counts both `compensated` and `compensation_failed` |
 
 ---
 

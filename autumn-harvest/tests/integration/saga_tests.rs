@@ -1343,3 +1343,121 @@ async fn two_saga_unwinds_in_one_workflow_count_independently() {
     );
     assert!(marker_command_names(&ctx2.drain_commands()).is_empty());
 }
+
+/// Known pre-existing engine limitation, pinned (round-3 Codex review of
+/// PR #973): a **durable (activity-backed) compensation cannot run once a
+/// `WorkflowCancelled` event is recorded in history** — the cancel event has
+/// no workflow-command counterpart and is never consumed by `match_activity`,
+/// so the compensation's `execute_activity_raw` dispatch diverges
+/// (`expected ActivityScheduled(..), got WorkflowCancelled`) instead of
+/// scheduling the activity.
+///
+/// **This is NOT introduced by issue #801.** Verified empirically on pristine
+/// `trunk-dev` (pre-#801, 2026-07-08): the identical flow fails with the
+/// byte-identical error —
+/// `SagaCompensationFailed { compensation_errors: ["non-deterministic
+/// replay: activity mismatch: expected ActivityScheduled(cancel_flight),
+/// got WorkflowCancelled"] }` — `match_activity`/`execute_activity_raw`
+/// are untouched by the #801 branch. Only **in-memory** compensation
+/// closures can actually execute after cancellation (the canonical
+/// `saga_compensate_all_on_cancel_pattern` above).
+///
+/// What #801 adds on top is deliberate and truthful: the unwind **began**
+/// (counted at unwind start — `harvest.saga.compensated`) and **failed**
+/// (`harvest.saga.compensation_failed`, the page-severity dangling-state
+/// signal), which is exactly the alert an operator needs, because the
+/// compensations genuinely did not run and the state IS dangling.
+/// Suppressing the count at a cancel frontier instead would (a) be
+/// impossible to scope — closures are opaque, so unwind-start cannot know a
+/// compensation is durable — and (b) uncount the working in-memory
+/// cancel-and-compensate population (regressing the mutant-k fix).
+#[tokio::test]
+async fn known_limitation_durable_compensation_after_recorded_cancel_fails_and_is_counted() {
+    async fn cancel_and_compensate_flow(ctx: &WorkflowContext) -> HarvestResult<()> {
+        let mut saga = Saga::new(ctx);
+        let flight: Value = saga
+            .step(
+                || async {
+                    ctx.execute_activity_raw("book_flight", Value::Null, "default")
+                        .await
+                },
+                move |fid: Value| async move {
+                    ctx.execute_activity_raw("cancel_flight", fid, "default")
+                        .await
+                        .map(|_| ())
+                },
+            )
+            .await?;
+        assert_eq!(flight, serde_json::json!("flight-1"));
+        assert!(ctx.is_cancelled());
+        saga.compensate_all().await
+    }
+
+    let book_id = autumn_harvest::types::ActivityExecId::new();
+    let history = {
+        let mut events = started_history();
+        events.extend([
+            WorkflowEvent::ActivityScheduled {
+                activity_id: book_id,
+                name: "book_flight".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: book_id,
+                output: serde_json::json!("flight-1"),
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator shutdown".into(),
+            },
+        ]);
+        events
+    };
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(history, Arc::clone(&recorder));
+    // The dispatch diverges immediately (never suspends) — bound the await so
+    // a future behavior change toward a forever-park fails loudly here.
+    let result = tokio::time::timeout(Duration::from_millis(500), cancel_and_compensate_flow(&ctx))
+        .await
+        .expect("a post-cancel durable compensation must fail fast, not suspend");
+
+    let err = result.expect_err("durable compensation after a recorded cancel cannot run");
+    match &err {
+        HarvestError::SagaCompensationFailed {
+            compensation_errors,
+            ..
+        } => {
+            assert_eq!(compensation_errors.len(), 1);
+            assert!(
+                compensation_errors[0]
+                    .contains("expected ActivityScheduled(cancel_flight), got WorkflowCancelled"),
+                "the failure is the pre-existing post-cancel dispatch divergence \
+                 (baseline-identical to trunk-dev), got: {}",
+                compensation_errors[0]
+            );
+        }
+        other => panic!("expected SagaCompensationFailed, got {other:?}"),
+    }
+
+    // The truthful counter pair: the unwind began (compensated) and failed
+    // (compensation_failed — the dangling-state page). `failed ≤ compensated`
+    // holds; both dedup markers ride the (discarded-for-a-sealed-run) batch.
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATED),
+        1,
+        "the unwind began — counted at unwind start by design"
+    );
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATION_FAILED),
+        1,
+        "the unwind failed — the dangling-state page must fire, because the \
+         compensations genuinely did not run"
+    );
+    assert_eq!(
+        marker_command_names(&ctx.drain_commands()),
+        vec![
+            "saga_compensated:1".to_owned(),
+            "saga_compensation_failed:1".to_owned(),
+        ]
+    );
+}
