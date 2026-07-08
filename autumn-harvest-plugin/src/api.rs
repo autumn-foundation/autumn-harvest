@@ -8380,8 +8380,24 @@ pub(crate) async fn start_workflow(
             .into_response();
         }
         // Fail fast on an oversized input rather than persisting a pending row
-        // that would fail at fire time on every scanner tick.
-        if effective_wf_cap > 0 {
+        // that would fail at fire time on every scanner tick. Skipped when
+        // `reserve_or_defer` would resolve this call via `Bypassed` (an
+        // active execution already satisfies the reuse policy) or an
+        // idempotent attach to an already-pending row -- neither inserts a
+        // fresh row, so a retry carrying a stale/oversized body must not be
+        // rejected (code-review fix, issue #607).
+        let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+            &mut conn,
+            &workflow_name,
+            &workflow_id,
+            request.reuse_policy.as_deref(),
+        )
+        .await
+        {
+            Ok(skip) => skip,
+            Err(e) => return map_error(e).into_response(),
+        };
+        if !skip_cap_check && effective_wf_cap > 0 {
             let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
             if observed > effective_wf_cap {
                 let ar = NewAuditRecord {
@@ -9254,8 +9270,33 @@ async fn batch_start_workflows(
                 // Fail fast on an oversized input rather than persisting a
                 // pending row that would fail at fire time on every scanner
                 // tick (code-review fix, issue #607): mirrors the single-start
-                // throttle path's early cap check.
-                if effective_wf_cap > 0 {
+                // throttle path's early cap check. Skipped when
+                // `reserve_or_defer` would resolve via `Bypassed` or an
+                // idempotent attach to an already-pending row -- neither
+                // inserts a fresh row, so a retry with a stale/oversized body
+                // must not be rejected.
+                let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+                    &mut conn,
+                    &item.workflow_name,
+                    workflow_id,
+                    None,
+                )
+                .await
+                {
+                    Ok(skip) => skip,
+                    Err(e) => {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: None,
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                };
+                if !skip_cap_check && effective_wf_cap > 0 {
                     let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                     if observed > effective_wf_cap {
                         rejected_count += 1;
@@ -15676,6 +15717,145 @@ async fn schedule_backfill(
                     continue;
                 }
 
+                // Start-throttle admission (issue #607): pace backfill admissions,
+                // defer the excess rather than admitting an entire backfill window
+                // at once. A deferred slot counts as dispatched (the timestamp is
+                // consumed; schedule_id/scheduled_for/origin=backfill are persisted
+                // so carryover (#488) and run-history (#534) lineage survive the
+                // deferral) and is admitted later by the throttle scanner. Mirrors
+                // `tick_one_workflow_schedule`'s throttle block (scheduler.rs) and
+                // the size-check-ordering fix applied there and at the other three
+                // call sites (issue #607 round 4).
+                let mut backfill_throttle_bucket: Option<String> = None;
+                if let Some((throttle_policy, resolved_throttle_key)) =
+                    workflow_resolving_throttle(&runtime.registry, &wf_name, &input)
+                {
+                    let effective_cap = runtime
+                        .registry
+                        .workflows
+                        .get(&wf_name)
+                        .and_then(|info| info.max_input_bytes)
+                        .map_or(runtime.registry.max_workflow_input_bytes, |per| {
+                            per.max(runtime.registry.max_workflow_input_bytes)
+                        });
+                    let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+                        &mut conn,
+                        &wf_name,
+                        &workflow_id,
+                        Some("reject_duplicate"),
+                    )
+                    .await
+                    {
+                        Ok(skip) => skip,
+                        Err(e) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: e.to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    if !skip_cap_check && effective_cap > 0 {
+                        let observed =
+                            serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                        if observed > effective_cap {
+                            skipped += 1;
+                            *skipped_reasons
+                                .entry("oversized_input".to_string())
+                                .or_insert(0) += 1;
+                            continue;
+                        }
+                    }
+                    let effective_retry = schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| {
+                            serde_json::from_value::<autumn_harvest::policy::RetryPolicy>(v.clone())
+                                .ok()
+                        })
+                        .or_else(|| {
+                            runtime
+                                .registry
+                                .workflows
+                                .get(&wf_name)
+                                .and_then(|info| info.retry_policy.clone())
+                        })
+                        .and_then(|p| serde_json::to_value(&p).ok());
+                    let start_options = autumn_harvest::debounce::DebounceStartOptions {
+                        reuse_policy: Some("reject_duplicate".to_string()),
+                        execution_timeout_secs: None,
+                        memo: None,
+                        search_attrs: None,
+                        sla_secs: sla.map(|d| d.num_seconds()),
+                        context_headers: None,
+                        priority: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
+                        owner: owner.map(str::to_string),
+                        runbook_url: runbook_url.map(str::to_string),
+                        severity: severity.map(str::to_string),
+                        max_execution_timeout_ceiling_secs: None,
+                        max_workflow_input_bytes: Some(effective_cap),
+                        trace_context: None,
+                        workflow_retry_policy: effective_retry,
+                        max_workflow_attempts_ceiling: runtime
+                            .registry
+                            .max_workflow_attempts_ceiling,
+                        completion_callbacks: None,
+                        schedule_id: Some(schedule_id),
+                        scheduled_for: Some(*original_slot),
+                        origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL.to_string()),
+                    };
+                    match autumn_harvest::throttle::reserve_or_defer(
+                        &mut conn,
+                        autumn_harvest::throttle::AdmitThrottleParams {
+                            workflow_name: &wf_name,
+                            throttle_key: &resolved_throttle_key,
+                            workflow_id: &workflow_id,
+                            queue_name: dispatch_queue,
+                            input: input.clone(),
+                            start_options,
+                            refill_per_sec: throttle_policy.refill_per_sec,
+                            burst: throttle_policy.burst,
+                            schedule_to_start: throttle_policy.schedule_to_start,
+                            shard_id: runtime.router.default_shard().as_i32(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(_)) => {
+                            runtime
+                                .registry
+                                .telemetry()
+                                .metrics
+                                .record_start_throttled(&wf_name);
+                            dispatched += 1;
+                            dispatched_this_call += 1;
+                            continue;
+                        }
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved {
+                            bucket_key,
+                        }) => {
+                            backfill_throttle_bucket = Some(bucket_key);
+                            // Fall through to the normal start below, on the same
+                            // connection.
+                        }
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                            // Active execution already resolves this reuse policy
+                            // as a no-op; no token reserved, fall through.
+                        }
+                        Err(e) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: e.to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    }
+                }
+
                 let result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -15742,12 +15922,26 @@ async fn schedule_backfill(
                         dispatched_this_call += 1;
                     }
                     Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
+                        // AC-a: an id-reuse short-circuit consumed no admission —
+                        // refund the reserved throttle token, if any was reserved.
+                        if let Some(ref bucket) = backfill_throttle_bucket {
+                            let _ =
+                                autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
+                                    .await;
+                        }
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(e) => {
+                        // No run admitted — refund the reserved throttle token
+                        // before propagating the failure.
+                        if let Some(ref bucket) = backfill_throttle_bucket {
+                            let _ =
+                                autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
+                                    .await;
+                        }
                         shard_failures.push(BackfillShardFailure {
                             shard_id: 0,
                             reason: e.to_string(),

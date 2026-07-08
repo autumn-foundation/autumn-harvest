@@ -2812,8 +2812,17 @@ async fn tick_one_workflow_schedule(
                 // non-throttled path's `return Err(error)` a few lines below:
                 // `dispatched`/`last_dispatched_at`/`last_original_slot_dispatched`
                 // are never touched, so `last_run_at` is not advanced and the
-                // next tick retries the same firing.
-                if effective_cap > 0 {
+                // next tick retries the same firing. Skipped when
+                // `reserve_or_defer` would resolve via `Bypassed` or an
+                // idempotent attach to an already-pending row.
+                let skip_cap_check = crate::throttle::skip_size_check(
+                    conn,
+                    wf_name,
+                    &workflow_id,
+                    Some("reject_duplicate"),
+                )
+                .await?;
+                if !skip_cap_check && effective_cap > 0 {
                     let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                     if observed > effective_cap {
                         return Err(crate::error::HarvestError::PayloadTooLarge {
@@ -3859,8 +3868,17 @@ async fn drain_buffered_schedule_runs(
                     // scanner tick. `break` (not `return Err`) matches this
                     // loop's own failure-handling convention below: drop this
                     // and any remaining buffered slots this tick rather than
-                    // retrying a permanently-failing input forever.
-                    if effective_cap > 0 {
+                    // retrying a permanently-failing input forever. Skipped
+                    // when `reserve_or_defer` would resolve via `Bypassed` or
+                    // an idempotent attach to an already-pending row.
+                    let skip_cap_check = crate::throttle::skip_size_check(
+                        conn,
+                        wf_name,
+                        &workflow_id,
+                        Some("reject_duplicate"),
+                    )
+                    .await?;
+                    if !skip_cap_check && effective_cap > 0 {
                         let observed =
                             serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                         if observed > effective_cap {

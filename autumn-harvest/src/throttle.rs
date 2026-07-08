@@ -487,6 +487,105 @@ async fn insert_pending_throttle_row(
     Ok(())
 }
 
+/// Whether an active execution for `(workflow_name, workflow_id)` already
+/// makes a throttle admission a no-op or an immediate reject under `reuse_policy`.
+///
+/// `AllowDuplicate`/`RejectDuplicate` bypass unconditionally against any
+/// existing state; `AllowDuplicateFailedOnly` bypasses unless the existing row
+/// is FAILED/CANCELLED (a genuine fresh start); `TerminateIfRunning` never
+/// bypasses (it always starts fresh: cancel + replace).
+///
+/// Extracted out of [`reserve_or_defer`] so both it and callers deciding
+/// whether to apply a *different* admission-time check (e.g. the workflow
+/// input byte-cap) can ask the identical question without duplicating the
+/// lookup or the reuse-policy matching.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn resolve_bypass(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    reuse_policy: crate::types::WorkflowIdReusePolicy,
+) -> crate::error::HarvestResult<bool> {
+    if matches!(
+        reuse_policy,
+        crate::types::WorkflowIdReusePolicy::TerminateIfRunning
+    ) {
+        return Ok(false);
+    }
+    let Some(existing) =
+        crate::execution::try_load_by_key(conn, workflow_name, workflow_id).await?
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        reuse_policy,
+        crate::types::WorkflowIdReusePolicy::AllowDuplicate
+            | crate::types::WorkflowIdReusePolicy::RejectDuplicate
+    ) || (reuse_policy == crate::types::WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        && !matches!(existing.state.as_str(), "FAILED" | "CANCELLED")))
+}
+
+/// Whether a pending throttle row already exists for this exact
+/// `(workflow_name, workflow_id)`, regardless of which bucket/key it was filed under.
+///
+/// A thin boolean wrapper over [`existing_pending_throttle_for_workflow_id`]
+/// for callers that only need the yes/no answer (e.g. deciding whether to
+/// apply the workflow input byte-cap), not the full [`ThrottleDeferOutcome`].
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn has_pending_throttle_for_workflow_id(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> crate::error::HarvestResult<bool> {
+    Ok(
+        existing_pending_throttle_for_workflow_id(conn, workflow_name, workflow_id)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Whether the fresh-deferral workflow-input byte-cap check should be
+/// *skipped* for this `(workflow_name, workflow_id)` under `reuse_policy_str`.
+///
+/// `reuse_policy_str` is the same wire-format string `AdmitThrottleParams`/
+/// `DebounceStartOptions` use, parsed via [`crate::debounce::parse_reuse_policy`],
+/// defaulting to `AllowDuplicate` when unset or unrecognized — identical to
+/// [`reserve_or_defer`]'s own parsing.
+///
+/// A caller applying a byte-cap check *before* ever calling [`reserve_or_defer`]
+/// (code-review fix, issue #607) must not reject a retry that
+/// [`reserve_or_defer`] would resolve via [`ThrottleAdmission::Bypassed`] (an
+/// active execution already satisfies the reuse policy) or via an idempotent
+/// attach to an already-pending row — neither case inserts a fresh row, so
+/// the cap must not apply to either. Composes [`resolve_bypass`] and
+/// [`has_pending_throttle_for_workflow_id`], the same two primitives
+/// [`reserve_or_defer`] itself now uses for its own steps (0) and (1), so
+/// there is exactly one implementation of each question.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn skip_size_check(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    reuse_policy_str: Option<&str>,
+) -> crate::error::HarvestResult<bool> {
+    let reuse_policy = reuse_policy_str
+        .and_then(crate::debounce::parse_reuse_policy)
+        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
+    if resolve_bypass(conn, workflow_name, workflow_id, reuse_policy).await? {
+        return Ok(true);
+    }
+    has_pending_throttle_for_workflow_id(conn, workflow_name, workflow_id).await
+}
+
 /// Reserve a token for a start, or durably defer it when the bucket is empty.
 ///
 /// The admission primitive shared by every producer (HTTP start, batch, and the
@@ -544,22 +643,8 @@ pub async fn reserve_or_defer(
         .as_deref()
         .and_then(crate::debounce::parse_reuse_policy)
         .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
-    if !matches!(
-        reuse_policy,
-        crate::types::WorkflowIdReusePolicy::TerminateIfRunning
-    ) && let Some(existing) =
-        crate::execution::try_load_by_key(conn, params.workflow_name, params.workflow_id).await?
-    {
-        let bypass = matches!(
-            reuse_policy,
-            crate::types::WorkflowIdReusePolicy::AllowDuplicate
-                | crate::types::WorkflowIdReusePolicy::RejectDuplicate
-        ) || (reuse_policy
-            == crate::types::WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-            && !matches!(existing.state.as_str(), "FAILED" | "CANCELLED"));
-        if bypass {
-            return Ok(ThrottleAdmission::Bypassed);
-        }
+    if resolve_bypass(conn, params.workflow_name, params.workflow_id, reuse_policy).await? {
+        return Ok(ThrottleAdmission::Bypassed);
     }
 
     let key = bucket_key(params.workflow_name, params.throttle_key);

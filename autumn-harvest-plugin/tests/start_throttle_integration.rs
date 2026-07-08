@@ -26,6 +26,8 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use diesel::sql_types::{Jsonb, Text, Uuid as SqlUuid};
+use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
@@ -80,7 +82,19 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
     ),
     "\n",
+    // issue #607 round 4 backfill tests: harvest_schedules_kind_check, needed
+    // before inserting a workflow-kind schedule row.
+    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    // issue #607 round 4 backfill tests: harvest_schedules.jitter_secs / overlap_policy
+    // / buffered_runs / buffer_all_max, needed to insert a workflow-kind schedule row.
+    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
+    ),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
@@ -107,6 +121,13 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    // issue #607 round 4 backfill tests: harvest_schedules.consecutive_failure_limit
+    // / consecutive_failure_count / auto_paused_at, needed to insert a workflow-kind
+    // schedule row.
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
+    ),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
@@ -321,6 +342,184 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (status, json)
+}
+
+/// A raw (non-pooled) connection for direct schedule-row insertion and
+/// assertion queries that the HTTP surface has no endpoint for.
+async fn raw_connect(url: &str) -> diesel_async::AsyncPgConnection {
+    diesel_async::AsyncPgConnection::establish(url)
+        .await
+        .expect("raw connection should establish")
+}
+
+/// Insert a due, workflow-kind (non-DAG), `interval`-scheduled row so a
+/// backfill request has real slots to plan. `workflow_input` is fixed for
+/// the whole schedule, so every planned slot resolves to the *same*
+/// throttle key -- deliberately, so a single schedule can exercise pacing
+/// across a burst of backfilled slots.
+async fn insert_workflow_schedule(
+    conn: &mut diesel_async::AsyncPgConnection,
+    wf_name: &str,
+    input: Value,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules \
+         (id, workflow_name, schedule_expr, timezone, catchup, max_active_runs, \
+          is_paused, jitter_secs, overlap_policy, buffered_runs, buffer_all_max, \
+          skip_policy, workflow_input) \
+         VALUES ($1, $2, 'interval:3600', 'UTC', false, 10, false, 0, 'skip', \
+          '[]'::jsonb, 0, 'skip', $3)",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(wf_name)
+    .bind::<Jsonb, _>(input)
+    .execute(conn)
+    .await
+    .expect("insert workflow schedule");
+    id
+}
+
+async fn execution_count(conn: &mut diesel_async::AsyncPgConnection, wf_name: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE workflow_name = $1",
+    )
+    .bind::<Text, _>(wf_name)
+    .get_result::<Count>(conn)
+    .await
+    .expect("count executions")
+    .count
+}
+
+async fn throttle_row_count(conn: &mut diesel_async::AsyncPgConnection, wf_name: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_start_throttle WHERE workflow_name = $1",
+    )
+    .bind::<Text, _>(wf_name)
+    .get_result::<Count>(conn)
+    .await
+    .expect("count throttle rows")
+    .count
+}
+
+/// Issue #607 round 4: `schedule_backfill`'s workflow branch previously
+/// admitted every backfilled slot immediately, bypassing throttle pacing
+/// entirely -- an operator backfilling hundreds of slots for a throttled
+/// workflow got them all admitted at once. Verifies the fix: burst = 2
+/// against 5 planned hourly slots admits exactly 2 executions immediately
+/// and durably defers the remaining 3 as pending throttle rows (each
+/// counted in `skipped_reasons["throttled"]`, per the scheduler-tick
+/// precedent where a deferred fire still counts as "dispatched" -- the
+/// slot was consumed, just not admitted yet).
+#[tokio::test]
+async fn schedule_backfill_paces_admissions_and_defers_the_excess() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 2.0));
+    let mut conn = raw_connect(&url).await;
+
+    let schedule_id =
+        insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
+
+    let now = chrono::Utc::now();
+    let from = now - chrono::Duration::hours(4);
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/backfill"),
+        json!({ "from": from, "to": now }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "backfill request: {body:?}");
+    assert_eq!(
+        body["total"],
+        json!(5),
+        "5 hourly slots from `from` to `to` inclusive: {body:?}"
+    );
+    assert_eq!(
+        body["dispatched"],
+        json!(5),
+        "every slot is consumed (started immediately or durably deferred): {body:?}"
+    );
+    assert_eq!(body["failed"], json!(0), "{body:?}");
+    assert_eq!(body["skipped"], json!(0), "{body:?}");
+
+    let real_executions = execution_count(&mut conn, "sync_tenant").await;
+    assert_eq!(
+        real_executions, 2,
+        "only burst=2 slots should have started immediately, the rest deferred"
+    );
+    let pending_rows = throttle_row_count(&mut conn, "sync_tenant").await;
+    assert_eq!(
+        pending_rows, 3,
+        "the remaining 3 slots must be durable pending throttle rows, not admitted"
+    );
+}
+
+/// Issue #607 round 4: an oversized backfilled slot must be skipped (not
+/// durably deferred into a pending row that could never successfully fire)
+/// -- mirroring the fix already applied to the single-start, batch, and
+/// scheduler-tick call sites.
+#[tokio::test]
+async fn schedule_backfill_skips_oversized_input_before_deferring() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // burst = 1 drains on the first (only) slot, so the oversized input
+    // hits an empty bucket and -- absent the fix -- would be durably
+    // deferred rather than skipped.
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    let oversized_input = json!({
+        "tenant_id": "acme",
+        "payload": "x".repeat(3 * 1024 * 1024),
+    });
+    let schedule_id = insert_workflow_schedule(&mut conn, "sync_tenant", oversized_input).await;
+
+    let now = chrono::Utc::now();
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/backfill"),
+        json!({ "from": now, "to": now }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "backfill request: {body:?}");
+    assert_eq!(body["total"], json!(1), "{body:?}");
+    assert_eq!(
+        body["dispatched"],
+        json!(0),
+        "the oversized slot must not be counted as dispatched: {body:?}"
+    );
+    assert_eq!(
+        body["skipped"],
+        json!(1),
+        "the oversized slot must be skipped, not deferred: {body:?}"
+    );
+    let reasons = body["skipped_reasons"]
+        .as_object()
+        .expect("skipped_reasons object");
+    assert_eq!(
+        reasons.get("oversized_input"),
+        Some(&json!(1)),
+        "skip reason must name the byte-cap violation: {body:?}"
+    );
+
+    let real_executions = execution_count(&mut conn, "sync_tenant").await;
+    assert_eq!(real_executions, 0, "no execution should have started");
+    let pending_rows = throttle_row_count(&mut conn, "sync_tenant").await;
+    assert_eq!(
+        pending_rows, 0,
+        "no pending throttle row should exist for the oversized slot"
+    );
 }
 
 #[tokio::test]

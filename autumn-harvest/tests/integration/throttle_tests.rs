@@ -1257,6 +1257,118 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
     );
 }
 
+// ── `skip_size_check` ordering fix (issue #607 round 4) ─────────────────────
+//
+// Round 3 added an early oversized-input rejection at 4 call sites, running
+// *before* `reserve_or_defer` is ever called. That meant it could not see
+// either of `reserve_or_defer`'s own two idempotent-retry shortcuts --
+// `Bypassed` (an active execution already satisfies the reuse policy) or an
+// idempotent attach to an already-pending row -- so a retry carrying a
+// stale/oversized body for an already-active or already-pending workflow_id
+// was wrongly rejected with a size error instead of correctly resolving to
+// the existing execution/pending row. `skip_size_check` is the shared
+// primitive extracted so every call site can ask "would `reserve_or_defer`
+// resolve this via one of its two no-fresh-row shortcuts?" before ever
+// looking at the payload size.
+
+#[tokio::test]
+async fn skip_size_check_true_when_execution_already_active() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let wf_id = "already-active-job";
+
+    start(&mut conn, wf, wf_id, serde_json::json!({})).await;
+
+    assert!(
+        autumn_harvest::throttle::skip_size_check(&mut conn, wf, wf_id, Some("reject_duplicate"),)
+            .await
+            .expect("skip_size_check"),
+        "an active execution must skip the size check under reject_duplicate \
+         (reserve_or_defer would resolve this via Bypassed, not a fresh row)"
+    );
+    assert!(
+        autumn_harvest::throttle::skip_size_check(&mut conn, wf, wf_id, None)
+            .await
+            .expect("skip_size_check"),
+        "same, defaulting to allow_duplicate when reuse_policy_str is None"
+    );
+}
+
+#[tokio::test]
+async fn skip_size_check_false_when_terminate_if_running_never_bypasses() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let wf_id = "terminate-if-running-job";
+
+    start(&mut conn, wf, wf_id, serde_json::json!({})).await;
+
+    assert!(
+        !autumn_harvest::throttle::skip_size_check(
+            &mut conn,
+            wf,
+            wf_id,
+            Some("terminate_if_running"),
+        )
+        .await
+        .expect("skip_size_check"),
+        "terminate_if_running always starts fresh (cancel + replace) -- an \
+         oversized body for it must still be rejected, not skipped"
+    );
+}
+
+#[tokio::test]
+async fn skip_size_check_true_when_pending_row_already_exists() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key = "acme";
+    let wf_id = "pending-retry-job";
+
+    // Drain the bucket so the first admission durably defers.
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            0.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("first admission defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+
+    // A retry for the same workflow_id with a stale/oversized body must not
+    // be rejected -- `reserve_or_defer` would resolve it to the same pending
+    // row (issue #607's own idempotent-retry guarantee), not insert a
+    // second, size-checked row.
+    assert!(
+        autumn_harvest::throttle::skip_size_check(&mut conn, wf, wf_id, None)
+            .await
+            .expect("skip_size_check"),
+        "an already-pending workflow_id must skip the size check"
+    );
+}
+
+#[tokio::test]
+async fn skip_size_check_false_for_a_genuinely_fresh_workflow_id() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let wf_id = "genuinely-fresh-job";
+
+    assert!(
+        !autumn_harvest::throttle::skip_size_check(&mut conn, wf, wf_id, None)
+            .await
+            .expect("skip_size_check"),
+        "no active execution and no pending row -- a genuinely fresh \
+         admission must still be size-checked"
+    );
+}
+
 // ── Scheduler-tick oversized-input cap check (issue #607 code review) ───────
 
 fn noop_scheduler_handler<'a>(
