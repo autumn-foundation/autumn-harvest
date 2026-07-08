@@ -289,7 +289,11 @@ pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
     UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
 };
-pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
+pub use payload_codec::{
+    CodecError, IdentityCodec, LossyDecodeOutcome, PayloadCodec, PayloadCodecs,
+    UNDECODABLE_MARKER_KEY, UNDECODABLE_REASON_CODEC_ERROR, UNDECODABLE_REASON_INVALID_BASE64,
+    UNDECODABLE_REASON_INVALID_JSON, UNDECODABLE_REASON_UNKNOWN_CODEC, undecodable_marker,
+};
 pub use payload_store::{
     OffloadedRef, PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
 };

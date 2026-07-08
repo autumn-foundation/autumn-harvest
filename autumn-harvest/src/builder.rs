@@ -892,6 +892,20 @@ impl HarvestBuilder {
         &self.update_handlers
     }
 
+    /// The configured payload-codec registry.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::payload_codecs`] (issue #608):
+    /// lets the plugin mirror the registry onto its API state at `build()`
+    /// time — alongside the `decode_payloads_on_read` opt-in flag — instead
+    /// of waiting for the runtime startup hook, so there is no boot window
+    /// where a decode-eligible request sees a default identity-only registry.
+    /// `try_build` clones this registry verbatim, so the pre-build and
+    /// post-build views are identical.
+    #[must_use]
+    pub const fn payload_codecs(&self) -> &PayloadCodecs {
+        &self.payload_codecs
+    }
+
     /// Registered declarative query handlers, in registration order.
     ///
     /// Pre-build counterpart of [`BuiltHarvest::query_handlers`] (issue #597).

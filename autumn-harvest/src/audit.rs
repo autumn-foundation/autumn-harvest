@@ -137,6 +137,18 @@ pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
 /// excluded from) those management-router manifests. See
 /// `docs/getting-started/12-webhooks.md`.
 pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
+/// Audit operation: an operator read decoded codec-encrypted payloads on the
+/// management API / Vantage UI read path (issue #608).
+///
+/// A **read** audit like [`OP_EXECUTION_STREAM_OPEN`]: written at most once
+/// per request, and only when at least one codec envelope was actually
+/// decoded or degraded to an `_harvest_undecodable` marker (the SSE stream
+/// audits once at stream open whenever decode mode is active for that
+/// stream, since frame counts are unknowable up front). The record names the
+/// actor, route, and target execution — never the payload content. No
+/// `CLASSIFIED_ROUTES`/`ALL_MUTATION_ROUTES` change: no route mutates and no
+/// new route exists.
+pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -480,6 +492,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // webhook paths are user-defined, app-level routes; see the doc comment
     // on OP_WEBHOOK_TRIGGER.
     OP_WEBHOOK_TRIGGER,
+    // Operator read-path payload decoding (issue #608). Read audit — no
+    // ALL_MUTATION_ROUTES entry; see the doc comment on OP_PAYLOAD_DECODE_READ.
+    OP_PAYLOAD_DECODE_READ,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -1076,6 +1091,22 @@ mod tests {
         assert!(
             AUDITED_OPERATIONS.contains(&OP_CALLBACK_REDRIVE),
             "OP_CALLBACK_REDRIVE must appear in AUDITED_OPERATIONS (issue #605)"
+        );
+    }
+
+    #[test]
+    fn payload_decode_read_op_is_registered_in_audited_operations() {
+        // Issue #608: operator read-path decoding of codec-encrypted payloads
+        // writes one best-effort audit row per request that decoded/marked
+        // ≥1 envelope (SSE: one row at stream open when decode mode is
+        // active). It is a *read* audit like OP_EXECUTION_STREAM_OPEN — no
+        // CLASSIFIED_ROUTES/ALL_MUTATION_ROUTES change (no route mutates and
+        // no new route exists), but the operation name itself must be in the
+        // registry so audit consumers can enumerate it.
+        assert_eq!(OP_PAYLOAD_DECODE_READ, "payload.decode_read");
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_PAYLOAD_DECODE_READ),
+            "OP_PAYLOAD_DECODE_READ must appear in AUDITED_OPERATIONS (issue #608)"
         );
     }
 

@@ -113,6 +113,9 @@ pub struct HarvestPlugin {
     mcp_tools_enabled: bool,
     /// Optional prefix override for the generated MCP tool routes.
     mcp_tools_prefix: Option<String>,
+    /// Deployment-level opt-in for operator read-path payload decoding
+    /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
+    decode_payloads_on_read: bool,
     /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
@@ -140,6 +143,7 @@ impl HarvestPlugin {
             mcp_tool_middleware: None,
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
+            decode_payloads_on_read: false,
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
             #[cfg(feature = "metrics")]
@@ -288,6 +292,35 @@ impl HarvestPlugin {
         self
     }
 
+    /// Decode codec-encrypted payloads on the operator read path (issue #608).
+    ///
+    /// Explicit opt-in, default **off** — without this call, responses are
+    /// byte-for-byte identical to today and no handler ever consults the
+    /// codec registry. With it enabled, the management API read surfaces
+    /// (`/result`, history export under `payload_policy=full`, describe,
+    /// `/history`, `/stack`, `GET /dead-letters`, the SSE event stream) and
+    /// the Vantage UI decode stored codec envelopes **only** for requests
+    /// that pass the same harvest-admin predicate the `require_admin` layer
+    /// uses — a non-admin caller on an ungated route still sees the stored
+    /// bytes. Every request that actually decodes (or degrades) at least one
+    /// envelope writes a best-effort `payload.decode_read` audit record, so
+    /// plaintext reads are accountable. A per-field decode failure (bad key,
+    /// rotated-away codec id) degrades to an `_harvest_undecodable` marker —
+    /// never a 500. Stored rows are never mutated.
+    ///
+    /// Note: with [`Self::api_with_auth`], the embedder boundary makes every
+    /// request that reaches the API an admin — decode then applies to all of
+    /// them, which is exactly the boundary's contract.
+    ///
+    /// See `docs/operations/read-path-decode.md` for the full operator guide,
+    /// including the provenance caveat (decoded values are not authenticated)
+    /// and the deliberately-undecoded list surfaces.
+    #[must_use]
+    pub const fn decode_payloads_on_read(mut self) -> Self {
+        self.decode_payloads_on_read = true;
+        self
+    }
+
     /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
     /// (issue #344).
     ///
@@ -374,6 +407,7 @@ impl Plugin for HarvestPlugin {
             mcp_tool_middleware,
             mcp_tools_enabled,
             mcp_tools_prefix,
+            decode_payloads_on_read,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
             #[cfg(feature = "metrics")]
@@ -478,6 +512,17 @@ impl Plugin for HarvestPlugin {
         } else {
             None
         };
+
+        // Issue #608: deployment-level opt-in for read-path payload decoding,
+        // co-located with the codec-registry mirror so both are in place
+        // before the HTTP server binds — no boot window where a
+        // decode-eligible request sees a default identity-only registry
+        // (`try_build` clones the registry verbatim, so this pre-build view
+        // is identical to the post-build one). Mirroring is unconditional
+        // and cheap; behavior is controlled by the flag + per-request admin
+        // gate. Must run before `builder` is moved into the runtime slot.
+        api_state.set_payload_codecs(builder.payload_codecs().clone());
+        api_state.set_decode_payloads_on_read(decode_payloads_on_read);
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
@@ -655,6 +700,9 @@ async fn start_harvest_runtime(
     // which every `BuiltHarvest` consumer (this plugin and the standalone
     // runner) funnels through.
     api_state.set_completion_callback_ssrf_policy(built.completion_callback_config().ssrf_policy());
+    // The read-path decode codec registry (issue #608) is mirrored in
+    // `Plugin::build`, together with the opt-in flag, so it is in place
+    // before the HTTP server binds — not here.
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.
@@ -1275,6 +1323,25 @@ mod tests {
         assert!(!mcp_tools_unprotected(true, true));
         assert!(!mcp_tools_unprotected(false, false));
         assert!(!mcp_tools_unprotected(false, true));
+    }
+
+    /// Issue #608: read-path payload decoding is a deliberate, explicit
+    /// opt-in (mirrors the `mcp_tools()` const-fn flag precedent). The flag
+    /// must default off so a plugin that never mentions it produces
+    /// byte-for-byte identical responses to today.
+    #[test]
+    fn decode_payloads_on_read_flag_defaults_off_and_sets_on_builder() {
+        let plugin = HarvestPlugin::new();
+        assert!(
+            !plugin.decode_payloads_on_read,
+            "decode_payloads_on_read must default to false (issue #608 AC1)"
+        );
+
+        let plugin = plugin.decode_payloads_on_read();
+        assert!(
+            plugin.decode_payloads_on_read,
+            "HarvestPlugin::decode_payloads_on_read() must set the opt-in flag"
+        );
     }
 
     #[test]
