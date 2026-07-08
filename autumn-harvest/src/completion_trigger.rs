@@ -8,6 +8,36 @@ pub enum InputMapping {
     Passthrough,
     Static(Value),
     Projection(String),
+    /// Assemble a structured terminal-outcome envelope from the source
+    /// execution's recorded terminal state + row fields (issue #748).
+    ///
+    /// A source that reached a non-`Completed` terminal state has a `NULL`
+    /// recorded output, so a `Passthrough`/`Projection` mapping delivers
+    /// `Null` and a failure-routed handler starts blind. This variant instead
+    /// projects already-recorded execution data — the terminal state, the
+    /// source identity, the output (only on `COMPLETED`), and the error /
+    /// cancel reason — into a fixed envelope:
+    ///
+    /// ```json
+    /// {
+    ///   "terminal_state": "FAILED",
+    ///   "source_exec_id": "…",
+    ///   "source_workflow_id": "…",
+    ///   "source_workflow_name": "…",
+    ///   "output": null,
+    ///   "error": "payment declined: insufficient funds"
+    /// }
+    /// ```
+    ///
+    /// `projection = None` yields the full envelope; `projection = Some(path)`
+    /// plucks a dotted field from it using the same [`project_json_path`]
+    /// mechanism `Projection` uses (e.g. `Some("error")` → the bare error
+    /// string). Read-side projection only — no `WorkflowEvent` variant, no
+    /// migration.
+    Outcome {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projection: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -413,6 +443,37 @@ pub fn project_json_path(value: &Value, path: &str) -> Value {
     project_json_path_opt(value, path)
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+/// Build the terminal-outcome envelope for [`InputMapping::Outcome`] (issue
+/// #748). A pure read-side projection of already-recorded execution data — no
+/// event variant, no migration.
+///
+/// Envelope semantics: `output` is non-null **only** on `COMPLETED` (the
+/// caller passes `Some(&output)` only when `state == TerminalState::Completed`,
+/// else `None`); `error` carries the failure message on `FAILED`/`TIMED_OUT`
+/// and the cancel reason on `CANCELLED` when one was recorded (the caller just
+/// forwards `execution.error`, which is naturally `None` on `COMPLETED`).
+/// `terminal_state` is the state's canonical string (e.g. `"FAILED"`).
+// The sole non-test caller (`evaluate_triggers_for_execution`) is `db`-gated,
+// so this is genuinely unused in a `--no-default-features` lib build.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn build_outcome_envelope(
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    workflow_id: &str,
+    workflow_name: &str,
+    output: Option<&Value>,
+    error: Option<&str>,
+) -> Value {
+    serde_json::json!({
+        "terminal_state": state.as_str(),
+        "source_exec_id": exec_id.to_string(),
+        "source_workflow_id": workflow_id,
+        "source_workflow_name": workflow_name,
+        "output": output.cloned().unwrap_or(Value::Null),
+        "error": error.map_or(Value::Null, |s| Value::String(s.to_string())),
+    })
 }
 
 /// Borrowing sibling of [`project_json_path`] that distinguishes a **missing**
@@ -876,6 +937,31 @@ pub fn evaluate_triggers_for_execution<'a>(
                 InputMapping::Passthrough => source_output,
                 InputMapping::Static(v) => v,
                 InputMapping::Projection(ref path) => project_json_path(&source_output, path),
+                // Issue #748: assemble the terminal-outcome envelope from the
+                // already-loaded execution row. `output` is threaded only on a
+                // COMPLETED source (else NULL); `error` carries the failure /
+                // cancel reason. This single `target_input` flows to BOTH the
+                // same-shard start and the cross-shard outbox row below, so
+                // inline/outbox parity (AC5) holds by construction.
+                InputMapping::Outcome { ref projection } => {
+                    let output_for_env = if matches!(state, TerminalState::Completed) {
+                        execution.output.as_ref()
+                    } else {
+                        None
+                    };
+                    let envelope = build_outcome_envelope(
+                        exec_id,
+                        state,
+                        &execution.workflow_id,
+                        &execution.workflow_name,
+                        output_for_env,
+                        execution.error.as_deref(),
+                    );
+                    match projection {
+                        Some(path) => project_json_path(&envelope, path),
+                        None => envelope,
+                    }
+                }
             };
 
             let target_workflow_id = format!("completion-trigger-{}-{}", trigger_db.id, exec_id);
@@ -1350,6 +1436,207 @@ mod tests {
         // And the new value is accepted by the same serde path the management API uses.
         let new: Vec<TerminalState> = serde_json::from_value(json!(["Terminated"])).unwrap();
         assert_eq!(new, vec![TerminalState::Terminated]);
+    }
+
+    // ── issue #748: Outcome input-mapping envelope ─────────────────────────
+
+    #[test]
+    fn outcome_envelope_failed_has_error_and_null_output() {
+        let exec_id = crate::types::ExecutionId::new();
+        let env = build_outcome_envelope(
+            exec_id,
+            TerminalState::Failed,
+            "order-42",
+            "fulfill_order",
+            None,
+            Some("boom"),
+        );
+        assert_eq!(env["terminal_state"], json!("FAILED"));
+        assert_eq!(env["error"], json!("boom"));
+        assert_eq!(env["output"], Value::Null);
+        assert_eq!(env["source_exec_id"], json!(exec_id.to_string()));
+        assert_eq!(env["source_workflow_id"], json!("order-42"));
+        assert_eq!(env["source_workflow_name"], json!("fulfill_order"));
+    }
+
+    #[test]
+    fn outcome_envelope_completed_has_output_and_null_error() {
+        let exec_id = crate::types::ExecutionId::new();
+        let output = json!({"shipped": true, "carrier": "acme"});
+        let env = build_outcome_envelope(
+            exec_id,
+            TerminalState::Completed,
+            "order-7",
+            "fulfill_order",
+            Some(&output),
+            None,
+        );
+        assert_eq!(env["terminal_state"], json!("COMPLETED"));
+        assert_eq!(env["output"], output);
+        assert_eq!(env["error"], Value::Null);
+        assert_eq!(env["source_workflow_id"], json!("order-7"));
+    }
+
+    #[test]
+    fn outcome_envelope_timed_out_and_cancelled_carry_reason() {
+        let exec_id = crate::types::ExecutionId::new();
+        let timed_out = build_outcome_envelope(
+            exec_id,
+            TerminalState::TimedOut,
+            "wid",
+            "wf",
+            None,
+            Some("deadline exceeded"),
+        );
+        assert_eq!(timed_out["terminal_state"], json!("TIMED_OUT"));
+        assert_eq!(timed_out["error"], json!("deadline exceeded"));
+        assert_eq!(timed_out["output"], Value::Null);
+
+        let cancelled = build_outcome_envelope(
+            exec_id,
+            TerminalState::Cancelled,
+            "wid",
+            "wf",
+            None,
+            Some("operator cancel: fraud review"),
+        );
+        assert_eq!(cancelled["terminal_state"], json!("CANCELLED"));
+        assert_eq!(cancelled["error"], json!("operator cancel: fraud review"));
+        assert_eq!(cancelled["output"], Value::Null);
+    }
+
+    #[test]
+    fn outcome_mapping_projection_plucks_field() {
+        // Drives the same logic the inline `Outcome { projection }` arm uses:
+        // build the envelope, then project a dotted path out of it.
+        let exec_id = crate::types::ExecutionId::new();
+        let env = build_outcome_envelope(
+            exec_id,
+            TerminalState::Failed,
+            "wid",
+            "wf",
+            None,
+            Some("boom"),
+        );
+        assert_eq!(project_json_path(&env, "error"), json!("boom"));
+        assert_eq!(project_json_path(&env, "terminal_state"), json!("FAILED"));
+    }
+
+    #[test]
+    fn outcome_mapping_none_yields_full_envelope() {
+        let exec_id = crate::types::ExecutionId::new();
+        let env = build_outcome_envelope(
+            exec_id,
+            TerminalState::Failed,
+            "wid",
+            "wf",
+            None,
+            Some("boom"),
+        );
+        // `projection = None` means the whole envelope is the target input.
+        let obj = env.as_object().expect("envelope is an object");
+        assert_eq!(obj.len(), 6);
+        for key in [
+            "terminal_state",
+            "source_exec_id",
+            "source_workflow_id",
+            "source_workflow_name",
+            "output",
+            "error",
+        ] {
+            assert!(obj.contains_key(key), "envelope missing key {key}");
+        }
+    }
+
+    #[test]
+    fn outcome_mapping_projection_missing_path_yields_null() {
+        // Graceful degradation for the `Outcome` variant: a projection path
+        // that doesn't exist in the envelope resolves to `Null` (same as the
+        // inline arm's `project_json_path(&envelope, path)`), never an error.
+        let exec_id = crate::types::ExecutionId::new();
+        let env = build_outcome_envelope(
+            exec_id,
+            TerminalState::Failed,
+            "wid",
+            "wf",
+            None,
+            Some("boom"),
+        );
+        assert_eq!(project_json_path(&env, "nonexistent.path"), Value::Null);
+    }
+
+    #[test]
+    fn outcome_envelope_terminated_state() {
+        // TERMINATED is a valid trigger-firing terminal state (issue #504) not
+        // named in AC1 but must produce a coherent envelope: the terminate
+        // reason lands in `error`, output is null.
+        let exec_id = crate::types::ExecutionId::new();
+        let env = build_outcome_envelope(
+            exec_id,
+            TerminalState::Terminated,
+            "wid",
+            "wf",
+            None,
+            Some("operator terminate: runaway loop"),
+        );
+        assert_eq!(env["terminal_state"], json!("TERMINATED"));
+        assert_eq!(env["error"], json!("operator terminate: runaway loop"));
+        assert_eq!(env["output"], Value::Null);
+    }
+
+    #[test]
+    fn input_mapping_outcome_serde_round_trip() {
+        // Adjacently-tagged encoding for the new variant (both projection shapes).
+        // `projection = None` skips the field entirely (FIX 2: `#[serde(default,
+        // skip_serializing_if = "Option::is_none")]`), matching how the sibling
+        // `condition` field is handled — cleaner than a serialized `null`.
+        let none = InputMapping::Outcome { projection: None };
+        let none_v = serde_json::to_value(&none).unwrap();
+        assert_eq!(none_v, json!({"type": "Outcome", "data": {}}));
+        assert_eq!(
+            serde_json::from_value::<InputMapping>(none_v).unwrap(),
+            none
+        );
+        // Both the omitted-field form and an explicit `null` deserialize back
+        // to `None` (`#[serde(default)]`), so a client may omit `projection`.
+        assert_eq!(
+            serde_json::from_value::<InputMapping>(json!({"type": "Outcome", "data": {}})).unwrap(),
+            none
+        );
+        assert_eq!(
+            serde_json::from_value::<InputMapping>(
+                json!({"type": "Outcome", "data": {"projection": null}})
+            )
+            .unwrap(),
+            none
+        );
+
+        let some = InputMapping::Outcome {
+            projection: Some("error".to_string()),
+        };
+        let some_v = serde_json::to_value(&some).unwrap();
+        assert_eq!(
+            some_v,
+            json!({"type": "Outcome", "data": {"projection": "error"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<InputMapping>(some_v).unwrap(),
+            some
+        );
+
+        // AC4: existing variants' encoding is unchanged.
+        assert_eq!(
+            serde_json::to_value(InputMapping::Passthrough).unwrap(),
+            json!({"type": "Passthrough"})
+        );
+        assert_eq!(
+            serde_json::to_value(InputMapping::Static(json!(1))).unwrap(),
+            json!({"type": "Static", "data": 1})
+        );
+        assert_eq!(
+            serde_json::to_value(InputMapping::Projection("a.b".to_string())).unwrap(),
+            json!({"type": "Projection", "data": "a.b"})
+        );
     }
 
     // ── issue #810: TriggerCondition output guards ─────────────────────────
