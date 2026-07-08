@@ -16930,6 +16930,72 @@ async fn rollback_manual_trigger_budget(
     .await;
 }
 
+/// Pure decision: has an incremented `runs_started` reached a finite `max_runs`
+/// budget? Unlimited (`None`) or non-positive `max_runs` never exhausts. (#688)
+fn backfill_budget_reached(new_runs_started: i32, max_runs: Option<i32>) -> bool {
+    max_runs.is_some_and(|max| max > 0 && new_runs_started >= max)
+}
+
+/// Atomically reserve one `max_runs` slot for a backfill dispatch (issue #688),
+/// mirroring `trigger_schedule_now`'s pre-increment. Runs on the schedule's own
+/// shard. Returns `Ok(Some(new_runs_started))` when a slot was reserved (the
+/// post-increment value), `Ok(None)` when the budget is exhausted (0 rows), or a
+/// DB error. Unlimited schedules (`max_runs IS NULL`) always reserve and
+/// increment for observability, matching the prior post-loop batch increment.
+async fn reserve_backfill_budget_slot(
+    sched_conn: &mut diesel_async::AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<i32>, diesel::result::Error> {
+    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+    diesel::update(
+        sdsl::harvest_schedules
+            .find(schedule_id)
+            .filter(sdsl::exhausted_at.is_null())
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "max_runs IS NULL OR runs_started < max_runs",
+            )),
+    )
+    .set((
+        sdsl::runs_started.eq(sdsl::runs_started + 1),
+        sdsl::updated_at.eq(at),
+    ))
+    .returning(sdsl::runs_started)
+    .get_result::<i32>(sched_conn)
+    .await
+    .optional()
+}
+
+/// After a successful `reserve_backfill_budget_slot`, transition the schedule to
+/// exhausted if the reserved slot reached `max_runs`. Guarded on `exhausted_at
+/// IS NULL` to avoid a double-exhaust race with the tick; sets `next_run_at =
+/// NULL` so the schedule leaves the due-list. Best-effort (error ignored). (#688)
+async fn transition_backfill_exhausted_if_reached(
+    sched_conn: &mut diesel_async::AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    new_runs_started: i32,
+    max_runs: Option<i32>,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+    if !backfill_budget_reached(new_runs_started, max_runs) {
+        return;
+    }
+    let _ = diesel::update(
+        sdsl::harvest_schedules
+            .find(schedule_id)
+            .filter(sdsl::exhausted_at.is_null()),
+    )
+    .set((
+        sdsl::exhausted_at.eq(Some(at)),
+        sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+        sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        sdsl::updated_at.eq(at),
+    ))
+    .execute(sched_conn)
+    .await;
+}
+
 // ── Schedule backfill (issue #177) ────────────────────────────────────────────
 
 /// Request body for `POST /admin/schedules/{id}/backfill`.
@@ -17393,6 +17459,11 @@ async fn schedule_backfill(
         running_at_start
     };
     let mut dispatched_this_call: i64 = 0;
+    let mut budget_hit = false;
+    // Atomic per-slot max_runs reservation runs on the schedule's own shard
+    // (issue #688); schedule rows may live on a non-default shard than the
+    // execution shard, exactly like trigger_schedule_now's budget accounting.
+    let mut sched_conn = acquire_conn(pool.pool_for(schedule_shard)).await?;
 
     match kind {
         ScheduleKind::Workflow => {
@@ -17404,25 +17475,15 @@ async fn schedule_backfill(
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
             for (original_slot, _fire_time) in &timestamp_pairs {
-                // Respect the max_runs total budget (issue #478): a backfill must not
-                // dispatch past the schedule's remaining run budget, otherwise an
-                // out-of-budget run would advance scheduled carryover (#488). Mirrors
-                // the max_active gate below (computed once, tracked via
-                // dispatched_this_call); like that gate it is best-effort against a
-                // concurrent tick.
-                //
-                // Concurrent backfills for the *same* schedule are safe: each slot
-                // produces a deterministic `workflow_id` (via `scheduled_workflow_id_pub`)
-                // so two concurrent requests for the same slot hit the DB
-                // partial-unique-index and one is rejected — no duplicate start.
-                // The max_runs snapshot may be slightly stale under heavy concurrency,
-                // but it never dispatches beyond the budget *seen at the start of this
-                // call*, which is the closest we can get without a serialisable
-                // transaction wrapping the entire loop.
-                if schedule.max_runs.is_some_and(|max| {
-                    max > 0
-                        && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
-                }) {
+                // Once the atomic DB max_runs reservation (issue #688) fails for one
+                // slot the budget is exhausted for every remaining slot too; report
+                // each as skipped without another DB round-trip. The actual budget
+                // check is the atomic conditional UPDATE below (after the admission
+                // gate), which is race-safe against a concurrent backfill/tick — it
+                // replaces the prior stale in-memory `runs_started + dispatched_this_call`
+                // snapshot check that could let two concurrent requests both pass the
+                // gate with one remaining slot (Codex P2, PR #677).
+                if budget_hit {
                     skipped += 1;
                     *skipped_reasons
                         .entry("max_runs_exhausted".to_string())
@@ -17551,6 +17612,33 @@ async fn schedule_backfill(
                     continue;
                 }
 
+                // Atomically reserve one max_runs slot on the schedule's own shard
+                // BEFORE committing to a start (issue #688). Placed after the prior-run
+                // and admission checks so a slot is reserved only for a run that will
+                // actually attempt to start; every non-committing path below releases
+                // it via `rollback_manual_trigger_budget`.
+                let now = chrono::Utc::now();
+                let reserved_runs_started =
+                    match reserve_backfill_budget_slot(&mut sched_conn, schedule_id, now).await {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
+                            budget_hit = true;
+                            skipped += 1;
+                            *skipped_reasons
+                                .entry("max_runs_exhausted".to_string())
+                                .or_insert(0) += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: format!("failed to reserve run budget: {e}"),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    };
+
                 // Start-throttle admission (issue #607): pace backfill admissions,
                 // defer the excess rather than admitting an entire backfill window
                 // at once. A deferred slot counts as dispatched (the timestamp is
@@ -17582,6 +17670,7 @@ async fn schedule_backfill(
                     {
                         Ok(skip) => skip,
                         Err(e) => {
+                            rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                             shard_failures.push(BackfillShardFailure {
                                 shard_id: 0,
                                 reason: e.to_string(),
@@ -17594,6 +17683,7 @@ async fn schedule_backfill(
                         let observed =
                             serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                         if observed > effective_cap {
+                            rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                             skipped += 1;
                             *skipped_reasons
                                 .entry("oversized_input".to_string())
@@ -17667,6 +17757,14 @@ async fn schedule_backfill(
                                     .record_start_throttled(&wf_name);
                                 dispatched += 1;
                                 dispatched_this_call += 1;
+                                transition_backfill_exhausted_if_reached(
+                                    &mut sched_conn,
+                                    schedule_id,
+                                    reserved_runs_started,
+                                    schedule.max_runs,
+                                    now,
+                                )
+                                .await;
                             } else {
                                 // A repeated backfill call for a window whose
                                 // slot is still durably deferred from an
@@ -17678,6 +17776,8 @@ async fn schedule_backfill(
                                 // request can't double-count the slot as
                                 // dispatched or double-spend max_runs budget
                                 // for it (code review, issue #607).
+                                rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now)
+                                    .await;
                                 skipped += 1;
                                 *skipped_reasons
                                     .entry("already_exists".to_string())
@@ -17697,6 +17797,7 @@ async fn schedule_backfill(
                             // as a no-op; no token reserved, fall through.
                         }
                         Err(e) => {
+                            rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                             shard_failures.push(BackfillShardFailure {
                                 shard_id: 0,
                                 reason: e.to_string(),
@@ -17771,10 +17872,20 @@ async fn schedule_backfill(
                     Ok(started) if started.created => {
                         dispatched += 1;
                         dispatched_this_call += 1;
+                        transition_backfill_exhausted_if_reached(
+                            &mut sched_conn,
+                            schedule_id,
+                            reserved_runs_started,
+                            schedule.max_runs,
+                            now,
+                        )
+                        .await;
                     }
                     Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
                         // AC-a: an id-reuse short-circuit consumed no admission —
+                        // release the reserved max_runs slot (issue #688) and
                         // refund the reserved throttle token, if any was reserved.
+                        rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                         if let Some(ref bucket) = backfill_throttle_bucket {
                             let _ =
                                 autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
@@ -17786,8 +17897,10 @@ async fn schedule_backfill(
                             .or_insert(0) += 1;
                     }
                     Err(e) => {
-                        // No run admitted — refund the reserved throttle token
+                        // No run admitted — release the reserved max_runs slot
+                        // (issue #688) and refund the reserved throttle token
                         // before propagating the failure.
+                        rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                         if let Some(ref bucket) = backfill_throttle_bucket {
                             let _ =
                                 autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
@@ -17808,11 +17921,10 @@ async fn schedule_backfill(
             let shard_pool = pool.pool_for(shard_id);
 
             for (original_slot, _fire_time) in &timestamp_pairs {
-                // Respect the max_runs total budget (issue #478) — see the workflow loop.
-                if schedule.max_runs.is_some_and(|max| {
-                    max > 0
-                        && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
-                }) {
+                // Once the atomic DB max_runs reservation (issue #688) fails for one
+                // slot the budget is exhausted for every remaining slot too — see the
+                // workflow loop. Replaces the prior stale in-memory snapshot check.
+                if budget_hit {
                     skipped += 1;
                     *skipped_reasons
                         .entry("max_runs_exhausted".to_string())
@@ -17929,6 +18041,31 @@ async fn schedule_backfill(
                     continue;
                 }
 
+                // Atomically reserve one max_runs slot on the schedule's own shard
+                // BEFORE committing to a start (issue #688). Placed after the prior-run
+                // and admission checks; every non-committing path below releases it.
+                let now = chrono::Utc::now();
+                let reserved_runs_started =
+                    match reserve_backfill_budget_slot(&mut sched_conn, schedule_id, now).await {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
+                            budget_hit = true;
+                            skipped += 1;
+                            *skipped_reasons
+                                .entry("max_runs_exhausted".to_string())
+                                .or_insert(0) += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: shard_id.as_i32(),
+                                reason: format!("failed to reserve run budget: {e}"),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    };
+
                 let start_result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -17980,21 +18117,32 @@ async fn schedule_backfill(
                     Ok(started) if started.created => {
                         dispatched += 1;
                         dispatched_this_call += 1;
+                        transition_backfill_exhausted_if_reached(
+                            &mut sched_conn,
+                            schedule_id,
+                            reserved_runs_started,
+                            schedule.max_runs,
+                            now,
+                        )
+                        .await;
                     }
                     Ok(_) => {
-                        // RejectDuplicate → already exists
+                        // RejectDuplicate → already exists; release the reserved slot (#688).
+                        rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(autumn_harvest::HarvestError::AlreadyExists { .. }) => {
+                        rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(e) => {
+                        rollback_manual_trigger_budget(&mut sched_conn, schedule_id, now).await;
                         shard_failures.push(BackfillShardFailure {
                             shard_id: shard_id.as_i32(),
                             reason: e.to_string(),
@@ -18006,51 +18154,10 @@ async fn schedule_backfill(
         }
     }
 
-    // Persist the consumed max_runs budget (issue #478) so a later backfill or
-    // scheduler tick sees it: without this, a tagged backfill that participates in
-    // carryover (#488) would leave harvest_schedules.runs_started unchanged and a
-    // subsequent out-of-budget run could still be started. Mirror the scheduler's
-    // DB-side atomic increment (runs_started + dispatched) on the schedule's own shard,
-    // transitioning to exhausted when the cap is reached. Best-effort: a failure here
-    // must not fail an already-dispatched backfill (the gate above still bounds a single
-    // request), so errors are logged-and-ignored.
-    if dispatched_this_call > 0 {
-        let dispatched_i32 = i32::try_from(dispatched_this_call).unwrap_or(i32::MAX);
-        let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
-        let budget_exhausted = schedule
-            .max_runs
-            .is_some_and(|max| max > 0 && new_runs_started >= max);
-        if let Ok(mut budget_conn) = acquire_conn(pool.pool_for(schedule_shard)).await {
-            use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
-            let now = chrono::Utc::now();
-            let res = if budget_exhausted {
-                diesel::update(
-                    sdsl::harvest_schedules
-                        .find(schedule_id)
-                        .filter(sdsl::exhausted_at.is_null()),
-                )
-                .set((
-                    sdsl::runs_started.eq(sdsl::runs_started + dispatched_i32),
-                    sdsl::exhausted_at.eq(Some(now)),
-                    sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-                ))
-                .execute(&mut budget_conn)
-                .await
-            } else {
-                diesel::update(sdsl::harvest_schedules.find(schedule_id))
-                    .set(sdsl::runs_started.eq(sdsl::runs_started + dispatched_i32))
-                    .execute(&mut budget_conn)
-                    .await
-            };
-            if let Err(e) = res {
-                tracing::warn!(
-                    schedule_id = %schedule_id,
-                    error = %e,
-                    "failed to persist backfill max_runs budget consumption"
-                );
-            }
-        }
-    }
+    // Budget is now consumed per-slot atomically via `reserve_backfill_budget_slot`
+    // (issue #688) inside the dispatch loops, replacing the prior post-loop batch
+    // increment which raced against concurrent requests. `dispatched_this_call`
+    // still gates `max_active_runs` above, but no longer drives budget accounting.
 
     let status = if shard_failures.is_empty() && failed == 0 {
         "complete"
@@ -28240,6 +28347,65 @@ mod tests {
         // (the live scheduler only increments it under a budget-checked guard),
         // but a stale read must not report a negative remaining budget.
         assert_eq!(remaining_runs_budget(3, 5), 0);
+    }
+
+    // ── Backfill atomic-reservation budget decision (issue #688) ──────────────
+
+    #[test]
+    fn backfill_budget_reached_truth_table() {
+        // Unlimited (None) never exhausts.
+        assert!(!backfill_budget_reached(0, None));
+        // Non-positive max_runs never exhausts.
+        assert!(!backfill_budget_reached(5, Some(0)));
+        assert!(!backfill_budget_reached(0, Some(0)));
+        // Under budget.
+        assert!(!backfill_budget_reached(4, Some(5)));
+        // At budget.
+        assert!(backfill_budget_reached(5, Some(5)));
+        // Over budget (defensive: a reserved slot reaching or passing the cap).
+        assert!(backfill_budget_reached(6, Some(5)));
+    }
+
+    #[test]
+    fn reserve_backfill_budget_slot_generates_the_guarded_conditional_update() {
+        // Shape-check the atomic reservation UPDATE without a DB: it must
+        // increment runs_started, guard on both exhausted_at IS NULL and the
+        // max_runs budget, and RETURN the post-increment runs_started so the
+        // caller can decide exhaustion (issue #688).
+        use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+        use diesel::query_dsl::methods::FilterDsl;
+        let at = chrono::Utc::now();
+        let stmt = diesel::update(FilterDsl::filter(
+            FilterDsl::filter(
+                sdsl::harvest_schedules.find(uuid::Uuid::nil()),
+                sdsl::exhausted_at.is_null(),
+            ),
+            diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "max_runs IS NULL OR runs_started < max_runs",
+            ),
+        ))
+        .set((
+            sdsl::runs_started.eq(sdsl::runs_started + 1),
+            sdsl::updated_at.eq(at),
+        ))
+        .returning(sdsl::runs_started);
+        let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
+        assert!(
+            sql.contains(r#""runs_started" = ("harvest_schedules"."runs_started" + $1)"#),
+            "must increment runs_started, got: {sql}"
+        );
+        assert!(
+            sql.contains("max_runs IS NULL OR runs_started < max_runs"),
+            "must carry the budget guard, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#""harvest_schedules"."exhausted_at" IS NULL"#),
+            "must guard on exhausted_at IS NULL, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#"RETURNING "harvest_schedules"."runs_started""#),
+            "must return the post-increment runs_started, got: {sql}"
+        );
     }
 
     // ── Preview bound truncation (issue #543 — end_at / remaining-run budget) ──

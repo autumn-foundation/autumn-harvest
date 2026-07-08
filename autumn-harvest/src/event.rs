@@ -648,6 +648,24 @@ pub enum WorkflowEvent {
 }
 
 impl WorkflowEvent {
+    /// Forward-compatible constructor for [`WorkflowEvent::WorkflowStarted`] that
+    /// defaults the carryover (#488) and scheduled-time (#508) additive fields to
+    /// `None`. Gives downstream code a non-breaking construction path across future
+    /// additive field additions to this variant (issue #688).
+    #[must_use]
+    pub const fn workflow_started(
+        input: serde_json::Value,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self::WorkflowStarted {
+            input,
+            timestamp,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
     /// Stable string identifier for this event variant, stored in
     /// `harvest_events.event_type`.
     #[must_use]
@@ -1606,6 +1624,64 @@ mod tests {
             back,
             WorkflowEvent::WorkflowRedriven { reason: None, .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_started_constructor_defaults_additive_fields_to_none()
+    -> Result<(), serde_json::Error> {
+        let ts = Utc::now();
+        let event = WorkflowEvent::workflow_started(serde_json::json!({"k": 1}), ts);
+        match &event {
+            WorkflowEvent::WorkflowStarted {
+                input,
+                timestamp,
+                last_completion_result,
+                last_error,
+                scheduled_time,
+            } => {
+                assert_eq!(input, &serde_json::json!({"k": 1}));
+                assert_eq!(timestamp, &ts);
+                assert!(last_completion_result.is_none());
+                assert!(last_error.is_none());
+                assert!(scheduled_time.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // The three additive optionals skip when None.
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            !json.contains("last_completion_result"),
+            "last_completion_result must skip when None, got {json}"
+        );
+        assert!(
+            !json.contains("last_error"),
+            "last_error must skip when None, got {json}"
+        );
+        assert!(
+            !json.contains("scheduled_time"),
+            "scheduled_time must skip when None, got {json}"
+        );
+
+        // Round-trips back to an equivalent value.
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowStarted {
+                input,
+                timestamp,
+                last_completion_result,
+                last_error,
+                scheduled_time,
+            } => {
+                assert_eq!(input, serde_json::json!({"k": 1}));
+                assert_eq!(timestamp, ts);
+                assert!(last_completion_result.is_none());
+                assert!(last_error.is_none());
+                assert!(scheduled_time.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
         Ok(())
     }
 }
