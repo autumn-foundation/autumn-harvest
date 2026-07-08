@@ -22,6 +22,7 @@ mod dag_builder;
 mod dag_mapping_tests;
 #[cfg(all(feature = "testing", feature = "unified-dag-execution"))]
 mod dag_unified_tests;
+mod dashboard_pack_docs;
 mod debounce_tests;
 mod delayed_start_tests;
 mod det_check_tests;
