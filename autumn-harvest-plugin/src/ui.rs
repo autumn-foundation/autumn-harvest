@@ -53,7 +53,7 @@ use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
-use autumn_harvest::payload_codec::LossyDecodeOutcome;
+use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
@@ -1064,27 +1064,23 @@ async fn workflow_detail_ui(
 
     // Read-path payload decoding (issue #608): decode the loaded copies only
     // (stored rows are never touched); one best-effort audit row per page
-    // render that decoded or marked ≥1 envelope.
+    // render that decoded or marked ≥1 envelope. Only the fields the page
+    // actually renders are decoded — the attempts/signals panel event copies
+    // (`activity_events`/`signal_update_events`) are deliberately excluded
+    // since those panels never render payload fields (PR #936 review).
     let mut execution = execution;
     let mut page_events = page_events;
-    {
-        let mut event_copies: Vec<&mut HarvestEvent> = page_events
-            .iter_mut()
-            .chain(activity_events.iter_mut())
-            .chain(signal_update_events.iter_mut())
-            .collect();
-        decode_and_audit_workflow_detail(
-            &api_state,
-            &mut conn,
-            &headers,
-            extension_session(maybe_session),
-            exec_id,
-            &mut execution,
-            &mut event_copies,
-            &mut blocked_on,
-        )
-        .await;
-    }
+    decode_and_audit_workflow_detail(
+        &api_state,
+        &mut conn,
+        &headers,
+        extension_session(maybe_session),
+        exec_id,
+        &mut execution,
+        &mut page_events,
+        &mut blocked_on,
+    )
+    .await;
 
     Ok(render_workflow_detail(
         &execution,
@@ -1101,13 +1097,42 @@ async fn workflow_detail_ui(
     ))
 }
 
+/// Decode only the workflow-detail fields the renderer actually displays
+/// (PR #936 review, round 5): the execution row's payload fields (the
+/// Input/Output/Memo/Search-attributes cards + the error banner), the
+/// timeline page's event payloads (rendered in full under "view payload"),
+/// and the blocked-on panel's heartbeat checkpoints. Hidden fields are
+/// deliberately NOT decoded — the pending-activity `input`, pending-signal
+/// payloads, and the attempts/signals panel event copies render only
+/// names / error strings / timestamps, never payload fields, so decoding
+/// them would burn codec/KMS work and count envelopes in the
+/// `payload.decode_read` audit outcome for plaintext the operator is never
+/// shown. Returns the merged outcome for the page's single audit row, so the
+/// audit accounting covers exactly the surfaced fields.
+fn decode_workflow_detail_rendered_fields(
+    codecs: &PayloadCodecs,
+    execution: &mut WorkflowExecution,
+    timeline_events: &mut [HarvestEvent],
+    blocked_on: &mut BlockedOnData,
+) -> LossyDecodeOutcome {
+    let mut outcome = decode_workflow_execution_fields(execution, codecs);
+    for event in timeline_events.iter_mut() {
+        outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
+    }
+    for task in &mut blocked_on.activities {
+        if let Some(checkpoint) = task.heartbeat_details.as_mut() {
+            outcome = outcome.merged(codecs.decode_value_lossy(checkpoint));
+        }
+    }
+    outcome
+}
+
 /// Read-path payload decoding for the workflow-detail page (issue #608):
 /// resolves the decode-only-when-admin gate ([`read_path_decoder`]) and, when
-/// active, tolerantly decodes the loaded copies — the execution row's payload
-/// fields, every timeline/attempts/signals-panel event, and the blocked-on
-/// panel's activity inputs, heartbeat checkpoints, and signal payloads — then
-/// writes the page's single best-effort audit row when ≥1 envelope was
-/// touched. Operates on in-memory copies only; stored rows are untouched.
+/// active, tolerantly decodes the loaded copies of the rendered fields only
+/// (see [`decode_workflow_detail_rendered_fields`]), then writes the page's
+/// single best-effort audit row when ≥1 surfaced envelope was touched.
+/// Operates on in-memory copies only; stored rows are untouched.
 ///
 /// `conn` is the page handler's own (execution-shard) pooled connection —
 /// the audit row is written through it rather than acquiring a second
@@ -1120,25 +1145,14 @@ async fn decode_and_audit_workflow_detail(
     session: Option<Session>,
     exec_id: HarvestExecutionId,
     execution: &mut WorkflowExecution,
-    events: &mut [&mut HarvestEvent],
+    timeline_events: &mut [HarvestEvent],
     blocked_on: &mut BlockedOnData,
 ) {
     let Some(codecs) = read_path_decoder(api_state, session).await else {
         return;
     };
-    let mut outcome = decode_workflow_execution_fields(execution, &codecs);
-    for event in events.iter_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
-    }
-    for task in &mut blocked_on.activities {
-        outcome = outcome.merged(codecs.decode_value_lossy(&mut task.input));
-        if let Some(checkpoint) = task.heartbeat_details.as_mut() {
-            outcome = outcome.merged(codecs.decode_value_lossy(checkpoint));
-        }
-    }
-    for signal in &mut blocked_on.signals {
-        outcome = outcome.merged(codecs.decode_value_lossy(&mut signal.payload));
-    }
+    let outcome =
+        decode_workflow_detail_rendered_fields(&codecs, execution, timeline_events, blocked_on);
     let target = exec_id.to_string();
     audit_decoded_read(
         api_state,
@@ -8157,6 +8171,170 @@ mod tests {
             heartbeat_details_cap: 0,
             heartbeat_caps: std::collections::HashMap::new(),
         }
+    }
+
+    // ── Issue #608 / PR #936 round 5: decode only rendered detail fields ─────
+
+    /// Reversing test codec so an envelope is distinguishable from plaintext.
+    #[derive(Debug)]
+    struct ReverseUiCodec;
+
+    impl autumn_harvest::payload_codec::PayloadCodec for ReverseUiCodec {
+        fn codec_id(&self) -> &'static str {
+            "reverse"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+            let mut v = raw.to_vec();
+            v.reverse();
+            Ok(v)
+        }
+        fn decode(
+            &self,
+            encoded: &[u8],
+        ) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+            let mut v = encoded.to_vec();
+            v.reverse();
+            Ok(v)
+        }
+    }
+
+    fn ui_test_codecs() -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseUiCodec));
+        codecs
+    }
+
+    /// Builds a well-formed `reverse` codec envelope for `plain` via the
+    /// public `encode_event` round-trip (mirrors the integration fixture).
+    fn ui_envelope(plain: &Value) -> Value {
+        let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: plain.clone(),
+        };
+        let encoded = ui_test_codecs().encode_event(&event).expect("encode event");
+        encoded["data"]["output"].clone()
+    }
+
+    fn stub_timeline_event(event_data: Value) -> HarvestEvent {
+        HarvestEvent {
+            id: 1,
+            workflow_exec_id: uuid::Uuid::new_v4(),
+            event_id: 0,
+            event_type: "ActivityScheduled".to_string(),
+            event_data,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn stub_pending_signal(payload: Value) -> HarvestSignal {
+        HarvestSignal {
+            id: uuid::Uuid::new_v4(),
+            workflow_exec_id: uuid::Uuid::new_v4(),
+            signal_name: "approval".to_string(),
+            payload,
+            received_at: Utc::now(),
+            consumed: false,
+            idempotency_key: None,
+        }
+    }
+
+    /// PR #936 round 5: the pending-activity `input` and pending-signal
+    /// payloads are never rendered by the detail page, so they must not be
+    /// decoded and must not count toward the `payload.decode_read` audit
+    /// outcome — envelopes there stay untouched and the outcome stays empty
+    /// (no audit row would be written for a page whose only envelopes are
+    /// hidden).
+    #[test]
+    fn hidden_detail_fields_are_not_decoded_and_never_touch_the_audit_outcome() {
+        let codecs = ui_test_codecs();
+        let mut execution = stub_execution();
+        let mut timeline: Vec<HarvestEvent> = vec![];
+
+        let input_envelope = ui_envelope(&serde_json::json!({"card": "pii-task-input"}));
+        let signal_envelope = ui_envelope(&serde_json::json!({"approver": "pii-signal"}));
+        let mut task = task_queue_item_for_activity("charge_card", "PENDING");
+        task.input = input_envelope.clone();
+        let mut blocked_on = stub_blocked_on();
+        blocked_on.activities.push(task);
+        blocked_on
+            .signals
+            .push(stub_pending_signal(signal_envelope.clone()));
+
+        let outcome = decode_workflow_detail_rendered_fields(
+            &codecs,
+            &mut execution,
+            &mut timeline,
+            &mut blocked_on,
+        );
+
+        assert_eq!(outcome.decoded, 0, "hidden fields must not be decoded");
+        assert_eq!(outcome.failed, 0, "hidden fields must not be marked");
+        assert!(
+            !outcome.touched(),
+            "a page whose only envelopes are hidden must not write an audit row"
+        );
+        assert_eq!(
+            blocked_on.activities[0].input, input_envelope,
+            "the pending-activity input must keep its stored envelope"
+        );
+        assert_eq!(
+            blocked_on.signals[0].payload, signal_envelope,
+            "the pending-signal payload must keep its stored envelope"
+        );
+    }
+
+    /// The fields the detail page actually renders — execution payload
+    /// fields, timeline event payloads, and heartbeat checkpoints — are
+    /// decoded, and the audit outcome counts exactly those.
+    #[test]
+    fn rendered_detail_fields_are_decoded_and_counted_exactly() {
+        let codecs = ui_test_codecs();
+        let mut execution = stub_execution();
+        execution.input = ui_envelope(&serde_json::json!({"user": "pii-exec-input"}));
+        let mut timeline = vec![stub_timeline_event(serde_json::json!({
+            "type": "ActivityScheduled",
+            "data": { "input": ui_envelope(&serde_json::json!({"card": "pii-event"})) },
+        }))];
+
+        let checkpoint_envelope = ui_envelope(&serde_json::json!({"progress": "pii-checkpoint"}));
+        let input_envelope = ui_envelope(&serde_json::json!({"card": "pii-task-input"}));
+        let mut task = task_queue_item_for_activity("charge_card", "RUNNING");
+        task.input = input_envelope.clone();
+        task.heartbeat_details = Some(checkpoint_envelope);
+        let mut blocked_on = stub_blocked_on();
+        blocked_on.activities.push(task);
+
+        let outcome = decode_workflow_detail_rendered_fields(
+            &codecs,
+            &mut execution,
+            &mut timeline,
+            &mut blocked_on,
+        );
+
+        assert_eq!(
+            (outcome.decoded, outcome.failed),
+            (3, 0),
+            "exactly the three surfaced envelopes are decoded"
+        );
+        assert_eq!(
+            execution.input,
+            serde_json::json!({"user": "pii-exec-input"}),
+            "the rendered execution input must be decoded"
+        );
+        assert_eq!(
+            timeline[0].event_data["data"]["input"],
+            serde_json::json!({"card": "pii-event"}),
+            "the rendered timeline event payload must be decoded"
+        );
+        assert_eq!(
+            blocked_on.activities[0].heartbeat_details,
+            Some(serde_json::json!({"progress": "pii-checkpoint"})),
+            "the rendered heartbeat checkpoint must be decoded"
+        );
+        assert_eq!(
+            blocked_on.activities[0].input, input_envelope,
+            "the hidden pending-activity input must stay an envelope even when \
+             its sibling checkpoint is decoded"
+        );
     }
 
     #[test]

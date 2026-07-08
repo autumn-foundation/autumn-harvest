@@ -3364,8 +3364,9 @@ async fn workflow_detail_ui_renders_decoded_input() {
     // heartbeat checkpoint is an envelope, and an unconsumed signal whose
     // payload is an envelope. The panel renders the checkpoint and the
     // timeline renders each event's data; the blocked-on activity *input*
-    // and signal *payload* are decoded too (they feed the audit outcome)
-    // but the panel does not render them, so they have no HTML assertion.
+    // and signal *payload* are never rendered, so they are deliberately NOT
+    // decoded (PR #936 review, round 5) — their plaintext must not appear
+    // anywhere in the page.
     {
         let history = autumn_harvest::store::load_history(&mut conn, exec_id)
             .await
@@ -3438,6 +3439,16 @@ async fn workflow_detail_ui_renders_decoded_input() {
         !html.contains("_harvest_codec_envelope"),
         "workflow detail must not render the raw envelope: {html}"
     );
+    // Hidden fields are not decoded (PR #936 round 5): their plaintext never
+    // reaches the page.
+    assert!(
+        !html.contains("pii-detail-task-input"),
+        "the never-rendered pending-activity input must not be decoded: {html}"
+    );
+    assert!(
+        !html.contains("pii-detail-signal"),
+        "the never-rendered pending-signal payload must not be decoded: {html}"
+    );
 
     // UI-originated decode rows carry `source: ui`, matching every other
     // audit row ui.rs writes.
@@ -3457,5 +3468,135 @@ async fn workflow_detail_ui_renders_decoded_input() {
     assert_eq!(
         stored_input, input_envelope,
         "stored input must remain ciphertext after the decoded render"
+    );
+}
+
+/// Issue #608 / PR #936 round 5: a detail render whose *only* envelopes live
+/// in fields the page never displays — the pending-activity `input`, the
+/// pending-signal payload, and the attempts/signals panel event copies
+/// (isolated from the timeline via `?event_page=1`) — must do zero decode
+/// work and write NO `payload.decode_read` audit row.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_envelopes() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "encrypted_workflow",
+            workflow_id: "detail-decode-hidden-1",
+            exec_id,
+            // A plain, already-decoded input: the rendered fields carry no
+            // envelopes at all in this fixture.
+            input: json!({"user": "plain-input"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .expect("workflow insert should succeed");
+
+    // Hidden-surface envelopes only: an attempts-panel activity event and a
+    // signals-panel signal event (kept off the requested timeline page via
+    // `?event_page=1`), a pending activity whose `input` is an envelope (no
+    // heartbeat checkpoint), and an unconsumed signal with an envelope
+    // payload.
+    {
+        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        autumn_harvest::store::append_events(
+            &mut conn,
+            exec_id,
+            &[
+                autumn_harvest::WorkflowEvent::ActivityScheduled {
+                    activity_id: autumn_harvest::types::ActivityExecId::new(),
+                    name: "charge_card".to_string(),
+                    input: envelope_608(&json!({"card": "pii-hidden-event-input"})),
+                    queue: "default".to_string(),
+                },
+                autumn_harvest::WorkflowEvent::SignalReceived {
+                    signal_name: "approval".to_string(),
+                    payload: envelope_608(&json!({"approver": "pii-hidden-event-signal"})),
+                },
+            ],
+            history.next_event_id,
+        )
+        .await
+        .expect("append hidden-panel events");
+
+        let mut params = autumn_harvest::queue::EnqueueParams::new(
+            "default",
+            autumn_harvest::queue::TaskType::Activity,
+            envelope_608(&json!({"card": "pii-hidden-task-input"})),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some("charge_card".to_string());
+        autumn_harvest::queue::enqueue(&mut conn, &params)
+            .await
+            .expect("seed pending activity task");
+
+        autumn_harvest::signal::send_signal(
+            &mut conn,
+            exec_id,
+            "approval",
+            envelope_608(&json!({"approver": "pii-hidden-signal"})),
+        )
+        .await
+        .expect("seed pending signal");
+    }
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+
+    // event_page=1 → the timeline page is empty (offset 100 past the seeded
+    // events), so the only envelope-bearing copies the handler holds are the
+    // hidden ones.
+    let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}?event_page=1")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        !html.contains("pii-hidden-"),
+        "no hidden-field plaintext may appear in the page: {html}"
+    );
+    assert!(
+        !html.contains("_harvest_codec_envelope"),
+        "no raw envelope may appear in the page: {html}"
+    );
+
+    assert_eq!(
+        count_decode_audit_rows(&database_url).await,
+        0,
+        "a render whose only envelopes are hidden fields must not write a \
+         payload.decode_read audit row"
     );
 }

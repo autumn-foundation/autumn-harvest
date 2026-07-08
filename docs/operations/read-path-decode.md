@@ -67,7 +67,7 @@ their exports are byte-identical to before.
 | `GET /workflows/{id}/stack` | pending-activity heartbeat checkpoints, plus a decoded `input` field on each pending activity that is present **only** when decoding is active for the request |
 | `GET /dead-letters` | each row's `input` (JSONB) + `error` (TEXT) |
 | SSE `GET /executions/{id}/events/stream` | every frame (backfill + live), decoder resolved once at stream open |
-| Vantage UI | workflow detail page (input/output cards, timeline, blocked-on panel) and the DLQ page |
+| Vantage UI | workflow detail page (input/output/memo/search-attrs cards + error banner, timeline event payloads, blocked-on heartbeat checkpoints) and the DLQ page (input, error, last-10 events). The detail page decodes **only what it renders**: the pending-activity `input`, pending-signal payloads, and the attempts/signals panel event copies are never displayed, so they are not decoded and never count toward the audit outcome (PR #936 review). |
 
 ### Deliberately undecoded surfaces
 
