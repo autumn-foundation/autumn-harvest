@@ -296,11 +296,46 @@ Operational guidance:
 * **Prevention:** the mixed-version window is *new-binary registrations racing old-binary
   workers*. During a rolling deploy, register (or update) conditions that use newly added
   operators only **after** the whole fleet runs the new binary; conditions using only
-  operators every deployed build understands are safe to register at any time.
+  operators every deployed build understands are safe to register at any time. See
+  "Rollout ordering" below for the full deploy-ordering contract — including the strictly
+  worse pre-#810 window, where an old worker does not fail closed at all but fires the
+  trigger unconditionally.
 
 A durable re-evaluation queue for `condition_invalid` pairs is a named follow-up (see the
 PR #972 review thread); it is deliberately not built here to keep the guard slice
 self-contained ahead of issue #748.
+
+### Rollout ordering — guards are enforced by workers, not at registration
+
+A guard is evaluated by whichever **worker binary** commits the source workflow's
+terminal transition — never by the API node that accepted the registration. A guarded
+trigger is therefore only enforced by workers running a build that understands its
+`condition`, and there are two distinct mixed-version windows:
+
+* **Pre-#810 worker binaries do not fail closed — they fire unconditionally.** A worker
+  built before this feature selects the trigger row *without* the `condition` column
+  (Diesel queries name their columns explicitly, so the extra column is invisible rather
+  than an error) and its evaluation path has no gate at all. If the source workflow
+  closes on such a worker, the target starts as if the trigger were unguarded — and
+  because that binary never sees the guard, it emits **no warning, no skip counter, no
+  fires-row `outcome`**. This window cannot be detected from telemetry; it can only be
+  avoided by deploy ordering.
+* **#810+ binaries that cannot parse a specific stored condition fail closed**
+  (`condition_invalid`, previous section) — this is the future-operator window, and it
+  *is* detectable (warn + counter).
+
+**Rule: upgrade the entire worker fleet first, then register guarded triggers.** The
+same ordering applies to every future condition extension: register conditions that use
+newly added operators only after every deployed worker understands them.
+
+Harvest deliberately does **not** reject guarded registrations based on observed fleet
+state. `harvest_workers.build_id` is an optional, free-form operator label (often empty)
+with no mapping to "understands guard operator X"; heartbeat rows can be stale; and a
+pre-#810 worker can join the fleet the moment after any registration-time check passes —
+such a gate would be unreliable rather than protective. This matches the rollout
+contract of every other additive behavioral column in Harvest (completion callbacks
+#605, soft SLA #487, debounce #499, schedule catchup #484): documented deploy ordering,
+not registration gating.
 
 ### Re-registering a trigger replaces the whole definition
 
