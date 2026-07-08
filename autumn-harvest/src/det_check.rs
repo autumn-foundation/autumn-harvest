@@ -310,20 +310,29 @@ const RULES: &[Rule] = &[
         id: "DET011",
         severity: DetSeverity::Error,
         patterns: &[
-            // Select MACROS — the `!` makes these unambiguous macro
-            // invocations (no ident/method call contains it). `select!` alone
-            // matches `tokio::select!`, `futures::select!`, and a bare
-            // `select!`; `select_biased!` needs its own pattern (it does not
-            // contain the `select!` substring). Both are matched only at an
-            // identifier boundary (see `DET011_MACRO_BOUNDARY_PATTERNS`): the
-            // byte immediately preceding a match must not be an identifier
-            // byte, so an unrelated macro whose name merely ENDS in these
-            // tokens (`sql_select! {}`, `my_select!()`, `foo_select_biased!()`)
-            // is not flagged. This keeps det_check in agreement with the
-            // compile-time HVG010 guardrail, which matches macro paths exactly
-            // and accepts those unrelated macros (#799 P2 review). A preceding
-            // `::` (`tokio::select!` / `futures::select!`), brace, whitespace,
-            // or line start is a boundary and still matches.
+            // Select MACROS — the trailing `!` makes these unambiguous macro
+            // invocations (no ident/method call contains it) and bounds the
+            // macro NAME on the right, so `select_biasedx!` and a `select!`
+            // match inside `select_biased!` are excluded. The candidate pattern
+            // only LOCATES the macro name; the accept/reject decision is made by
+            // the path-precise `matches_select_macro_pattern` (see
+            // `DET011_MACRO_PATTERNS`), which extracts the FULL qualified macro
+            // path (walking back over the contiguous path run, stripping an
+            // optional leading `::`) and matches it EXACTLY against
+            // `is_allowed_select_macro_path`. That precision is required so a
+            // qualified macro under an UNRELATED root is NOT flagged:
+            // `crate::ui::select! {}`, `my::select_biased! {}`,
+            // `foo::bar::select! {}` all resolve to paths outside the allowed
+            // set and are rejected — exactly as the compile-time HVG010
+            // guardrail's `visit_macro` rejects them (#980 Codex P2 — the
+            // earlier ident-boundary-only check false-positived on any `::`
+            // prefix). `::tokio::select!` normalizes to `tokio::select` and IS
+            // flagged; `sql_select!` / `my_select!` are absorbed into a
+            // non-matching path by the backward walk and stay unflagged. The
+            // allowed set mirrors `visit_macro` case-for-case: bare `select`,
+            // `select_biased`, `tokio::select`, `futures::select`,
+            // `futures::select_biased` (note `tokio::select_biased` is absent
+            // there too).
             "select!",
             "select_biased!",
             // Combinator FUNCTIONS. These candidate patterns are the bare
@@ -552,8 +561,8 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
             for &pattern in rule.patterns {
                 let matched = if DET011_COMBINATOR_FN_PATTERNS.contains(&pattern) {
                     matches_futures_combinator_pattern(&code_part, pattern)
-                } else if DET011_MACRO_BOUNDARY_PATTERNS.contains(&pattern) {
-                    matches_at_ident_boundary(&code_part, pattern)
+                } else if DET011_MACRO_PATTERNS.contains(&pattern) {
+                    matches_select_macro_pattern(&code_part, pattern)
                 } else {
                     code_part.contains(pattern)
                 };
@@ -936,30 +945,45 @@ fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
         if !call_paren_follows(bytes, name_end) {
             return false;
         }
-        // (3) Walk backward over the contiguous path run (ident bytes and `:`).
-        let mut run_start = pos;
-        while run_start > 0 {
-            let b = bytes[run_start - 1];
-            if is_ident_byte(b) || b == b':' {
-                run_start -= 1;
-            } else {
-                break;
-            }
-        }
-        // A `.` immediately before the path run is a method call — reject.
-        if run_start > 0 && bytes[run_start - 1] == b'.' {
-            return false;
-        }
-        let path = &code[run_start..name_end];
-        // Strip a single optional leading `::` (absolute path), mirroring the
-        // syn-based HVG010 macro lint's `path_to_string`, which ignores
-        // `leading_colon`. So `::futures::future::select(a, b)` normalizes to
-        // `futures::future::select` and is flagged — matching the compile-time
-        // guardrail — while `::my_dsl::select_all(v)` normalizes to
-        // `my_dsl::select_all` and stays unflagged (#980 Codex P2).
-        let normalized = path.strip_prefix("::").unwrap_or(path);
-        is_allowed_combinator_path(normalized)
+        // (3) Extract the full qualified path ending at the name (walking back
+        // over the contiguous path run and stripping an optional leading `::`),
+        // and match it exactly against the allowed set. A `.`-preceded run is a
+        // method call → `None` → rejected.
+        extract_qualified_path(code, pos, name_end).is_some_and(is_allowed_combinator_path)
     })
+}
+
+/// Walk backward from `name_start` over the contiguous path run (identifier
+/// bytes and `:`) and return the full qualified path from the run start through
+/// `name_end`, with a single optional leading `::` stripped (so an absolute
+/// path like `::tokio::select` normalizes to `tokio::select`, mirroring the
+/// syn-based HVG010 macro lint's `path_to_string`, which ignores
+/// `leading_colon`). Returns `None` when the run is immediately preceded by a
+/// `.` — a method call, which is never a qualified path/macro invocation.
+///
+/// Shared by the DET011 combinator-FUNCTION matcher
+/// ([`matches_futures_combinator_pattern`]) and the DET011 select-MACRO matcher
+/// ([`matches_select_macro_pattern`]) so both extract the path identically. The
+/// caller supplies `name_start`/`name_end` — for a function the whole pattern
+/// (`future::select`) is the tail run; for a macro the `!` is excluded from
+/// `name_end` so only the macro PATH (`tokio::select`) is returned.
+fn extract_qualified_path(code: &str, name_start: usize, name_end: usize) -> Option<&str> {
+    let bytes = code.as_bytes();
+    let mut run_start = name_start;
+    while run_start > 0 {
+        let b = bytes[run_start - 1];
+        if is_ident_byte(b) || b == b':' {
+            run_start -= 1;
+        } else {
+            break;
+        }
+    }
+    // A `.` immediately before the path run is a method call — reject.
+    if run_start > 0 && bytes[run_start - 1] == b'.' {
+        return None;
+    }
+    let path = &code[run_start..name_end];
+    Some(path.strip_prefix("::").unwrap_or(path))
 }
 
 /// From byte index `after_name` (just past a combinator name token), returns
@@ -1002,22 +1026,60 @@ fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
     i < bytes.len() && bytes[i] == b'('
 }
 
-/// DET011 macro patterns matched only at an identifier boundary — the select
-/// macros. A preceding identifier byte means the token is only a *suffix* of a
-/// longer, unrelated macro name (`sql_select!`, `my_select!`,
-/// `foo_select_biased!`), so it is not flagged; this mirrors the compile-time
-/// HVG010 guardrail, which matches macro paths exactly and accepts those
-/// unrelated macros (#799 P2 review). A preceding `::` (as in `tokio::select!`
-/// / `futures::select!`), brace, whitespace, or line start is a boundary and
-/// still matches.
-const DET011_MACRO_BOUNDARY_PATTERNS: &[&str] = &["select!", "select_biased!"];
+/// DET011 candidate patterns for the select MACROS. Each carries a trailing
+/// `!` (so the macro NAME is a complete token bounded on the right by the bang,
+/// which keeps `select_biasedx!` and a `select` prefix inside `select_biased!`
+/// from matching); the accept/reject decision is made by the path-precise
+/// [`matches_select_macro_pattern`], which extracts the full qualified macro
+/// path and matches it EXACTLY against [`is_allowed_select_macro_path`]. This
+/// keeps `det_check` in lock-step with the compile-time HVG010 guardrail's
+/// `visit_macro`, which matches macro paths exactly (#799 / #980 Codex P2).
+const DET011_MACRO_PATTERNS: &[&str] = &["select!", "select_biased!"];
 
-/// True if `pattern` occurs in `code` at an identifier boundary: the byte
-/// immediately preceding a match is not an identifier byte.
-fn matches_at_ident_boundary(code: &str, pattern: &str) -> bool {
-    let bytes = code.as_bytes();
-    code.match_indices(pattern)
-        .any(|(pos, _)| pos == 0 || !is_ident_byte(bytes[pos - 1]))
+/// The exact set of paths that name a select MACRO flagged by HVG010.
+///
+/// This mirrors, case-for-case, the allowed-path set in the macro crate's
+/// `determinism_lint.rs::visit_macro`: bare `select`/`select_biased`,
+/// `tokio::select`, `futures::select`, and `futures::select_biased`. Note that
+/// `tokio::select_biased` is deliberately ABSENT — it is not in `visit_macro`'s
+/// set either. A qualified path with any OTHER root (`crate::ui::select`,
+/// `my::select_biased`, `foo::bar::select`) is absent, so those are never
+/// flagged, exactly as the compile-time guardrail leaves them un-flagged
+/// (#980 Codex P2 — the qualified-macro-path false-positive fix).
+fn is_allowed_select_macro_path(path: &str) -> bool {
+    matches!(
+        path,
+        "select" | "select_biased" | "tokio::select" | "futures::select" | "futures::select_biased"
+    )
+}
+
+/// True if a select-macro `pattern` (`select!` or `select_biased!`, trailing
+/// `!` included) occurs in `code` as an invocation whose FULL qualified macro
+/// path is in the allowed set. For each occurrence the check is:
+///
+/// 1. The trailing `!` in `pattern` guarantees the macro name is a complete
+///    token on the right (`select_biasedx!` and a `select!` match inside
+///    `select_biased!` are excluded by `match_indices` itself).
+/// 2. The full qualified path ending at the macro name (the `!` excluded) is
+///    extracted by [`extract_qualified_path`] — walking backward over the
+///    contiguous path run and stripping an optional leading `::` — then matched
+///    exactly against [`is_allowed_select_macro_path`]. A `.`-preceded run
+///    (`None`) is rejected.
+///
+/// This is path-precise, so an unrelated macro of the same tail name under a
+/// different root (`crate::ui::select!`, `my::select_biased!`,
+/// `foo::bar::select!`) is never flagged — mirroring `visit_macro`'s
+/// exact-path matching — while `::tokio::select!` normalizes to `tokio::select`
+/// and IS flagged. `sql_select!` / `my_select!` are absorbed into a
+/// non-matching path (`sql_select` / `my_select`) by the backward walk and stay
+/// unflagged.
+fn matches_select_macro_pattern(code: &str, pattern: &str) -> bool {
+    // `pattern` ends with `!`; exclude it so only the macro PATH is extracted.
+    let name_end_offset = pattern.len() - 1;
+    code.match_indices(pattern).any(|(pos, _)| {
+        extract_qualified_path(code, pos, pos + name_end_offset)
+            .is_some_and(is_allowed_select_macro_path)
+    })
 }
 
 /// Byte positions of whole-word occurrences of `word` in `code`.

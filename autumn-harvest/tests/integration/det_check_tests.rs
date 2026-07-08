@@ -1435,10 +1435,10 @@ fn det011_select_macro_is_flagged_exactly_once_no_double_count() {
 #[test]
 fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
     // An unrelated macro whose name merely ENDS in `select!` / `select_biased!`
-    // must NOT be flagged — the identifier-boundary guard excludes a preceding
-    // identifier byte, keeping det_check in agreement with the compile-time
-    // HVG010 guardrail (which matches macro paths exactly and accepts these)
-    // (#980 Codex P2 review).
+    // must NOT be flagged — the backward path walk absorbs the leading ident
+    // bytes into a non-matching path (`sql_select` / `my_select`), keeping
+    // det_check in agreement with the compile-time HVG010 guardrail (which
+    // matches macro paths exactly and accepts these) (#980 Codex P2 review).
     for call in [
         "sql_select! { columns }",
         "let _ = my_select!();",
@@ -1451,6 +1451,47 @@ fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
             "`{call}` must NOT be flagged for DET011, got: {report:?}"
         );
     }
+}
+
+#[test]
+fn det011_does_not_flag_qualified_non_select_macros() {
+    // #980 Codex P2 (the qualified-macro-path false positive): a `select!` /
+    // `select_biased!` macro under an UNRELATED root path must NOT be flagged.
+    // The earlier ident-boundary-only check false-positived on any `::` prefix
+    // (the byte before `select!` is `:`, which is not an identifier byte);
+    // the full-path match resolves these to paths outside the allowed set —
+    // exactly as the compile-time HVG010 `visit_macro` leaves them un-flagged.
+    for call in [
+        "crate::ui::select! { columns }",
+        "let _ = my::select_biased! { a };",
+        "foo::bar::select! { x }",
+        "x::select! { y }",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "qualified non-select macro `{call}` must NOT be flagged for DET011, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_flags_absolute_path_select_macro() {
+    // An absolute-path select macro normalizes to `tokio::select` (the single
+    // optional leading `::` is stripped, mirroring `visit_macro`'s
+    // `path_to_string` ignoring `leading_colon`) and IS flagged, exactly once.
+    let src = wf("::tokio::select! { _ = a => {} }");
+    let report = check_source(&src, "test.rs");
+    let count = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET011")
+        .count();
+    assert_eq!(
+        count, 1,
+        "`::tokio::select!` must be flagged exactly once (normalized to tokio::select), got: {report:?}"
+    );
 }
 
 #[test]
