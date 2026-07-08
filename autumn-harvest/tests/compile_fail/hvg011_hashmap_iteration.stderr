@@ -1,0 +1,6 @@
+error: [HVG011] Workflow determinism violation: Iterating a std::collections::HashMap or HashSet directly inside a workflow body observes the hash-iteration order, which is randomized per process (RandomState seeds differ across workers and restarts), so a replay can visit the entries in a different order than the original run. When the loop body schedules commands (ctx.execute_activity*, ctx.spawn_child_workflow*, ctx.execute_local_activity*, ctx.timer, ctx.side_effect), the command sequence is recorded in history in iteration order -- a reordered replay produces a different command sequence and diverges (non-determinism error / nd-block). Even a command-free loop can leak the non-deterministic order into workflow-local state and flip a later branch.
+       Alternative: Use a BTreeMap/BTreeSet (deterministic iteration order) for any collection a workflow iterates, or collect the keys into a Vec and sort() it before iterating: let mut keys: Vec<_> = map.keys().cloned().collect(); keys.sort(); for k in keys { ... }. Collections that are only ever point-looked-up (never iterated) are fine to keep as HashMap/HashSet.
+ --> tests/compile_fail/hvg011_hashmap_iteration.rs:8:31
+  |
+8 |     for (account, _amount) in &amounts {
+  |                               ^
