@@ -1,0 +1,3655 @@
+{
+  "uid": "harvest-starter-pack",
+  "title": "Harvest Starter Pack",
+  "description": "Starter Grafana dashboard pack v0.1.0 for the Harvest workflow engine (autumn-harvest). Covers the full ADR-0001 / telemetry.rs metric catalogue as scraped through the metrics-rs adapter (MetricsRsRecorder + metrics-exporter-prometheus). Panel choices and any thresholds mentioned in panel descriptions are starter defaults, not universal SLOs \u2014 tune to your workload. Source of truth: docs/dashboards/starter-pack-v0.1.0.json in the autumn-harvest repo; alert mapping in docs/dashboards/README.md; response runbook in docs/runbooks/harvest-alerts.md.",
+  "tags": [
+    "harvest",
+    "starter-pack",
+    "v0.1.0"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "workflow",
+        "label": "Workflow",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(harvest_workflow_started_total, workflow)",
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0
+      },
+      {
+        "name": "queue",
+        "label": "Queue",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(harvest_queue_depth, queue)",
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0
+      },
+      {
+        "name": "shard",
+        "label": "Shard",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(harvest_dlq_entries, shard)",
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Workflow start rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (workflow) (rate(harvest_workflow_started_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{workflow}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "New workflow executions started per second, by workflow type."
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Workflow terminal outcomes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(harvest_workflow_terminal_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Terminal workflow outcomes per second (completed / failed / cancelled / timed_out / terminated / continued_as_new). Emitted exactly once per terminal outcome (issue #519)."
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Workflow failure ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (workflow) (rate(harvest_workflow_terminal_total{outcome=\"failed\",workflow=~\"$workflow\"}[$__rate_interval])) / sum by (workflow) (rate(harvest_workflow_terminal_total{outcome!=\"continued_as_new\",workflow=~\"$workflow\"}[$__rate_interval]))",
+          "legendFormat": "{{workflow}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_workflow_failure_rate (docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate) Fraction of terminal executions that ended failed, per workflow type. Starter default threshold: > 10% over 5m \u2014 a starter default, not a universal SLO."
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue) (harvest_queue_depth{queue=~\"$queue\"})",
+          "legendFormat": "{{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_queue_backlog_growth (docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth) Pending tasks per queue. max by (queue) avoids double-counting when several worker replicas sample the same cross-shard depth. Secondary capacity signal \u2014 the schedule-to-start p99 panel is the primary page."
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Schedule-to-start latency p99",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket{queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (queue) (rate(harvest_queue_schedule_to_start_sum{queue=~\"$queue\"}[$__rate_interval])) / sum by (queue) (rate(harvest_queue_schedule_to_start_count{queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "avg {{queue}} (bucket-less fallback)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_queue_schedule_to_start_high (docs/runbooks/harvest-alerts.md#harvest_queue_schedule_to_start_high) Seconds from task eligibility to worker claim \u2014 the canonical worker-capacity SLI (issue #501). The p99 target needs set_buckets_for_metric; the avg target works on a bucket-less exporter."
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "DLQ entries by shard",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (shard) (harvest_dlq_entries{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_dlq_growth (docs/runbooks/harvest-alerts.md#harvest_dlq_growth) Dead-letter queue depth per shard. Any growth for critical workflows is page-worthy."
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Worker slot utilization",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "harvest_worker_slots_in_use / (harvest_worker_slots_in_use + harvest_worker_slots_available)",
+          "legendFormat": "{{slot_type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_worker_slot_saturation (docs/runbooks/harvest-alerts.md#harvest_worker_slot_saturation) Dispatch-slot utilization per slot_type (issue #531). Pair with queue depth: slots saturated AND backlog growing = worker bottleneck; slots free while backlog grows = downstream bottleneck. 90%/5m is a starter default."
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Workflow lifecycle",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "panels": [
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Workflow starts by queue",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 34
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (rate(harvest_workflow_started_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "Workflow duration p50 / p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 34
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_workflow_duration_bucket{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "histogram_quantile(0.50, sum by (le, workflow) (rate(harvest_workflow_duration_bucket{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p50 {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "C",
+              "expr": "sum by (workflow) (rate(harvest_workflow_duration_sum{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / sum by (workflow) (rate(harvest_workflow_duration_count{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "avg {{workflow}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "End-to-end workflow execution latency. Quantile targets need set_buckets_for_metric; the avg target works on a bucket-less exporter."
+        },
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "Terminal outcomes by workflow",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 42
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, outcome) (rate(harvest_workflow_terminal_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 13,
+          "type": "timeseries",
+          "title": "Workflow-level retries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 42
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (rate(harvest_workflow_retries_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Workflow-level retry policy re-runs (issue #523)."
+        },
+        {
+          "id": 14,
+          "type": "timeseries",
+          "title": "Continue-as-new rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 50
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow_type) (rate(harvest_workflow_continue_as_new_total{workflow_type=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow_type}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 15,
+          "type": "timeseries",
+          "title": "History size p99 (events)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 50
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, workflow_type) (rate(harvest_workflow_history_size_bucket{workflow_type=~\"$workflow\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{workflow_type}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (workflow_type) (rate(harvest_workflow_history_size_sum{workflow_type=~\"$workflow\"}[$__rate_interval])) / sum by (workflow_type) (rate(harvest_workflow_history_size_count{workflow_type=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "avg {{workflow_type}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Recorded events per execution at completion. Persistently large histories are continue-as-new candidates."
+        },
+        {
+          "id": 16,
+          "type": "timeseries",
+          "title": "Oversized histories (approaching cap)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow) (harvest_workflow_history_oversized{workflow=~\"$workflow\"})",
+              "legendFormat": "{{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Executions whose history has crossed the warning threshold of the history cap."
+        },
+        {
+          "id": 17,
+          "type": "timeseries",
+          "title": "Unfinished handlers at completion",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, kind) (rate(harvest_workflow_unfinished_handlers_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} {{kind}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Workflow completed while an update/signal handler was still in flight."
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Workflow health: timeouts, SLA & non-determinism",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "panels": [
+        {
+          "id": 19,
+          "type": "timeseries",
+          "title": "Workflow execution timeouts",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 36
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_workflow_timeout_total{workflow=~\"$workflow\",queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Executions force-timed-out by the execution_timeout scanner (issue #243), per hour."
+        },
+        {
+          "id": 20,
+          "type": "timeseries",
+          "title": "Workflow task timeouts",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 36
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_workflow_task_timeout_total{workflow=~\"$workflow\",queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Decision-cycle (workflow task) timeouts (issue #494), per hour."
+        },
+        {
+          "id": 21,
+          "type": "timeseries",
+          "title": "Soft SLA breaches",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 44
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_workflow_sla_breached_total{workflow=~\"$workflow\",queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Observation-only soft SLA breaches (issue #487) \u2014 the run keeps executing; emitted exactly once per breaching run."
+        },
+        {
+          "id": 22,
+          "type": "timeseries",
+          "title": "Non-determinism detections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 44
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, build_id) (increase(harvest_workflow_non_determinism_total{workflow=~\"$workflow\"}[5m]))",
+              "legendFormat": "{{workflow}} @ {{build_id}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_workflow_non_determinism (docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism) Replay divergences detected (issue #480). Any non-zero value after a deploy means a replay-breaking build shipped \u2014 first action: GET /api/harvest/workflows?nd_blocked=true."
+        },
+        {
+          "id": 23,
+          "type": "timeseries",
+          "title": "Non-determinism blocks entered",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 52
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_workflow_nondeterministic_block_total{workflow=~\"$workflow\",queue=~\"$queue\"}[5m]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Executions entering the non-terminal ND block (issue #603). Rolling back the offending build resumes the cohort automatically. Companion to Alert: harvest_workflow_non_determinism."
+        },
+        {
+          "id": 24,
+          "type": "timeseries",
+          "title": "Workflows paused",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 52
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (rate(harvest_workflow_paused_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Operator pause events (issue #383)."
+        },
+        {
+          "id": 25,
+          "type": "timeseries",
+          "title": "Pause duration p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 60
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_workflow_pause_duration_bucket{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (workflow) (rate(harvest_workflow_pause_duration_sum{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / sum by (workflow) (rate(harvest_workflow_pause_duration_count{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "avg {{workflow}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "How long paused executions stay paused before resume (operator or auto-resume ceiling)."
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "row",
+      "title": "Workflow admission & pacing",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "panels": [
+        {
+          "id": 27,
+          "type": "timeseries",
+          "title": "Debounced start admissions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 38
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow) (rate(harvest_workflow_debounced_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Trigger-burst admissions collapsed by the debounce gate (issue #499). The debounce key is deliberately not a label (unbounded tenant input)."
+        },
+        {
+          "id": 28,
+          "type": "timeseries",
+          "title": "Debounce fires",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 38
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (rate(harvest_workflow_debounce_fired_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Debounced starts actually fired by the scanner after the trailing-edge window."
+        },
+        {
+          "id": 29,
+          "type": "timeseries",
+          "title": "Start-throttle deferrals",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 46
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow) (rate(harvest_workflow_start_throttled_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Starts deferred (never dropped) by the start throttle (issue #607). Per-key backlog is visible at GET /api/harvest/admin/start-throttle."
+        },
+        {
+          "id": 30,
+          "type": "timeseries",
+          "title": "Admission gate blocks",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 46
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (scope, reason) (rate(harvest_admission_blocked_total[$__rate_interval]))",
+              "legendFormat": "{{scope}} {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Starts rejected by operator admission gates (issue #377)."
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "Admission gates active",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 54
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "harvest_admission_gates_active",
+              "legendFormat": "active gates",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Number of currently-armed admission gates. Non-zero outside an incident window deserves a look."
+        },
+        {
+          "id": 32,
+          "type": "timeseries",
+          "title": "External signals sent",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 54
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome, reason_code) (rate(harvest_workflow_external_signal_sent_total[$__rate_interval]))",
+              "legendFormat": "{{outcome}} {{reason_code}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Cross-workflow signal deliveries by outcome (issue #274)."
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "row",
+      "title": "Activities",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "panels": [
+        {
+          "id": 34,
+          "type": "timeseries",
+          "title": "Activity duration p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 40
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, activity) (rate(harvest_activity_duration_bucket{queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (activity) (rate(harvest_activity_duration_sum{queue=~\"$queue\"}[$__rate_interval])) / sum by (activity) (rate(harvest_activity_duration_count{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "avg {{activity}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Activity handler latency by activity type. The p99 target needs set_buckets_for_metric; the avg target works on a bucket-less exporter."
+        },
+        {
+          "id": 35,
+          "type": "timeseries",
+          "title": "Activity failure rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 40
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity, queue) (rate(harvest_activity_duration_count{status=\"failed\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{activity}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_activity_failure_surge (docs/runbooks/harvest-alerts.md#harvest_activity_failure_surge) Failed activity completions per second. Starter default: page above 5% of completions or > 10 failures in 5m for a critical activity."
+        },
+        {
+          "id": 36,
+          "type": "timeseries",
+          "title": "Activity success ratio",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 48
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\",queue=~\"$queue\"}[$__rate_interval])) / sum by (activity, queue) (rate(harvest_activity_attempts_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{activity}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_activity_success_ratio (docs/runbooks/harvest-alerts.md#harvest_activity_success_ratio) Completed attempts / all attempts within the single harvest.activity.attempts family (issue #528). Starter default: page below 90% over 5m."
+        },
+        {
+          "id": 37,
+          "type": "timeseries",
+          "title": "Failed attempts by error type (top 10)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 48
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, sum by (activity, error_type) (rate(harvest_activity_failed_total[$__rate_interval])))",
+              "legendFormat": "{{activity}} {{error_type}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Terminal/non-retryable per-attempt failures with error-type breakdown (issue #528). error_type values are author-shaped \u2014 kept to topk."
+        },
+        {
+          "id": 38,
+          "type": "timeseries",
+          "title": "Activity retry rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 56
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity, queue) (rate(harvest_activity_retries_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{activity}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_activity_retry_storm (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Alert: harvest_activity_retry_storm_critical (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm_critical) Retries actually enqueued per second \u2014 the authoritative retry-storm signal. Starter defaults: ticket > 5/s, page > 20/s, both over 5m."
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "type": "row",
+      "title": "Circuit breakers",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": [
+        {
+          "id": 40,
+          "type": "timeseries",
+          "title": "Circuit breakers tripped",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 42
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity_name) (increase(harvest_activity_circuit_tripped_total[1h]))",
+              "legendFormat": "{{activity_name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Per-activity circuit breakers opened in the last hour (issue #369)."
+        },
+        {
+          "id": 41,
+          "type": "timeseries",
+          "title": "Circuit breakers closed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 42
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity_name) (increase(harvest_activity_circuit_closed_total[1h]))",
+              "legendFormat": "{{activity_name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Circuit breakers recovered to closed in the last hour (half-open probe success or operator force-close)."
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "row",
+      "title": "Queues & workers",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panels": [
+        {
+          "id": 43,
+          "type": "timeseries",
+          "title": "Oldest pending task age",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 44
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (queue) (harvest_queue_oldest_pending_age{queue=~\"$queue\"})",
+              "legendFormat": "{{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Age of the oldest claimable eligible task per queue (issue #501) \u2014 the fast-detection companion to the schedule-to-start p99. Companion signal for Alert: harvest_queue_backlog_growth."
+        },
+        {
+          "id": 44,
+          "type": "timeseries",
+          "title": "Tasks dispatched by queue",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 44
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue) (rate(harvest_queue_dispatched_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Per-queue dispatch rate (issue #515) \u2014 confirms the live dispatch split matches configured queue weights."
+        },
+        {
+          "id": 45,
+          "type": "timeseries",
+          "title": "Worker slots in use / available",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 52
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (slot_type) (harvest_worker_slots_in_use)",
+              "legendFormat": "{{slot_type}} in use",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (slot_type) (harvest_worker_slots_available)",
+              "legendFormat": "{{slot_type}} available",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Raw dispatch-slot occupancy per slot_type across the fleet (issue #531). The Overview utilization panel maps Alert: harvest_worker_slot_saturation."
+        },
+        {
+          "id": 46,
+          "type": "timeseries",
+          "title": "Adaptive slot tuner target",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 52
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "harvest_worker_slot_target",
+              "legendFormat": "{{slot_type}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Current tuner slot target per slot_type (issue #548) \u2014 confirms live behaviour stays inside the operator band."
+        },
+        {
+          "id": 47,
+          "type": "timeseries",
+          "title": "Slot tuner decisions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 60
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (slot_type, decision) (rate(harvest_worker_tuner_decisions_total[$__rate_interval]))",
+              "legendFormat": "{{slot_type}} {{decision}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Tuner grow/shrink/hold rate. A steady stream of grow/shrink under flat load usually means the band or step size needs retuning."
+        }
+      ]
+    },
+    {
+      "id": 48,
+      "type": "row",
+      "title": "Timers",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
+      "panels": [
+        {
+          "id": 49,
+          "type": "timeseries",
+          "title": "Timers started",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 46
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(harvest_timer_started_total[$__rate_interval])",
+              "legendFormat": "timers started",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 50,
+          "type": "timeseries",
+          "title": "Timer duration p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 46
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(harvest_timer_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "rate(harvest_timer_duration_sum[$__rate_interval]) / rate(harvest_timer_duration_count[$__rate_interval])",
+              "legendFormat": "avg (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Durable timer fire latency from scheduled fire time."
+        }
+      ]
+    },
+    {
+      "id": 51,
+      "type": "row",
+      "title": "Schedules & triggers",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "panels": [
+        {
+          "id": 52,
+          "type": "timeseries",
+          "title": "Schedule runs vs skipped",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 48
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (kind, name) (rate(harvest_schedule_runs_total[$__rate_interval]))",
+              "legendFormat": "runs {{kind}} {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (kind, name, reason) (rate(harvest_schedule_skipped_total[$__rate_interval]))",
+              "legendFormat": "skipped {{kind}} {{name}} {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_schedule_missed_runs (docs/runbooks/harvest-alerts.md#harvest_schedule_missed_runs) Dispatched vs skipped schedule firings. Any skip on a required schedule is page-worthy."
+        },
+        {
+          "id": 53,
+          "type": "timeseries",
+          "title": "Schedule HA fire attempts",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 48
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_schedule_fire_attempts_total[$__rate_interval]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_schedule_ha_domination (docs/runbooks/harvest-alerts.md#harvest_schedule_ha_domination) claimed vs lost_race schedule-slot claims (issue #350). In a healthy N-replica deployment claims are roughly even; extreme skew signals topology misconfiguration."
+        },
+        {
+          "id": 54,
+          "type": "timeseries",
+          "title": "Schedules auto-paused",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 56
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (name) (increase(harvest_schedule_auto_paused_total[1h]))",
+              "legendFormat": "{{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Schedules auto-paused after consecutive dispatch failures (issue #360)."
+        },
+        {
+          "id": 55,
+          "type": "timeseries",
+          "title": "Manual schedule triggers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 56
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (name, outcome) (increase(harvest_schedule_manual_trigger_total[1h]))",
+              "legendFormat": "{{name}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 56,
+          "type": "timeseries",
+          "title": "Schedule decision write failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "increase(harvest_schedule_decision_write_failed_total[1h])",
+              "legendFormat": "write failures",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Scheduler audit-decision rows that failed to persist. Should stay at zero."
+        },
+        {
+          "id": 57,
+          "type": "timeseries",
+          "title": "Completion trigger fires",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (trigger, outcome) (rate(harvest_completion_trigger_fires_total[$__rate_interval]))",
+              "legendFormat": "{{trigger}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Terminal-state completion triggers fired, by trigger and outcome."
+        }
+      ]
+    },
+    {
+      "id": 58,
+      "type": "row",
+      "title": "DLQ & quarantine",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "panels": [
+        {
+          "id": 59,
+          "type": "timeseries",
+          "title": "DLQ redrives",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 50
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, outcome) (rate(harvest_dlq_redriven_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{queue}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Dead letters redriven back onto the task queue, by outcome. The Overview DLQ-entries panel maps Alert: harvest_dlq_growth."
+        },
+        {
+          "id": 60,
+          "type": "timeseries",
+          "title": "Tasks quarantined (poison pill)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 50
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, reason) (increase(harvest_task_quarantined_total{queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{queue}} {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Tasks quarantined to the DLQ after repeated worker-process crashes (issue #367)."
+        }
+      ]
+    },
+    {
+      "id": 61,
+      "type": "row",
+      "title": "Cache, retention & shards",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "panels": [
+        {
+          "id": 62,
+          "type": "timeseries",
+          "title": "Workflow cache hit ratio",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 52
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum (rate(harvest_workflow_cache_hit_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / (sum (rate(harvest_workflow_cache_hit_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) + sum (rate(harvest_workflow_cache_miss_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "hit ratio",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Warm-cache hit ratio on the worker hot path (issue #235). A low ratio with sticky routing enabled means affinity is not landing."
+        },
+        {
+          "id": 63,
+          "type": "timeseries",
+          "title": "Retention deletions by shard",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 52
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (shard) (rate(harvest_retention_deleted_total{shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_retention_lag (docs/runbooks/harvest-alerts.md#harvest_retention_lag) Terminal-history rows deleted by the retention janitor. A sustained zero while eligible terminal history exists means retention is lagging."
+        },
+        {
+          "id": 64,
+          "type": "timeseries",
+          "title": "Stranded pending tasks by shard",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 60
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (shard) (harvest_shard_stranded_pending{shard=~\"$shard\"})",
+              "legendFormat": "shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Eligible pending tasks with no live worker able to claim them, per shard."
+        }
+      ]
+    },
+    {
+      "id": 65,
+      "type": "row",
+      "title": "Concurrency & rate limits",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "panels": [
+        {
+          "id": 66,
+          "type": "timeseries",
+          "title": "Concurrency in flight (top 10 keys)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 54
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, harvest_concurrency_in_flight)",
+              "legendFormat": "{{key}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Per-key in-flight executions against the concurrency limit (issue #247). key cardinality is author-controlled \u2014 kept to topk."
+        },
+        {
+          "id": 67,
+          "type": "timeseries",
+          "title": "Concurrency deferred (top 10 keys)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 54
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, harvest_concurrency_deferred)",
+              "legendFormat": "{{key}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Per-key starts deferred at the concurrency cap. Sustained deferrals mean the limit is the bottleneck."
+        },
+        {
+          "id": 68,
+          "type": "timeseries",
+          "title": "Rate-limit bucket state (top 10 keys)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 62
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, harvest_rate_limit_tokens_available)",
+              "legendFormat": "tokens {{key}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "topk(10, harvest_rate_limit_refill_rate)",
+              "legendFormat": "refill {{key}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Token-bucket levels and refill rates per rate-limit key (issue #88)."
+        },
+        {
+          "id": 69,
+          "type": "timeseries",
+          "title": "Rate-limit throttle events (top 10 keys)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 62
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, sum by (key) (rate(harvest_rate_limit_throttled_total[$__rate_interval])))",
+              "legendFormat": "{{key}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Dispatches rescheduled because a rate-limit bucket was empty."
+        }
+      ]
+    },
+    {
+      "id": 70,
+      "type": "row",
+      "title": "Payloads & offload",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 55
+      },
+      "panels": [
+        {
+          "id": 71,
+          "type": "timeseries",
+          "title": "Payload size p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 56
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, payload_kind) (rate(harvest_payload_bytes_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{payload_kind}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (payload_kind) (rate(harvest_payload_bytes_sum[$__rate_interval])) / sum by (payload_kind) (rate(harvest_payload_bytes_count[$__rate_interval]))",
+              "legendFormat": "avg {{payload_kind}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Observed payload sizes by payload kind (issue #252). Bridged in the metrics-rs adapter by issue #754."
+        },
+        {
+          "id": 72,
+          "type": "timeseries",
+          "title": "Payload cap rejections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 56
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (payload_kind, workflow_type) (rate(harvest_payload_rejected_total{workflow_type=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{payload_kind}} {{workflow_type}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Payloads rejected by the byte-cap guard (issue #252). Bridged in the metrics-rs adapter by issue #754."
+        },
+        {
+          "id": 73,
+          "type": "timeseries",
+          "title": "Payloads offloaded (claim-check)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (payload_field, store_id) (rate(harvest_payload_offloaded_total[$__rate_interval]))",
+              "legendFormat": "{{payload_field}} @ {{store_id}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Fields offloaded to the external PayloadStore (issue #524)."
+        },
+        {
+          "id": 74,
+          "type": "timeseries",
+          "title": "Offload fetch latency p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, store_id) (rate(harvest_payload_offload_fetch_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{store_id}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (store_id) (rate(harvest_payload_offload_fetch_duration_sum[$__rate_interval])) / sum by (store_id) (rate(harvest_payload_offload_fetch_duration_count[$__rate_interval]))",
+              "legendFormat": "avg {{store_id}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Claim-check blob fetch latency on the replay/read path."
+        }
+      ]
+    },
+    {
+      "id": 75,
+      "type": "row",
+      "title": "Webhooks, sessions & queries",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 57
+      },
+      "panels": [
+        {
+          "id": 76,
+          "type": "timeseries",
+          "title": "Webhook deliveries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (path, outcome) (rate(harvest_webhook_received_total[$__rate_interval]))",
+              "legendFormat": "recv {{path}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (path, outcome) (rate(harvest_webhook_rejected_total[$__rate_interval]))",
+              "legendFormat": "rej {{path}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Inbound webhook triggers received vs rejected, per registered binding path (issue #344)."
+        },
+        {
+          "id": 77,
+          "type": "timeseries",
+          "title": "Worker session acquisitions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, outcome) (rate(harvest_session_acquisition_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{queue}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Session acquisitions by outcome (acquired / timed_out / broken) \u2014 issue #606."
+        },
+        {
+          "id": 78,
+          "type": "timeseries",
+          "title": "Query handler duration p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, query_name) (rate(harvest_query_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{query_name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (query_name) (rate(harvest_query_duration_sum[$__rate_interval])) / sum by (query_name) (rate(harvest_query_duration_count[$__rate_interval]))",
+              "legendFormat": "avg {{query_name}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Read-only query handler latency (issue #234)."
+        }
+      ]
+    },
+    {
+      "id": 79,
+      "type": "row",
+      "title": "Readiness checks (no native metric)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "panels": [
+        {
+          "id": 80,
+          "type": "text",
+          "title": "Readiness: Deployment preflight",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 60
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
+          }
+        },
+        {
+          "id": 81,
+          "type": "text",
+          "title": "Readiness: Worker fleet coverage",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 60
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
+          }
+        },
+        {
+          "id": 82,
+          "type": "text",
+          "title": "Readiness: Worker fleet saturation",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 68
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
+          }
+        },
+        {
+          "id": 83,
+          "type": "text",
+          "title": "Readiness: Shard readiness",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 68
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
+          }
+        },
+        {
+          "id": 84,
+          "type": "text",
+          "title": "Readiness: Build-routing compatibility",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 76
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution-id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
+          }
+        }
+      ]
+    }
+  ]
+}

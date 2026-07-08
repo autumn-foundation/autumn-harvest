@@ -6,6 +6,12 @@ first action, confirm the blast radius, then choose the smallest reversible
 step. The pack protects workflow execution; it does not replace app-specific
 SLOs.
 
+First responders: import the starter Grafana dashboard pack
+(`docs/dashboards/starter-pack-v0.1.0.json`) for the visual side of every
+metric-backed rule below — each alert maps to a named panel (the mapping
+table lives in `docs/dashboards/README.md`), and each mapped panel's
+description links back to its section in this runbook.
+
 ## harvest_preflight_failed
 
 ### Triage steps
@@ -560,6 +566,65 @@ Fix the database configuration so all replicas share the same shard pools. Do no
 Escalate to the platform owner if:
 - A `fire_claim_token` row has `fire_claimed_until` more than 2 minutes in the past and `next_run_at` has not advanced (indicates the claiming process is alive but wedged without completing the fire or clearing the claim — this should not happen with the current implementation and would indicate a bug).
 - The alert fires on a single-replica deployment (indicates a misconfiguration or metric collection error).
+
+## harvest_workflow_failure_rate
+
+The fraction of terminal workflow executions ending `failed` has exceeded the
+threshold (starter default: 10% over 5 minutes) for a workflow type. This is
+the primary success-rate SLO signal, computed from the
+`harvest.workflow.terminal{outcome}` counter (issue #519), which fires exactly
+once per terminal outcome. The `outcome` label separates `failed` from
+operator-driven `cancelled`/`terminated` and from `timed_out`, so the ratio
+pages only on genuine failures.
+
+### Triage steps
+
+1. Identify the `workflow` label from the alert.
+2. List recent failures: `harvest workflow list --state FAILED --workflow <name>`
+   (or `GET /api/harvest/workflows?state=FAILED&workflow_name=<name>`) and read
+   the `error` field on a sample of rows.
+3. Check the DLQ for poison-pill or retry-exhaustion entries from the same
+   workflow: `harvest dlq list --limit 25`, or aggregate root causes with
+   `harvest dlq aggregate --group-by workflow_name,failure_signature`.
+4. Compare the failure onset against recent deploys and against the
+   `harvest.activity.failed{error_type}` breakdown — a workflow failure surge
+   is usually downstream of an activity failure surge.
+5. If failures are non-determinism related, follow
+   `#harvest_workflow_non_determinism` instead (check
+   `GET /api/harvest/workflows?nd_blocked=true`).
+
+### Likely causes
+
+A deployment regression in the workflow or one of its activities, a downstream
+dependency outage exhausting activity retries, poison-pill quarantine failing
+the owning workflows, a too-tight `execution_timeout` misclassifying slow runs
+(those surface as `timed_out`, not `failed`, unless a handler maps them), or a
+payload/schema drift that makes the workflow fail deterministically on new
+input.
+
+### False positives
+
+Low-traffic workflow types produce unstable ratios over short windows — a
+single failure in a 5-minute window with two terminal runs is 50%. Alert only
+on workflow types with steady baseline traffic, or lengthen the window.
+Deliberate operator terminations and cancellations are separate `outcome`
+values and never count toward this ratio; `continued_as_new` is excluded from
+the denominator by the pack's expression.
+
+### Safe actions
+
+Roll back the offending workflow/activity release, force-open a circuit
+breaker if a known-bad downstream is burning retries
+(`POST /api/harvest/admin/circuits/{activity_name}/force-open`), pause the
+schedules feeding the failing workflow type, or pause individual runaway
+executions. Redrive dead letters only after the root cause is fixed.
+
+### Escalation criteria
+
+Escalate to the workflow owner when the failure ratio stays above the
+threshold for more than two windows, and to the release owner when the onset
+correlates with a deploy. Page immediately if the failing workflow type backs
+a customer-facing SLO or if DLQ entries for it are accumulating rapidly.
 
 ## harvest_workflow_non_determinism
 
