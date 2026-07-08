@@ -857,10 +857,16 @@ async fn lookup_error_on_earlier_shard_still_resolves_on_later_shard() {
     // than the acquire-failure arm. Shard 1 is healthy and owns the schedule.
     //
     // NB: the router-known-but-poolless shard case (finding 1) funnels into the
-    // same `any_shard_unreachable` flag + `resolve_not_found_outcome` decision but
-    // cannot be modelled here — `build_app` installs no runtime, so `api_state`
-    // has no router and `expected_shards` reduces to the live pool keys. That path
-    // is covered by the pure unit test `resolve_not_found_outcome_*` in `api.rs`.
+    // same `any_shard_unreachable` flag + `resolve_not_found_outcome` decision
+    // (existence gate) AND, since the fan-out now iterates the same
+    // `expected_shards` set, into an unavailable run observation (fan-out) — but
+    // neither can be modelled here: `build_app` installs no runtime, so
+    // `api_state` has no router and `expected_shards` reduces to the live pool
+    // keys. Those paths are covered by the pure unit tests
+    // `resolve_not_found_outcome_*` and
+    // `observe_schedule_runs_shard_poolless_shard_is_unavailable_not_complete`
+    // in `api.rs`. The fan-out's query-error → `partial` path is covered
+    // end-to-end by `one_shard_down_is_partial_not_500`.
     let container = Postgres::default()
         .with_tag("16")
         .start()

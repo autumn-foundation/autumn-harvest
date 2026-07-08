@@ -14501,6 +14501,65 @@ fn validate_run_filters(params: &schedule_runs::ScheduleRunsParams) -> Result<()
     Ok(())
 }
 
+/// Query one shard for its run list + cadence summary (issue #762).
+///
+/// Returns a [`schedule_runs::ShardRunsObservation`] rather than propagating
+/// errors so a single unreachable shard never fails the whole fan-out — the
+/// caller folds it into `build_runs_response`'s partial/unavailable status. A
+/// `None` pool (a shard the router knows about but for which this process has
+/// no pool wired up yet, mid a shard-add rollout) yields an unavailable
+/// observation rather than being silently omitted, mirroring
+/// `workflow_count::observe_shard`.
+async fn observe_schedule_runs_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    schedule_id: uuid::Uuid,
+    query: &autumn_harvest::ScheduleRunQuery,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> schedule_runs::ShardRunsObservation {
+    let unavailable = |error: String| schedule_runs::ShardRunsObservation {
+        shard_id,
+        runs: Vec::new(),
+        summary: Vec::new(),
+        error: Some(error),
+    };
+
+    let Some(pool) = pool else {
+        return unavailable(format!("shard {shard_id} has no configured storage pool"));
+    };
+    let mut conn = match acquire_conn(&pool).await {
+        Ok(conn) => conn,
+        Err(err) => return unavailable(err.to_string()),
+    };
+
+    let runs =
+        match autumn_harvest::list_schedule_runs(&mut conn, schedule_id, shard_id, query).await {
+            Ok(runs) => runs,
+            Err(err) => return unavailable(err.to_string()),
+        };
+
+    let summary = match autumn_harvest::schedule_run_state_summary(
+        &mut conn,
+        schedule_id,
+        shard_id,
+        since,
+        until,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(err) => return unavailable(err.to_string()),
+    };
+
+    schedule_runs::ShardRunsObservation {
+        shard_id,
+        runs,
+        summary,
+        error: None,
+    }
+}
+
 async fn list_schedule_runs_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
@@ -14512,11 +14571,11 @@ async fn list_schedule_runs_handler(
 
     validate_run_filters(&params)?;
 
-    let pool = api_state.storage_pool().map_err(map_error)?;
-
     // Existence + next_run_at resolution consults the full expected shard set
     // (router ∪ pools), so it 503s rather than 404s when a shard couldn't be
-    // checked; the runs fan-out below keeps its own partial/complete status.
+    // checked; the runs fan-out below uses the *same* expected shard set so its
+    // partial/complete status can never read `complete` while a router-known
+    // shard was never queried (issue #762 review).
     let schedule = resolve_schedule_for_runs(&api_state, schedule_id).await?;
     let next_run_at = schedule.next_run_at;
 
@@ -14531,71 +14590,28 @@ async fn list_schedule_runs_handler(
         limit: params.limit.saturating_add(1),
     };
 
+    // Fan out across every shard the router knows about (not just those with a
+    // live pool) — a router-known but poolless shard (mid a shard-add rollout)
+    // becomes an unavailable observation rather than being silently omitted, so
+    // `build_runs_response` reports `partial`/`unavailable` and never a false
+    // `complete`. Mirrors `workflow_count`/`workflow_reachability`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+
     let mut observations = Vec::new();
-    for (shard, shard_pool) in pool.iter_shards() {
-        let shard_id = shard.as_i32();
-        // Per-shard failures are recorded as an unavailable observation rather than
-        // failing the whole request, so one down shard yields a partial result.
-        let mut conn = match acquire_conn(shard_pool).await {
-            Ok(conn) => conn,
-            Err(err) => {
-                observations.push(schedule_runs::ShardRunsObservation {
-                    shard_id,
-                    runs: Vec::new(),
-                    summary: Vec::new(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-
-        let runs = match autumn_harvest::list_schedule_runs(
-            &mut conn,
-            schedule_id,
-            shard_id,
-            &query,
-        )
-        .await
-        {
-            Ok(runs) => runs,
-            Err(err) => {
-                observations.push(schedule_runs::ShardRunsObservation {
-                    shard_id,
-                    runs: Vec::new(),
-                    summary: Vec::new(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-
-        let summary = match autumn_harvest::schedule_run_state_summary(
-            &mut conn,
-            schedule_id,
-            shard_id,
-            params.since,
-            params.until,
-        )
-        .await
-        {
-            Ok(summary) => summary,
-            Err(err) => {
-                observations.push(schedule_runs::ShardRunsObservation {
-                    shard_id,
-                    runs: Vec::new(),
-                    summary: Vec::new(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-
-        observations.push(schedule_runs::ShardRunsObservation {
-            shard_id,
-            runs,
-            summary,
-            error: None,
-        });
+    for shard_id in &expected {
+        let pool = pools.get(shard_id).cloned();
+        observations.push(
+            observe_schedule_runs_shard(
+                *shard_id,
+                pool,
+                schedule_id,
+                &query,
+                params.since,
+                params.until,
+            )
+            .await,
+        );
     }
 
     Ok(Json(schedule_runs::build_runs_response(
@@ -26405,6 +26421,61 @@ mod tests {
             resolve_not_found_outcome(true),
             ScheduleExistenceOutcome::Indeterminate,
             "an expected shard could not be checked → 503 indeterminate"
+        );
+    }
+
+    /// A router-known-but-poolless expected shard (mid a shard-add rollout) must
+    /// become an *unavailable* run observation — never be silently omitted — so
+    /// the fan-out's `build_runs_response` status reads `partial`/`unavailable`
+    /// rather than a false `complete` (issue #762 review). No DB needed: the
+    /// `None`-pool arm returns synchronously without touching a pool.
+    #[tokio::test]
+    async fn observe_schedule_runs_shard_poolless_shard_is_unavailable_not_complete() {
+        let query = autumn_harvest::ScheduleRunQuery {
+            states: Vec::new(),
+            origins: Vec::new(),
+            since: None,
+            until: None,
+            cursor: None,
+            limit: 21,
+        };
+
+        let obs = observe_schedule_runs_shard(
+            7,
+            None, // router-known shard, no pool wired up yet
+            uuid::Uuid::new_v4(),
+            &query,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(obs.shard_id, 7);
+        assert!(
+            obs.error.is_some(),
+            "a poolless expected shard must be an unavailable observation, not skipped"
+        );
+        assert!(obs.runs.is_empty());
+        assert!(obs.summary.is_empty());
+
+        // The unavailable observation, combined with a healthy inspected shard,
+        // must drive the report status to `partial` — never `complete`.
+        let inspected = schedule_runs::ShardRunsObservation {
+            shard_id: 0,
+            runs: Vec::new(),
+            summary: Vec::new(),
+            error: None,
+        };
+        let resp = schedule_runs::build_runs_response(
+            uuid::Uuid::new_v4(),
+            None,
+            20,
+            vec![inspected, obs],
+        );
+        assert_eq!(
+            resp.status,
+            schedule_runs::RunsReportStatus::Partial,
+            "one inspected + one unavailable expected shard → partial, not complete"
         );
     }
 
