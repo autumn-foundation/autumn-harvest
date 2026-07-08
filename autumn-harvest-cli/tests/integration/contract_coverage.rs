@@ -458,6 +458,17 @@ fn schedule_delete_is_covered() {
 }
 
 #[test]
+fn schedule_update_is_covered() {
+    assert_covered(&[
+        "schedule",
+        "update",
+        "00000000-0000-0000-0000-000000000001",
+        "--cron",
+        "0 3 * * *",
+    ]);
+}
+
+#[test]
 fn schedule_backfill_is_covered() {
     assert_covered(&[
         "schedule",
@@ -799,6 +810,41 @@ fn schedule_create_workflow_body_fields_are_documented() {
         "--catchup",
         "--paused",
     ]);
+}
+
+#[test]
+fn schedule_update_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "schedule",
+        "update",
+        "00000000-0000-0000-0000-000000000001",
+        "--cron",
+        "0 3 * * *",
+        "--tz",
+        "America/New_York",
+        "--input-json",
+        r#"{"env":"prod"}"#,
+        "--queue",
+        "etl-workers",
+        "--overlap-policy",
+        "buffer_all",
+        "--buffer-all-max",
+        "12",
+        "--catchup-policy",
+        "window",
+        "--catchup-window-secs",
+        "7200",
+        "--jitter-secs",
+        "30",
+        "--max-active-runs",
+        "4",
+        "--calendar",
+        "us-holidays",
+        "--end-at",
+        "2030-01-01T00:00:00Z",
+        "--max-runs",
+        "24",
+    ])
 }
 
 #[test]
