@@ -34,6 +34,19 @@
 //! DET010 is the det_check twin of guardrail HVG011 (the issue proposed
 //! HVG010/DET010, but HVG010 was permanently assigned to SelectMacro/#600).
 //!
+//! # Heuristic pre-check vs. authoritative guardrail
+//!
+//! `det_check` is a best-effort **text** scanner: a fast, CLI-friendly
+//! pre-check that mirrors the compile-time guardrails so problems surface early
+//! (in review or CI) without waiting for a build. Being text-based, it can lag
+//! the guardrails on exotic syntax (turbofish, unusual spacing, multi-line
+//! calls). The **authoritative** determinism gate is the syn-based proc-macro
+//! guardrail that runs during compilation (e.g. HVG010 for DET011): it operates
+//! on the parsed AST, so it always hard-blocks these forms even where the text
+//! scanner would miss them. When the two disagree, trust the compile-time
+//! guardrail — it is the safety net, and `#[workflow(allow_nondeterministic_apis)]`
+//! (or a `// harvest-suppress:` comment for det_check) is the escape hatch.
+//!
 //! # Suppression
 //!
 //! Place a `// harvest-suppress: RULE_ID "reason"` comment on the line
@@ -313,12 +326,17 @@ const RULES: &[Rule] = &[
             // or line start is a boundary and still matches.
             "select!",
             "select_biased!",
-            // Combinator FUNCTIONS. These candidate patterns cheaply locate a
-            // possible combinator call; the actual decision is made by the
+            // Combinator FUNCTIONS. These candidate patterns are the bare
+            // combinator NAME anchors (no trailing `(`); they cheaply locate a
+            // possible combinator call and the actual decision is made by the
             // path-precise `matches_futures_combinator_pattern` (see
-            // `DET011_COMBINATOR_FN_PATTERNS`), which extracts the FULL
-            // qualified path ending at the call and matches it exactly against
-            // the same allowed-path set as the compile-time HVG010 guardrail's
+            // `DET011_COMBINATOR_FN_PATTERNS`), which (a) confirms the name is a
+            // complete token, (b) requires a call `(` to follow — after an
+            // OPTIONAL turbofish `::<…>` and any surrounding whitespace, so a
+            // turbofished call `future::select::<_, _>(a, b)` is caught too
+            // (#980 Codex P2) — and (c) extracts the FULL qualified path ending
+            // at the call and matches it exactly against the same allowed-path
+            // set as the compile-time HVG010 guardrail's
             // `is_select_combinator_path`. That precision is required so a
             // qualified call by an UNRELATED helper of the same tail name is
             // NOT flagged: `crate::future::select(`, `my_dsl::select_all(`,
@@ -331,15 +349,15 @@ const RULES: &[Rule] = &[
             // genuinely BARE distinctive names `select_all`/`select_ok`/
             // `try_select` (a bare free-fn call by any of these three is, in
             // practice, always the futures combinator via
-            // `use futures::future::select_all;`). Bare `select(` is
+            // `use futures::future::select_all;`). Bare `select` is
             // deliberately NOT in the allowed set (`select` is a common
             // free-fn / query-builder name), and a preceding `.` (method call,
             // e.g. `q.select_all()`) is rejected — mirroring the AST macro
             // visitor's structural exclusion of method calls.
-            "future::select(",
-            "select_all(",
-            "select_ok(",
-            "try_select(",
+            "future::select",
+            "select_all",
+            "select_ok",
+            "try_select",
         ],
         message: "select! / futures select combinator inside a workflow function races ctx-managed \
                   awaitables non-deterministically. tokio::select! polls its branches in a \
@@ -840,19 +858,18 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// DET011 candidate patterns for the futures combinator FUNCTIONS. Each is a
-/// cheap substring locator; the accept/reject decision is made by the
-/// path-precise [`matches_futures_combinator_pattern`], which extracts the
-/// full qualified path ending at the call and matches it exactly against the
-/// allowed set. This keeps `det_check` in lock-step with the compile-time HVG010
-/// guardrail's `is_select_combinator_path`, which matches whole paths exactly
+/// DET011 candidate patterns for the futures combinator FUNCTIONS. Each is the
+/// bare combinator NAME (no trailing `(`) — a cheap substring locator; the
+/// accept/reject decision is made by the path-precise
+/// [`matches_futures_combinator_pattern`], which confirms the name is a complete
+/// token, requires a call `(` (skipping an optional turbofish and whitespace),
+/// and extracts the full qualified path ending at the call to match it exactly
+/// against the allowed set. This keeps `det_check` in lock-step with the
+/// compile-time HVG010 guardrail's `is_select_combinator_path`, which matches
+/// whole paths exactly after `syn` has already stripped any turbofish
 /// (#980 Codex P2 review).
-const DET011_COMBINATOR_FN_PATTERNS: &[&str] = &[
-    "future::select(",
-    "select_all(",
-    "select_ok(",
-    "try_select(",
-];
+const DET011_COMBINATOR_FN_PATTERNS: &[&str] =
+    &["future::select", "select_all", "select_ok", "try_select"];
 
 /// The exact set of paths that name a futures wait-first combinator FUNCTION.
 ///
@@ -880,24 +897,43 @@ fn is_allowed_combinator_path(path: &str) -> bool {
     )
 }
 
-/// True if a candidate combinator `pattern` occurs in `code` as a genuine
-/// futures combinator call. For each occurrence of `pattern` (which ends in the
-/// `(` of the call), the full qualified path ending at that call is extracted by
-/// walking backward over the contiguous run of path bytes (identifier bytes and
-/// `:`), then matched exactly against [`is_allowed_combinator_path`]. A match
-/// whose path run is immediately preceded by `.` is a method call and is
-/// rejected. This is path-precise, so an unrelated helper of the same tail name
-/// under a different root (`crate::future::select(`, `my_dsl::select_all(`) is
-/// never flagged — mirroring the macro lint's exact-path matching (#980 P2).
+/// True if a candidate combinator `pattern` (a bare combinator NAME, e.g.
+/// `future::select` or `select_all`) occurs in `code` as a genuine futures
+/// combinator call. For each occurrence of `pattern` the check is:
+///
+/// 1. The name must be a complete token — the byte immediately after it must
+///    not be an identifier byte, so `future::select` inside `future::selected`
+///    / `future::select_all`, or `select_all` inside `select_all_flag`, is not
+///    a false hit (the longer name is caught by its own anchor).
+/// 2. A call `(` must follow once an OPTIONAL turbofish `::<…>` and any
+///    surrounding whitespace are skipped (see [`call_paren_follows`]). This is
+///    what makes `future::select::<_, _>(a, b)` and `select_all::<Vec<_>>(v)`
+///    match — the syn-based HVG010 macro lint strips such path arguments before
+///    matching, so `det_check` must tolerate them too (#980 Codex P2).
+/// 3. The full qualified path ending at the name is extracted by walking
+///    backward over the contiguous run of path bytes (identifier bytes and
+///    `:`), then matched exactly against [`is_allowed_combinator_path`]. A path
+///    run immediately preceded by `.` is a method call and is rejected.
+///
+/// This is path-precise, so an unrelated helper of the same tail name under a
+/// different root (`crate::future::select`, `my_dsl::select_all`) is never
+/// flagged — mirroring the macro lint's exact-path matching — with or without a
+/// turbofish.
 fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
     let bytes = code.as_bytes();
-    // `name_len` = pattern length minus the trailing `(`.
-    let name_len = pattern.len() - 1;
+    let name_len = pattern.len();
     code.match_indices(pattern).any(|(pos, _)| {
-        // `name_end` is the byte index just past the last char of the call
-        // name (i.e. the position of the `(`).
+        // `name_end` is the byte index just past the last char of the name.
         let name_end = pos + name_len;
-        // Walk backward over the contiguous path run (ident bytes and `:`).
+        // (1) The name must be a complete token, not a prefix of a longer one.
+        if name_end < bytes.len() && is_ident_byte(bytes[name_end]) {
+            return false;
+        }
+        // (2) A call `(` must follow (after an optional turbofish + whitespace).
+        if !call_paren_follows(bytes, name_end) {
+            return false;
+        }
+        // (3) Walk backward over the contiguous path run (ident bytes and `:`).
         let mut run_start = pos;
         while run_start > 0 {
             let b = bytes[run_start - 1];
@@ -914,6 +950,46 @@ fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
         let path = &code[run_start..name_end];
         is_allowed_combinator_path(path)
     })
+}
+
+/// From byte index `after_name` (just past a combinator name token), returns
+/// `true` if a call `(` follows once an OPTIONAL turbofish `::<…>` and any
+/// surrounding whitespace are skipped. The turbofish's angle brackets are
+/// matched with a balanced-depth scan (their contents may contain nested `<>`,
+/// commas, paths, and `_`); the scan is bounded by `bytes.len()`, so it cannot
+/// run away, and an unbalanced group is rejected rather than treated as a call.
+///
+/// Recognized shapes (all → `true`):
+/// `name(`, `name (`, `name::<T>(`, `name::<_, _> (`, `name::<Vec<Box<T>>>(`.
+/// Anything else after the name (`.`, `::foo`, `,`, end of segment) → `false`.
+fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
+    let mut i = after_name;
+    // Optional whitespace before an (optional) turbofish.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Optional turbofish `::<…>`.
+    if i + 2 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' && bytes[i + 2] == b'<' {
+        i += 3; // skip `::<`, entering the angle-bracket group at depth 1.
+        let mut depth: u32 = 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return false; // unbalanced angle brackets — not a turbofish call.
+        }
+    }
+    // Optional whitespace after the turbofish (or the name).
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Require the call `(`.
+    i < bytes.len() && bytes[i] == b'('
 }
 
 /// DET011 macro patterns matched only at an identifier boundary — the select

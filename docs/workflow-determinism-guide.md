@@ -376,6 +376,10 @@ async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, Str
 
 HVG010 is a **HardBlocker**: an unguarded `select!` over ctx-managed awaitables can silently diverge a replay or leak in-flight activities/timers, both of which are worse than a build failure.
 
+#### Heuristic pre-check vs. authoritative guardrail
+
+The compile-time HVG010 proc-macro guardrail (syn-based, operating on the parsed AST) is the **authoritative** gate — it always hard-blocks these forms, including turbofished calls like `future::select::<_, _>(a, b)` (it strips path arguments before matching). Its `det_check` twin (`DET011`) is a best-effort **text** pre-check that mirrors the guardrail so problems surface early in review or CI without a full build; being text-based it can lag on exotic syntax (turbofish, unusual spacing, multi-line calls). When the two disagree, trust the compile-time guardrail — it is the safety net — and reach for the escape hatch (`#[workflow(allow_nondeterministic_apis)]`, or a `// harvest-suppress: DET011 "reason"` comment for `det_check`) only when the race is provably safe.
+
 ---
 
 ### HVG011 — `HashMap`/`HashSet` iteration order (HardBlocker*, command-aware)

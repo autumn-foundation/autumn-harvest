@@ -1586,6 +1586,70 @@ fn det011_flags_futures_qualified_and_short_form_combinators() {
 }
 
 #[test]
+fn det011_flags_turbofished_combinator_calls() {
+    // A turbofish (and defensive whitespace) between the combinator name and the
+    // call `(` must NOT hide the call from det_check: the syn-based HVG010 macro
+    // lint strips path arguments before matching and DOES hard-block these
+    // forms, so det_check must too, or the text pre-check green-lights code the
+    // compile-time guardrail rejects (#980 Codex P2). Each is exactly one
+    // DET011 finding.
+    for call in [
+        "let _ = futures::future::select::<_, _>(a, b).await;",
+        "let _ = future::select_all::<Vec<_>>(v).await;",
+        "let _ = select_all::<Vec<_>>(v).await;",
+        "let _ = try_select::<_,_>(a, b).await;",
+        "let _ = select_ok::<Vec<Box<T>>>(v).await;",
+        "let _ = future::select ::<_, _> (a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "turbofished combinator `{call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_turbofished_non_futures_or_method_forms() {
+    // The turbofish tolerance must NOT loosen path precision: a qualified call
+    // under a non-futures root, or a method call, stays unflagged even WITH a
+    // turbofish (mirrors the macro lint's exact-path matching). Bare `select`
+    // has no allowed form (turbofished or not) and stays unflagged.
+    for call in [
+        "let _ = crate::future::select::<_,_>(a, b).await;",
+        "let _ = my_dsl::select_all::<T>(v);",
+        "let _ = foo::try_select::<_, _>(a, b);",
+        "let _ = bar::future::select_ok::<T>(v);",
+        "let _ = x.select_all::<T>();",
+        "let _ = q.try_select::<_,_>(a, b);",
+        "let _ = select::<_,_>(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "turbofished form `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+    // A macro whose name merely ends in `select` is still not a combinator,
+    // regardless of any turbofish elsewhere on the line.
+    for call in ["sql_select! { foo }", "my_select!(a, b)"] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "suffix macro `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
 fn det011_does_not_flag_method_call_forms_of_combinators() {
     // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
     // free-function combinators — they must not be flagged, mirroring the AST
