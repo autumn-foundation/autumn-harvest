@@ -366,6 +366,39 @@ fn catalog_lookup_missing_id_returns_none() {
     assert!(rule_by_id("").is_none());
 }
 
+// ── HVG011: HashMap/HashSet iteration order (issue #785) ─────────────────────
+//
+// NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
+// already permanently assigned to SelectMacro (issue #600) and rule IDs are
+// never reused, so the iteration-order rule ships as HVG011.
+
+#[test]
+fn catalog_contains_hvg011_nondeterministic_iteration() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let entry = rule_by_id("HVG011")
+        .expect("HVG011 (issue #785, remapped from the issue's proposed HVG010) must exist");
+    assert!(
+        matches!(entry.category, RuleCategory::NonDeterministicIteration),
+        "HVG011 must use the NonDeterministicIteration category"
+    );
+    // Catalog severity is the class's worst case (a command-emitting loop);
+    // detection surfaces downgrade command-free loops to Warning.
+    assert!(
+        matches!(entry.severity, Severity::HardBlocker),
+        "HVG011 catalog severity must be HardBlocker"
+    );
+    let explanation = entry.explanation.to_lowercase();
+    assert!(
+        explanation.contains("iteration") && explanation.contains("hash"),
+        "HVG011 explanation must name the hash-iteration-order risk"
+    );
+    assert!(
+        entry.alternative.contains("BTreeMap") && entry.alternative.contains("sort"),
+        "HVG011 alternative must offer BTreeMap/BTreeSet or sorted-Vec remediation"
+    );
+}
+
 // ── Finding construction from catalog entry ───────────────────────────────────
 
 #[test]

@@ -21,6 +21,7 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/hvg007_process_global.rs");
     t.compile_fail("tests/compile_fail/hvg008_nondeterministic_predicate.rs");
     t.compile_fail("tests/compile_fail/hvg010_select_macro.rs");
+    t.compile_fail("tests/compile_fail/hvg011_hashmap_iteration.rs");
     t.compile_fail("tests/compile_fail/webhook_missing_path.rs");
     t.compile_fail("tests/compile_fail/webhook_neither_target.rs");
     t.compile_fail("tests/compile_fail/webhook_both_targets.rs");

@@ -771,3 +771,584 @@ fn regression_det008_direct_io() {
     );
     assert!(report.findings.iter().any(|f| f.rule_id == "DET008"));
 }
+
+// ── DET010: HashMap/HashSet iteration order (issue #785) ──────────────────
+//
+// NOTE on the rule ID: issue #785's text proposed "DET/HVG010" but HVG010 was
+// already permanently assigned to SelectMacro (issue #600) and DET009 was the
+// current det_check maximum, so this rule ships as DET010 in det_check and
+// HVG011 in the guardrail catalog / macro lint.
+
+#[test]
+fn det010_flags_hashmap_loop_with_command_as_error() {
+    let src = wf(
+        "let mut m: HashMap<String, u64> = HashMap::new();\n    for (k, v) in &m {\n        ctx.execute_activity_raw(\"debit\", serde_json::json!(k), \"default\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010 finding, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Error),
+        "command-emitting HashMap loop must be Error, got: {finding:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn det010_pure_computation_hashmap_loop_is_warning() {
+    let src = wf(
+        "let mut m: HashMap<String, u64> = HashMap::new();\n    let mut total = 0u64;\n    for (_k, v) in &m {\n        total += v;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010 warning finding, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Warning),
+        "command-free HashMap loop must be Warning, got: {finding:?}"
+    );
+    assert!(
+        !report.has_hard_blockers(),
+        "a command-free loop must not be a hard blocker"
+    );
+}
+
+#[test]
+fn det010_flags_hashset_loop_with_command() {
+    let src = wf(
+        "let mut s: HashSet<String> = HashSet::new();\n    for item in &s {\n        ctx.spawn_child_workflow_raw(\"child\", serde_json::json!(item)).await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010 for HashSet, got: {report:?}"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+#[test]
+fn det010_flags_hashset_new_inferred_binding() {
+    // Binding hash-typed via the initializer only (no type annotation).
+    let src = wf(
+        "let mut s = HashSet::new();\n    s.insert(1u64);\n    for item in s.iter() {\n        ctx.timer(\"t\", *item).await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "HashSet::new() initializer must mark the binding, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_flags_iter_method_forms() {
+    for method in ["iter()", "keys()", "values()", "drain()", "into_iter()"] {
+        let src = wf(&format!(
+            "let mut m: HashMap<String, u64> = HashMap::new();\n    for x in m.{method} {{\n        ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n    }}"
+        ));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET010"),
+            "`for x in m.{method}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det010_flags_mut_borrow_form() {
+    let src = wf(
+        "let mut m: HashMap<String, u64> = HashMap::new();\n    for (_k, v) in &mut m {\n        ctx.side_effect(\"se\", || *v).await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "`for .. in &mut m` must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_flags_collect_turbofish_binding() {
+    let src = wf(
+        "let m = items.into_iter().collect::<HashMap<String, u64>>();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        ".collect::<HashMap<..>>() binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_shadowing_with_vec_untracks_the_ident() {
+    // Last binding wins: re-binding `m` as a Vec must clear the hash mark.
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    let m: Vec<u64> = m.values().copied().collect();\n    for v in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(v), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a later non-hash binding of the same ident must untrack it, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_never_flags_ordered_collections() {
+    for binding in [
+        "let m: BTreeMap<String, u64> = BTreeMap::new();",
+        "let m: BTreeSet<String> = BTreeSet::new();",
+        "let m: Vec<String> = Vec::new();",
+        "let m: IndexMap<String, u64> = IndexMap::new();",
+        "let m = [1u64, 2, 3];",
+    ] {
+        let src = wf(&format!(
+            "{binding}\n    for x in &m {{\n        ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n    }}"
+        ));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET010"),
+            "ordered collection `{binding}` must never be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det010_sorted_keys_vec_is_never_flagged() {
+    // The recommended remediation itself must pass: collect keys, sort, iterate.
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    let mut keys: Vec<String> = m.keys().cloned().collect();\n    keys.sort();\n    for k in keys {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "sorted-keys Vec iteration must never be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_longer_iterator_chain_is_not_flagged() {
+    // Chains past a single method call are deliberately out of scope — this is
+    // how "already-sorted iterators are never flagged" holds.
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for k in m.keys().sorted() {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "multi-call iterator chain must not be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_function_parameter_map_is_not_flagged() {
+    // Only locally `let`-bound hash collections are tracked (explicit
+    // syntactic boundary from issue #785) — parameters are never flagged.
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext, map: HashMap<String, u64>) -> Result<(), String> {\n    for (k, _v) in &map {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "function-parameter map must not be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_suppression_is_honored_and_reported() {
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let m: HashMap<String, u64> = HashMap::new();\n    // harvest-suppress: DET010 \"single entry map; order cannot matter\"\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "suppressed DET010 must not produce a finding, got: {report:?}"
+    );
+    assert!(
+        report
+            .suppressions
+            .iter()
+            .any(|s| s.rule_id == "DET010" && !s.reason.is_empty()),
+        "DET010 suppression must be echoed into report.suppressions, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_activity_bodies_are_never_flagged() {
+    let src = act(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        println!(\"{k}\");\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "activity bodies must never be flagged for DET010, got: {report:?}"
+    );
+}
+
+// ── DET010 review hardening (PR #970) ──────────────────────────────────────
+
+// P1-B: positional binding parser — word-containment false positives.
+
+#[test]
+fn det010_vec_of_hashmap_annotation_is_not_flagged() {
+    let src = wf(
+        "let v: Vec<HashMap<String, u64>> = Vec::new();\n    for m in &v {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(m), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "Vec<HashMap<..>> annotation must not track the binding, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_option_hashmap_annotation_is_not_flagged() {
+    let src = wf(
+        "let m: Option<HashMap<String, u64>> = None;\n    for x in &m {\n        let _ = x;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "Option<HashMap<..>> annotation must not track the binding, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_generic_call_turbofish_is_not_flagged() {
+    let src = wf(
+        "let ids = load_ids::<HashMap<String, u64>>();\n    for x in &ids {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a generic call turbofish mentioning HashMap must not track the binding, got: {report:?}"
+    );
+}
+
+// P1-C: depth-scoped binding eviction + for-pattern masking.
+
+#[test]
+fn det010_inner_block_hash_binding_does_not_leak() {
+    let src = wf(
+        "let m: Vec<u64> = Vec::new();\n    {\n        let m: HashMap<String, u64> = HashMap::new();\n        let _ = m.len();\n    }\n    for v in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(v), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "an inner-block hash binding must not leak past block exit, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_for_loop_pattern_masks_tracked_ident() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    let lists: Vec<Vec<u64>> = Vec::new();\n    for m in &lists {\n        for x in m {\n            ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n        }\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a for-loop pattern binding must mask the tracked ident for the body extent, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_for_loop_pattern_mask_is_restored_after_the_loop() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    let lists: Vec<Vec<u64>> = Vec::new();\n    for m in &lists {\n        let _ = m;\n    }\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let det010: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET010")
+        .collect();
+    assert_eq!(
+        det010.len(),
+        1,
+        "the outer hash binding must fire again after the masking loop closes, got: {report:?}"
+    );
+    assert!(matches!(det010[0].severity, DetSeverity::Error));
+}
+
+#[test]
+fn det010_match_arm_shadow_residual_over_flag_is_documented() {
+    // RESIDUAL LIMITATION (documented, PR #970 P1-C): the line-based det_check
+    // pass cannot mask match-arm (or closure-param) pattern bindings, so a
+    // tracked ident re-bound by `Some(m) =>` is still over-flagged inside the
+    // arm. The syn-based macro lint is scope-exact for this shape; suppress
+    // with `// harvest-suppress: DET010 "..."` when intended. This test pins
+    // the residual behavior so it is explicit, not accidental.
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    match resolve() {\n        Some(m) => {\n            for item in &m {\n                ctx.execute_activity_raw(\"a\", serde_json::json!(item), \"q\").await?;\n            }\n        }\n        None => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "pinned residual: match-arm pattern shadowing is over-flagged by the line-based pass"
+    );
+}
+
+// P2-B: HVG011 suppression alias (AC5).
+
+#[test]
+fn det010_hvg011_alias_suppression_suppresses_and_echoes() {
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let m: HashMap<String, u64> = HashMap::new();\n    // harvest-suppress: HVG011 \"single entry map; order cannot matter\"\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "HVG011-spelled suppression must suppress the DET010 finding, got: {report:?}"
+    );
+    assert!(
+        report
+            .suppressions
+            .iter()
+            .any(|s| s.rule_id == "HVG011" && !s.reason.is_empty()),
+        "the HVG011 alias must be echoed with the id the author wrote, got: {report:?}"
+    );
+}
+
+// P2-C: fallible collect turbofish.
+
+#[test]
+fn det010_collect_result_turbofish_is_tracked() {
+    let src = wf(
+        "let m = items.into_iter().collect::<Result<HashMap<String, u64>, String>>()?;\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        ".collect::<Result<HashMap<..>, E>>()? must be tracked, got: {report:?}"
+    );
+}
+
+// P2-D: multi-line `let` statements.
+
+#[test]
+fn det010_multiline_let_initializer_is_tracked() {
+    let src = wf(
+        "let m =\n        items.into_iter().collect::<HashMap<String, u64>>();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a multi-line `let m =` / `..collect::<HashMap<..>>();` binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_multiline_let_annotation_is_tracked() {
+    let src = wf(
+        "let m:\n        HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a multi-line `let m:` / `HashMap<..> = ..;` binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_multiline_for_header_is_a_documented_miss() {
+    // DOCUMENTED LIMITATION (PR #970 P2-D): a `for` header split across lines
+    // (`for (k, v) in` / `&m`) is not detected by the line-based pass — the
+    // syn-based macro lint catches this shape. Pinned so the miss is explicit.
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, v) in\n        &m\n    {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "pinned limitation: multi-line for header is not detected by det_check"
+    );
+}
+
+// P2-F.3: ctx.race() is a command marker.
+
+#[test]
+fn det010_race_in_loop_body_is_error() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        let _ = ctx.race().activity_raw(\"a\", serde_json::json!(k), \"q\").run().await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Error),
+        "ctx.race() in the loop body must make the finding an Error, got: {finding:?}"
+    );
+}
+
+// P3.2: severity scan starts at the `for` token.
+
+#[test]
+fn det010_same_line_preceding_command_does_not_inflate_severity() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    ctx.timer(\"t\", 1).await?; for (_k, v) in &m { let _ = v; }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Warning),
+        "a command BEFORE the `for` on the same line must not make an empty loop an Error, got: {finding:?}"
+    );
+}
+
+#[test]
+fn det010_enclosing_same_line_brace_does_not_extend_body_scan() {
+    // An enclosing `{` before the `for` must not inflate depth and drag the
+    // body scan past the loop's own close into following (outside) lines.
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    if cond { for x in &m { let _ = x; }\n        ctx.execute_activity_raw(\"a\", serde_json::json!(1), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Warning),
+        "a command outside the loop but inside an enclosing same-line block must not inflate severity, got: {finding:?}"
+    );
+}
+
+// P3.3: test-matrix pins.
+
+#[test]
+fn det010_hashmap_from_binding_is_tracked() {
+    let src = wf(
+        "let m = HashMap::from([(\"a\", 1u64)]);\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "HashMap::from([..]) binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_hashmap_default_binding_is_tracked() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::default();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "HashMap::default() binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_flags_remaining_iter_method_forms() {
+    for method in ["iter_mut()", "values_mut()", "into_keys()", "into_values()"] {
+        let src = wf(&format!(
+            "let mut m: HashMap<String, u64> = HashMap::new();\n    for x in m.{method} {{\n        ctx.execute_activity_raw(\"a\", serde_json::json!(1), \"q\").await?;\n    }}"
+        ));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET010"),
+            "`for x in m.{method}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det010_collect_hashset_turbofish_is_tracked() {
+    let src = wf(
+        "let s = items.into_iter().collect::<HashSet<String>>();\n    for x in &s {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        ".collect::<HashSet<..>>() binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_fan_out_helper_in_loop_body_is_error() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (_k, v) in &m {\n        let _ = ctx.execute_activity_fan_out(&info(), vec![v]).await;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010, got: {report:?}"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+#[test]
+fn det010_side_effect_in_loop_body_is_error() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (_k, v) in &m {\n        let _ = ctx.side_effect(\"draw\", || *v);\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010, got: {report:?}"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+#[test]
+fn det010_execute_local_activity_in_loop_body_is_error() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        ctx.execute_local_activity_raw(\"a\", serde_json::json!(k)).await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010, got: {report:?}"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+// P3.5: committed self-scan (AC7). The <5s success metric holds comfortably
+// (~100ms observed) but is deliberately not asserted — CI timing is flaky.
+
+#[test]
+fn det010_self_scan_of_harvest_src_is_clean() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let report = autumn_harvest::det_check::check_dir(&dir).expect("src dir must be readable");
+    let det010: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET010")
+        .collect();
+    assert!(
+        det010.is_empty(),
+        "AC7: autumn-harvest/src must have zero DET010 findings, got: {det010:?}"
+    );
+}
+
+#[test]
+fn det010_finding_carries_metadata() {
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .expect("DET010 finding");
+    assert_eq!(finding.workflow_name.as_deref(), Some("test_wf"));
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(loc.file, "test.rs");
+    assert!(loc.line > 0);
+    assert!(!finding.message.is_empty());
+    assert!(
+        finding.alternative.contains("BTreeMap") || finding.alternative.contains("sort"),
+        "alternative must point at BTreeMap or sorted-Vec remediation, got: {}",
+        finding.alternative
+    );
+}
