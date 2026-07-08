@@ -267,6 +267,16 @@ fn workflow_cancel_is_covered() {
 }
 
 #[test]
+fn workflow_pause_is_covered() {
+    assert_covered(&["workflow", "pause", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn workflow_resume_is_covered() {
+    assert_covered(&["workflow", "resume", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
 fn workflow_reset_is_covered() {
     assert_covered(&[
         "workflow",
@@ -591,6 +601,17 @@ fn workflow_cancel_body_fields_are_documented() {
     assert_body_fields_documented(&[
         "workflow",
         "cancel",
+        "00000000-0000-0000-0000-000000000001",
+        "--reason",
+        "test",
+    ]);
+}
+
+#[test]
+fn workflow_pause_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "pause",
         "00000000-0000-0000-0000-000000000001",
         "--reason",
         "test",

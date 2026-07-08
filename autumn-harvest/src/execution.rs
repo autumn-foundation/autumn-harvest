@@ -1282,6 +1282,9 @@ pub struct PausedWorkflowExecution {
     /// `true` when this request performed the `RUNNING → PAUSED` transition;
     /// `false` when the execution was already paused (idempotent).
     pub newly_paused: bool,
+    /// When the pause took effect (issue #609): the timestamp recorded by this
+    /// request, or the original pause instant for an idempotent repeat.
+    pub paused_at: Option<chrono::DateTime<Utc>>,
     /// Workflow type name (for per-workflow metrics without a re-query).
     pub workflow_name: String,
     /// Task queue the execution was dispatched on.
@@ -1293,12 +1296,17 @@ pub struct PausedWorkflowExecution {
 pub struct ResumedWorkflowExecution {
     /// Resumed workflow execution ID.
     pub exec_id: ExecutionId,
-    /// Execution state after the request (always `"RUNNING"`).
+    /// Execution state after the request (`"RUNNING"` after a real resume; the
+    /// unchanged current state after a no-op resume of a non-paused run).
     pub state: String,
     /// Actor that requested the resume.
     pub actor: String,
-    /// Wall-clock seconds the execution spent paused.
+    /// Wall-clock seconds the execution spent paused (`0.0` for a no-op).
     pub pause_duration_secs: f64,
+    /// `true` when this request performed the `PAUSED → RUNNING` transition;
+    /// `false` when the execution was not paused and nothing was mutated
+    /// (idempotent no-op, issue #609 AC7).
+    pub newly_resumed: bool,
     /// Workflow type name (for per-workflow metrics without a re-query).
     pub workflow_name: String,
     /// Task queue the execution was dispatched on.
@@ -1390,6 +1398,7 @@ pub async fn pause_workflow_execution(
                             reason: execution.pause_reason,
                             actor: execution.pause_actor.unwrap_or(actor),
                             newly_paused: false,
+                            paused_at: execution.paused_at,
                             workflow_name: execution.workflow_name,
                             queue_name: execution.queue_name,
                         });
@@ -1439,6 +1448,7 @@ pub async fn pause_workflow_execution(
                     reason,
                     actor,
                     newly_paused: true,
+                    paused_at: Some(paused_at),
                     workflow_name: execution.workflow_name,
                     queue_name: execution.queue_name,
                 })
@@ -1454,6 +1464,204 @@ pub async fn pause_workflow_execution(
     Ok(result)
 }
 
+/// SQL to shift still-open task rows' cross-retry wall-clock deadline
+/// (`schedule_to_close_at`, issue #378) forward by the pause span on resume
+/// (issue #609, AC5).
+///
+/// Binds: `$1` = pause span in microseconds (`BIGINT`), `$2` = the resumed
+/// execution's UUID. Only `PENDING`/`RUNNING` rows that actually carry a
+/// deadline are touched, mirroring the scanner's enforcement scope.
+///
+/// **Frozen rows also get their `scheduled_at` shifted** (issue #609
+/// post-review hardening, finding 3, option (b)): a `PENDING` row whose
+/// pre-shift `schedule_to_close_at` has already elapsed was *frozen* for the
+/// remainder of the pause — unclaimable throughout (the claim query requires
+/// `schedule_to_close_at > NOW()`) and spared by both the pause-aware
+/// `ScheduleToClose` scanner and the frozen-row-aware `ScheduleToStart`
+/// scanner. Shifting its `scheduled_at` forward by the same span is harmless
+/// (nothing could have claimed it while frozen — claim ordering by
+/// `scheduled_at` is only perturbed for rows that were out of the running
+/// anyway) and restores both its `schedule_to_start` budget and its
+/// retry-backoff position relative to the resume instant; without it, the
+/// next `ScheduleToStart` scan would instantly kill the row post-resume
+/// because the pause consumed its entire `scheduled_at + schedule_to_start`
+/// window. The shift deliberately does NOT apply to unfrozen `PENDING` rows
+/// (they stayed claimable during the pause — activities are not pause-gated
+/// — so their queue position and genuine worker-capacity signal must stay
+/// untouched) nor to `RUNNING` rows (`scheduled_at` is meaningless
+/// in-flight). The `CASE` reads the pre-update `schedule_to_close_at` (SQL
+/// `UPDATE` semantics: every `SET` expression sees the old row), so the
+/// frozen test is evaluated against the pre-shift deadline.
+#[must_use]
+pub const fn shift_schedule_to_close_on_resume_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
+         scheduled_at = CASE \
+             WHEN state = 'PENDING' AND schedule_to_close_at <= NOW() \
+             THEN scheduled_at + ($1::bigint * INTERVAL '1 microsecond') \
+             ELSE scheduled_at END \
+     WHERE workflow_exec_id = $2 \
+     AND state IN ('PENDING', 'RUNNING') \
+     AND schedule_to_close_at IS NOT NULL"
+}
+
+/// SQL to shift still-open **external** tasks' wall-clock deadline
+/// (`harvest_external_tasks.schedule_to_close_at`) forward by the pause span
+/// on resume (issue #609 post-review hardening, finding 2).
+///
+/// Binds: `$1` = pause span in microseconds (`BIGINT`), `$2` = the resumed
+/// execution's UUID. Mirrors [`shift_schedule_to_close_on_resume_query`] for
+/// the external-task table: only `PENDING` rows are open (every other
+/// external state — `COMPLETED`/`FAILED`/`TIMED_OUT`/`CANCELLED` — is
+/// terminal), and
+/// `schedule_to_close_at` is `NOT NULL` there, so no null guard is needed.
+///
+/// **Lock ordering (issue #609 post-review hardening, third bot-review
+/// round):** the `harvest_external_tasks` convention is *task row →
+/// execution row* (set by the completion paths in `external_task.rs` and
+/// followed by `timeout::enforce_external_task_timeouts`), but this query
+/// runs inside the resume transaction, which already holds the execution row
+/// lock — the inverted (execution-first) order. Waiting on a task row from
+/// here would therefore be an ABBA deadlock against a concurrent
+/// completion/scanner holding that task row and waiting on our execution
+/// lock. The `FOR UPDATE SKIP LOCKED` subselect makes this shift *never
+/// wait* on a task row, so it cannot participate in a lock cycle. Skipping a
+/// locked row is semantically safe in every case: a row locked by
+/// `complete_externally`/`fail_externally` becomes terminal once we commit
+/// (no shift needed); a row locked by `extend_deadline` gets a fresh
+/// `NOW()`-anchored deadline (no paused time charged); and a row locked by
+/// the timeout scanner was already expired *before* the pause began (the
+/// scan excludes PAUSED executions), so the shift would not have rescued it
+/// anyway — a deadline elapsed before the pause is still elapsed after
+/// shifting by exactly the pause span.
+#[must_use]
+pub const fn shift_external_schedule_to_close_on_resume_query() -> &'static str {
+    "UPDATE harvest_external_tasks \
+     SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
+         updated_at = NOW() \
+     WHERE id IN (\
+         SELECT id FROM harvest_external_tasks \
+         WHERE workflow_exec_id = $2 \
+         AND state = 'PENDING' \
+         FOR UPDATE SKIP LOCKED\
+     )"
+}
+
+/// Resume-time pause-span and deadline arithmetic, extracted from
+/// [`resume_workflow_execution`].
+struct ResumeDeadlineShifts {
+    pause_span: chrono::Duration,
+    pause_duration_secs: f64,
+    new_deadline_at: Option<chrono::DateTime<Utc>>,
+    new_sla_deadline_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Pure resume-time deadline arithmetic (issues #243/#487 × #383).
+fn resume_deadline_shifts(
+    execution: &WorkflowExecution,
+    resumed_at: chrono::DateTime<Utc>,
+) -> ResumeDeadlineShifts {
+    // Clamp the pause span to a non-negative duration so a clock skew that
+    // puts `paused_at` ahead of `resumed_at` neither reports a negative pause
+    // nor rewinds the deadline.
+    let pause_span = execution
+        .paused_at
+        .map(|p| resumed_at - p)
+        .filter(|span| *span > chrono::Duration::zero())
+        .unwrap_or_else(chrono::Duration::zero);
+    let pause_duration_secs = pause_span.to_std().map_or(0.0, |d| d.as_secs_f64());
+
+    // Pause suspends the SLA clock (issue #383 × #243): push the absolute
+    // execution deadline forward by the time spent paused so paused
+    // wall-clock does not count against the workflow's `execution_timeout`.
+    // `None` (no deadline) stays `None`.
+    let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
+    // Also push the soft SLA deadline forward (issue #487): a workflow paused
+    // mid-flight should not breach its SLA while paused — BUT only suspend a
+    // deadline that was still ahead when the pause began. A deadline already
+    // passed before the pause stays in the past so the breach (which occurred
+    // while RUNNING) is still observed by the scanner on the next tick after
+    // resume, rather than being silently pushed into the future.
+    let new_sla_deadline_at = execution
+        .sla_deadline_at
+        .map(|d| match execution.paused_at {
+            Some(p) if d > p => d + pause_span,
+            _ => d,
+        });
+
+    ResumeDeadlineShifts {
+        pause_span,
+        pause_duration_secs,
+        new_deadline_at,
+        new_sla_deadline_at,
+    }
+}
+
+/// Upper bound for the resume-time pause-span shift, in microseconds:
+/// 100 years (~3.15e15 µs).
+///
+/// `chrono::Duration::num_microseconds` returns `None` for a span too long to
+/// represent in `i64` microseconds (> ~292,471 years); binding an `i64::MAX`
+/// fallback into the `... * INTERVAL '1 microsecond'` shift SQL would raise a
+/// Postgres "timestamp/interval out of range" error and roll back the whole
+/// resume transaction. An unrepresentable (or merely astronomically long)
+/// span instead clamps to this finite bound — far below Postgres's
+/// interval/timestamp range (timestamps top out at year 294276) — so the
+/// shift SQL can never raise "out of range" and the resume always commits.
+const MAX_PAUSE_SHIFT_MICROS: i64 = 100 * 365 * 24 * 3600 * 1_000_000;
+
+/// Pure clamp for the pause-span → microseconds conversion used by
+/// [`shift_schedule_to_close_for_resume`]: non-positive spans pass through
+/// (the caller skips the shift entirely for them); the upper end is bounded
+/// by [`MAX_PAUSE_SHIFT_MICROS`] so the bound value is always safe to add to
+/// a real timestamp in SQL.
+fn clamped_pause_shift_micros(pause_span: chrono::Duration) -> i64 {
+    pause_span
+        .num_microseconds()
+        .unwrap_or(i64::MAX)
+        .min(MAX_PAUSE_SHIFT_MICROS)
+}
+
+/// AC5 (issue #609) × #378: pause also suspends the per-activity cross-retry
+/// wall-clock deadline. Shifts every still-open task row's
+/// `schedule_to_close_at` forward by the clamped pause span — and, for
+/// pause-frozen `PENDING` rows, `scheduled_at` as well (see
+/// [`shift_schedule_to_close_on_resume_query`]) — plus the execution's
+/// still-`PENDING` external tasks' `schedule_to_close_at` (see
+/// [`shift_external_schedule_to_close_on_resume_query`]; issue #609
+/// post-review hardening, finding 2). Runs on the caller's connection so it
+/// joins the resume transaction.
+///
+/// This mirrors `deadline_at`'s unconditional shift rather than
+/// `sla_deadline_at`'s elapsed-deadline carve-out: shifting by exactly the
+/// pause span never grants extra budget — a deadline already elapsed before
+/// the pause began (`deadline < paused_at`) is still in the past after the
+/// shift (`deadline + span < paused_at + span = resumed_at`), so the scanner
+/// times it out on its next tick after resume; a deadline still ahead retains
+/// exactly its remaining budget.
+async fn shift_schedule_to_close_for_resume(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    pause_span: chrono::Duration,
+) -> HarvestResult<()> {
+    let pause_span_micros = clamped_pause_shift_micros(pause_span);
+    if pause_span_micros > 0 {
+        diesel::sql_query(shift_schedule_to_close_on_resume_query())
+            .bind::<diesel::sql_types::BigInt, _>(pause_span_micros)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        diesel::sql_query(shift_external_schedule_to_close_on_resume_query())
+            .bind::<diesel::sql_types::BigInt, _>(pause_span_micros)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 /// Resume a paused workflow execution (issue #383).
 ///
 /// Appends a [`WorkflowEvent::WorkflowExecutionResumed`] event, transitions the
@@ -1463,11 +1671,17 @@ pub async fn pause_workflow_execution(
 /// original order on the next decision; signals queued during the pause are
 /// delivered in order.
 ///
+/// Resuming an execution that is *not* paused — `RUNNING`, or any terminal
+/// state — is a **success no-op** (issue #609, AC7): nothing is mutated, no
+/// event is appended, and the result reports `newly_resumed: false` with a
+/// zero pause duration. Rationale: idempotent operator retry — a resume
+/// retried after the run already resumed (or completed post-resume) must not
+/// error. This mirrors the Phase 3.32 terminate `newly_terminated: false`
+/// no-op precedent.
+///
 /// # Errors
 ///
 /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
-/// - [`HarvestError::Config`] when the execution is not in the `PAUSED` state
-///   (→ 409).
 /// - [`HarvestError::Database`] for persistence failures.
 pub async fn resume_workflow_execution(
     conn: &mut AsyncPgConnection,
@@ -1499,41 +1713,25 @@ pub async fn resume_workflow_execution(
                     })?;
 
                 if execution.state != "PAUSED" {
-                    return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is not paused (state: {})",
-                        execution.state
-                    )));
+                    // Success no-op (issue #609, AC7): idempotent operator
+                    // retry — see the function doc comment.
+                    return Ok(ResumedWorkflowExecution {
+                        exec_id,
+                        state: execution.state,
+                        actor,
+                        pause_duration_secs: 0.0,
+                        newly_resumed: false,
+                        workflow_name: execution.workflow_name,
+                        queue_name: execution.queue_name,
+                    });
                 }
 
-                // Clamp the pause span to a non-negative duration so a clock skew
-                // that puts `paused_at` ahead of `resumed_at` neither reports a
-                // negative pause nor rewinds the deadline.
-                let pause_span = execution
-                    .paused_at
-                    .map(|p| resumed_at - p)
-                    .filter(|span| *span > chrono::Duration::zero())
-                    .unwrap_or_else(chrono::Duration::zero);
-                let pause_duration_secs = pause_span.to_std().map_or(0.0, |d| d.as_secs_f64());
-
-                // Pause suspends the SLA clock (issue #383 × #243): push the
-                // absolute execution deadline forward by the time spent paused so
-                // paused wall-clock does not count against the workflow's
-                // `execution_timeout`. `None` (no deadline) stays `None`.
-                let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
-                // Also push the soft SLA deadline forward (issue #487): a workflow
-                // paused mid-flight should not breach its SLA while paused — BUT
-                // only suspend a deadline that was still ahead when the pause
-                // began. A deadline already passed before the pause stays in the
-                // past so the breach (which occurred while RUNNING) is still
-                // observed by the scanner on the next tick after resume, rather
-                // than being silently pushed into the future.
-                let new_sla_deadline_at =
-                    execution
-                        .sla_deadline_at
-                        .map(|d| match execution.paused_at {
-                            Some(p) if d > p => d + pause_span,
-                            _ => d,
-                        });
+                let ResumeDeadlineShifts {
+                    pause_span,
+                    pause_duration_secs,
+                    new_deadline_at,
+                    new_sla_deadline_at,
+                } = resume_deadline_shifts(&execution, resumed_at);
 
                 let history = store::load_history(conn, exec_id).await?;
                 store::append_events(
@@ -1569,6 +1767,8 @@ pub async fn resume_workflow_execution(
                     )));
                 }
 
+                shift_schedule_to_close_for_resume(conn, exec_id, pause_span).await?;
+
                 // Re-arm the executor: wake the parked workflow task so the
                 // workflow advances on its next decision attempt. Any timer that
                 // fired while paused, or signal queued during the pause, is
@@ -1580,6 +1780,7 @@ pub async fn resume_workflow_execution(
                     state: "RUNNING".to_string(),
                     actor,
                     pause_duration_secs,
+                    newly_resumed: true,
                     workflow_name: execution.workflow_name,
                     queue_name: execution.queue_name,
                 })
@@ -1588,11 +1789,16 @@ pub async fn resume_workflow_execution(
         })
         .await?;
 
-    metrics.record_workflow_pause_duration(
-        &result.workflow_name,
-        &result.queue_name,
-        result.pause_duration_secs,
-    );
+    // A no-op resume never actually resumed anything: skip the duration
+    // histogram so zero-length phantom samples don't skew percentiles
+    // (mirrors pause gating `record_workflow_paused` on `newly_paused`).
+    if result.newly_resumed {
+        metrics.record_workflow_pause_duration(
+            &result.workflow_name,
+            &result.queue_name,
+            result.pause_duration_secs,
+        );
+    }
 
     Ok(result)
 }
@@ -1742,7 +1948,7 @@ pub async fn auto_resume_expired_pauses(
     let mut resumed = 0;
     for exec_id in expired {
         match resume_workflow_execution(conn, exec_id, "auto-resume(timeout)", metrics).await {
-            Ok(_) => {
+            Ok(r) if r.newly_resumed => {
                 resumed += 1;
                 tracing::warn!(
                     exec_id = %exec_id,
@@ -1750,8 +1956,9 @@ pub async fn auto_resume_expired_pauses(
                 );
             }
             // The execution was resumed or cancelled between the scan and the
-            // claim; not a fatal condition for the sweep.
-            Err(HarvestError::Config(_) | HarvestError::NotFound(_)) => {}
+            // claim (surfaced as a `newly_resumed: false` no-op since issue
+            // #609); not a fatal condition for the sweep.
+            Ok(_) | Err(HarvestError::Config(_) | HarvestError::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
     }
@@ -4198,9 +4405,143 @@ mod non_terminal_sql_tests {
 
 #[cfg(test)]
 mod pause_helper_tests {
-    use super::pause_timeout_exceeded;
+    use super::{
+        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded,
+        shift_external_schedule_to_close_on_resume_query, shift_schedule_to_close_on_resume_query,
+    };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
+
+    #[test]
+    fn pause_shift_micros_clamps_unrepresentable_span_to_finite_bound() {
+        // Binding an i64::MAX fallback into the `* INTERVAL '1 microsecond'`
+        // shift SQL would raise a PostgreSQL "timestamp/interval out of
+        // range" error and roll back the resume transaction: a span too long
+        // for `num_microseconds` must clamp to the finite cap instead.
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::MAX),
+            MAX_PAUSE_SHIFT_MICROS
+        );
+        // A representable-but-absurd span beyond the cap clamps too.
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::days(200 * 365)),
+            MAX_PAUSE_SHIFT_MICROS
+        );
+    }
+
+    #[test]
+    fn pause_shift_micros_passes_normal_spans_through_untouched() {
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::minutes(30)),
+            30 * 60 * 1_000_000
+        );
+        assert_eq!(clamped_pause_shift_micros(ChronoDuration::zero()), 0);
+        // Non-positive spans pass through; the caller skips the shift for
+        // them (`pause_span_micros > 0` guard).
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::seconds(-5)),
+            -5_000_000
+        );
+    }
+
+    #[test]
+    fn resume_shift_query_targets_open_deadline_bearing_tasks_only() {
+        // AC5 (issue #609) × #378: on resume, still-open task rows carrying a
+        // cross-retry deadline are shifted forward by the pause span.
+        let sql = shift_schedule_to_close_on_resume_query();
+        assert!(sql.contains("UPDATE harvest_task_queue"));
+        assert!(
+            sql.contains("schedule_to_close_at = schedule_to_close_at +"),
+            "must shift the existing deadline, not overwrite it"
+        );
+        assert!(
+            sql.contains("'PENDING'") && sql.contains("'RUNNING'"),
+            "only open tasks are shifted; terminal rows stay untouched"
+        );
+        assert!(
+            sql.contains("schedule_to_close_at IS NOT NULL"),
+            "tasks without a deadline must not be touched"
+        );
+        assert!(
+            sql.contains("workflow_exec_id = $2"),
+            "the shift is scoped to the resumed execution"
+        );
+    }
+
+    #[test]
+    fn resume_shift_query_restores_scheduled_at_for_frozen_rows_only() {
+        // Finding 3 (issue #609 post-review hardening), option (b): a
+        // pause-frozen PENDING row — its pre-shift schedule_to_close_at
+        // already elapsed, so it was unclaimable for the pause's remainder —
+        // also gets scheduled_at shifted forward, restoring its
+        // schedule_to_start budget and retry-backoff position. Unfrozen
+        // PENDING rows (still claimable during the pause) and RUNNING rows
+        // must keep scheduled_at untouched.
+        let sql = shift_schedule_to_close_on_resume_query();
+        assert!(
+            sql.contains("scheduled_at = CASE"),
+            "scheduled_at must be shifted conditionally, never unconditionally"
+        );
+        assert!(
+            sql.contains("WHEN state = 'PENDING' AND schedule_to_close_at <= NOW()"),
+            "the frozen predicate is PENDING + pre-shift deadline already elapsed"
+        );
+        assert!(
+            sql.contains("THEN scheduled_at + ($1::bigint * INTERVAL '1 microsecond')"),
+            "frozen rows shift scheduled_at by exactly the pause span"
+        );
+        assert!(
+            sql.contains("ELSE scheduled_at END"),
+            "non-frozen rows must keep their scheduled_at"
+        );
+    }
+
+    #[test]
+    fn external_resume_shift_query_targets_open_external_tasks_only() {
+        // Finding 2 (issue #609 post-review hardening): resume also shifts
+        // the execution's still-open external tasks' wall-clock deadline by
+        // the pause span, mirroring the task-queue treatment.
+        let sql = shift_external_schedule_to_close_on_resume_query();
+        assert!(sql.contains("UPDATE harvest_external_tasks"));
+        assert!(
+            sql.contains("schedule_to_close_at = schedule_to_close_at +"),
+            "must shift the existing deadline, not overwrite it"
+        );
+        assert!(
+            sql.contains("state = 'PENDING'"),
+            "only PENDING external tasks are open; terminal rows stay untouched"
+        );
+        assert!(
+            sql.contains("workflow_exec_id = $2"),
+            "the shift is scoped to the resumed execution"
+        );
+        assert!(
+            sql.contains("updated_at = NOW()"),
+            "external-task mutations stamp updated_at"
+        );
+    }
+
+    #[test]
+    fn external_resume_shift_query_never_waits_on_a_locked_task_row() {
+        // Third bot-review round (issue #609 post-review hardening): the
+        // harvest_external_tasks lock convention is task row → execution row
+        // (completion paths, timeout scanner), but this shift runs with the
+        // execution row lock already held — the inverted order. It must
+        // therefore never *wait* on a task row (SKIP LOCKED), or a concurrent
+        // completion/scanner holding the task row and waiting on our
+        // execution lock would ABBA-deadlock. Skipped rows are safe by
+        // construction — see the query's doc comment.
+        let sql = shift_external_schedule_to_close_on_resume_query();
+        assert!(
+            sql.contains("FOR UPDATE SKIP LOCKED"),
+            "the shift must skip, not wait on, concurrently locked task rows"
+        );
+        assert!(
+            sql.contains("WHERE id IN ("),
+            "locking happens in the subselect so the outer UPDATE only \
+             touches rows this transaction actually holds"
+        );
+    }
 
     #[test]
     fn pause_not_expired_within_ceiling() {

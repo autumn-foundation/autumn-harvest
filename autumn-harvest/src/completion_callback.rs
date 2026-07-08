@@ -1352,6 +1352,10 @@ pub enum OutcomeAction {
 /// given attempt number, so `JitterPolicy::Full`/`Equal`/`Decorrelated`
 /// spread retries across deliveries instead of all of them backing off in
 /// lockstep (the whole point of configuring jitter).
+// The only non-test caller (`fire_due_on_conn`) is `db`-gated, so without
+// `db` (e.g. `--no-default-features --features testing`, the combo the CLI's
+// clippy job builds) this helper would otherwise be dead code.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 #[must_use]
 fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
     let mut seed = 0xcbf2_9ce4_8422_2325_u64;

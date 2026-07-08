@@ -851,6 +851,24 @@ enum WorkflowCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Pause a running workflow execution (operator intervention).
+    ///
+    /// While paused the executor dispatches no new commands for the execution;
+    /// in-flight activities run to completion. PAUSED is a non-terminal active
+    /// state — resume with `harvest workflow resume`. Pausing an
+    /// already-paused execution is a no-op.
+    Pause {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Human-readable pause reason (max 500 chars), recorded in audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a paused workflow execution, waking the parked task.
+    Resume {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
     /// Erase PII payload fields from a completed workflow execution (GDPR Art. 17).
     ///
     /// Replaces all payload-bearing fields (`input`, `output`, `payload`, `details`,
@@ -3661,6 +3679,21 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 Some(Value::Object(body)),
             ))
         }
+        WorkflowCommand::Pause {
+            execution_id,
+            reason,
+        } => {
+            let mut body = Map::new();
+            insert_string(&mut body, "reason", reason.as_deref());
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/pause", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            ))
+        }
+        WorkflowCommand::Resume { execution_id } => Ok(ApiRequest::post(
+            format!("/workflows/{}/resume", path_segment(execution_id)),
+            None,
+        )),
         WorkflowCommand::ErasePayloads {
             execution_id,
             reason,
@@ -6373,6 +6406,62 @@ mod erase_payloads_cli_tests {
             body.get("reason").is_none() || body["reason"].is_null(),
             "omitting --reason must not send the field"
         );
+    }
+}
+
+#[cfg(test)]
+mod pause_resume_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn pause_builds_post_request() {
+        let req = request(&["workflow", "pause", "abc-123"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/pause");
+    }
+
+    #[test]
+    fn pause_with_reason_includes_reason_in_body() {
+        let req = request(&[
+            "workflow",
+            "pause",
+            "abc-123",
+            "--reason",
+            "investigating incident INC-42",
+        ]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/pause");
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["reason"], "investigating incident INC-42");
+    }
+
+    #[test]
+    fn pause_without_reason_sends_no_reason_field() {
+        let req = request(&["workflow", "pause", "abc-123"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert!(
+            body.get("reason").is_none() || body["reason"].is_null(),
+            "omitting --reason must not send the field"
+        );
+    }
+
+    #[test]
+    fn resume_builds_post_request_with_no_body() {
+        let req = request(&["workflow", "resume", "abc-123"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/resume");
+        assert!(req.body.is_none(), "resume must send no request body");
     }
 }
 

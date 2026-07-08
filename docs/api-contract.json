@@ -985,7 +985,7 @@
           {
             "name": "reason",
             "required": false,
-            "description": "Human-readable pause reason (max 500 chars) recorded in audit log."
+            "description": "Human-readable pause reason (max 500 chars) recorded on the execution row (pause_reason) and the WorkflowExecutionPaused history event."
           }
         ]
       },
@@ -997,7 +997,8 @@
           "state",
           "reason",
           "actor",
-          "newly_paused"
+          "newly_paused",
+          "paused_at"
         ]
       },
       "error_responses": [
@@ -1024,8 +1025,8 @@
       "path": "/workflows/{id}/resume",
       "category": "workflow",
       "read_only": false,
-      "description": "Resume a paused workflow execution, re-arming command dispatch and waking the parked task.",
-      "idempotency": "Not idempotent: only an execution in the PAUSED state can be resumed (409 otherwise).",
+      "description": "Resume a paused workflow execution, re-arming command dispatch and waking the parked task. Resuming a non-paused (running or terminal) execution is a success no-op reporting newly_resumed=false.",
+      "idempotency": "Idempotent: resuming a non-paused execution is a 200 no-op (newly_resumed=false); nothing is mutated.",
       "params": [
         {
           "name": "id",
@@ -1046,17 +1047,14 @@
           "execution_id",
           "state",
           "actor",
-          "pause_duration_secs"
+          "pause_duration_secs",
+          "newly_resumed"
         ]
       },
       "error_responses": [
         {
           "status": 404,
           "description": "Execution not found."
-        },
-        {
-          "status": 409,
-          "description": "Execution is not in the PAUSED state."
         },
         {
           "status": 500,
