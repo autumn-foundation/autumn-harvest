@@ -24,6 +24,7 @@ db = [
 ]
 testing = []
 metrics-rs = ["dep:metrics"]
+dag-export-gantt = []
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]

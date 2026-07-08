@@ -239,6 +239,8 @@ pub use dag::{
     DagTask, DagTaskRef,
 };
 pub use dag_export::{export_dot, export_mermaid};
+#[cfg(feature = "dag-export-gantt")]
+pub use dag_export::export_mermaid_gantt;
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,

@@ -91,6 +91,77 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports the Critical Path to a Mermaid.js Gantt chart.
+///
+/// Visualizes the longest execution path through the DAG, showing the sequence of bottlenecks.
+/// Since `CriticalPathResult` currently doesn't store individual task durations, this
+/// basic visualizer evenly distributes the time or shows the sequence.
+/// For a more precise visualization, it can be extended when `CriticalPathResult`
+/// includes individual durations.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+/// use autumn_harvest::dag_export::export_mermaid_gantt;
+/// use std::time::Duration;
+///
+/// fn a() {}
+/// fn b() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let n1 = builder.activity(a);
+/// let n2 = builder.activity(b).upstream(&n1);
+/// let dag = builder.build().unwrap();
+///
+/// let analyzer = CriticalPathAnalyzer::new(dag)
+///     .mock_duration("a", Duration::from_secs(10))
+///     .mock_duration("b", Duration::from_secs(5));
+/// let result = analyzer.analyze();
+///
+/// let gantt = export_mermaid_gantt(&result).unwrap();
+/// assert!(gantt.contains("gantt"));
+/// assert!(gantt.contains("a :"));
+/// assert!(gantt.contains("b :"));
+/// ```
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "dag-export-gantt")]
+pub fn export_mermaid_gantt(
+    critical_path: &crate::critical_path::CriticalPathResult,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title Critical Path")?;
+    writeln!(out, "    dateFormat  X")?; // X is unix timestamp format, we use simple numbers
+    writeln!(out, "    axisFormat %s")?; // seconds format
+
+    writeln!(out, "    section Activities")?;
+
+    let mut start_time = 0;
+
+    // We don't have individual durations in the current CriticalPathResult,
+    // so we will just create a sequential visualization using 1s for each step
+    // just to show the dependency chain in a Gantt format, until we augment CriticalPathResult.
+    // To make it look like a Gantt, each task starts after the previous one.
+
+    for (i, name) in critical_path.path_names.iter().enumerate() {
+        let task_id = format!("t{i}");
+        let duration = 1; // Default to 1 for visual sequence
+        if i == 0 {
+            writeln!(out, "    {name} : {task_id}, {start_time}, {duration}s")?;
+        } else {
+            let prev_id = format!("t{}", i - 1);
+            writeln!(out, "    {name} : {task_id}, after {prev_id}, {duration}s")?;
+        }
+        start_time += duration;
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +224,28 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[test]
+    #[cfg(feature = "dag-export-gantt")]
+    fn test_export_gantt() {
+        use crate::critical_path::CriticalPathAnalyzer;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let analyzer = CriticalPathAnalyzer::new(dag)
+            .mock_duration("dummy_activity", Duration::from_secs(10))
+            .mock_duration("dummy_activity2", Duration::from_secs(5));
+
+        let result = analyzer.analyze();
+        let gantt = export_mermaid_gantt(&result).unwrap();
+
+        assert!(gantt.contains("gantt"));
+        assert!(gantt.contains("dummy_activity : t0"));
+        assert!(gantt.contains("dummy_activity2 : t1, after t0"));
     }
 }
