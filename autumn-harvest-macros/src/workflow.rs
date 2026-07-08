@@ -321,8 +321,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                             ))
                         }
                     };
-                    if n <= 0.0 {
-                        return Err(inner.error("throttle `burst` must be greater than zero"));
+                    if n < 1.0 {
+                        return Err(inner.error(
+                            "throttle `burst` must be >= 1.0 (a bucket capacity below \
+                             one token can never successfully debit)",
+                        ));
                     }
                     burst = Some(n);
                     Ok(())

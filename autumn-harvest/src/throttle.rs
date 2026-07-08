@@ -163,9 +163,20 @@ impl ThrottlePolicy {
     /// `burst` defaults to the rate's per-period count (e.g. `"100/m"` → `100`)
     /// when `None`, so a single window's worth of starts can burst through.
     ///
+    /// The final `burst` (explicit or defaulted) must be `>= 1.0`. The token
+    /// debit path (`queue::try_consume_rate_limit_token`) only admits a start
+    /// when the refilled bucket reaches `>= 1.0`, and refill is capped at
+    /// `burst` — a bucket capacity below one token (e.g. an explicit
+    /// `burst = 0.5`, or a fractional per-unit rate like `"0.5/s"` with no
+    /// explicit burst) can therefore never successfully debit, deferring
+    /// every start under that key forever (or until `schedule_to_start` drops
+    /// it, if configured) rather than merely pacing them (code review, issue
+    /// #607).
+    ///
     /// # Errors
     /// Returns `Err(message)` when the rate string is malformed, the rate is
-    /// non-positive, or an explicit `burst` is non-positive.
+    /// non-positive, or the final `burst` (explicit or defaulted from the
+    /// rate's per-period count) is below `1.0`.
     pub fn from_rate_str(
         rate: &str,
         burst: Option<f64>,
@@ -174,9 +185,22 @@ impl ThrottlePolicy {
     ) -> Result<Self, String> {
         let spec = parse_rate(rate)?;
         let burst = match burst {
-            Some(b) if b > 0.0 => b,
-            Some(b) => return Err(format!("throttle burst must be > 0, got {b}")),
-            None => spec.per_period_count,
+            Some(b) if b >= 1.0 => b,
+            Some(b) => {
+                return Err(format!(
+                    "throttle burst must be >= 1.0 (a bucket capacity below \
+                     one token can never successfully debit), got {b}"
+                ));
+            }
+            None if spec.per_period_count >= 1.0 => spec.per_period_count,
+            None => {
+                return Err(format!(
+                    "throttle rate '{rate}' has a per-period count of \
+                     {count} (< 1.0); pass an explicit burst >= 1.0 to use a \
+                     sub-unit rate",
+                    count = spec.per_period_count
+                ));
+            }
         };
         Ok(Self {
             refill_per_sec: spec.refill_per_sec,
@@ -624,15 +648,6 @@ pub async fn reserve_or_defer(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
-    if params.throttle_key.len() > THROTTLE_KEY_MAX_BYTES {
-        return Err(crate::error::HarvestError::Config(format!(
-            "throttle key length {} bytes exceeds maximum {} bytes; \
-             use a shorter key or hash the value before using it as a key",
-            params.throttle_key.len(),
-            THROTTLE_KEY_MAX_BYTES
-        )));
-    }
-
     // (0) Bypass entirely when an active execution already makes this
     // admission a no-op or an immediate reject under the caller's reuse
     // policy. TerminateIfRunning always starts fresh (cancel + replace), so
@@ -647,9 +662,6 @@ pub async fn reserve_or_defer(
         return Ok(ThrottleAdmission::Bypassed);
     }
 
-    let key = bucket_key(params.workflow_name, params.throttle_key);
-    let now = Utc::now();
-
     // (1) Idempotency: a retry of a request whose start is already durably
     // deferred (e.g. after a client-side timeout that never saw the first
     // 202) must land on the *same* pending row rather than queue a second one
@@ -663,6 +675,25 @@ pub async fn reserve_or_defer(
     {
         return Ok(ThrottleAdmission::Deferred(existing));
     }
+
+    // Both idempotent-retry shortcuts above (0 and 1) resolve entirely from
+    // `workflow_id` and never persist anything keyed by `throttle_key`, so
+    // neither may depend on the key's length -- a stale/new input resolving
+    // to an over-long key must still attach to the existing execution/pending
+    // row rather than fail (code review, issue #607). Only a genuinely fresh
+    // admission below actually persists a bucket/row keyed by `throttle_key`,
+    // so the length is validated here, not before steps 0/1.
+    if params.throttle_key.len() > THROTTLE_KEY_MAX_BYTES {
+        return Err(crate::error::HarvestError::Config(format!(
+            "throttle key length {} bytes exceeds maximum {} bytes; \
+             use a shorter key or hash the value before using it as a key",
+            params.throttle_key.len(),
+            THROTTLE_KEY_MAX_BYTES
+        )));
+    }
+
+    let key = bucket_key(params.workflow_name, params.throttle_key);
+    let now = Utc::now();
 
     // (2) FIFO fast-path guard: an existing backlog means we must append, not
     // jump the queue.
@@ -1289,6 +1320,36 @@ mod tests {
     #[test]
     fn from_rate_str_rejects_non_positive_burst() {
         assert!(ThrottlePolicy::from_rate_str("100/m", Some(0.0), None, None).is_err());
+    }
+
+    /// Code-review fix (issue #607): an explicit burst below 1.0 must be
+    /// rejected -- the token debit path (`LEAST(burst, refilled) >= 1.0`) can
+    /// never successfully reserve a token when `burst < 1.0`, deferring every
+    /// start under that key forever.
+    #[test]
+    fn from_rate_str_rejects_explicit_burst_below_one() {
+        let err = ThrottlePolicy::from_rate_str("100/m", Some(0.5), None, None).unwrap_err();
+        assert!(
+            err.contains(">= 1.0"),
+            "error should explain the >= 1.0 floor: {err}"
+        );
+    }
+
+    /// Same bug, reached via a *defaulted* burst: a fractional per-unit rate
+    /// like `"0.5/s"` with no explicit burst defaults to `per_period_count`
+    /// (0.5), which is just as unusable as an explicit sub-one burst.
+    #[test]
+    fn from_rate_str_rejects_fractional_rate_with_no_explicit_burst() {
+        assert!(ThrottlePolicy::from_rate_str("0.5/s", None, None, None).is_err());
+    }
+
+    /// An explicit burst >= 1.0 overrides a fractional rate's defaulted
+    /// per-period count -- the sub-unit *rate* is fine, only the resulting
+    /// bucket *capacity* must reach at least one token.
+    #[test]
+    fn from_rate_str_accepts_explicit_burst_overriding_a_fractional_rate() {
+        let p = ThrottlePolicy::from_rate_str("0.5/s", Some(1.0), None, None).unwrap();
+        assert!((p.burst - 1.0).abs() < 1e-9);
     }
 
     // ── resolve_throttle_key ─────────────────────────────────────────────────

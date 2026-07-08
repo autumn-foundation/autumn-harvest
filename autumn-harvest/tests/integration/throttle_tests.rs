@@ -1369,6 +1369,158 @@ async fn skip_size_check_false_for_a_genuinely_fresh_workflow_id() {
     );
 }
 
+// ── key-length validation ordering fix (issue #607 code review) ────────────
+//
+// `reserve_or_defer` rejects a throttle key over `THROTTLE_KEY_MAX_BYTES`
+// bytes before it would ever be persisted into a bucket/pending row. That
+// check must not run ahead of the two idempotent-retry shortcuts (an active
+// execution already satisfying the reuse policy, or an existing pending row
+// for the same workflow_id) -- both resolve entirely from `workflow_id` and
+// never persist anything keyed by the (possibly over-long) `throttle_key`, so
+// a retry carrying a stale/new input that happens to resolve to an over-long
+// key must still attach to the existing execution/pending row rather than
+// fail with a key-length error.
+
+fn oversized_key() -> String {
+    "k".repeat(autumn_harvest::throttle::THROTTLE_KEY_MAX_BYTES + 1)
+}
+
+#[tokio::test]
+async fn oversized_key_bypasses_when_execution_already_active() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let wf_id = "oversized-key-active-job";
+    let key = oversized_key();
+
+    start(&mut conn, wf, wf_id, serde_json::json!({})).await;
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            &key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            Some("reject_duplicate"),
+        ),
+    )
+    .await
+    .expect("an already-active workflow_id must bypass, not fail on key length");
+    assert!(
+        matches!(admit, ThrottleAdmission::Bypassed),
+        "got {admit:?}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_key_resolves_to_existing_pending_row() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let wf_id = "oversized-key-pending-job";
+    let key = "acme";
+
+    // First admission under a valid key durably defers (bucket drained).
+    let first = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            0.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("first admission defers");
+    let ThrottleAdmission::Deferred(_first_outcome) = first else {
+        panic!("expected Deferred, got {first:?}");
+    };
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+
+    // A retry for the same workflow_id, whose stale/new input now resolves to
+    // an over-long key, must still resolve to the *existing* pending row --
+    // not fail on key length, and not insert a second row.
+    let oversized = oversized_key();
+    let retry = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            &oversized,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            0.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("an already-pending workflow_id must resolve to the existing row");
+    let ThrottleAdmission::Deferred(retry_outcome) = retry else {
+        panic!("expected Deferred, got {retry:?}");
+    };
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+    assert_eq!(throttle_row_count(&mut conn, &oversized).await, 0);
+
+    // A third call (also via an oversized key) must land on the exact same
+    // row as the retry -- comparing two DB-round-tripped outcomes avoids the
+    // in-memory-vs-Postgres timestamp precision mismatch a comparison against
+    // `first_outcome` would hit (its `deferred_at` was captured client-side
+    // with nanosecond precision before Postgres's microsecond truncation on
+    // insert; see `retry_with_same_workflow_id_does_not_create_a_second_pending_row`).
+    let third = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            &oversized,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            0.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("a further retry must also resolve to the existing row");
+    let ThrottleAdmission::Deferred(third_outcome) = third else {
+        panic!("expected Deferred, got {third:?}");
+    };
+    assert_eq!(third_outcome.deferred_at, retry_outcome.deferred_at);
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+}
+
+#[tokio::test]
+async fn oversized_key_still_rejected_for_a_genuinely_fresh_admission() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let wf_id = "oversized-key-fresh-job";
+    let key = oversized_key();
+
+    let err = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            &key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect_err("a genuinely fresh admission must still be key-length checked");
+    assert!(err.to_string().contains("exceeds maximum"), "{err}");
+}
+
 // ── Scheduler-tick oversized-input cap check (issue #607 code review) ───────
 
 fn noop_scheduler_handler<'a>(
