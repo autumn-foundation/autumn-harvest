@@ -1016,6 +1016,30 @@ async fn stack_pending_activity_input_is_decoded() {
         !stack_str.contains("_harvest_codec_envelope"),
         "stack must not leak envelopes: {stack_str}"
     );
+    // A decode-active response carries the input-budget signaling fields
+    // (PR #936 review): the small seeded input is within its per-activity cap
+    // and the cumulative per-response budget, so it passes through unclipped.
+    let pending = &stack["pending_activities"][0];
+    assert_eq!(
+        pending["input_truncated"],
+        json!(false),
+        "small input must not be truncated per-field: {stack_str}"
+    );
+    assert_eq!(
+        pending["input_omitted_for_budget"],
+        json!(false),
+        "small input must not be withheld for budget: {stack_str}"
+    );
+    assert!(
+        pending["input_bytes"].as_u64().is_some_and(|b| b > 0),
+        "the decoded input's observed size must be reported: {stack_str}"
+    );
+    assert_eq!(
+        stack["inputs_truncated_for_budget"],
+        json!(false),
+        "the response-level input-budget flag must be present (and false) \
+         when decoding is active: {stack_str}"
+    );
 }
 
 /// AC5: `GET /dead-letters` decodes the failed task's input (JSONB) and

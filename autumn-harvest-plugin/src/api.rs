@@ -1238,6 +1238,14 @@ struct WorkflowStackResponse {
     /// exhausted (#503 review). Affected entries carry
     /// `heartbeat_details_omitted_for_budget: true`.
     checkpoints_truncated_for_budget: bool,
+    /// `true` when one or more decoded pending-activity inputs were withheld
+    /// because the cumulative per-response input budget was exhausted
+    /// (issue #608, mirroring the #503 checkpoint budget). Affected entries
+    /// carry `input_omitted_for_budget: true`. Present only when read-path
+    /// payload decoding was active for this request — omitted otherwise so
+    /// flag-off responses stay byte-identical to pre-#608 builds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inputs_truncated_for_budget: Option<bool>,
     last_event_id: i64,
 }
 
@@ -1295,9 +1303,34 @@ struct PendingActivity {
     /// Present **only** when read-path payload decoding is active for this
     /// request (deployment opt-in + harvest-admin access) — omitted
     /// otherwise, so flag-off responses stay byte-identical to pre-#608
-    /// builds. `None` for external-handoff rows.
+    /// builds. `None` for external-handoff rows, and withheld (with
+    /// `input_truncated` / `input_omitted_for_budget` signaling why) when the
+    /// decoded payload exceeds the activity's effective input cap or the
+    /// cumulative per-response input budget — the same #503 policy that
+    /// bounds heartbeat checkpoints.
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<serde_json::Value>,
+    /// `true` when the decoded input exceeded this activity's effective
+    /// input-payload cap (#252, per-activity override raised against the
+    /// global ceiling) and was withheld from the response; inspect
+    /// `input_bytes` for the size. Mirrors `heartbeat_details_truncated`.
+    /// `Option`-typed (unlike the checkpoint trio) purely so flag-off
+    /// responses omit the key and stay byte-identical to pre-#608 builds;
+    /// populated whenever decoding is active for the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_truncated: Option<bool>,
+    /// `true` when this input was within its own cap but was withheld because
+    /// the cumulative per-response input budget was already exhausted by
+    /// earlier activities (issue #608, mirroring the #503 checkpoint budget).
+    /// `input_bytes` still reports its size. Present only when decoding is
+    /// active for the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_omitted_for_budget: Option<bool>,
+    /// Observed serialized byte size of the decoded input. Present only when
+    /// decoding is active for the request (and the row is a task-queue
+    /// activity, not an external handoff).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_bytes: Option<u64>,
     last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Latest heartbeat checkpoint payload reported by the activity via
     /// `ctx.heartbeat(...)` — the current value of
@@ -1374,6 +1407,10 @@ pub(crate) fn heartbeat_details_truncation(
 /// Takes the payload by value so the owned value flows through to the response
 /// with **zero clones** on the API hot path (returned when within the cap,
 /// dropped when over-cap).
+///
+/// Despite the name this is a generic bounded-payload projection: the stack
+/// endpoint also reuses it to bound decoded pending-activity *inputs* against
+/// the activity's effective input cap (issue #608, PR #936 review).
 pub(crate) fn project_heartbeat_details(
     details: Option<serde_json::Value>,
     cap: u64,
@@ -1435,6 +1472,36 @@ fn apply_checkpoint_response_budget(activities: &mut [PendingActivity], budget: 
         if omit {
             pa.heartbeat_details = None;
             pa.heartbeat_details_omitted_for_budget = true;
+            any_withheld = true;
+        }
+    }
+    any_withheld
+}
+
+/// Apply [`checkpoint_budget_decisions`] to the decoded pending-activity
+/// inputs of a stack response, mirroring [`apply_checkpoint_response_budget`]
+/// so a fan-out workflow with many pending activities can't return roughly
+/// `count × cap` bytes of decoded inputs (issue #608, PR #936 review).
+/// Withheld inputs get `input = None` + `input_omitted_for_budget =
+/// Some(true)`, while their `input_bytes` size is still reported. Returns
+/// `true` when at least one input was withheld for budget. Only call when
+/// read-path decoding is active — with decoding off every `input` is `None`
+/// and the response field must stay absent.
+fn apply_input_response_budget(activities: &mut [PendingActivity], budget: u64) -> bool {
+    // Only entries with an included input participate in the budget; absent or
+    // individually-truncated entries (`input == None`) map to `None`.
+    let sizes: Vec<Option<u64>> = activities
+        .iter()
+        .map(|pa| pa.input.is_some().then(|| pa.input_bytes.unwrap_or(0)))
+        .collect();
+    let mut any_withheld = false;
+    for (pa, omit) in activities
+        .iter_mut()
+        .zip(checkpoint_budget_decisions(&sizes, budget))
+    {
+        if omit {
+            pa.input = None;
+            pa.input_omitted_for_budget = Some(true);
             any_withheld = true;
         }
     }
@@ -7131,6 +7198,9 @@ async fn get_workflow_stack(
             buffered_signals: Vec::new(),
             pending_child_workflows: Vec::new(),
             checkpoints_truncated_for_budget: false,
+            // A terminal stack never decodes anything (empty lists), so the
+            // decode-only budget flag stays absent regardless of the decoder.
+            inputs_truncated_for_budget: None,
             last_event_id,
         }));
     }
@@ -7188,6 +7258,14 @@ async fn get_workflow_stack(
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
         |rt| rt.registry.max_activity_result_bytes,
     );
+    // The decoded pending-activity inputs (issue #608) are bounded the same
+    // way, against the #252 activity-*input* cap (per-activity override
+    // resolved below; this global value doubles as the cumulative
+    // per-response input budget, mirroring the checkpoint budget).
+    let default_input_cap = stack_runtime.as_ref().map_or(
+        autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+        |rt| rt.registry.max_activity_input_bytes,
+    );
     // Snapshot the current time once above the loop so all tasks in the same
     // response are judged against a consistent instant (Finding 7 / #516).
     let now = chrono::Utc::now();
@@ -7199,9 +7277,13 @@ async fn get_workflow_stack(
             // Read-path payload decoding (issue #608): the task input is
             // surfaced (decoded) only when the decoder is active for this
             // request; heartbeat checkpoints are decoded in place before the
-            // cap projection. Both operate on the response copy only.
+            // cap projection. Both operate on the response copy only. The
+            // decoded input is projected against the activity's effective
+            // input cap further below (PR #936 review), mirroring the
+            // checkpoint projection, so a large fan-out can't bloat the
+            // response.
             let mut heartbeat_details = t.heartbeat_details;
-            let input = if let Some(codecs) = decoder.as_ref() {
+            let decoded_input = if let Some(codecs) = decoder.as_ref() {
                 if let Some(checkpoint) = heartbeat_details.as_mut() {
                     decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(checkpoint));
                 }
@@ -7251,6 +7333,24 @@ async fn get_workflow_stack(
                 });
             let (heartbeat_details, heartbeat_details_truncated, heartbeat_details_bytes) =
                 project_heartbeat_details(heartbeat_details, heartbeat_cap);
+            // Judge the decoded input against this activity's effective
+            // *input* cap (per-activity override raised against the global
+            // ceiling), reusing the pure #503 projection (PR #936 review).
+            // The companion fields are populated whenever decoding is active
+            // so an over-cap withholding is signaled rather than silent.
+            let (input, input_truncated, input_bytes) =
+                decoded_input.map_or((None, None, None), |decoded| {
+                    let input_cap = stack_runtime
+                        .as_ref()
+                        .zip(t.activity_name.as_deref())
+                        .map_or(default_input_cap, |(rt, name)| {
+                            rt.registry.activity_input_cap(name)
+                        });
+                    let (payload, truncated, bytes) =
+                        project_heartbeat_details(Some(decoded), input_cap);
+                    (payload, Some(truncated), bytes)
+                });
+            let input_omitted_for_budget = input_truncated.map(|_| false);
             PendingActivity {
                 activity_exec_id: t.id.to_string(),
                 activity_name: t.activity_name.unwrap_or_default(),
@@ -7261,6 +7361,9 @@ async fn get_workflow_stack(
                 task_status,
                 claimed_by_worker_id: t.worker_id,
                 input,
+                input_truncated,
+                input_omitted_for_budget,
+                input_bytes,
                 last_heartbeat_at: t.last_heartbeat_at,
                 heartbeat_details,
                 heartbeat_details_truncated,
@@ -7302,6 +7405,9 @@ async fn get_workflow_stack(
             task_status: task.state.clone(),
             claimed_by_worker_id: None,
             input: None,
+            input_truncated: None,
+            input_omitted_for_budget: None,
+            input_bytes: None,
             last_heartbeat_at: None,
             heartbeat_details: None,
             heartbeat_details_truncated: false,
@@ -7324,6 +7430,14 @@ async fn get_workflow_stack(
     // The per-response budget reuses the global activity-result cap.
     let checkpoints_truncated_for_budget =
         apply_checkpoint_response_budget(&mut pending_activities, default_heartbeat_cap);
+    // Same cumulative bound for the decoded inputs (issue #608, PR #936
+    // review), reusing the global input cap as the per-response budget. Gated
+    // on the decoder so flag-off responses omit the field entirely and stay
+    // byte-identical to pre-#608 builds (with decoding off every `input` is
+    // `None`, so there would be nothing to budget anyway).
+    let inputs_truncated_for_budget = decoder
+        .as_ref()
+        .map(|_| apply_input_response_budget(&mut pending_activities, default_input_cap));
     let pending_local_activities = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any([
@@ -7491,6 +7605,7 @@ async fn get_workflow_stack(
         buffered_signals,
         pending_child_workflows,
         checkpoints_truncated_for_budget,
+        inputs_truncated_for_budget,
         last_event_id,
     }))
 }
@@ -24459,6 +24574,9 @@ mod tests {
             max_attempts: 1,
             task_status: "RUNNING".to_string(),
             input: None,
+            input_truncated: None,
+            input_omitted_for_budget: None,
+            input_bytes: None,
             claimed_by_worker_id: None,
             last_heartbeat_at: None,
             heartbeat_details: bytes.map(|_| serde_json::json!({"k": "v"})),
@@ -24470,6 +24588,76 @@ mod tests {
             start_to_close_deadline: None,
             heartbeat_deadline: None,
         }
+    }
+
+    /// A decode-active pending activity carrying an included decoded input of
+    /// the given observed size (`None` = no input surfaced, e.g. an
+    /// external-handoff row or an input already withheld by its own cap).
+    fn pending_with_input(bytes: Option<u64>) -> PendingActivity {
+        PendingActivity {
+            input: bytes.map(|_| serde_json::json!({"card": "4242"})),
+            input_truncated: Some(false),
+            input_omitted_for_budget: Some(false),
+            input_bytes: bytes,
+            ..pending_with_checkpoint(None)
+        }
+    }
+
+    #[test]
+    fn input_budget_zero_is_disabled() {
+        let mut items = vec![pending_with_input(Some(100)); 5];
+        let withheld = apply_input_response_budget(&mut items, 0);
+        assert!(!withheld);
+        assert!(items.iter().all(|i| i.input.is_some()));
+    }
+
+    #[test]
+    fn input_budget_withholds_past_total_in_order() {
+        // Budget 250: first two (100+100) fit; third pushes over and is
+        // withheld — the same policy the checkpoint budget applies (#503),
+        // mirrored for decoded inputs (issue #608, PR #936 review).
+        let mut items = vec![pending_with_input(Some(100)); 3];
+        let withheld = apply_input_response_budget(&mut items, 250);
+        assert!(withheld);
+        assert!(items[0].input.is_some(), "small inputs pass through");
+        assert!(items[1].input.is_some());
+        assert!(items[2].input.is_none(), "over-budget input is withheld");
+        assert_eq!(items[2].input_omitted_for_budget, Some(true));
+        // Size is still reported for the withheld entry, and it is not marked
+        // as individually truncated.
+        assert_eq!(items[2].input_bytes, Some(100));
+        assert_eq!(items[2].input_truncated, Some(false));
+    }
+
+    #[test]
+    fn input_budget_always_keeps_first_even_if_oversized() {
+        // A single input larger than the whole budget is still shown so a
+        // raised per-activity input cap keeps full visibility, matching the
+        // checkpoint budget's first-kept rule.
+        let mut items = vec![
+            pending_with_input(Some(10_000)),
+            pending_with_input(Some(10)),
+        ];
+        let withheld = apply_input_response_budget(&mut items, 1000);
+        assert!(items[0].input.is_some(), "first is always kept");
+        assert_eq!(items[0].input_omitted_for_budget, Some(false));
+        assert!(items[1].input.is_none());
+        assert!(withheld);
+    }
+
+    #[test]
+    fn input_budget_skips_absent_inputs() {
+        // Entries with no included input (external handoffs, per-field
+        // truncations) don't consume budget.
+        let mut items = vec![
+            pending_with_input(None),
+            pending_with_input(Some(100)),
+            pending_with_input(Some(100)),
+        ];
+        let withheld = apply_input_response_budget(&mut items, 250);
+        assert!(!withheld, "200 bytes of input fit within 250");
+        assert!(items[1].input.is_some());
+        assert!(items[2].input.is_some());
     }
 
     #[test]
@@ -27107,15 +27295,33 @@ mod tests {
             !off_json.contains("\"input\""),
             "flag-off PendingActivity JSON must omit the input key entirely: {off_json}"
         );
+        // The input-budget companion fields (PR #936 review) share the same
+        // contract: absent (None) with decoding off.
+        for key in ["input_truncated", "input_omitted_for_budget", "input_bytes"] {
+            assert!(
+                !off_json.contains(key),
+                "flag-off PendingActivity JSON must omit `{key}`: {off_json}"
+            );
+        }
 
         let on = PendingActivity {
             input: Some(serde_json::json!({"card": "4242"})),
+            input_truncated: Some(false),
+            input_omitted_for_budget: Some(false),
+            input_bytes: Some(16),
             ..off
         };
         let on_json = serde_json::to_string(&on).expect("serialize");
         assert!(
             on_json.contains("\"input\":{\"card\":\"4242\"}"),
             "decode-active PendingActivity JSON must carry the input: {on_json}"
+        );
+        assert!(
+            on_json.contains("\"input_truncated\":false")
+                && on_json.contains("\"input_omitted_for_budget\":false")
+                && on_json.contains("\"input_bytes\":16"),
+            "decode-active PendingActivity JSON must carry the input-budget \
+             companion fields: {on_json}"
         );
     }
 
