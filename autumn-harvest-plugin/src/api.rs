@@ -15241,12 +15241,30 @@ pub struct CreateCompletionTriggerRequest {
     pub target_workflow_name: String,
     pub input_mapping: Option<InputMapping>,
     pub queue_name: Option<String>,
-    /// Optional output guard (issue #810). An unknown operator is a serde
-    /// deserialization error (→ 400 from the Json extractor); an over-cap or
-    /// malformed-path condition is rejected with a 400 by explicit
-    /// validation. `None` = unconditional (legacy behavior).
+    /// Optional output guard (issue #810), carried as raw JSON and decoded
+    /// explicitly by the handler (`decode_trigger_condition`). Typing this
+    /// field as `TriggerCondition` would hand an unknown operator to axum's
+    /// `Json` extractor, which rejects data-shape errors with a **422** and a
+    /// plain-text body — the handler-level decode is what produces the
+    /// documented `400` JSON error for unknown operators, over-cap trees, and
+    /// malformed paths alike. `None` = unconditional (legacy behavior).
     #[serde(default)]
-    pub condition: Option<TriggerCondition>,
+    pub condition: Option<serde_json::Value>,
+}
+
+/// Decode + validate the raw `condition` JSON from a
+/// [`CreateCompletionTriggerRequest`] (issue #810). `Ok(None)` = no guard;
+/// `Err` carries the human-readable reason (unknown operator, over-cap tree,
+/// malformed path) the handler maps to a `400` JSON error.
+fn decode_trigger_condition(
+    raw: Option<serde_json::Value>,
+) -> Result<Option<TriggerCondition>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let condition: TriggerCondition = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    condition.validate()?;
+    Ok(Some(condition))
 }
 
 async fn list_completion_triggers(
@@ -15307,22 +15325,19 @@ async fn create_completion_trigger(
         .unwrap_or_else(|| vec![TerminalState::Completed]);
     let mapping = request.input_mapping.unwrap_or(InputMapping::Passthrough);
 
-    // Output-guard boundedness validation (issue #810): reject at
-    // registration with a 400, never silently drop.
-    if let Some(ref condition) = request.condition
-        && let Err(message) = condition.validate()
-    {
-        return Err(AutumnError::bad_request_msg(format!(
-            "invalid trigger condition: {message}"
-        )));
-    }
+    // Output-guard decode + boundedness validation (issue #810): reject at
+    // registration with a 400 JSON error, never silently drop. Decoding
+    // happens here (not in the Json extractor) so an unknown operator gets
+    // the documented 400 rather than axum's 422 plain-text rejection.
+    let condition = decode_trigger_condition(request.condition).map_err(|message| {
+        AutumnError::bad_request_msg(format!("invalid trigger condition: {message}"))
+    })?;
 
     let states_val = serde_json::to_value(&states)
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid terminal states: {e}")))?;
     let mapping_val = serde_json::to_value(&mapping)
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid input mapping: {e}")))?;
-    let condition_val = request
-        .condition
+    let condition_val = condition
         .as_ref()
         .map(serde_json::to_value)
         .transpose()
@@ -29072,20 +29087,28 @@ mod tests {
     }
 
     /// issue #810: the registration request's optional `condition` field.
-    /// An unknown operator is a serde deserialization error — the axum Json
-    /// extractor turns exactly this failure into the AC-mandated 400 — and a
-    /// legacy body without the field still deserializes (`None`).
+    /// It rides the request as raw JSON (so a bad condition can never trip
+    /// axum's Json extractor into a 422 plain-text rejection) and is decoded
+    /// by the handler via `decode_trigger_condition`, which produces the
+    /// AC-mandated 400 for unknown operators, over-cap trees, and malformed
+    /// paths alike; a legacy body without the field still deserializes
+    /// (`None`).
     #[test]
     fn create_completion_trigger_request_condition_serde() {
-        // Legacy body (no condition key) → None.
+        // Legacy body (no condition key) → None, decoded to no guard.
         let legacy: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
             "source_workflow_name": "a",
             "target_workflow_name": "b",
         }))
         .unwrap();
         assert!(legacy.condition.is_none());
+        assert!(
+            decode_trigger_condition(legacy.condition)
+                .unwrap()
+                .is_none()
+        );
 
-        // Well-formed condition round-trips.
+        // Well-formed condition decodes through the handler helper.
         let ok: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
             "source_workflow_name": "a",
             "target_workflow_name": "b",
@@ -29095,29 +29118,36 @@ mod tests {
             },
         }))
         .unwrap();
+        let decoded = decode_trigger_condition(ok.condition).unwrap();
         assert!(matches!(
-            ok.condition,
+            decoded,
             Some(TriggerCondition::GreaterThan { ref path, .. }) if path == "amount"
         ));
 
-        // Unknown operator → deserialization error (→ 400 at the HTTP boundary,
-        // never silently dropped).
-        let bad = serde_json::from_value::<CreateCompletionTriggerRequest>(serde_json::json!({
+        // Unknown operator: the REQUEST still deserializes (the raw-JSON
+        // field keeps the Json extractor out of the decision — a typed field
+        // here would surface as axum's 422 with a plain-text body), and the
+        // handler decode rejects it (→ 400, never silently dropped).
+        let bad: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
             "source_workflow_name": "a",
             "target_workflow_name": "b",
             "condition": {"type": "Regex", "data": {"path": "a", "value": ".*"}},
-        }));
-        assert!(bad.is_err());
+        }))
+        .unwrap();
+        let err = decode_trigger_condition(bad.condition).unwrap_err();
+        assert!(err.contains("unknown variant `Regex`"), "{err}");
 
-        // Over-cap conditions deserialize fine but fail `validate()` — the
-        // property the handler's explicit pre-insert check relies on. (This
-        // pins only the validate() outcome; the end-to-end 400 for an
-        // over-cap body is proven by
-        // `completion_triggers_integration.rs::test_condition_registration_rejects_invalid_with_400`.)
-        let mut over_deep = TriggerCondition::Exists { path: "a".into() };
+        // Over-cap conditions deserialize fine but fail the helper's
+        // validate() leg. (The end-to-end 400 for an over-cap body is proven
+        // by `completion_triggers_integration.rs::test_condition_registration_rejects_invalid_with_400`.)
+        let mut over_deep = serde_json::json!({"type": "Exists", "data": {"path": "a"}});
         for _ in 0..autumn_harvest::MAX_CONDITION_DEPTH {
-            over_deep = TriggerCondition::All(vec![over_deep]);
+            over_deep = serde_json::json!({"type": "All", "data": [over_deep]});
         }
-        assert!(over_deep.validate().is_err());
+        assert!(decode_trigger_condition(Some(over_deep)).is_err());
+
+        // Malformed dotted path → rejected by the same helper.
+        let malformed = serde_json::json!({"type": "Exists", "data": {"path": "a..b"}});
+        assert!(decode_trigger_condition(Some(malformed)).is_err());
     }
 }

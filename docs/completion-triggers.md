@@ -238,7 +238,11 @@ registration surfaces — `HarvestBuilder::try_build()` (builder error) and
 * total nodes > **64** (`MAX_CONDITION_NODES`)
 * `In` sets longer than **64** (`MAX_CONDITION_IN_VALUES`)
 * malformed dotted paths (empty segments, e.g. `"a..b"`, `".a"`)
-* unknown operators (a serde deserialization error → `400`; never silently dropped)
+* unknown operators (a serde deserialization error → `400`; never silently dropped). The
+  HTTP handler decodes the `condition` field from raw JSON itself rather than letting the
+  typed `Json` extractor do it — axum surfaces extractor-level data errors as a `422` with
+  a plain-text body, whereas the handler-level decode produces the documented `400` JSON
+  error for every invalid-condition shape uniformly.
 
 There is no separate byte-size cap on condition payloads: over HTTP, total condition bytes
 are bounded by axum's default request body limit (2 MiB), and evaluation is a linear walk

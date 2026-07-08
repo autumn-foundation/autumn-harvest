@@ -2957,8 +2957,11 @@ async fn test_invalid_stored_condition_fails_closed() {
 }
 
 /// issue #810 registration surface: invalid condition JSON is rejected with a
-/// 400 (unknown operator via serde; over-cap/malformed-path via `validate()`),
-/// never silently dropped; a valid condition round-trips through GET.
+/// 400 JSON error — unknown operator, over-cap, and malformed-path all via the
+/// handler's explicit `decode_trigger_condition` (the field rides the request
+/// as raw JSON precisely so axum's typed Json extractor can't surface an
+/// unknown operator as a 422 plain-text rejection) — never silently dropped;
+/// a valid condition round-trips through GET.
 #[tokio::test]
 async fn test_condition_registration_rejects_invalid_with_400() {
     let _lock = TEST_MUTEX
@@ -2968,7 +2971,8 @@ async fn test_condition_registration_rejects_invalid_with_400() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // Unknown operator → 400 (serde rejection at the Json extractor).
+    // Unknown operator → 400 (handler-level decode; a typed Json-extractor
+    // field would instead return axum's 422 with a plain-text body).
     let (status, _) = post_json(
         &app,
         "/admin/completion-triggers",
