@@ -404,7 +404,22 @@ pub(crate) async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
 ) -> HarvestResult<store::EventHistory> {
-    harvest_workflow_executions::table
+    Ok(lock_workflow_execution_row_and_load_history(conn, exec_id)
+        .await?
+        .1)
+}
+
+/// Like [`lock_workflow_execution_and_load_history`], but also returns the
+/// locked execution row itself — the `SELECT ... FOR UPDATE` loads the full
+/// row anyway, so a caller that needs row-current execution metadata under
+/// the lock (e.g. [`enforce_activity_timeout`]'s PAUSED re-check, issue #609
+/// post-review hardening, second bot-review round) gets it without a second
+/// query. Mirrors `worker.rs`'s sibling of the same name.
+async fn lock_workflow_execution_row_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> HarvestResult<(WorkflowExecution, store::EventHistory)> {
+    let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
@@ -414,7 +429,8 @@ pub(crate) async fn lock_workflow_execution_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    store::load_history(conn, exec_id).await
+    let history = store::load_history(conn, exec_id).await?;
+    Ok((execution, history))
 }
 
 pub(crate) async fn task_state_for_update(
@@ -427,6 +443,28 @@ pub(crate) async fn task_state_for_update(
         .find(task_id)
         .for_update()
         .select(dsl::state)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
+/// Locked (`FOR UPDATE`) read of a task row's current state **and**
+/// row-current `schedule_to_close_at`. [`enforce_activity_timeout`] needs the
+/// deadline in addition to the state so the frozen-row half of the PAUSED
+/// re-check ([`pause_suppresses_timeout_enforcement`]) can be evaluated
+/// against the row's current value under the execution row lock, not the
+/// scan-time snapshot.
+async fn task_state_and_deadline_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<Option<(String, Option<chrono::DateTime<Utc>>)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select((dsl::state, dsl::schedule_to_close_at))
         .first(conn)
         .await
         .optional()
@@ -446,6 +484,56 @@ const fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&
         // ScheduleToClose fires for both: mid-execution (RUNNING) and queued
         // past the deadline before any worker claimed it (PENDING).
         TimeoutReason::ScheduleToClose => &["RUNNING", "PENDING"],
+    }
+}
+
+/// Pure decision rule for the PAUSED re-check the timeout enforcers perform
+/// under the execution row lock (issue #609 post-review hardening, second
+/// bot-review round). `true` means "skip enforcement for this task without
+/// mutating anything" — the row stays `PENDING`/`RUNNING`, no
+/// `ActivityTimedOut` is appended, and the pause machinery (claim-gate
+/// freeze + resume-time deadline shift) covers it instead.
+///
+/// The scan-time PAUSED exclusions ([`schedule_to_close_timeout_query`]'s
+/// blanket `NOT EXISTS`, [`schedule_to_start_timeout_query`]'s frozen-row
+/// carve-out, and [`enforce_external_task_timeouts`]'s Diesel filter) protect
+/// only a non-locking snapshot: a pause committing after the scan — or while
+/// enforcement waits on the execution row lock — was previously enforced
+/// anyway, appending a timeout event mid-pause. This re-check, evaluated
+/// against the state observed *under* the execution row lock (the same lock
+/// `pause_workflow_execution` holds, so the two serialize), is the guarantee.
+///
+/// Per-reason scoping mirrors the scan queries exactly:
+/// - `ScheduleToClose`: pause suspends the cross-retry deadline clock
+///   outright (issue #609, AC5) — always skip while paused.
+/// - `ScheduleToStart`: stays pause-blind **except** for a row that is now
+///   frozen (`schedule_to_close_at` set and elapsed): a row unfrozen at scan
+///   time can become frozen before enforcement locks the row (pause commits
+///   plus deadline elapses in the gap), and terminally
+///   schedule-to-start-failing it mid-pause would destroy exactly the state
+///   the frozen-row carve-out preserves. An *unfrozen* pending row of a
+///   paused execution remains claimable by design (activities are not
+///   pause-gated), so its schedule-to-start signal (worker capacity) stays
+///   genuine and stays enforced.
+/// - `Heartbeat`/`StartToClose`: deliberately pause-blind — already-
+///   dispatched work runs to completion under pause (issue #383), so a hung
+///   in-flight activity of a paused execution still times out on its own
+///   merits.
+fn pause_suppresses_timeout_enforcement(
+    reason: &TimeoutReason,
+    execution_state: &str,
+    row_schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if execution_state != "PAUSED" {
+        return false;
+    }
+    match reason {
+        TimeoutReason::ScheduleToClose => true,
+        TimeoutReason::ScheduleToStart => {
+            row_schedule_to_close_at.is_some_and(|deadline| deadline <= now)
+        }
+        TimeoutReason::Heartbeat | TimeoutReason::StartToClose => false,
     }
 }
 
@@ -643,11 +731,31 @@ async fn enforce_activity_timeout(
         .transaction::<bool, HarvestError, _>(|conn| {
             let error = error.clone();
             async move {
-                let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
-                let Some(state) = task_state_for_update(conn, task.id).await? else {
+                let (execution, history) =
+                    lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+                let Some((state, row_schedule_to_close_at)) =
+                    task_state_and_deadline_for_update(conn, task.id).await?
+                else {
                     return Ok(false);
                 };
                 if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
+                    return Ok(false);
+                }
+                // Authoritative PAUSED re-check under the execution row lock
+                // (issue #609 post-review hardening, second bot-review round):
+                // the scan snapshot's PAUSED exclusions are non-locking, so a
+                // pause committing after the scan — or while this transaction
+                // waited on the lock `pause_workflow_execution` itself holds —
+                // must be honoured here or the timeout lands mid-pause. See
+                // `pause_suppresses_timeout_enforcement` for the per-reason
+                // scoping (schedule_to_close always; schedule_to_start only
+                // for a now-frozen row; heartbeat/start-to-close pause-blind).
+                if pause_suppresses_timeout_enforcement(
+                    reason,
+                    &execution.state,
+                    row_schedule_to_close_at,
+                    Utc::now(),
+                ) {
                     return Ok(false);
                 }
                 let activity_id =
@@ -818,6 +926,16 @@ async fn enforce_workflow_timeout(
 /// ([`crate::execution::shift_external_schedule_to_close_on_resume_query`])
 /// so paused wall-clock is never charged against the external deadline.
 ///
+/// The scan filter above is a non-locking snapshot only — it does not
+/// serialize with `pause_workflow_execution` (which locks only the execution
+/// row), so a pause committing after the scan must not be enforced anyway
+/// (issue #609 post-review hardening, second bot-review round). The guarantee
+/// is the per-task transaction below: it takes the execution row `FOR UPDATE`
+/// **before** transitioning the external task, re-checks `PAUSED` under that
+/// lock, and skips the task entirely (left `PENDING`, no event) when the
+/// pause won the race — so the state flip and the event append always happen
+/// under the same lock the pause path holds.
+///
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
@@ -837,10 +955,11 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         .await
         .map_err(crate::error::database_error)?;
 
-    let count = expired.len();
+    let mut count = 0usize;
 
     for task in &expired {
         let exec_id = execution_id_from_uuid(task.workflow_exec_id);
+        let exec_uuid = task.workflow_exec_id;
         let activity_id = ActivityExecId::from_uuid(task.activity_id);
         let task_id = task.id;
 
@@ -850,29 +969,49 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         };
 
         let result = conn
-            .transaction::<(), HarvestError, _>(|conn| {
+            .transaction::<bool, HarvestError, _>(|conn| {
                 async move {
-                    // Guard against three races:
+                    // Take the execution row lock FIRST — the same lock
+                    // `pause_workflow_execution`/`resume_workflow_execution`
+                    // hold — so the PAUSED re-check, the external-task state
+                    // flip, and the event append all serialize with the pause
+                    // path (issue #609 post-review hardening, second
+                    // bot-review round). A vanished execution row falls
+                    // through to the claiming UPDATE's own filters, matching
+                    // the pre-existing behaviour.
+                    let execution_state: Option<String> = harvest_workflow_executions::table
+                        .find(exec_uuid)
+                        .for_update()
+                        .select(harvest_workflow_executions::state)
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+                    if execution_state.as_deref().is_some_and(|state| {
+                        pause_suppresses_timeout_enforcement(
+                            &TimeoutReason::ScheduleToClose,
+                            state,
+                            None,
+                            Utc::now(),
+                        )
+                    }) {
+                        // Pause won the race: leave the row PENDING and
+                        // untouched — the resume-time deadline shift covers it.
+                        return Ok(false);
+                    }
+
+                    // Guard against two remaining races (the PAUSED case is
+                    // now handled authoritatively under the lock above):
                     // 1. complete/fail landed after our scan → state != PENDING
                     // 2. heartbeat (or a resume's pause-span shift, issue
                     //    #609) extended the deadline after our scan →
                     //    schedule_to_close_at is now in the future
-                    // 3. a pause landed after our scan → the owning execution
-                    //    is now PAUSED and the deadline clock is suspended
                     // Either way, 0 rows updated means we skip the timeout event.
                     let rows = diesel::update(
                         harvest_external_tasks::table
                             .find(task_id)
                             .filter(harvest_external_tasks::state.eq("PENDING"))
-                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now()))
-                            .filter(diesel::dsl::not(diesel::dsl::exists(
-                                harvest_workflow_executions::table
-                                    .filter(
-                                        harvest_workflow_executions::id
-                                            .eq(harvest_external_tasks::workflow_exec_id),
-                                    )
-                                    .filter(harvest_workflow_executions::state.eq("PAUSED")),
-                            ))),
+                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
                     )
                     .set((
                         harvest_external_tasks::state.eq("TIMED_OUT"),
@@ -883,24 +1022,29 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                     .map_err(crate::error::database_error)?;
 
                     if rows == 0 {
-                        return Ok(());
+                        return Ok(false);
                     }
 
                     store::append_single_event(conn, exec_id, timeout_event).await?;
-                    queue::wake_workflow_task(conn, exec_id).await
+                    queue::wake_workflow_task(conn, exec_id).await?;
+                    Ok(true)
                 }
                 .scope_boxed()
             })
             .await;
 
-        if let Err(error) = result {
-            tracing::error!(
-                task_id = %task.id,
-                exec_id = %exec_id,
-                error = %error,
-                "failed to enforce external task schedule-to-close timeout"
-            );
-            return Err(error);
+        match result {
+            Ok(true) => count += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task.id,
+                    exec_id = %exec_id,
+                    error = %error,
+                    "failed to enforce external task schedule-to-close timeout"
+                );
+                return Err(error);
+            }
         }
     }
 
@@ -2231,6 +2375,106 @@ mod tests {
             sql.contains("EXISTS"),
             "the freeze requires the owning execution to actually be PAUSED"
         );
+    }
+
+    // ── locked PAUSED re-check (issue #609, second bot-review round) ────────
+
+    #[test]
+    fn pause_recheck_never_suppresses_a_running_execution() {
+        let now = Utc::now();
+        let elapsed = Some(now - chrono::Duration::minutes(1));
+        for reason in [
+            TimeoutReason::Heartbeat,
+            TimeoutReason::StartToClose,
+            TimeoutReason::ScheduleToStart,
+            TimeoutReason::ScheduleToClose,
+        ] {
+            assert!(
+                !pause_suppresses_timeout_enforcement(&reason, "RUNNING", elapsed, now),
+                "{reason} must enforce normally against a RUNNING execution"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_recheck_suppresses_schedule_to_close_while_paused() {
+        // The P2 race this round closes for the scanner path: a pause
+        // committing after the scan snapshot (or while enforcement waits on
+        // the execution row lock) suspends the cross-retry deadline clock,
+        // so ScheduleToClose enforcement must always yield to it.
+        let now = Utc::now();
+        assert!(pause_suppresses_timeout_enforcement(
+            &TimeoutReason::ScheduleToClose,
+            "PAUSED",
+            Some(now - chrono::Duration::minutes(1)),
+            now
+        ));
+        // The external-task path carries no separate row deadline argument —
+        // the blanket ScheduleToClose suppression must not depend on it.
+        assert!(pause_suppresses_timeout_enforcement(
+            &TimeoutReason::ScheduleToClose,
+            "PAUSED",
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn pause_recheck_suppresses_schedule_to_start_only_for_frozen_rows() {
+        // A row unfrozen at scan time (execution RUNNING) can become frozen
+        // (pause commits + deadline elapses) before enforcement locks the
+        // row — the re-check must spare exactly the now-frozen row, and only
+        // it: an unfrozen pending row of a paused execution stays claimable
+        // by design, so its schedule-to-start signal stays enforced.
+        let now = Utc::now();
+        assert!(
+            pause_suppresses_timeout_enforcement(
+                &TimeoutReason::ScheduleToStart,
+                "PAUSED",
+                Some(now - chrono::Duration::seconds(1)),
+                now
+            ),
+            "frozen (deadline elapsed) rows must be spared"
+        );
+        assert!(
+            !pause_suppresses_timeout_enforcement(
+                &TimeoutReason::ScheduleToStart,
+                "PAUSED",
+                Some(now + chrono::Duration::minutes(10)),
+                now
+            ),
+            "an unfrozen row (deadline still ahead) stays enforced"
+        );
+        assert!(
+            !pause_suppresses_timeout_enforcement(
+                &TimeoutReason::ScheduleToStart,
+                "PAUSED",
+                None,
+                now
+            ),
+            "a row with no cross-retry deadline can never be frozen"
+        );
+    }
+
+    #[test]
+    fn pause_recheck_keeps_in_flight_reasons_pause_blind() {
+        // Already-dispatched work runs to completion under pause (issue
+        // #383): a hung in-flight activity of a paused execution still times
+        // out on its own merits.
+        let now = Utc::now();
+        let elapsed = Some(now - chrono::Duration::minutes(1));
+        assert!(!pause_suppresses_timeout_enforcement(
+            &TimeoutReason::Heartbeat,
+            "PAUSED",
+            elapsed,
+            now
+        ));
+        assert!(!pause_suppresses_timeout_enforcement(
+            &TimeoutReason::StartToClose,
+            "PAUSED",
+            elapsed,
+            now
+        ));
     }
 
     #[test]

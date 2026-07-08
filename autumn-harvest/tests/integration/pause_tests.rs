@@ -118,6 +118,10 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
+    "\n",
+    // issue #499: enforce_timeouts_once now scans harvest_debounce.
+    include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
+    "\n",
     include_str!("../../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
     include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
     "\n",
@@ -979,6 +983,276 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
         unfrozen_deadline_shift >= chrono::Duration::minutes(29)
             && unfrozen_deadline_shift <= chrono::Duration::minutes(31),
         "the unfrozen row's deadline still shifts forward, got {unfrozen_deadline_shift:?}"
+    );
+}
+
+// ── Second bot-review round (issue #609 post-review hardening): scan-vs- ────
+// ── enforce races in the timeout scanners ───────────────────────────────────
+
+/// Inserts a PENDING activity task with a caller-chosen `activity_id` so a
+/// matching non-terminal `ActivityScheduled` event can be appended to history
+/// (the activity-timeout enforcer resolves the pending activity through
+/// exactly that pairing).
+async fn insert_pending_activity_task_with_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    activity_id: uuid::Uuid,
+    schedule_to_close_at: chrono::DateTime<chrono::Utc>,
+) -> uuid::Uuid {
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input, state, \
+          attempt, max_attempts, schedule_to_close_at) \
+         VALUES ($1, 'default', 'activity', $2, 'deadline_activity', $3, '{}'::jsonb, 'PENDING', \
+                 0, 10, $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(activity_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .execute(conn)
+    .await
+    .expect("insert pending activity task");
+    task_id
+}
+
+/// Holds the execution row lock open on a dedicated connection (explicit
+/// `BEGIN` + `SELECT ... FOR UPDATE`, no commit) so the test can queue a real
+/// `pause_workflow_execution` behind it and release only after the scanner
+/// under test has taken its non-locking scan snapshot — the exact
+/// scan-then-pause-then-enforce ordering of the race. Mirrors the
+/// lock-holding precedent in `integration_e2e.rs`
+/// (`wake_workflow_task_retries_after_losing_the_park_row_lock_race`).
+async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    conn.batch_execute("BEGIN")
+        .await
+        .expect("begin should succeed");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(conn)
+        .await
+        .expect("lock execution row");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_after_the_scan() {
+    // Second bot-review round, finding A (issue #609 post-review hardening,
+    // P2): the ScheduleToClose scanner's PAUSED exclusion protects only the
+    // `find_timed_out_tasks` SELECT snapshot. `enforce_activity_timeout`
+    // then locks the execution row — but previously never re-checked whether
+    // the locked row was now PAUSED, so a pause committing after the scan
+    // (or while enforcement waited on the lock) still appended
+    // `ActivityTimedOut { ScheduleToClose }` and failed the task mid-pause.
+    // Choreography: hold the execution row lock on one connection, queue the
+    // real pause behind it, then start the scanner — its scan snapshot (a
+    // non-locking read) sees the still-RUNNING execution and picks up the
+    // expired task, and its enforcement transaction queues on the row lock
+    // BEHIND the pause. Releasing the lock lets the pause commit first; the
+    // authoritative locked re-check must then skip enforcement entirely.
+    use autumn_harvest::timeout::enforce_timeouts_once;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let mut conn_lock = connect(&url).await;
+    let mut conn_pause = connect(&url).await;
+    let mut conn_scan = connect(&url).await;
+
+    let exec_id = start(&mut conn, "wf", "s2c-scan-race-1").await;
+    let activity_id = uuid::Uuid::new_v4();
+    store::append_single_event(
+        &mut conn,
+        exec_id,
+        WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::from_uuid(activity_id),
+            name: "deadline_activity".to_string(),
+            input: serde_json::json!({}),
+            queue: "default".to_string(),
+        },
+    )
+    .await
+    .expect("append ActivityScheduled");
+    let task_id = insert_pending_activity_task_with_id(
+        &mut conn,
+        exec_id,
+        activity_id,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+
+    hold_execution_row_lock(&mut conn_lock, exec_id).await;
+
+    // Queue the real pause behind the held lock so it wins the lock FIFO
+    // over the scanner's enforcement transaction started below.
+    let pause_handle = tokio::spawn(async move {
+        pause_workflow_execution(
+            &mut conn_pause,
+            exec_id,
+            Some("contain"),
+            "oncall",
+            &NoOpMetrics,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The scan snapshot runs unblocked (the execution's committed state is
+    // still RUNNING, so the task is picked up as ScheduleToClose-expired);
+    // the per-task enforcement transaction then blocks on the execution row
+    // lock behind the queued pause.
+    let scan_handle = tokio::spawn(async move {
+        enforce_timeouts_once(
+            &mut conn_scan,
+            &NoOpMetrics,
+            Duration::from_secs(5),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    conn_lock
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the held execution row lock");
+
+    let paused = pause_handle
+        .await
+        .expect("pause task should not panic")
+        .expect("pause should succeed");
+    assert!(paused.newly_paused, "the pause must have won the race");
+    scan_handle
+        .await
+        .expect("scanner task should not panic")
+        .expect("timeout enforcement should succeed");
+
+    use autumn_harvest::schema::harvest_task_queue as t;
+    let (state, error): (String, Option<String>) = t::table
+        .filter(t::id.eq(task_id))
+        .select((t::state, t::error))
+        .first(&mut conn)
+        .await
+        .expect("task must exist");
+    assert_eq!(
+        state, "PENDING",
+        "the task must be left untouched (frozen by the claim gate until \
+         resume), not deadline-failed against a paused execution"
+    );
+    assert!(
+        error.is_none(),
+        "a skipped enforcement must not write an error, got {error:?}"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "no ActivityTimedOut {{ ScheduleToClose }} may be appended while the \
+         owning execution is paused"
+    );
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "PAUSED",
+        "the pause must survive the scanner untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() {
+    // Second bot-review round, finding B (issue #609 post-review hardening,
+    // P2): the external-task scan's PAUSED check was a non-locking NOT EXISTS
+    // subquery inside the claiming UPDATE — it never serialized with
+    // `pause_workflow_execution` (which locks only the execution row), so a
+    // pause committing between the UPDATE's snapshot and the event append
+    // still flipped the external task to TIMED_OUT and appended
+    // `ActivityTimedOut` mid-pause. The per-task transaction now takes the
+    // execution row lock FIRST and re-checks PAUSED under it, so the state
+    // flip and the append serialize with the pause path. Same choreography
+    // as the sibling task-queue test above.
+    use autumn_harvest::timeout::enforce_external_task_timeouts;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let mut conn_lock = connect(&url).await;
+    let mut conn_pause = connect(&url).await;
+    let mut conn_scan = connect(&url).await;
+
+    let exec_id = start(&mut conn, "wf", "ext-scan-race-1").await;
+    let ext_id = insert_pending_external_task(
+        &mut conn,
+        exec_id,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+
+    hold_execution_row_lock(&mut conn_lock, exec_id).await;
+
+    let pause_handle = tokio::spawn(async move {
+        pause_workflow_execution(
+            &mut conn_pause,
+            exec_id,
+            Some("contain"),
+            "oncall",
+            &NoOpMetrics,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The scan SELECT is non-locking and sees the still-RUNNING committed
+    // state, so the expired external task is claimed for enforcement; the
+    // per-task transaction's execution row lock then queues behind the pause.
+    let scan_handle =
+        tokio::spawn(async move { enforce_external_task_timeouts(&mut conn_scan).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    conn_lock
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the held execution row lock");
+
+    let paused = pause_handle
+        .await
+        .expect("pause task should not panic")
+        .expect("pause should succeed");
+    assert!(paused.newly_paused, "the pause must have won the race");
+    let enforced = scan_handle
+        .await
+        .expect("scanner task should not panic")
+        .expect("external timeout enforcement should succeed");
+    assert_eq!(
+        enforced, 0,
+        "an enforcement skipped by the locked PAUSED re-check must not be \
+         counted as timed out"
+    );
+
+    use autumn_harvest::schema::harvest_external_tasks as ext;
+    let state: String = ext::table
+        .filter(ext::id.eq(ext_id))
+        .select(ext::state)
+        .first(&mut conn)
+        .await
+        .expect("external task must exist");
+    assert_eq!(
+        state, "PENDING",
+        "the external task must be left genuinely untouched so the \
+         resume-time deadline shift covers it"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "no ActivityTimedOut may be appended while the execution is paused"
+    );
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "PAUSED",
+        "the pause must survive the scanner untouched"
     );
 }
 
