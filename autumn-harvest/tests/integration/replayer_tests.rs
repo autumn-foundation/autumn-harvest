@@ -3270,3 +3270,174 @@ async fn replayer_succeeds_for_pre_marker_saga_history() {
         "legacy histories are never counted retroactively"
     );
 }
+
+/// Failed-unwind workflow for the post-review P2-1 persisted shape: one saga
+/// step (in-memory forward, activity-backed compensation that terminally
+/// failed), the author catches `SagaCompensationFailed`, consumes the
+/// duplicate webhook signal, and completes normally.
+fn saga_failed_unwind_with_trailing_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async { Ok::<_, autumn_harvest::HarvestError>(serde_json::json!("rsv-1")) },
+            move |rsv: Value| async move {
+                ctx.execute_activity_raw("release", rsv, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if saga.compensate_all().await.is_ok() {
+            return Err("compensation unexpectedly succeeded".to_string());
+        }
+        // Author-caught dangling state; consume the duplicate cancel webhook
+        // signal that arrived at the final unwind cycle's wake, then complete.
+        let _ = ctx
+            .wait_for_signal("dup_cancel")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("dangling_state_logged"))
+    })
+}
+
+/// The exact history the P2-1 fix persists: the failure marker recorded PAST
+/// the drained trailing signal. This must replay deterministically with zero
+/// fresh samples — the money proof that the new marker position is
+/// replay-consistent.
+#[tokio::test]
+async fn replayer_succeeds_for_failed_unwind_history_with_trailing_signal() {
+    let release_id = ActivityExecId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: "release".into(),
+            input: serde_json::json!("rsv-1"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: release_id,
+            error: "release rejected".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            non_retryable: false,
+            details: None,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "dup_cancel".into(),
+            payload: serde_json::json!({"retry": true}),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensation_failed:1".into(),
+            details: serde_json::json!(1),
+        },
+    ];
+
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "saga_failed_unwind_with_trailing_signal_workflow",
+            saga_failed_unwind_with_trailing_signal_workflow,
+        )
+        .with_metrics(recorder.clone())
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the failure marker recorded past a drained trailing signal must \
+         replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder.failed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a full-history replay of the failed unwind emits no fresh samples"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+/// Cancel-and-compensate workflow for the marker-past-cancellation shape.
+fn saga_cancel_and_compensate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async { Ok::<_, autumn_harvest::HarvestError>("flight-1") },
+            |_| async { Ok::<_, autumn_harvest::HarvestError>(()) },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if ctx.is_cancelled() {
+            saga.compensate_all().await.map_err(|e| e.to_string())?;
+            return Ok(serde_json::json!("cancelled_and_compensated"));
+        }
+        Ok(serde_json::json!("completed"))
+    })
+}
+
+/// The cancel-and-compensate persisted shape: the `saga_compensated:{seq}`
+/// marker recorded AFTER the (never-consumed) `WorkflowCancelled` lifecycle
+/// event. Must replay deterministically with zero fresh samples.
+#[tokio::test]
+async fn replayer_succeeds_for_cancel_and_compensate_history_with_marker() {
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(1),
+        },
+    ];
+
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "saga_cancel_and_compensate_workflow",
+            saga_cancel_and_compensate_workflow,
+        )
+        .with_metrics(recorder.clone())
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the compensated marker recorded past the cancellation event must \
+         replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a replay of the recorded cancel-and-compensate unwind emits nothing"
+    );
+}

@@ -1371,6 +1371,28 @@ impl Session<'_> {
 // WorkflowContext
 // ---------------------------------------------------------------------------
 
+/// Disposition of one logical saga compensation unwind, resolved **once** at
+/// unwind start by
+/// [`WorkflowContext::observe_saga_unwind_start`] (issue #801, post-review
+/// hardening).
+///
+/// `counted` records whether the unwind's `saga_compensated:{seq}` marker was
+/// recorded or observed (live frontier / already recorded). The matching
+/// [`WorkflowContext::observe_saga_unwind_failed`] call follows this
+/// disposition rather than performing an independent positional match, so the
+/// compensated/failed counter pair can never disagree about one unwind
+/// (invariant: `failed ≤ compensated`, per unwind) — the root cause of the
+/// two review P2s was two independent positional matches whose signal-drain
+/// side effects changed each other's view of the same code position.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SagaUnwindObservation {
+    /// The unwind's deterministic per-context sequence number.
+    pub(crate) seq: u32,
+    /// Whether this unwind is counted (`harvest.saga.compensated` fired on
+    /// some cycle). An uncounted unwind's failure stays uncounted.
+    pub(crate) counted: bool,
+}
+
 /// Context passed to every workflow function.
 ///
 /// In **replay mode** (resuming from Postgres history): commands are matched
@@ -3258,58 +3280,101 @@ impl WorkflowContext {
     /// Allocates this unwind's deterministic sequence number and matches its
     /// `saga_compensated:{seq}` dedup marker against recorded history:
     ///
-    /// - **Live frontier** — records the marker (a plain `RecordMarker`
-    ///   bookkeeping command, persisted in the same batch as the unwind's
-    ///   own first dispatch) and emits `harvest.saga.compensated` exactly
-    ///   once, labeled `workflow` + `queue`.
-    /// - **Recorded / absent** — emits nothing: a replayed unwind was already
-    ///   counted, and a pre-#801 marker-less history is never counted
-    ///   retroactively (nor mutated — the cursor is left untouched so the
-    ///   recorded events still match the compensation's own commands).
+    /// - **Live frontier** (including the cancel-and-compensate frontier
+    ///   behind a trailing `WorkflowCancelled`) — records the marker (a plain
+    ///   `RecordMarker` bookkeeping command, persisted in the same batch as
+    ///   the unwind's own first dispatch) and emits
+    ///   `harvest.saga.compensated` exactly once, labeled `workflow` +
+    ///   `queue`.
+    /// - **Recorded** — emits nothing: a replayed unwind was already counted.
+    /// - **Absent / drained-signal frontier** — emits nothing: a pre-#801
+    ///   marker-less history is never counted retroactively (nor mutated —
+    ///   the cursor is left untouched so the recorded events still match the
+    ///   compensation's own commands), and an unwind entered at a
+    ///   drained-signal frontier (canonically a signal-with-start run whose
+    ///   unwind begins before the staged signal is awaited) is conservatively
+    ///   uncounted as a whole — the same caveat [`Self::patched`] documents.
     ///
-    /// Returns the sequence number for the matching
-    /// [`observe_saga_unwind_failed`](Self::observe_saga_unwind_failed) call.
+    /// Returns the unwind's [`SagaUnwindObservation`] — its sequence number
+    /// plus whether it is **counted** — for the matching
+    /// [`observe_saga_unwind_failed`](Self::observe_saga_unwind_failed) call,
+    /// which follows this disposition so the compensated/failed counter pair
+    /// can never disagree about one logical unwind (invariant: `failed ≤
+    /// compensated`, per unwind; post-review P2-2).
     ///
     /// # Panics
     ///
     /// Panics if the internal matcher, commands, or seq mutex is poisoned.
-    pub(crate) fn observe_saga_unwind_start(&self, pending: usize) -> u32 {
+    pub(crate) fn observe_saga_unwind_start(&self, pending: usize) -> SagaUnwindObservation {
         let seq = self.next_saga_seq();
         let name = crate::replay::saga_compensated_marker_name(seq);
-        if self.match_history(|m| m.match_saga_marker(&name)) == SagaMarkerMatch::LiveFrontier {
-            self.push_command(WorkflowCommand::RecordMarker {
-                name,
-                details: Value::from(pending as u64),
-            });
-            self.metrics
-                .record_saga_compensated(&self.workflow_name, &self.queue_name);
-        }
-        seq
+        let counted = match self.match_history(|m| m.match_saga_marker(&name)) {
+            SagaMarkerMatch::LiveFrontier => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name,
+                    details: Value::from(pending as u64),
+                });
+                self.metrics
+                    .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                true
+            }
+            // Already counted on the cycle that first recorded the marker.
+            SagaMarkerMatch::Recorded => true,
+            // Conservative: pre-#801 histories and drained-signal frontiers
+            // are never counted — and the failure counter follows suit.
+            SagaMarkerMatch::Absent | SagaMarkerMatch::DrainedSignalFrontier => false,
+        };
+        SagaUnwindObservation { seq, counted }
     }
 
     /// Observe a saga unwind finishing with at least one compensation error —
     /// the `SagaCompensationFailed` dangling-state case (issue #801).
     ///
-    /// Same three-state dedup discipline as
+    /// Same dedup discipline as
     /// [`observe_saga_unwind_start`](Self::observe_saga_unwind_start), against
-    /// the `saga_compensation_failed:{seq}` marker: emits
-    /// `harvest.saga.compensation_failed` exactly once on the live frontier,
-    /// stays silent on replay and on pre-#801 histories. Emission happens
-    /// in-Saga (not at the worker terminal boundary), so an author-caught
-    /// failure in a workflow that goes on to COMPLETE is still counted.
+    /// the `saga_compensation_failed:{seq}` marker, but **coupled to the
+    /// unwind's disposition** (post-review P2-1/P2-2): the failure of a
+    /// *counted* unwind is always counted — including at a drained-signal
+    /// frontier, so a duplicate/extra signal ingested at the final unwind
+    /// cycle's wake (e.g. a retried cancel webhook) can never permanently
+    /// suppress the page-severity counter — while the failure of an
+    /// *uncounted* unwind stays uncounted (never `failed=1` with
+    /// `compensated=0`, and never an asymmetric marker set). Emits
+    /// `harvest.saga.compensation_failed` exactly once per counted failed
+    /// unwind, stays silent on replay and on pre-#801 histories. Emission
+    /// happens in-Saga (not at the worker terminal boundary), so an
+    /// author-caught failure in a workflow that goes on to COMPLETE is still
+    /// counted.
     ///
     /// # Panics
     ///
     /// Panics if the internal matcher, commands, or seq mutex is poisoned.
-    pub(crate) fn observe_saga_unwind_failed(&self, seq: u32, error_count: usize) {
-        let name = crate::replay::saga_compensation_failed_marker_name(seq);
-        if self.match_history(|m| m.match_saga_marker(&name)) == SagaMarkerMatch::LiveFrontier {
-            self.push_command(WorkflowCommand::RecordMarker {
-                name,
-                details: Value::from(error_count as u64),
-            });
-            self.metrics
-                .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+    pub(crate) fn observe_saga_unwind_failed(
+        &self,
+        observation: SagaUnwindObservation,
+        error_count: usize,
+    ) {
+        let name = crate::replay::saga_compensation_failed_marker_name(observation.seq);
+        match self.match_history(|m| m.match_saga_marker(&name)) {
+            SagaMarkerMatch::LiveFrontier | SagaMarkerMatch::DrainedSignalFrontier
+                if observation.counted =>
+            {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name,
+                    details: Value::from(error_count as u64),
+                });
+                self.metrics
+                    .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+            }
+            // Silent otherwise: Recorded (already counted on the cycle that
+            // first recorded the marker), an uncounted unwind's frontier
+            // (the coupling invariant — its failure stays uncounted), or a
+            // plain Absent (pre-#801 history / a non-transparent event at
+            // the cursor) which is never recorded into.
+            SagaMarkerMatch::Recorded
+            | SagaMarkerMatch::LiveFrontier
+            | SagaMarkerMatch::DrainedSignalFrontier
+            | SagaMarkerMatch::Absent => {}
         }
     }
 
@@ -14090,8 +14155,9 @@ mod tests {
         let recorder = std::sync::Arc::new(SagaMetricCounter::default());
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_history())
             .with_metrics(recorder.clone());
-        let seq = ctx.observe_saga_unwind_start(3);
-        assert_eq!(seq, 1);
+        let obs = ctx.observe_saga_unwind_start(3);
+        assert_eq!(obs.seq, 1);
+        assert!(obs.counted, "a live-frontier unwind is counted");
         assert_eq!(recorder.compensated.lock().unwrap().len(), 1);
         let commands = ctx.drain_commands();
         assert_eq!(commands.len(), 1);
@@ -14113,8 +14179,9 @@ mod tests {
         });
         let ctx2 =
             WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
-        let seq2 = ctx2.observe_saga_unwind_start(3);
-        assert_eq!(seq2, 1, "seq allocation is deterministic per call site");
+        let obs2 = ctx2.observe_saga_unwind_start(3);
+        assert_eq!(obs2.seq, 1, "seq allocation is deterministic per call site");
+        assert!(obs2.counted, "a replayed recorded unwind is still counted");
         assert_eq!(
             recorder.compensated.lock().unwrap().len(),
             1,
@@ -14128,8 +14195,8 @@ mod tests {
         let recorder = std::sync::Arc::new(SagaMetricCounter::default());
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_history())
             .with_metrics(recorder.clone());
-        let seq = ctx.observe_saga_unwind_start(2);
-        ctx.observe_saga_unwind_failed(seq, 1);
+        let obs = ctx.observe_saga_unwind_start(2);
+        ctx.observe_saga_unwind_failed(obs, 1);
         assert_eq!(recorder.failed.lock().unwrap().len(), 1);
         let commands = ctx.drain_commands();
         assert_eq!(commands.len(), 2);
@@ -14153,8 +14220,8 @@ mod tests {
         });
         let ctx2 =
             WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
-        let seq2 = ctx2.observe_saga_unwind_start(2);
-        ctx2.observe_saga_unwind_failed(seq2, 1);
+        let obs2 = ctx2.observe_saga_unwind_start(2);
+        ctx2.observe_saga_unwind_failed(obs2, 1);
         assert_eq!(recorder.compensated.lock().unwrap().len(), 1);
         assert_eq!(recorder.failed.lock().unwrap().len(), 1);
         assert!(ctx2.drain_commands().is_empty());
@@ -14167,8 +14234,8 @@ mod tests {
             .with_workflow_name("book_trip")
             .with_queue_name("payments")
             .with_metrics(recorder.clone());
-        let seq = ctx.observe_saga_unwind_start(1);
-        ctx.observe_saga_unwind_failed(seq, 1);
+        let obs = ctx.observe_saga_unwind_start(1);
+        ctx.observe_saga_unwind_failed(obs, 1);
         assert_eq!(
             recorder.compensated.lock().unwrap().as_slice(),
             &[("book_trip".to_owned(), "payments".to_owned())]
@@ -14177,5 +14244,112 @@ mod tests {
             recorder.failed.lock().unwrap().as_slice(),
             &[("book_trip".to_owned(), "payments".to_owned())]
         );
+    }
+
+    #[test]
+    fn observe_saga_unwind_failed_records_past_a_drained_trailing_signal_when_counted() {
+        // Post-review P2-1: a counted unwind whose failure is observed with a
+        // trailing un-awaited signal at the cursor must still record + emit —
+        // the failure marker lands past the drained signal.
+        let mut history = started_history();
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: Value::from(1u64),
+        });
+        history.push(WorkflowEvent::SignalReceived {
+            signal_name: "dup_cancel".into(),
+            payload: Value::Null,
+        });
+
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
+        let obs = ctx.observe_saga_unwind_start(1);
+        assert!(
+            obs.counted,
+            "the recorded marker means the unwind is counted"
+        );
+        ctx.observe_saga_unwind_failed(obs, 1);
+        assert_eq!(
+            recorder.failed.lock().unwrap().len(),
+            1,
+            "a trailing un-awaited signal must not suppress the failure counter"
+        );
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            WorkflowCommand::RecordMarker { name, .. } => {
+                assert_eq!(name, "saga_compensation_failed:1");
+            }
+            other => panic!("expected RecordMarker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_saga_unwind_failed_follows_an_uncounted_unwind() {
+        // Post-review P2-2: the signal-with-start shape — the unwind starts
+        // at a drained-signal frontier and is conservatively uncounted; its
+        // failure must follow that disposition (never failed=1 with
+        // compensated=0, never an asymmetric marker set).
+        let mut history = started_history();
+        history.push(WorkflowEvent::SignalReceived {
+            signal_name: "kick".into(),
+            payload: Value::Null,
+        });
+
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
+        let obs = ctx.observe_saga_unwind_start(1);
+        assert!(
+            !obs.counted,
+            "a drained-signal-frontier unwind is uncounted"
+        );
+        ctx.observe_saga_unwind_failed(obs, 1);
+        assert_eq!(recorder.compensated.lock().unwrap().len(), 0);
+        assert_eq!(
+            recorder.failed.lock().unwrap().len(),
+            0,
+            "an uncounted unwind's failure stays uncounted"
+        );
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn observe_saga_unwind_counts_the_cancel_and_compensate_frontier() {
+        // The cancel-and-compensate pattern: WorkflowCancelled has no
+        // workflow-command counterpart and never leaves the cursor, so the
+        // unwind of a freshly-cancelled run must still be counted (the docs'
+        // load-bearing claim for in-Saga emission).
+        let mut history = started_history();
+        history.push(WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        });
+
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history.clone())
+            .with_metrics(recorder.clone());
+        let obs = ctx.observe_saga_unwind_start(2);
+        assert!(obs.counted);
+        assert_eq!(recorder.compensated.lock().unwrap().len(), 1);
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+
+        // Next cycle: the marker persisted after the cancellation event —
+        // found out-of-order, no re-emit.
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: Value::from(2u64),
+        });
+        let ctx2 =
+            WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
+        let obs2 = ctx2.observe_saga_unwind_start(2);
+        assert!(obs2.counted);
+        assert_eq!(
+            recorder.compensated.lock().unwrap().len(),
+            1,
+            "the cancel-frontier unwind must not re-emit once its marker is recorded"
+        );
+        assert!(ctx2.drain_commands().is_empty());
     }
 }

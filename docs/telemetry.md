@@ -378,14 +378,30 @@ on every replay" contract never double-counts, and pre-#801 marker-less
 histories are never counted retroactively. The failure counter is emitted
 in-Saga rather than at the worker terminal boundary, so it is separable from
 `harvest.workflow.terminal{outcome=failed}` and fires even when the workflow
-author catches `SagaCompensationFailed` and the run completes. **Crash-window
-caveat:** the sample is emitted in-process alongside the durable marker
-write; for the documented durable pattern (compensations invoking activities)
-the marker persists with the unwind's first dispatch batch, making the
-crash-mid-unwind scenario exactly-once, while a *pure in-memory* unwind
-(zero durable footprint) that crash-resumes within a single decision cycle
-can re-count (at-least-once) — the metric mirror of the "compensations
-re-run wholesale" idempotency contract in `docs/saga.md`.
+author catches `SagaCompensationFailed` and the run completes.
+
+**Per-unwind coherence (post-review hardening):** the unwind's disposition
+is resolved once at unwind start and the failure counter follows it, so
+`failed ≤ compensated` holds per unwind. A counted unwind's failure is never
+suppressed by a trailing un-awaited signal (the failure marker is recorded
+past the drained signal), the cancel-and-compensate pattern is counted (a
+trailing `WorkflowCancelled` is transparent to the marker matcher), and an
+unwind entered at a drained-signal frontier — canonically a
+signal-with-start run whose unwind starts before the staged signal is
+awaited — is conservatively uncounted **as a whole** (the `ctx.patched()`
+signal-with-start caveat, inherited).
+
+**Crash-window caveat (at-least-once, both counters, durable and in-memory
+unwinds alike):** each sample is emitted in-process within the
+single-decision-cycle gap before its dedup marker's batch commits — the
+start marker persists with the unwind's first dispatch batch, the failure
+marker with the post-unwind batch — so a worker crash (or a #383 pause-race
+decision discard) inside that gap re-emits after resume. A crash
+*mid-unwind* — between compensations, after the first batch committed — is
+exactly-once. A *pure in-memory* unwind (zero durable footprint) is the
+maximal case: a crash-resume anywhere within its single cycle can re-count —
+the metric mirror of the "compensations re-run wholesale" idempotency
+contract in `docs/saga.md`.
 
 ---
 

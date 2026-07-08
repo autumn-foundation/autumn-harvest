@@ -178,17 +178,48 @@ cancel-and-compensate unwinds in runs that never terminally fail — both
 cases a terminal-boundary emission would structurally miss. It is therefore
 fully separable from `harvest.workflow.terminal{outcome=failed}`.
 
+**Per-unwind coherence (post-review hardening).** The unwind's disposition
+(counted or not) is resolved **once**, at unwind start, and the failure
+counter follows it — so the pair can never disagree about one logical
+unwind, and the invariant **`failed ≤ compensated`** holds per unwind (ratio
+dashboards never divide by zero or exceed 100%). Two concrete consequences:
+
+- A *counted* unwind's failure is always counted, **including past a
+  trailing un-awaited signal** at the failed-unwind end (e.g. a retried
+  cancel webhook ingested at the final unwind cycle's wake) — the failure
+  marker is recorded past the drained signal, replay-consistently.
+- The **cancel-and-compensate pattern is counted**: a trailing
+  `WorkflowCancelled` has no workflow-command counterpart and never leaves
+  the replay cursor, so the marker matcher treats it as transparent — the
+  unwind of a freshly-cancelled run is the live frontier.
+
 **Accepted edges** (documented deliberately):
 
-- An unwind entered while unconsumed non-marker events sit at the replay
-  cursor (e.g. a post-restart replay with a trailing `WorkflowCancelled`) is
-  conservatively **uncounted** — for a metrics-only feature, a silent
-  under-count of a rare edge beats any chance of recording a marker at a
-  wrong history position.
-- A **pure in-memory** unwind (no compensation touches an activity, so the
-  cycle has zero durable footprint) that crash-resumes within one decision
-  cycle can re-count (at-least-once) — the metric mirror of the
-  "compensations re-run wholesale" contract.
+- An unwind entered while unconsumed non-marker, non-cancellation events sit
+  at the replay cursor is conservatively **uncounted as a whole** (both
+  counters) — for a metrics-only feature, a silent under-count of a rare
+  edge beats any chance of recording a marker at a wrong history position.
+- **Signal-with-start caveat** (inherited from `ctx.patched()`): an unwind
+  entered at a drained-signal frontier — canonically a signal-with-start run
+  whose unwind begins before the staged signal is awaited — is
+  conservatively **uncounted as a whole**, deterministically on every
+  replay. The failure counter follows (never `failed=1` with
+  `compensated=0`).
+- **Crash window (at-least-once), both counters, durable and in-memory
+  unwinds alike:** the sample is emitted in-process within the
+  single-decision-cycle gap before its marker's batch commits (start marker:
+  before the unwind's first dispatch batch persists; failure marker: before
+  the post-unwind batch persists). A worker crash inside that gap re-emits
+  on resume. A crash *mid-unwind* — between compensations, after the first
+  batch committed — is exactly-once. A **pure in-memory** unwind (zero
+  durable footprint) is the maximal case: a crash-resume anywhere within its
+  single cycle can re-count — the metric mirror of the "compensations re-run
+  wholesale" contract.
+- **Pause race (at-least-once):** an operator pause (#383) committing while
+  the unwind's first decision cycle is in flight discards the cycle's
+  pending commands — including the freshly pushed marker — after the sample
+  already fired; the re-derived cycle after resume emits again. Same class
+  as the crash window.
 - **Forward compatibility:** a history recorded by #801+ code does not
   replay under pre-#801 builds (the marker is unknown to the old matcher);
   a rollback nd-blocks (#603, non-terminal, recoverable) until rolled
@@ -209,13 +240,16 @@ lock in these semantics:
 | Test | What it proves |
 |------|----------------|
 | `saga_cancellation_does_not_auto_compensate` | `Saga` leaves compensations pending when `ctx.is_cancelled()` is true; no automatic unwind occurs |
-| `saga_compensate_all_on_cancel_pattern` | The recommended explicit cancel-and-compensate pattern works end-to-end; LIFO order is preserved |
+| `saga_compensate_all_on_cancel_pattern` | The recommended explicit cancel-and-compensate pattern works end-to-end; LIFO order is preserved — and (post-review) the unwind is counted, with its dedup marker recorded past the `WorkflowCancelled` event |
 | `saga_compensation_idempotency_under_replay` | On a simulated second execution (replay after crash), all compensations re-run; by-ID compensations are safe, release-most-recent would produce double-effects |
 | `saga_compensated_metric_emitted_once_across_crash_replay` | The `harvest.saga.compensated` counter reflects real compensation sequences, not the replay count — the durable marker suppresses re-emission on crash-resume (issue #801, AC3) |
 | `saga_compensation_failed_metric_distinct_and_once` | The failure counter is a distinct signal, emitted exactly once and deduped across replays by its own marker |
 | `saga_compensation_failed_emitted_even_when_author_catches_error` | An author-caught `SagaCompensationFailed` is still counted (in-Saga emission) |
 | `saga_success_path_emits_no_saga_metrics_and_no_marker_commands` | A saga that never compensates emits nothing new (issue #801, AC6) |
 | `pre_801_history_mid_unwind_replays_clean_and_uncounted` | A pre-#801 marker-less history — including one captured mid-unwind — replays without divergence and without emission |
+| `trailing_unawaited_signal_does_not_suppress_the_failure_counter` | A counted unwind's failure fires exactly once even with a trailing un-awaited signal at the failed-unwind end (post-review P2-1) |
+| `signal_with_start_shape_keeps_the_failed_counter_coupled_to_compensated` | An uncounted (drained-signal-frontier) unwind's failure stays uncounted — `failed ≤ compensated` holds per unwind (post-review P2-2) |
+| `two_saga_unwinds_in_one_workflow_count_independently` | Two compensation sequences in one workflow allocate distinct seq markers and each count exactly once |
 
 ---
 

@@ -435,7 +435,11 @@ async fn saga_cancellation_does_not_auto_compensate() {
 /// the execution ends cleanly.
 #[tokio::test]
 async fn saga_compensate_all_on_cancel_pattern() {
-    let ctx = cancelled_context("operator shutdown");
+    // Issue #801 post-review hardening (mutant k): the cancel-and-compensate
+    // unwind must be COUNTED — instrumentation never consults is_cancelled().
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = cancelled_context("operator shutdown")
+        .with_metrics(Arc::clone(&recorder) as Arc<dyn MetricsRecorder>);
     let mut saga = Saga::new(&ctx);
     let log = Arc::new(Mutex::new(Vec::new()));
 
@@ -495,6 +499,21 @@ async fn saga_compensate_all_on_cancel_pattern() {
             "cancel_flight:flight-1",
         ],
         "compensate_all fires in LIFO order when the author invokes it explicitly"
+    );
+
+    // The cancel-and-compensate unwind is a real compensation sequence and
+    // must be counted exactly once, with its durable dedup marker recorded —
+    // a regression gating emission on !is_cancelled() would silently uncount
+    // exactly the population sagas serve (issue #801, AC1).
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATED),
+        1,
+        "a cancel-and-compensate unwind must fire harvest.saga.compensated"
+    );
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 0);
+    assert_eq!(
+        marker_command_names(&ctx.drain_commands()),
+        vec!["saga_compensated:1".to_owned()]
     );
 }
 
@@ -1119,4 +1138,208 @@ async fn pre_801_history_mid_unwind_replays_clean_and_uncounted() {
         marker_command_names(&ctx2.drain_commands()).is_empty(),
         "the suspended cycle's command batch must carry no saga marker"
     );
+}
+
+/// P2-1 (post-review hardening): a trailing un-awaited signal at the
+/// failed-unwind end must NOT suppress `harvest.saga.compensation_failed`
+/// for a counted unwind.
+///
+/// Shape (the review's empirical reproduction): the unwind was counted in an
+/// earlier cycle (its `saga_compensated:1` marker is in history), its
+/// activity-backed compensation terminally failed, and a duplicate/extra
+/// signal (e.g. a retried cancel webhook) was ingested after the
+/// compensation's terminal — landing exactly at the failed-observe cursor
+/// position. The failure marker must be recorded past the drained signal and
+/// the page-severity counter must fire, exactly once.
+#[tokio::test]
+async fn trailing_unawaited_signal_does_not_suppress_the_failure_counter() {
+    // One saga step: in-memory forward step, activity-backed compensation
+    // that replays to the recorded terminal failure.
+    async fn run_failing_unwind(ctx: &WorkflowContext) -> HarvestError {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || async { Ok::<_, HarvestError>(serde_json::json!("rsv-1")) },
+            move |rsv: Value| async move {
+                ctx.execute_activity_raw("release", rsv, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .expect("forward step ok");
+        saga.compensate_all()
+            .await
+            .expect_err("compensation replays the recorded activity failure")
+    }
+
+    let release_id = autumn_harvest::types::ActivityExecId::new();
+    let failed_unwind_history = || {
+        let mut events = started_history();
+        events.extend([
+            saga_marker("saga_compensated:1", 1),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: release_id,
+                name: "release".into(),
+                input: serde_json::json!("rsv-1"),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: release_id,
+                error: "release rejected".into(),
+                attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "dup_cancel".into(),
+                payload: serde_json::json!({"retry": true}),
+            },
+        ]);
+        events
+    };
+
+    // Cycle F — the cycle that observes the compensation failure.
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(failed_unwind_history(), Arc::clone(&recorder));
+    run_failing_unwind(&ctx).await;
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATED),
+        0,
+        "the compensated counter was already emitted in an earlier cycle (marker dedupe)"
+    );
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATION_FAILED),
+        1,
+        "a genuinely failed, counted unwind must fire the page-severity counter \
+         even with a trailing un-awaited signal at the failed-unwind end"
+    );
+    assert_eq!(
+        marker_command_names(&ctx.drain_commands()),
+        vec!["saga_compensation_failed:1".to_owned()],
+        "the failure marker must be recorded (past the drained trailing signal)"
+    );
+
+    // Cycle F+1 — the failure marker persisted after the signal: exactly-once.
+    let mut history = failed_unwind_history();
+    history.push(saga_marker("saga_compensation_failed:1", 1));
+    let ctx2 = observed_context(history, Arc::clone(&recorder));
+    run_failing_unwind(&ctx2).await;
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATION_FAILED),
+        1,
+        "the failure counter must not re-emit once its marker is recorded"
+    );
+    assert!(
+        marker_command_names(&ctx2.drain_commands()).is_empty(),
+        "no fresh marker on the replay cycle"
+    );
+}
+
+/// P2-2 (post-review hardening): the `failed ≤ compensated` invariant.
+///
+/// Signal-with-start shape: the staged signal sits at the cursor when the
+/// unwind starts, so the whole unwind is conservatively uncounted (the same
+/// caveat `ctx.patched()` documents). The failure counter must FOLLOW that
+/// disposition — an uncounted unwind's failure stays uncounted, never
+/// producing `compensated=0, failed=1` (which breaks ratio dashboards and
+/// records an asymmetric marker set).
+#[tokio::test]
+async fn signal_with_start_shape_keeps_the_failed_counter_coupled_to_compensated() {
+    async fn run_failing_in_memory_unwind(ctx: &WorkflowContext) -> HarvestError {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || async { Ok::<_, HarvestError>("rsv-1".to_string()) },
+            |_| async { Err::<(), _>(workflow_failed("release rejected")) },
+        )
+        .await
+        .expect("forward step ok");
+        saga.compensate_all()
+            .await
+            .expect_err("in-memory compensation fails")
+    }
+
+    let signal_with_start_history = || {
+        let mut events = started_history();
+        events.push(WorkflowEvent::SignalReceived {
+            signal_name: "kick".into(),
+            payload: serde_json::json!({"n": 1}),
+        });
+        events
+    };
+
+    // Every cycle resolves identically: the unwind is uncounted as a unit.
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    for cycle in 0..2 {
+        let ctx = observed_context(signal_with_start_history(), Arc::clone(&recorder));
+        run_failing_in_memory_unwind(&ctx).await;
+        assert_eq!(
+            recorder.count(METRIC_SAGA_COMPENSATED),
+            0,
+            "cycle {cycle}: an unwind entered at a drained-signal frontier is \
+             conservatively uncounted"
+        );
+        assert_eq!(
+            recorder.count(METRIC_SAGA_COMPENSATION_FAILED),
+            0,
+            "cycle {cycle}: the failure counter must follow the unwind's \
+             disposition — never failed=1 with compensated=0"
+        );
+        assert!(
+            marker_command_names(&ctx.drain_commands()).is_empty(),
+            "cycle {cycle}: an uncounted unwind records no marker at all \
+             (no asymmetric marker set)"
+        );
+    }
+}
+
+/// Mutant-killer for the seq counter (test-review P2-2): two compensation
+/// sequences in one workflow must get distinct seq-numbered markers and count
+/// independently — a frozen `next_saga_seq` would collide both unwinds on
+/// `saga_compensated:1`.
+#[tokio::test]
+async fn two_saga_unwinds_in_one_workflow_count_independently() {
+    async fn run_two_compensated_sagas(ctx: &WorkflowContext) {
+        for _ in 0..2 {
+            let mut saga = Saga::new(ctx);
+            saga.step(
+                || async { Ok::<_, HarvestError>("ok") },
+                |_| async { Ok::<_, HarvestError>(()) },
+            )
+            .await
+            .expect("step ok");
+            saga.compensate_all().await.expect("compensation succeeds");
+        }
+    }
+
+    // Cycle 1 — both unwinds live: two distinct markers, two samples.
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(started_history(), Arc::clone(&recorder));
+    run_two_compensated_sagas(&ctx).await;
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATED),
+        2,
+        "each compensation sequence counts once"
+    );
+    assert_eq!(
+        marker_command_names(&ctx.drain_commands()),
+        vec![
+            "saga_compensated:1".to_owned(),
+            "saga_compensated:2".to_owned(),
+        ],
+        "the second unwind must allocate a fresh seq, never reuse seq 1"
+    );
+
+    // Cycle 2 — replay with both markers persisted: zero new samples.
+    let mut history = started_history();
+    history.push(saga_marker("saga_compensated:1", 1));
+    history.push(saga_marker("saga_compensated:2", 1));
+    let ctx2 = observed_context(history, Arc::clone(&recorder));
+    run_two_compensated_sagas(&ctx2).await;
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATED),
+        2,
+        "a replay of two recorded unwinds emits nothing new"
+    );
+    assert!(marker_command_names(&ctx2.drain_commands()).is_empty());
 }

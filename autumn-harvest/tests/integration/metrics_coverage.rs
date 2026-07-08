@@ -415,7 +415,11 @@ fn schedule_skipped_reason_values_match_adr() {
 fn saga_counters_reachable_and_never_labeled_by_execution_id() {
     // Issue #801: both saga counters must be reachable via the trait with
     // exactly the workflow + queue labels — execution.id is forbidden by
-    // construction (ADR-0001 §7).
+    // construction (ADR-0001 §7). Scope note (post-review): the label keys
+    // asserted below belong to the RecordingMetrics test double, so this
+    // test pins the trait's reachable surface, not production label content
+    // (which is pinned by the context-level label tests and the
+    // metrics_rs_adapter bridge test).
     let rec = RecordingMetrics::default();
     rec.record_saga_compensated("book_trip", "payments");
     rec.record_saga_compensation_failed("book_trip", "payments");

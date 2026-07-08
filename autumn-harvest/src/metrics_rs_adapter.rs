@@ -884,15 +884,90 @@ mod tests {
 
     #[test]
     fn bridges_saga_counters_with_workflow_and_queue_labels() {
-        // The bridge forwards both saga counters to the `metrics` crate with
-        // the workflow + queue label constants. metrics 0.24 routes to a
-        // no-op sink when no global recorder is installed — these calls must
-        // complete without panicking (the file's established bridge-coverage
-        // idiom; label content is pinned by the counter! constants used in
-        // the impl).
-        let rec = MetricsRsRecorder;
-        rec.record_saga_compensated("book_trip", "default");
-        rec.record_saga_compensation_failed("book_trip", "default");
+        // Real label-content assertion (issue #801 post-review): a local
+        // `metrics::Recorder` captures the registered counter keys, so a
+        // swapped or dropped label value in the bridge is caught here —
+        // unlike the file's older no-panic smoke idiom, which predates
+        // `metrics::with_local_recorder` (0.24).
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_saga_compensated("book_trip", "payments");
+            rec.record_saga_compensation_failed("book_trip", "payments");
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        let expected_labels = vec![
+            (METRIC_LABEL_WORKFLOW.to_owned(), "book_trip".to_owned()),
+            (METRIC_LABEL_QUEUE.to_owned(), "payments".to_owned()),
+        ];
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (METRIC_SAGA_COMPENSATED.to_owned(), expected_labels.clone()),
+                (METRIC_SAGA_COMPENSATION_FAILED.to_owned(), expected_labels),
+            ],
+            "the bridge must register both saga counters with exactly the \
+             workflow + queue label constants, values un-swapped"
+        );
     }
 
     #[test]

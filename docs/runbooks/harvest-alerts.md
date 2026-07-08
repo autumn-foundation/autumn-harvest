@@ -751,7 +751,6 @@ Escalate to the downstream owner for external dependency outages. Escalate to th
 if the retry policy is misconfigured. Page (`harvest_activity_retry_storm_critical`) when the retry
 rate exceeds 20/s — at that scale the task queue backlog will grow and other queues will be starved.
 
-
 ## harvest_saga_compensation_spike
 
 **What a compensation spike means:** sagas are rolling back en masse. Each
@@ -772,7 +771,7 @@ workflow failures become visible.
    breakdown, and `harvest.activity.retries` for a concurrent retry storm on
    the same activity.
 3. Inspect recent failures directly: `harvest workflow list --state FAILED
-   --workflow <name> | head -20` (or `GET /api/harvest/workflows?state=FAILED`)
+   --workflow-name <name> | head -20` (or `GET /api/harvest/workflows?state=FAILED`)
    and read the `error` field for the original step error.
 4. Check whether `harvest_saga_compensation_failed` is ALSO firing — a spike
    plus failed compensations means dangling state is accumulating; treat as
@@ -819,11 +818,14 @@ affected workflow type moves money or inventory.
 **What to do when a compensation fails:** a rollback itself failed
 (`HarvestError::SagaCompensationFailed`), so the system is holding
 partially-committed, dangling state — a charge that was not refunded, a
-reservation that was not released. Nothing in the engine will retry the
-failed compensation closure wholesale on its own timeline (a still-running
-execution's replay re-runs compensations, but a terminally-failed or
-author-caught one will not); every increment therefore represents work for a
-human until reconciled. The counter fires exactly once per failed unwind,
+reservation that was not released. Nothing in the engine re-attempts a
+failed compensation on its own timeline: for the documented durable pattern
+(a compensation that invokes an activity), the activity's recorded
+`ActivityFailed` terminal is **replayed, never re-executed** — deterministic
+replay returns the recorded failure — and a pure in-memory compensation
+closure only re-runs if the still-RUNNING execution replays again, which
+does not survive an author-caught, completed run. Every increment therefore
+represents work for a human until reconciled. The counter fires exactly once per failed unwind,
 including unwinds whose error the workflow author caught — it is deliberately
 separable from `harvest.workflow.terminal{outcome=failed}` so you can page on
 it alone.
@@ -832,7 +834,7 @@ it alone.
 
 1. Identify the workflow type and queue from the metric labels.
 2. List candidate executions: `harvest workflow list --state FAILED
-   --workflow <name>` — the execution `error` field carries the
+   --workflow-name <name>` — the execution `error` field carries the
    `SagaCompensationFailed` message with the original step error AND the
    per-compensation error strings. For author-caught cases the run may be
    COMPLETED; search the execution history for the failing compensation
@@ -853,19 +855,29 @@ it alone.
 
 ### False positives
 
-None by design — the counter has zero false negatives and each increment is
-a real failed unwind. If an increment is expected (e.g. a deliberately
-non-compensatable step), the workflow should not register a compensation for
-that step at all.
+None by design — each increment is a real failed unwind. (False *negatives*
+are limited to the documented conservative edge: an unwind entered at an
+unresolvable history position — e.g. a signal-with-start run whose unwind
+starts before the staged signal is awaited — is uncounted as a whole; see
+the accepted edges in `docs/saga.md`.) If an increment is expected (e.g. a
+deliberately non-compensatable step), the workflow should not register a
+compensation for that step at all.
 
 ### Safe actions
 
 1. Manually reconcile each dangling resource (issue the refund, release the
    reservation) using the resource ids recorded in the execution history.
-2. If the compensation failure was transient and the execution is still
-   RUNNING (author caught and parked), a replay re-runs the compensation —
-   compensations are idempotent by contract, so re-driving the workflow task
-   is safe.
+2. Re-driving the workflow task helps **only for pure in-memory
+   compensation closures** in a still-RUNNING execution: those re-run
+   wholesale on every replay (idempotent by contract), so a transient
+   failure can clear. It is safe but **ineffective** for the documented
+   durable pattern (activity-backed compensations): the compensation
+   activity's retries are already exhausted and its recorded `ActivityFailed`
+   is replayed, not re-executed — `retry-now` (#516) only helps a
+   *backing-off PENDING* task, not a terminally-failed one. For durable
+   compensations, reconcile manually (step 1) or reset the execution from
+   history before the failed compensation (#148, `docs/runbooks/` reset
+   tooling) after fixing the downstream.
 3. Fix the compensation activity (or its downstream) before re-enabling the
    traffic source; a broken compensation path turns every future rollback
    into manual work.

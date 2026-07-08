@@ -252,8 +252,8 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `shard` (≤ 256)                               |                       |
 | `METRIC_WORKFLOW_PAUSED`   | `harvest.workflow.paused`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`      |
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
-| `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` — exactly once per real compensation sequence (non-empty saga unwind running forward), deduped across replays via a durable `saga_compensated:{seq}` marker (issue #801) | `execution.id` |
-| `METRIC_SAGA_COMPENSATION_FAILED` | `harvest.saga.compensation_failed` | Counter | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` — exactly once per unwind finishing with ≥1 compensation error (the `SagaCompensationFailed` dangling state); emitted in-Saga so it is separable from `harvest.workflow.terminal{outcome=failed}` and fires even for author-caught failures (issue #801) | `execution.id` |
+| `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
+| `METRIC_SAGA_COMPENSATION_FAILED` | `harvest.saga.compensation_failed` | Counter | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 
 **Cardinality rule**: `execution.id` (a UUID) is **explicitly forbidden** as a
 metric label. It is unbounded and would explode the metric time-series in any

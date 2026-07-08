@@ -677,7 +677,7 @@
       "severity": "ticket",
       "owner_persona": "workflow owner",
       "description": "Sagas are rolling back at an elevated rate. A compensation spike is the canonical leading indicator that a downstream dependency is failing: forward steps succeed until one dependency starts erroring, and every affected saga then unwinds. The counter fires exactly once per real unwind (deduped across replays by a durable marker), so the rate reflects genuine rollback volume, not replay noise.",
-      "first_action": "Identify the spiking workflow label, then find the failing step: harvest workflow list --state FAILED --workflow <name> | head -20 and check harvest.activity.failed{workflow.type=<name>} for the error.type breakdown of the downstream that is failing.",
+      "first_action": "Identify the spiking workflow label, then find the failing step: harvest workflow list --state FAILED --workflow-name <name> | head -20 and check harvest.activity.failed{workflow.type=<name>} for the error.type breakdown of the downstream that is failing.",
       "dependencies": [
         {
           "ref": "#801",
@@ -709,7 +709,7 @@
       "severity": "page",
       "owner_persona": "runtime on-call",
       "description": "A saga rollback itself failed, leaving the system in a partially-committed, dangling state (e.g. a charge that could not be refunded, a reservation that could not be released) that needs manual reconciliation. This signal is distinct from harvest.workflow.terminal{outcome=failed} and fires even when the workflow author catches the error and the run completes — every dangling state raises exactly one alertable increment.",
-      "first_action": "Find the affected executions: harvest workflow list --state FAILED --workflow <name>, then inspect each run's history for the failing compensation activity (GET /api/harvest/workflows/{id}/history) and reconcile the dangling resource manually (refund, release, restore).",
+      "first_action": "Find the affected executions: harvest workflow list --state FAILED --workflow-name <name>, then inspect each run's history for the failing compensation activity (GET /api/harvest/workflows/{id}/history) and reconcile the dangling resource manually (refund, release, restore).",
       "dependencies": [
         {
           "ref": "#801",
@@ -719,7 +719,7 @@
       ],
       "prometheus": {
         "mode": "native",
-        "notes": "Zero false negatives is the design goal: the counter is emitted in-Saga at the failure observation point, deduped across replays by a durable marker. workflow and queue labels are bounded; execution.id is never a label.",
+        "notes": "Zero false negatives is the design goal: the counter is emitted in-Saga at the failure observation point, deduped across replays by a durable marker, and (post-review hardening) a counted unwind's failure is never suppressed by a trailing un-awaited signal. The only uncounted failures are the documented conservative edge (an unwind entered at an unresolvable history position is uncounted as a whole — see docs/saga.md accepted edges). workflow and queue labels are bounded; execution.id is never a label.",
         "expressions": [
           {
             "kind": "promql",

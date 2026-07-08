@@ -255,8 +255,10 @@ impl<'ctx> Saga<'ctx> {
         // Counted at unwind start (the earliest outage signal), deduped
         // across replays by the durable `saga_compensated:{seq}` marker —
         // recorded in the same command batch as the first compensation's own
-        // dispatch, so a crash at any point mid-unwind resumes silent.
-        let seq = self.ctx.observe_saga_unwind_start(self.compensations.len());
+        // dispatch, so a crash at any point mid-unwind resumes silent. The
+        // returned observation carries the unwind's disposition; the failure
+        // observe below follows it (invariant: failed ≤ compensated).
+        let observation = self.ctx.observe_saga_unwind_start(self.compensations.len());
 
         let mut errors = Vec::new();
 
@@ -271,8 +273,12 @@ impl<'ctx> Saga<'ctx> {
         } else {
             // The dangling-state signal (`harvest.saga.compensation_failed`),
             // emitted here rather than at the worker terminal boundary so an
-            // author-caught failure is still observed.
-            self.ctx.observe_saga_unwind_failed(seq, errors.len());
+            // author-caught failure is still observed. Keyed to the unwind's
+            // start disposition: a counted unwind's failure is always counted
+            // (even past a trailing un-awaited signal), an uncounted unwind's
+            // failure stays uncounted.
+            self.ctx
+                .observe_saga_unwind_failed(observation, errors.len());
             Err(errors)
         }
     }

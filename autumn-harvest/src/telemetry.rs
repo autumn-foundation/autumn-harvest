@@ -445,6 +445,10 @@ pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_thrott
 /// A compensation-rate spike is the canonical leading indicator that a
 /// downstream dependency is failing and sagas are rolling back en masse.
 ///
+/// At-least-once within the single-decision-cycle gap between in-process
+/// emission and the marker's batch commit (crash / pause-race discard) —
+/// see the accepted edges in `docs/saga.md`.
+///
 /// Labeled by `workflow` (workflow name) and `queue` (task queue name).
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_SAGA_COMPENSATED: &str = "harvest.saga.compensated";
@@ -459,6 +463,10 @@ pub const METRIC_SAGA_COMPENSATED: &str = "harvest.saga.compensated";
 /// counter, and emitted in-Saga rather than at the worker terminal boundary,
 /// so it fires even when the workflow author catches the error and the run
 /// goes on to COMPLETE.
+///
+/// Coupled to the unwind's start disposition (`failed ≤ compensated`, per
+/// unwind), and at-least-once within the same emit→persist gap as the
+/// compensated counter — see the accepted edges in `docs/saga.md`.
 ///
 /// Labeled by `workflow` (workflow name) and `queue` (task queue name).
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
@@ -3061,8 +3069,12 @@ mod tests {
 
     #[test]
     fn execution_id_is_not_a_parameter_of_record_saga_counters() {
-        // ADR-0001 §7 cardinality rule: execution.id is span-only. Verified
-        // by construction — both methods accept exactly (workflow_name, queue).
+        // Compile-level pin ONLY: this test proves the two methods exist and
+        // accept exactly (workflow_name, queue) — the cardinality guarantee
+        // itself is the trait signature (an ExecutionId parameter would not
+        // compile). It asserts nothing at runtime and is not evidence of
+        // production label content; that is pinned by the context-level
+        // label tests and the metrics_rs_adapter bridge test.
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_saga_compensated("billing", "default");
         rec.record_saga_compensation_failed("billing", "default");

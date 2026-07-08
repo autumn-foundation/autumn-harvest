@@ -497,6 +497,12 @@ pub async fn run_workflow_with_state_advancing_clock(
         WorkflowHistoryPolicy::default(),
     )
     .with_advancing_timer_clock()
+    // Thread the workflow/queue names from span_meta into the context
+    // (mirrors run_workflow_with_state_history_policy_and_caps) so harness
+    // users — WorkflowTestEnv::with_workflow_name/with_queue_name — can
+    // assert metric label content (issue #801 post-review P3).
+    .with_workflow_name(span_meta.map_or("", |m| m.workflow_name.as_str()))
+    .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     .with_metrics(metrics);
     drive_workflow(ctx, handler, input, span_meta).await
 }

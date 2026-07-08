@@ -8556,24 +8556,27 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
 static SAGA_CANCEL_FLIGHT_RUNS: AtomicUsize = AtomicUsize::new(0);
 static SAGA_CANCEL_HOTEL_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-/// Counts the two saga counters emitted through the worker's real telemetry
-/// wiring; every other `MetricsRecorder` method stays a no-op default.
+/// Records the two saga counters (with their labels) emitted through the
+/// worker's real telemetry wiring; every other `MetricsRecorder` method stays
+/// a no-op default. Labels are recorded here and asserted after the run —
+/// never asserted inside the callback, which runs on the worker task and
+/// would surface a label regression as a confusing poison-pill FAILED
+/// instead of a clear assertion message (issue #801 post-review).
 #[derive(Default)]
 struct SagaE2eRecorder {
-    compensated: AtomicUsize,
+    compensated: std::sync::Mutex<Vec<(String, String)>>,
     compensation_failed: AtomicUsize,
 }
 
 impl autumn_harvest::telemetry::MetricsRecorder for SagaE2eRecorder {
     fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
-        assert_eq!(workflow_name, "e2e_test_workflow");
-        assert_eq!(queue, "default");
-        self.compensated.fetch_add(1, Ordering::SeqCst);
+        self.compensated
+            .lock()
+            .expect("saga e2e recorder lock")
+            .push((workflow_name.to_owned(), queue.to_owned()));
     }
 
-    fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
-        assert_eq!(workflow_name, "e2e_test_workflow");
-        assert_eq!(queue, "default");
+    fn record_saga_compensation_failed(&self, _workflow_name: &str, _queue: &str) {
         self.compensation_failed.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -8775,11 +8778,18 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
         "workflow error must carry the original step failure, got: {error}"
     );
 
-    // Exactly-once across every decision cycle of the unwind.
+    // Exactly-once across every decision cycle of the unwind, with the real
+    // worker-threaded labels (asserted here, after the run, so a regression
+    // reads as a clear assertion failure rather than an in-worker panic).
     assert_eq!(
-        AtomicUsize::load(&recorder.compensated, Ordering::SeqCst),
-        1,
-        "harvest.saga.compensated must fire exactly once per real unwind"
+        recorder
+            .compensated
+            .lock()
+            .expect("saga e2e recorder lock")
+            .as_slice(),
+        &[("e2e_test_workflow".to_owned(), "default".to_owned())],
+        "harvest.saga.compensated must fire exactly once per real unwind, \
+         labeled with the workflow type and claimed queue"
     );
     assert_eq!(
         AtomicUsize::load(&recorder.compensation_failed, Ordering::SeqCst),
