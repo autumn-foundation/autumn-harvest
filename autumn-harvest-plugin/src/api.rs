@@ -33,10 +33,10 @@ use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID, HEADER_SOURCE,
-    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
-    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
-    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
-    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE,
+    OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET,
+    OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
+    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
@@ -1752,6 +1752,23 @@ struct RetryActivityNowResponse {
     already_eligible: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct FailActivityNowResponse {
+    ok: bool,
+    execution_id: String,
+    activity_exec_id: String,
+    activity_name: String,
+    queue: String,
+    /// `true` when this call performed the force-fail.
+    forced: bool,
+    /// `true` when a prior force-fail was detected — idempotent no-op success.
+    already_forced: bool,
+    /// The distinct failure cause recorded on the forced `ActivityFailed`
+    /// event (always `"OperatorForceFailed"`), so operators and scripts can
+    /// key on it without hardcoding the constant.
+    error_type: &'static str,
+}
+
 /// Response row for `GET /workflows/{id}/completion-deliveries` (issue #605).
 #[derive(Debug, Serialize)]
 struct CompletionDeliveryResponse {
@@ -2173,6 +2190,14 @@ struct TerminateWorkflowRequest {
 
 #[derive(Debug, Default, Deserialize)]
 struct PauseWorkflowRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Optional body for `POST /workflows/{id}/activities/{activity_exec_id}/fail-now`
+/// (issue #765).
+#[derive(Debug, Default, Deserialize)]
+struct FailActivityNowRequest {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -3070,6 +3095,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(retry_activity_now).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+            post(fail_activity_now).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/completion-deliveries",
             get(list_completion_deliveries).route_layer(require_admin.clone()),
         )
@@ -3660,6 +3689,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
         ),
+        (
+            "POST",
+            "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+        ),
         ("GET", "/workflows/{id}/completion-deliveries"),
         (
             "POST",
@@ -3871,6 +3904,11 @@ pub const fn management_api_request_fields()
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
             Some(&[]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+            Some(&["reason"]),
         ),
         (
             "POST",
@@ -4323,6 +4361,20 @@ pub const fn management_api_response_fields()
                 "next_retry_at",
                 "advanced",
                 "already_eligible",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+            Some(&[
+                "ok",
+                "execution_id",
+                "activity_exec_id",
+                "activity_name",
+                "queue",
+                "forced",
+                "already_forced",
+                "error_type",
             ]),
         ),
         (
@@ -12648,6 +12700,142 @@ async fn retry_activity_now(
                 }),
             ))
         }
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `POST /workflows/{id}/activities/{activity_exec_id}/fail-now` — force-fail
+/// exactly one hung in-flight (RUNNING) activity task (issue #765).
+/// Admin-guarded. Appends `ActivityFailed` with the distinct
+/// `OperatorForceFailed` error type (no new event variant), skips every
+/// remaining retry attempt, and wakes the parked workflow task so the owning
+/// workflow advances to its own failure/compensation path — it is NOT
+/// terminated. Returns 202 Accepted with `forced: true` when this call
+/// performed the force-fail, or `forced: false, already_forced: true` for an
+/// idempotent repeat on an already-forced task. Returns 404 for unknown task
+/// IDs or wrong workflow, 409 for tasks that are not force-failable (not
+/// RUNNING, genuinely failed, or a workflow task).
+///
+/// Note: local activities run inline on the workflow worker and have no
+/// `harvest_task_queue` row — `fail-now` does not apply to them (404).
+#[allow(clippy::too_many_lines)]
+async fn fail_activity_now(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, activity_exec_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    // Optional body ({"reason": "…"}): mirror `terminate_workflow`'s raw-Bytes
+    // handling so a body-less POST (or an empty body with a JSON content-type)
+    // still force-fails with the defaulted reason instead of 422-ing in the
+    // extractor, while a genuinely malformed non-empty body is rejected.
+    body: axum::body::Bytes,
+) -> Result<(axum::http::StatusCode, Json<FailActivityNowResponse>), AutumnError> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/activities/{activity_exec_id}/fail-now";
+
+    let request: FailActivityNowRequest = if body.is_empty() {
+        FailActivityNowRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
+    };
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_ACTIVITY_FAIL_NOW,
+                    target_type: TARGET_ACTIVITY,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+
+    let Ok(task_id) = uuid::Uuid::parse_str(&activity_exec_id) else {
+        // Write a STATUS_FAILED audit record (symmetric with the malformed `id`
+        // path above) so operators can see the rejected call in the audit log.
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut audit_conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_ACTIVITY_FAIL_NOW,
+                target_type: TARGET_ACTIVITY,
+                target_id: Some(activity_exec_id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("malformed activity_exec_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+        }
+        return Err(AutumnError::not_found_msg(format!(
+            "unknown activity_exec_id: {activity_exec_id}"
+        )));
+    };
+
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result = autumn_harvest::timeout::force_fail_activity(
+        &mut conn,
+        exec_id.as_uuid(),
+        task_id,
+        request.reason.as_deref(),
+    )
+    .await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_ACTIVITY_FAIL_NOW,
+        target_type: TARGET_ACTIVITY,
+        target_id: Some(activity_exec_id.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok((
+            axum::http::StatusCode::ACCEPTED,
+            Json(FailActivityNowResponse {
+                ok: true,
+                execution_id: exec_id_str,
+                activity_exec_id,
+                activity_name: outcome.activity_name,
+                queue: outcome.queue_name,
+                forced: outcome.forced,
+                already_forced: outcome.already_forced,
+                error_type: autumn_harvest::failure::ERROR_TYPE_OPERATOR_FORCE_FAILED,
+            }),
+        )),
         Err(e) => Err(conflict_from(e)),
     }
 }

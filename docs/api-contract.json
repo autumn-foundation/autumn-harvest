@@ -1175,6 +1175,71 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force-fail exactly one hung in-flight (RUNNING) activity task. Appends ActivityFailed with the distinct error_type 'OperatorForceFailed' through the existing recording path (no new event variant), marks the task row FAILED with the typed failure envelope, and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path -- it is NOT terminated. Remaining retry attempts are skipped regardless of retry policy (the forced failure is non-retryable by construction), and a late result from the worker still running the activity is ignored (no double-apply). Only RUNNING activity tasks are force-failable. Local activities run inline and have no task-queue row -- this endpoint does not apply to them (404).",
+      "idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "activity_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable reason recorded in the forced ActivityFailed event's message and details (e.g. an incident id)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "activity_exec_id",
+          "activity_name",
+          "queue",
+          "forced",
+          "already_forced",
+          "error_type"
+        ],
+        "field_notes": {
+          "forced": "true when this call performed the force-fail; false when a prior force-fail was detected (idempotent no-op).",
+          "already_forced": "true when the task was already force-failed by an earlier call -- zero writes were performed.",
+          "error_type": "Always 'OperatorForceFailed' -- the distinct failure cause workflow code can match on (HarvestError::is_operator_force_failed) to tell an operator intervention apart from a genuine activity error."
+        }
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution or activity task not found, including a task belonging to a different workflow, or activity_exec_id is not a valid UUID. Local activities have no task-queue row and return 404."
+        },
+        {
+          "status": 409,
+          "description": "Task is not force-failable: not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), or the id names a workflow task rather than an activity task."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/workflows/{id}/completion-deliveries",
       "category": "workflow",
