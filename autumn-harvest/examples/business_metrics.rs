@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_run_emits_the_branch_counter_exactly_once() {
+    async fn live_run_emits_the_fulfilled_counter_exactly_once() {
         let metrics = Arc::new(CountingMetrics::default());
         let outcome = WorkflowTestEnv::new()
             .with_metrics(metrics.clone())

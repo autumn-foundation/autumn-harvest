@@ -255,7 +255,8 @@ Dedupe scope is shard-local, keyed on `(execution_id, idempotency_key)`
 at-least-once behavior exactly — every call delivers a distinct signal event.
 
 The CLI reaches parity with the same flag (issue #753) — it maps onto the
-`?idempotency_key=` query parameter of the same route:
+`?idempotency_key=` query parameter of the same route (an empty key is
+rejected at the CLI, since the server treats an empty param as omitted):
 
 ```bash
 harvest workflow signal <exec-id> approval \
@@ -263,10 +264,14 @@ harvest workflow signal <exec-id> approval \
   --idempotency-key evt_abc123
 ```
 
-Signalling a terminal execution returns the existing terminal/404 error
-semantics unchanged, whether or not a key is supplied. See also the
-[idempotency chapter](06-idempotency.md#idempotent-signal-delivery) and the
-signal-delivery section of `docs/management-api.md`.
+Terminal executions: an unkeyed signal — or a keyed signal whose key never
+landed — keeps the existing terminal/404 error semantics (the fresh keyed
+insert rolls back with the error). One deliberate carve-out: a keyed retry
+whose key already landed while the run was still active dedupes to a no-op
+success (`202 { "signal_delivered": false }`) even after the run has since
+gone terminal — the retry acknowledges a delivery that already happened.
+See also the [idempotency chapter](06-idempotency.md#idempotent-signal-delivery)
+and the [signal-delivery section of the management-API reference](../management-api.md#signal-delivery-post-workflowsidsignalsignal_name).
 
 ### The saga-choreography example
 

@@ -66,10 +66,14 @@ hand-rolled "seen event ids" dedup set in the workflow body (issues #521/#753):
 
 Dedupe scope is per execution — `(execution_id, idempotency_key)` — so the
 same upstream event id may safely target different executions. A deduplicated
-delivery returns 2xx with `signal_delivered: false`, and omitting the key
-preserves the legacy at-least-once behavior exactly. Full contract and curl
-examples: [signals chapter](04-signals.md#idempotent-standalone-signals-over-http-issue-521)
-and the signal-delivery section of `docs/management-api.md`.
+delivery returns 2xx with `signal_delivered: false` — deliberately even when
+the execution has since gone terminal, as long as the key originally landed
+while the run was still active (a retry acknowledges a delivery that already
+happened; a fresh key or an unkeyed signal to a terminal run still gets the
+terminal error). Omitting the key preserves the legacy at-least-once behavior
+exactly. Full contract and curl examples:
+[signals chapter](04-signals.md#idempotent-standalone-signals-over-http-issue-521)
+and the [signal-delivery section of the management-API reference](../management-api.md#signal-delivery-post-workflowsidsignalsignal_name).
 
 ---
 

@@ -3535,8 +3535,9 @@ impl autumn_harvest::telemetry::MetricsRecorder for CountingMetrics {
     }
 }
 
-/// One activity, then a single business-counter increment (issue #758's
-/// "counter incremented once in workflow code" shape).
+/// One activity, then a single business-counter increment and one histogram
+/// sample (issue #758's "counter incremented once in workflow code" shape;
+/// the histogram proves suppression covers both metric kinds).
 fn business_counter_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3548,6 +3549,8 @@ fn business_counter_workflow<'a>(
             .map_err(|e| e.to_string())?;
         ctx.metrics()
             .counter("orders_fulfilled", 1, &[("tier", "gold")]);
+        ctx.metrics()
+            .histogram("order_amount_usd", 42.5, &[("tier", "gold")]);
         Ok(serde_json::json!({"shipped": shipped}))
     })
 }
@@ -3621,6 +3624,11 @@ async fn live_execution_emits_workflow_counter_exactly_once() {
         metrics.counter_total(),
         1,
         "a counter incremented once in workflow code must emit exactly once"
+    );
+    assert_eq!(
+        metrics.histogram_total(),
+        1,
+        "a histogram sampled once in workflow code must emit exactly once"
     );
 }
 

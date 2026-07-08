@@ -208,6 +208,7 @@ I/O is non-idempotent: replaying it sends duplicate requests, corrupts database 
 | **Disallowed** | `lazy_static! { static ref REGISTRY: Mutex<Vec<String>> = ...; } REGISTRY.lock().push(...)` |
 | **Allowed** | Accumulate state in local variables across `ctx.timer()` and activity boundaries |
 | **Allowed** | `ctx.metrics().counter(...)` / `ctx.metrics().histogram(...)` (replay-safe) for workflow-body metrics |
+| **Allowed** | Emit other side-channel updates (non-metric writes to external systems) inside activities, not in workflow code |
 
 Global mutations are re-applied on every replay, causing double-counting or inconsistent state across workers.
 

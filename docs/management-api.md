@@ -585,9 +585,15 @@ at-least-once contract exactly: every call delivers a distinct signal event.
 { "ok": true, "signal_delivered": false }  // deduplicated retry — idempotent replay, not an error
 ```
 
-Signalling a terminal execution returns the existing terminal/404 error
-semantics unchanged, whether or not a key is supplied; `404` for an unknown
-execution id.
+Terminal executions: an **unkeyed** signal — or a keyed signal whose key has
+never landed — keeps the existing terminal-error semantics (the keyed insert
+is rolled back, so no orphan row is left behind). One deliberate carve-out:
+a keyed **retry** whose key already landed while the execution was still
+running dedupes to a no-op success (`202 { "signal_delivered": false }`) even
+after the execution has since gone terminal — the retry acknowledges a
+delivery that already happened rather than requesting a new one
+(`send_signal_idempotent` attempts the insert *before* validating state for
+exactly this reason). `404` for an unknown execution id, keyed or not.
 
 ### CLI usage
 
@@ -598,6 +604,10 @@ harvest workflow signal <exec-id> approval \
 ```
 
 `--idempotency-key` maps onto the `?idempotency_key=` query parameter of this
-route. See `docs/getting-started/04-signals.md` for the full walkthrough and
-`docs/getting-started/06-idempotency.md` for the surrounding idempotency
-story (including `signal-with-start` for the first-delivery case).
+route; an empty key is rejected at the CLI (the server would treat it as
+omitted, silently degrading to at-least-once). See the
+[signals chapter](getting-started/04-signals.md#idempotent-standalone-signals-over-http-issue-521)
+for the full walkthrough and the
+[idempotency chapter](getting-started/06-idempotency.md#idempotent-signal-delivery)
+for the surrounding idempotency story (including `signal-with-start` for the
+first-delivery case).

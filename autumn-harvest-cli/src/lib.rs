@@ -929,8 +929,11 @@ enum WorkflowCommand {
         /// `signal_delivered=false` for the deduped retries. Omit to keep the
         /// legacy at-least-once behavior (every call delivers a distinct
         /// signal event). Typically a stable upstream event id (e.g. a Stripe
-        /// event id or SQS message id).
-        #[arg(long, value_name = "KEY")]
+        /// event id or SQS message id). An empty key is rejected — the server
+        /// treats an empty `?idempotency_key=` as omitted, which would
+        /// silently degrade an intended exactly-once delivery to
+        /// at-least-once.
+        #[arg(long, value_name = "KEY", value_parser = parse_idempotency_key)]
         idempotency_key: Option<String>,
     },
     /// Query workflow state.
@@ -5202,6 +5205,24 @@ fn query_encode(input: &str) -> String {
         }
     }
     out
+}
+
+/// Clap value-parser for `--idempotency-key` (issue #753).
+///
+/// Mirrors the server's `Idempotency-Key` header semantics: a present but
+/// empty (or whitespace-only) key is rejected up front rather than silently
+/// degraded — the management API treats an empty `?idempotency_key=` query
+/// param as omitted, which would turn an intended exactly-once delivery into
+/// at-least-once without the caller noticing.
+fn parse_idempotency_key(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err(
+            "--idempotency-key must not be empty; omit the flag entirely for legacy \
+             at-least-once delivery"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 // ─── Version-gate retirement check helpers ────────────────────────────────────

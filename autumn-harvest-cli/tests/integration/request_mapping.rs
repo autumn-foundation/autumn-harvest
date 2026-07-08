@@ -590,6 +590,39 @@ fn workflow_signal_idempotency_key_is_query_encoded() {
 }
 
 #[test]
+fn workflow_signal_empty_idempotency_key_is_rejected() {
+    // Mirror the server's header semantics (issue #521): a present but empty
+    // Idempotency-Key is rejected rather than silently degraded to
+    // at-least-once — the server treats an empty ?idempotency_key= as
+    // omitted, so a client that intended exactly-once must never send one.
+    for empty in ["", "   "] {
+        let result = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "signal",
+            "00000000-0000-0000-0000-000000000001",
+            "approved",
+            "--idempotency-key",
+            empty,
+        ]);
+        let message = match result {
+            Err(e) => e.to_string(),
+            Ok(cli) => match cli.api_request() {
+                Err(e) => e.to_string(),
+                Ok(req) => panic!(
+                    "empty --idempotency-key {empty:?} must be rejected, but mapped to {}",
+                    req.path
+                ),
+            },
+        };
+        assert!(
+            message.contains("idempotency"),
+            "rejection must name the flag, got: {message}"
+        );
+    }
+}
+
+#[test]
 fn workflow_signal_without_idempotency_key_omits_query_param() {
     // AC (issue #753): omitting the key preserves today's at-least-once
     // behavior exactly — no query param is sent at all.
