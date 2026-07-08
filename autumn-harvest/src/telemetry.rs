@@ -439,7 +439,7 @@ pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_thrott
 /// it was accepted or rejected. Labeled with:
 /// - `payload.kind`: the [`PayloadKind`] variant (e.g. `"ActivityInput"`)
 /// - `workflow.type`: the workflow type name
-/// - `activity.name`: the activity name (empty string when not applicable)
+/// - `activity.name`: the activity name (label omitted when not applicable)
 ///
 /// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
 ///

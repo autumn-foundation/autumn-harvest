@@ -1,0 +1,25 @@
+# Exclusions for github.com/grafana/dashboard-linter (run: dashboard-linter lint starter-pack-v0.1.0.json).
+# Each exclusion is a deliberate repo-policy conflict, not an oversight — see docs/dashboards/README.md.
+exclusions:
+  target-job-rule:
+    reason: >-
+      The Harvest metric catalogue (ADR-0001 §7) defines a bounded label contract
+      (workflow, queue, outcome, activity.name, ...) with no job label; job/instance
+      are scrape-config-dependent and the pack must import cleanly against any
+      Prometheus setup. Issue #754 AC-5 mandates workflow/queue/shard template
+      variables as the navigation dimensions instead.
+  target-instance-rule:
+    reason: >-
+      Same as target-job-rule; additionally the pack is a fleet-wide aggregation
+      dashboard — replica-global sampler gauges deliberately aggregate with
+      max across replicas (README "Multi-replica deployments"), so per-instance
+      filtering would reintroduce the double-counting the pack avoids.
+  template-job-rule:
+    reason: See target-job-rule; the templated dimensions are workflow/queue/shard per issue #754 AC-5.
+  template-instance-rule:
+    reason: See target-instance-rule.
+  uneditable-dashboard:
+    reason: >-
+      The pack is a starter pack, not a provisioned mixin — thresholds are starter
+      defaults operators are expected to tune in place (README "Versioning and
+      tuning"), so the dashboard is intentionally editable.
