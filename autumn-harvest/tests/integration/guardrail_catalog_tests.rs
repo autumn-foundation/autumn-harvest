@@ -378,9 +378,8 @@ fn catalog_contains_hvg011_nondeterministic_iteration() {
 
     let entry = rule_by_id("HVG011")
         .expect("HVG011 (issue #785, remapped from the issue's proposed HVG010) must exist");
-    assert_eq!(
-        format!("{:?}", entry.category),
-        "NonDeterministicIteration",
+    assert!(
+        matches!(entry.category, RuleCategory::NonDeterministicIteration),
         "HVG011 must use the NonDeterministicIteration category"
     );
     // Catalog severity is the class's worst case (a command-emitting loop);
