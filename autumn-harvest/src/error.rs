@@ -581,6 +581,17 @@ impl HarvestError {
     pub fn is_circuit_open(&self) -> bool {
         self.activity_error_type() == Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN)
     }
+
+    /// `true` if this is an activity failure synthesised because an operator
+    /// force-failed the hung in-flight activity (issue #765).
+    ///
+    /// ```rust,ignore
+    /// if err.is_operator_force_failed() { /* compensate */ }
+    /// ```
+    #[must_use]
+    pub fn is_operator_force_failed(&self) -> bool {
+        self.activity_error_type() == Some(crate::failure::ERROR_TYPE_OPERATOR_FORCE_FAILED)
+    }
 }
 
 /// Standard result type for internal harvest engine operations.
@@ -813,10 +824,28 @@ mod tests {
     }
 
     #[test]
+    fn activity_failed_decodes_typed_operator_force_failed_payload() {
+        // Issue #765 AC: the workflow can read a distinct failure cause to
+        // tell an operator-forced failure apart from a genuine activity error.
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let payload = ActivityFailure::operator_force_failed(Some("wedged on dead downstream"))
+            .into_error_payload();
+        let e = HarvestError::activity_failed("charge_card", 1, &payload);
+        assert_eq!(e.activity_error_type(), Some("OperatorForceFailed"));
+        assert!(e.is_operator_force_failed());
+        assert!(!e.is_circuit_open());
+        let details = e
+            .activity_details()
+            .expect("OperatorForceFailed carries details");
+        assert_eq!(details["reason"], "wedged on dead downstream");
+    }
+
+    #[test]
     fn activity_failed_legacy_string_is_error_type_error() {
         let e = HarvestError::activity_failed("send_email", 2, "connection refused");
         assert_eq!(e.activity_error_type(), Some("Error"));
         assert!(!e.is_circuit_open());
+        assert!(!e.is_operator_force_failed());
         assert!(e.activity_details().is_none());
         // The human message is preserved as the source.
         assert!(e.to_string().contains("connection refused"));

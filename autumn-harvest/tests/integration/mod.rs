@@ -31,6 +31,7 @@ mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
 mod fanout_tests;
+mod force_fail_tests;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
