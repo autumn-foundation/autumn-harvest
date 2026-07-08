@@ -4948,7 +4948,11 @@
         },
         {
           "status": 404,
-          "description": "Unknown schedule id (no schedule with that id on any shard)."
+          "description": "Unknown schedule id: no schedule with that id was found and every shard was reachable, so its absence is authoritative."
+        },
+        {
+          "status": 503,
+          "description": "Indeterminate existence (retryable): the schedule id was not found and at least one shard is unreachable, so its absence cannot be confirmed. Retry once shards recover."
         }
       ]
     },

@@ -22,7 +22,8 @@
 //! DET011 is the det_check twin of guardrail HVG010 (SelectMacro, issue #600):
 //! `tokio::select!` / `futures::select!` / `select_biased!` and the
 //! `futures::future::{select, select_all, select_ok, try_select}` combinators
-//! race ctx-managed awaitables non-deterministically (the winning branch
+//! (in both the fully-qualified `futures::future::…` and the short `future::…`
+//! forms) race ctx-managed awaitables non-deterministically (the winning branch
 //! differs between the live run and a replay). HVG010 is the compile-time /
 //! catalog id; det_check surfaces the same hazard as DET011 (DET010 was the
 //! prior det_check maximum).
@@ -303,18 +304,26 @@ const RULES: &[Rule] = &[
             // contain the `select!` substring).
             "select!",
             "select_biased!",
-            // Combinator FUNCTIONS. `futures::future::select(` covers the
-            // qualified plain-select combinator; the bare distinctive forms
-            // (`select_all(`/`select_ok(`/`try_select(`) are specific enough to
-            // futures that a *free-function* call by any of these three is, in
-            // practice, the combinator. These three are matched only at a
-            // call-position boundary (see `DET011_CALL_BOUNDARY_PATTERNS`): a
-            // preceding `.` (method call, e.g. `q.select_all()`) or identifier
-            // char (a longer name) excludes the match, mirroring the AST macro
-            // visitor's structural exclusion of method calls. Bare `select(` is
-            // deliberately omitted entirely (it would match `.select(`
-            // query-builder method calls even at a boundary — too common).
-            "futures::future::select(",
+            // Combinator FUNCTIONS. `future::select(` covers the plain-select
+            // combinator in BOTH its qualified (`futures::future::select(`) and
+            // short (`use futures::future; future::select(`) forms — the short
+            // form is a genuine suffix of the qualified one, so the single
+            // pattern matches both without a second entry (and, since the engine
+            // emits at most one finding per rule per line, never double-counts a
+            // qualified call). This matches the AST macro visitor, which
+            // recognizes the `future::select` short form too. The bare
+            // distinctive forms (`select_all(`/`select_ok(`/`try_select(`) are
+            // specific enough to futures that a *free-function* call by any of
+            // these three is, in practice, the combinator. All four are matched
+            // only at a call-position boundary (see
+            // `DET011_CALL_BOUNDARY_PATTERNS`): a preceding `.` (method call,
+            // e.g. `q.select_all()` / a hypothetical `.future::select(`) or
+            // identifier char (a longer name like `my_future::select(`) excludes
+            // the match, mirroring the AST macro visitor's structural exclusion
+            // of method calls. Bare `select(` is deliberately omitted entirely
+            // (it would match `.select(` query-builder method calls even at a
+            // boundary — too common).
+            "future::select(",
             "select_all(",
             "select_ok(",
             "try_select(",
@@ -816,12 +825,21 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// DET011 patterns matched only at a call-position boundary — the bare futures
+/// DET011 patterns matched only at a call-position boundary — the futures
 /// combinator functions. A preceding `.` (method call) or identifier char (a
 /// longer name that merely ends in the pattern text) excludes the match, so
-/// `q.select_all()` / `x.try_select(a, b)` are not flagged, mirroring the AST
-/// macro visitor's structural exclusion of method calls (#799 P2 review).
-const DET011_CALL_BOUNDARY_PATTERNS: &[&str] = &["select_all(", "select_ok(", "try_select("];
+/// `q.select_all()` / `x.try_select(a, b)` / `my_future::select(` are not
+/// flagged, mirroring the AST macro visitor's structural exclusion of method
+/// calls (#799 P2 review). `future::select(` here matches both the short form
+/// (`future::select(`, at a boundary) and the qualified form
+/// (`futures::future::select(`, where the substring is preceded by `:`, which
+/// is neither `.` nor an identifier byte).
+const DET011_CALL_BOUNDARY_PATTERNS: &[&str] = &[
+    "future::select(",
+    "select_all(",
+    "select_ok(",
+    "try_select(",
+];
 
 /// True if `pattern` occurs in `code` at a call-position boundary: the byte
 /// immediately preceding a match is neither `.` nor an identifier byte.

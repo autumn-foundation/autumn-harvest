@@ -1416,6 +1416,57 @@ fn det011_flags_qualified_future_select_combinator() {
 }
 
 #[test]
+fn det011_flags_short_form_future_select_combinator() {
+    // The `use futures::future; future::select(a, b)` short form must be flagged
+    // too, matching the AST macro visitor which recognizes `future::select`
+    // (#980 Codex P2). Exactly one DET011 finding is emitted for a qualified
+    // call even though the short-form pattern is a suffix of it — the engine
+    // emits at most one finding per rule per line.
+    let src = wf("let _ = future::select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET011")
+            .count(),
+        1,
+        "short-form `future::select(..)` must be flagged exactly once, got: {report:?}"
+    );
+
+    let qualified = wf("let _ = futures::future::select(a, b).await;");
+    let qreport = check_source(&qualified, "test.rs");
+    assert_eq!(
+        qreport
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET011")
+            .count(),
+        1,
+        "qualified `futures::future::select(..)` must be flagged exactly once (no double-count), got: {qreport:?}"
+    );
+}
+
+#[test]
+fn det011_does_not_flag_method_or_suffix_forms_of_future_select() {
+    // A `.select()` method call and a module whose name merely ends in `future`
+    // must NOT be flagged for the `future::select(` pattern — the call-position
+    // boundary guard excludes a preceding `.` or identifier char (#980 Codex P2).
+    for call in [
+        "let _ = x.select();",
+        "let _ = builder.select(cols);",
+        "let _ = my_future::select(a, b);",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "`{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
 fn det011_flags_bare_distinctive_combinators() {
     for call in ["select_all(v)", "select_ok(v)", "try_select(a, b)"] {
         let src = wf(&format!("let _ = {call}.await;"));
