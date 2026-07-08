@@ -95,6 +95,11 @@ pub enum NonDeterminismKind {
     /// so the old `version:…` marker was left unconsumed and was encountered
     /// by the next command at that cursor position.
     VersionMarkerMismatch,
+    /// A `patch:{id}` marker was left unconsumed — e.g. the `patched()` call
+    /// was removed or renamed before all marker-bearing executions drained
+    /// (issue #687's deploy-3 step taken too early) — and was encountered by
+    /// the next command at that cursor position.
+    PatchMarkerMismatch,
     /// The divergence could not be classified into a known category.
     Unknown,
 }
@@ -114,6 +119,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::ContinueAsNewMismatch => write!(f, "ContinueAsNewMismatch"),
             Self::EarlyCompletion => write!(f, "EarlyCompletion"),
             Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
+            Self::PatchMarkerMismatch => write!(f, "PatchMarkerMismatch"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -1308,13 +1314,23 @@ fn parse_nd_message(msg: &str) -> (NonDeterminismKind, String, String) {
 /// `actual` is the event type / name that was actually found at the cursor.
 /// If `actual` names a `version:…` marker the cause is a renamed version gate,
 /// which is always classified as [`NonDeterminismKind::VersionMarkerMismatch`]
-/// regardless of which command kind triggered the mismatch.
+/// regardless of which command kind triggered the mismatch. A `patch:…`
+/// marker is likewise always classified as
+/// [`NonDeterminismKind::PatchMarkerMismatch`] (issue #687).
 fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
     // A version marker found where another event was expected means the version
     // gate's change_id was renamed — classify specifically so error messages
     // point at the version gate rather than the command that first noticed it.
     if actual.starts_with("MarkerRecorded(version:") {
         return NonDeterminismKind::VersionMarkerMismatch;
+    }
+    // A patch marker found where another event was expected means the
+    // `patched()` call was removed/renamed before all marker-bearing
+    // executions drained (issue #687) — classify specifically so error
+    // messages point at the patch gate rather than the command that first
+    // noticed it.
+    if actual.starts_with("MarkerRecorded(patch:") {
+        return NonDeterminismKind::PatchMarkerMismatch;
     }
     match kind_str {
         "activity" => NonDeterminismKind::ActivityScheduleMismatch,
@@ -3378,6 +3394,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_nd_message_patch_marker_mismatch() {
+        // The activity matcher sees a stale patch marker (the patched() call
+        // was removed before all marker-bearing executions drained — issue #687).
+        let (kind, expected, actual) = parse_nd_message(
+            "activity mismatch: expected ActivityScheduled(step), got MarkerRecorded(patch:gate_old)",
+        );
+        assert_eq!(kind, NonDeterminismKind::PatchMarkerMismatch);
+        assert_eq!(expected, "ActivityScheduled(step)");
+        assert_eq!(actual, "MarkerRecorded(patch:gate_old)");
+    }
+
+    #[test]
     fn classify_kind_covers_all_prefixes() {
         assert_eq!(
             classify_kind("activity", "ActivityScheduled(other)"),
@@ -3427,6 +3455,11 @@ mod tests {
         assert_eq!(
             classify_kind("activity", "MarkerRecorded(version:gate_old)"),
             NonDeterminismKind::VersionMarkerMismatch
+        );
+        // Patch marker in actual likewise wins regardless of kind_str (issue #687)
+        assert_eq!(
+            classify_kind("timer", "MarkerRecorded(patch:gate_old)"),
+            NonDeterminismKind::PatchMarkerMismatch
         );
     }
 

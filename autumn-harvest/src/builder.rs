@@ -475,6 +475,32 @@ pub enum HarvestBuilderError {
         workflow: String,
     },
 
+    /// A workflow's `ThrottlePolicy` (issue #607) has a `burst` or
+    /// `refill_per_sec` that could never actually pace admissions.
+    ///
+    /// `ThrottlePolicy::from_rate_str` — the path the `#[workflow(throttle(...))]`
+    /// macro always uses — already rejects these values at parse time, but
+    /// `ThrottlePolicy`'s fields are `pub` so an application can also
+    /// construct one directly (a struct literal, or
+    /// `WorkflowInfo::with_throttle`) and bypass that validation entirely
+    /// (code review, issue #607). A `burst` below `1.0` (or non-finite) can
+    /// never successfully debit a token — the token debit path only admits a
+    /// start when the refilled bucket reaches `>= 1.0`, and refill is capped
+    /// at `burst` — so every start under that key would defer forever. A
+    /// non-finite or non-positive `refill_per_sec` either disables the
+    /// throttle (an infinite refill effectively fills the bucket instantly,
+    /// admitting everything) or freezes it once the initial burst is spent
+    /// (a zero/negative/NaN refill never restores a drained bucket).
+    /// Caught here, at build time, so every construction path is validated
+    /// exactly once regardless of how the policy was built.
+    #[error("workflow '{workflow}' has an invalid ThrottlePolicy: {reason}")]
+    InvalidWorkflowThrottlePolicy {
+        /// The workflow name.
+        workflow: String,
+        /// Which field was invalid and why.
+        reason: String,
+    },
+
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
@@ -864,6 +890,20 @@ impl HarvestBuilder {
     #[must_use]
     pub fn update_handlers(&self) -> &[UpdateHandlerInfo] {
         &self.update_handlers
+    }
+
+    /// The configured payload-codec registry.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::payload_codecs`] (issue #608):
+    /// lets the plugin mirror the registry onto its API state at `build()`
+    /// time — alongside the `decode_payloads_on_read` opt-in flag — instead
+    /// of waiting for the runtime startup hook, so there is no boot window
+    /// where a decode-eligible request sees a default identity-only registry.
+    /// `try_build` clones this registry verbatim, so the pre-build and
+    /// post-build views are identical.
+    #[must_use]
+    pub const fn payload_codecs(&self) -> &PayloadCodecs {
+        &self.payload_codecs
     }
 
     /// Registered declarative query handlers, in registration order.
@@ -1381,6 +1421,7 @@ impl HarvestBuilder {
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
+        validate_workflow_throttle_policies(&self.workflows)?;
         validate_dag_workflow_name_collisions(
             &self.workflows,
             &self.auto_registered_dag_workflows,
@@ -1812,6 +1853,52 @@ fn validate_workflow_concurrency_limits(
         if wf.concurrency.is_some_and(|p| p.limit == 0) {
             return Err(HarvestBuilderError::ZeroWorkflowConcurrencyLimit {
                 workflow: wf.name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject workflows whose `ThrottlePolicy` (issue #607) has a `burst` or
+/// `refill_per_sec` that could never actually pace admissions.
+///
+/// `ThrottlePolicy::from_rate_str` (the only path `#[workflow(throttle(...))]`
+/// uses) already enforces these same rules at parse time, but the struct's
+/// fields are `pub`, so a direct construction (a struct literal, or
+/// `WorkflowInfo::with_throttle`) bypasses that check entirely (code review).
+/// Validated once here, at build time, regardless of how the policy was
+/// built — mirrors `validate_workflow_concurrency_limits`'s precedent for
+/// catching a similarly "silently permanently broken" policy shape.
+fn validate_workflow_throttle_policies(
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    for wf in workflows {
+        let Some(policy) = wf.throttle else {
+            continue;
+        };
+        if !policy.burst.is_finite() {
+            return Err(HarvestBuilderError::InvalidWorkflowThrottlePolicy {
+                workflow: wf.name.to_string(),
+                reason: format!("burst must be a finite number, got {}", policy.burst),
+            });
+        }
+        if policy.burst < 1.0 {
+            return Err(HarvestBuilderError::InvalidWorkflowThrottlePolicy {
+                workflow: wf.name.to_string(),
+                reason: format!(
+                    "burst must be >= 1.0 (a bucket capacity below one token \
+                     can never successfully debit), got {}",
+                    policy.burst
+                ),
+            });
+        }
+        if !policy.refill_per_sec.is_finite() || policy.refill_per_sec <= 0.0 {
+            return Err(HarvestBuilderError::InvalidWorkflowThrottlePolicy {
+                workflow: wf.name.to_string(),
+                reason: format!(
+                    "refill_per_sec must be a finite number > 0, got {}",
+                    policy.refill_per_sec
+                ),
             });
         }
     }
@@ -2445,6 +2532,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2956,6 +3044,7 @@ mod tests {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -2979,6 +3068,115 @@ mod tests {
         assert!(err.to_string().contains("report_wf"));
     }
 
+    /// Minimal `WorkflowInfo` carrying `throttle` and nothing else non-default,
+    /// for the `validate_workflow_throttle_policies` tests below.
+    fn throttled_wf_info(throttle: crate::throttle::ThrottlePolicy) -> WorkflowInfo {
+        WorkflowInfo {
+            mcp: false,
+            name: "report_wf",
+            module: "test",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: Some(throttle),
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn builder_rejects_directly_constructed_throttle_policy_with_burst_below_one() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 1.0,
+                burst: 0.5,
+                key_expr: None,
+                schedule_to_start: None,
+            })])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowThrottlePolicy { ref workflow, .. }
+                    if workflow == "report_wf"
+            ),
+            "expected InvalidWorkflowThrottlePolicy, got: {err}"
+        );
+        assert!(err.to_string().contains("burst"));
+    }
+
+    #[test]
+    fn builder_rejects_directly_constructed_throttle_policy_with_infinite_burst() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 1.0,
+                burst: f64::INFINITY,
+                key_expr: None,
+                schedule_to_start: None,
+            })])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowThrottlePolicy { ref workflow, .. }
+                    if workflow == "report_wf"
+            ),
+            "expected InvalidWorkflowThrottlePolicy, got: {err}"
+        );
+        assert!(err.to_string().contains("finite"));
+    }
+
+    #[test]
+    fn builder_rejects_directly_constructed_throttle_policy_with_nonpositive_refill() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 0.0,
+                burst: 5.0,
+                key_expr: None,
+                schedule_to_start: None,
+            })])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowThrottlePolicy { ref workflow, .. }
+                    if workflow == "report_wf"
+            ),
+            "expected InvalidWorkflowThrottlePolicy, got: {err}"
+        );
+        assert!(err.to_string().contains("refill_per_sec"));
+    }
+
+    #[test]
+    fn builder_accepts_a_valid_directly_constructed_throttle_policy() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 1.667,
+                burst: 20.0,
+                key_expr: Some("input.tenant_id"),
+                schedule_to_start: None,
+            })])
+            .try_build();
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
     #[test]
     fn builder_accepts_workflow_with_nonzero_concurrency_limit() {
         use crate::concurrency::ConcurrencyPolicy;
@@ -2997,6 +3195,7 @@ mod tests {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,

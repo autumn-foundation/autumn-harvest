@@ -1,0 +1,7 @@
+error: throttle rate '0.5/s' has a per-period count below 1.0; pass an explicit burst >= 1.0 to use a sub-unit rate
+ --> tests/compile_fail/throttle_subunit_rate_no_burst.rs:7:1
+  |
+7 | #[workflow(throttle(rate = "0.5/s"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `workflow` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -625,6 +625,62 @@ pub async fn load_history_with_codecs(
     })
 }
 
+/// Load history **without** applying any payload-codec transform (issue #608).
+///
+/// Each row's `event_data` is deserialized directly into [`WorkflowEvent`],
+/// so codec envelopes (`_harvest_codec_envelope`) written by a non-identity
+/// codec ride along verbatim as opaque [`serde_json::Value`]s inside the
+/// event's payload fields. This is the loader for operator **read surfaces**
+/// that apply their own payload policy downstream — history-export redaction
+/// replaces payload fields wholesale (envelope included), and the issue-#608
+/// read-path decoder tolerantly decodes (or marks) each envelope per-field —
+/// so the strict identity-only [`load_history`] path (which hard-errors
+/// `UnknownPayloadCodec` on the first foreign envelope) must not pre-empt
+/// them.
+///
+/// On an identity-codec deployment no envelopes are ever stored (the identity
+/// default encodes payloads as plain JSON), so this returns byte-identical
+/// events to [`load_history`].
+///
+/// **Never use this for replay or any engine execution path** — replay must
+/// see decoded plaintext and uses the codec-aware loaders
+/// ([`load_history_inflated`] / [`load_history_with_codecs`]).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on connection or query
+/// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
+/// value can't be deserialized into [`WorkflowEvent`].
+pub async fn load_history_undecoded(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::from_value::<WorkflowEvent>(row.event_data)
+                .map_err(crate::error::HarvestError::from)
+        })
+        .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
 /// Load history, inflating any offloaded payload fields from the configured
 /// [`PayloadOffloader`](crate::payload_store::PayloadOffloader) (issue #524).
 ///

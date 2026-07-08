@@ -239,6 +239,7 @@ fn make_registry_for(
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

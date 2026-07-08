@@ -650,6 +650,27 @@ impl HandlerRegistry {
                 per.max(self.max_activity_result_bytes)
             })
     }
+
+    /// Effective input-payload byte cap for the named activity (issue #252).
+    ///
+    /// Returns the per-activity `max_input_bytes` override raised against the
+    /// global `max_activity_input_bytes` ceiling (`override.max(global)`),
+    /// mirroring [`Self::activity_result_cap`]. Unknown activities fall back
+    /// to the global cap. Read-only.
+    ///
+    /// Used by the management stack endpoint (issue #608) so a decoded
+    /// pending-activity input is judged against the same effective cap the
+    /// activity's input was admitted under, rather than the global default
+    /// only.
+    #[must_use]
+    pub fn activity_input_cap(&self, name: &str) -> u64 {
+        self.activities
+            .get(name)
+            .and_then(|a| a.max_input_bytes)
+            .map_or(self.max_activity_input_bytes, |per| {
+                per.max(self.max_activity_input_bytes)
+            })
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -12753,6 +12774,7 @@ mod tests {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -12906,6 +12928,52 @@ mod tests {
         assert_eq!(registry.activity_result_cap("tiny"), global);
         // Unknown activity -> global cap.
         assert_eq!(registry.activity_result_cap("nonexistent"), global);
+    }
+
+    #[test]
+    fn activity_input_cap_resolves_per_activity_override() {
+        fn act(name: &'static str, max_input_bytes: Option<u64>) -> ActivityInfo {
+            ActivityInfo {
+                name,
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: None,
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_schedule_to_close: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
+                max_input_bytes,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                requires: None,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }
+        }
+
+        let global = crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES;
+        let registry = HandlerRegistry::new(
+            vec![],
+            vec![
+                act("plain", None),
+                act("big", Some(global * 4)),
+                act("tiny", Some(1024)),
+            ],
+        );
+
+        // No override -> global cap.
+        assert_eq!(registry.activity_input_cap("plain"), global);
+        // Higher override -> raised cap (full input visibility, #608).
+        assert_eq!(registry.activity_input_cap("big"), global * 4);
+        // Lower override -> never lowers below the global ceiling.
+        assert_eq!(registry.activity_input_cap("tiny"), global);
+        // Unknown activity -> global cap.
+        assert_eq!(registry.activity_input_cap("nonexistent"), global);
     }
 
     #[test]

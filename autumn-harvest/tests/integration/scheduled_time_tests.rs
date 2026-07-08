@@ -194,6 +194,7 @@ fn make_registry(wf_name: &'static str) -> Arc<HandlerRegistry> {
             concurrency: None,
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

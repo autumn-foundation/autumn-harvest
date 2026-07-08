@@ -632,6 +632,7 @@ fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
 
         owner: None,

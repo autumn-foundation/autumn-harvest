@@ -145,6 +145,8 @@ pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+/// Workflow-start throttle — pace admissions, defer the excess (issue #607).
+pub mod throttle;
 pub mod types;
 pub mod update;
 /// Read-only per-tenant/per-workflow usage aggregation (issue #596).
@@ -287,7 +289,11 @@ pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
     UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
 };
-pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
+pub use payload_codec::{
+    CodecError, IdentityCodec, LossyDecodeOutcome, PayloadCodec, PayloadCodecs,
+    UNDECODABLE_MARKER_KEY, UNDECODABLE_REASON_CODEC_ERROR, UNDECODABLE_REASON_INVALID_BASE64,
+    UNDECODABLE_REASON_INVALID_JSON, UNDECODABLE_REASON_UNKNOWN_CODEC, undecodable_marker,
+};
 pub use payload_store::{
     OffloadedRef, PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
 };
@@ -298,7 +304,7 @@ pub use policy::{
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
-pub use replay::{HistoryMatch, HistoryMatcher, SignalOrTimerMatch};
+pub use replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch, SignalOrTimerMatch};
 #[cfg(feature = "db")]
 pub use reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,

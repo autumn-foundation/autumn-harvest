@@ -1996,6 +1996,9 @@ pub async fn enforce_timeouts_once(
         crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
             .await?;
     count +=
+        crate::throttle::fire_due_throttled_starts(conn, sharded_pool, shard_assignments, metrics)
+            .await?;
+    count +=
         crate::event_batch::fire_due_event_batches(conn, sharded_pool, shard_assignments, metrics)
             .await?;
     count += crate::completion_callback::fire_due_completion_deliveries(

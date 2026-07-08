@@ -277,6 +277,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -381,6 +382,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,

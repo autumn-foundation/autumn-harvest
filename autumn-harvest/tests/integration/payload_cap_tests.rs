@@ -56,6 +56,7 @@ fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -241,6 +242,7 @@ fn workflow_info_has_max_input_bytes_field() {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
 
         owner: None,
@@ -265,6 +267,7 @@ fn workflow_info_has_max_input_bytes_field() {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: Some(8 * 1024 * 1024),
 
         owner: None,

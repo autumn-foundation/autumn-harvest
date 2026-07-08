@@ -436,6 +436,7 @@ pub mod flows {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -494,6 +495,7 @@ pub mod relative_test_self {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     owner: None,
                     runbook_url: None,
@@ -540,6 +542,7 @@ pub mod relative_test_super {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     owner: None,
                     runbook_url: None,
@@ -590,6 +593,7 @@ pub mod relative_test_plain {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     owner: None,
                     runbook_url: None,

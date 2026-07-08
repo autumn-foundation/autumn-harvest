@@ -3556,6 +3556,25 @@
     },
     {
       "method": "GET",
+      "path": "/admin/start-throttle",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the per-(workflow_name, throttle_key) deferred-start backlog across all shards (issue #607). Each group represents starts that were paced by a start throttle and durably deferred because the per-key token bucket was empty; they are admitted later by the throttle scanner as tokens refill. Fields: workflow_name, throttle_key (\"\" for an unkeyed/global-per-workflow throttle), deferred_count, oldest_deferred_at, shard_id. Sorted by deferred_count descending. Lets an operator confirm a throttle is active and watch the backlog drain.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/batches/pending",
       "category": "workflow",
       "read_only": true,
