@@ -1734,28 +1734,35 @@ impl WorkflowContext {
         // Extract start_time, carryover, and scheduled slot from WorkflowStarted (first event).
         let (start_time, last_completion_result, last_error, scheduled_time) = events
             .first()
-            .and_then(|e| match e {
-                WorkflowEvent::WorkflowStarted {
+            .and_then(|e| {
+                if let WorkflowEvent::WorkflowStarted {
                     timestamp,
                     last_completion_result,
                     last_error,
                     scheduled_time,
                     ..
-                } => Some((
-                    *timestamp,
-                    last_completion_result.clone(),
-                    last_error.clone(),
-                    *scheduled_time,
-                )),
-                _ => None,
+                } = e
+                {
+                    Some((
+                        *timestamp,
+                        last_completion_result.clone(),
+                        last_error.clone(),
+                        *scheduled_time,
+                    ))
+                } else {
+                    None
+                }
             })
             .unwrap_or_else(|| (Utc::now(), None, None, None));
 
         // Capture any terminal cancellation event so workflow code can detect
         // it via `is_cancelled()` / `check_cancellation()` during replay.
-        let cancellation_reason = events.iter().find_map(|e| match e {
-            WorkflowEvent::WorkflowCancelled { reason } => Some(reason.clone()),
-            _ => None,
+        let cancellation_reason = events.iter().find_map(|e| {
+            if let WorkflowEvent::WorkflowCancelled { reason } = e {
+                Some(reason.clone())
+            } else {
+                None
+            }
         });
 
         let mut matcher = HistoryMatcher::new(events);
