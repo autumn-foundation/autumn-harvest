@@ -1599,6 +1599,32 @@ fn workflow_retry_activity_maps_to_post_retry_now_route() {
     assert_eq!(request.body, None, "retry-activity sends no body");
 }
 
+#[test]
+fn workflow_fail_activity_maps_to_post_fail_now_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "fail-activity",
+        "exec-123",
+        "act-456",
+        "--reason",
+        "hung in flight",
+    ])
+    .expect("fail-activity args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("fail-activity request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/exec-123/activities/act-456/fail-now"
+    );
+    let body = request.body.expect("fail-activity sends a body");
+    assert_eq!(body["reason"], "hung in flight");
+}
+
 // ── pause / resume subcommands (issue #609) ───────────────────────────────────
 
 #[test]

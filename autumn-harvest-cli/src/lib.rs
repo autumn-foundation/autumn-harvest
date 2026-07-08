@@ -891,6 +891,23 @@ enum WorkflowCommand {
         /// Activity execution ID (the id surfaced by `workflow stack`).
         activity_exec_id: String,
     },
+    /// Force-fail a hung in-flight (RUNNING) activity, skipping all remaining
+    /// retries.
+    ///
+    /// The owning workflow observes the distinct `OperatorForceFailed` error
+    /// type and advances to its own failure/compensation path — it is NOT
+    /// terminated. Re-issuing the command on an already-forced activity is an
+    /// idempotent no-op success.
+    FailActivity {
+        /// Workflow execution ID.
+        workflow_id: String,
+        /// Activity execution ID (the id surfaced by `workflow stack`).
+        activity_exec_id: String,
+        /// Human-readable reason recorded in the forced failure (e.g. an
+        /// incident id).
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Fork a workflow execution at an event boundary.
     Reset {
         /// Workflow execution ID.
@@ -3789,6 +3806,22 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             ),
             None,
         )),
+        WorkflowCommand::FailActivity {
+            workflow_id,
+            activity_exec_id,
+            reason,
+        } => {
+            let mut body = Map::new();
+            insert_string(&mut body, "reason", reason.as_deref());
+            Ok(ApiRequest::post(
+                format!(
+                    "/workflows/{}/activities/{}/fail-now",
+                    path_segment(workflow_id),
+                    path_segment(activity_exec_id)
+                ),
+                Some(Value::Object(body)),
+            ))
+        }
         WorkflowCommand::Reset {
             execution_id,
             reset_to_event_id,
@@ -6671,6 +6704,49 @@ mod retry_activity_cli_tests {
         assert!(
             req.body.is_none(),
             "retry-activity must send no request body"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fail_activity_cli_tests {
+    use super::*;
+
+    fn request(args: &[&str]) -> ApiRequest {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn fail_activity_builds_post_request_with_correct_path() {
+        let req = request(&["workflow", "fail-activity", "exec-123", "act-456"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/exec-123/activities/act-456/fail-now");
+    }
+
+    #[test]
+    fn fail_activity_with_reason_sends_reason_body() {
+        let req = request(&[
+            "workflow",
+            "fail-activity",
+            "exec-123",
+            "act-456",
+            "--reason",
+            "hung on dead downstream, INC-42",
+        ]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["reason"], "hung on dead downstream, INC-42");
+    }
+
+    #[test]
+    fn fail_activity_without_reason_sends_no_reason_field() {
+        let req = request(&["workflow", "fail-activity", "exec-123", "act-456"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert!(
+            body.get("reason").is_none() || body["reason"].is_null(),
+            "omitting --reason must not send the field"
         );
     }
 }
