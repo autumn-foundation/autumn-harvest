@@ -1533,6 +1533,110 @@ async fn oversized_key_still_rejected_for_a_genuinely_fresh_admission() {
     assert!(err.to_string().contains("exceeds maximum"), "{err}");
 }
 
+/// Code-review fix (issue #607): a pending row already past its
+/// `schedule_to_start` deadline must not be treated as an idempotent
+/// already-pending admission, even if the scanner hasn't dropped it yet
+/// (e.g. a delayed tick, or the retry racing the timeout sweep). Without the
+/// fix, a retry for the same `workflow_id` would silently return the stale
+/// row's `Deferred` outcome; the scanner then times out and deletes that row
+/// without ever starting a workflow, so the caller's accepted retry never
+/// actually runs.
+#[tokio::test]
+async fn expired_pending_row_is_not_returned_by_idempotent_retry_lookup() {
+    use diesel_async::RunQueryDsl;
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key = "acme";
+    let wf_id = "slow-retry-job";
+
+    // Seed drains the sole burst token so the real admission below defers.
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            "seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed");
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            Some(Duration::from_secs(300)),
+            None,
+        ),
+    )
+    .await
+    .expect("defers");
+    let ThrottleAdmission::Deferred(first) = admit else {
+        panic!("expected Deferred, got {admit:?}");
+    };
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+
+    // Force the deadline into the past, simulating the scanner not yet
+    // having swept the row (a delayed tick, or the retry racing the timeout
+    // sweep).
+    diesel::sql_query(
+        "UPDATE harvest_start_throttle SET expires_at = NOW() - INTERVAL '1 hour' WHERE workflow_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf_id)
+    .execute(&mut conn)
+    .await
+    .expect("expire");
+
+    // skip_size_check must not treat the expired row as "already pending".
+    assert!(
+        !autumn_harvest::throttle::skip_size_check(&mut conn, wf, wf_id, None)
+            .await
+            .expect("skip_size_check"),
+        "an expired pending row must not count as an already-pending admission"
+    );
+
+    // A retry must not silently bind to the doomed row -- it must create a
+    // genuinely fresh admission (a second row), not report the stale row's
+    // outcome.
+    let retry = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            Some(Duration::from_secs(300)),
+            None,
+        ),
+    )
+    .await
+    .expect("retry defers fresh");
+    let ThrottleAdmission::Deferred(retry_outcome) = retry else {
+        panic!("expected Deferred, got {retry:?}");
+    };
+    assert_ne!(
+        retry_outcome.deferred_at, first.deferred_at,
+        "the retry must not return the stale expired row's outcome"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, key).await,
+        2,
+        "a fresh row must be inserted alongside the still-present expired one"
+    );
+}
+
 // ── Scheduler-tick oversized-input cap check (issue #607 code review) ───────
 
 fn noop_scheduler_handler<'a>(

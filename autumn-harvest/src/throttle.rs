@@ -444,6 +444,13 @@ async fn pending_backlog_exists(
 /// *same* pending row instead of silently queuing a second, independent one
 /// that a later `reject_duplicate` fire would drop with no signal back to the
 /// original (retried) caller.
+///
+/// A row already past its `schedule_to_start` deadline is never returned,
+/// even if the scanner hasn't dropped it yet (code review, issue #607) --
+/// otherwise a retry would land on a row the scanner is about to time out
+/// and delete without ever starting a workflow, reporting `Deferred` for a
+/// start that will never actually run. Ignoring it here lets the retry
+/// proceed to a genuinely fresh admission instead.
 #[cfg(feature = "db")]
 async fn existing_pending_throttle_for_workflow_id(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -459,9 +466,15 @@ async fn existing_pending_throttle_for_workflow_id(
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
         deferred_at: DateTime<Utc>,
     }
+    // Exclude a row already past its schedule_to_start deadline even if the
+    // scanner hasn't deleted it yet (code review, issue #607): otherwise a
+    // retry lands on a row the scanner is about to drop without ever
+    // starting a workflow, silently reporting `Deferred` for a start that
+    // will never run.
     let row: Option<Row> = diesel::sql_query(
         "SELECT throttle_key, deferred_at FROM harvest_start_throttle \
          WHERE workflow_name = $1 AND workflow_id = $2 \
+           AND (expires_at IS NULL OR expires_at >= NOW()) \
          ORDER BY deferred_at ASC LIMIT 1",
     )
     .bind::<diesel::sql_types::Text, _>(workflow_name)
