@@ -16930,12 +16930,6 @@ async fn rollback_manual_trigger_budget(
     .await;
 }
 
-/// Pure decision: has an incremented `runs_started` reached a finite `max_runs`
-/// budget? Unlimited (`None`) or non-positive `max_runs` never exhausts. (#688)
-fn backfill_budget_reached(new_runs_started: i32, max_runs: Option<i32>) -> bool {
-    max_runs.is_some_and(|max| max > 0 && new_runs_started >= max)
-}
-
 /// Build the atomic reservation UPDATE statement for a backfill dispatch
 /// (issue #688). A macro rather than a function because diesel's
 /// `UpdateStatement` return type (with `.set(..).returning(..)`) is not cleanly
@@ -16946,8 +16940,8 @@ fn backfill_budget_reached(new_runs_started: i32, max_runs: Option<i32>) -> bool
 /// `runs_started`, guards on `exhausted_at IS NULL` and the `max_runs` budget,
 /// and RETURNs the post-increment `runs_started`. A non-positive `max_runs`
 /// (`max_runs <= 0`) is treated as UNLIMITED here — matching
-/// `backfill_budget_reached`, the up-front exhaustion check, and the dry-run
-/// projection — so a row with `max_runs = 0` never wrongly reserves 0 rows.
+/// `transition_backfill_exhausted_stmt!`, the up-front exhaustion check, and the
+/// dry-run projection — so a row with `max_runs = 0` never wrongly reserves 0 rows.
 macro_rules! reserve_backfill_budget_slot_stmt {
     ($schedule_id:expr, $at:expr) => {{
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
@@ -17132,43 +17126,61 @@ async fn release_backfill_budget_slot(
     }
 }
 
+/// Build the "transition a backfill schedule to exhausted" UPDATE (issue #688,
+/// Codex F6). A macro (like `reserve_backfill_budget_slot_stmt!` /
+/// `clear_stale_max_runs_exhaustion_stmt!` / `rearm_backfill_next_run_stmt!`) so
+/// the live path (`transition_backfill_exhausted_if_reached`) and the no-DB shape
+/// test share one source of truth. The WHERE clause reads `max_runs`/`runs_started`
+/// FROM THE ROW ITSELF (`max_runs IS NOT NULL AND max_runs > 0 AND runs_started >=
+/// max_runs`) rather than a request-start snapshot, so it always matches the same
+/// live row the reservation UPDATE already evaluated. That makes exhaustion
+/// race-safe against a concurrent `PATCH /admin/schedules/{id}` (issue #771) that
+/// changes `max_runs` between the reservation and this call: a raised/removed cap
+/// no longer wrongly exhausts, and a lowered cap correctly exhausts an at-cap row.
+/// `max_runs <= 0`/NULL are UNLIMITED (never exhaust), matching the reservation
+/// guard. Guarded on `exhausted_at IS NULL` (no double-exhaust race with the tick);
+/// `next_run_at` is deliberately NOT touched (backfill dispatches historical slots
+/// and does not own the forward-cadence pointer — that is the scheduler tick's job;
+/// the `exhausted_at IS NULL` due-list filter already excludes an exhausted row, and
+/// nulling it would strand the schedule off the due-list if the exhaustion is later
+/// cleared by `release_backfill_budget_slot` dropping below cap).
+macro_rules! transition_backfill_exhausted_stmt {
+    ($schedule_id:expr, $at:expr) => {{
+        use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+        diesel::update(
+            sdsl::harvest_schedules
+                .find($schedule_id)
+                .filter(sdsl::exhausted_at.is_null())
+                .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "max_runs IS NOT NULL AND max_runs > 0 AND runs_started >= max_runs",
+                )),
+        )
+        .set((
+            sdsl::exhausted_at.eq(Some($at)),
+            sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+            sdsl::updated_at.eq($at),
+        ))
+    }};
+}
+
 /// After a successful `reserve_backfill_budget_slot`, transition the schedule to
-/// exhausted if the reserved slot reached `max_runs`. Guarded on `exhausted_at
-/// IS NULL` to avoid a double-exhaust race with the tick. Deliberately does NOT
-/// touch `next_run_at`: backfill dispatches historical slots and does not own
-/// the forward-cadence pointer (that is the scheduler tick's job), the
-/// `exhausted_at IS NULL` due-list filter already excludes an exhausted row, and
-/// nulling it would strand the schedule off the due-list if the exhaustion is
-/// later cleared (e.g. by `release_backfill_budget_slot` dropping below cap).
-/// This restores the original pre-#688 post-loop batch-increment behavior, which
-/// set only `runs_started`/`exhausted_at`/`exhausted_reason`. Best-effort (error
-/// logged). (#688)
+/// exhausted iff the LIVE row is at/over its LIVE `max_runs` cap (issue #688,
+/// Codex F6). Evaluating `max_runs` and `runs_started` from the row inside the
+/// UPDATE — rather than a request-start snapshot — makes this race-safe against a
+/// concurrent `PATCH /admin/schedules/{id}` (issue #771) that changes `max_runs`
+/// between the reservation and this call; the reservation UPDATE already used live
+/// row values, so both budget decisions are now snapshot-free. Best-effort but
+/// visible: a failed transition is self-healing (the next tick/backfill re-detects
+/// `runs_started >= max_runs`), yet the failure should be diagnosable rather than
+/// silent (issue #688).
 async fn transition_backfill_exhausted_if_reached(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
-    new_runs_started: i32,
-    max_runs: Option<i32>,
     at: chrono::DateTime<chrono::Utc>,
 ) {
-    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
-    if !backfill_budget_reached(new_runs_started, max_runs) {
-        return;
-    }
-    // Best-effort but visible: a failed transition is self-healing (the next
-    // tick/backfill re-detects `runs_started >= max_runs`), yet the failure
-    // should be diagnosable rather than silent (issue #688).
-    if let Err(e) = diesel::update(
-        sdsl::harvest_schedules
-            .find(schedule_id)
-            .filter(sdsl::exhausted_at.is_null()),
-    )
-    .set((
-        sdsl::exhausted_at.eq(Some(at)),
-        sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-        sdsl::updated_at.eq(at),
-    ))
-    .execute(sched_conn)
-    .await
+    if let Err(e) = transition_backfill_exhausted_stmt!(schedule_id, at)
+        .execute(sched_conn)
+        .await
     {
         tracing::warn!(
             schedule_id = %schedule_id,
@@ -17868,12 +17880,15 @@ async fn schedule_backfill(
                 // intra-backfill case is a no-op and this only fires after the clear
                 // un-exhausted a `max_runs_exhausted` row.
                 let rearm_next = schedule.next_run_at;
-                let reserved_runs_started = {
+                // The reserved `runs_started` value is intentionally unused: the
+                // exhaustion transition below re-evaluates the LIVE row (issue #688,
+                // Codex F6), so no request-start snapshot is threaded through.
+                {
                     // same_pool → reuse the per-slot exec `conn`; else the separate
                     // schedule connection. `conn` is not otherwise borrowed here.
                     let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
                     match reserve_backfill_budget_slot(budget_conn, schedule_id, now).await {
-                        Ok(Some(v)) => v,
+                        Ok(Some(_)) => {}
                         Ok(None) => {
                             budget_hit = true;
                             skipped += 1;
@@ -17891,7 +17906,7 @@ async fn schedule_backfill(
                             continue;
                         }
                     }
-                };
+                }
 
                 // Start-throttle admission (issue #607): pace backfill admissions,
                 // defer the excess rather than admitting an entire backfill window
@@ -18019,8 +18034,6 @@ async fn schedule_backfill(
                                 transition_backfill_exhausted_if_reached(
                                     budget_conn,
                                     schedule_id,
-                                    reserved_runs_started,
-                                    schedule.max_runs,
                                     now,
                                 )
                                 .await;
@@ -18140,14 +18153,8 @@ async fn schedule_backfill(
                         dispatched += 1;
                         dispatched_this_call += 1;
                         let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
-                        transition_backfill_exhausted_if_reached(
-                            budget_conn,
-                            schedule_id,
-                            reserved_runs_started,
-                            schedule.max_runs,
-                            now,
-                        )
-                        .await;
+                        transition_backfill_exhausted_if_reached(budget_conn, schedule_id, now)
+                            .await;
                     }
                     Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
                         // AC-a: an id-reuse short-circuit consumed no admission —
@@ -18359,12 +18366,15 @@ async fn schedule_backfill(
                 // intra-backfill case is a no-op and this only fires after the clear
                 // un-exhausted a `max_runs_exhausted` row.
                 let rearm_next = schedule.next_run_at;
-                let reserved_runs_started = {
+                // The reserved `runs_started` value is intentionally unused: the
+                // exhaustion transition below re-evaluates the LIVE row (issue #688,
+                // Codex F6), so no request-start snapshot is threaded through.
+                {
                     // same_pool → reuse the per-slot exec `conn`; else the separate
                     // schedule connection. `conn` is not otherwise borrowed here.
                     let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
                     match reserve_backfill_budget_slot(budget_conn, schedule_id, now).await {
-                        Ok(Some(v)) => v,
+                        Ok(Some(_)) => {}
                         Ok(None) => {
                             budget_hit = true;
                             skipped += 1;
@@ -18382,7 +18392,7 @@ async fn schedule_backfill(
                             continue;
                         }
                     }
-                };
+                }
 
                 let start_result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
@@ -18436,14 +18446,8 @@ async fn schedule_backfill(
                         dispatched += 1;
                         dispatched_this_call += 1;
                         let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
-                        transition_backfill_exhausted_if_reached(
-                            budget_conn,
-                            schedule_id,
-                            reserved_runs_started,
-                            schedule.max_runs,
-                            now,
-                        )
-                        .await;
+                        transition_backfill_exhausted_if_reached(budget_conn, schedule_id, now)
+                            .await;
                     }
                     Ok(_) => {
                         // RejectDuplicate → already exists; release the reserved slot (#688).
@@ -28677,21 +28681,33 @@ mod tests {
     // ── Backfill atomic-reservation budget decision (issue #688) ──────────────
 
     #[test]
-    fn backfill_budget_reached_truth_table() {
-        // Unlimited (None) never exhausts.
-        assert!(!backfill_budget_reached(0, None));
-        // Non-positive max_runs never exhausts.
-        assert!(!backfill_budget_reached(5, Some(0)));
-        assert!(!backfill_budget_reached(0, Some(0)));
-        // Under budget.
-        assert!(!backfill_budget_reached(4, Some(5)));
-        // At budget.
-        assert!(backfill_budget_reached(5, Some(5)));
-        // Boundary: max_runs = 1 (ties the pure fn to the money-test scenario —
-        // a single reserved slot must immediately exhaust the schedule).
-        assert!(backfill_budget_reached(1, Some(1)));
-        // Over budget (defensive: a reserved slot reaching or passing the cap).
-        assert!(backfill_budget_reached(6, Some(5)));
+    fn transition_backfill_exhausted_generates_the_live_row_guarded_update() {
+        // Shape-check the exhaustion transition UPDATE without a DB (issue #688,
+        // Codex F6): it must evaluate max_runs/runs_started FROM THE ROW (not a
+        // request-start snapshot), guarding on
+        // `max_runs IS NOT NULL AND max_runs > 0 AND runs_started >= max_runs`
+        // plus exhausted_at IS NULL, and set exhausted_at/exhausted_reason. Built
+        // via the SAME macro the live `transition_backfill_exhausted_if_reached`
+        // executes, so editing the guard or the SET clause there breaks this test.
+        let at = chrono::Utc::now();
+        let stmt = transition_backfill_exhausted_stmt!(uuid::Uuid::nil(), at);
+        let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
+        assert!(
+            sql.contains("max_runs IS NOT NULL AND max_runs > 0 AND runs_started >= max_runs"),
+            "must evaluate the live-row at-cap predicate, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#""harvest_schedules"."exhausted_at" IS NULL"#),
+            "must guard on exhausted_at IS NULL (no double-exhaust), got: {sql}"
+        );
+        assert!(
+            sql.contains(r#"SET "exhausted_at" = $"#),
+            "must set exhausted_at, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#""exhausted_reason" = $"#),
+            "must set exhausted_reason, got: {sql}"
+        );
     }
 
     #[test]
