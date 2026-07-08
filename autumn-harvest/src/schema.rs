@@ -521,6 +521,8 @@ diesel::table! {
         is_static -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        /// Optional output guard AST (issue #810). NULL = unconditional.
+        condition -> Nullable<Jsonb>,
     }
 }
 
@@ -531,6 +533,9 @@ diesel::table! {
         source_exec_id -> Uuid,
         trigger_id -> Uuid,
         fired_at -> Timestamptz,
+        /// NULL = fired; `condition_unmet` / `condition_invalid` =
+        /// resolved-skipped by the output guard (issue #810).
+        outcome -> Nullable<Text>,
     }
 }
 

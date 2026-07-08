@@ -557,6 +557,19 @@ pub enum HarvestBuilderError {
         registered: Vec<String>,
     },
 
+    /// A completion trigger carries an output guard that fails
+    /// [`crate::completion_trigger::TriggerCondition::validate`] — over the
+    /// boundedness caps or with a malformed dotted path (issue #810). Never
+    /// silently dropped: registration fails fast.
+    #[non_exhaustive]
+    #[error("completion_trigger '{trigger_id}' has an invalid condition: {message}")]
+    InvalidCompletionTriggerCondition {
+        /// The offending trigger's id.
+        trigger_id: uuid::Uuid,
+        /// The first validation violation found.
+        message: String,
+    },
+
     /// `max_workflow_history_events` is set but is not strictly greater than
     /// the configured soft `continue_as_new_threshold`.
     ///
@@ -1611,6 +1624,17 @@ fn validate_completion_triggers(
                 workflow_name: trigger.target_workflow_name.clone(),
                 role: "target",
                 registered,
+            });
+        }
+        // Output-guard boundedness validation (issue #810): reject an
+        // over-cap or malformed-path condition at build time so it can never
+        // reach the terminal-commit path.
+        if let Some(ref condition) = trigger.condition
+            && let Err(message) = condition.validate()
+        {
+            return Err(HarvestBuilderError::InvalidCompletionTriggerCondition {
+                trigger_id: trigger.id,
+                message,
             });
         }
     }
@@ -3712,6 +3736,67 @@ mod tests {
                 }) if workflow_name == "unknown_target" && role == "target"
             ),
             "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_invalid_trigger_condition() {
+        use crate::completion_trigger::{CompletionTrigger, TriggerCondition};
+
+        // A structurally valid condition passes try_build.
+        let ok_trigger =
+            CompletionTrigger::new("test", "test").with_condition(TriggerCondition::Eq {
+                path: "region".into(),
+                value: serde_json::json!("EU"),
+            });
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_trigger(ok_trigger)
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "Expected builder success with a valid condition, got: {result:?}"
+        );
+
+        // A condition over the boundedness caps fails try_build (issue #810).
+        let mut over_deep = TriggerCondition::Exists { path: "a".into() };
+        for _ in 0..crate::completion_trigger::MAX_CONDITION_DEPTH {
+            over_deep = TriggerCondition::All(vec![over_deep]);
+        }
+        let trigger_id = uuid::Uuid::new_v4();
+        let bad_trigger = CompletionTrigger::new("test", "test")
+            .with_id(trigger_id)
+            .with_condition(over_deep);
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_trigger(bad_trigger)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::InvalidCompletionTriggerCondition {
+                    trigger_id: id,
+                    ..
+                }) if id == trigger_id
+            ),
+            "Expected InvalidCompletionTriggerCondition, got: {result:?}"
+        );
+
+        // A malformed dotted path fails try_build too.
+        let bad_path =
+            CompletionTrigger::new("test", "test").with_condition(TriggerCondition::Exists {
+                path: "a..b".into(),
+            });
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_trigger(bad_path)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::InvalidCompletionTriggerCondition { .. })
+            ),
+            "Expected InvalidCompletionTriggerCondition for malformed path, got: {result:?}"
         );
     }
 

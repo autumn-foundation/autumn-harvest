@@ -331,6 +331,7 @@ metric is emitted in the source code.
 | `harvest.webhook.rejected` | Counter | `webhook_receiver.rs` — every inbound webhook request rejected: signature/timestamp/replay verification failure, payload parse failure, mapping-function rejection, or missing idempotency key. Never fires for `accepted`/`idempotent_replay` (issue #344) |
 | `harvest.saga.compensated` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_start`), exactly once per real compensation sequence: a non-empty `compensate_all` / step-failure unwind actually running forward (issue #801) |
 | `harvest.saga.compensation_failed` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_failed`), exactly once per unwind ending with ≥1 compensation error — the `SagaCompensationFailed` dangling-state case, counted even when the author catches the error (issue #801) |
+| `harvest.completion_trigger.skipped` | Counter | `completion_trigger.rs` — `evaluate_triggers_for_execution`, on output-guard skips (`condition_unmet` = guard evaluated false, once per fresh skip — a redelivered, already-resolved skip records `deduped` on `harvest.completion_trigger.fires` instead; `condition_invalid` = stored condition unparseable/over-cap, fail-closed with no fires row — the fire is lost for that terminal unless evaluation re-enters, so alert on this reason and re-trigger by hand; see docs/completion-triggers.md "Fail-closed on invalid stored conditions"). Best-effort on the operator cancel/terminate and parent-close-cascade paths (no recorder threaded there); the fires-row `outcome` column is the authoritative skip record (issue #810) |
 
 ### Label sets
 
@@ -360,6 +361,7 @@ metric is emitted in the source code.
 | `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
 | `harvest.saga.compensated` | `workflow`, `queue` |
 | `harvest.saga.compensation_failed` | `workflow`, `queue` |
+| `harvest.completion_trigger.skipped` | `trigger` (trigger UUID — same precedent as `harvest.completion_trigger.fires`), `reason` (`condition_unmet\|condition_invalid`) |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by

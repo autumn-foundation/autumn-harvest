@@ -3883,6 +3883,11 @@
             "name": "queue_name",
             "required": false,
             "description": "Target queue name override."
+          },
+          {
+            "name": "condition",
+            "required": false,
+            "description": "Optional bounded output-guard condition AST (issue #810); the trigger fires only when it evaluates true against the source workflow's recorded output. Unknown operators, malformed paths, or over-cap trees are rejected with 400."
           }
         ]
       },
@@ -3896,7 +3901,8 @@
           "input_mapping",
           "queue_name",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "condition"
         ]
       },
       "error_responses": [

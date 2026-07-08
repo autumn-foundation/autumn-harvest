@@ -62,7 +62,7 @@ use autumn_harvest::calendar::{
     list_calendars, load_exclusions_for_calendar, plan_backfill_with_calendar,
     preview_schedule_firings, replace_calendar_exclusions,
 };
-use autumn_harvest::completion_trigger::{InputMapping, TerminalState};
+use autumn_harvest::completion_trigger::{InputMapping, TerminalState, TriggerCondition};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
@@ -3990,6 +3990,7 @@ pub const fn management_api_request_fields()
                 "target_workflow_name",
                 "input_mapping",
                 "queue_name",
+                "condition",
             ]),
         ),
         ("POST", "/admin/retention/run-now", Some(&[])),
@@ -4671,6 +4672,7 @@ pub const fn management_api_response_fields()
                 "queue_name",
                 "created_at",
                 "updated_at",
+                "condition",
             ]),
         ),
         // ── schedules ─────────────────────────────────────────────────────────
@@ -15239,6 +15241,30 @@ pub struct CreateCompletionTriggerRequest {
     pub target_workflow_name: String,
     pub input_mapping: Option<InputMapping>,
     pub queue_name: Option<String>,
+    /// Optional output guard (issue #810), carried as raw JSON and decoded
+    /// explicitly by the handler (`decode_trigger_condition`). Typing this
+    /// field as `TriggerCondition` would hand an unknown operator to axum's
+    /// `Json` extractor, which rejects data-shape errors with a **422** and a
+    /// plain-text body — the handler-level decode is what produces the
+    /// documented `400` JSON error for unknown operators, over-cap trees, and
+    /// malformed paths alike. `None` = unconditional (legacy behavior).
+    #[serde(default)]
+    pub condition: Option<serde_json::Value>,
+}
+
+/// Decode + validate the raw `condition` JSON from a
+/// [`CreateCompletionTriggerRequest`] (issue #810). `Ok(None)` = no guard;
+/// `Err` carries the human-readable reason (unknown operator, over-cap tree,
+/// malformed path) the handler maps to a `400` JSON error.
+fn decode_trigger_condition(
+    raw: Option<serde_json::Value>,
+) -> Result<Option<TriggerCondition>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let condition: TriggerCondition = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    condition.validate()?;
+    Ok(Some(condition))
 }
 
 async fn list_completion_triggers(
@@ -15299,10 +15325,23 @@ async fn create_completion_trigger(
         .unwrap_or_else(|| vec![TerminalState::Completed]);
     let mapping = request.input_mapping.unwrap_or(InputMapping::Passthrough);
 
+    // Output-guard decode + boundedness validation (issue #810): reject at
+    // registration with a 400 JSON error, never silently drop. Decoding
+    // happens here (not in the Json extractor) so an unknown operator gets
+    // the documented 400 rather than axum's 422 plain-text rejection.
+    let condition = decode_trigger_condition(request.condition).map_err(|message| {
+        AutumnError::bad_request_msg(format!("invalid trigger condition: {message}"))
+    })?;
+
     let states_val = serde_json::to_value(&states)
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid terminal states: {e}")))?;
     let mapping_val = serde_json::to_value(&mapping)
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid input mapping: {e}")))?;
+    let condition_val = condition
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid trigger condition: {e}")))?;
 
     let new_row = NewCompletionTriggerDb {
         id: trigger_id,
@@ -15312,6 +15351,7 @@ async fn create_completion_trigger(
         input_mapping: mapping_val,
         queue_name: request.queue_name.clone(),
         is_static: false,
+        condition: condition_val,
     };
 
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -15357,6 +15397,7 @@ async fn create_completion_trigger(
                                 triggers_dsl::is_static.eq(old_row.is_static),
                                 triggers_dsl::created_at.eq(old_row.created_at),
                                 triggers_dsl::updated_at.eq(old_row.updated_at),
+                                triggers_dsl::condition.eq(&old_row.condition),
                             ))
                             .execute(&mut rollback_conn)
                             .await;
@@ -15385,6 +15426,7 @@ async fn create_completion_trigger(
                     triggers_dsl::target_workflow_name.eq(&new_row.target_workflow_name),
                     triggers_dsl::input_mapping.eq(&new_row.input_mapping),
                     triggers_dsl::queue_name.eq(&new_row.queue_name),
+                    triggers_dsl::condition.eq(&new_row.condition),
                     triggers_dsl::updated_at.eq(Utc::now()),
                 ))
                 .get_result::<CompletionTriggerDb>(&mut conn)
@@ -15411,6 +15453,7 @@ async fn create_completion_trigger(
                                     triggers_dsl::is_static.eq(old_row.is_static),
                                     triggers_dsl::created_at.eq(old_row.created_at),
                                     triggers_dsl::updated_at.eq(old_row.updated_at),
+                                    triggers_dsl::condition.eq(&old_row.condition),
                                 ))
                                 .execute(&mut rollback_conn)
                                 .await;
@@ -29041,5 +29084,70 @@ mod tests {
             json_body["error"], "boom",
             "TEXT error must decode via decode_error_string_lossy: {json_body}"
         );
+    }
+
+    /// issue #810: the registration request's optional `condition` field.
+    /// It rides the request as raw JSON (so a bad condition can never trip
+    /// axum's Json extractor into a 422 plain-text rejection) and is decoded
+    /// by the handler via `decode_trigger_condition`, which produces the
+    /// AC-mandated 400 for unknown operators, over-cap trees, and malformed
+    /// paths alike; a legacy body without the field still deserializes
+    /// (`None`).
+    #[test]
+    fn create_completion_trigger_request_condition_serde() {
+        // Legacy body (no condition key) → None, decoded to no guard.
+        let legacy: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
+            "source_workflow_name": "a",
+            "target_workflow_name": "b",
+        }))
+        .unwrap();
+        assert!(legacy.condition.is_none());
+        assert!(
+            decode_trigger_condition(legacy.condition)
+                .unwrap()
+                .is_none()
+        );
+
+        // Well-formed condition decodes through the handler helper.
+        let ok: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
+            "source_workflow_name": "a",
+            "target_workflow_name": "b",
+            "condition": {
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 1000}
+            },
+        }))
+        .unwrap();
+        let decoded = decode_trigger_condition(ok.condition).unwrap();
+        assert!(matches!(
+            decoded,
+            Some(TriggerCondition::GreaterThan { ref path, .. }) if path == "amount"
+        ));
+
+        // Unknown operator: the REQUEST still deserializes (the raw-JSON
+        // field keeps the Json extractor out of the decision — a typed field
+        // here would surface as axum's 422 with a plain-text body), and the
+        // handler decode rejects it (→ 400, never silently dropped).
+        let bad: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
+            "source_workflow_name": "a",
+            "target_workflow_name": "b",
+            "condition": {"type": "Regex", "data": {"path": "a", "value": ".*"}},
+        }))
+        .unwrap();
+        let err = decode_trigger_condition(bad.condition).unwrap_err();
+        assert!(err.contains("unknown variant `Regex`"), "{err}");
+
+        // Over-cap conditions deserialize fine but fail the helper's
+        // validate() leg. (The end-to-end 400 for an over-cap body is proven
+        // by `completion_triggers_integration.rs::test_condition_registration_rejects_invalid_with_400`.)
+        let mut over_deep = serde_json::json!({"type": "Exists", "data": {"path": "a"}});
+        for _ in 0..autumn_harvest::MAX_CONDITION_DEPTH {
+            over_deep = serde_json::json!({"type": "All", "data": [over_deep]});
+        }
+        assert!(decode_trigger_condition(Some(over_deep)).is_err());
+
+        // Malformed dotted path → rejected by the same helper.
+        let malformed = serde_json::json!({"type": "Exists", "data": {"path": "a..b"}});
+        assert!(decode_trigger_condition(Some(malformed)).is_err());
     }
 }
