@@ -2225,7 +2225,21 @@ async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<store::EventHistory> {
-    harvest_workflow_executions::table
+    Ok(lock_workflow_execution_row_and_load_history(conn, exec_id)
+        .await?
+        .1)
+}
+
+/// Like [`lock_workflow_execution_and_load_history`], but also returns the
+/// locked execution row itself — the `SELECT ... FOR UPDATE` loads the full
+/// row anyway, so a caller that needs row-current execution metadata under
+/// the lock (e.g. the retry path's PAUSED re-check, issue #609 post-review
+/// hardening) gets it without a second query.
+async fn lock_workflow_execution_row_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<(WorkflowExecution, store::EventHistory)> {
+    let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
@@ -2235,7 +2249,8 @@ async fn lock_workflow_execution_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    store::load_history(conn, exec_id).await
+    let history = store::load_history(conn, exec_id).await?;
+    Ok((execution, history))
 }
 
 async fn task_state_for_update(
@@ -5056,12 +5071,14 @@ fn schedule_to_close_deadline_exceeded(
 /// AC5): pause suspends the cross-retry deadline clock, so a failing activity
 /// of a paused execution is requeued normally instead of deadline-failed —
 /// resume shifts `schedule_to_close_at` forward by the pause span, and the
-/// requeued row is `PENDING` so the shift covers it. A pause landing after
-/// this read deadline-fails the task, consistent with the
-/// "already-dispatched work runs to completion" boundary in-flight
-/// enforcement has under pause (issue #383). Scoped: this extra indexed read
-/// runs only when the task carries a deadline *and* that deadline check
-/// already failed.
+/// requeued row is `PENDING` so the shift covers it. This read is a fast-path
+/// optimization only, not the guarantee: a pause committing after this read
+/// is caught by [`record_schedule_to_close_activity_timeout`]'s authoritative
+/// re-check of the execution state under the execution row lock (which
+/// serializes against `pause_workflow_execution`'s own lock), so the race
+/// window this unlocked read leaves open is closed there. Scoped: this extra
+/// indexed read runs only when the task carries a deadline *and* that
+/// deadline check already failed.
 async fn owning_execution_is_paused(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -5090,6 +5107,47 @@ enum ScheduleToCloseTimeoutOutcome {
     /// The claim-time snapshot is stale; the caller must fall through to a
     /// normal retry requeue instead of failing the task terminally.
     DeadlineShifted,
+    /// The owning execution is `PAUSED` as observed under the execution row
+    /// lock (issue #609 post-review hardening, round 2): a pause committed
+    /// after the caller's non-locking [`owning_execution_is_paused`] fast
+    /// path read. Pause suspends the `schedule_to_close` clock, so the
+    /// caller must fall through to a normal retry requeue — the requeued
+    /// `PENDING` row is frozen by the claim gate and its deadline is shifted
+    /// forward by the pause span on resume.
+    ExecutionPaused,
+}
+
+/// Pure decision rule for the re-check
+/// [`record_schedule_to_close_activity_timeout`] performs under the execution
+/// row lock (issue #609 post-review hardening). `Some(outcome)` means bail
+/// out without mutating anything; `None` means the deadline enforcement
+/// proceeds (append `ActivityTimedOut { ScheduleToClose }` + fail the task).
+///
+/// Ordering matters: a concurrently-resolved task row wins over everything
+/// (the caller must never requeue it), then a `PAUSED` owning execution wins
+/// over the deadline arithmetic (pause suspends the clock even when the
+/// row-current deadline is already exceeded — the resume-time shift will push
+/// it forward), then the fresh-deadline check catches a stale claim-time
+/// snapshot after a completed pause/resume cycle.
+fn schedule_to_close_recheck_outcome(
+    execution_state: &str,
+    task_row: Option<&(String, Option<chrono::DateTime<chrono::Utc>>)>,
+    now: chrono::DateTime<chrono::Utc>,
+    retry_delay: chrono::Duration,
+) -> Option<ScheduleToCloseTimeoutOutcome> {
+    let Some((task_state, fresh_deadline)) = task_row else {
+        return Some(ScheduleToCloseTimeoutOutcome::Handled);
+    };
+    if task_state != "RUNNING" {
+        return Some(ScheduleToCloseTimeoutOutcome::Handled);
+    }
+    if execution_state == "PAUSED" {
+        return Some(ScheduleToCloseTimeoutOutcome::ExecutionPaused);
+    }
+    if !deadline_would_be_exceeded(*fresh_deadline, now, retry_delay) {
+        return Some(ScheduleToCloseTimeoutOutcome::DeadlineShifted);
+    }
+    None
 }
 
 /// Locked (`FOR UPDATE`) read of a task row's current state and
@@ -5125,11 +5183,22 @@ async fn task_state_and_deadline_for_update(
 /// pre-shift value, charging paused wall-clock to the activity budget (the
 /// exact outcome AC5 exists to prevent). This function therefore re-reads
 /// the row's current deadline **inside** its transaction — which takes the
-/// execution row lock via [`lock_workflow_execution_and_load_history`], the
-/// same lock `resume_workflow_execution` holds while shifting, so the read
-/// observes either the pre- or post-shift value, never a torn one — and
+/// execution row lock via [`lock_workflow_execution_row_and_load_history`],
+/// the same lock `resume_workflow_execution` holds while shifting, so the
+/// read observes either the pre- or post-shift value, never a torn one — and
 /// returns [`ScheduleToCloseTimeoutOutcome::DeadlineShifted`] without
 /// mutating anything when the fresh deadline is no longer exceeded.
+///
+/// The caller's `owning_execution_is_paused` gate is likewise a non-locking
+/// read taken *before* this transaction opens (issue #609 post-review
+/// hardening, round 2): a pause committing in the gap would be observed here
+/// as a now-`PAUSED` execution whose deadline is genuinely exceeded, and
+/// deadline-failing it mid-pause would violate the pause-suspends-the-clock
+/// contract. The locked execution row (free — the lock helper loads it
+/// anyway) is therefore re-checked for `PAUSED`, returning
+/// [`ScheduleToCloseTimeoutOutcome::ExecutionPaused`] without mutating
+/// anything so the caller requeues normally. The whole decision is the pure
+/// [`schedule_to_close_recheck_outcome`].
 async fn record_schedule_to_close_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -5149,21 +5218,21 @@ async fn record_schedule_to_close_activity_timeout(
     conn.transaction::<ScheduleToCloseTimeoutOutcome, HarvestError, _>(|conn| {
         let error = error.clone();
         async move {
-            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
-            let Some((state, fresh_deadline)) =
-                task_state_and_deadline_for_update(conn, task.id).await?
-            else {
-                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
-            };
-            if state != "RUNNING" {
-                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
-            }
-            // Fresh-deadline re-check under the execution row lock: if a
-            // concurrent resume shifted the deadline into the future, this
-            // attempt still has budget — abort the timeout and let the
-            // caller requeue normally.
-            if !deadline_would_be_exceeded(fresh_deadline, chrono::Utc::now(), retry_delay) {
-                return Ok(ScheduleToCloseTimeoutOutcome::DeadlineShifted);
+            let (execution, history) =
+                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+            let task_row = task_state_and_deadline_for_update(conn, task.id).await?;
+            // Authoritative re-check under the execution row lock: bail
+            // without mutation when the task was concurrently resolved, the
+            // owning execution was paused after the caller's non-locking
+            // fast-path read, or a concurrent resume shifted the deadline
+            // into the future (this attempt still has budget).
+            if let Some(outcome) = schedule_to_close_recheck_outcome(
+                &execution.state,
+                task_row.as_ref(),
+                chrono::Utc::now(),
+                retry_delay,
+            ) {
+                return Ok(outcome);
             }
             let timeout_event = WorkflowEvent::ActivityTimedOut {
                 activity_id,
@@ -5242,7 +5311,14 @@ async fn handle_activity_result(
                         // cycle shifted the row's deadline forward (issue #609
                         // post-review hardening) — the attempt still has
                         // budget, so fall through to the normal requeue below.
-                        ScheduleToCloseTimeoutOutcome::DeadlineShifted => {}
+                        // ExecutionPaused is the sibling race (a pause
+                        // committing after the non-locking gate above, caught
+                        // under the execution row lock): pause suspends the
+                        // deadline clock, so requeue normally — the PENDING
+                        // row is frozen by the claim gate and its deadline is
+                        // shifted forward on resume.
+                        ScheduleToCloseTimeoutOutcome::DeadlineShifted
+                        | ScheduleToCloseTimeoutOutcome::ExecutionPaused => {}
                     }
                 }
                 // Store the human-readable error for ActivityContext::previous_failure()
@@ -13436,5 +13512,92 @@ mod tests {
         let delay = chrono::Duration::seconds(300);
         assert!(deadline_would_be_exceeded(stale_snapshot, now, delay));
         assert!(!deadline_would_be_exceeded(shifted_fresh, now, delay));
+    }
+
+    // ── schedule_to_close in-transaction re-check (issue #609, round 2) ─────
+
+    #[test]
+    fn recheck_missing_task_row_is_handled() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            schedule_to_close_recheck_outcome("RUNNING", None, now, chrono::Duration::seconds(1)),
+            Some(ScheduleToCloseTimeoutOutcome::Handled)
+        );
+    }
+
+    #[test]
+    fn recheck_concurrently_resolved_task_is_handled_even_when_paused() {
+        // A task another writer already resolved must never be requeued —
+        // Handled wins over the PAUSED check.
+        let now = chrono::Utc::now();
+        let row = ("FAILED".to_string(), Some(now - chrono::Duration::hours(1)));
+        assert_eq!(
+            schedule_to_close_recheck_outcome(
+                "PAUSED",
+                Some(&row),
+                now,
+                chrono::Duration::seconds(300)
+            ),
+            Some(ScheduleToCloseTimeoutOutcome::Handled)
+        );
+    }
+
+    #[test]
+    fn recheck_paused_execution_wins_over_an_exceeded_row_deadline() {
+        // The P2 race this round closes: a pause committing after the
+        // caller's non-locking gate but before this transaction's lock.
+        // Both the snapshot and the row-current deadline are exceeded, so
+        // only the locked PAUSED re-check can save the task from being
+        // deadline-failed mid-pause.
+        let now = chrono::Utc::now();
+        let row = (
+            "RUNNING".to_string(),
+            Some(now - chrono::Duration::seconds(1)),
+        );
+        assert_eq!(
+            schedule_to_close_recheck_outcome(
+                "PAUSED",
+                Some(&row),
+                now,
+                chrono::Duration::seconds(300)
+            ),
+            Some(ScheduleToCloseTimeoutOutcome::ExecutionPaused)
+        );
+    }
+
+    #[test]
+    fn recheck_shifted_deadline_aborts_the_timeout() {
+        let now = chrono::Utc::now();
+        let row = (
+            "RUNNING".to_string(),
+            Some(now + chrono::Duration::hours(1)),
+        );
+        assert_eq!(
+            schedule_to_close_recheck_outcome(
+                "RUNNING",
+                Some(&row),
+                now,
+                chrono::Duration::seconds(300)
+            ),
+            Some(ScheduleToCloseTimeoutOutcome::DeadlineShifted)
+        );
+    }
+
+    #[test]
+    fn recheck_running_with_exceeded_deadline_proceeds_to_enforce() {
+        let now = chrono::Utc::now();
+        let row = (
+            "RUNNING".to_string(),
+            Some(now - chrono::Duration::seconds(1)),
+        );
+        assert_eq!(
+            schedule_to_close_recheck_outcome(
+                "RUNNING",
+                Some(&row),
+                now,
+                chrono::Duration::seconds(300)
+            ),
+            None
+        );
     }
 }

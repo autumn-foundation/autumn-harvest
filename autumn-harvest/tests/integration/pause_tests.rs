@@ -25,6 +25,7 @@ use diesel::QueryDsl;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::Value;
 use testcontainers::ContainerAsync;
@@ -1177,6 +1178,255 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
         get_state(&mut conn, exec_id).await,
         "RUNNING",
         "the owning execution must be unaffected"
+    );
+}
+
+// ── Round 2 (issue #609 post-review hardening): pause after the gate ────────
+
+/// Activity handler that reproduces an operator pause committing in the gap
+/// between the retry path's non-locking `owning_execution_is_paused` gate and
+/// `record_schedule_to_close_activity_timeout`'s transaction taking the
+/// execution row lock. Mirroring the round-3 lock-holding precedent
+/// (`wake_workflow_task_retries_after_losing_the_park_row_lock_race`): a hold
+/// connection takes the execution row's `FOR UPDATE` lock in an explicit
+/// open `BEGIN`, a second connection queues the *real*
+/// `pause_workflow_execution` behind it, and the hold is released only after
+/// this attempt's retryable failure has passed the gate (reading the still
+/// committed-RUNNING snapshot) and blocked on the row lock — so the pause
+/// commits first in the lock queue and the timeout transaction observes a
+/// now-PAUSED execution whose row deadline IS exceeded. Only the
+/// in-transaction PAUSED re-check can save the task from being
+/// deadline-failed mid-pause.
+fn self_pausing_activity<'a>(
+    _ctx: &'a autumn_harvest::ActivityContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let db_url = input
+            .get("db_url")
+            .and_then(Value::as_str)
+            .expect("test input must carry db_url")
+            .to_string();
+        let exec_id: ExecutionId = input
+            .get("exec_id")
+            .and_then(Value::as_str)
+            .expect("test input must carry exec_id")
+            .parse()
+            .expect("exec_id must parse");
+
+        // Hold the execution row lock open across an explicit BEGIN so the
+        // pause below queues on it but cannot commit yet.
+        let mut conn_hold = <AsyncPgConnection as AsyncConnection>::establish(&db_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        conn_hold
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| e.to_string())?;
+        diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut conn_hold)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // The real operator pause, queued behind the hold on its own
+        // connection. It acquires the lock (and commits PAUSED) the moment
+        // the hold releases.
+        let pause_url = db_url.clone();
+        tokio::spawn(async move {
+            let mut conn_pause = <AsyncPgConnection as AsyncConnection>::establish(&pause_url)
+                .await
+                .expect("pause conn should connect");
+            pause_workflow_execution(
+                &mut conn_pause,
+                exec_id,
+                Some("incident containment mid-attempt"),
+                "oncall",
+                &NoOpMetrics,
+            )
+            .await
+            .expect("pause should succeed once the hold releases");
+        });
+        // Give the spawned pause a moment to reach and block on the FOR
+        // UPDATE queue before this attempt fails — so it is ahead of the
+        // retry path's timeout transaction in the lock queue.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Release the hold only after the failure below has reached the
+        // retry path: the non-locking gate reads the committed (RUNNING)
+        // snapshot, then the timeout transaction blocks on the row lock
+        // behind the pause. On a slow runner the gate may instead read an
+        // already-committed PAUSED and short-circuit — the asserted end
+        // state is identical either way.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            conn_hold
+                .batch_execute("COMMIT")
+                .await
+                .expect("hold commit should succeed");
+        });
+        Err("transient failure after the concurrent pause".to_string())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() {
+    // Round 2 (issue #609 post-review hardening, P2): the retry path's
+    // `owning_execution_is_paused` gate is a non-locking read taken BEFORE
+    // `record_schedule_to_close_activity_timeout` opens its transaction and
+    // takes the execution row lock. A pause committing in that gap used to
+    // be deadline-failed anyway (the transaction only re-checked task state
+    // and the row-current deadline), violating the
+    // pause-suspends-schedule_to_close contract for the race window. The
+    // authoritative PAUSED re-check under the execution row lock is the
+    // guarantee; this test constructs the race window by letting the activity
+    // itself queue a real pause of its own execution behind a held row lock
+    // mid-attempt (released only after the failure reaches the retry path).
+    // Both the claim-time snapshot deadline AND the row-current deadline are
+    // exceeded, so neither the snapshot gate nor the resume-shift staleness
+    // re-check can save the task — only the new PAUSED re-check.
+    use autumn_harvest::RetryPolicy;
+    use autumn_harvest::info::ActivityInfo;
+    use autumn_harvest::queue::{EnqueueParams, TaskType};
+    use autumn_harvest::types::ActivityExecId;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    // Execution row without a workflow task: this test drives only the
+    // activity retry path, so no workflow handler must ever run.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'wf', $2, 0, 'null'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+    .execute(&mut conn)
+    .await
+    .expect("insert execution row");
+
+    let activity_id = ActivityExecId::new();
+    let activity_input = serde_json::json!({"db_url": url, "exec_id": exec_id.to_string()});
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({}),
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "self_pausing_activity".to_string(),
+                input: activity_input.clone(),
+                queue: "default".to_string(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append history");
+
+    // Deadline 30s ahead (claimable) with a 300s retry delay: exceeded at
+    // fail time both on the claim-time snapshot AND on the untouched row
+    // value — deterministically, with no sleeping.
+    let mut params = EnqueueParams::new("default", TaskType::Activity, activity_input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("self_pausing_activity".to_string());
+    params.activity_id = Some(activity_id.as_uuid());
+    params.max_attempts = 5;
+    params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+    params.retry_policy = Some(
+        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
+            .expect("retry policy serializes"),
+    );
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue activity task");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![],
+        vec![ActivityInfo {
+            name: "self_pausing_activity",
+            module: "pause_tests",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: self_pausing_activity,
+        }],
+    ));
+    let worker = Arc::new(make_worker(registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Wait for the attempt to fail and be re-resolved by the retry path: a
+    // requeue lands the row back in PENDING with the attempt's error stored,
+    // while the buggy path lands it in FAILED with an ActivityTimedOut event.
+    use autumn_harvest::schema::harvest_task_queue as t;
+    let poll_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (state, error) = loop {
+        let (state, error): (String, Option<String>) = t::table
+            .filter(t::id.eq(task_id))
+            .select((t::state, t::error))
+            .first(&mut conn)
+            .await
+            .expect("task must exist");
+        let resolved = state == "FAILED" || (state == "PENDING" && error.is_some());
+        if resolved || std::time::Instant::now() > poll_deadline {
+            break (state, error);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        state, "PENDING",
+        "the task must be requeued (frozen by the claim gate until resume), \
+         not deadline-failed against a paused execution"
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("transient failure after the concurrent pause")),
+        "the requeued row must carry the attempt's error for the next attempt, got {error:?}"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "no ActivityTimedOut {{ ScheduleToClose }} may be recorded while the \
+         owning execution is paused"
+    );
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "PAUSED",
+        "the pause must survive the retry path untouched"
     );
 }
 
