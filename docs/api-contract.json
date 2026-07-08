@@ -1180,7 +1180,7 @@
       "category": "workflow",
       "read_only": false,
       "description": "Force-fail exactly one hung in-flight (RUNNING) activity task. Appends ActivityFailed with the distinct error_type 'OperatorForceFailed' through the existing recording path (no new event variant), marks the task row FAILED with the typed failure envelope, and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path -- it is NOT terminated. Remaining retry attempts are skipped regardless of retry policy (the forced failure is non-retryable by construction), and a late result from the worker still running the activity is ignored (no double-apply). Only RUNNING activity tasks of a non-terminal execution are force-failable. Note: if the owning workflow has a workflow-level retry policy (issue #523) and propagates this error to workflow failure, the run is retried fresh and the activity re-dispatched -- use cancel/terminate instead if the goal is to stop the run. Local activities run inline and have no task-queue row -- this endpoint does not apply to them (404).",
-      "idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event.",
+      "idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event. Idempotency wins over the terminal-execution guard: a retry issued after the woken workflow has consumed the forced failure and sealed its own run (the expected aftermath of a successful force-fail) still returns the no-op success rather than the terminal 409.",
       "params": [
         {
           "name": "id",
@@ -1235,7 +1235,7 @@
         },
         {
           "status": 409,
-          "description": "Task is not force-failable: the owning execution is already terminal (COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED), the task is not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), the id names a workflow task rather than an activity task, or history already carries a terminal event for the activity."
+          "description": "Task is not force-failable: the owning execution is already terminal (COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED) and the task is not already-forced (an already-forced task returns the idempotent 202 no-op even on a sealed run), the task is not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), the id names a workflow task rather than an activity task, or history already carries a terminal event for the activity."
         },
         {
           "status": 500,

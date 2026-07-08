@@ -12739,11 +12739,13 @@ async fn retry_activity_now(
 /// workflow advances to its own failure/compensation path — it is NOT
 /// terminated. Returns 202 Accepted with `forced: true` when this call
 /// performed the force-fail, or `forced: false, already_forced: true` for an
-/// idempotent repeat on an already-forced task. Returns 404 for unknown task
-/// IDs or wrong workflow, 409 for tasks that are not force-failable (not
-/// RUNNING, genuinely failed, a workflow task, or the owning execution is
-/// already terminal — a sealed run's history must never grow another
-/// `ActivityFailed`).
+/// idempotent repeat on an already-forced task — including after the owning
+/// run has since sealed (the idempotent short-circuit wins over the
+/// terminal-execution guard, so a lost-response retry never flips to a 409).
+/// Returns 404 for unknown task IDs or wrong workflow, 409 for tasks that
+/// are not force-failable (not RUNNING, genuinely failed, a workflow task,
+/// or a non-already-forced task whose owning execution is already terminal —
+/// a sealed run's history must never grow another `ActivityFailed`).
 ///
 /// The optional `reason` is truncated to 500 chars at this boundary (see
 /// `truncate_operator_reason`) before it is durably recorded.

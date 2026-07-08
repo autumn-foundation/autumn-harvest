@@ -958,7 +958,11 @@ fn classify_force_fail_target(
 ///   (cannot resurrect the FAILED row), and a late non-retryable `Err` no-ops
 ///   in `finalize_activity_failure`'s terminal-history/row-state guards.
 /// - **Idempotent**: re-issuing the call on an already-forced task returns
-///   `Ok` with `already_forced: true` and performs zero writes.
+///   `Ok` with `already_forced: true` and performs zero writes — including
+///   after the owning run has since sealed (the woken workflow consuming the
+///   forced failure and reaching its own terminal state is the *expected*
+///   aftermath of a successful force-fail, so a lost-response retry must not
+///   flip to the terminal 409 below).
 /// - **Pause is deliberately NOT a blocker**: in-flight enforcement is
 ///   pause-blind, mirroring the Heartbeat/StartToClose posture in
 ///   [`pause_suppresses_timeout_enforcement`] — a hung activity of a paused
@@ -975,10 +979,11 @@ fn classify_force_fail_target(
 ///   `ActivityFailed` after its terminal event. A stray `RUNNING` activity
 ///   row on a terminal execution is reachable (a plain workflow failure does
 ///   NOT fail open activity rows), so this guard is load-bearing, not
-///   theoretical. The guard also wins over the idempotent already-forced
-///   short-circuit: a retried fail-now against a since-sealed run reports
-///   the terminal conflict (still zero writes) rather than
-///   `already_forced: true`.
+///   theoretical. The idempotent already-forced short-circuit wins over
+///   this guard: a retried fail-now whose first call succeeded and whose
+///   forced failure has since sealed the run still returns the documented
+///   no-op success (`already_forced: true`, zero writes) — only a
+///   non-already-forced row on a terminal execution reports the conflict.
 /// - If the row is still `RUNNING` but history already carries a terminal
 ///   event for the activity (a state [`enforce_activity_timeout`] treats as
 ///   a no-op), this returns a `409` conflict instead of appending — the
@@ -1039,16 +1044,36 @@ pub async fn force_fail_activity(
                 )));
             };
 
+            let classification =
+                classify_force_fail_target(&task.task_type, &task.state, task.error.as_deref());
+
+            // Idempotent short-circuit — deliberately checked BEFORE the
+            // terminal-execution guard below. The common lifecycle of a
+            // successful force-fail is that the woken workflow consumes the
+            // forced `ActivityFailed` and seals its own run (often FAILED)
+            // within one poll cycle, so an operator/script retry after a
+            // lost response would otherwise flip from the documented
+            // idempotent no-op to the terminal 409. Both paths are
+            // zero-writes, so honouring idempotency here never grows a
+            // sealed run's history (PR #974 Codex review).
+            if classification == ForceFailClassification::AlreadyForced {
+                return Ok(ForceFailActivityOutcome {
+                    task_id,
+                    queue_name: task.queue_name.clone(),
+                    activity_name: task.activity_name.clone().unwrap_or_default(),
+                    forced: false,
+                    already_forced: true,
+                });
+            }
+
             // Terminal-execution guard: a sealed run's history must never
             // grow another `ActivityFailed` after its terminal event (a plain
             // workflow failure does NOT fail open activity rows, so a stray
-            // RUNNING row on a FAILED execution is reachable), and an
-            // operator retrying a fail-now script against a run that has
-            // since sealed must get an honest conflict rather than a
-            // misleading `202`. Checked after the task-existence check so an
-            // unknown task id still reports `404` first, and before
-            // classification so even the zero-write idempotent
-            // already-forced case reports the terminal conflict.
+            // RUNNING row on a FAILED execution is reachable). Checked after
+            // the task-existence check so an unknown task id still reports
+            // `404` first, and after the zero-write idempotent already-forced
+            // short-circuit above so a retried fail-now stays idempotent even
+            // once the run seals.
             if crate::erase::is_terminal_state(&execution.state) {
                 return Err(HarvestError::Config(format!(
                     "workflow execution {workflow_exec_id} is already terminal ({}); \
@@ -1057,22 +1082,19 @@ pub async fn force_fail_activity(
                 )));
             }
 
-            match classify_force_fail_target(&task.task_type, &task.state, task.error.as_deref()) {
+            match classification {
+                ForceFailClassification::AlreadyForced => {
+                    unreachable!(
+                        "AlreadyForced is short-circuited above, before the \
+                         terminal-execution guard"
+                    );
+                }
                 ForceFailClassification::NotAnActivityTask => {
                     return Err(HarvestError::Config(format!(
                         "task {task_id} is a '{}' task, not an activity task — only \
                          in-flight activity tasks can be force-failed",
                         task.task_type
                     )));
-                }
-                ForceFailClassification::AlreadyForced => {
-                    return Ok(ForceFailActivityOutcome {
-                        task_id,
-                        queue_name: task.queue_name.clone(),
-                        activity_name: task.activity_name.clone().unwrap_or_default(),
-                        forced: false,
-                        already_forced: true,
-                    });
                 }
                 ForceFailClassification::NotRunning => {
                     return Err(HarvestError::Config(format!(

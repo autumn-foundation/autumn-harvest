@@ -522,6 +522,75 @@ async fn second_call_is_idempotent_no_op() {
     );
 }
 
+#[tokio::test]
+async fn retry_after_forced_run_sealed_is_idempotent_no_op() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let activity_id = ActivityExecId::new();
+    seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
+    let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
+
+    let first = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("first"))
+        .await
+        .expect("first call succeeds");
+    assert!(first.forced);
+
+    // The woken workflow consumes the forced ActivityFailed and seals its own
+    // run — the common lifecycle within one poll cycle. Simulate the seal.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', error = 'wf boom' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal execution FAILED");
+
+    let events_before = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history")
+        .events
+        .len();
+
+    // A retried fail-now (lost response / script retry) must stay the
+    // documented idempotent no-op success — NOT flip to the terminal 409
+    // (PR #974 Codex review): the already-forced short-circuit wins over the
+    // terminal-execution guard.
+    let second = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("second"))
+        .await
+        .expect("retry after the run sealed is an idempotent no-op success");
+    assert!(!second.forced);
+    assert!(second.already_forced);
+
+    // Zero writes: no event appended, exactly one terminal event for the
+    // activity, the stored envelope keeps the FIRST reason, and neither the
+    // task row nor the execution row was touched.
+    let history = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history");
+    assert_eq!(
+        history.events.len(),
+        events_before,
+        "no event may be appended by the idempotent retry"
+    );
+    assert_eq!(
+        count_activity_failed_events(&history.events, activity_id),
+        1,
+        "history must still carry exactly one forced ActivityFailed"
+    );
+    let row = load_task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "FAILED", "task row must be untouched");
+    let stored = row.error.expect("forced row stores the failure envelope");
+    assert!(
+        parse_error_payload_full(&stored).message.contains("first"),
+        "the idempotent no-op must not overwrite the stored reason"
+    );
+    assert_eq!(
+        execution_state(&mut conn, exec_id).await,
+        "FAILED",
+        "execution row must be untouched"
+    );
+}
+
 // ── conflicts (409) ──────────────────────────────────────────────────────────
 
 #[tokio::test]
