@@ -687,6 +687,88 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
     );
 }
 
+/// Code-review fix (issue #607 round 6): `POST /admin/schedules/{id}/trigger`
+/// (manual trigger-now) previously called the start primitive directly with
+/// no throttle check at all -- unlike scheduled and backfilled fires, which
+/// both already pace through `reserve_or_defer`. An operator repeatedly
+/// hitting this route for a throttled workflow schedule could bypass its
+/// declared rate/burst entirely. Verifies a manual trigger against an
+/// already-empty bucket is durably deferred (`outcome: "deferred"`, no
+/// `execution_id`) instead of admitted immediately.
+#[tokio::test]
+async fn manual_trigger_defers_when_throttle_bucket_is_empty() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
+    let schedule_id =
+        insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "trigger request: {body:?}");
+    assert_eq!(body["outcome"], json!("deferred"), "{body:?}");
+    assert_eq!(
+        body["execution_id"],
+        Value::Null,
+        "a deferred trigger must not carry an execution id yet: {body:?}"
+    );
+
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        0,
+        "the triggered run must have been deferred, not started"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        1,
+        "exactly one pending throttle row should exist for the deferred trigger"
+    );
+}
+
+/// A manual trigger with an available token still starts immediately
+/// (`outcome: "fired"`), unaffected by the throttle-deferral fix above.
+#[tokio::test]
+async fn manual_trigger_starts_immediately_when_token_available() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    let schedule_id =
+        insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "trigger request: {body:?}");
+    assert_eq!(body["outcome"], json!("fired"), "{body:?}");
+    assert!(
+        body["execution_id"].is_string(),
+        "a fired trigger must carry a real execution id: {body:?}"
+    );
+
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        1,
+        "the sole token should have admitted the trigger immediately"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        0,
+        "no pending throttle row should exist when a token was available"
+    );
+}
+
 #[tokio::test]
 async fn under_limit_starts_then_defers_excess_and_backlog_is_visible() {
     let (url, _container) = setup_database().await;

@@ -183,9 +183,12 @@ pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_callbacks: Option<serde_json::Value>,
     /// Schedule id that triggered this deferred start (issue #607 throttle +
-    /// #488 carryover). Only ever set by the scheduler/backfill throttle paths;
-    /// debounce/batch always leave it `None`, so the carryover lineage of a
-    /// throttled scheduled fire survives the deferral.
+    /// #488 carryover). Only ever set by the scheduler/backfill/manual-trigger
+    /// throttle paths; debounce/batch always leave it `None`, so the carryover
+    /// lineage of a throttled scheduled fire survives the deferral. A manual
+    /// trigger sets `scheduled_for: None` alongside it (matching its own
+    /// immediate-start path), so it is attributed to the schedule without
+    /// participating in carryover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_id: Option<uuid::Uuid>,
     /// Logical schedule slot this deferred start fires for (issue #488).

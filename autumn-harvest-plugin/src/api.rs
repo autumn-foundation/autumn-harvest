@@ -15020,6 +15020,236 @@ async fn trigger_schedule_now(
                 .and_then(|info| info.retry_policy.clone())
         });
 
+    // Start-throttle admission (issue #607 code review): a manual trigger-now
+    // must pace like scheduled/backfilled fires rather than always admitting
+    // immediately -- otherwise an operator repeatedly hitting this route
+    // could bypass a throttled workflow's declared rate/burst entirely. DAG
+    // schedules resolve no throttle policy here (`DagInfo` has no `throttle`
+    // field, and a unified DAG's auto-registered shadow `WorkflowInfo` never
+    // carries one either), so this is a no-op for the DAG branch by
+    // construction -- unlike `schedule_backfill`, no explicit kind check is
+    // needed. A deferred trigger still counts as a spent run-budget slot
+    // (mirrors the scheduler-tick/backfill precedent: the pre-incremented
+    // `runs_started` above is NOT rolled back), so a repeatedly-triggered
+    // throttled schedule can't also bypass its own `max_runs` budget by
+    // piling up pending rows.
+    let mut trigger_throttle_bucket: Option<String> = None;
+    if let Some((throttle_policy, resolved_throttle_key)) =
+        workflow_resolving_throttle(&runtime.registry, &workflow_name, &input)
+    {
+        let effective_cap = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|info| info.max_input_bytes)
+            .map_or(runtime.registry.max_workflow_input_bytes, |per| {
+                per.max(runtime.registry.max_workflow_input_bytes)
+            });
+        // Mirrors the size-check-ordering fix applied at every other call
+        // site (issue #607 round 4): skip the cap check when
+        // `reserve_or_defer` would resolve via `Bypassed` or an idempotent
+        // attach to an already-pending row. `workflow_id` here is always
+        // freshly generated per request, so this is mostly defensive, but
+        // keeps the primitive's contract uniform across every call site.
+        let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+            &mut exec_conn,
+            &workflow_name,
+            &workflow_id,
+            Some("allow_duplicate"),
+        )
+        .await
+        {
+            Ok(skip) => skip,
+            Err(e) => {
+                rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("throttle_admission_failed"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(&schedule_display_name, "start_failed");
+                return Err(map_error(e));
+            }
+        };
+        if !skip_cap_check && effective_cap > 0 {
+            let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+            if observed > effective_cap {
+                rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("rejected_oversized_input"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(
+                        &schedule_display_name,
+                        "rejected_oversized_input",
+                    );
+                return Err(AutumnError::bad_request_msg(format!(
+                    "workflow input ({observed} bytes) exceeds cap ({effective_cap} bytes)"
+                )));
+            }
+        }
+        let start_options = autumn_harvest::debounce::DebounceStartOptions {
+            reuse_policy: Some("allow_duplicate".to_string()),
+            execution_timeout_secs: info_execution_timeout.map(|d| d.num_seconds()),
+            memo: None,
+            search_attrs: None,
+            sla_secs: sla.map(|d| d.num_seconds()),
+            context_headers: None,
+            priority: None,
+            concurrency_key: concurrency_key.clone(),
+            concurrency_limit,
+            owner: owner.map(str::to_string),
+            runbook_url: runbook_url.map(str::to_string),
+            severity: severity.map(str::to_string),
+            max_execution_timeout_ceiling_secs: api_state
+                .max_workflow_execution_timeout()
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            max_workflow_input_bytes: Some(effective_cap),
+            trace_context: None,
+            workflow_retry_policy: manual_trigger_retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok()),
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            completion_callbacks: None,
+            schedule_id: Some(schedule_id),
+            scheduled_for: None,
+            origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER.to_string()),
+        };
+        match autumn_harvest::throttle::reserve_or_defer(
+            &mut exec_conn,
+            autumn_harvest::throttle::AdmitThrottleParams {
+                workflow_name: &workflow_name,
+                throttle_key: &resolved_throttle_key,
+                workflow_id: &workflow_id,
+                queue_name: &queue_name,
+                input: input.clone(),
+                start_options,
+                refill_per_sec: throttle_policy.refill_per_sec,
+                burst: throttle_policy.burst,
+                schedule_to_start: throttle_policy.schedule_to_start,
+                shard_id: trigger_exec_shard.as_i32(),
+            },
+        )
+        .await
+        {
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(_)) => {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_start_throttled(&workflow_name);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: Some("deferred"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                // The pre-increment above already wrote runs_started =
+                // runs_started + 1. If that new value reaches max_runs,
+                // transition to exhausted now, exactly like the "fired"
+                // success path below -- a deferred fire still spends budget.
+                {
+                    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+                    let new_runs_started = schedule.runs_started.saturating_add(1);
+                    if schedule
+                        .max_runs
+                        .is_some_and(|max| max > 0 && new_runs_started >= max)
+                    {
+                        let _ = diesel::update(
+                            sdsl::harvest_schedules
+                                .find(schedule.id)
+                                .filter(sdsl::exhausted_at.is_null()),
+                        )
+                        .set((
+                            sdsl::exhausted_at.eq(Some(triggered_at)),
+                            sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+                            sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                            sdsl::updated_at.eq(triggered_at),
+                        ))
+                        .execute(&mut sched_conn)
+                        .await;
+                    }
+                }
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(&schedule_display_name, "deferred");
+                return Ok(Json(ScheduleTriggerResponse {
+                    execution_id: None,
+                    workflow_id,
+                    triggered_at,
+                    outcome: "deferred".to_string(),
+                }));
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                trigger_throttle_bucket = Some(bucket_key);
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                // Active execution already resolves this reuse policy as a
+                // no-op; no token reserved, fall through to the normal start.
+            }
+            Err(e) => {
+                rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("throttle_admission_failed"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(&schedule_display_name, "start_failed");
+                return Err(map_error(e));
+            }
+        }
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut exec_conn,
         StartWorkflowParams {
@@ -15078,44 +15308,21 @@ async fn trigger_schedule_now(
     .await;
 
     let (exec_id_out, outcome) = match result {
-        Ok(exec_result) => (Some(exec_result.exec_id.as_uuid()), "fired"),
+        Ok(exec_result) => {
+            // AC-a (issue #607): an id-reuse short-circuit that attached to an
+            // existing run instead of creating one must refund its reserved
+            // token, mirroring every other admission call site.
+            if !exec_result.created
+                && let Some(ref bucket) = trigger_throttle_bucket
+            {
+                let _ =
+                    autumn_harvest::queue::refund_rate_limit_token(&mut exec_conn, bucket).await;
+            }
+            (Some(exec_result.exec_id.as_uuid()), "fired")
+        }
         Err(e) => {
             // Undo the pre-increment so the budget reflects actual started workflows.
-            // Do NOT guard on exhausted_at IS NULL: a scheduler tick could have raced
-            // and set exhausted_at after our pre-increment, so the guard would silently
-            // skip the rollback and leave runs_started inflated (issue #478).
-            {
-                use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
-                let _ = diesel::update(sdsl::harvest_schedules.find(schedule.id))
-                    .set((
-                        sdsl::runs_started.eq(sdsl::runs_started - 1),
-                        sdsl::updated_at.eq(triggered_at),
-                    ))
-                    .execute(&mut sched_conn)
-                    .await;
-                // If the decrement brought runs_started below max_runs, clear any
-                // exhaustion that our (now-reversed) pre-increment may have caused.
-                // next_run_at is intentionally not restored here — a future
-                // upsert_workflow_schedule call (e.g. on server restart for
-                // code-declared schedules) will recalculate it.
-                let _ = diesel::update(
-                    sdsl::harvest_schedules
-                        .find(schedule.id)
-                        .filter(sdsl::exhausted_at.is_not_null())
-                        .filter(sdsl::max_runs.is_null().or(diesel::dsl::sql::<
-                            diesel::sql_types::Bool,
-                        >(
-                            "runs_started < max_runs"
-                        ))),
-                )
-                .set((
-                    sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                    sdsl::exhausted_reason.eq(None::<String>),
-                    sdsl::updated_at.eq(triggered_at),
-                ))
-                .execute(&mut sched_conn)
-                .await;
-            }
+            rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_SCHEDULE_TRIGGER,
@@ -15195,6 +15402,51 @@ async fn trigger_schedule_now(
         triggered_at,
         outcome: outcome.to_string(),
     }))
+}
+
+/// Undo `trigger_schedule_now`'s pre-incremented `runs_started` budget slot
+/// when the trigger did not end up producing a run — a start failure, or
+/// (issue #607) an oversized input / throttle-admission error caught before
+/// the start primitive is ever called. Do NOT guard the decrement on
+/// `exhausted_at IS NULL`: a scheduler tick could have raced and set
+/// `exhausted_at` after the pre-increment, so the guard would silently skip
+/// the rollback and leave `runs_started` inflated (issue #478). If the
+/// decrement brought `runs_started` below `max_runs`, clear any exhaustion the
+/// (now-reversed) pre-increment may have caused; `next_run_at` is
+/// intentionally not restored here — a future `upsert_workflow_schedule` call
+/// (e.g. on server restart for code-declared schedules) will recalculate it.
+async fn rollback_manual_trigger_budget(
+    sched_conn: &mut diesel_async::AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+    let _ = diesel::update(sdsl::harvest_schedules.find(schedule_id))
+        .set((
+            sdsl::runs_started.eq(sdsl::runs_started - 1),
+            sdsl::updated_at.eq(at),
+        ))
+        .execute(sched_conn)
+        .await;
+    let _ = diesel::update(
+        sdsl::harvest_schedules
+            .find(schedule_id)
+            .filter(sdsl::exhausted_at.is_not_null())
+            .filter(
+                sdsl::max_runs
+                    .is_null()
+                    .or(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                        "runs_started < max_runs",
+                    )),
+            ),
+    )
+    .set((
+        sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        sdsl::exhausted_reason.eq(None::<String>),
+        sdsl::updated_at.eq(at),
+    ))
+    .execute(sched_conn)
+    .await;
 }
 
 // ── Schedule backfill (issue #177) ────────────────────────────────────────────
