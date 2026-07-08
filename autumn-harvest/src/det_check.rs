@@ -16,6 +16,13 @@
 //! | DET007 | Error    | Background task spawning                       |
 //! | DET008 | Error    | Direct network / filesystem I/O                |
 //! | DET009 | Warning  | Bare tracing calls (log amplification)         |
+//! | DET010 | Error*   | `HashMap`/`HashSet` iteration order (issue #785) |
+//!
+//! \* DET010 is command-aware: a flagged loop whose body schedules commands
+//! (`.execute_activity*`, `.spawn_child_workflow*`, `.execute_local_activity*`,
+//! `.timer(`, `.side_effect(`) is an Error; a command-free loop is a Warning.
+//! DET010 is the det_check twin of guardrail HVG011 (the issue proposed
+//! HVG010/DET010, but HVG010 was permanently assigned to SelectMacro/#600).
 //!
 //! # Suppression
 //!
@@ -489,7 +496,258 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
         }
     }
 
+    report.merge(check_hash_iteration(wf_name, body_lines, file));
+
     report
+}
+
+// ── DET010: HashMap/HashSet iteration order (issue #785) ─────────────────────
+//
+// The substring-table `Rule` engine above cannot express this rule (it needs
+// binding tracking plus loop-body extent), so DET010 is a bespoke pass over
+// the same extracted workflow bodies. It shares `DetFinding`/`DetSeverity`/
+// `DetSuppression`, `find_suppression`, and `strip_unparseable_content`, and
+// fires from the same `check_source`/`check_file`/`check_dir` front doors.
+//
+// Rule-ID note: issue #785's text proposed "DET/HVG010", but HVG010 was
+// already permanently assigned to SelectMacro (issue #600) and DET009 was the
+// previous det_check maximum — this rule ships as DET010 here and HVG011 in
+// the guardrail catalog / `#[workflow]` macro lint.
+
+const DET010_ID: &str = "DET010";
+
+/// Iteration methods on `HashMap`/`HashSet` whose order is hash-randomized.
+/// Only a SINGLE argument-free call from this set on a tracked ident is
+/// flagged — longer chains (`map.keys().sorted()`, `.collect::<Vec<_>>()`)
+/// are never flagged, which is how "already-sorted iterators are never
+/// flagged" holds.
+const DET010_ITER_METHODS: &[&str] = &[
+    "iter",
+    "iter_mut",
+    "keys",
+    "values",
+    "values_mut",
+    "drain",
+    "into_iter",
+    "into_keys",
+    "into_values",
+];
+
+/// Command markers for the severity decision: a loop body containing any of
+/// these schedules history-ordered durable commands, so hash-order iteration
+/// is an Error; a command-free loop is a Warning.
+const DET010_COMMAND_MARKERS: &[&str] = &[
+    ".execute_activity",
+    ".spawn_child_workflow",
+    ".execute_local_activity",
+    ".timer(",
+    ".side_effect(",
+];
+
+const DET010_MESSAGE: &str =
+    "Iterating a HashMap/HashSet inside a workflow function observes hash-randomized \
+     iteration order, which can differ between the original run and any replay on another \
+     worker process. Commands scheduled inside the loop are recorded in history in iteration \
+     order, so a reordered replay produces a different command sequence and diverges \
+     (non-determinism error / nd-block).";
+
+const DET010_ALTERNATIVE: &str =
+    "Use a BTreeMap/BTreeSet for any collection the workflow iterates, or collect the keys \
+     into a Vec and sort() it before iterating: `let mut keys: Vec<_> = \
+     map.keys().cloned().collect(); keys.sort();`.";
+
+/// Single ordered pass over a workflow body: track hash-typed `let` bindings
+/// (last-binding-wins per ident), then flag `for … in` loops over a tracked
+/// binding, with command-aware severity and `harvest-suppress` support.
+fn check_hash_iteration(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheckReport {
+    use std::collections::HashSet;
+
+    let mut report = DetCheckReport::default();
+    let mut tracked: HashSet<String> = HashSet::new();
+    let stripped: Vec<String> = body_lines
+        .iter()
+        .map(|&(_, line)| strip_unparseable_content(line))
+        .collect();
+
+    for (idx, &(source_line, raw_line)) in body_lines.iter().enumerate() {
+        let code = &stripped[idx];
+
+        // Bindings first: a `let` and a `for` on the same line appear in that
+        // source order.
+        record_det010_bindings(code, &mut tracked);
+
+        let Some(ident) = det010_for_loop_target(code, &tracked) else {
+            continue;
+        };
+
+        let prev_line = if idx > 0 { body_lines[idx - 1].1 } else { "" };
+        if let Some(reason) = find_suppression(DET010_ID, raw_line, prev_line) {
+            report.suppressions.push(DetSuppression {
+                rule_id: DET010_ID.to_string(),
+                reason,
+                location: DetLocation {
+                    file: file.to_string(),
+                    line: source_line,
+                },
+            });
+            continue;
+        }
+
+        let severity = if det010_loop_body_has_command(&stripped, idx) {
+            DetSeverity::Error
+        } else {
+            DetSeverity::Warning
+        };
+        report.findings.push(DetFinding {
+            rule_id: DET010_ID,
+            severity,
+            workflow_name: Some(wf_name.to_string()),
+            location: Some(DetLocation {
+                file: file.to_string(),
+                line: source_line,
+            }),
+            message: format!(
+                "[{DET010_ID}] {DET010_MESSAGE} (iterated hash-typed binding: `{ident}`)"
+            ),
+            alternative: DET010_ALTERNATIVE,
+        });
+    }
+
+    report
+}
+
+const fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Byte positions of whole-word occurrences of `word` in `code`.
+fn word_positions(code: &str, word: &str) -> Vec<usize> {
+    let bytes = code.as_bytes();
+    code.match_indices(word)
+        .filter(|&(pos, _)| {
+            let before_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+            let after = pos + word.len();
+            let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+            before_ok && after_ok
+        })
+        .map(|(pos, _)| pos)
+        .collect()
+}
+
+fn contains_word(code: &str, word: &str) -> bool {
+    !word_positions(code, word).is_empty()
+}
+
+const fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Updates `tracked` for every `let` binding on this (comment/string-stripped)
+/// line. A binding whose statement (up to the next `;` or end of line)
+/// mentions `HashMap`/`HashSet` as a whole word — type annotation,
+/// constructor call, or `.collect::<HashMap<..>>()` turbofish alike — marks
+/// the ident; any other `let` re-binding of that ident untracks it
+/// (last-binding-wins / shadowing). Destructuring patterns bind no single
+/// ident and are ignored — unknown binding shapes default to NOT tracking,
+/// since false positives are the top risk.
+fn record_det010_bindings(code: &str, tracked: &mut std::collections::HashSet<String>) {
+    for pos in word_positions(code, "let") {
+        let after_let = code[pos + 3..].trim_start();
+        let after_mut = after_let.strip_prefix("mut ").unwrap_or(after_let);
+        let ident: String = after_mut
+            .trim_start()
+            .chars()
+            .take_while(|&c| is_ident_char(c))
+            .collect();
+        if ident.is_empty() {
+            continue;
+        }
+
+        let stmt_end = code[pos..].find(';').map_or(code.len(), |rel| pos + rel);
+        let stmt = &code[pos..stmt_end];
+        if contains_word(stmt, "HashMap") || contains_word(stmt, "HashSet") {
+            tracked.insert(ident);
+        } else {
+            tracked.remove(&ident);
+        }
+    }
+}
+
+/// If this stripped line contains a `for … in <expr> {` loop whose iterated
+/// expression is a tracked hash-typed binding — a bare ident, `&ident` /
+/// `&mut ident`, or exactly one argument-free [`DET010_ITER_METHODS`] call on
+/// the ident — returns the binding ident.
+fn det010_for_loop_target(
+    code: &str,
+    tracked: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let for_pos = word_positions(code, "for").into_iter().next()?;
+    let after_for = &code[for_pos + 3..];
+    let header = after_for
+        .find('{')
+        .map_or(after_for, |brace| &after_for[..brace]);
+    let in_pos = header.rfind(" in ")?;
+    let expr = header[in_pos + 4..].trim();
+    let expr = expr.strip_prefix("&mut ").unwrap_or(expr);
+    let expr = expr.strip_prefix('&').unwrap_or(expr).trim();
+
+    // Bare tracked ident.
+    if !expr.is_empty() && expr.chars().all(is_ident_char) {
+        return tracked.contains(expr).then(|| expr.to_string());
+    }
+
+    // Exactly one argument-free iteration method call: `ident.method()`.
+    let (ident, call) = expr.split_once('.')?;
+    if ident.is_empty() || !ident.chars().all(is_ident_char) || call.contains('.') {
+        return None;
+    }
+    let method = call.strip_suffix("()")?;
+    if !DET010_ITER_METHODS.contains(&method) {
+        return None;
+    }
+    tracked.contains(ident).then(|| ident.to_string())
+}
+
+/// Scans the loop body starting at `start` (the `for` line itself) for
+/// command markers, using brace depth over the stripped lines to bound the
+/// body's extent. On the line where the loop closes, only text before the
+/// closing brace is searched.
+fn det010_loop_body_has_command(stripped: &[String], start: usize) -> bool {
+    let mut depth: u32 = 0;
+    let mut entered = false;
+
+    for line in stripped.iter().skip(start) {
+        let mut close_pos = None;
+        for (pos, ch) in line.char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    entered = true;
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if entered && depth == 0 {
+                        close_pos = Some(pos);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let search = close_pos.map_or(line.as_str(), |pos| &line[..pos]);
+        if DET010_COMMAND_MARKERS
+            .iter()
+            .any(|marker| search.contains(marker))
+        {
+            return true;
+        }
+        if close_pos.is_some() {
+            return false;
+        }
+    }
+
+    false
 }
 
 // ── Lexer helpers ─────────────────────────────────────────────────────────────

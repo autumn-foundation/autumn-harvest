@@ -1,6 +1,6 @@
 use proc_macro2::Span;
-use std::collections::HashMap;
-use syn::{Expr, visit::Visit};
+use std::collections::{HashMap, HashSet};
+use syn::{Expr, spanned::Spanned as _, visit::Visit};
 
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
@@ -23,6 +23,10 @@ pub struct DeterminismVisitor {
     catalog: HashMap<String, RuleInfo>,
     in_await_condition_closure: bool,
     pub context_param_name: Option<String>,
+    /// HVG011 (issue #785): local `let` bindings currently known to be
+    /// `HashMap`/`HashSet`-typed. Last-binding-wins per ident — a later
+    /// non-hash binding of the same ident untracks it (shadowing).
+    hash_locals: HashSet<String>,
 }
 
 impl DeterminismVisitor {
@@ -33,10 +37,25 @@ impl DeterminismVisitor {
             catalog,
             in_await_condition_closure: false,
             context_param_name: None,
+            hash_locals: HashSet::new(),
         }
     }
 
     fn add_finding(&mut self, rule_id: &str, span: Span) {
+        self.push_finding(rule_id, span, None);
+    }
+
+    /// Like [`Self::add_finding`] but overrides the catalog severity.
+    ///
+    /// Used by HVG011's command-aware downgrade: the catalog severity is the
+    /// class's worst case (HardBlocker — a command-emitting loop); a
+    /// command-free loop is surfaced as a Warning instead. Kept as a separate
+    /// path so the HVG008 rewrite logic in [`Self::push_finding`] is untouched.
+    fn add_finding_with_severity(&mut self, rule_id: &str, span: Span, severity: &str) {
+        self.push_finding(rule_id, span, Some(severity));
+    }
+
+    fn push_finding(&mut self, rule_id: &str, span: Span, severity_override: Option<&str>) {
         let actual_rule_id =
             if self.in_await_condition_closure && (rule_id == "HVG001" || rule_id == "HVG002") {
                 "HVG008"
@@ -46,13 +65,174 @@ impl DeterminismVisitor {
         if let Some(rule) = self.catalog.get(actual_rule_id) {
             self.findings.push(LinterFinding {
                 rule_id: rule.id.clone(),
-                severity: rule.severity.clone(),
+                severity: severity_override
+                    .map_or_else(|| rule.severity.clone(), ToString::to_string),
                 message: rule.explanation.clone(),
                 alternative: rule.alternative.clone(),
                 span,
             });
         }
     }
+
+    /// HVG011: returns the tracked ident when `expr` (a `for` loop's iterated
+    /// expression) iterates a locally-bound `HashMap`/`HashSet`.
+    ///
+    /// Deliberately narrow (issue #785's explicit syntactic boundary): only a
+    /// bare tracked ident, `&ident` / `&mut ident`, or a SINGLE
+    /// argument-free iteration method call on a tracked ident matches. Longer
+    /// chains (`map.keys().sorted()`, `.collect::<Vec<_>>()`) are never
+    /// flagged — that is how "already-sorted iterators are never flagged"
+    /// holds — and function parameters/fields are never tracked.
+    fn iterated_hash_local(&self, expr: &syn::Expr) -> Option<String> {
+        let path_ident = |e: &syn::Expr| -> Option<String> {
+            if let Expr::Path(p) = e {
+                p.path.get_ident().map(ToString::to_string)
+            } else {
+                None
+            }
+        };
+        let ident = match expr {
+            Expr::Path(_) => path_ident(expr)?,
+            Expr::Reference(r) => path_ident(&r.expr)?,
+            Expr::MethodCall(mc)
+                if mc.args.is_empty()
+                    && mc.turbofish.is_none()
+                    && HASH_ITER_METHODS.contains(&mc.method.to_string().as_str()) =>
+            {
+                path_ident(&mc.receiver)?
+            }
+            _ => return None,
+        };
+        self.hash_locals.contains(&ident).then_some(ident)
+    }
+}
+
+/// Iteration methods on `HashMap`/`HashSet` whose order is hash-randomized.
+const HASH_ITER_METHODS: &[&str] = &[
+    "iter",
+    "iter_mut",
+    "keys",
+    "values",
+    "values_mut",
+    "drain",
+    "into_iter",
+    "into_keys",
+    "into_values",
+];
+
+fn is_hash_collection_name(ident: &syn::Ident) -> bool {
+    ident == "HashMap" || ident == "HashSet"
+}
+
+/// `true` when a type annotation's path ends in `HashMap`/`HashSet`
+/// (any prefix, e.g. `std::collections::HashMap<K, V>`).
+fn type_is_hash_collection(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        tp.path
+            .segments
+            .last()
+            .is_some_and(|seg| is_hash_collection_name(&seg.ident))
+    } else {
+        false
+    }
+}
+
+/// `true` when a `let` initializer expression produces a `HashMap`/`HashSet`:
+/// a constructor call (`HashMap::new()`, `HashSet::from(..)`,
+/// `with_capacity` variants — any path prefix) or a chain ending in
+/// `.collect::<HashMap<..>>()` / `.collect::<HashSet<..>>()`.
+fn init_is_hash_collection(expr: &syn::Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            if let Expr::Path(p) = &*call.func {
+                let segments: Vec<_> = p.path.segments.iter().collect();
+                if segments.len() >= 2 {
+                    let ctor = segments[segments.len() - 1].ident.to_string();
+                    let collection = &segments[segments.len() - 2].ident;
+                    return is_hash_collection_name(collection)
+                        && matches!(
+                            ctor.as_str(),
+                            "new"
+                                | "from"
+                                | "from_iter"
+                                | "with_capacity"
+                                | "with_hasher"
+                                | "with_capacity_and_hasher"
+                        );
+                }
+            }
+            false
+        }
+        Expr::MethodCall(mc) if mc.method == "collect" => {
+            mc.turbofish.as_ref().is_some_and(|tf| {
+                tf.args.iter().any(|arg| {
+                    matches!(arg, syn::GenericArgument::Type(ty) if type_is_hash_collection(ty))
+                })
+            })
+        }
+        // `..collect::<HashMap<..>>()?` — unwrap the try.
+        Expr::Try(t) => init_is_hash_collection(&t.expr),
+        _ => false,
+    }
+}
+
+/// Extracts the bound ident (and whether its explicit type annotation is a
+/// hash collection) from a `let` pattern. Tuple/struct destructuring returns
+/// `None` — unknown binding shapes default to NOT tracking (false positives
+/// are the top risk for a HardBlocker lint).
+fn local_binding_target(pat: &syn::Pat) -> Option<(String, bool)> {
+    match pat {
+        syn::Pat::Ident(pi) => Some((pi.ident.to_string(), false)),
+        syn::Pat::Type(pt) => {
+            if let syn::Pat::Ident(pi) = &*pt.pat {
+                Some((pi.ident.to_string(), type_is_hash_collection(&pt.ty)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Command-call predicate for HVG011's severity decision: method names on the
+/// workflow context that schedule durable commands (history-ordered work).
+fn is_ctx_command_method(name: &str) -> bool {
+    name.starts_with("execute_activity")
+        || name.starts_with("spawn_child_workflow")
+        || name.starts_with("execute_local_activity")
+        || name == "timer"
+        || name == "side_effect"
+}
+
+/// Nested scan of a `for` loop body for command calls on the context param.
+struct CtxCommandFinder<'a> {
+    ctx_name: &'a str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for CtxCommandFinder<'_> {
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        if self.found {
+            return;
+        }
+        if let Expr::Path(p) = &*i.receiver
+            && p.path.is_ident(self.ctx_name)
+            && is_ctx_command_method(&i.method.to_string())
+        {
+            self.found = true;
+            return;
+        }
+        syn::visit::visit_expr_method_call(self, i);
+    }
+}
+
+fn block_contains_ctx_command(block: &syn::Block, ctx_name: &str) -> bool {
+    let mut finder = CtxCommandFinder {
+        ctx_name,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
 }
 
 fn path_to_string(path: &syn::Path) -> String {
@@ -179,6 +359,51 @@ fn is_io_path(path_str: &str) -> bool {
 }
 
 impl<'ast> Visit<'ast> for DeterminismVisitor {
+    fn visit_local(&mut self, i: &'ast syn::Local) {
+        // HVG011 binding tracking: mark `let` bindings that are hash-typed via
+        // an explicit type annotation, a `HashMap::new()`-style constructor
+        // call, or a `.collect::<HashMap<..>>()` turbofish. Last-binding-wins:
+        // re-binding the same ident to a non-hash type untracks it. Unknown
+        // binding shapes are never tracked (default to NOT flagging).
+        if let Some((name, annotated_hash)) = local_binding_target(&i.pat) {
+            let init_hash = i
+                .init
+                .as_ref()
+                .is_some_and(|init| init_is_hash_collection(&init.expr));
+            if annotated_hash || init_hash {
+                self.hash_locals.insert(name);
+            } else {
+                self.hash_locals.remove(&name);
+            }
+        }
+
+        // Delegate to nested traversal
+        syn::visit::visit_local(self, i);
+    }
+
+    fn visit_expr_for_loop(&mut self, i: &'ast syn::ExprForLoop) {
+        // HVG011: NonDeterministicIteration (issue #785; the issue proposed
+        // HVG010, permanently taken by SelectMacro/#600, hence HVG011).
+        // Command-aware severity: a loop body that schedules commands on the
+        // context param is a HardBlocker (the recorded command order would
+        // follow the randomized hash order and diverge on replay); a
+        // command-free loop is downgraded to a Warning.
+        if self.iterated_hash_local(&i.expr).is_some() {
+            let ctx_name = self.context_param_name.clone();
+            let has_command =
+                block_contains_ctx_command(&i.body, ctx_name.as_deref().unwrap_or("ctx"));
+            let span = i.expr.span();
+            if has_command {
+                self.add_finding("HVG011", span);
+            } else {
+                self.add_finding_with_severity("HVG011", span, "Warning");
+            }
+        }
+
+        // Delegate to nested traversal
+        syn::visit::visit_expr_for_loop(self, i);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
         if let Expr::Path(expr_path) = &*i.func {
@@ -490,6 +715,15 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
             severity: "HardBlocker".to_string(),
             explanation: "Using tokio::select!, futures::select!, or futures::select_biased! to race concurrent ctx-managed operations (activities, timers, signals, child workflows) inside a workflow body is a double footgun: (1) the winning branch depends on non-deterministic poll/arrival order, so a replay can pick a different branch than the original run and diverge; (2) the dropped loser branches do not durably cancel the underlying work -- a scheduled activity keeps running on a worker and a durable timer row stays live, leaking state that is never cleaned up.".to_string(),
             alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive (issue #600). It records the winning branch durably via a MarkerRecorded event so replay always resolves the same winner, and durably cancels every losing branch (activity task rows, child-workflow executions, or a losing durable timer) so no leaked in-flight work remains. For a single signal bounded by a deadline, ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive ctx.race()'s timer-plus-signal shape wraps.".to_string(),
+        },
+        // HVG011 (issue #785; the issue proposed HVG010, permanently taken by
+        // SelectMacro/#600 — IDs are never reused). Text must stay
+        // byte-identical to the guardrail.rs CATALOG entry.
+        RuleInfo {
+            id: "HVG011".to_string(),
+            severity: "HardBlocker".to_string(),
+            explanation: "Iterating a std::collections::HashMap or HashSet directly inside a workflow body observes the hash-iteration order, which is randomized per process (RandomState seeds differ across workers and restarts), so a replay can visit the entries in a different order than the original run. When the loop body schedules commands (ctx.execute_activity*, ctx.spawn_child_workflow*, ctx.execute_local_activity*, ctx.timer, ctx.side_effect), the command sequence is recorded in history in iteration order -- a reordered replay produces a different command sequence and diverges (non-determinism error / nd-block). Even a command-free loop can leak the non-deterministic order into workflow-local state and flip a later branch.".to_string(),
+            alternative: "Use a BTreeMap/BTreeSet (deterministic iteration order) for any collection a workflow iterates, or collect the keys into a Vec and sort() it before iterating: let mut keys: Vec<_> = map.keys().cloned().collect(); keys.sort(); for k in keys { ... }. Collections that are only ever point-looked-up (never iterated) are fine to keep as HashMap/HashSet.".to_string(),
         },
     ];
 
