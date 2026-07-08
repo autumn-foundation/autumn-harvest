@@ -836,10 +836,15 @@ it alone.
 2. List candidate executions: `harvest workflow list --state FAILED
    --workflow-name <name>` — the execution `error` field carries the
    `SagaCompensationFailed` message with the original step error AND the
-   per-compensation error strings. For author-caught cases the run may be
-   COMPLETED; search the execution history for the failing compensation
-   activity's `ActivityFailed` event instead
-   (`GET /api/harvest/workflows/{execution_id}/history`).
+   per-compensation error strings. If nothing is FAILED, the author caught
+   the error and the run COMPLETED normally: also list recent completions
+   (`harvest workflow list --state COMPLETED --workflow-name <name>
+   --limit 20`) and search each run's history
+   (`GET /api/harvest/workflows/{execution_id}/history`) for the
+   `saga_compensation_failed:` durable marker (`MarkerRecorded`) or the
+   `SagaCompensationFailed` error string, plus the failing compensation
+   activity's `ActivityFailed` event — either path always yields an
+   execution id to inspect.
 3. Read the `compensation_errors` list in the error message to see exactly
    which compensations failed and why.
 4. Determine the dangling resource for each failed compensation (the forward
