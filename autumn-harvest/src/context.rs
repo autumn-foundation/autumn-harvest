@@ -3274,6 +3274,25 @@ impl WorkflowContext {
         *seq
     }
 
+    /// `true` when this context is a [`WorkflowReplayer`](crate::testing::WorkflowReplayer)
+    /// strict/canary probe rather than an engine decision cycle.
+    ///
+    /// The distinction matters because the matcher alone cannot tell a
+    /// genuinely-live frontier from a probe's read of an old terminal
+    /// history: a pre-#801 cancelled run's history (`[..., WorkflowCancelled]`,
+    /// no saga marker) is byte-identical to the history the engine's live
+    /// cancel-and-compensate decision cycle sees at unwind time. In the
+    /// engine, `SagaMarkerMatch::LiveFrontier` there is always genuinely live
+    /// (a terminal execution gets no further decision cycles; the only
+    /// re-run of that shape is the at-least-once crash-recovery window, which
+    /// must re-count). In a probe it is always a retroactive read — counting
+    /// there would emit metrics for years-old runs and push fresh
+    /// `RecordMarker` commands the strict replayer correctly flags as
+    /// `<new commands emitted>` (Codex P2, PR #973 review).
+    const fn is_replay_probe(&self) -> bool {
+        self.strict_replay || self.canary_mode
+    }
+
     /// Observe the start of a non-empty saga compensation unwind
     /// (called by [`Saga`](crate::saga::Saga)'s `run_compensations`).
     ///
@@ -3295,6 +3314,13 @@ impl WorkflowContext {
     ///   unwind begins before the staged signal is awaited) is conservatively
     ///   uncounted as a whole — the same caveat [`Self::patched`] documents.
     ///
+    /// **Replay probes** (`WorkflowReplayer` strict/canary contexts) suppress
+    /// the frontier arms entirely — uncounted, no marker command — because a
+    /// marker-less frontier there is a pure read of an old history that was
+    /// never counted (canonically a pre-#801 cancelled run's trailing
+    /// `WorkflowCancelled`), not a live unwind; see
+    /// [`Self::is_replay_probe`].
+    ///
     /// Returns the unwind's [`SagaUnwindObservation`] — its sequence number
     /// plus whether it is **counted** — for the matching
     /// [`observe_saga_unwind_failed`](Self::observe_saga_unwind_failed) call,
@@ -3310,13 +3336,23 @@ impl WorkflowContext {
         let name = crate::replay::saga_compensated_marker_name(seq);
         let counted = match self.match_history(|m| m.match_saga_marker(&name)) {
             SagaMarkerMatch::LiveFrontier => {
-                self.push_command(WorkflowCommand::RecordMarker {
-                    name,
-                    details: Value::from(pending as u64),
-                });
-                self.metrics
-                    .record_saga_compensated(&self.workflow_name, &self.queue_name);
-                true
+                // A replay probe (WorkflowReplayer strict/canary) is a pure
+                // read: a marker-less frontier there is an old history that
+                // was never counted (e.g. a pre-#801 cancelled run whose
+                // terminal `WorkflowCancelled` the lookahead skips), NOT a
+                // live unwind — never count it retroactively, never push a
+                // fresh marker command mid-replay (Codex P2, PR #973 review).
+                if self.is_replay_probe() {
+                    false
+                } else {
+                    self.push_command(WorkflowCommand::RecordMarker {
+                        name,
+                        details: Value::from(pending as u64),
+                    });
+                    self.metrics
+                        .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    true
+                }
             }
             // Already counted on the cycle that first recorded the marker.
             SagaMarkerMatch::Recorded => true,
@@ -3356,8 +3392,11 @@ impl WorkflowContext {
     ) {
         let name = crate::replay::saga_compensation_failed_marker_name(observation.seq);
         match self.match_history(|m| m.match_saga_marker(&name)) {
+            // The probe gate mirrors observe_saga_unwind_start: a replay
+            // probe never records into a frontier, even for a counted unwind
+            // (its `counted` came from a marker already in history).
             SagaMarkerMatch::LiveFrontier | SagaMarkerMatch::DrainedSignalFrontier
-                if observation.counted =>
+                if observation.counted && !self.is_replay_probe() =>
             {
                 self.push_command(WorkflowCommand::RecordMarker {
                     name,
@@ -14351,5 +14390,59 @@ mod tests {
             "the cancel-frontier unwind must not re-emit once its marker is recorded"
         );
         assert!(ctx2.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn observe_saga_unwind_is_silent_in_a_strict_replay_probe_at_the_cancel_frontier() {
+        // Codex P2 (PR #973 review): a pre-#801 cancelled history ends in a
+        // marker-less `WorkflowCancelled`. In the ENGINE that shape is the
+        // genuinely-live cancel-and-compensate cycle and must count (the test
+        // above); in a `WorkflowReplayer` probe (strict/canary) the identical
+        // shape is a pure read of an old terminal run and must stay silent —
+        // no retroactive count, no fresh marker command mid-replay.
+        let mut history = started_history();
+        history.push(WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        });
+
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx = WorkflowContext::for_replay_strict(ExecutionId::new(), history)
+            .with_metrics(recorder.clone());
+        let obs = ctx.observe_saga_unwind_start(2);
+        assert!(
+            !obs.counted,
+            "a replay probe must never count a marker-less frontier"
+        );
+        ctx.observe_saga_unwind_failed(obs, 1);
+        assert_eq!(recorder.compensated.lock().unwrap().len(), 0);
+        assert_eq!(recorder.failed.lock().unwrap().len(), 0);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a replay probe must never push fresh marker commands"
+        );
+    }
+
+    #[test]
+    fn observe_saga_unwind_probe_still_reads_recorded_markers_as_counted() {
+        // The probe gate must not disturb the recorded arm: a marker-bearing
+        // history read under a strict probe is still `counted` (so the failed
+        // counter's coupling logic sees the same disposition the engine saw)
+        // while emitting nothing and pushing nothing.
+        let mut history = started_history();
+        history.push(WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        });
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: Value::from(2u64),
+        });
+
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx = WorkflowContext::for_replay_strict(ExecutionId::new(), history)
+            .with_metrics(recorder.clone());
+        let obs = ctx.observe_saga_unwind_start(2);
+        assert!(obs.counted, "a recorded marker is counted even in a probe");
+        assert_eq!(recorder.compensated.lock().unwrap().len(), 0);
+        assert!(ctx.drain_commands().is_empty());
     }
 }

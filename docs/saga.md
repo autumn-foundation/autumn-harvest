@@ -191,7 +191,12 @@ dashboards never divide by zero or exceed 100%). Two concrete consequences:
 - The **cancel-and-compensate pattern is counted**: a trailing
   `WorkflowCancelled` has no workflow-command counterpart and never leaves
   the replay cursor, so the marker matcher treats it as transparent — the
-  unwind of a freshly-cancelled run is the live frontier.
+  unwind of a freshly-cancelled run is the live frontier. In a
+  **`WorkflowReplayer` strict/canary probe** the byte-identical history
+  shape (a pre-#801 marker-less *terminal* cancelled run) is a pure read,
+  not a live unwind: the observe layer suppresses the frontier arms in probe
+  contexts, so old cancelled histories are never counted retroactively and
+  the strict replayer never sees a fresh marker command.
 
 **Accepted edges** (documented deliberately):
 

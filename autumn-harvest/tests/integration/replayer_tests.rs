@@ -3441,3 +3441,50 @@ async fn replayer_succeeds_for_cancel_and_compensate_history_with_marker() {
         "a replay of the recorded cancel-and-compensate unwind emits nothing"
     );
 }
+
+/// Codex P2 (PR #973 review): the normal terminal shape for a **pre-#801**
+/// cancelled run is `[..., WorkflowCancelled]` with NO saga marker anywhere —
+/// the cancellation event itself is the last recorded event. A replay probe
+/// of that history against the cancel-and-compensate workflow must stay
+/// uncounted and command-free: the matcher's cancellation-transparency
+/// lookahead reports the frontier, but a `WorkflowReplayer` run is a pure
+/// read — it must never retroactively count an old history nor push a fresh
+/// marker command mid-replay.
+#[tokio::test]
+async fn replayer_pre_marker_cancelled_history_stays_uncounted() {
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        },
+    ];
+
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "saga_cancel_and_compensate_workflow",
+            saga_cancel_and_compensate_workflow,
+        )
+        .with_metrics(recorder.clone())
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a pre-#801 marker-less cancelled history must replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a replay probe must never retroactively count a pre-#801 cancelled history"
+    );
+    assert_eq!(recorder.failed.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

@@ -279,7 +279,12 @@ pub enum SagaMarkerMatch {
     /// pattern: the cancellation event has no workflow-command counterpart
     /// and never leaves the cursor, so it must not hide the frontier from a
     /// metrics-only marker). The caller records a fresh marker and emits the
-    /// counter exactly here.
+    /// counter exactly here — **unless** the context is a `WorkflowReplayer`
+    /// strict/canary probe: the matcher cannot distinguish the engine's
+    /// genuinely-live cancel-and-compensate cycle from a probe's read of a
+    /// pre-#801 marker-less *terminal* cancelled history (the two histories
+    /// are byte-identical), so the caller additionally gates this arm on
+    /// `WorkflowContext::is_replay_probe` (Codex P2, PR #973 review).
     LiveFrontier,
     /// Replaying pre-drain, but after stashing trailing un-awaited signal
     /// events the cursor is past the end of recorded history — a
