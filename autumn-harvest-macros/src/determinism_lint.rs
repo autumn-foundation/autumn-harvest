@@ -498,3 +498,292 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
     }
     rules
 }
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod hvg011_tests {
+    //! Visitor-level tests for HVG011 (issue #785): HashMap/HashSet
+    //! iteration-order determinism.
+    //!
+    //! NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
+    //! already permanently assigned to SelectMacro (issue #600) and rule IDs
+    //! are never reused, so the iteration-order rule ships as HVG011.
+
+    use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
+    use syn::visit::Visit as _;
+
+    fn lint_with_ctx(src: &str, ctx_name: &str) -> Vec<LinterFinding> {
+        let item_fn: syn::ItemFn = syn::parse_str(src).expect("test source must parse");
+        let mut visitor = DeterminismVisitor::new(load_catalog_metadata());
+        visitor.context_param_name = Some(ctx_name.to_string());
+        visitor.visit_item_fn(&item_fn);
+        visitor.findings
+    }
+
+    fn lint(src: &str) -> Vec<LinterFinding> {
+        lint_with_ctx(src, "ctx")
+    }
+
+    fn hvg011_severities(findings: &[LinterFinding]) -> Vec<String> {
+        findings
+            .iter()
+            .filter(|f| f.rule_id == "HVG011")
+            .map(|f| f.severity.clone())
+            .collect()
+    }
+
+    #[test]
+    fn command_emitting_hashmap_loop_is_hard_blocker() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut m: HashMap<String, u64> = HashMap::new();
+                for (k, v) in &m {
+                    ctx.execute_activity_raw("debit", input, "default").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "command-emitting HashMap loop must be a HardBlocker"
+        );
+    }
+
+    #[test]
+    fn command_free_hashmap_loop_is_warning() {
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut m: HashMap<String, u64> = HashMap::new();
+                let mut total = 0u64;
+                for (_k, v) in &m {
+                    total += v;
+                }
+                Ok(())
+            }
+            ",
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["Warning".to_string()],
+            "command-free HashMap loop must be downgraded to Warning"
+        );
+    }
+
+    #[test]
+    fn fully_qualified_hashset_new_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut s = std::collections::HashSet::new();
+                for item in s.iter() {
+                    ctx.spawn_child_workflow_raw("child", item).await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+    }
+
+    #[test]
+    fn iteration_method_forms_are_flagged() {
+        for method in [
+            "iter()",
+            "iter_mut()",
+            "keys()",
+            "values()",
+            "values_mut()",
+            "drain()",
+            "into_iter()",
+            "into_keys()",
+            "into_values()",
+        ] {
+            let src = format!(
+                r#"
+                async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{
+                    let mut m: HashMap<String, u64> = HashMap::new();
+                    for x in m.{method} {{
+                        ctx.execute_activity_raw("a", x, "q").await?;
+                    }}
+                    Ok(())
+                }}
+                "#
+            );
+            let findings = lint(&src);
+            assert_eq!(
+                hvg011_severities(&findings).len(),
+                1,
+                "`for x in m.{method}` must be flagged exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn mut_borrow_iteration_is_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let mut m: HashMap<String, u64> = HashMap::new();
+                for (_k, v) in &mut m {
+                    ctx.timer("t", 1).await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+    }
+
+    #[test]
+    fn collect_turbofish_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = items.into_iter().collect::<std::collections::HashMap<String, u64>>();
+                for (k, _v) in &m {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+    }
+
+    #[test]
+    fn hashmap_from_binding_is_tracked() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m = HashMap::from([("a", 1u64)]);
+                for (k, _v) in &m {
+                    ctx.execute_local_activity_raw("a", k).await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+    }
+
+    #[test]
+    fn shadowing_with_vec_untracks_the_ident() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let m: Vec<u64> = m.values().copied().collect();
+                for v in &m {
+                    ctx.execute_activity_raw("a", v, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "a later non-hash binding of the same ident must untrack it"
+        );
+    }
+
+    #[test]
+    fn ordered_collections_and_params_are_never_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext, param_map: HashMap<String, u64>) -> Result<(), String> {
+                let b: BTreeMap<String, u64> = BTreeMap::new();
+                for (k, _v) in &b {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                let v: Vec<u64> = Vec::new();
+                for x in &v {
+                    ctx.execute_activity_raw("a", x, "q").await?;
+                }
+                for (k, _v) in &param_map {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "BTreeMap/Vec/function-parameter iteration must never be flagged"
+        );
+    }
+
+    #[test]
+    fn sorted_keys_vec_and_longer_chains_are_never_flagged() {
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let mut keys: Vec<String> = m.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                for k in m.keys().sorted() {
+                    ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "sorted-keys Vec and multi-call iterator chains must never be flagged"
+        );
+    }
+
+    #[test]
+    fn iteration_inside_side_effect_closure_is_not_flagged() {
+        // The side_effect closure subtree is deliberately not visited (the
+        // existing escape hatch) — iteration inside it must not be flagged.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                let _ = ctx.side_effect("sum", || {
+                    let mut total = 0u64;
+                    for (_k, v) in &m {
+                        total += v;
+                    }
+                    total
+                });
+                Ok(())
+            }
+            "#,
+        );
+        assert!(
+            hvg011_severities(&findings).is_empty(),
+            "iteration inside a ctx.side_effect closure must not be flagged"
+        );
+    }
+
+    #[test]
+    fn renamed_context_param_is_used_for_command_detection() {
+        let findings = lint_with_ctx(
+            r#"
+            async fn wf(wf_ctx: &WorkflowContext) -> Result<(), String> {
+                let m: HashMap<String, u64> = HashMap::new();
+                for (k, _v) in &m {
+                    wf_ctx.execute_activity_raw("a", k, "q").await?;
+                }
+                Ok(())
+            }
+            "#,
+            "wf_ctx",
+        );
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()],
+            "command detection must respect the renamed context param"
+        );
+    }
+}

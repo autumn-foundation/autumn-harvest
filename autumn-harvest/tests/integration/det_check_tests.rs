@@ -771,3 +771,216 @@ fn regression_det008_direct_io() {
     );
     assert!(report.findings.iter().any(|f| f.rule_id == "DET008"));
 }
+
+// ── DET010: HashMap/HashSet iteration order (issue #785) ──────────────────
+//
+// NOTE on the rule ID: issue #785's text proposed "DET/HVG010" but HVG010 was
+// already permanently assigned to SelectMacro (issue #600) and DET009 was the
+// current det_check maximum, so this rule ships as DET010 in det_check and
+// HVG011 in the guardrail catalog / macro lint.
+
+#[test]
+fn det010_flags_hashmap_loop_with_command_as_error() {
+    let src = wf("let mut m: HashMap<String, u64> = HashMap::new();\n    for (k, v) in &m {\n        ctx.execute_activity_raw(\"debit\", serde_json::json!(k), \"default\").await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010 finding, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Error),
+        "command-emitting HashMap loop must be Error, got: {finding:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn det010_pure_computation_hashmap_loop_is_warning() {
+    let src = wf("let mut m: HashMap<String, u64> = HashMap::new();\n    let mut total = 0u64;\n    for (_k, v) in &m {\n        total += v;\n    }");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010 warning finding, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Warning),
+        "command-free HashMap loop must be Warning, got: {finding:?}"
+    );
+    assert!(
+        !report.has_hard_blockers(),
+        "a command-free loop must not be a hard blocker"
+    );
+}
+
+#[test]
+fn det010_flags_hashset_loop_with_command() {
+    let src = wf("let mut s: HashSet<String> = HashSet::new();\n    for item in &s {\n        ctx.spawn_child_workflow_raw(\"child\", serde_json::json!(item)).await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected DET010 for HashSet, got: {report:?}"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+#[test]
+fn det010_flags_hashset_new_inferred_binding() {
+    // Binding hash-typed via the initializer only (no type annotation).
+    let src = wf("let mut s = HashSet::new();\n    s.insert(1u64);\n    for item in s.iter() {\n        ctx.timer(\"t\", *item).await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "HashSet::new() initializer must mark the binding, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_flags_iter_method_forms() {
+    for method in ["iter()", "keys()", "values()", "drain()", "into_iter()"] {
+        let src = wf(&format!(
+            "let mut m: HashMap<String, u64> = HashMap::new();\n    for x in m.{method} {{\n        ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n    }}"
+        ));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET010"),
+            "`for x in m.{method}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det010_flags_mut_borrow_form() {
+    let src = wf("let mut m: HashMap<String, u64> = HashMap::new();\n    for (_k, v) in &mut m {\n        ctx.side_effect(\"se\", || *v).await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "`for .. in &mut m` must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_flags_collect_turbofish_binding() {
+    let src = wf("let m = items.into_iter().collect::<HashMap<String, u64>>();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        ".collect::<HashMap<..>>() binding must be tracked, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_shadowing_with_vec_untracks_the_ident() {
+    // Last binding wins: re-binding `m` as a Vec must clear the hash mark.
+    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    let m: Vec<u64> = m.values().copied().collect();\n    for v in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(v), \"q\").await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a later non-hash binding of the same ident must untrack it, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_never_flags_ordered_collections() {
+    for binding in [
+        "let m: BTreeMap<String, u64> = BTreeMap::new();",
+        "let m: BTreeSet<String> = BTreeSet::new();",
+        "let m: Vec<String> = Vec::new();",
+        "let m: IndexMap<String, u64> = IndexMap::new();",
+        "let m = [1u64, 2, 3];",
+    ] {
+        let src = wf(&format!(
+            "{binding}\n    for x in &m {{\n        ctx.execute_activity_raw(\"a\", serde_json::json!(x), \"q\").await?;\n    }}"
+        ));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET010"),
+            "ordered collection `{binding}` must never be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det010_sorted_keys_vec_is_never_flagged() {
+    // The recommended remediation itself must pass: collect keys, sort, iterate.
+    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    let mut keys: Vec<String> = m.keys().cloned().collect();\n    keys.sort();\n    for k in keys {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "sorted-keys Vec iteration must never be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_longer_iterator_chain_is_not_flagged() {
+    // Chains past a single method call are deliberately out of scope — this is
+    // how "already-sorted iterators are never flagged" holds.
+    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    for k in m.keys().sorted() {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "multi-call iterator chain must not be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_function_parameter_map_is_not_flagged() {
+    // Only locally `let`-bound hash collections are tracked (explicit
+    // syntactic boundary from issue #785) — parameters are never flagged.
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext, map: HashMap<String, u64>) -> Result<(), String> {\n    for (k, _v) in &map {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "function-parameter map must not be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_suppression_is_honored_and_reported() {
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let m: HashMap<String, u64> = HashMap::new();\n    // harvest-suppress: DET010 \"single entry map; order cannot matter\"\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "suppressed DET010 must not produce a finding, got: {report:?}"
+    );
+    assert!(
+        report
+            .suppressions
+            .iter()
+            .any(|s| s.rule_id == "DET010" && !s.reason.is_empty()),
+        "DET010 suppression must be echoed into report.suppressions, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_activity_bodies_are_never_flagged() {
+    let src = act("let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        println!(\"{k}\");\n    }");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "activity bodies must never be flagged for DET010, got: {report:?}"
+    );
+}
+
+#[test]
+fn det010_finding_carries_metadata() {
+    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .expect("DET010 finding");
+    assert_eq!(finding.workflow_name.as_deref(), Some("test_wf"));
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(loc.file, "test.rs");
+    assert!(loc.line > 0);
+    assert!(!finding.message.is_empty());
+    assert!(
+        finding.alternative.contains("BTreeMap") || finding.alternative.contains("sort"),
+        "alternative must point at BTreeMap or sorted-Vec remediation, got: {}",
+        finding.alternative
+    );
+}
