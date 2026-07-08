@@ -4835,6 +4835,7 @@ pub const fn management_api_response_fields()
             Some(&[
                 "schedule_id",
                 "status",
+                "next_run_at",
                 "runs",
                 "summary",
                 "limit",
@@ -14410,6 +14411,39 @@ async fn list_schedule_runs_handler(
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // Resolve the schedule row once (on whichever shard owns it) so we can echo
+    // `next_run_at` and, critically, 404 an unknown id rather than returning a
+    // silently-empty run list (issue #762).
+    let schedule_row: Option<HarvestSchedule> = {
+        use autumn_harvest::schema::harvest_schedules::dsl;
+        let mut found: Option<HarvestSchedule> = None;
+        for (_shard, shard_pool) in pool.iter_shards() {
+            // An unreachable shard is skipped rather than 500ing the whole request
+            // (mirroring the run fan-out's partial-result philosophy). If the schedule
+            // lives only on a down shard the lookup degrades to a 404, never a 500.
+            let mut conn = match acquire_conn(shard_pool).await {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            let row: Option<HarvestSchedule> = dsl::harvest_schedules
+                .find(schedule_id)
+                .select(HarvestSchedule::as_select())
+                .first(&mut conn)
+                .await
+                .optional()
+                .map_err(database_error)
+                .map_err(map_error)?;
+            if row.is_some() {
+                found = row;
+                break;
+            }
+        }
+        found
+    };
+    let schedule = schedule_row
+        .ok_or_else(|| AutumnError::not_found_msg(format!("schedule {schedule_id}")))?;
+    let next_run_at = schedule.next_run_at;
+
     // Fetch limit + 1 per shard so the merge can detect whether a further page
     // exists across the combined keyset.
     let query = autumn_harvest::ScheduleRunQuery {
@@ -14490,6 +14524,7 @@ async fn list_schedule_runs_handler(
 
     Ok(Json(schedule_runs::build_runs_response(
         schedule_id,
+        next_run_at,
         params.limit,
         observations,
     )))

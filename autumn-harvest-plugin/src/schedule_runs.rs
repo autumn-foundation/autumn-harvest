@@ -64,18 +64,61 @@ pub struct ScheduleRunEntry {
     pub completed_at: Option<DateTime<Utc>>,
     /// Current execution state.
     pub state: String,
+    /// At-a-glance collapse of `state` into an outcome bucket (issue #762):
+    /// `completed`/`failed`/`timed_out`/`cancelled`/`terminated`/`running`, plus
+    /// `continued_as_new`/`paused`/`other` for the states outside the AC's six.
+    pub outcome: &'static str,
+    /// Terminal failure cause, first line only, populated **only** for a
+    /// terminally-failed run (`FAILED`/`TIMED_OUT`); `null` otherwise (issue #762).
+    pub error: Option<String>,
     /// Dispatch origin (`scheduled`/`backfill`/`manual_trigger`).
     pub origin: Option<String>,
 }
 
+/// Collapse an execution `state` into a compact per-run outcome bucket (issue #762).
+///
+/// Returns the six buckets the AC names (`completed`/`failed`/`timed_out`/
+/// `cancelled`/`terminated`/`running`) plus `continued_as_new`/`paused`/`other`
+/// for the states outside that list, so an unexpected/active state is never
+/// mislabelled as one of the six.
+#[must_use]
+pub fn collapse_outcome(state: &str) -> &'static str {
+    match state {
+        "COMPLETED" => "completed",
+        "FAILED" => "failed",
+        "TIMED_OUT" => "timed_out",
+        "CANCELLED" => "cancelled",
+        "TERMINATED" => "terminated",
+        "CONTINUED_AS_NEW" => "continued_as_new",
+        "RUNNING" => "running",
+        "PAUSED" => "paused",
+        _ => "other",
+    }
+}
+
+/// The terminal failure cause for display: the raw `error`'s first line, but only
+/// when the run is terminally-*failed* (`FAILED`/`TIMED_OUT`) — a cancel/terminate
+/// carries no failure cause, so its `error` (if any) is suppressed (issue #762).
+fn terminal_failed_error(state: &str, error: Option<String>) -> Option<String> {
+    if state == "FAILED" || state == "TIMED_OUT" {
+        error.map(|e| e.lines().next().unwrap_or("").to_string())
+    } else {
+        None
+    }
+}
+
 impl From<ScheduleRunRow> for ScheduleRunEntry {
     fn from(row: ScheduleRunRow) -> Self {
+        let outcome = collapse_outcome(&row.state);
+        let error = terminal_failed_error(&row.state, row.error);
         Self {
             execution_id: row.execution_id,
             nominal_fire_time: row.nominal_fire_time,
             started_at: row.started_at,
             completed_at: row.completed_at,
             state: row.state,
+            outcome,
+            error,
             origin: row.origin,
         }
     }
@@ -148,7 +191,11 @@ pub struct ScheduleRunsResponse {
     pub schedule_id: Uuid,
     /// Cross-shard completeness of this response.
     pub status: RunsReportStatus,
-    /// The schedule's runs, newest-first, capped at `limit`.
+    /// The schedule's next expected fire time (issue #762), echoed so a caller gets
+    /// "last N actual + next expected" without a second call. `null` when the
+    /// schedule has no upcoming fire (paused, exhausted, or manual-only).
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// The schedule's runs, newest-slot-first, capped at `limit`.
     pub runs: Vec<ScheduleRunEntry>,
     /// Per-state cadence summary over the window (scheduled-origin only).
     pub summary: ScheduleRunSummary,
@@ -161,11 +208,12 @@ pub struct ScheduleRunsResponse {
     pub shards: Vec<RunsShardInspection>,
 }
 
-/// Default page size when `limit` is omitted.
-pub const DEFAULT_LIMIT: i64 = 100;
-/// Hard cap on `limit`; larger requests are clamped down (and reported via the
-/// echoed `limit` + `next_cursor`, never silently truncated to a smaller number).
-pub const MAX_LIMIT: i64 = 1000;
+/// Default page size when `limit` is omitted (issue #762).
+pub const DEFAULT_LIMIT: i64 = 20;
+/// Hard cap on `limit` (issue #762); larger requests are clamped down per AC2's
+/// "clamped 1–200" (and reported via the echoed `limit` + `next_cursor`, never
+/// silently truncated to a smaller number). A `limit < 1` or non-integer is a `400`.
+pub const MAX_LIMIT: i64 = 200;
 
 /// Parsed query parameters for `GET /admin/schedules/{id}/runs` (issue #534).
 ///
@@ -184,7 +232,8 @@ pub struct ScheduleRunsParams {
     pub since: Option<DateTime<Utc>>,
     /// Exclusive upper bound on `started_at`.
     pub until: Option<DateTime<Utc>>,
-    /// Keyset cursor `(started_at, execution_id)`.
+    /// Keyset cursor `(sort_key, execution_id)`, where `sort_key` is the logical-slot
+    /// ordering key (`COALESCE(scheduled_for, started_at)`, issue #762).
     pub cursor: Option<(DateTime<Utc>, Uuid)>,
     /// Applied row cap.
     pub limit: i64,
@@ -239,11 +288,13 @@ impl ScheduleRunsParams {
     }
 }
 
-/// Encode a `(started_at, execution_id)` keyset cursor into the opaque token
-/// format `"<rfc3339_micros>|<uuid>"` (matching the #514 workflow-list cursor).
+/// Encode a `(sort_key, execution_id)` keyset cursor into the opaque token format
+/// `"<rfc3339_micros>|<uuid>"` (matching the #514 workflow-list cursor). `sort_key`
+/// is the logical-slot ordering key (`COALESCE(scheduled_for, started_at)`, issue
+/// #762) so pagination stays consistent with the newest-slot-first ordering.
 #[must_use]
-pub fn encode_cursor(started_at: DateTime<Utc>, execution_id: Uuid) -> String {
-    crate::api::encode_workflow_list_cursor_raw(&started_at, &execution_id)
+pub fn encode_cursor(sort_key: DateTime<Utc>, execution_id: Uuid) -> String {
+    crate::api::encode_workflow_list_cursor_raw(&sort_key, &execution_id)
 }
 
 /// Parse an opaque keyset cursor token back into `(started_at, execution_id)`.
@@ -266,16 +317,19 @@ pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
 
 /// Merge per-shard observations into the final run-history response (pure, no DB).
 ///
-/// Runs are merged across shards, sorted newest-first (`started_at DESC,
-/// execution_id DESC`), and truncated to `limit`. Each shard is queried for
-/// `limit + 1` rows, so a merged total exceeding `limit` means a further page
-/// exists: the list is truncated and `next_cursor` is derived from the last kept
-/// row. The cadence summary sums each shard's scheduled-origin per-state counts.
-/// `status` is `complete` only when every shard was inspected.
+/// Runs are merged across shards, sorted newest-slot-first
+/// (`COALESCE(scheduled_for, started_at) DESC, execution_id DESC` — the same
+/// logical-slot key [`ScheduleRunRow::sort_key`] the core query orders by), and
+/// truncated to `limit`. Each shard is queried for `limit + 1` rows, so a merged
+/// total exceeding `limit` means a further page exists: the list is truncated and
+/// `next_cursor` is derived from the last kept row's slot key. The cadence summary
+/// sums each shard's scheduled-origin per-state counts. `status` is `complete` only
+/// when every shard was inspected. `next_run_at` is echoed from the schedule row.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_runs_response(
     schedule_id: Uuid,
+    next_run_at: Option<DateTime<Utc>>,
     limit: i64,
     observations: Vec<ShardRunsObservation>,
 ) -> ScheduleRunsResponse {
@@ -284,19 +338,20 @@ pub fn build_runs_response(
     let inspected = observations.iter().filter(|o| o.error.is_none()).count();
     let unavailable = observations.iter().filter(|o| o.error.is_some()).count();
 
-    // Merge runs across shards and sort newest-first by the keyset key.
+    // Merge runs across shards and sort newest-slot-first by the keyset key
+    // (logical slot, falling back to started_at for slot-less manual fires).
     let mut merged: Vec<ScheduleRunRow> = observations
         .iter()
         .flat_map(|o| o.runs.iter().cloned())
         .collect();
     merged.sort_by(|a, b| {
-        b.started_at
-            .cmp(&a.started_at)
+        b.sort_key()
+            .cmp(&a.sort_key())
             .then_with(|| b.execution_id.cmp(&a.execution_id))
     });
 
     // A merged total beyond `limit` means at least one more row exists in the
-    // window: truncate and emit a cursor anchored on the last kept row.
+    // window: truncate and emit a cursor anchored on the last kept row's slot key.
     let keep = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_more = merged.len() > keep;
     if has_more {
@@ -305,7 +360,7 @@ pub fn build_runs_response(
     let next_cursor = if has_more {
         merged
             .last()
-            .map(|row| encode_cursor(row.started_at, row.execution_id))
+            .map(|row| encode_cursor(row.sort_key(), row.execution_id))
     } else {
         None
     };
@@ -338,6 +393,7 @@ pub fn build_runs_response(
     ScheduleRunsResponse {
         schedule_id,
         status,
+        next_run_at,
         runs: merged.into_iter().map(ScheduleRunEntry::from).collect(),
         summary,
         limit,
@@ -367,6 +423,27 @@ mod tests {
             completed_at: None,
             state: state.to_string(),
             origin: Some(origin.to_string()),
+            error: None,
+        }
+    }
+
+    /// A run with an explicit `scheduled_for` slot distinct from `started_at`, and an
+    /// optional recorded error (for slot-ordering + error/outcome coverage).
+    fn slot_run(
+        exec: u128,
+        slot: Option<i64>,
+        started: i64,
+        state: &str,
+        error: Option<&str>,
+    ) -> ScheduleRunRow {
+        ScheduleRunRow {
+            execution_id: uid(exec),
+            nominal_fire_time: slot.map(at),
+            started_at: at(started),
+            completed_at: None,
+            state: state.to_string(),
+            origin: Some("scheduled".to_string()),
+            error: error.map(ToOwned::to_owned),
         }
     }
 
@@ -398,6 +475,7 @@ mod tests {
     fn merges_runs_newest_first_across_shards() {
         let resp = build_runs_response(
             uid(1),
+            None,
             10,
             vec![
                 obs(
@@ -429,6 +507,7 @@ mod tests {
         // 3 rows available, limit 2: each shard returned up to limit+1=3.
         let resp = build_runs_response(
             uid(1),
+            None,
             2,
             vec![obs(
                 0,
@@ -459,6 +538,7 @@ mod tests {
     fn no_cursor_when_exactly_at_limit() {
         let resp = build_runs_response(
             uid(1),
+            None,
             2,
             vec![obs(
                 0,
@@ -481,6 +561,7 @@ mod tests {
     fn summary_sums_scheduled_counts_across_shards() {
         let resp = build_runs_response(
             uid(1),
+            None,
             10,
             vec![
                 obs(0, vec![], counts(&[("COMPLETED", 20), ("FAILED", 2)]), None),
@@ -504,6 +585,7 @@ mod tests {
     fn unavailable_shard_makes_partial_and_is_named() {
         let resp = build_runs_response(
             uid(1),
+            None,
             10,
             vec![
                 obs(
@@ -529,6 +611,7 @@ mod tests {
     fn all_shards_unavailable_is_unavailable_not_error() {
         let resp = build_runs_response(
             uid(1),
+            None,
             10,
             vec![obs(0, vec![], vec![], Some("pool missing"))],
         );
@@ -626,5 +709,153 @@ mod tests {
             serde_json::to_value(RunsReportStatus::Partial).unwrap(),
             serde_json::json!("partial")
         );
+    }
+
+    // ── issue #762 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn collapse_outcome_maps_every_state() {
+        assert_eq!(collapse_outcome("COMPLETED"), "completed");
+        assert_eq!(collapse_outcome("FAILED"), "failed");
+        assert_eq!(collapse_outcome("TIMED_OUT"), "timed_out");
+        assert_eq!(collapse_outcome("CANCELLED"), "cancelled");
+        assert_eq!(collapse_outcome("TERMINATED"), "terminated");
+        assert_eq!(collapse_outcome("RUNNING"), "running");
+        // States outside the AC's six are handled deterministically, never
+        // mislabelled as one of the six.
+        assert_eq!(collapse_outcome("CONTINUED_AS_NEW"), "continued_as_new");
+        assert_eq!(collapse_outcome("PAUSED"), "paused");
+        assert_eq!(collapse_outcome("SUSPENDED"), "other");
+        assert_eq!(collapse_outcome("something_new"), "other");
+    }
+
+    #[test]
+    fn entry_error_only_for_terminal_failed_and_first_line_only() {
+        // FAILED / TIMED_OUT surface the first line of the error.
+        let failed: ScheduleRunEntry = slot_run(
+            1,
+            Some(100),
+            100,
+            "FAILED",
+            Some("boom: bad thing\nstack line 2"),
+        )
+        .into();
+        assert_eq!(failed.outcome, "failed");
+        assert_eq!(failed.error.as_deref(), Some("boom: bad thing"));
+
+        let timed: ScheduleRunEntry =
+            slot_run(2, Some(100), 100, "TIMED_OUT", Some("deadline exceeded")).into();
+        assert_eq!(timed.error.as_deref(), Some("deadline exceeded"));
+
+        // A cancel/terminate is terminal but not *failed*: its error is suppressed.
+        let cancelled: ScheduleRunEntry =
+            slot_run(3, Some(100), 100, "CANCELLED", Some("operator cancel")).into();
+        assert_eq!(cancelled.outcome, "cancelled");
+        assert!(cancelled.error.is_none(), "non-failed terminal hides error");
+
+        // COMPLETED never carries an error even if the column somehow held one.
+        let ok: ScheduleRunEntry = slot_run(4, Some(100), 100, "COMPLETED", None).into();
+        assert_eq!(ok.outcome, "completed");
+        assert!(ok.error.is_none());
+    }
+
+    #[test]
+    fn merges_newest_slot_first_not_started_first() {
+        // Slot order and start order deliberately disagree: the backfill run has an
+        // *older* slot but a *newer* start time. Slot-DESC must win.
+        let resp = build_runs_response(
+            uid(1),
+            None,
+            10,
+            vec![obs(
+                0,
+                vec![
+                    // slot 300, started 300 (scheduled)
+                    slot_run(10, Some(300), 300, "COMPLETED", None),
+                    // slot 100 but started 900 (a late backfill of an old slot)
+                    slot_run(11, Some(100), 900, "COMPLETED", None),
+                    // manual fire: no slot, started 250 → sorts by started_at (250)
+                    slot_run(12, None, 250, "FAILED", Some("nope")),
+                ],
+                counts(&[]),
+                None,
+            )],
+        );
+
+        let order: Vec<u128> = resp.runs.iter().map(|r| r.execution_id.as_u128()).collect();
+        // slot 300 (exec10) > started 250 slot-less (exec12) > slot 100 (exec11).
+        assert_eq!(
+            order,
+            vec![10, 12, 11],
+            "ordered by logical slot, not start"
+        );
+    }
+
+    #[test]
+    fn cross_shard_interleave_orders_by_slot() {
+        let resp = build_runs_response(
+            uid(1),
+            None,
+            10,
+            vec![
+                obs(
+                    0,
+                    vec![
+                        slot_run(10, Some(400), 400, "COMPLETED", None),
+                        slot_run(11, Some(200), 200, "COMPLETED", None),
+                    ],
+                    counts(&[]),
+                    None,
+                ),
+                obs(
+                    1,
+                    vec![
+                        slot_run(20, Some(300), 300, "FAILED", Some("x")),
+                        slot_run(21, None, 100, "COMPLETED", None),
+                    ],
+                    counts(&[]),
+                    None,
+                ),
+            ],
+        );
+        let slots: Vec<i64> = resp.runs.iter().map(|r| r.started_at.timestamp()).collect();
+        // 400 (s0) > 300 (s1) > 200 (s0) > 100 (s1 manual).
+        assert_eq!(slots, vec![400, 300, 200, 100]);
+    }
+
+    #[test]
+    fn next_cursor_anchors_on_slot_key_of_last_kept_row() {
+        // 3 rows, limit 2: cursor must anchor on the *slot* key of the last kept row.
+        let resp = build_runs_response(
+            uid(1),
+            None,
+            2,
+            vec![obs(
+                0,
+                vec![
+                    slot_run(10, Some(300), 999, "COMPLETED", None),
+                    slot_run(11, Some(200), 888, "COMPLETED", None),
+                    slot_run(12, Some(100), 777, "COMPLETED", None),
+                ],
+                counts(&[]),
+                None,
+            )],
+        );
+        assert_eq!(resp.runs.len(), 2);
+        let cursor = resp.next_cursor.expect("more rows -> cursor");
+        let (ts, id) = parse_cursor(&cursor).unwrap();
+        // Last kept row is exec 11 (slot 200), so the cursor's timestamp is the slot
+        // key (200), NOT its started_at (888).
+        assert_eq!(ts, at(200), "cursor anchors on slot key, not started_at");
+        assert_eq!(id, uid(11));
+    }
+
+    #[test]
+    fn next_run_at_is_echoed() {
+        let resp = build_runs_response(uid(1), Some(at(50_000)), 10, vec![]);
+        assert_eq!(resp.next_run_at, Some(at(50_000)));
+        // Absent next fire (paused/exhausted/manual-only) echoes null.
+        let none = build_runs_response(uid(1), None, 10, vec![]);
+        assert!(none.next_run_at.is_none());
     }
 }
