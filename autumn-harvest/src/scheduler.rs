@@ -1181,11 +1181,55 @@ async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
 ) -> HarvestResult<HarvestSchedule> {
+    let expr = schedule_expr(Some(&ws.schedule));
+    let existing = find_or_insert_workflow_schedule(conn, ws, expr.as_deref()).await?;
+    match apply_workflow_schedule_update(conn, ws, &existing, false).await? {
+        AppliedScheduleUpdate::Updated(row) => Ok(*row),
+        // Unreachable: the unguarded (guard_live_fire_claim = false) path never
+        // skips. Kept as an error rather than a panic for defensive robustness.
+        AppliedScheduleUpdate::SkippedLiveClaim => Err(crate::error::database_error(
+            "schedule upsert unexpectedly skipped by fire-claim guard",
+        )),
+    }
+}
+
+/// Result of [`apply_workflow_schedule_update`].
+#[derive(Debug)]
+enum AppliedScheduleUpdate {
+    /// The row was updated; the re-selected row is returned.
+    Updated(Box<HarvestSchedule>),
+    /// `guard_live_fire_claim` was set and the row currently holds a live
+    /// (unexpired) #350 fire claim — nothing was written.
+    SkippedLiveClaim,
+}
+
+/// Shared in-place UPDATE body for an existing `harvest_schedules` row.
+///
+/// Single source of truth for the update semantics used by both the
+/// startup/registration upsert ([`upsert_workflow_schedule`]) and the
+/// operator PATCH path ([`update_workflow_schedule`], issue #771):
+/// `next_run_at` recompute on cadence change only, buffered-runs
+/// preservation/trim rules (#241), legacy `catchup` bool mirroring (#484),
+/// exhaustion reconciliation in both directions (#478), and the
+/// `auto_paused_at` clear rule (#360).
+///
+/// With `guard_live_fire_claim` the main UPDATE additionally requires
+/// `fire_claim_token IS NULL OR fire_claimed_until < NOW()` (issue #350):
+/// when a scheduler replica currently holds a live claim on the row (a fire
+/// is in flight), nothing is written and `SkippedLiveClaim` is returned so
+/// an edit can never race an in-flight fire. The upsert path passes `false`,
+/// preserving its pre-existing unconditional-update behavior.
+#[allow(clippy::too_many_lines)]
+async fn apply_workflow_schedule_update(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+    existing: &HarvestSchedule,
+    guard_live_fire_claim: bool,
+) -> HarvestResult<AppliedScheduleUpdate> {
     use crate::schema::harvest_schedules::dsl;
 
     let now = Utc::now();
     let expr = schedule_expr(Some(&ws.schedule));
-    let existing = find_or_insert_workflow_schedule(conn, ws, expr.as_deref()).await?;
     let dag_name = ws.dag_name.as_deref().or(existing.dag_name.as_deref());
 
     // Recalculate next_run_at: reset on schedule-expression change, preserve otherwise.
@@ -1218,47 +1262,69 @@ async fn upsert_workflow_schedule(
     } else {
         serde_json::json!([])
     };
-    diesel::update(dsl::harvest_schedules.find(existing.id))
-        .set((
-            dsl::schedule_expr.eq(expr),
-            dsl::timezone.eq(ws.schedule.timezone_str()),
-            // Mirror the effective catchup policy into the legacy `catchup`
-            // bool so API responses and any rollback/older reader that only
-            // honors the legacy column see the same enabled/disabled decision
-            // the policy columns encode (issue #484 / Codex #1220). When no
-            // policy is set the caller's explicit `catchup` bool is preserved.
-            dsl::catchup.eq(ws
-                .catchup_policy
-                .map_or(ws.catchup, crate::policy::CatchupPolicy::is_catchup_enabled)),
-            dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
-            dsl::dag_name.eq(dag_name),
-            dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
-            dsl::workflow_input.eq(Some(ws.input.clone())),
-            dsl::queue_name.eq(Some(ws.queue_name.as_str())),
-            dsl::updated_at.eq(now),
-            dsl::next_run_at.eq(next_run_at),
-            dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
-            dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
-            dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
-            dsl::buffered_runs.eq(new_buffered_runs),
-            dsl::calendar_name.eq(ws.calendar.as_deref()),
-            dsl::skip_policy.eq(ws.skip_policy.as_str()),
-            dsl::consecutive_failure_limit.eq(ws
-                .consecutive_failure_limit
-                .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
-            dsl::end_at.eq(ws.end_at),
-            dsl::max_runs.eq(ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
-            // Catchup policy columns (issue #484).
-            dsl::catchup_policy.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().0)),
-            dsl::catchup_window_secs.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().1)),
-            dsl::retry_policy.eq(ws
-                .retry_policy
-                .as_ref()
-                .and_then(|p| serde_json::to_value(p).ok())),
-        ))
+    let changeset = (
+        dsl::schedule_expr.eq(expr),
+        dsl::timezone.eq(ws.schedule.timezone_str()),
+        // Mirror the effective catchup policy into the legacy `catchup`
+        // bool so API responses and any rollback/older reader that only
+        // honors the legacy column see the same enabled/disabled decision
+        // the policy columns encode (issue #484 / Codex #1220). When no
+        // policy is set the caller's explicit `catchup` bool is preserved.
+        dsl::catchup.eq(ws
+            .catchup_policy
+            .map_or(ws.catchup, crate::policy::CatchupPolicy::is_catchup_enabled)),
+        dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
+        dsl::dag_name.eq(dag_name),
+        dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
+        dsl::workflow_input.eq(Some(ws.input.clone())),
+        dsl::queue_name.eq(Some(ws.queue_name.as_str())),
+        dsl::updated_at.eq(now),
+        dsl::next_run_at.eq(next_run_at),
+        dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
+        dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
+        dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
+        dsl::buffered_runs.eq(new_buffered_runs),
+        dsl::calendar_name.eq(ws.calendar.as_deref()),
+        dsl::skip_policy.eq(ws.skip_policy.as_str()),
+        dsl::consecutive_failure_limit.eq(ws
+            .consecutive_failure_limit
+            .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
+        dsl::end_at.eq(ws.end_at),
+        dsl::max_runs.eq(ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
+        // Catchup policy columns (issue #484).
+        dsl::catchup_policy.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().0)),
+        dsl::catchup_window_secs.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().1)),
+        dsl::retry_policy.eq(ws
+            .retry_policy
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p).ok())),
+    );
+    if guard_live_fire_claim {
+        // Anti-race with the scheduler tick (issue #350 / #771 AC7): refuse to
+        // rewrite a row whose fire claim is currently live. The tick's own
+        // claim UPDATE guards on its `next_run_at` snapshot, so a successful
+        // edit here invalidates any stale pre-claim snapshot symmetrically.
+        let rows_updated = diesel::update(
+            dsl::harvest_schedules.find(existing.id).filter(
+                dsl::fire_claim_token
+                    .is_null()
+                    .or(dsl::fire_claimed_until.lt(now)),
+            ),
+        )
+        .set(changeset)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+        if rows_updated == 0 {
+            return Ok(AppliedScheduleUpdate::SkippedLiveClaim);
+        }
+    } else {
+        diesel::update(dsl::harvest_schedules.find(existing.id))
+            .set(changeset)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
 
     // Clear exhausted state when the operator updates limits so that future runs are
     // again possible (issue #478). A schedule exhausted by end_at is no longer
@@ -1357,12 +1423,252 @@ async fn upsert_workflow_schedule(
             .map_err(crate::error::database_error)?;
     }
 
-    dsl::harvest_schedules
+    let row = dsl::harvest_schedules
         .find(existing.id)
         .select(HarvestSchedule::as_select())
         .first(conn)
         .await
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+    Ok(AppliedScheduleUpdate::Updated(Box::new(row)))
+}
+
+/// Partial, id-keyed update for an existing workflow schedule (issue #771).
+///
+/// Every field is optional: `None` leaves the stored value unchanged.
+/// Nullable columns use a double-`Option` — the outer `None` means
+/// "unchanged", `Some(None)` means "clear to NULL", `Some(Some(v))` sets `v`.
+///
+/// The schedule's workflow type is deliberately absent: it is not editable
+/// (changing it is semantically a different schedule).
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowSchedulePatch {
+    /// New schedule cadence. Changing it recomputes `next_run_at` anchored
+    /// at now — elapsed slots are never retroactively fired.
+    pub schedule: Option<Schedule>,
+    /// New JSON input passed to every scheduled run.
+    pub input: Option<serde_json::Value>,
+    /// New task queue name for dispatched runs.
+    pub queue_name: Option<String>,
+    /// New legacy catchup bool. Ignored when a `catchup_policy` is stored or
+    /// provided (the policy takes precedence, issue #484).
+    pub catchup: Option<bool>,
+    /// New maximum number of concurrently running scheduled executions.
+    pub max_active_runs: Option<u32>,
+    /// New jitter window (issue #240).
+    pub jitter: Option<Duration>,
+    /// New overlap policy (issue #241).
+    pub overlap_policy: Option<OverlapPolicy>,
+    /// New maximum buffered slots under `BufferAll` (issue #241).
+    pub buffer_all_max: Option<u32>,
+    /// New calendar association (issue #337). `Some(None)` detaches.
+    pub calendar: Option<Option<String>>,
+    /// New calendar skip policy (issue #337).
+    pub skip_policy: Option<crate::policy::SkipPolicy>,
+    /// New auto-pause threshold (issue #360). `Some(None)` disables.
+    pub consecutive_failure_limit: Option<Option<u32>>,
+    /// New absolute cutoff (issue #478). `Some(None)` removes the cutoff.
+    pub end_at: Option<Option<DateTime<Utc>>>,
+    /// New total run budget (issue #478). `Some(None)` (or `Some(Some(0))`)
+    /// removes the budget.
+    pub max_runs: Option<Option<u32>>,
+    /// New bounded catchup policy (issue #484). `Some(None)` clears the
+    /// policy columns, falling back to the legacy `catchup` bool.
+    pub catchup_policy: Option<Option<crate::policy::CatchupPolicy>>,
+    /// New schedule-level retry policy (issue #523). `Some(None)` clears.
+    pub retry_policy: Option<Option<crate::policy::RetryPolicy>>,
+}
+
+/// Typed outcome of [`update_workflow_schedule`].
+#[derive(Debug)]
+pub enum ScheduleUpdateOutcome {
+    /// The row was updated in place; the re-selected row is returned
+    /// (boxed: the row is much larger than the other variants).
+    Updated(Box<HarvestSchedule>),
+    /// No `harvest_schedules` row with the given id exists on this shard.
+    NotFound,
+    /// The row is a DAG schedule (`dag_name IS NOT NULL`) — DAG schedules
+    /// are owned by `PATCH /dags/{dag_name}`, not this updater.
+    DagSchedule,
+    /// A scheduler replica currently holds a live (unexpired) #350 fire
+    /// claim on the row — the fire is in flight. Nothing was written; retry
+    /// shortly (the claim lease is bounded at ~30 s).
+    ClaimLive,
+}
+
+/// Merge a [`WorkflowSchedulePatch`] over an existing `harvest_schedules` row
+/// into the full [`WorkflowSchedule`] the shared update body consumes.
+///
+/// Only fields present in the patch change; everything else round-trips from
+/// the stored row (`schedule_expr` is re-parsed with the same lenient rules
+/// the tick loop uses, so an unparseable/NULL expression is treated as
+/// `Schedule::Manual`).
+fn merge_schedule_patch(
+    existing: &HarvestSchedule,
+    patch: &WorkflowSchedulePatch,
+) -> HarvestResult<WorkflowSchedule> {
+    let workflow_name = existing.workflow_name.clone().ok_or_else(|| {
+        HarvestError::Config(format!(
+            "schedule {} has no workflow_name; not a workflow schedule",
+            existing.id
+        ))
+    })?;
+    let existing_schedule = existing
+        .schedule_expr
+        .as_deref()
+        .and_then(parse_schedule_from_expr)
+        .unwrap_or(Schedule::Manual);
+    // Reconstruct the stored catchup policy without the legacy-bool fallback:
+    // a NULL policy column stays None so an unrelated patch never converts a
+    // legacy-bool row into an explicit-policy row.
+    let existing_catchup_policy = existing.catchup_policy.as_deref().map(|_| {
+        crate::policy::CatchupPolicy::from_db(
+            existing.catchup_policy.as_deref(),
+            existing.catchup_window_secs,
+            existing.catchup,
+        )
+    });
+    let existing_retry_policy: Option<crate::policy::RetryPolicy> = existing
+        .retry_policy
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    Ok(WorkflowSchedule {
+        workflow_name,
+        dag_name: None,
+        schedule: patch.schedule.clone().unwrap_or(existing_schedule),
+        input: patch
+            .input
+            .clone()
+            .or_else(|| existing.workflow_input.clone())
+            .unwrap_or(serde_json::Value::Null),
+        catchup: patch.catchup.unwrap_or(existing.catchup),
+        max_active_runs: patch
+            .max_active_runs
+            .unwrap_or_else(|| u32::try_from(existing.max_active_runs).unwrap_or(0)),
+        // Not consulted by the shared update body (pause state is managed via
+        // pause/resume) — carried through for completeness only.
+        paused: existing.is_paused,
+        queue_name: patch
+            .queue_name
+            .clone()
+            .or_else(|| existing.queue_name.clone())
+            .unwrap_or_else(|| "default".to_string()),
+        jitter: patch.jitter.unwrap_or_else(|| {
+            Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0))
+        }),
+        overlap_policy: patch
+            .overlap_policy
+            .unwrap_or_else(|| OverlapPolicy::from_db(&existing.overlap_policy)),
+        buffer_all_max: patch
+            .buffer_all_max
+            .unwrap_or_else(|| u32::try_from(existing.buffer_all_max).unwrap_or(0)),
+        // Not persisted on harvest_schedules; nothing to preserve.
+        execution_timeout: None,
+        calendar: patch
+            .calendar
+            .as_ref()
+            .map_or_else(|| existing.calendar_name.clone(), Clone::clone),
+        skip_policy: patch
+            .skip_policy
+            .unwrap_or_else(|| crate::policy::SkipPolicy::from_db(&existing.skip_policy)),
+        consecutive_failure_limit: patch.consecutive_failure_limit.unwrap_or_else(|| {
+            existing
+                .consecutive_failure_limit
+                .map(|n| u32::try_from(n).unwrap_or(0))
+        }),
+        end_at: patch.end_at.unwrap_or(existing.end_at),
+        // Normalize 0 → None on both arms: callers passing max_runs=0 intend
+        // "no limit" (mirrors the create path).
+        max_runs: patch.max_runs.map_or_else(
+            || {
+                existing
+                    .max_runs
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n > 0)
+            },
+            |new| new.filter(|&n| n > 0),
+        ),
+        catchup_policy: patch.catchup_policy.unwrap_or(existing_catchup_policy),
+        retry_policy: patch
+            .retry_policy
+            .as_ref()
+            .map_or(existing_retry_policy, Clone::clone),
+    })
+}
+
+/// Apply a partial in-place update to an existing workflow schedule row,
+/// keyed by its `harvest_schedules.id` (issue #771).
+///
+/// The row's identity (`schedule_id`) is never changed — #488 carryover
+/// lineage, the `sched:{schedule_id}:…` workflow-id namespace, and #534 run
+/// history all keep resolving. Pause state, pause metadata, `runs_started`,
+/// `last_run_at`, and `consecutive_failure_count` are preserved.
+///
+/// The merged spec is validated before any write and the whole operation
+/// runs in a single transaction, so a rejected patch writes nothing.
+/// `next_run_at` is recomputed anchored at now only when the effective
+/// schedule expression actually changed (mirroring the registration upsert);
+/// otherwise the pending value is preserved.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the merged spec fails validation
+/// (invalid cron expression, unknown timezone, zero interval) and
+/// [`HarvestError::Database`] on connection/query failure. Row-state
+/// conditions (missing row, DAG row, live fire claim) are reported through
+/// [`ScheduleUpdateOutcome`], not errors.
+pub async fn update_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    patch: &WorkflowSchedulePatch,
+) -> HarvestResult<ScheduleUpdateOutcome> {
+    use crate::schema::harvest_schedules::dsl;
+    use diesel_async::AsyncConnection;
+    use scoped_futures::ScopedFutureExt;
+
+    conn.transaction(|conn| {
+        async move {
+            let existing: Option<HarvestSchedule> = dsl::harvest_schedules
+                .find(schedule_id)
+                .select(HarvestSchedule::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let Some(existing) = existing else {
+                return Ok(ScheduleUpdateOutcome::NotFound);
+            };
+            if existing.dag_name.is_some() || existing.workflow_name.is_none() {
+                return Ok(ScheduleUpdateOutcome::DagSchedule);
+            }
+
+            // Validate the MERGED spec (e.g. new cron + existing timezone)
+            // before any write; a Config error rolls the transaction back.
+            let merged = merge_schedule_patch(&existing, patch)?;
+            crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
+
+            match apply_workflow_schedule_update(conn, &merged, &existing, true).await? {
+                AppliedScheduleUpdate::Updated(row) => Ok(ScheduleUpdateOutcome::Updated(row)),
+                AppliedScheduleUpdate::SkippedLiveClaim => {
+                    // 0 rows can also mean the row vanished between our SELECT
+                    // and UPDATE (concurrent delete) — distinguish it.
+                    let still_exists: bool = diesel::select(diesel::dsl::exists(
+                        dsl::harvest_schedules.find(schedule_id),
+                    ))
+                    .get_result(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    if still_exists {
+                        Ok(ScheduleUpdateOutcome::ClaimLive)
+                    } else {
+                        Ok(ScheduleUpdateOutcome::NotFound)
+                    }
+                }
+            }
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Derive a deterministic, idempotent `workflow_id` for a scheduled run.
@@ -4381,6 +4687,194 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A representative workflow-schedule row for `merge_schedule_patch` unit
+    /// tests (no database required).
+    fn merge_base_row() -> HarvestSchedule {
+        let now = Utc::now();
+        HarvestSchedule {
+            id: uuid::Uuid::new_v4(),
+            dag_name: None,
+            schedule_expr: Some("interval:3600".to_string()),
+            timezone: "UTC".to_string(),
+            catchup: false,
+            max_active_runs: 2,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: Some(now + chrono::Duration::seconds(3600)),
+            created_at: now,
+            updated_at: now,
+            workflow_name: Some("merge_wf".to_string()),
+            workflow_input: Some(serde_json::json!({"env": "A"})),
+            queue_name: Some("etl".to_string()),
+            paused_at: None,
+            paused_by: None,
+            pause_reason: None,
+            jitter_secs: 30,
+            overlap_policy: "buffer_one".to_string(),
+            buffered_runs: serde_json::json!([]),
+            buffer_all_max: 7,
+            calendar_name: Some("us-holidays".to_string()),
+            skip_policy: "run_next_business_day".to_string(),
+            fire_claim_token: None,
+            fire_claimed_until: None,
+            consecutive_failure_limit: Some(4),
+            consecutive_failure_count: 0,
+            auto_paused_at: None,
+            end_at: Some(now + chrono::Duration::days(30)),
+            max_runs: Some(9),
+            runs_started: 3,
+            exhausted_at: None,
+            exhausted_reason: None,
+            catchup_policy: None,
+            catchup_window_secs: None,
+            last_catchup_dropped: 0,
+            last_catchup_at: None,
+            retry_policy: None,
+        }
+    }
+
+    /// An empty patch round-trips every stored value (only-provided-fields-
+    /// change semantics: nothing provided, nothing changes).
+    #[test]
+    fn merge_schedule_patch_empty_patch_round_trips() {
+        let row = merge_base_row();
+        let merged = merge_schedule_patch(&row, &WorkflowSchedulePatch::default()).expect("merge");
+
+        assert_eq!(merged.workflow_name, "merge_wf");
+        assert_eq!(
+            schedule_expr(Some(&merged.schedule)).as_deref(),
+            Some("interval:3600"),
+            "the stored expression must round-trip so next_run_at is preserved"
+        );
+        assert_eq!(merged.input, serde_json::json!({"env": "A"}));
+        assert_eq!(merged.queue_name, "etl");
+        assert!(!merged.catchup);
+        assert_eq!(merged.max_active_runs, 2);
+        assert_eq!(merged.jitter, Duration::from_secs(30));
+        assert_eq!(merged.overlap_policy, OverlapPolicy::BufferOne);
+        assert_eq!(merged.buffer_all_max, 7);
+        assert_eq!(merged.calendar.as_deref(), Some("us-holidays"));
+        assert_eq!(
+            merged.skip_policy,
+            crate::policy::SkipPolicy::RunNextBusinessDay
+        );
+        assert_eq!(merged.consecutive_failure_limit, Some(4));
+        assert_eq!(merged.end_at, row.end_at);
+        assert_eq!(merged.max_runs, Some(9));
+        assert!(
+            merged.catchup_policy.is_none(),
+            "a NULL-policy row must stay legacy-bool, never converted to an explicit policy"
+        );
+        assert!(merged.retry_policy.is_none());
+    }
+
+    /// Provided fields override; everything else keeps the stored value.
+    #[test]
+    fn merge_schedule_patch_overrides_only_provided_fields() {
+        let row = merge_base_row();
+        let patch = WorkflowSchedulePatch {
+            schedule: Some(Schedule::Cron("0 3 * * *".to_string())),
+            input: Some(serde_json::json!({"env": "B"})),
+            max_active_runs: Some(5),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+
+        assert_eq!(
+            schedule_expr(Some(&merged.schedule)).as_deref(),
+            Some("cron:0 3 * * *")
+        );
+        assert_eq!(merged.input, serde_json::json!({"env": "B"}));
+        assert_eq!(merged.max_active_runs, 5);
+        // Untouched fields keep the stored values.
+        assert_eq!(merged.queue_name, "etl");
+        assert_eq!(merged.overlap_policy, OverlapPolicy::BufferOne);
+        assert_eq!(merged.calendar.as_deref(), Some("us-holidays"));
+    }
+
+    /// Tri-state fields: `Some(None)` clears, outer `None` preserves.
+    #[test]
+    fn merge_schedule_patch_tristate_clear_vs_absent() {
+        let row = merge_base_row();
+        let patch = WorkflowSchedulePatch {
+            calendar: Some(None),
+            end_at: Some(None),
+            consecutive_failure_limit: Some(None),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+        assert!(merged.calendar.is_none(), "Some(None) must clear calendar");
+        assert!(merged.end_at.is_none(), "Some(None) must clear end_at");
+        assert!(merged.consecutive_failure_limit.is_none());
+        // Absent tri-state fields are preserved.
+        assert_eq!(merged.max_runs, Some(9));
+    }
+
+    /// `max_runs = 0` is normalized to "no limit" on both patch arms.
+    #[test]
+    fn merge_schedule_patch_normalizes_zero_max_runs_to_none() {
+        let row = merge_base_row();
+        let patch = WorkflowSchedulePatch {
+            max_runs: Some(Some(0)),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+        assert!(merged.max_runs.is_none(), "0 must normalize to None");
+
+        let mut zero_row = merge_base_row();
+        zero_row.max_runs = Some(0);
+        let merged =
+            merge_schedule_patch(&zero_row, &WorkflowSchedulePatch::default()).expect("merge");
+        assert!(merged.max_runs.is_none(), "stored 0 must normalize to None");
+    }
+
+    /// A stored `"manual"` (or NULL/unparseable) expression merges to
+    /// `Schedule::Manual`, matching the tick loop's lenient parse rules.
+    #[test]
+    fn merge_schedule_patch_manual_and_unparseable_exprs_map_to_manual() {
+        let mut row = merge_base_row();
+        row.schedule_expr = Some("manual".to_string());
+        let merged = merge_schedule_patch(&row, &WorkflowSchedulePatch::default()).expect("merge");
+        assert!(matches!(merged.schedule, Schedule::Manual));
+
+        row.schedule_expr = None;
+        let merged = merge_schedule_patch(&row, &WorkflowSchedulePatch::default()).expect("merge");
+        assert!(matches!(merged.schedule, Schedule::Manual));
+    }
+
+    /// A row with an explicit stored catchup policy reconstructs it (window
+    /// included); a patch clearing it falls back to the legacy bool.
+    #[test]
+    fn merge_schedule_patch_reconstructs_and_clears_catchup_policy() {
+        let mut row = merge_base_row();
+        row.catchup_policy = Some("window".to_string());
+        row.catchup_window_secs = Some(7200);
+        let merged = merge_schedule_patch(&row, &WorkflowSchedulePatch::default()).expect("merge");
+        assert_eq!(
+            merged.catchup_policy,
+            Some(crate::policy::CatchupPolicy::Window(Duration::from_secs(
+                7200
+            )))
+        );
+
+        let patch = WorkflowSchedulePatch {
+            catchup_policy: Some(None),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+        assert!(merged.catchup_policy.is_none(), "Some(None) must clear");
+    }
+
+    /// A row without a `workflow_name` is not a workflow schedule.
+    #[test]
+    fn merge_schedule_patch_rejects_rows_without_workflow_name() {
+        let mut row = merge_base_row();
+        row.workflow_name = None;
+        let err =
+            merge_schedule_patch(&row, &WorkflowSchedulePatch::default()).expect_err("must reject");
+        assert!(matches!(err, HarvestError::Config(_)));
+    }
 
     #[cfg(all(feature = "db", not(feature = "unified-dag-execution")))]
     fn test_pool(database_url: &str) -> DbPool {

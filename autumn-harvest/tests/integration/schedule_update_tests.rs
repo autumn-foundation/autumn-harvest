@@ -128,10 +128,7 @@ async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
 }
 
 /// Register a workflow schedule and return its row.
-async fn register_and_load(
-    conn: &mut AsyncPgConnection,
-    ws: &WorkflowSchedule,
-) -> HarvestSchedule {
+async fn register_and_load(conn: &mut AsyncPgConnection, ws: &WorkflowSchedule) -> HarvestSchedule {
     register_workflow_schedules(conn, std::slice::from_ref(ws))
         .await
         .expect("register schedule");
@@ -158,7 +155,7 @@ async fn load_by_id(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestSchedule {
 
 fn expect_updated(outcome: ScheduleUpdateOutcome) -> HarvestSchedule {
     match outcome {
-        ScheduleUpdateOutcome::Updated(row) => row,
+        ScheduleUpdateOutcome::Updated(row) => *row,
         other => panic!("expected Updated outcome, got {other:?}"),
     }
 }
@@ -205,10 +202,7 @@ async fn patch_input_only_changes_input_and_preserves_cadence() {
 #[tokio::test]
 async fn cadence_change_recomputes_next_run_at_anchored_at_now() {
     let (mut conn, _url, _c) = setup_db().await;
-    let ws = WorkflowSchedule::new(
-        "upd_cadence_wf",
-        Schedule::Cron("0 3 * * *".to_string()),
-    );
+    let ws = WorkflowSchedule::new("upd_cadence_wf", Schedule::Cron("0 3 * * *".to_string()));
     let before = register_and_load(&mut conn, &ws).await;
 
     let patch_started = Utc::now();
@@ -263,12 +257,14 @@ async fn non_cadence_policy_change_preserves_next_run_at() {
 }
 
 /// A paused schedule stays paused across a patch, and scheduler bookkeeping
-/// (runs_started, last_run_at, consecutive_failure_count, pause metadata) is
+/// (`runs_started`, `last_run_at`, `consecutive_failure_count`, pause
+/// metadata) is
 /// preserved.
 #[tokio::test]
 async fn paused_schedule_stays_paused_and_bookkeeping_preserved() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_paused_wf",
         Schedule::Interval(std::time::Duration::from_secs(600)),
@@ -317,8 +313,9 @@ async fn paused_schedule_stays_paused_and_bookkeeping_preserved() {
 /// repopulates `next_run_at` (issue #478 reconciliation, applied via PATCH).
 #[tokio::test]
 async fn raising_max_runs_clears_exhaustion_and_repopulates_next_run_at() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_unexhaust_wf",
         Schedule::Interval(std::time::Duration::from_secs(3600)),
@@ -355,15 +352,19 @@ async fn raising_max_runs_clears_exhaustion_and_repopulates_next_run_at() {
         "next_run_at must be repopulated so the schedule fires again"
     );
     assert_eq!(row.max_runs, Some(5));
-    assert_eq!(row.runs_started, 1, "runs_started is never reset by a patch");
+    assert_eq!(
+        row.runs_started, 1,
+        "runs_started is never reset by a patch"
+    );
 }
 
 /// Lowering `max_runs` to (or below) `runs_started` exhausts the schedule
 /// immediately rather than leaving it active-but-never-runnable.
 #[tokio::test]
 async fn lowering_max_runs_below_runs_started_exhausts_immediately() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_exhaust_now_wf",
         Schedule::Interval(std::time::Duration::from_secs(3600)),
@@ -385,17 +386,24 @@ async fn lowering_max_runs_below_runs_started_exhausts_immediately() {
             .expect("update must succeed"),
     );
 
-    assert!(row.exhausted_at.is_some(), "schedule must exhaust immediately");
+    assert!(
+        row.exhausted_at.is_some(),
+        "schedule must exhaust immediately"
+    );
     assert_eq!(row.exhausted_reason.as_deref(), Some("max_runs_exhausted"));
-    assert!(row.next_run_at.is_none(), "exhausted schedule must not fire");
+    assert!(
+        row.next_run_at.is_none(),
+        "exhausted schedule must not fire"
+    );
 }
 
 /// A live (unexpired) fire claim blocks the update with `ClaimLive` and the
 /// row is not modified (issue #350 anti-race, AC7).
 #[tokio::test]
 async fn live_fire_claim_blocks_update_with_claim_live_outcome() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_claim_live_wf",
         Schedule::Interval(std::time::Duration::from_secs(60)),
@@ -435,8 +443,9 @@ async fn live_fire_claim_blocks_update_with_claim_live_outcome() {
 /// An expired fire claim (crashed replica) does not block the update.
 #[tokio::test]
 async fn expired_fire_claim_does_not_block_update() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_claim_expired_wf",
         Schedule::Interval(std::time::Duration::from_secs(60)),
@@ -461,15 +470,19 @@ async fn expired_fire_claim_does_not_block_update() {
             .await
             .expect("update must succeed"),
     );
-    assert_eq!(row.workflow_input, Some(serde_json::json!({"proceeds": true})));
+    assert_eq!(
+        row.workflow_input,
+        Some(serde_json::json!({"proceeds": true}))
+    );
 }
 
 /// DAG schedule rows are owned by `PATCH /dags/{dag_name}` — the workflow
 /// schedule updater must refuse them.
 #[tokio::test]
 async fn dag_schedule_row_returns_dag_schedule_outcome() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let id = Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -507,9 +520,10 @@ async fn dag_schedule_row_returns_dag_schedule_outcome() {
 #[tokio::test]
 async fn unknown_id_returns_not_found() {
     let (mut conn, _url, _c) = setup_db().await;
-    let outcome = update_workflow_schedule(&mut conn, Uuid::new_v4(), &WorkflowSchedulePatch::default())
-        .await
-        .expect("update call must not error");
+    let outcome =
+        update_workflow_schedule(&mut conn, Uuid::new_v4(), &WorkflowSchedulePatch::default())
+            .await
+            .expect("update call must not error");
     assert!(
         matches!(outcome, ScheduleUpdateOutcome::NotFound),
         "unknown id must yield NotFound, got {outcome:?}"
@@ -563,13 +577,18 @@ async fn invalid_merged_schedule_writes_nothing() {
 /// the stored value unchanged.
 #[tokio::test]
 async fn tristate_clear_and_absence_semantics() {
-    let (mut conn, _url, _c) = setup_db().await;
     use harvest_schedules::dsl;
+
+    let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_tristate_wf",
         Schedule::Interval(std::time::Duration::from_secs(3600)),
     );
     let before = register_and_load(&mut conn, &ws).await;
+    // calendar_name carries a foreign key to harvest_calendars — create it.
+    autumn_harvest::calendar::create_calendar(&mut conn, "us-holidays", None)
+        .await
+        .expect("create calendar");
     let end_at = Utc::now() + chrono::Duration::days(30);
     diesel::update(harvest_schedules::table.find(before.id))
         .set((

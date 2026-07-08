@@ -4081,6 +4081,153 @@
       ]
     },
     {
+      "method": "PATCH",
+      "path": "/admin/schedules/{id}",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at.",
+      "idempotency": "Idempotent for identical bodies: re-applying the same partial update converges on the same row state. Returns 409 while a scheduler replica holds a live fire claim on the row (the claim lease is bounded at ~30 s); retry shortly.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "schedule_expr",
+            "required": false,
+            "description": "New schedule expression: bare cron, 'cron:<expr>', 'cron_tz:<tz>:<expr>', 'interval:<secs>', or 'manual'."
+          },
+          {
+            "name": "timezone",
+            "required": false,
+            "description": "New IANA timezone for the cron expression. Provided without schedule_expr it re-anchors the stored cron expression; ignored for interval/manual schedules."
+          },
+          {
+            "name": "input",
+            "required": false,
+            "description": "New workflow input payload (any JSON value)."
+          },
+          {
+            "name": "catchup",
+            "required": false,
+            "description": "New legacy catchup bool; ignored when a catchup_policy is stored or provided."
+          },
+          {
+            "name": "max_active_runs",
+            "required": false,
+            "description": "New maximum concurrent scheduled runs."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "New task queue name for scheduled runs."
+          },
+          {
+            "name": "jitter_secs",
+            "required": false,
+            "description": "New jitter window in seconds; 0 disables jitter (issue #240)."
+          },
+          {
+            "name": "overlap_policy",
+            "required": false,
+            "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other (issue #241)."
+          },
+          {
+            "name": "buffer_all_max",
+            "required": false,
+            "description": "New maximum buffered slots under buffer_all (issue #241)."
+          },
+          {
+            "name": "calendar",
+            "required": false,
+            "description": "New named calendar (issue #337). Tri-state: omit = unchanged, explicit null = detach the calendar."
+          },
+          {
+            "name": "skip_policy",
+            "required": false,
+            "description": "New calendar skip policy: skip, run_next_business_day, run_prev_business_day (issue #337)."
+          },
+          {
+            "name": "consecutive_failure_limit",
+            "required": false,
+            "description": "New auto-pause threshold (issue #360). Tri-state: omit = unchanged, explicit null = disable auto-pause."
+          },
+          {
+            "name": "end_at",
+            "required": false,
+            "description": "New absolute UTC cutoff (issue #478). Tri-state: omit = unchanged, explicit null = remove the cutoff. Raising a limit on an exhausted schedule clears the exhaustion."
+          },
+          {
+            "name": "max_runs",
+            "required": false,
+            "description": "New total run budget (issue #478). Tri-state: omit = unchanged, explicit null (or 0) = remove the budget."
+          },
+          {
+            "name": "catchup_policy",
+            "required": false,
+            "description": "New bounded catchup policy: skip_all, most_recent, window, unbounded (issue #484). Tri-state: omit = unchanged, explicit null = clear (fall back to the legacy catchup bool)."
+          },
+          {
+            "name": "catchup_window_secs",
+            "required": false,
+            "description": "Window length in seconds for catchup_policy = window; re-windows an already-'window' policy when sent alone, ignored for other modes (issue #484)."
+          },
+          {
+            "name": "retry_policy",
+            "required": false,
+            "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "kind",
+          "name",
+          "schedule_expr",
+          "is_paused",
+          "paused_at",
+          "paused_by",
+          "pause_reason",
+          "next_run_at",
+          "last_run_at",
+          "max_active_runs",
+          "catchup",
+          "last_backfill",
+          "catchup_policy_effective",
+          "catchup_window_secs",
+          "catchup_dropped_last_recovery",
+          "last_catchup_at"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed schedule id, workflow_name present in the body (not editable), DAG schedule row, invalid cron/interval expression or timezone, unknown overlap/skip/catchup policy, or unknown calendar. Nothing is written."
+        },
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 409,
+          "description": "The schedule is firing right now (a scheduler replica holds a live fire claim); retry shortly."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/admin/schedules/{id}/pause",
       "category": "schedule",

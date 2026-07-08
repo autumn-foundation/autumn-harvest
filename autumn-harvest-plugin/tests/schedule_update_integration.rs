@@ -198,9 +198,10 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {
-    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-        AsyncPgConnection,
-    >::new(database_url);
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            database_url,
+        );
     deadpool::managed::Pool::builder(manager)
         .max_size(4)
         .build()
@@ -269,8 +270,11 @@ fn build_app(pool: &DbPool, registry: Arc<HandlerRegistry>) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    harvest_api_router(api_state)
-        .with_state(AppState::for_test().with_pool(pool.clone()).with_profile("test"))
+    harvest_api_router(api_state).with_state(
+        AppState::for_test()
+            .with_pool(pool.clone())
+            .with_profile("test"),
+    )
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -288,12 +292,10 @@ async fn request_json(
 ) -> (StatusCode, Value) {
     let uri = uri.into();
     let mut builder = Request::builder().method(method).uri(&uri);
-    let body = if let Some(payload) = payload {
+    if payload.is_some() {
         builder = builder.header("content-type", "application/json");
-        Body::from(payload.to_string())
-    } else {
-        Body::empty()
-    };
+    }
+    let body = payload.map_or_else(Body::empty, |payload| Body::from(payload.to_string()));
     let response = app
         .clone()
         .oneshot(builder.body(body).unwrap())
@@ -342,7 +344,11 @@ async fn create_schedule(app: &HarvestApiApp, wf_name: &str, body_extra: Value) 
         }
     }
     let (status, created) = post_json(app, "/admin/schedules/workflow", body).await;
-    assert_eq!(status, StatusCode::CREATED, "create must succeed: {created}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create must succeed: {created}"
+    );
     created["id"]
         .as_str()
         .expect("created schedule must have an id")
@@ -360,7 +366,7 @@ async fn load_schedule_row(url: &str, id: Uuid) -> HarvestSchedule {
         .expect("load schedule row")
 }
 
-/// Arm the schedule's next_run_at `secs_ago` seconds in the past so the next
+/// Arm the schedule's `next_run_at` `secs_ago` seconds in the past so the next
 /// tick fires that slot (strictly decreasing values across calls, see #488).
 async fn arm_slot(url: &str, id: Uuid, secs_ago: i64) {
     use harvest_schedules::dsl;
@@ -390,7 +396,7 @@ async fn wait_for_completed(url: &str, wf_name: &str, min_count: i64) -> Vec<Uui
                 .load(&mut conn)
                 .await
                 .unwrap_or_default();
-            if rows.len() as i64 >= min_count {
+            if i64::try_from(rows.len()).unwrap_or(i64::MAX) >= min_count {
                 return rows;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -469,20 +475,19 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
     // ── Run 2 under the post-edit spec ───────────────────────────────────────
     arm_slot(&url, id, 200).await;
     tick(&pool, &registry).await;
-    let run_ids = wait_for_completed(&url, wf_name, 2).await;
-    let run2_id = *run_ids.iter().find(|r| **r != run1_ids[0]).unwrap();
+    let completed_ids = wait_for_completed(&url, wf_name, 2).await;
+    let run2_id = *completed_ids.iter().find(|r| **r != run1_ids[0]).unwrap();
 
     let mut conn = connect(&url).await;
-    let (run2_input, run2_output): (Value, Option<Value>) =
-        harvest_workflow_executions::table
-            .find(run2_id)
-            .select((
-                harvest_workflow_executions::dsl::input,
-                harvest_workflow_executions::dsl::output,
-            ))
-            .first(&mut conn)
-            .await
-            .expect("load run 2");
+    let (run2_input, run2_output): (Value, Option<Value>) = harvest_workflow_executions::table
+        .find(run2_id)
+        .select((
+            harvest_workflow_executions::dsl::input,
+            harvest_workflow_executions::dsl::output,
+        ))
+        .first(&mut conn)
+        .await
+        .expect("load run 2");
     assert_eq!(
         run2_input,
         json!({"env": "B"}),
@@ -499,7 +504,7 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
 }
 
 /// An invalid-cron PATCH returns 400 and leaves the row byte-for-byte
-/// unchanged (AC11d, validate-before-commit).
+/// unchanged (`AC11d`, validate-before-commit).
 #[tokio::test]
 async fn invalid_cron_patch_returns_400_and_leaves_row_unchanged() {
     let (url, _container) = setup_test_database_url().await;
@@ -516,7 +521,11 @@ async fn invalid_cron_patch_returns_400_and_leaves_row_unchanged() {
         json!({"schedule_expr": "cron:not a cron", "input": {"should": "not persist"}}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid cron must 400: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid cron must 400: {body}"
+    );
     assert!(
         body.to_string().contains("schedule_expr"),
         "error must name the invalid field: {body}"
@@ -597,7 +606,7 @@ async fn unknown_calendar_is_rejected_with_400() {
     );
 }
 
-/// PATCHing an unknown schedule id returns 404; a malformed id returns 400.
+/// `PATCH`ing an unknown schedule id returns 404; a malformed id returns 400.
 #[tokio::test]
 async fn unknown_or_malformed_id_is_rejected() {
     let (url, _container) = setup_test_database_url().await;
@@ -634,12 +643,13 @@ async fn load_missing(url: &str) -> bool {
 /// rejects it with 400.
 #[tokio::test]
 async fn dag_schedule_row_is_rejected_with_400() {
+    use harvest_schedules::dsl;
+
     let (url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&url);
     let registry = etl_registry("sched_upd_dagrow_wf");
     let app = build_app(&pool, registry);
 
-    use harvest_schedules::dsl;
     let dag_row_id = Uuid::new_v4();
     let mut conn = connect(&url).await;
     diesel::insert_into(harvest_schedules::table)
@@ -678,6 +688,8 @@ async fn dag_schedule_row_is_rejected_with_400() {
 /// in-flight fire; once the claim lease expires the edit proceeds.
 #[tokio::test]
 async fn live_fire_claim_returns_409_until_expired() {
+    use harvest_schedules::dsl;
+
     let (url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&url);
     let registry = etl_registry("sched_upd_claim_wf");
@@ -685,7 +697,6 @@ async fn live_fire_claim_returns_409_until_expired() {
 
     let id = create_schedule(&app, "sched_upd_claim_wf", json!({})).await;
 
-    use harvest_schedules::dsl;
     let mut conn = connect(&url).await;
     diesel::update(harvest_schedules::table.find(id))
         .set((
@@ -815,8 +826,14 @@ async fn explicit_null_clears_and_absence_preserves_nullable_fields() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{patched}");
-    assert!(patched["max_runs"].is_null(), "max_runs must be cleared: {patched}");
-    assert!(patched["end_at"].is_null(), "end_at must be cleared: {patched}");
+    assert!(
+        patched["max_runs"].is_null(),
+        "max_runs must be cleared: {patched}"
+    );
+    assert!(
+        patched["end_at"].is_null(),
+        "end_at must be cleared: {patched}"
+    );
 
     // An empty body is a valid no-op returning the current entry.
     let (status, patched) = patch_json(&app, format!("/admin/schedules/{id}"), json!({})).await;

@@ -844,7 +844,7 @@ fn schedule_update_body_fields_are_documented() {
         "2030-01-01T00:00:00Z",
         "--max-runs",
         "24",
-    ])
+    ]);
 }
 
 #[test]

@@ -1266,9 +1266,15 @@ fn schedule_update_maps_to_patch_route_with_partial_body() {
     assert_eq!(body["input"], json!({"env": "prod"}));
     // Only provided flags appear in the body — partial semantics.
     let obj = body.as_object().expect("body must be an object");
-    assert!(!obj.contains_key("queue_name"), "absent flags must be omitted");
+    assert!(
+        !obj.contains_key("queue_name"),
+        "absent flags must be omitted"
+    );
     assert!(!obj.contains_key("max_active_runs"));
-    assert!(!obj.contains_key("workflow_name"), "workflow_name is not editable");
+    assert!(
+        !obj.contains_key("workflow_name"),
+        "workflow_name is not editable"
+    );
 }
 
 #[test]

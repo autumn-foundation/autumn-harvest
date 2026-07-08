@@ -58,6 +58,8 @@ pub const OP_DAG_RETRY: &str = "dag.retry";
 pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
+/// Audit operation: Edited an existing workflow schedule in place (issue #771).
+pub const OP_SCHEDULE_UPDATE: &str = "schedule.update";
 /// Audit operation: Paused an active workflow schedule.
 pub const OP_SCHEDULE_PAUSE: &str = "schedule.pause";
 /// Audit operation: Resumed a paused workflow schedule.
@@ -376,6 +378,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("POST /admin/retention/run-now", RouteClass::Mutating),
     ("POST /admin/schedules/workflow", RouteClass::Mutating),
+    ("PATCH /admin/schedules/{id}", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/backfill", RouteClass::Mutating),
@@ -452,6 +455,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
+    OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME,
     OP_SCHEDULE_DELETE,
@@ -637,6 +641,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/schedules", None),
     ("GET /admin/rate-limits", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
+    ("PATCH /admin/schedules/{id}", Some(OP_SCHEDULE_UPDATE)),
     ("POST /admin/schedules/{id}/pause", Some(OP_SCHEDULE_PAUSE)),
     (
         "POST /admin/schedules/{id}/resume",
