@@ -541,6 +541,108 @@ fn workflow_signal_and_cancel_use_post_bodies() {
 }
 
 #[test]
+fn workflow_signal_idempotency_key_maps_to_query_param() {
+    // Issue #753: the CLI signal subcommand reaches parity with the HTTP
+    // surface (issue #521) by mapping --idempotency-key onto the
+    // ?idempotency_key= query param of the plain signal route.
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "signal",
+        "00000000-0000-0000-0000-000000000001",
+        "approved",
+        "--payload-json",
+        r#"{"approved":true}"#,
+        "--idempotency-key",
+        "evt_abc123",
+    ])
+    .expect("workflow signal args with --idempotency-key should parse");
+    let request = cli.api_request().expect("signal request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/signal/approved?idempotency_key=evt_abc123"
+    );
+    assert_eq!(request.body, Some(json!({ "approved": true })));
+}
+
+#[test]
+fn workflow_signal_idempotency_key_is_query_encoded() {
+    // Keys derived from upstream event ids may carry reserved characters —
+    // they must be RFC 3986 query-encoded, mirroring the other query params.
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "signal",
+        "00000000-0000-0000-0000-000000000001",
+        "approved",
+        "--idempotency-key",
+        "evt 1/2&3",
+    ])
+    .expect("workflow signal args should parse");
+    let request = cli.api_request().expect("signal request should build");
+
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/signal/approved?idempotency_key=evt%201%2F2%263"
+    );
+}
+
+#[test]
+fn workflow_signal_empty_idempotency_key_is_rejected() {
+    // Mirror the server's header semantics (issue #521): a present but empty
+    // Idempotency-Key is rejected rather than silently degraded to
+    // at-least-once — the server treats an empty ?idempotency_key= as
+    // omitted, so a client that intended exactly-once must never send one.
+    for empty in ["", "   "] {
+        let result = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "signal",
+            "00000000-0000-0000-0000-000000000001",
+            "approved",
+            "--idempotency-key",
+            empty,
+        ]);
+        let message = match result {
+            Err(e) => e.to_string(),
+            Ok(cli) => match cli.api_request() {
+                Err(e) => e.to_string(),
+                Ok(req) => panic!(
+                    "empty --idempotency-key {empty:?} must be rejected, but mapped to {}",
+                    req.path
+                ),
+            },
+        };
+        assert!(
+            message.contains("idempotency"),
+            "rejection must name the flag, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn workflow_signal_without_idempotency_key_omits_query_param() {
+    // AC (issue #753): omitting the key preserves today's at-least-once
+    // behavior exactly — no query param is sent at all.
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "signal",
+        "00000000-0000-0000-0000-000000000001",
+        "approved",
+    ])
+    .expect("workflow signal args should parse");
+    let request = cli.api_request().expect("signal request should build");
+
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/signal/approved"
+    );
+}
+
+#[test]
 fn workflow_reset_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",

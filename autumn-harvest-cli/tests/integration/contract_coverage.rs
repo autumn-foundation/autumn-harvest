@@ -300,6 +300,20 @@ fn workflow_signal_is_covered() {
 }
 
 #[test]
+fn workflow_signal_with_idempotency_key_is_covered() {
+    // Issue #753: --idempotency-key maps onto the documented
+    // ?idempotency_key= query param of the same contract route.
+    assert_covered(&[
+        "workflow",
+        "signal",
+        "00000000-0000-0000-0000-000000000001",
+        "my_signal",
+        "--idempotency-key",
+        "evt_abc123",
+    ]);
+}
+
+#[test]
 fn workflow_query_is_covered() {
     assert_covered(&[
         "workflow",

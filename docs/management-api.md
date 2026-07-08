@@ -554,3 +554,60 @@ Looks up the result of an admitted update. Returns:
   "workflow_state": "FAILED"
 }
 ```
+
+## Signal delivery (`POST /workflows/{id}/signal/{signal_name}`)
+
+Delivers a named signal to a running workflow execution. The request body is
+the signal payload itself (free-form JSON) — nothing else is ever smuggled
+into it.
+
+### Idempotent delivery (issues #521 / #753)
+
+Webhook and event sources deliver at-least-once. To make duplicate deliveries
+land **exactly one** `SignalReceived` event, supply an exactly-once key
+out-of-band:
+
+- `Idempotency-Key:` request header (wins when both are present), or
+- `?idempotency_key=` query parameter.
+
+A present `Idempotency-Key` header that is empty or not valid UTF-8 is
+rejected with `400 Bad Request` rather than silently degraded to
+at-least-once. Dedupe scope is shard-local, keyed on
+`(execution_id, idempotency_key)` — the same upstream event id may safely
+target different executions. Omitting the key preserves the legacy
+at-least-once contract exactly: every call delivers a distinct signal event.
+
+### Response
+
+```
+202 Accepted
+{ "ok": true, "signal_delivered": true }   // freshly queued
+{ "ok": true, "signal_delivered": false }  // deduplicated retry — idempotent replay, not an error
+```
+
+Terminal executions: an **unkeyed** signal — or a keyed signal whose key has
+never landed — keeps the existing terminal-error semantics (the keyed insert
+is rolled back, so no orphan row is left behind). One deliberate carve-out:
+a keyed **retry** whose key already landed while the execution was still
+running dedupes to a no-op success (`202 { "signal_delivered": false }`) even
+after the execution has since gone terminal — the retry acknowledges a
+delivery that already happened rather than requesting a new one
+(`send_signal_idempotent` attempts the insert *before* validating state for
+exactly this reason). `404` for an unknown execution id, keyed or not.
+
+### CLI usage
+
+```bash
+harvest workflow signal <exec-id> approval \
+  --payload-json '{"approved": true}' \
+  --idempotency-key evt_abc123
+```
+
+`--idempotency-key` maps onto the `?idempotency_key=` query parameter of this
+route; an empty key is rejected at the CLI (the server would treat it as
+omitted, silently degrading to at-least-once). See the
+[signals chapter](getting-started/04-signals.md#idempotent-standalone-signals-over-http-issue-521)
+for the full walkthrough and the
+[idempotency chapter](getting-started/06-idempotency.md#idempotent-signal-delivery)
+for the surrounding idempotency story (including `signal-with-start` for the
+first-delivery case).

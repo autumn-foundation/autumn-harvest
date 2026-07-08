@@ -3488,3 +3488,195 @@ async fn replayer_pre_marker_cancelled_history_stays_uncounted() {
     );
     assert_eq!(recorder.failed.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Replay-safe custom business metrics (issue #758, shipped as issue #532):
+// a counter incremented once in a workflow body is emitted exactly once on
+// the live execution and zero times across N >= 5 replay cycles.
+// ---------------------------------------------------------------------------
+
+/// Counting `MetricsRecorder` capturing every custom-metric emission.
+///
+/// `is_enabled()` keeps its default (`true`) so `UserMetrics` does not
+/// short-circuit; every other recorder method keeps its no-op default.
+#[derive(Default)]
+struct CountingMetrics {
+    counters: std::sync::atomic::AtomicU64,
+    histograms: std::sync::atomic::AtomicU64,
+}
+
+impl CountingMetrics {
+    fn counter_total(&self) -> u64 {
+        self.counters.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn histogram_total(&self) -> u64 {
+        self.histograms.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for CountingMetrics {
+    fn record_user_counter(&self, name: &str, value: u64, _labels: &[(&str, &str)]) {
+        assert!(
+            name.starts_with(autumn_harvest::telemetry::USER_METRIC_PREFIX),
+            "custom metric names must carry the harvest.user. namespace, got {name}"
+        );
+        self.counters
+            .fetch_add(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_user_histogram(&self, name: &str, _value: f64, _labels: &[(&str, &str)]) {
+        assert!(
+            name.starts_with(autumn_harvest::telemetry::USER_METRIC_PREFIX),
+            "custom metric names must carry the harvest.user. namespace, got {name}"
+        );
+        self.histograms
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One activity, then a single business-counter increment and one histogram
+/// sample (issue #758's "counter incremented once in workflow code" shape;
+/// the histogram proves suppression covers both metric kinds).
+fn business_counter_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let shipped = ctx
+            .execute_activity_raw("fulfill", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.metrics()
+            .counter("orders_fulfilled", 1, &[("tier", "gold")]);
+        ctx.metrics()
+            .histogram("order_amount_usd", 42.5, &[("tier", "gold")]);
+        Ok(serde_json::json!({"shipped": shipped}))
+    })
+}
+
+/// Loop variant: `input` is the iteration count; each iteration runs the
+/// activity and increments the counter once — two live iterations must emit
+/// exactly two.
+fn business_counter_loop_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let iterations = input.as_u64().unwrap_or(0);
+        for _ in 0..iterations {
+            ctx.execute_activity_raw("fulfill", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            ctx.metrics()
+                .counter("orders_fulfilled", 1, &[("tier", "gold")]);
+        }
+        Ok(serde_json::json!({"iterations": iterations}))
+    })
+}
+
+/// Recorded history for `business_counter_workflow` — note there is **no**
+/// event corresponding to the `ctx.metrics()` call: custom metrics leave the
+/// history byte-identical (issue #758's append-only AC by construction).
+fn business_counter_history() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "fulfill".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("shipped"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"shipped": "shipped"}),
+        },
+    ]
+}
+
+/// AC (issue #758): a workflow that increments a counter once in its body,
+/// replayed across N (>= 5) cycles, produces **exactly 1** emission — 1 from
+/// the live run (asserted here via `WorkflowTestEnv`), 0 from the replays
+/// (asserted in `five_cycle_replay_emits_zero_workflow_metrics` below).
+#[tokio::test]
+async fn live_execution_emits_workflow_counter_exactly_once() {
+    let metrics = std::sync::Arc::new(CountingMetrics::default());
+    let outcome = autumn_harvest::testing::WorkflowTestEnv::new()
+        .with_metrics(metrics.clone())
+        .mock_activity("fulfill", |_| Ok(serde_json::json!("shipped")))
+        .run(business_counter_workflow, Value::Null)
+        .await;
+
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    // The test env drives multiple executor iterations (live frontier +
+    // replay cycles after each suspension); emission still nets exactly one.
+    assert_eq!(
+        metrics.counter_total(),
+        1,
+        "a counter incremented once in workflow code must emit exactly once"
+    );
+    assert_eq!(
+        metrics.histogram_total(),
+        1,
+        "a histogram sampled once in workflow code must emit exactly once"
+    );
+}
+
+/// AC (issue #758): 0 double-counts across a 5-cycle replay of a counter
+/// incremented once in workflow code.
+#[tokio::test]
+async fn five_cycle_replay_emits_zero_workflow_metrics() {
+    let metrics = std::sync::Arc::new(CountingMetrics::default());
+
+    for cycle in 0..5 {
+        let report = WorkflowReplayer::new()
+            .register_fn("business_counter_workflow", business_counter_workflow)
+            .with_metrics(metrics.clone())
+            .replay_from_events(business_counter_history())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "replay cycle {cycle} must succeed: {report}"
+        );
+    }
+
+    assert_eq!(
+        metrics.counter_total(),
+        0,
+        "custom workflow metrics must be suppressed on every replay cycle"
+    );
+    assert_eq!(
+        metrics.histogram_total(),
+        0,
+        "custom workflow histograms must be suppressed on every replay cycle"
+    );
+}
+
+/// AC (issue #758): a live execution that legitimately hits the increment
+/// twice (a loop iteration recorded in history) emits exactly 2.
+#[tokio::test]
+async fn live_loop_hitting_increment_twice_emits_exactly_two() {
+    let metrics = std::sync::Arc::new(CountingMetrics::default());
+    let outcome = autumn_harvest::testing::WorkflowTestEnv::new()
+        .with_metrics(metrics.clone())
+        .mock_activity("fulfill", |_| Ok(serde_json::json!("shipped")))
+        .run(business_counter_loop_workflow, serde_json::json!(2))
+        .await;
+
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    assert_eq!(
+        metrics.counter_total(),
+        2,
+        "two legitimate live increments must emit exactly twice — no more (replay double-count), no fewer (over-suppression)"
+    );
+}

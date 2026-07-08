@@ -923,6 +923,18 @@ enum WorkflowCommand {
         /// File containing JSON signal payload. Use `-` for stdin.
         #[arg(long, value_name = "PATH", conflicts_with = "payload_json")]
         payload_file: Option<PathBuf>,
+        /// Exactly-once delivery key (issue #753). Repeated deliveries with
+        /// the same key for the same execution land exactly one
+        /// `SignalReceived` event; the response reports
+        /// `signal_delivered=false` for the deduped retries. Omit to keep the
+        /// legacy at-least-once behavior (every call delivers a distinct
+        /// signal event). Typically a stable upstream event id (e.g. a Stripe
+        /// event id or SQS message id). An empty key is rejected — the server
+        /// treats an empty `?idempotency_key=` as omitted, which would
+        /// silently degrade an intended exactly-once delivery to
+        /// at-least-once.
+        #[arg(long, value_name = "KEY", value_parser = parse_idempotency_key)]
+        idempotency_key: Option<String>,
     },
     /// Query workflow state.
     Query {
@@ -3807,6 +3819,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             signal_name,
             payload_json,
             payload_file,
+            idempotency_key,
         } => {
             let payload = parse_json_source(
                 payload_json.as_deref(),
@@ -3814,9 +3827,16 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 "signal payload",
             )?
             .unwrap_or_else(|| json!({}));
+            // The exactly-once delivery key rides the ?idempotency_key= query
+            // param (issue #521's out-of-band surface) — the request body must
+            // stay the raw signal payload, so the key is never smuggled into it.
+            let suffix = idempotency_key
+                .as_deref()
+                .map(|key| format!("?idempotency_key={}", query_encode(key)))
+                .unwrap_or_default();
             Ok(ApiRequest::post(
                 format!(
-                    "/workflows/{}/signal/{}",
+                    "/workflows/{}/signal/{}{suffix}",
                     path_segment(execution_id),
                     path_segment(signal_name)
                 ),
@@ -5185,6 +5205,24 @@ fn query_encode(input: &str) -> String {
         }
     }
     out
+}
+
+/// Clap value-parser for `--idempotency-key` (issue #753).
+///
+/// Mirrors the server's `Idempotency-Key` header semantics: a present but
+/// empty (or whitespace-only) key is rejected up front rather than silently
+/// degraded — the management API treats an empty `?idempotency_key=` query
+/// param as omitted, which would turn an intended exactly-once delivery into
+/// at-least-once without the caller noticing.
+fn parse_idempotency_key(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err(
+            "--idempotency-key must not be empty; omit the flag entirely for legacy \
+             at-least-once delivery"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 // ─── Version-gate retirement check helpers ────────────────────────────────────

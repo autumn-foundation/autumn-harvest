@@ -36,6 +36,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
+      - name: Clippy autumn-harvest-cli
+        run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -75,6 +77,10 @@ jobs:
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       - name: Run macros tests
         run: cargo test -p autumn-harvest-macros
+      - name: Run CLI tests (issue #753)
+        run: cargo test -p autumn-harvest-cli
+      - name: Run business_metrics example tests (issue #758)
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
       - name: Compile plugin integration tests
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --no-run
       - name: Run Docker-backed integration tests
