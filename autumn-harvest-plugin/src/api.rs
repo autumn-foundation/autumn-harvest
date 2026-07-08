@@ -90,9 +90,8 @@ use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStat
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
-    ensure_dag_schedule, next_run_after_pub, parse_schedule_from_expr_pub,
-    plan_backfill_timestamps, scheduled_workflow_id_pub, trigger_unified_dag,
-    update_workflow_schedule,
+    ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -17063,13 +17062,16 @@ async fn reserve_backfill_budget_slot(
 /// and warn on error so a leaked `+1` or a stale exhaustion is diagnosable rather
 /// than silently drifting.
 ///
-/// `rearm_next` (issue #688 review, Codex F3): when the clear above actually
+/// `rearm_next` (issue #688 review, Codex F3/F5): when the clear above actually
 /// un-exhausts a `max_runs_exhausted` row that a concurrent scheduler *tick*
 /// nulled `next_run_at` on while exhausting it mid-backfill, re-arm the forward
 /// pointer so the schedule returns to the due-list rather than being stranded
-/// off it until an unrelated PATCH/restart. `rearm_next` is the next slot after
-/// the release's timestamp (`None` for a manual schedule with no expr → no
-/// re-arm), an approximation the tick refines with calendar/skip on its next
+/// off it until an unrelated PATCH/restart. `rearm_next` is the pre-tick due
+/// `next_run_at` snapshot loaded at backfill request start — NOT a recompute from
+/// the release's timestamp (`None` for a manual schedule with no due slot → no
+/// re-arm). Recomputing from `now` would advance PAST an already-due slot the tick
+/// skipped, dropping that run for a catchup schedule; the snapshot restores the
+/// exact slot to retry, which the tick refines with calendar/skip on its next
 /// firing. Guarded (see `rearm_backfill_next_run_stmt!`) so the common
 /// intra-backfill case (our own transition never nulls `next_run_at`) is a no-op.
 async fn release_backfill_budget_slot(
@@ -17857,8 +17859,15 @@ async fn schedule_backfill(
                 // actually attempt to start; every non-committing path below releases
                 // it via `release_backfill_budget_slot`.
                 let now = chrono::Utc::now();
-                // Re-arm target for a release that clears a tick-nulled exhaustion (F3).
-                let rearm_next = next_run_after_pub(parsed_schedule.as_ref(), now);
+                // Re-arm target for a release that clears a tick-nulled exhaustion
+                // (F3/F5): restore the pre-tick due `next_run_at` snapshot loaded at
+                // backfill request start, NOT a recompute from `now`. Recomputing from
+                // `now` would advance PAST an already-due slot the tick skipped, dropping
+                // that run for a catchup schedule; the snapshot is the exact slot to retry.
+                // The re-arm UPDATE stays guarded on `next_run_at IS NULL`, so the common
+                // intra-backfill case is a no-op and this only fires after the clear
+                // un-exhausted a `max_runs_exhausted` row.
+                let rearm_next = schedule.next_run_at;
                 let reserved_runs_started = {
                     // same_pool → reuse the per-slot exec `conn`; else the separate
                     // schedule connection. `conn` is not otherwise borrowed here.
@@ -18341,8 +18350,15 @@ async fn schedule_backfill(
                 // BEFORE committing to a start (issue #688). Placed after the prior-run
                 // and admission checks; every non-committing path below releases it.
                 let now = chrono::Utc::now();
-                // Re-arm target for a release that clears a tick-nulled exhaustion (F3).
-                let rearm_next = next_run_after_pub(parsed_schedule.as_ref(), now);
+                // Re-arm target for a release that clears a tick-nulled exhaustion
+                // (F3/F5): restore the pre-tick due `next_run_at` snapshot loaded at
+                // backfill request start, NOT a recompute from `now`. Recomputing from
+                // `now` would advance PAST an already-due slot the tick skipped, dropping
+                // that run for a catchup schedule; the snapshot is the exact slot to retry.
+                // The re-arm UPDATE stays guarded on `next_run_at IS NULL`, so the common
+                // intra-backfill case is a no-op and this only fires after the clear
+                // un-exhausted a `max_runs_exhausted` row.
+                let rearm_next = schedule.next_run_at;
                 let reserved_runs_started = {
                     // same_pool → reuse the per-slot exec `conn`; else the separate
                     // schedule connection. `conn` is not otherwise borrowed here.
