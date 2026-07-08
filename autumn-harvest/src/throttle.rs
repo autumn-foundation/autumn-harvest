@@ -1041,28 +1041,50 @@ async fn fire_due_on_conn(
                 // in the same query block as a window function, so the lock
                 // must be taken on the outer, window-function-free SELECT
                 // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
-                // `selected` orders by per-key rank (`rn`) first, `deferred_at`
-                // second -- not the reverse (code review, issue #607). With a
-                // flat `ORDER BY deferred_at ASC LIMIT $2`, enough
-                // concurrently-exhausted keys can still fill the *entire*
-                // batch with rows that can never fire (each capped at $1 by
-                // the WHERE clause, but nothing bounds how many *distinct*
-                // exhausted keys contribute their $1 rows before a newer,
-                // genuinely ready key's row is reached): e.g. 10 exhausted
-                // keys x 10 rows each already exhausts a 100-row batch,
-                // permanently starving an 11th key's single ready row every
-                // tick. Ordering by `rn` first means every distinct key's
-                // rank-1 (oldest) row is considered in the first "tier"
-                // before any key's rank-2 row is considered, so a ready
-                // key's row is examined as long as the number of distinct
-                // backlogged keys does not itself exceed the batch size.
+                // `candidates` is pre-filtered to rows that are actually
+                // examinable this tick -- either already past their
+                // `schedule_to_start` deadline (must be examined so AC-c can
+                // time them out), or whose bucket's *snapshot* token level
+                // (`LEAST(burst, tokens + elapsed*refill_rate)`) currently
+                // shows >= 1.0 available (a genuinely exhausted bucket is
+                // excluded from the candidate set entirely, at any scale --
+                // code review, issue #607). Without this pre-filter, enough
+                // concurrently-exhausted keys can permanently occupy the
+                // entire batch with rows that can never fire regardless of
+                // ordering: this round's earlier fix (rank-then-date
+                // ordering) only bounded the damage to the first
+                // `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys --
+                // beyond that many, their rank-1 rows alone still fill the
+                // whole budget on every tick, starving a ready key forever.
+                // A row whose bucket happens to be missing (a data anomaly;
+                // `reserve_or_defer` always creates the bucket before
+                // inserting the pending row, so this should not occur in
+                // practice) is conservatively still treated as a candidate,
+                // matching this query's pre-existing behavior for that case
+                // -- `try_consume_rate_limit_token` naturally leaves it
+                // parked (not deleted) when there is truly no bucket to debit.
+                // `selected` then orders the *pre-filtered* candidates by
+                // per-key rank first, `deferred_at` second, still capping
+                // one key at `THROTTLE_FIRE_PER_KEY_CAP` so several
+                // simultaneously-ready keys share the batch fairly. Postgres
+                // forbids `FOR UPDATE` in the same query block as a window
+                // function, so the lock must be taken on the outer,
+                // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
+                // `FOR UPDATE`).
                 let due_sql = "
                     WITH candidates AS (
-                        SELECT id, deferred_at,
+                        SELECT t.id, t.deferred_at,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY bucket_key ORDER BY deferred_at ASC
+                                   PARTITION BY t.bucket_key ORDER BY t.deferred_at ASC
                                ) AS rn
-                        FROM harvest_start_throttle
+                        FROM harvest_start_throttle t
+                        LEFT JOIN harvest_rate_limit_buckets b ON b.key = t.bucket_key
+                        WHERE (t.expires_at IS NOT NULL AND t.expires_at < NOW())
+                           OR b.key IS NULL
+                           OR LEAST(
+                                  b.burst,
+                                  b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate
+                              ) >= 1.0
                     ),
                     selected AS (
                         SELECT id FROM candidates WHERE rn <= $1
@@ -1283,6 +1305,64 @@ pub async fn throttle_backlog_by_key(
             shard_id: r.shard_id,
         })
         .collect())
+}
+
+/// Count of pending (not-yet-fired) `harvest_start_throttle` rows for a
+/// given `workflow_name`, across every throttle key.
+///
+/// A throttled admission durably defers *before* any `WorkflowStarted`
+/// event exists -- no `harvest_workflow_executions` row is created until the
+/// scanner fires it. A caller enforcing a workflow-name-scoped concurrency
+/// bound (e.g. a schedule's `max_active_runs`/overlap policy, issue #241/#478)
+/// against a plain `COUNT(*) ... WHERE state IN ('RUNNING','PAUSED')` query
+/// would therefore under-count: a deferred fire is a logically in-flight run
+/// that just hasn't materialized yet, and omitting it lets the caller admit
+/// more concurrent runs than its own limit allows (code review, issue #607).
+/// Callers should add this count to their own running-count before
+/// comparing against a `max_active_runs`-style ceiling.
+///
+/// Tolerates a missing `harvest_start_throttle` table (mixed-schema
+/// fixtures / a deployment mid-upgrade) by returning `0`, matching
+/// [`fire_due_throttled_starts`]'s own `to_regclass` tolerance -- this lets
+/// every pre-existing scheduler test fixture that never migrated the
+/// throttle table keep working unchanged.
+///
+/// # Errors
+/// Returns `HarvestError` if the database query fails.
+#[cfg(feature = "db")]
+pub async fn pending_throttle_count_for_workflow(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+) -> crate::error::HarvestResult<i64> {
+    #[derive(diesel::QueryableByName)]
+    struct Present {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        present: bool,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    use diesel_async::RunQueryDsl;
+    let exists: Present =
+        diesel::sql_query("SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present")
+            .get_result(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    if !exists.present {
+        return Ok(0);
+    }
+
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(row.n)
 }
 
 // ---------------------------------------------------------------------------

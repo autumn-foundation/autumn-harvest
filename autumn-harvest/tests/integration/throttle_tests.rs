@@ -1375,6 +1375,117 @@ async fn scanner_does_not_starve_a_fresh_key_behind_many_exhausted_keys() {
     );
 }
 
+/// Code-review fix (issue #607, P2): the rank-then-date ordering fix above
+/// only bounds the damage to the first `THROTTLE_FIRE_BATCH_SIZE` distinct
+/// exhausted keys -- beyond that many, their rank-1 rows alone still fill
+/// the whole batch on every tick, since nothing excludes a genuinely
+/// exhausted bucket from the candidate set in the first place. This test
+/// creates *real*, genuinely-empty buckets (not merely missing ones) for
+/// 100 distinct keys -- exactly `THROTTLE_FIRE_BATCH_SIZE` -- plus one more
+/// (101st) key with a real, ready bucket, so all 101 keys tie at rank 1 and
+/// the fresh key's newer `deferred_at` would lose the date tie-break under
+/// rank-only ordering. Fixed by pre-filtering candidates to rows whose
+/// bucket snapshot currently shows an available token (or are already
+/// expired, or have no bucket at all) -- a genuinely exhausted bucket is
+/// never a candidate, at any scale.
+#[tokio::test]
+async fn scanner_readiness_filter_excludes_more_than_batch_size_distinct_exhausted_keys() {
+    use diesel_async::RunQueryDsl;
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+
+    // 100 distinct keys, each with a *real* bucket showing 0 available
+    // tokens (refill_rate = 0, so it can never refill) and exactly one
+    // pending row (rank 1).
+    for key_idx in 0..THROTTLE_FIRE_BATCH_SIZE {
+        let key = format!("real-exhausted-{key_idx}");
+        let bkey = bucket_key(wf, &key);
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
+             VALUES ($1, 0.0, 1.0, 0.0, NOW(), NOW(), NOW())",
+        )
+        .bind::<diesel::sql_types::Text, _>(&bkey)
+        .execute(&mut conn)
+        .await
+        .expect("insert exhausted bucket");
+        diesel::sql_query(
+            "INSERT INTO harvest_start_throttle \
+             (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, \
+              input, start_options, deferred_at, expires_at, shard_id, created_at) \
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, 'default', 'null'::jsonb, \
+                      '{}'::jsonb, NOW(), NULL, 0, NOW())",
+        )
+        .bind::<diesel::sql_types::Text, _>(wf)
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .bind::<diesel::sql_types::Text, _>(&bkey)
+        .bind::<diesel::sql_types::Text, _>(format!("real-exhausted-{key_idx}"))
+        .execute(&mut conn)
+        .await
+        .expect("insert exhausted row");
+    }
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM harvest_start_throttle"
+        )
+        .await,
+        THROTTLE_FIRE_BATCH_SIZE,
+        "100 rows across 100 keys with real, permanently-empty buckets"
+    );
+
+    // A 101st key's single row, deferred strictly after all 100 exhausted
+    // rows (so it is the newest by deferred_at -- and would lose the
+    // rank-then-date tie-break if the exhausted rows were still candidates)
+    // with a real, debitable token.
+    let fresh_key = "real-fresh";
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            fresh_key,
+            "real-fresh-seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("fresh key seed consumes its burst token");
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            fresh_key,
+            "real-fresh-job",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("fresh key row defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+    set_bucket_tokens(&mut conn, &bucket_key(wf, fresh_key), 1.0).await;
+
+    let fired = drain(&mut conn, &metrics).await;
+    assert_eq!(
+        fired, 1,
+        "the fresh (101st) key's ready row must fire despite 100 other \
+         keys with real, permanently-exhausted buckets"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, fresh_key).await,
+        0,
+        "the fresh key's row must have fired this tick, proving it wasn't starved"
+    );
+}
+
 // ── `skip_size_check` ordering fix (issue #607 round 4) ─────────────────────
 //
 // Round 3 added an early oversized-input rejection at 4 call sites, running
@@ -1954,6 +2065,112 @@ async fn scheduler_tick_rejects_oversized_input_before_deferring() {
     );
 }
 
+/// Code-review fix (issue #607, P1): a throttled scheduled fire durably
+/// defers before any `harvest_workflow_executions` row exists. The
+/// scheduler's `max_active_runs`/overlap gate is computed solely from that
+/// table, so -- without counting pending throttle rows -- a schedule with
+/// `max_active_runs = 1` could dispatch (and defer) a *second* slot on a
+/// later tick while the first deferred fire is still sitting in the
+/// throttle queue, never having started an execution. This violates the
+/// schedule's own concurrency guarantee and lets throttled schedules
+/// overlap in a way the unthrottled scheduler would have skipped/buffered.
+#[tokio::test]
+async fn throttled_scheduled_deferral_counts_against_max_active_runs() {
+    use diesel_async::RunQueryDsl;
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "throttled_overlap_wf";
+
+    // Seed the bucket with capacity exactly 1 (not the registered policy's
+    // real burst=100) so the very first admission attempt drains it --
+    // `ensure_throttle_bucket`'s `ON CONFLICT (key) DO NOTHING` means
+    // whichever call creates the bucket row wins its burst/refill_rate.
+    reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf_name,
+            throttle_key: "",
+            workflow_id: "seed",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("seed consumes the bucket's sole token");
+
+    let sched_id = insert_schedule_with_input(&mut conn, wf_name, serde_json::json!({})).await;
+    // insert_schedule_with_input hardcodes max_active_runs = 10; force it to
+    // 1 for this test's concurrency-limit scenario.
+    diesel::sql_query("UPDATE harvest_schedules SET max_active_runs = 1 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(sched_id)
+        .execute(&mut conn)
+        .await
+        .expect("set max_active_runs");
+    drop(conn);
+
+    let pool = make_scheduler_pool(&url);
+    let registry = make_throttled_registry(wf_name);
+    let dags = Arc::new(DagCatalog::default());
+
+    // First tick: the due slot defers (bucket already drained by the seed).
+    tick_once(
+        pool.clone(),
+        registry.clone(),
+        dags.clone(),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("first tick");
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        throttle_row_count(&mut conn, "").await,
+        1,
+        "first tick defers exactly one pending row"
+    );
+    assert_eq!(execution_count(&mut conn, wf_name).await, 0);
+
+    // Force the schedule due again immediately, simulating the next
+    // interval having already elapsed, without waiting real wall-clock time.
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(sched_id)
+    .execute(&mut conn)
+    .await
+    .expect("force due again");
+    drop(conn);
+
+    // Second tick: without the fix, `running` (computed only from
+    // harvest_workflow_executions) is still 0, so max_active_runs=1 would
+    // not block a second dispatch -- the schedule would defer a *second*
+    // pending row even though the first deferred fire hasn't started yet.
+    tick_once(
+        pool.clone(),
+        registry.clone(),
+        dags.clone(),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("second tick");
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        throttle_row_count(&mut conn, "").await,
+        1,
+        "the second tick must not defer a second pending row while the \
+         first is still queued -- max_active_runs=1 must count the pending \
+         throttle row as an in-flight run"
+    );
+    assert_eq!(execution_count(&mut conn, wf_name).await, 0);
+}
+
 /// Insert a schedule row with a pre-populated `buffered_runs` slot (a single
 /// past fire time), the buffered/backfill drain path's trigger condition
 /// (`jsonb_array_length(buffered_runs) > 0`), whose `workflow_input` is the
@@ -2008,6 +2225,117 @@ async fn schedule_buffered_runs(conn: &mut AsyncPgConnection, id: Uuid) -> Vec<S
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Same fix, buffered/backfill-fire loop (issue #607, P1): a throttled
+/// buffered-slot fire durably defers before any execution row exists, so
+/// this loop's `available = max_active_runs - running` must also count
+/// pending throttle rows -- otherwise a schedule with `max_active_runs = 1`
+/// could drain (and defer) a second buffered slot on a later tick while an
+/// earlier deferred fire from this same loop is still queued.
+#[tokio::test]
+async fn throttled_buffered_deferral_counts_against_max_active_runs() {
+    use diesel_async::RunQueryDsl;
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "throttled_buffered_overlap_wf";
+
+    // Seed the bucket with capacity exactly 1 (see the scheduler-tick sibling
+    // test above for why), so the very first buffered-slot admission drains it.
+    reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf_name,
+            throttle_key: "",
+            workflow_id: "seed",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("seed consumes the bucket's sole token");
+
+    let sched_id =
+        insert_schedule_with_buffered_slot(&mut conn, wf_name, serde_json::json!({})).await;
+    // insert_schedule_with_buffered_slot hardcodes max_active_runs = 10;
+    // force it to 1 for this test's concurrency-limit scenario.
+    diesel::sql_query("UPDATE harvest_schedules SET max_active_runs = 1 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(sched_id)
+        .execute(&mut conn)
+        .await
+        .expect("set max_active_runs");
+    drop(conn);
+
+    let pool = make_scheduler_pool(&url);
+    let registry = make_throttled_registry(wf_name);
+    let dags = Arc::new(DagCatalog::default());
+
+    // First tick: the single buffered slot defers (bucket already drained).
+    tick_once(
+        pool.clone(),
+        registry.clone(),
+        dags.clone(),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("first tick");
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        throttle_row_count(&mut conn, "").await,
+        1,
+        "first tick defers exactly one pending row for the buffered slot"
+    );
+    assert_eq!(execution_count(&mut conn, wf_name).await, 0);
+    assert!(
+        schedule_buffered_runs(&mut conn, sched_id).await.is_empty(),
+        "the drained slot must be removed from buffered_runs"
+    );
+
+    // Simulate a second buffered slot arriving later (without waiting real
+    // wall-clock time) by re-populating buffered_runs directly.
+    diesel::sql_query("UPDATE harvest_schedules SET buffered_runs = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([(chrono::Utc::now()
+            - chrono::Duration::seconds(10))
+        .to_rfc3339()]))
+        .bind::<diesel::sql_types::Uuid, _>(sched_id)
+        .execute(&mut conn)
+        .await
+        .expect("re-populate buffered_runs");
+    drop(conn);
+
+    // Second tick: without the fix, `running` is still 0 (the first
+    // deferred fire never started an execution), so max_active_runs=1 would
+    // not block draining the second buffered slot too.
+    tick_once(
+        pool.clone(),
+        registry.clone(),
+        dags.clone(),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("second tick");
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        throttle_row_count(&mut conn, "").await,
+        1,
+        "the second tick must not defer a second pending row while the \
+         first is still queued -- max_active_runs=1 must count the pending \
+         throttle row as an in-flight run"
+    );
+    assert_eq!(execution_count(&mut conn, wf_name).await, 0);
+    assert_eq!(
+        schedule_buffered_runs(&mut conn, sched_id).await.len(),
+        1,
+        "the second buffered slot must remain queued, not drained"
+    );
 }
 
 /// Code-review fix (issue #607, proactive): the buffered/backfill-fire loop

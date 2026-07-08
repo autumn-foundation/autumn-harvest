@@ -2420,6 +2420,11 @@ async fn tick_one_workflow_schedule(
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
+    // A throttled fire (issue #607) durably defers before any execution row
+    // exists -- count it toward max_active_runs/overlap so a schedule can't
+    // dispatch past its own concurrency limit while an earlier fire is still
+    // sitting in the throttle queue (code review, issue #607).
+    running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
 
     if running >= i64::from(schedule.max_active_runs) {
         let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
@@ -3719,13 +3724,19 @@ async fn drain_buffered_schedule_runs(
             continue;
         }
 
-        let running: i64 = harvest_workflow_executions::table
+        let mut running: i64 = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
             .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
+        // A throttled fire durably defers before any execution row exists --
+        // count it toward max_active_runs so this loop can't drain more
+        // buffered slots than the schedule's true remaining capacity allows
+        // while an earlier fire is still sitting in the throttle queue
+        // (code review, issue #607).
+        running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
 
         let available = i64::from(schedule.max_active_runs).saturating_sub(running);
         if available <= 0 {
