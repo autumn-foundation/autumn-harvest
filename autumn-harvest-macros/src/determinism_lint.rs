@@ -882,7 +882,7 @@ mod hvg011_tests {
     //! iteration-order determinism.
     //!
     //! NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
-    //! already permanently assigned to SelectMacro (issue #600) and rule IDs
+    //! already permanently assigned to `SelectMacro` (issue #600) and rule IDs
     //! are never reused, so the iteration-order rule ships as HVG011.
 
     use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
