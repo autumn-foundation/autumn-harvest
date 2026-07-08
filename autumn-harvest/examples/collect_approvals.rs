@@ -34,7 +34,7 @@ pub struct ApprovalStatus {
 }
 
 // HVG010 opt-out with justification (issue #799): this workflow deliberately
-// uses `futures::future::select` at line 92 to race a `wait_for_signal` against
+// uses `futures::future::select` below to race a `wait_for_signal` against
 // an `await_condition_timeout`. The guardrail flags the combinator as a
 // HardBlocker because it cannot statically prove such a race is replay-safe, but
 // this specific use IS deterministic: `futures::future::select` polls its

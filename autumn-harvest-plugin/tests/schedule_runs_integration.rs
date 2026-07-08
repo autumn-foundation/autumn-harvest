@@ -812,3 +812,34 @@ async fn one_shard_down_is_partial_not_500() {
         .any(|s| s["status"] == "unavailable");
     assert!(unavailable, "the down shard is named in the report");
 }
+
+#[tokio::test]
+async fn schedule_on_down_shard_is_indeterminate_not_404() {
+    // issue #762 review: a schedule that genuinely EXISTS but whose owning shard is
+    // unreachable must be reported as INDETERMINATE (503), never as a definitive 404
+    // (which would lie about existence). Mirrors `one_shard_down_is_partial_not_500`
+    // but seeds the schedule on the DOWN shard so the existence lookup can't resolve
+    // it while a shard is unreachable.
+    let ((url0, url1), _c) = setup_two_shards().await;
+    let sid = Uuid::new_v4();
+    // Schedule lives on shard 1, which we will make unreachable.
+    seed_schedule(&url1, sid, None).await;
+
+    // Point shard 1 at a database that does not exist so its pool fails; shard 0 is
+    // healthy but does not own the schedule.
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url0));
+    pools.insert(
+        ShardId::new(1),
+        build_pool(&url1.replace("harvest_shard_", "missing_db_")),
+    );
+    let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let app = build_app(storage);
+
+    let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "existence is indeterminate while a shard is down; must be 503, not 404, got body {body:?}"
+    );
+}

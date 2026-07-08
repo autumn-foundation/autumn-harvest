@@ -306,9 +306,14 @@ const RULES: &[Rule] = &[
             // Combinator FUNCTIONS. `futures::future::select(` covers the
             // qualified plain-select combinator; the bare distinctive forms
             // (`select_all(`/`select_ok(`/`try_select(`) are specific enough to
-            // futures that a call by any of these three is, in practice, the
-            // combinator. Bare `select(` is deliberately omitted (it would
-            // match `.select(` query-builder method calls).
+            // futures that a *free-function* call by any of these three is, in
+            // practice, the combinator. These three are matched only at a
+            // call-position boundary (see `DET011_CALL_BOUNDARY_PATTERNS`): a
+            // preceding `.` (method call, e.g. `q.select_all()`) or identifier
+            // char (a longer name) excludes the match, mirroring the AST macro
+            // visitor's structural exclusion of method calls. Bare `select(` is
+            // deliberately omitted entirely (it would match `.select(`
+            // query-builder method calls even at a boundary — too common).
             "futures::future::select(",
             "select_all(",
             "select_ok(",
@@ -505,7 +510,12 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
 
         'rules: for rule in RULES {
             for &pattern in rule.patterns {
-                if !code_part.contains(pattern) {
+                let matched = if DET011_CALL_BOUNDARY_PATTERNS.contains(&pattern) {
+                    matches_at_call_boundary(&code_part, pattern)
+                } else {
+                    code_part.contains(pattern)
+                };
+                if !matched {
                     continue;
                 }
 
@@ -804,6 +814,21 @@ fn det010_emit_for_finding(
 
 const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// DET011 patterns matched only at a call-position boundary — the bare futures
+/// combinator functions. A preceding `.` (method call) or identifier char (a
+/// longer name that merely ends in the pattern text) excludes the match, so
+/// `q.select_all()` / `x.try_select(a, b)` are not flagged, mirroring the AST
+/// macro visitor's structural exclusion of method calls (#799 P2 review).
+const DET011_CALL_BOUNDARY_PATTERNS: &[&str] = &["select_all(", "select_ok(", "try_select("];
+
+/// True if `pattern` occurs in `code` at a call-position boundary: the byte
+/// immediately preceding a match is neither `.` nor an identifier byte.
+fn matches_at_call_boundary(code: &str, pattern: &str) -> bool {
+    let bytes = code.as_bytes();
+    code.match_indices(pattern)
+        .any(|(pos, _)| pos == 0 || (bytes[pos - 1] != b'.' && !is_ident_byte(bytes[pos - 1])))
 }
 
 /// Byte positions of whole-word occurrences of `word` in `code`.

@@ -210,9 +210,11 @@ pub struct ScheduleRunsResponse {
 
 /// Default page size when `limit` is omitted (issue #762).
 pub const DEFAULT_LIMIT: i64 = 20;
-/// Hard cap on `limit` (issue #762); larger requests are clamped down per AC2's
-/// "clamped 1–200" (and reported via the echoed `limit` + `next_cursor`, never
-/// silently truncated to a smaller number). A `limit < 1` or non-integer is a `400`.
+/// Hard cap on `limit` (issue #762); larger requests are clamped down.
+///
+/// Per AC2's "clamped 1–200" (and reported via the echoed `limit` +
+/// `next_cursor`, never silently truncated to a smaller number). A `limit < 1`
+/// or non-integer is a `400`.
 pub const MAX_LIMIT: i64 = 200;
 
 /// Parsed query parameters for `GET /admin/schedules/{id}/runs` (issue #534).
@@ -288,10 +290,12 @@ impl ScheduleRunsParams {
     }
 }
 
-/// Encode a `(sort_key, execution_id)` keyset cursor into the opaque token format
-/// `"<rfc3339_micros>|<uuid>"` (matching the #514 workflow-list cursor). `sort_key`
-/// is the logical-slot ordering key (`COALESCE(scheduled_for, started_at)`, issue
-/// #762) so pagination stays consistent with the newest-slot-first ordering.
+/// Encode a `(sort_key, execution_id)` keyset cursor into an opaque token.
+///
+/// The token format is `"<rfc3339_micros>|<uuid>"` (matching the #514
+/// workflow-list cursor). `sort_key` is the logical-slot ordering key
+/// (`COALESCE(scheduled_for, started_at)`, issue #762) so pagination stays
+/// consistent with the newest-slot-first ordering.
 #[must_use]
 pub fn encode_cursor(sort_key: DateTime<Utc>, execution_id: Uuid) -> String {
     crate::api::encode_workflow_list_cursor_raw(&sort_key, &execution_id)

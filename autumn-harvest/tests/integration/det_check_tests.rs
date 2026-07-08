@@ -1428,6 +1428,38 @@ fn det011_flags_bare_distinctive_combinators() {
 }
 
 #[test]
+fn det011_does_not_flag_method_call_forms_of_combinators() {
+    // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
+    // free-function combinators — they must not be flagged, mirroring the AST
+    // visitor's structural exclusion of method-call receivers (#799 P2 review).
+    for call in [
+        "let _ = x.select_all();",
+        "let _ = q.try_select(a, b);",
+        "let _ = builder.select_ok(cols);",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "method-call form `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+    // A free-function call and the qualified plain-select combinator MUST still
+    // be flagged.
+    for call in [
+        "let _ = select_all(v).await;",
+        "let _ = futures::future::select(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "free-function combinator `{call}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
 fn det011_does_not_flag_unrelated_code() {
     // A clean workflow using the sanctioned alternatives — zero DET011.
     let src = wf(

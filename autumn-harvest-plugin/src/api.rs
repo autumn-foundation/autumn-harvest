@@ -14377,23 +14377,63 @@ async fn get_schedule_decisions(
 /// cadence summary that counts only `scheduled`-origin runs so a backfill storm or
 /// ad-hoc trigger never inflates the failure ratio. Fans out across shards and
 /// flags partial results when a shard is unavailable (never a hard 500).
-async fn list_schedule_runs_handler(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path(id_str): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
-) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+/// Resolve the schedule row (on whichever shard owns it) so the runs handler can
+/// echo `next_run_at` and, critically, `404` an unknown id rather than returning a
+/// silently-empty run list (issue #762).
+///
+/// A not-found result is `404` only when every shard was reachable; if any shard
+/// was unreachable the row's existence is indeterminate, so it returns `503`
+/// rather than lying with a definitive `404` (issue #762 review). Never `500`.
+async fn resolve_schedule_for_runs(
+    pool: &HarvestDbPool,
+    schedule_id: uuid::Uuid,
+) -> Result<HarvestSchedule, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let mut any_shard_unreachable = false;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        // An unreachable shard is skipped rather than 500ing the whole request
+        // (mirroring the run fan-out's partial-result philosophy).
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            any_shard_unreachable = true;
+            continue;
+        };
+        let row: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(schedule_id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(map_error)?;
+        if let Some(row) = row {
+            return Ok(row);
+        }
+    }
+
+    if any_shard_unreachable {
+        // Not found, but at least one shard was unreachable — existence is
+        // indeterminate. Never lie with a 404, never 500.
+        Err(AutumnError::service_unavailable_msg(format!(
+            "cannot determine whether schedule {schedule_id} exists: one or more \
+             shards are unreachable; retry once shards recover"
+        )))
+    } else {
+        // Not found and every shard was reachable — genuinely unknown.
+        Err(AutumnError::not_found_msg(format!(
+            "schedule {schedule_id}"
+        )))
+    }
+}
+
+/// Validate the state/origin vocabularies up front so a typo is a `400`, not a
+/// silently-empty match.
+fn validate_run_filters(params: &schedule_runs::ScheduleRunsParams) -> Result<(), AutumnError> {
     const KNOWN_ORIGINS: [&str; 3] = [
         autumn_harvest::execution::ORIGIN_SCHEDULED,
         autumn_harvest::execution::ORIGIN_BACKFILL,
         autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER,
     ];
-
-    let schedule_id = parse_uuid(&id_str, "schedule id")?;
-    let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
-        .map_err(AutumnError::bad_request_msg)?;
-
-    // Validate the state/origin vocabularies up front so a typo is a 400, not a
-    // silently-empty match.
     for state in &params.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
             return Err(AutumnError::bad_request_msg(format!(
@@ -14408,40 +14448,23 @@ async fn list_schedule_runs_handler(
             )));
         }
     }
+    Ok(())
+}
+
+async fn list_schedule_runs_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+    let schedule_id = parse_uuid(&id_str, "schedule id")?;
+    let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
+        .map_err(AutumnError::bad_request_msg)?;
+
+    validate_run_filters(&params)?;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    // Resolve the schedule row once (on whichever shard owns it) so we can echo
-    // `next_run_at` and, critically, 404 an unknown id rather than returning a
-    // silently-empty run list (issue #762).
-    let schedule_row: Option<HarvestSchedule> = {
-        use autumn_harvest::schema::harvest_schedules::dsl;
-        let mut found: Option<HarvestSchedule> = None;
-        for (_shard, shard_pool) in pool.iter_shards() {
-            // An unreachable shard is skipped rather than 500ing the whole request
-            // (mirroring the run fan-out's partial-result philosophy). If the schedule
-            // lives only on a down shard the lookup degrades to a 404, never a 500.
-            let mut conn = match acquire_conn(shard_pool).await {
-                Ok(conn) => conn,
-                Err(_) => continue,
-            };
-            let row: Option<HarvestSchedule> = dsl::harvest_schedules
-                .find(schedule_id)
-                .select(HarvestSchedule::as_select())
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(database_error)
-                .map_err(map_error)?;
-            if row.is_some() {
-                found = row;
-                break;
-            }
-        }
-        found
-    };
-    let schedule = schedule_row
-        .ok_or_else(|| AutumnError::not_found_msg(format!("schedule {schedule_id}")))?;
+    let schedule = resolve_schedule_for_runs(&pool, schedule_id).await?;
     let next_run_at = schedule.next_run_at;
 
     // Fetch limit + 1 per shard so the merge can detect whether a further page

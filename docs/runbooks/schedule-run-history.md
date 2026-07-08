@@ -101,7 +101,7 @@ harvest schedule runs <schedule-id> --origin manual_trigger
 
 ## Pagination
 
-The list is capped (default 100, max 1000). When more runs match than the cap, the
+The list is capped (default 20, max 200). When more runs match than the cap, the
 response carries a `next_cursor`; pass it back to page through:
 
 ```bash
