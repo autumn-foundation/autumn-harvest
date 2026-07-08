@@ -463,7 +463,7 @@ pub(crate) fn build_outcome_envelope(
     state: TerminalState,
     workflow_id: &str,
     workflow_name: &str,
-    output: Option<&Value>,
+    output: Option<Value>,
     error: Option<&str>,
 ) -> Value {
     serde_json::json!({
@@ -471,7 +471,7 @@ pub(crate) fn build_outcome_envelope(
         "source_exec_id": exec_id.to_string(),
         "source_workflow_id": workflow_id,
         "source_workflow_name": workflow_name,
-        "output": output.cloned().unwrap_or(Value::Null),
+        "output": output.unwrap_or(Value::Null),
         "error": error.map_or(Value::Null, |s| Value::String(s.to_string())),
     })
 }
@@ -944,8 +944,13 @@ pub fn evaluate_triggers_for_execution<'a>(
                 // same-shard start and the cross-shard outbox row below, so
                 // inline/outbox parity (AC5) holds by construction.
                 InputMapping::Outcome { ref projection } => {
+                    // Reuse the already-owned `source_output` clone (the guard's
+                    // clone from above) on a COMPLETED source instead of
+                    // re-borrowing `execution.output` and cloning a second time
+                    // inside the builder. `source_output` is unused by this arm
+                    // otherwise, so moving it here is free.
                     let output_for_env = if matches!(state, TerminalState::Completed) {
-                        execution.output.as_ref()
+                        Some(source_output)
                     } else {
                         None
                     };
@@ -1468,7 +1473,7 @@ mod tests {
             TerminalState::Completed,
             "order-7",
             "fulfill_order",
-            Some(&output),
+            Some(output.clone()),
             None,
         );
         assert_eq!(env["terminal_state"], json!("COMPLETED"));
