@@ -537,6 +537,29 @@ fn pause_suppresses_timeout_enforcement(
     }
 }
 
+/// Pure verdict for the locked re-read of an external-task row inside
+/// [`enforce_external_task_timeouts`]'s per-task transaction (issue #609
+/// post-review hardening, third bot-review round). `true` means "the row is
+/// still an enforceable schedule-to-close timeout": it is still open
+/// (`PENDING`) and its deadline is still elapsed. `false` means a concurrent
+/// writer won the race after the scan snapshot — a completion/failure flipped
+/// the state, or `extend_deadline`/a resume's pause-span shift pushed
+/// `schedule_to_close_at` back into the future — and the scanner must skip
+/// the row entirely: no state flip, no `ActivityTimedOut` event, not counted.
+///
+/// The locked re-read this feeds replaces trusting the scan snapshot (which
+/// the pre-fix code re-verified via filters on the claiming `UPDATE`
+/// instead); it exists so the row lock can be taken *before* the execution
+/// row lock — see the lock-ordering convention comment inside
+/// [`enforce_external_task_timeouts`].
+fn external_task_timeout_still_due(
+    state: &str,
+    schedule_to_close_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    state == "PENDING" && schedule_to_close_at < now
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
@@ -930,11 +953,14 @@ async fn enforce_workflow_timeout(
 /// serialize with `pause_workflow_execution` (which locks only the execution
 /// row), so a pause committing after the scan must not be enforced anyway
 /// (issue #609 post-review hardening, second bot-review round). The guarantee
-/// is the per-task transaction below: it takes the execution row `FOR UPDATE`
-/// **before** transitioning the external task, re-checks `PAUSED` under that
+/// is the per-task transaction below: it locks the external-task row, then
+/// the execution row `FOR UPDATE`, re-checks `PAUSED` under that execution
 /// lock, and skips the task entirely (left `PENDING`, no event) when the
 /// pause won the race — so the state flip and the event append always happen
-/// under the same lock the pause path holds.
+/// under the same lock the pause path holds. The lock *order* (task row
+/// first, execution row second) matches the external-task completion paths —
+/// see the lock-ordering convention comment inside the transaction (issue
+/// #609 post-review hardening, third bot-review round).
 ///
 /// # Errors
 ///
@@ -971,14 +997,75 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         let result = conn
             .transaction::<bool, HarvestError, _>(|conn| {
                 async move {
-                    // Take the execution row lock FIRST — the same lock
+                    // Per-table lock-ordering convention (issue #609
+                    // post-review hardening, third bot-review round):
+                    //
+                    //   harvest_external_tasks: task row → execution row
+                    //   harvest_task_queue:     execution row → task row
+                    //
+                    // The external-task completion paths (`external_task.rs`'s
+                    // `complete_externally`/`fail_externally`/`extend_deadline`)
+                    // lock the task row first via `lock_task`, then lock the
+                    // execution row inside `store::append_single_event` — so
+                    // this scanner MUST lock the task row first too. An
+                    // earlier revision took the execution row lock first,
+                    // which was an ABBA inversion against a concurrent
+                    // completion: Postgres deadlock-detects and aborts one of
+                    // the two transactions, surfacing spurious errors to
+                    // valid external-completion callers. (The task-queue
+                    // enforcers — `enforce_activity_timeout`,
+                    // `worker::record_schedule_to_close_activity_timeout` —
+                    // follow the *opposite*, execution-first convention for
+                    // `harvest_task_queue` rows; that is safe because no
+                    // task-queue writer locks the task row and then the
+                    // execution row, e.g. `queue::requeue_for_retry` touches
+                    // only the task row. The one external-task writer that
+                    // must run execution-first — resume's pause-span shift,
+                    // `execution::shift_external_schedule_to_close_on_resume_query`,
+                    // which lives inside the execution-locked resume
+                    // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
+                    // waits on a task row and cannot join a lock cycle.)
+                    //
+                    // The locked re-read below replaces trusting the scan
+                    // snapshot (the pre-fix code re-verified it via filters
+                    // on the claiming UPDATE instead).
+                    let locked_row: Option<(String, chrono::DateTime<Utc>)> =
+                        harvest_external_tasks::table
+                            .find(task_id)
+                            .for_update()
+                            .select((
+                                harvest_external_tasks::state,
+                                harvest_external_tasks::schedule_to_close_at,
+                            ))
+                            .first(conn)
+                            .await
+                            .optional()
+                            .map_err(crate::error::database_error)?;
+                    let Some((task_state, deadline)) = locked_row else {
+                        // Row vanished after the scan (e.g. retention
+                        // cascade-deleted the owning execution): skip.
+                        return Ok(false);
+                    };
+                    // Guard against two races the scan snapshot cannot see:
+                    // 1. complete/fail landed after our scan → state != PENDING
+                    // 2. heartbeat (or a resume's pause-span shift, issue
+                    //    #609) extended the deadline after our scan →
+                    //    schedule_to_close_at is now in the future
+                    // Either way: skip — no flip, no event, not counted.
+                    if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
+                        return Ok(false);
+                    }
+
+                    // THEN the execution row lock — the same lock
                     // `pause_workflow_execution`/`resume_workflow_execution`
                     // hold — so the PAUSED re-check, the external-task state
-                    // flip, and the event append all serialize with the pause
-                    // path (issue #609 post-review hardening, second
-                    // bot-review round). A vanished execution row falls
-                    // through to the claiming UPDATE's own filters, matching
-                    // the pre-existing behaviour.
+                    // flip, and the event append below all serialize with the
+                    // pause path (issue #609 post-review hardening, second
+                    // bot-review round): the pause-suppression guarantee is
+                    // unchanged by the task-first reordering. A vanished
+                    // execution row (None) proceeds and surfaces as
+                    // `append_single_event`'s NotFound, matching the
+                    // pre-existing behaviour.
                     let execution_state: Option<String> = harvest_workflow_executions::table
                         .find(exec_uuid)
                         .for_update()
@@ -1000,30 +1087,16 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                         return Ok(false);
                     }
 
-                    // Guard against two remaining races (the PAUSED case is
-                    // now handled authoritatively under the lock above):
-                    // 1. complete/fail landed after our scan → state != PENDING
-                    // 2. heartbeat (or a resume's pause-span shift, issue
-                    //    #609) extended the deadline after our scan →
-                    //    schedule_to_close_at is now in the future
-                    // Either way, 0 rows updated means we skip the timeout event.
-                    let rows = diesel::update(
-                        harvest_external_tasks::table
-                            .find(task_id)
-                            .filter(harvest_external_tasks::state.eq("PENDING"))
-                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
-                    )
-                    .set((
-                        harvest_external_tasks::state.eq("TIMED_OUT"),
-                        harvest_external_tasks::updated_at.eq(Utc::now()),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                    if rows == 0 {
-                        return Ok(false);
-                    }
+                    // The task row is locked and verified above, so a plain
+                    // flip suffices — no re-filters needed.
+                    diesel::update(harvest_external_tasks::table.find(task_id))
+                        .set((
+                            harvest_external_tasks::state.eq("TIMED_OUT"),
+                            harvest_external_tasks::updated_at.eq(Utc::now()),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
 
                     store::append_single_event(conn, exec_id, timeout_event).await?;
                     queue::wake_workflow_task(conn, exec_id).await?;
@@ -2475,6 +2548,48 @@ mod tests {
             elapsed,
             now
         ));
+    }
+
+    // ── external-task locked re-read verdict (issue #609, third bot-review
+    //    round: task-row-first lock ordering) ─────────────────────────────
+
+    #[test]
+    fn external_task_recheck_enforces_a_still_open_expired_row() {
+        let now = Utc::now();
+        assert!(
+            external_task_timeout_still_due("PENDING", now - chrono::Duration::seconds(1), now),
+            "a still-PENDING row past its deadline is an enforceable timeout"
+        );
+    }
+
+    #[test]
+    fn external_task_recheck_skips_a_concurrently_resolved_row() {
+        // A completion/failure that won the race after the scan snapshot must
+        // make the scanner skip: no flip, no ActivityTimedOut, not counted.
+        let now = Utc::now();
+        let elapsed = now - chrono::Duration::seconds(1);
+        for state in ["COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"] {
+            assert!(
+                !external_task_timeout_still_due(state, elapsed, now),
+                "a {state} row must not be timed out a second time"
+            );
+        }
+    }
+
+    #[test]
+    fn external_task_recheck_skips_a_deadline_shifted_into_the_future() {
+        // extend_deadline — or a resume's pause-span shift (issue #609) —
+        // pushing schedule_to_close_at past NOW() after the scan snapshot
+        // must make the scanner skip the row.
+        let now = Utc::now();
+        assert!(!external_task_timeout_still_due(
+            "PENDING",
+            now + chrono::Duration::minutes(5),
+            now
+        ));
+        // Boundary: a deadline exactly at NOW() is not yet elapsed (the scan
+        // itself uses a strict `<`).
+        assert!(!external_task_timeout_still_due("PENDING", now, now));
     }
 
     #[test]

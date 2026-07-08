@@ -1169,10 +1169,14 @@ async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() 
     // `pause_workflow_execution` (which locks only the execution row), so a
     // pause committing between the UPDATE's snapshot and the event append
     // still flipped the external task to TIMED_OUT and appended
-    // `ActivityTimedOut` mid-pause. The per-task transaction now takes the
-    // execution row lock FIRST and re-checks PAUSED under it, so the state
-    // flip and the append serialize with the pause path. Same choreography
-    // as the sibling task-queue test above.
+    // `ActivityTimedOut` mid-pause. The per-task transaction now locks the
+    // external-task row first (third bot-review round: task-row-first is the
+    // harvest_external_tasks convention set by the completion paths — taking
+    // the execution lock first was an ABBA inversion against
+    // `complete_externally`/`fail_externally`/`extend_deadline`), THEN the
+    // execution row, and re-checks PAUSED under the execution lock — so the
+    // state flip and the event append still serialize with the pause path.
+    // Same choreography as the sibling task-queue test above.
     use autumn_harvest::timeout::enforce_external_task_timeouts;
 
     let (url, _c) = setup().await;

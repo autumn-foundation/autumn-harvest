@@ -1515,13 +1515,36 @@ pub const fn shift_schedule_to_close_on_resume_query() -> &'static str {
 /// external state — `COMPLETED`/`FAILED`/`TIMED_OUT`/`CANCELLED` — is
 /// terminal), and
 /// `schedule_to_close_at` is `NOT NULL` there, so no null guard is needed.
+///
+/// **Lock ordering (issue #609 post-review hardening, third bot-review
+/// round):** the `harvest_external_tasks` convention is *task row →
+/// execution row* (set by the completion paths in `external_task.rs` and
+/// followed by `timeout::enforce_external_task_timeouts`), but this query
+/// runs inside the resume transaction, which already holds the execution row
+/// lock — the inverted (execution-first) order. Waiting on a task row from
+/// here would therefore be an ABBA deadlock against a concurrent
+/// completion/scanner holding that task row and waiting on our execution
+/// lock. The `FOR UPDATE SKIP LOCKED` subselect makes this shift *never
+/// wait* on a task row, so it cannot participate in a lock cycle. Skipping a
+/// locked row is semantically safe in every case: a row locked by
+/// `complete_externally`/`fail_externally` becomes terminal once we commit
+/// (no shift needed); a row locked by `extend_deadline` gets a fresh
+/// `NOW()`-anchored deadline (no paused time charged); and a row locked by
+/// the timeout scanner was already expired *before* the pause began (the
+/// scan excludes PAUSED executions), so the shift would not have rescued it
+/// anyway — a deadline elapsed before the pause is still elapsed after
+/// shifting by exactly the pause span.
 #[must_use]
 pub const fn shift_external_schedule_to_close_on_resume_query() -> &'static str {
     "UPDATE harvest_external_tasks \
      SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
          updated_at = NOW() \
-     WHERE workflow_exec_id = $2 \
-     AND state = 'PENDING'"
+     WHERE id IN (\
+         SELECT id FROM harvest_external_tasks \
+         WHERE workflow_exec_id = $2 \
+         AND state = 'PENDING' \
+         FOR UPDATE SKIP LOCKED\
+     )"
 }
 
 /// Resume-time pause-span and deadline arithmetic, extracted from
@@ -4495,6 +4518,28 @@ mod pause_helper_tests {
         assert!(
             sql.contains("updated_at = NOW()"),
             "external-task mutations stamp updated_at"
+        );
+    }
+
+    #[test]
+    fn external_resume_shift_query_never_waits_on_a_locked_task_row() {
+        // Third bot-review round (issue #609 post-review hardening): the
+        // harvest_external_tasks lock convention is task row → execution row
+        // (completion paths, timeout scanner), but this shift runs with the
+        // execution row lock already held — the inverted order. It must
+        // therefore never *wait* on a task row (SKIP LOCKED), or a concurrent
+        // completion/scanner holding the task row and waiting on our
+        // execution lock would ABBA-deadlock. Skipped rows are safe by
+        // construction — see the query's doc comment.
+        let sql = shift_external_schedule_to_close_on_resume_query();
+        assert!(
+            sql.contains("FOR UPDATE SKIP LOCKED"),
+            "the shift must skip, not wait on, concurrently locked task rows"
+        );
+        assert!(
+            sql.contains("WHERE id IN ("),
+            "locking happens in the subselect so the outer UPDATE only \
+             touches rows this transaction actually holds"
         );
     }
 
