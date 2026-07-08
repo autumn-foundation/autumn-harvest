@@ -277,6 +277,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -298,6 +299,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -319,6 +321,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: Some(target_schema_fn),
@@ -343,6 +346,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -364,6 +368,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -385,6 +390,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -2168,6 +2174,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 concurrency: None,
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -2188,6 +2195,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 concurrency: None,
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,

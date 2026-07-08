@@ -182,6 +182,21 @@ pub struct DebounceStartOptions {
     /// instead of silently discarding them (issue #605 code review).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_callbacks: Option<serde_json::Value>,
+    /// Schedule id that triggered this deferred start (issue #607 throttle +
+    /// #488 carryover). Only ever set by the scheduler/backfill/manual-trigger
+    /// throttle paths; debounce/batch always leave it `None`, so the carryover
+    /// lineage of a throttled scheduled fire survives the deferral. A manual
+    /// trigger sets `scheduled_for: None` alongside it (matching its own
+    /// immediate-start path), so it is attributed to the schedule without
+    /// participating in carryover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<uuid::Uuid>,
+    /// Logical schedule slot this deferred start fires for (issue #488).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_for: Option<DateTime<Utc>>,
+    /// Dispatch origin (issue #534): `scheduled`/`backfill`/`manual_trigger`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// Parameters for [`admit_debounced_start`].
@@ -803,8 +818,12 @@ async fn fire_claimed_debounce_row(
     }
 }
 
+/// Parse a persisted reuse-policy string back into its typed form.
+///
+/// Shared with `throttle.rs`, which persists the same string representation in
+/// its own deferred-start options blob (`DebounceStartOptions.reuse_policy`).
 #[cfg(feature = "db")]
-fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReusePolicy> {
+pub(crate) fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReusePolicy> {
     use crate::types::WorkflowIdReusePolicy::{
         AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
     };

@@ -326,6 +326,7 @@ metric is emitted in the source code.
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `run_shard_tick`, per tick per shard |
 | `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
+| `harvest.workflow.start_throttled` | Counter | `api.rs` (HTTP/batch) + `scheduler.rs` (scheduled/buffered fires) — once per workflow start deferred by a start throttle because the per-key token bucket was empty (issue #607) |
 | `harvest.webhook.received` | Counter | `webhook_receiver.rs` — every request that reaches an inbound webhook receiver route, regardless of outcome (issue #344) |
 | `harvest.webhook.rejected` | Counter | `webhook_receiver.rs` — every inbound webhook request rejected: signature/timestamp/replay verification failure, payload parse failure, mapping-function rejection, or missing idempotency key. Never fires for `accepted`/`idempotent_replay` (issue #344) |
 
@@ -352,6 +353,7 @@ metric is emitted in the source code.
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
 | `harvest.retention.deleted` | `shard` |
 | `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
+| `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
 | `harvest.webhook.received` | `path` (registered `#[webhook(path = ...)]` bindings only, closed set), `outcome` (`accepted\|idempotent_replay\|verify_failed\|parse_failed\|missing_idempotency\|internal_error`) |
 | `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
 
