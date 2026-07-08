@@ -1179,7 +1179,7 @@
       "path": "/workflows/{id}/activities/{activity_exec_id}/fail-now",
       "category": "workflow",
       "read_only": false,
-      "description": "Force-fail exactly one hung in-flight (RUNNING) activity task. Appends ActivityFailed with the distinct error_type 'OperatorForceFailed' through the existing recording path (no new event variant), marks the task row FAILED with the typed failure envelope, and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path -- it is NOT terminated. Remaining retry attempts are skipped regardless of retry policy (the forced failure is non-retryable by construction), and a late result from the worker still running the activity is ignored (no double-apply). Only RUNNING activity tasks are force-failable. Local activities run inline and have no task-queue row -- this endpoint does not apply to them (404).",
+      "description": "Force-fail exactly one hung in-flight (RUNNING) activity task. Appends ActivityFailed with the distinct error_type 'OperatorForceFailed' through the existing recording path (no new event variant), marks the task row FAILED with the typed failure envelope, and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path -- it is NOT terminated. Remaining retry attempts are skipped regardless of retry policy (the forced failure is non-retryable by construction), and a late result from the worker still running the activity is ignored (no double-apply). Only RUNNING activity tasks of a non-terminal execution are force-failable. Note: if the owning workflow has a workflow-level retry policy (issue #523) and propagates this error to workflow failure, the run is retried fresh and the activity re-dispatched -- use cancel/terminate instead if the goal is to stop the run. Local activities run inline and have no task-queue row -- this endpoint does not apply to them (404).",
       "idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event.",
       "params": [
         {
@@ -1202,7 +1202,7 @@
           {
             "name": "reason",
             "required": false,
-            "description": "Human-readable reason recorded in the forced ActivityFailed event's message and details (e.g. an incident id)."
+            "description": "Human-readable reason recorded in the forced ActivityFailed event's message and details (e.g. an incident id). Truncated server-side to 500 characters."
           }
         ]
       },
@@ -1226,12 +1226,16 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "Malformed workflow execution id, or malformed JSON request body."
+        },
+        {
           "status": 404,
-          "description": "Execution or activity task not found, including a task belonging to a different workflow, or activity_exec_id is not a valid UUID. Local activities have no task-queue row and return 404."
+          "description": "Execution or activity task not found, including a task belonging to a different workflow, or activity_exec_id is not a valid UUID. Local activities have no task-queue row and return 404. Note: external-handoff activity IDs are a different id-space from task-queue PKs; passing one will return 404."
         },
         {
           "status": 409,
-          "description": "Task is not force-failable: not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), or the id names a workflow task rather than an activity task."
+          "description": "Task is not force-failable: the owning execution is already terminal (COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED), the task is not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), the id names a workflow task rather than an activity task, or history already carries a terminal event for the activity."
         },
         {
           "status": 500,
