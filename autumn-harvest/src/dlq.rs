@@ -1637,10 +1637,7 @@ pub fn merge_dlq_aggregates(
         }
     }
 
-    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged
-        .into_values()
-        .map(|group| (group.key.clone(), group))
-        .collect();
+    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged.into_iter().collect();
     let limit = params.limit_groups as usize;
 
     let (groups, truncated) = rollup_top_n(
