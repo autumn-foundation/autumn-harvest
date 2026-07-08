@@ -544,15 +544,13 @@ const DET010_COMMAND_MARKERS: &[&str] = &[
     ".side_effect(",
 ];
 
-const DET010_MESSAGE: &str =
-    "Iterating a HashMap/HashSet inside a workflow function observes hash-randomized \
+const DET010_MESSAGE: &str = "Iterating a HashMap/HashSet inside a workflow function observes hash-randomized \
      iteration order, which can differ between the original run and any replay on another \
      worker process. Commands scheduled inside the loop are recorded in history in iteration \
      order, so a reordered replay produces a different command sequence and diverges \
      (non-determinism error / nd-block).";
 
-const DET010_ALTERNATIVE: &str =
-    "Use a BTreeMap/BTreeSet for any collection the workflow iterates, or collect the keys \
+const DET010_ALTERNATIVE: &str = "Use a BTreeMap/BTreeSet for any collection the workflow iterates, or collect the keys \
      into a Vec and sort() it before iterating: `let mut keys: Vec<_> = \
      map.keys().cloned().collect(); keys.sort();`.";
 

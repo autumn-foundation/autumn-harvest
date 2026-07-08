@@ -48,7 +48,7 @@ impl DeterminismVisitor {
     /// Like [`Self::add_finding`] but overrides the catalog severity.
     ///
     /// Used by HVG011's command-aware downgrade: the catalog severity is the
-    /// class's worst case (HardBlocker — a command-emitting loop); a
+    /// class's worst case (`HardBlocker` — a command-emitting loop); a
     /// command-free loop is surfaced as a Warning instead. Kept as a separate
     /// path so the HVG008 rewrite logic in [`Self::push_finding`] is untouched.
     fn add_finding_with_severity(&mut self, rule_id: &str, span: Span, severity: &str) {
@@ -163,13 +163,11 @@ fn init_is_hash_collection(expr: &syn::Expr) -> bool {
             }
             false
         }
-        Expr::MethodCall(mc) if mc.method == "collect" => {
-            mc.turbofish.as_ref().is_some_and(|tf| {
-                tf.args.iter().any(|arg| {
-                    matches!(arg, syn::GenericArgument::Type(ty) if type_is_hash_collection(ty))
-                })
-            })
-        }
+        Expr::MethodCall(mc) if mc.method == "collect" => mc.turbofish.as_ref().is_some_and(|tf| {
+            tf.args.iter().any(
+                |arg| matches!(arg, syn::GenericArgument::Type(ty) if type_is_hash_collection(ty)),
+            )
+        }),
         // `..collect::<HashMap<..>>()?` — unwrap the try.
         Expr::Try(t) => init_is_hash_collection(&t.expr),
         _ => false,
@@ -179,7 +177,7 @@ fn init_is_hash_collection(expr: &syn::Expr) -> bool {
 /// Extracts the bound ident (and whether its explicit type annotation is a
 /// hash collection) from a `let` pattern. Tuple/struct destructuring returns
 /// `None` — unknown binding shapes default to NOT tracking (false positives
-/// are the top risk for a HardBlocker lint).
+/// are the top risk for a `HardBlocker` lint).
 fn local_binding_target(pat: &syn::Pat) -> Option<(String, bool)> {
     match pat {
         syn::Pat::Ident(pi) => Some((pi.ident.to_string(), false)),
@@ -821,7 +819,10 @@ mod hvg011_tests {
             }
             "#,
         );
-        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
     }
 
     #[test]
@@ -870,7 +871,10 @@ mod hvg011_tests {
             }
             "#,
         );
-        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
     }
 
     #[test]
@@ -886,7 +890,10 @@ mod hvg011_tests {
             }
             "#,
         );
-        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
     }
 
     #[test]
@@ -902,7 +909,10 @@ mod hvg011_tests {
             }
             "#,
         );
-        assert_eq!(hvg011_severities(&findings), vec!["HardBlocker".to_string()]);
+        assert_eq!(
+            hvg011_severities(&findings),
+            vec!["HardBlocker".to_string()]
+        );
     }
 
     #[test]

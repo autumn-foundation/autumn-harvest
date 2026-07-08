@@ -781,7 +781,9 @@ fn regression_det008_direct_io() {
 
 #[test]
 fn det010_flags_hashmap_loop_with_command_as_error() {
-    let src = wf("let mut m: HashMap<String, u64> = HashMap::new();\n    for (k, v) in &m {\n        ctx.execute_activity_raw(\"debit\", serde_json::json!(k), \"default\").await?;\n    }");
+    let src = wf(
+        "let mut m: HashMap<String, u64> = HashMap::new();\n    for (k, v) in &m {\n        ctx.execute_activity_raw(\"debit\", serde_json::json!(k), \"default\").await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     let finding = report
         .findings
@@ -797,7 +799,9 @@ fn det010_flags_hashmap_loop_with_command_as_error() {
 
 #[test]
 fn det010_pure_computation_hashmap_loop_is_warning() {
-    let src = wf("let mut m: HashMap<String, u64> = HashMap::new();\n    let mut total = 0u64;\n    for (_k, v) in &m {\n        total += v;\n    }");
+    let src = wf(
+        "let mut m: HashMap<String, u64> = HashMap::new();\n    let mut total = 0u64;\n    for (_k, v) in &m {\n        total += v;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     let finding = report
         .findings
@@ -816,7 +820,9 @@ fn det010_pure_computation_hashmap_loop_is_warning() {
 
 #[test]
 fn det010_flags_hashset_loop_with_command() {
-    let src = wf("let mut s: HashSet<String> = HashSet::new();\n    for item in &s {\n        ctx.spawn_child_workflow_raw(\"child\", serde_json::json!(item)).await?;\n    }");
+    let src = wf(
+        "let mut s: HashSet<String> = HashSet::new();\n    for item in &s {\n        ctx.spawn_child_workflow_raw(\"child\", serde_json::json!(item)).await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     let finding = report
         .findings
@@ -829,7 +835,9 @@ fn det010_flags_hashset_loop_with_command() {
 #[test]
 fn det010_flags_hashset_new_inferred_binding() {
     // Binding hash-typed via the initializer only (no type annotation).
-    let src = wf("let mut s = HashSet::new();\n    s.insert(1u64);\n    for item in s.iter() {\n        ctx.timer(\"t\", *item).await?;\n    }");
+    let src = wf(
+        "let mut s = HashSet::new();\n    s.insert(1u64);\n    for item in s.iter() {\n        ctx.timer(\"t\", *item).await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -853,7 +861,9 @@ fn det010_flags_iter_method_forms() {
 
 #[test]
 fn det010_flags_mut_borrow_form() {
-    let src = wf("let mut m: HashMap<String, u64> = HashMap::new();\n    for (_k, v) in &mut m {\n        ctx.side_effect(\"se\", || *v).await?;\n    }");
+    let src = wf(
+        "let mut m: HashMap<String, u64> = HashMap::new();\n    for (_k, v) in &mut m {\n        ctx.side_effect(\"se\", || *v).await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -863,7 +873,9 @@ fn det010_flags_mut_borrow_form() {
 
 #[test]
 fn det010_flags_collect_turbofish_binding() {
-    let src = wf("let m = items.into_iter().collect::<HashMap<String, u64>>();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let src = wf(
+        "let m = items.into_iter().collect::<HashMap<String, u64>>();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -874,7 +886,9 @@ fn det010_flags_collect_turbofish_binding() {
 #[test]
 fn det010_shadowing_with_vec_untracks_the_ident() {
     // Last binding wins: re-binding `m` as a Vec must clear the hash mark.
-    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    let m: Vec<u64> = m.values().copied().collect();\n    for v in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(v), \"q\").await?;\n    }");
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    let m: Vec<u64> = m.values().copied().collect();\n    for v in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(v), \"q\").await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         !report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -905,7 +919,9 @@ fn det010_never_flags_ordered_collections() {
 #[test]
 fn det010_sorted_keys_vec_is_never_flagged() {
     // The recommended remediation itself must pass: collect keys, sort, iterate.
-    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    let mut keys: Vec<String> = m.keys().cloned().collect();\n    keys.sort();\n    for k in keys {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    let mut keys: Vec<String> = m.keys().cloned().collect();\n    keys.sort();\n    for k in keys {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         !report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -917,7 +933,9 @@ fn det010_sorted_keys_vec_is_never_flagged() {
 fn det010_longer_iterator_chain_is_not_flagged() {
     // Chains past a single method call are deliberately out of scope — this is
     // how "already-sorted iterators are never flagged" holds.
-    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    for k in m.keys().sorted() {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for k in m.keys().sorted() {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         !report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -956,7 +974,9 @@ fn det010_suppression_is_honored_and_reported() {
 
 #[test]
 fn det010_activity_bodies_are_never_flagged() {
-    let src = act("let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        println!(\"{k}\");\n    }");
+    let src = act(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        println!(\"{k}\");\n    }",
+    );
     let report = check_source(&src, "test.rs");
     assert!(
         !report.findings.iter().any(|f| f.rule_id == "DET010"),
@@ -966,7 +986,9 @@ fn det010_activity_bodies_are_never_flagged() {
 
 #[test]
 fn det010_finding_carries_metadata() {
-    let src = wf("let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }");
+    let src = wf(
+        "let m: HashMap<String, u64> = HashMap::new();\n    for (k, _v) in &m {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
+    );
     let report = check_source(&src, "test.rs");
     let finding = report
         .findings
