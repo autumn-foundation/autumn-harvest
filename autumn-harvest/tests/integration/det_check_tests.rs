@@ -1406,6 +1406,54 @@ fn det011_flags_select_biased_macro() {
 }
 
 #[test]
+fn det011_select_macro_is_flagged_exactly_once_no_double_count() {
+    // A line with a single `tokio::select!` must yield exactly ONE DET011
+    // finding — the `select!` and `select_biased!` macro patterns must not both
+    // fire on the same line (#980 Codex P2). The engine dedupes per-rule-per-line
+    // via `continue 'rules`, so this confirms the boundary guard did not
+    // accidentally introduce a second match.
+    for macro_call in [
+        "tokio::select! { _ = a => {} }",
+        "futures::select! { _ = a => {} }",
+        "select! { _ = a => {} }",
+        "select_biased! { _ = a => {} }",
+    ] {
+        let src = wf(macro_call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "`{macro_call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
+    // An unrelated macro whose name merely ENDS in `select!` / `select_biased!`
+    // must NOT be flagged — the identifier-boundary guard excludes a preceding
+    // identifier byte, keeping det_check in agreement with the compile-time
+    // HVG010 guardrail (which matches macro paths exactly and accepts these)
+    // (#980 Codex P2 review).
+    for call in [
+        "sql_select! { columns }",
+        "let _ = my_select!();",
+        "let _ = foo_select_biased!();",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "`{call}` must NOT be flagged for DET011, got: {report:?}"
+        );
+    }
+}
+
+#[test]
 fn det011_flags_qualified_future_select_combinator() {
     let src = wf("let _ = futures::future::select(a, b).await;");
     let report = check_source(&src, "test.rs");

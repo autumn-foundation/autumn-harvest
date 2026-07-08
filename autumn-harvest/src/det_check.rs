@@ -301,7 +301,16 @@ const RULES: &[Rule] = &[
             // invocations (no ident/method call contains it). `select!` alone
             // matches `tokio::select!`, `futures::select!`, and a bare
             // `select!`; `select_biased!` needs its own pattern (it does not
-            // contain the `select!` substring).
+            // contain the `select!` substring). Both are matched only at an
+            // identifier boundary (see `DET011_MACRO_BOUNDARY_PATTERNS`): the
+            // byte immediately preceding a match must not be an identifier
+            // byte, so an unrelated macro whose name merely ENDS in these
+            // tokens (`sql_select! {}`, `my_select!()`, `foo_select_biased!()`)
+            // is not flagged. This keeps det_check in agreement with the
+            // compile-time HVG010 guardrail, which matches macro paths exactly
+            // and accepts those unrelated macros (#799 P2 review). A preceding
+            // `::` (`tokio::select!` / `futures::select!`), brace, whitespace,
+            // or line start is a boundary and still matches.
             "select!",
             "select_biased!",
             // Combinator FUNCTIONS. `future::select(` covers the plain-select
@@ -521,6 +530,8 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
             for &pattern in rule.patterns {
                 let matched = if DET011_CALL_BOUNDARY_PATTERNS.contains(&pattern) {
                     matches_at_call_boundary(&code_part, pattern)
+                } else if DET011_MACRO_BOUNDARY_PATTERNS.contains(&pattern) {
+                    matches_at_ident_boundary(&code_part, pattern)
                 } else {
                     code_part.contains(pattern)
                 };
@@ -847,6 +858,25 @@ fn matches_at_call_boundary(code: &str, pattern: &str) -> bool {
     let bytes = code.as_bytes();
     code.match_indices(pattern)
         .any(|(pos, _)| pos == 0 || (bytes[pos - 1] != b'.' && !is_ident_byte(bytes[pos - 1])))
+}
+
+/// DET011 macro patterns matched only at an identifier boundary — the select
+/// macros. A preceding identifier byte means the token is only a *suffix* of a
+/// longer, unrelated macro name (`sql_select!`, `my_select!`,
+/// `foo_select_biased!`), so it is not flagged; this mirrors the compile-time
+/// HVG010 guardrail, which matches macro paths exactly and accepts those
+/// unrelated macros (#799 P2 review). A preceding `::` (as in `tokio::select!`
+/// / `futures::select!`), brace, whitespace, or line start is a boundary and
+/// still matches. Unlike [`DET011_CALL_BOUNDARY_PATTERNS`] there is no `.`
+/// exclusion (a `.select!` method-position macro call is not valid Rust).
+const DET011_MACRO_BOUNDARY_PATTERNS: &[&str] = &["select!", "select_biased!"];
+
+/// True if `pattern` occurs in `code` at an identifier boundary: the byte
+/// immediately preceding a match is not an identifier byte.
+fn matches_at_ident_boundary(code: &str, pattern: &str) -> bool {
+    let bytes = code.as_bytes();
+    code.match_indices(pattern)
+        .any(|(pos, _)| pos == 0 || !is_ident_byte(bytes[pos - 1]))
 }
 
 /// Byte positions of whole-word occurrences of `word` in `code`.
