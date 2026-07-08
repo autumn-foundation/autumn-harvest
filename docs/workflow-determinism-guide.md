@@ -331,8 +331,11 @@ HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break det
 |---|---|
 | **Disallowed** | `tokio::select! { r = ctx.timer("t", 60) => {}, s = ctx.wait_for_signal("approve") => {} }` |
 | **Disallowed** | `futures::select! { a = fut_a.fuse() => {}, b = fut_b.fuse() => {} }` |
+| **Disallowed** | `futures::future::select(fut_a, fut_b).await` (also `select_all` / `select_ok` / `try_select`) |
 | **Allowed** | `ctx.race().timer(Duration::from_secs(60)).signal("approve").run().await?` |
 | **Allowed** | `ctx.race().activity_raw("fetch_a", input, "q").activity_raw("fetch_b", input, "q").run().await?` |
+
+HVG010 flags both the select **macros** (`tokio::select!`, `futures::select!`, `futures::select_biased!`) and their function-call siblings, the `futures::future::{select, select_all, select_ok, try_select}` **combinators** (issue #799) — they carry the identical footgun. (Inside an `#[activity]` body `select!` is fine: only the activity's recorded *result* matters, not its internal control flow, so activities may race freely.)
 
 Harvest already sanctions `futures::join!`/`futures::try_join!` for wait-**all** concurrency (see HVG005 above: "Harvest records each branch's result durably and re-joins them correctly on replay"). There is no equivalent sanction for wait-**first** — `select!` is a double footgun in a replay engine:
 

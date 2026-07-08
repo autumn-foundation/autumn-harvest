@@ -1352,3 +1352,157 @@ fn det010_finding_carries_metadata() {
         finding.alternative
     );
 }
+
+// ── DET011: select! / futures select combinators (issue #799) ─────────────
+//
+// The det_check twin of guardrail HVG010 (SelectMacro, issue #600). HVG010 is
+// the compile-time / catalog id; det_check surfaces the same hazard as DET011
+// (DET010 was the prior det_check maximum). Catches BOTH the select MACROS
+// (`tokio::select!`, `futures::select!`, `select_biased!`) and the distinctive
+// futures combinator FUNCTIONS (`futures::future::select(`, `select_all(`,
+// `select_ok(`, `try_select(`). Racing ctx-managed awaitables is always a
+// determinism hazard, so DET011 is an Error (no command-aware downgrade).
+
+#[test]
+fn det011_flags_tokio_select_macro_as_error() {
+    let src = wf(
+        "tokio::select! {\n        _ = ctx.timer(\"t\", 60) => {}\n        _ = ctx.wait_for_signal(\"s\") => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET011")
+        .unwrap_or_else(|| panic!("expected DET011 finding, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Error),
+        "select! in a workflow must be an Error, got: {finding:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn det011_flags_futures_select_macro() {
+    let src = wf(
+        "futures::select! {\n        a = fut_a.fuse() => {}\n        b = fut_b.fuse() => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "futures::select! must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_select_biased_macro() {
+    let src = wf(
+        "select_biased! {\n        a = fut_a.fuse() => {}\n        b = fut_b.fuse() => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "select_biased! must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_qualified_future_select_combinator() {
+    let src = wf("let _ = futures::future::select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "futures::future::select(..) combinator must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_bare_distinctive_combinators() {
+    for call in ["select_all(v)", "select_ok(v)", "try_select(a, b)"] {
+        let src = wf(&format!("let _ = {call}.await;"));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "bare `{call}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_unrelated_code() {
+    // A clean workflow using the sanctioned alternatives — zero DET011.
+    let src = wf(
+        "ctx.execute_activity_raw(\"a\", serde_json::json!(1), \"q\").await?;\n    let _ = ctx.race().activity_raw(\"b\", serde_json::json!(2), \"q\");",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "clean workflow must not be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_suppression_is_honored_and_reported() {
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {\n    // harvest-suppress: DET011 \"replay fixture proves this biased select is safe\"\n    let _ = futures::future::select(a, b).await;\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "suppressed DET011 must not produce a finding, got: {report:?}"
+    );
+    assert!(
+        report
+            .suppressions
+            .iter()
+            .any(|s| s.rule_id == "DET011" && !s.reason.is_empty()),
+        "DET011 suppression must be echoed into report.suppressions, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_activity_bodies_are_never_flagged() {
+    // AC6: select! and the futures combinators inside an #[activity] body are
+    // never flagged — activities may race freely.
+    let src = act(
+        "tokio::select! {\n        _ = std::future::ready(()) => {}\n    }\n    let _ = futures::future::select(a, b).await;",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "activity bodies must never be flagged for DET011, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_finding_carries_metadata_and_names_race_alternative() {
+    let src = wf("let _ = futures::future::select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET011")
+        .expect("DET011 finding");
+    assert_eq!(finding.workflow_name.as_deref(), Some("test_wf"));
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(loc.file, "test.rs");
+    assert!(loc.line > 0);
+    assert!(!finding.message.is_empty());
+    assert!(
+        finding.alternative.contains("ctx.race()"),
+        "alternative must point at ctx.race(), got: {}",
+        finding.alternative
+    );
+}
+
+#[test]
+fn det011_self_scan_of_harvest_src_is_clean() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let report = autumn_harvest::det_check::check_dir(&dir).expect("src dir must be readable");
+    let det011: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET011")
+        .collect();
+    assert!(
+        det011.is_empty(),
+        "autumn-harvest/src must have zero DET011 findings, got: {det011:?}"
+    );
+}

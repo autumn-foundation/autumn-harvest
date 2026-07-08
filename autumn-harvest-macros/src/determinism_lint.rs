@@ -452,6 +452,40 @@ fn is_io_path(path_str: &str) -> bool {
     false
 }
 
+/// HVG010 (issue #799) combinator-FUNCTION detection: `true` when `path_str`
+/// names one of the `futures` select combinators, matched conservatively
+/// because HVG010 is a `HardBlocker` and a false positive breaks user builds.
+///
+/// Matched:
+///   * the `futures`-anchored qualified forms `futures::future::{select,
+///     select_all, select_ok, try_select}` and their `future::…` short forms
+///     (the idiomatic `use futures::future;` spelling); and
+///   * the bare DISTINCTIVE names `select_all`/`select_ok`/`try_select` — a
+///     bare free-fn call by any of these three is, in practice, always the
+///     futures combinator (via `use futures::future::select_all;`).
+///
+/// Deliberately NOT matched: bare `select(...)`. `select` is a common
+/// free-function / query-builder name, so a bare call is too ambiguous to
+/// hard-block. (The bare `select!` MACRO form IS flagged in `visit_macro` —
+/// a macro invocation is unambiguous.) `.select(…)` / `.select_all()` METHOD
+/// calls are never seen here (they are `Expr::MethodCall`, not `Expr::Call`).
+fn is_select_combinator_path(path_str: &str) -> bool {
+    matches!(
+        path_str,
+        "futures::future::select"
+            | "futures::future::select_all"
+            | "futures::future::select_ok"
+            | "futures::future::try_select"
+            | "future::select"
+            | "future::select_all"
+            | "future::select_ok"
+            | "future::try_select"
+            | "select_all"
+            | "select_ok"
+            | "try_select"
+    )
+}
+
 impl<'ast> Visit<'ast> for DeterminismVisitor {
     fn visit_local(&mut self, i: &'ast syn::Local) {
         // HVG011 binding tracking: mark `let` bindings that are hash-typed via
@@ -644,6 +678,19 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             if is_io_path(&path_str) {
                 self.add_finding(
                     "HVG006",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
+            }
+
+            // HVG010: SelectMacro (issue #799) — the futures combinator
+            // FUNCTIONS are the function-call siblings of tokio::select!/
+            // futures::select! and carry the identical non-deterministic-winner
+            // + no-durable-loser-cancellation footgun (the select MACROS are
+            // flagged separately in visit_macro). Matching is conservative; see
+            // is_select_combinator_path for the false-positive-safe rationale.
+            if is_select_combinator_path(&path_str) {
+                self.add_finding(
+                    "HVG010",
                     expr_path.path.segments.last().unwrap().ident.span(),
                 );
             }
@@ -854,8 +901,8 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
         RuleInfo {
             id: "HVG010".to_string(),
             severity: "HardBlocker".to_string(),
-            explanation: "Using tokio::select!, futures::select!, or futures::select_biased! to race concurrent ctx-managed operations (activities, timers, signals, child workflows) inside a workflow body is a double footgun: (1) the winning branch depends on non-deterministic poll/arrival order, so a replay can pick a different branch than the original run and diverge; (2) the dropped loser branches do not durably cancel the underlying work -- a scheduled activity keeps running on a worker and a durable timer row stays live, leaking state that is never cleaned up.".to_string(),
-            alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive (issue #600). It records the winning branch durably via a MarkerRecorded event so replay always resolves the same winner, and durably cancels every losing branch (activity task rows, child-workflow executions, or a losing durable timer) so no leaked in-flight work remains. For a single signal bounded by a deadline, ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive ctx.race()'s timer-plus-signal shape wraps.".to_string(),
+            explanation: "Using tokio::select!, futures::select!, or futures::select_biased! -- or the futures::future::{select, select_all, select_ok, try_select} combinators -- to race concurrent ctx-managed operations (activities, timers, signals, child workflows) inside a workflow body is a double footgun: (1) the winning branch depends on non-deterministic poll/arrival order, so a replay can pick a different branch than the original run and diverge; (2) the dropped loser branches do not durably cancel the underlying work -- a scheduled activity keeps running on a worker and a durable timer row stays live, leaking state that is never cleaned up.".to_string(),
+            alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive (issue #600). It records the winning branch durably via a MarkerRecorded event so replay always resolves the same winner, and durably cancels every losing branch (activity task rows, child-workflow executions, or a losing durable timer) so no leaked in-flight work remains. For a single signal bounded by a deadline, ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive ctx.race()'s timer-plus-signal shape wraps. To fan out many activities in parallel and collect their results in a deterministic order, use ctx.execute_activity_fan_out* instead of racing them; to block until a workflow-local predicate holds (optionally bounded by a deadline), use ctx.await_condition_timeout().".to_string(),
         },
         // HVG011 (issue #785; the issue proposed HVG010, permanently taken by
         // SelectMacro/#600 — IDs are never reused). Text must stay
@@ -1541,5 +1588,190 @@ mod hvg011_tests {
             vec!["HardBlocker".to_string()],
             "command detection must respect the renamed context param"
         );
+    }
+}
+
+#[cfg(test)]
+mod hvg010_combinator_tests {
+    //! Visitor-level tests for HVG010's combinator-FUNCTION detection (issue
+    //! #799). HVG010 already flags the select MACROS (`tokio::select!`,
+    //! `futures::select!`, `select_biased!`) via `visit_macro`; issue #799
+    //! extends the SAME rule to the `futures::future::{select, select_all,
+    //! select_ok, try_select}` combinator FUNCTIONS, which race concurrent
+    //! futures with the identical non-deterministic-winner footgun.
+    //!
+    //! The select-macro positive case is covered by the
+    //! `hvg010_select_macro.rs` compile-fail fixture; the activity-body
+    //! negative case (AC6) is covered by the `#[activity]` macro never running
+    //! this visitor (see `suppressed_guardrails.rs` and the det_check
+    //! `det011_activity_bodies_are_never_flagged` test) — the visitor lints
+    //! whatever `fn` it is handed, so an "activity" negative cannot be
+    //! expressed at this layer.
+
+    use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
+    use syn::visit::Visit as _;
+
+    fn lint(src: &str) -> Vec<LinterFinding> {
+        let item_fn: syn::ItemFn = syn::parse_str(src).expect("test source must parse");
+        let mut visitor = DeterminismVisitor::new(load_catalog_metadata());
+        visitor.context_param_name = Some("ctx".to_string());
+        visitor.visit_item_fn(&item_fn);
+        visitor.findings
+    }
+
+    fn hvg010_findings(findings: &[LinterFinding]) -> Vec<&LinterFinding> {
+        findings.iter().filter(|f| f.rule_id == "HVG010").collect()
+    }
+
+    #[test]
+    fn qualified_futures_future_select_is_flagged_as_hard_blocker() {
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let a = Box::pin(async {});
+                let b = Box::pin(async {});
+                let _ = futures::future::select(a, b).await;
+                Ok(())
+            }
+            ",
+        );
+        let hvg010 = hvg010_findings(&findings);
+        assert_eq!(
+            hvg010.len(),
+            1,
+            "futures::future::select must be flagged exactly once"
+        );
+        assert_eq!(
+            hvg010[0].severity, "HardBlocker",
+            "HVG010 combinator finding must be a HardBlocker"
+        );
+    }
+
+    #[test]
+    fn all_qualified_combinator_variants_are_flagged() {
+        for call in [
+            "futures::future::select(a, b)",
+            "futures::future::select_all(v)",
+            "futures::future::select_ok(v)",
+            "futures::future::try_select(a, b)",
+            "future::select(a, b)",
+            "future::select_all(v)",
+            "future::select_ok(v)",
+            "future::try_select(a, b)",
+        ] {
+            let src = format!(
+                r"
+                async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{
+                    let _ = {call};
+                    Ok(())
+                }}
+                "
+            );
+            assert_eq!(
+                hvg010_findings(&lint(&src)).len(),
+                1,
+                "`{call}` must be flagged as HVG010"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_distinctive_combinator_names_are_flagged() {
+        // `select_all` / `select_ok` / `try_select` are distinctive enough that
+        // a bare free-fn call (via `use futures::future::select_all;`) is
+        // flagged with acceptable false-positive risk.
+        for call in ["select_all(v)", "select_ok(v)", "try_select(a, b)"] {
+            let src = format!(
+                r"
+                async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{
+                    let _ = {call};
+                    Ok(())
+                }}
+                "
+            );
+            assert_eq!(
+                hvg010_findings(&lint(&src)).len(),
+                1,
+                "bare `{call}` must be flagged as HVG010"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_select_call_is_not_flagged() {
+        // Bare `select(...)` is deliberately NOT matched: `select` is a common
+        // free-function name (query builders, user helpers), too ambiguous to
+        // hard-block. The bare select! MACRO form IS flagged (unambiguous).
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let _ = select(a, b);
+                Ok(())
+            }
+            ",
+        );
+        assert!(
+            hvg010_findings(&findings).is_empty(),
+            "bare `select(...)` must NOT be flagged (false-positive-safe)"
+        );
+    }
+
+    #[test]
+    fn method_call_select_forms_are_not_flagged() {
+        // `.select(...)` / `.select_all()` METHOD calls (e.g. a diesel query
+        // builder) are not free-function combinators and must not be flagged.
+        let findings = lint(
+            r"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let _ = users.select(id);
+                let _ = query.select_all();
+                let _ = query.try_select(a, b);
+                Ok(())
+            }
+            ",
+        );
+        assert!(
+            hvg010_findings(&findings).is_empty(),
+            "method-call select forms must NOT be flagged"
+        );
+    }
+
+    #[test]
+    fn select_macro_is_still_flagged_alongside_combinators() {
+        // Regression: the macro path (visit_macro) still fires, and a body
+        // mixing a macro and a combinator flags both.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                tokio::select! {
+                    _ = ctx.timer("t", 60) => {}
+                    _ = ctx.wait_for_signal("s") => {}
+                }
+                let _ = futures::future::select(a, b).await;
+                Ok(())
+            }
+            "#,
+        );
+        assert_eq!(
+            hvg010_findings(&findings).len(),
+            2,
+            "both the select! macro and the combinator must be flagged"
+        );
+    }
+
+    #[test]
+    fn clean_workflow_using_sanctioned_alternatives_has_no_hvg010() {
+        // Negative control: the sanctioned alternatives (ctx.race(),
+        // execute_activity_raw) produce zero HVG010 findings.
+        let findings = lint(
+            r#"
+            async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+                let _ = ctx.race().activity_raw("a", input, "q");
+                ctx.execute_activity_raw("b", input, "q").await?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(hvg010_findings(&findings).is_empty());
     }
 }

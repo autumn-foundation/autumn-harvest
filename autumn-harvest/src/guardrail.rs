@@ -23,7 +23,7 @@
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
 //! | HVG008 | NonDeterministicPredicate| HardBlocker | Non-deterministic predicate closures|
 //! | HVG009 | UnsafeLogging | Warning      | Bare tracing calls amplified by replay |
-//! | HVG010 | SelectMacro   | HardBlocker  | `tokio::select!` / `futures::select!` over ctx awaitables |
+//! | HVG010 | SelectMacro   | HardBlocker  | `select!` macros + `futures::future::select*` combinators over ctx awaitables |
 //! | HVG011 | NonDeterministicIteration | HardBlocker* | `HashMap`/`HashSet` iteration order (issue #785) |
 //!
 //! \* HVG011's catalog severity is the class's worst case (a loop body that
@@ -64,8 +64,10 @@ pub enum RuleCategory {
     /// Bare `tracing::{info,warn,error}!` calls inside a `#[workflow]` body that
     /// fire on every replay cycle, amplifying log volume.
     UnsafeLogging,
-    /// `tokio::select!` / `futures::select!` / `futures::select_biased!` used to
-    /// race concurrent operations inside a `#[workflow]` body (issue #600).
+    /// `tokio::select!` / `futures::select!` / `futures::select_biased!` — or the
+    /// `futures::future::{select, select_all, select_ok, try_select}`
+    /// combinator functions (issue #799) — used to race concurrent operations
+    /// inside a `#[workflow]` body (issue #600).
     SelectMacro,
     /// Iteration over a `HashMap`/`HashSet` inside a `#[workflow]` body — hash
     /// iteration order is randomized per process and diverges on replay
@@ -227,8 +229,9 @@ static CATALOG: &[RuleEntry] = &[
         id: "HVG010",
         severity: Severity::HardBlocker,
         category: RuleCategory::SelectMacro,
-        explanation: "Using tokio::select!, futures::select!, or futures::select_biased! to race \
-            concurrent ctx-managed operations (activities, timers, signals, child workflows) \
+        explanation: "Using tokio::select!, futures::select!, or futures::select_biased! -- or \
+            the futures::future::{select, select_all, select_ok, try_select} combinators -- to \
+            race concurrent ctx-managed operations (activities, timers, signals, child workflows) \
             inside a workflow body is a double footgun: (1) the winning branch depends on \
             non-deterministic poll/arrival order, so a replay can pick a different branch than \
             the original run and diverge; (2) the dropped loser branches do not durably cancel \
@@ -240,7 +243,10 @@ static CATALOG: &[RuleEntry] = &[
             (activity task rows, child-workflow executions, or a losing durable timer) so no \
             leaked in-flight work remains. For a single signal bounded by a deadline, \
             ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive \
-            ctx.race()'s timer-plus-signal shape wraps.",
+            ctx.race()'s timer-plus-signal shape wraps. To fan out many activities in parallel \
+            and collect their results in a deterministic order, use ctx.execute_activity_fan_out* \
+            instead of racing them; to block until a workflow-local predicate holds (optionally \
+            bounded by a deadline), use ctx.await_condition_timeout().",
     },
     // HVG011 (issue #785). ID remap: the issue text proposed HVG010, but
     // HVG010 was already permanently assigned to SelectMacro (issue #600) and

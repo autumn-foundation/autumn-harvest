@@ -17,6 +17,15 @@
 //! | DET008 | Error    | Direct network / filesystem I/O                |
 //! | DET009 | Warning  | Bare tracing calls (log amplification)         |
 //! | DET010 | Error*   | `HashMap`/`HashSet` iteration order (issue #785) |
+//! | DET011 | Error    | `select!` / futures select combinators (issue #799) |
+//!
+//! DET011 is the det_check twin of guardrail HVG010 (SelectMacro, issue #600):
+//! `tokio::select!` / `futures::select!` / `select_biased!` and the
+//! `futures::future::{select, select_all, select_ok, try_select}` combinators
+//! race ctx-managed awaitables non-deterministically (the winning branch
+//! differs between the live run and a replay). HVG010 is the compile-time /
+//! catalog id; det_check surfaces the same hazard as DET011 (DET010 was the
+//! prior det_check maximum).
 //!
 //! \* DET010 is command-aware: a flagged loop whose body schedules commands
 //! (`.execute_activity*`, `.spawn_child_workflow*`, `.execute_local_activity*`,
@@ -282,6 +291,41 @@ const RULES: &[Rule] = &[
                       These are replay-aware: output is suppressed during replay cycles and \
                       each event is auto-tagged with workflow_id, execution_id, and workflow_type. \
                       See guardrail HVG009 in the catalog for the full rationale.",
+    },
+    Rule {
+        id: "DET011",
+        severity: DetSeverity::Error,
+        patterns: &[
+            // Select MACROS — the `!` makes these unambiguous macro
+            // invocations (no ident/method call contains it). `select!` alone
+            // matches `tokio::select!`, `futures::select!`, and a bare
+            // `select!`; `select_biased!` needs its own pattern (it does not
+            // contain the `select!` substring).
+            "select!",
+            "select_biased!",
+            // Combinator FUNCTIONS. `futures::future::select(` covers the
+            // qualified plain-select combinator; the bare distinctive forms
+            // (`select_all(`/`select_ok(`/`try_select(`) are specific enough to
+            // futures that a call by any of these three is, in practice, the
+            // combinator. Bare `select(` is deliberately omitted (it would
+            // match `.select(` query-builder method calls).
+            "futures::future::select(",
+            "select_all(",
+            "select_ok(",
+            "try_select(",
+        ],
+        message: "select! / futures select combinator inside a workflow function races ctx-managed \
+                  awaitables non-deterministically. tokio::select! polls its branches in a \
+                  randomized order by design, so the branch that wins can differ between the first \
+                  live run and a later replay, silently diverging the execution; the dropped loser \
+                  branches also do not durably cancel the underlying activity or timer.",
+        alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive \
+                      (issue #600): it records the winning branch durably and cancels the losers. \
+                      For a signal bounded by a deadline use ctx.receive_signal_timeout() / \
+                      ctx.wait_for_signal_timeout(); to fan out many activities in parallel and \
+                      collect their results in a deterministic order use ctx.execute_activity_fan_out*; \
+                      to block until a predicate holds use ctx.await_condition_timeout(). Inside an \
+                      #[activity] body, select! is fine — only the activity's recorded result matters.",
     },
 ];
 

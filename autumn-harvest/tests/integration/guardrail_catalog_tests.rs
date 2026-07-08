@@ -399,6 +399,65 @@ fn catalog_contains_hvg011_nondeterministic_iteration() {
     );
 }
 
+// ── HVG010: SelectMacro (issue #600) + combinator functions (issue #799) ─────
+//
+// NOTE on the rule ID: issue #799's text proposed "HVG011", but HVG011 was
+// already permanently assigned to NonDeterministicIteration (issue #785) and
+// rule IDs are never reused — the select rule is HVG010 (issue #600), extended
+// by issue #799 to also flag the futures combinator FUNCTIONS.
+
+#[test]
+fn catalog_hvg010_is_select_macro_hard_blocker() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let entry = rule_by_id("HVG010").expect("HVG010 (SelectMacro) must exist");
+    assert!(
+        matches!(entry.category, RuleCategory::SelectMacro),
+        "HVG010 must use the SelectMacro category"
+    );
+    assert!(
+        matches!(entry.severity, Severity::HardBlocker),
+        "HVG010 must be a HardBlocker (branch poll order is not author-controllable)"
+    );
+}
+
+#[test]
+fn catalog_hvg010_explanation_names_the_combinator_functions() {
+    // AC1 (issue #799): the rule covers the futures combinator FUNCTIONS as
+    // well as the select macros.
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let explanation = rule_by_id("HVG010").unwrap().explanation;
+    for needle in ["select!", "select_all", "select_ok", "try_select"] {
+        assert!(
+            explanation.contains(needle),
+            "HVG010 explanation must name `{needle}`, got: {explanation}"
+        );
+    }
+}
+
+#[test]
+fn catalog_hvg010_alternative_names_todays_deterministic_primitives() {
+    // AC3 (issue #799): the diagnostic must name the alternatives that exist
+    // TODAY — ctx.race() (issue #600), receive_signal_timeout /
+    // wait_for_signal_timeout, execute_activity_fan_out*, await_condition_timeout.
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let alt = rule_by_id("HVG010").unwrap().alternative;
+    for needle in [
+        "ctx.race()",
+        "receive_signal_timeout",
+        "wait_for_signal_timeout",
+        "execute_activity_fan_out",
+        "await_condition_timeout",
+    ] {
+        assert!(
+            alt.contains(needle),
+            "HVG010 alternative must name `{needle}`, got: {alt}"
+        );
+    }
+}
+
 // ── Finding construction from catalog entry ───────────────────────────────────
 
 #[test]
