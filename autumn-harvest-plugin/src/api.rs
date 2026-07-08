@@ -16944,7 +16944,10 @@ fn backfill_budget_reached(new_runs_started: i32, max_runs: Option<i32>) -> bool
 /// truth, so editing the guard, the increment, or the RETURNING clause breaks the
 /// shape test rather than silently drifting. The statement increments
 /// `runs_started`, guards on `exhausted_at IS NULL` and the `max_runs` budget,
-/// and RETURNs the post-increment `runs_started`.
+/// and RETURNs the post-increment `runs_started`. A non-positive `max_runs`
+/// (`max_runs <= 0`) is treated as UNLIMITED here — matching
+/// `backfill_budget_reached`, the up-front exhaustion check, and the dry-run
+/// projection — so a row with `max_runs = 0` never wrongly reserves 0 rows.
 macro_rules! reserve_backfill_budget_slot_stmt {
     ($schedule_id:expr, $at:expr) => {{
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
@@ -16953,7 +16956,7 @@ macro_rules! reserve_backfill_budget_slot_stmt {
                 .find($schedule_id)
                 .filter(sdsl::exhausted_at.is_null())
                 .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                    "max_runs IS NULL OR runs_started < max_runs",
+                    "max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs",
                 )),
         )
         .set((
@@ -16961,6 +16964,37 @@ macro_rules! reserve_backfill_budget_slot_stmt {
             sdsl::updated_at.eq($at),
         ))
         .returning(sdsl::runs_started)
+    }};
+}
+
+/// Build the "clear a stale `max_runs_exhausted` exhaustion" UPDATE used by
+/// `release_backfill_budget_slot` when a decrement drops `runs_started` back
+/// below the cap (issue #688 review, Codex). A macro (like
+/// `reserve_backfill_budget_slot_stmt!`) so the live path and the no-DB shape
+/// test share one source of truth. Guarded on `exhausted_reason =
+/// 'max_runs_exhausted'` so an `end_at` exhaustion set by a concurrent tick is
+/// NEVER resurrected, on `exhausted_at IS NOT NULL`, and on the below-cap
+/// predicate (with the same `max_runs <= 0` = unlimited handling as the
+/// reservation guard). Clears `exhausted_at`/`exhausted_reason` only; does NOT
+/// touch `next_run_at` (backfill's own transition no longer nulls it, so it
+/// retains the tick's last valid forward pointer).
+macro_rules! clear_stale_max_runs_exhaustion_stmt {
+    ($schedule_id:expr, $at:expr) => {{
+        use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+        diesel::update(
+            sdsl::harvest_schedules
+                .find($schedule_id)
+                .filter(sdsl::exhausted_at.is_not_null())
+                .filter(sdsl::exhausted_reason.eq("max_runs_exhausted"))
+                .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs",
+                )),
+        )
+        .set((
+            sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            sdsl::exhausted_reason.eq(None::<String>),
+            sdsl::updated_at.eq($at),
+        ))
     }};
 }
 
@@ -16982,18 +17016,35 @@ async fn reserve_backfill_budget_slot(
 }
 
 /// Release a `max_runs` slot reserved by `reserve_backfill_budget_slot` when the
-/// dispatch did not ultimately happen (issue #688). Decrement ONLY — a backfill
-/// release path provably never set `exhausted_at` itself (the exhaustion
-/// transition runs only on commit paths, and once a slot exhausts the budget the
-/// `budget_hit` fast-path prevents any further reservation in the same request),
-/// so — unlike `rollback_manual_trigger_budget` (used by `trigger_schedule_now`,
-/// which reserves-and-maybe-exhausts as one logical op) — this must NOT clear
-/// `exhausted_at`: doing so could resurrect a *foreign* exhaustion set by a
-/// concurrent tick/trigger and leave the schedule `exhausted_at = NULL,
-/// next_run_at = NULL` (off the due-list, never fired again). Conservative by
-/// design: a released slot at worst leaves the schedule marked exhausted with a
-/// spare slot (never an over-run). Warns on error so a leaked `+1` is diagnosable
-/// rather than silently drifting `runs_started` toward premature exhaustion.
+/// dispatch did not ultimately happen (issue #688). Decrement of `runs_started`,
+/// then a *guarded* clear of a `max_runs_exhausted` exhaustion when the decrement
+/// drops back below the cap.
+///
+/// The clear is guarded on `exhausted_reason = 'max_runs_exhausted'` so an
+/// `end_at` exhaustion set by a concurrent tick is NEVER resurrected — unlike a
+/// blanket clear, which could revive a *foreign* exhaustion. It targets the case
+/// where two concurrent near-cap backfill reservations both increment
+/// `runs_started`, one transitions the row to `max_runs_exhausted` on the
+/// temporary count, and the other's slot then releases (`AlreadyExists` /
+/// oversized input / admission error) back below the cap — without this, the
+/// decrement-only release would leave the schedule stuck exhausted with a free
+/// slot. Neither UPDATE touches `next_run_at`: `transition_backfill_exhausted_if_reached`
+/// no longer nulls it (Fix 2a), so the row retains the tick's last valid forward
+/// pointer and returns to the due-list correctly once un-exhausted.
+///
+/// Conservative by design: at worst a released slot leaves the schedule marked
+/// exhausted with a spare slot (never an over-run). Both UPDATEs are best-effort
+/// and warn on error so a leaked `+1` or a stale exhaustion is diagnosable rather
+/// than silently drifting.
+///
+/// Known narrow cross-actor limitation: if a scheduler *tick* exhausts the
+/// schedule (which nulls `next_run_at`) DURING an in-flight backfill and the
+/// backfill then releases below cap, the clear above resets `exhausted_at` but
+/// `next_run_at` stays NULL (the tick nulled it), leaving the schedule off the
+/// due-list until a subsequent schedule PATCH (limit-raise recomputes
+/// `next_run_at`) or server restart. Same class as the in-memory
+/// `live_runs_started`-snapshot tick limitation; a full fix (recompute here or
+/// serialize backfill under the HA claim) is out of scope.
 async fn release_backfill_budget_slot(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
@@ -17014,12 +17065,33 @@ async fn release_backfill_budget_slot(
             "issue #688: failed to release a reserved backfill max_runs slot; runs_started may be transiently inflated"
         );
     }
+    // If the decrement dropped runs_started back below the cap, clear a
+    // max_runs exhaustion the row may have picked up from a *concurrent* near-cap
+    // backfill reservation's transition (issue #688 review, Codex). Guarded so an
+    // end_at exhaustion is never resurrected; does NOT touch next_run_at.
+    if let Err(e) = clear_stale_max_runs_exhaustion_stmt!(schedule_id, at)
+        .execute(sched_conn)
+        .await
+    {
+        tracing::warn!(
+            schedule_id = %schedule_id,
+            error = %e,
+            "issue #688: failed to clear stale max_runs exhaustion on backfill budget release"
+        );
+    }
 }
 
 /// After a successful `reserve_backfill_budget_slot`, transition the schedule to
 /// exhausted if the reserved slot reached `max_runs`. Guarded on `exhausted_at
-/// IS NULL` to avoid a double-exhaust race with the tick; sets `next_run_at =
-/// NULL` so the schedule leaves the due-list. Best-effort (error ignored). (#688)
+/// IS NULL` to avoid a double-exhaust race with the tick. Deliberately does NOT
+/// touch `next_run_at`: backfill dispatches historical slots and does not own
+/// the forward-cadence pointer (that is the scheduler tick's job), the
+/// `exhausted_at IS NULL` due-list filter already excludes an exhausted row, and
+/// nulling it would strand the schedule off the due-list if the exhaustion is
+/// later cleared (e.g. by `release_backfill_budget_slot` dropping below cap).
+/// This restores the original pre-#688 post-loop batch-increment behavior, which
+/// set only `runs_started`/`exhausted_at`/`exhausted_reason`. Best-effort (error
+/// logged). (#688)
 async fn transition_backfill_exhausted_if_reached(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
@@ -17042,7 +17114,6 @@ async fn transition_backfill_exhausted_if_reached(
     .set((
         sdsl::exhausted_at.eq(Some(at)),
         sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-        sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
         sdsl::updated_at.eq(at),
     ))
     .execute(sched_conn)
@@ -28504,8 +28575,8 @@ mod tests {
             "must increment runs_started, got: {sql}"
         );
         assert!(
-            sql.contains("max_runs IS NULL OR runs_started < max_runs"),
-            "must carry the budget guard, got: {sql}"
+            sql.contains("max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs"),
+            "must carry the budget guard treating max_runs <= 0 as unlimited, got: {sql}"
         );
         assert!(
             sql.contains(r#""harvest_schedules"."exhausted_at" IS NULL"#),
@@ -28514,6 +28585,40 @@ mod tests {
         assert!(
             sql.contains(r#"RETURNING "harvest_schedules"."runs_started""#),
             "must return the post-increment runs_started, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn clear_stale_max_runs_exhaustion_generates_the_guarded_clear_update() {
+        // Shape-check the release-path clear UPDATE without a DB (issue #688
+        // review, Codex F2b): it must guard on exhausted_reason =
+        // 'max_runs_exhausted' (so an end_at exhaustion is never resurrected),
+        // exhausted_at IS NOT NULL, and the below-cap predicate, and must NULL
+        // exhausted_at/exhausted_reason. Built via the SAME macro the live
+        // `release_backfill_budget_slot` executes, so editing the guard or the
+        // SET clause there breaks this test.
+        let at = chrono::Utc::now();
+        let stmt = clear_stale_max_runs_exhaustion_stmt!(uuid::Uuid::nil(), at);
+        let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
+        assert!(
+            sql.contains(r#""harvest_schedules"."exhausted_reason" = $"#),
+            "must guard on exhausted_reason = 'max_runs_exhausted', got: {sql}"
+        );
+        assert!(
+            sql.contains(r#""harvest_schedules"."exhausted_at" IS NOT NULL"#),
+            "must guard on exhausted_at IS NOT NULL, got: {sql}"
+        );
+        assert!(
+            sql.contains("max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs"),
+            "must guard on the below-cap predicate, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#"SET "exhausted_at" = $"#),
+            "must set exhausted_at (to NULL), got: {sql}"
+        );
+        assert!(
+            sql.contains(r#""exhausted_reason" = $"#),
+            "must set exhausted_reason (to NULL), got: {sql}"
         );
     }
 

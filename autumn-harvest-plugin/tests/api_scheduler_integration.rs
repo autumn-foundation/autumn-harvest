@@ -5372,6 +5372,79 @@ async fn backfill_unlimited_schedule_increments_runs_started() {
     );
 }
 
+/// A row with `max_runs = 0` in the column must be treated as UNLIMITED by the
+/// atomic reservation guard (issue #688 review, Codex F1) — matching
+/// `backfill_budget_reached`, the up-front exhaustion check, and the dry-run
+/// projection, all of which read non-positive `max_runs` as "no cap". The
+/// builder normalizes `0 → None`, so this writes `0` to the column DIRECTLY via
+/// diesel to simulate a pre-existing / hand-written row. Without the
+/// `max_runs <= 0` clause in the reservation predicate, `0 < 0` is false and the
+/// backfill would wrongly skip every slot as `max_runs_exhausted`.
+///
+/// NOTE: the release-clears-exhaustion path (F2b) is a concurrent-only scenario
+/// not deterministically reproducible in a single-request test: within one
+/// request, once a slot transitions the row to exhausted, subsequent
+/// reservations fail the `exhausted_at IS NULL` guard and set `budget_hit`, so no
+/// release-after-transition occurs intra-request. F2b is covered by the
+/// `clear_stale_max_runs_exhaustion_generates_the_guarded_clear_update` shape
+/// test plus code reasoning, matching the no-Docker precedent.
+#[tokio::test]
+async fn backfill_max_runs_zero_is_treated_as_unlimited() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_max_runs_zero_wf";
+    // Register unlimited (builder normalizes 0 → None), then force the column to
+    // literal 0 to exercise the reservation guard's non-positive handling.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect to force max_runs = 0");
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(harvest_schedules::max_runs.eq(Some(0_i32)))
+            .execute(&mut conn)
+            .await
+            .expect("forcing max_runs = 0 must succeed");
+    }
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(3), "window has 3 slots");
+    assert_eq!(
+        body["dispatched"],
+        serde_json::json!(3),
+        "max_runs = 0 must be treated as unlimited — every slot dispatches"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 3,
+        "runs_started must increase by the number dispatched (max_runs = 0 = unlimited)"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "a max_runs = 0 (unlimited) schedule must never transition to exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        3,
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
