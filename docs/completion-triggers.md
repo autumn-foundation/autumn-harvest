@@ -148,6 +148,113 @@ Triggers support projection mapping from the source workflow output payload:
 
 ---
 
+## Conditional Triggers — Output Guards (issue #810)
+
+A trigger can carry an optional **output guard**: a bounded, declarative condition evaluated
+**server-side at terminal-commit time** against the source workflow's recorded output JSON.
+The trigger fires only when the condition evaluates `true`; when it evaluates `false` the fire
+is **skipped without starting the target** — no target execution row, no target-side metrics,
+no DLQ exposure for the filtered-out case. A trigger with no condition (`NULL` in storage)
+fires exactly as before — full backward compatibility.
+
+The guard is a fixed comparison AST, deliberately **not** an expression/CEL engine. It is a
+pure, deterministic function: the same recorded output always produces the same fire/skip
+decision on every redelivery. No workflow code runs.
+
+### Builder usage
+
+```rust
+use autumn_harvest::completion_trigger::{CompletionTrigger, TriggerCondition};
+use serde_json::json;
+
+// Fire the high-value fulfillment flow only for orders over 1000 in the EU:
+let trigger = CompletionTrigger::new("order_flow", "high_value_fulfillment")
+    .with_condition(TriggerCondition::All(vec![
+        TriggerCondition::GreaterThan { path: "amount".into(), value: json!(1000) },
+        TriggerCondition::Eq { path: "region".into(), value: json!("EU") },
+    ]));
+```
+
+### JSON shape (management API)
+
+The condition serializes adjacently tagged (`type` / `data`), mirroring `input_mapping`:
+
+```json
+{
+  "source_workflow_name": "order_flow",
+  "target_workflow_name": "high_value_fulfillment",
+  "condition": {
+    "type": "All",
+    "data": [
+      {"type": "GreaterThan", "data": {"path": "amount", "value": 1000}},
+      {"type": "Eq", "data": {"path": "region", "value": "EU"}}
+    ]
+  }
+}
+```
+
+### Operator set (closed)
+
+Leaf operators take a dotted JSON `path` (the same `project_json_path` machinery
+`InputMapping::Projection` uses; the empty path selects the whole output):
+
+| Operator | Meaning |
+|----------|---------|
+| `Eq` / `NotEq` | Equality / inequality against `value` |
+| `GreaterThan` / `GreaterThanOrEq` / `LessThan` / `LessThanOrEq` | Numeric ordering against `value` |
+| `In` | Membership in the `values` set |
+| `Exists` | Path is present in the output (including an explicit `null`) |
+| `IsNull` | Path is present AND the value is exactly `null` |
+| `All` / `Any` / `Not` | AND / OR / NOT composition (`All([])` = true, `Any([])` = false) |
+
+Evaluation semantics (all defined results — a guard can never panic or 500 the terminal
+commit):
+
+* **Missing path or explicit `null`** ⇒ every comparison operator (`Eq`/`NotEq`/ordering/`In`)
+  evaluates `false`. Test absence explicitly with `Not(Exists)` and nullness with `IsNull`.
+* **Numeric coercion**: for `Eq`/`NotEq`/`In`, when both sides are JSON numbers they compare
+  as `f64` (so `1 == 1.0`); otherwise comparison is strict JSON equality (a number never
+  equals a numeric string). The ordering operators are **numeric-only** — non-numeric
+  operands yield `false`.
+* A non-`Completed` source usually has a `NULL` recorded output, which evaluates as a literal
+  JSON `null` root: member paths are all missing, so comparisons are `false` — but a
+  `Not(Exists(..))`-style guard can still meaningfully fire. Guards are output-only by design
+  (the failure-cause envelope is issue #748's story).
+
+### Boundedness caps (registration-time validation)
+
+A hostile or accidental mega-condition can never reach the terminal-commit path. Both
+registration surfaces — `HarvestBuilder::try_build()` (builder error) and
+`POST /admin/completion-triggers` (`400`) — reject:
+
+* nesting depth > **8** (`MAX_CONDITION_DEPTH`)
+* total nodes > **64** (`MAX_CONDITION_NODES`)
+* `In` sets longer than **64** (`MAX_CONDITION_IN_VALUES`)
+* malformed dotted paths (empty segments, e.g. `"a..b"`, `".a"`)
+* unknown operators (a serde deserialization error → `400`; never silently dropped)
+
+### Skips are recorded exactly-once and observable
+
+A condition-skip is **resolved-skipped**, not silently dropped:
+
+* The `(source_exec_id, trigger_id)` row is inserted into
+  `harvest_completion_trigger_fires` through the same `ON CONFLICT DO NOTHING` PK path a real
+  fire uses, with the skip reason recorded in the additive `outcome` column
+  (`NULL` = fired, `condition_unmet` / `condition_invalid` = skipped). A re-delivered
+  terminal (e.g. the parent-close cascade re-entering evaluation) dedupes against that row
+  exactly like a real fire — a skipped terminal can never late-fire.
+* The new counter `harvest.completion_trigger.skipped{trigger, reason}` increments once per
+  fresh skip (see Telemetry below).
+
+### Fail-closed on invalid stored conditions
+
+If a stored `condition` no longer parses (or violates the caps — e.g. a row written by a
+different build), the trigger **fails closed**: the fire is skipped, recorded with the
+distinct reason `condition_invalid`, and a warning is logged. Harvest never fires on an
+unintelligible guard and never errors the source's terminal commit.
+
+---
+
 ## Axum Admin APIs
 
 Triggers can be listed or registered dynamically at runtime using the following REST endpoints:
@@ -214,6 +321,7 @@ Completion triggers emit the `harvest.completion_trigger.fires` metric counter t
 | Metric | Instrument | Labels | Description |
 |--------|------------|--------|-------------|
 | `harvest.completion_trigger.fires` | Counter | `trigger`, `outcome` | Emitted on every completion-trigger evaluation. See the `outcome` values below. |
+| `harvest.completion_trigger.skipped` | Counter | `trigger`, `reason` | Emitted once per fresh output-guard skip (issue #810). `reason` is `condition_unmet` (guard evaluated false) or `condition_invalid` (stored condition unparseable/over-cap — fail-closed). A redelivered, already-resolved skip records `deduped` on the fires counter instead. |
 
 The `outcome` label takes one of:
 

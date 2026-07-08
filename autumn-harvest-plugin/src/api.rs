@@ -62,7 +62,7 @@ use autumn_harvest::calendar::{
     list_calendars, load_exclusions_for_calendar, plan_backfill_with_calendar,
     preview_schedule_firings, replace_calendar_exclusions,
 };
-use autumn_harvest::completion_trigger::{InputMapping, TerminalState};
+use autumn_harvest::completion_trigger::{InputMapping, TerminalState, TriggerCondition};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
@@ -3990,6 +3990,7 @@ pub const fn management_api_request_fields()
                 "target_workflow_name",
                 "input_mapping",
                 "queue_name",
+                "condition",
             ]),
         ),
         ("POST", "/admin/retention/run-now", Some(&[])),
@@ -4671,6 +4672,7 @@ pub const fn management_api_response_fields()
                 "queue_name",
                 "created_at",
                 "updated_at",
+                "condition",
             ]),
         ),
         // ── schedules ─────────────────────────────────────────────────────────
@@ -15239,6 +15241,12 @@ pub struct CreateCompletionTriggerRequest {
     pub target_workflow_name: String,
     pub input_mapping: Option<InputMapping>,
     pub queue_name: Option<String>,
+    /// Optional output guard (issue #810). An unknown operator is a serde
+    /// deserialization error (→ 400 from the Json extractor); an over-cap or
+    /// malformed-path condition is rejected with a 400 by explicit
+    /// validation. `None` = unconditional (legacy behavior).
+    #[serde(default)]
+    pub condition: Option<TriggerCondition>,
 }
 
 async fn list_completion_triggers(
@@ -15299,10 +15307,26 @@ async fn create_completion_trigger(
         .unwrap_or_else(|| vec![TerminalState::Completed]);
     let mapping = request.input_mapping.unwrap_or(InputMapping::Passthrough);
 
+    // Output-guard boundedness validation (issue #810): reject at
+    // registration with a 400, never silently drop.
+    if let Some(ref condition) = request.condition
+        && let Err(message) = condition.validate()
+    {
+        return Err(AutumnError::bad_request_msg(format!(
+            "invalid trigger condition: {message}"
+        )));
+    }
+
     let states_val = serde_json::to_value(&states)
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid terminal states: {e}")))?;
     let mapping_val = serde_json::to_value(&mapping)
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid input mapping: {e}")))?;
+    let condition_val = request
+        .condition
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid trigger condition: {e}")))?;
 
     let new_row = NewCompletionTriggerDb {
         id: trigger_id,
@@ -15312,6 +15336,7 @@ async fn create_completion_trigger(
         input_mapping: mapping_val,
         queue_name: request.queue_name.clone(),
         is_static: false,
+        condition: condition_val,
     };
 
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -15357,6 +15382,7 @@ async fn create_completion_trigger(
                                 triggers_dsl::is_static.eq(old_row.is_static),
                                 triggers_dsl::created_at.eq(old_row.created_at),
                                 triggers_dsl::updated_at.eq(old_row.updated_at),
+                                triggers_dsl::condition.eq(&old_row.condition),
                             ))
                             .execute(&mut rollback_conn)
                             .await;
@@ -15385,6 +15411,7 @@ async fn create_completion_trigger(
                     triggers_dsl::target_workflow_name.eq(&new_row.target_workflow_name),
                     triggers_dsl::input_mapping.eq(&new_row.input_mapping),
                     triggers_dsl::queue_name.eq(&new_row.queue_name),
+                    triggers_dsl::condition.eq(&new_row.condition),
                     triggers_dsl::updated_at.eq(Utc::now()),
                 ))
                 .get_result::<CompletionTriggerDb>(&mut conn)
@@ -15411,6 +15438,7 @@ async fn create_completion_trigger(
                                     triggers_dsl::is_static.eq(old_row.is_static),
                                     triggers_dsl::created_at.eq(old_row.created_at),
                                     triggers_dsl::updated_at.eq(old_row.updated_at),
+                                    triggers_dsl::condition.eq(&old_row.condition),
                                 ))
                                 .execute(&mut rollback_conn)
                                 .await;
@@ -29041,5 +29069,52 @@ mod tests {
             json_body["error"], "boom",
             "TEXT error must decode via decode_error_string_lossy: {json_body}"
         );
+    }
+
+    /// issue #810: the registration request's optional `condition` field.
+    /// An unknown operator is a serde deserialization error — the axum Json
+    /// extractor turns exactly this failure into the AC-mandated 400 — and a
+    /// legacy body without the field still deserializes (`None`).
+    #[test]
+    fn create_completion_trigger_request_condition_serde() {
+        // Legacy body (no condition key) → None.
+        let legacy: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
+            "source_workflow_name": "a",
+            "target_workflow_name": "b",
+        }))
+        .unwrap();
+        assert!(legacy.condition.is_none());
+
+        // Well-formed condition round-trips.
+        let ok: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
+            "source_workflow_name": "a",
+            "target_workflow_name": "b",
+            "condition": {
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 1000}
+            },
+        }))
+        .unwrap();
+        assert!(matches!(
+            ok.condition,
+            Some(TriggerCondition::GreaterThan { ref path, .. }) if path == "amount"
+        ));
+
+        // Unknown operator → deserialization error (→ 400 at the HTTP boundary,
+        // never silently dropped).
+        let bad = serde_json::from_value::<CreateCompletionTriggerRequest>(serde_json::json!({
+            "source_workflow_name": "a",
+            "target_workflow_name": "b",
+            "condition": {"type": "Regex", "data": {"path": "a", "value": ".*"}},
+        }));
+        assert!(bad.is_err());
+
+        // Over-cap conditions deserialize fine but fail validate() — the
+        // handler's explicit check turns this into a 400.
+        let mut over_deep = TriggerCondition::Exists { path: "a".into() };
+        for _ in 0..autumn_harvest::MAX_CONDITION_DEPTH {
+            over_deep = TriggerCondition::All(vec![over_deep]);
+        }
+        assert!(over_deep.validate().is_err());
     }
 }
