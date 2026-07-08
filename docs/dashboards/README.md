@@ -171,6 +171,22 @@ double-counting. **Replica-local** gauges, where each replica owns its own
 value (`harvest_worker_slots_in_use` / `_available`), sum correctly across
 the fleet; the per-replica slot panels legend the `instance` label instead.
 
+## Lint Validation
+
+The pack lints clean under the official
+[`grafana/dashboard-linter`](https://github.com/grafana/dashboard-linter)
+(`dashboard-linter lint starter-pack-v0.1.0.json`, run from this
+directory), which parse-validates every panel's PromQL, checks the
+templated datasource, counter `rate()`/`increase()` aggregation,
+`$__rate_interval` usage, units, and panel titles/descriptions. The
+sibling `.lint` file excludes exactly five rules, each with a documented
+reason: the `job`/`instance` matcher and template-variable rules (the
+ADR-0001 §7 label contract has no job/instance labels, and issue #754
+mandates `workflow`/`queue`/`shard` as the navigation dimensions) and the
+`uneditable-dashboard` rule (a starter pack is meant to be tuned in
+place). The linter validates the dashboard *model*; a manual import into a
+real Grafana ≥ 10 instance remains the final pre-merge verification step.
+
 ## Versioning
 
 The filename carries the pack version (`v0.1.0`); the dashboard `uid`

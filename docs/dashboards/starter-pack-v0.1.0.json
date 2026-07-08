@@ -533,7 +533,8 @@
                 "uid": "${datasource}"
               }
             }
-          ]
+          ],
+          "description": "Per-queue breakdown of workflow start rate; complements the Overview start-rate panel."
         },
         {
           "id": 11,
@@ -648,7 +649,8 @@
                 "uid": "${datasource}"
               }
             }
-          ]
+          ],
+          "description": "Per-workflow terminal outcome mix (harvest.workflow.terminal, issue #519); the Overview panel shows the same counter grouped by outcome only."
         },
         {
           "id": 13,
@@ -745,7 +747,8 @@
                 "uid": "${datasource}"
               }
             }
-          ]
+          ],
+          "description": "Continue-as-new fork rate (harvest.workflow.continue_as_new); sustained growth means long-lived entity workflows are cycling their histories."
         },
         {
           "id": 15,
@@ -2285,7 +2288,8 @@
                 "uid": "${datasource}"
               }
             }
-          ]
+          ],
+          "description": "Durable timer starts (harvest.timer.started); a drop to zero while workflows use ctx.timer indicates a stuck scheduler or worker."
         },
         {
           "id": 50,
@@ -2561,7 +2565,8 @@
                 "uid": "${datasource}"
               }
             }
-          ]
+          ],
+          "description": "Manual schedule fires via trigger-now (harvest.schedule.manual_trigger) by outcome; operator-initiated, so spikes should match known interventions."
         },
         {
           "id": 56,
