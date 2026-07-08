@@ -185,7 +185,16 @@ impl ThrottlePolicy {
     ) -> Result<Self, String> {
         let spec = parse_rate(rate)?;
         let burst = match burst {
-            Some(b) if b >= 1.0 => b,
+            Some(b) if b.is_finite() && b >= 1.0 => b,
+            Some(b) if !b.is_finite() => {
+                // An infinite (or NaN) burst is inserted verbatim as the
+                // bucket's initial `tokens` (`ensure_throttle_bucket`), and
+                // `LEAST(burst, tokens + refill)` degrades to `tokens + refill`
+                // -- an unbounded, ever-growing allowance that never actually
+                // throttles anything, effectively disabling the throttle for
+                // that key (code review, issue #607).
+                return Err(format!("throttle burst must be a finite number, got {b}"));
+            }
             Some(b) => {
                 return Err(format!(
                     "throttle burst must be >= 1.0 (a bucket capacity below \
@@ -761,14 +770,16 @@ type FiredThrottle = (
     Vec<(crate::types::ExecutionId, String)>,
     Vec<(String, String)>,
     // Whether this fire should count toward `harvest.schedule.runs` (issue
-    // #607 code review): true only when the deferred start carried
-    // schedule-lineage (`schedule_id.is_some()`, set by the scheduler-tick
-    // and buffered/backfill-fire throttle branches) and actually created a
-    // fresh execution, mirroring those callers' own immediate-path gate
-    // (`if outcome.created() { metrics.record_schedule_run(...) }`) so a
+    // #607 code review): true only when the deferred start's persisted
+    // `origin == "scheduled"` (set only by the scheduler-tick and
+    // buffered-run throttle branches, never by the HTTP manual-backfill
+    // endpoint even though it also persists a `schedule_id`) and it actually
+    // created a fresh execution, mirroring those callers' own immediate-path
+    // gate (`if outcome.created() { metrics.record_schedule_run(...) }`) so a
     // throttled scheduled fire is counted exactly once, on the same terms as
-    // an unthrottled one -- never for HTTP-start/batch-originated throttled
-    // fires, which carry no schedule_id and were never counted here either.
+    // an unthrottled one -- never for HTTP-start/batch/backfill-originated
+    // throttled fires, which either carry no `schedule_id` at all or use a
+    // different `origin` and were never counted here either.
     bool,
 );
 
@@ -875,12 +886,16 @@ async fn fire_claimed_throttle_row(
     let owner = opts.owner;
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
-    // Only a schedule-lineage fire (scheduler-tick / buffered-backfill-fire
-    // throttle branches persist schedule_id) should ever count toward
-    // `harvest.schedule.runs` -- an HTTP-start or batch-originated throttled
-    // fire carries no schedule_id and must not be counted (issue #607 code
-    // review).
-    let is_scheduled_fire = opts.schedule_id.is_some();
+    // Only a scheduler-tick / buffered-run throttle branch should ever count
+    // toward `harvest.schedule.runs` -- gated on `origin == "scheduled"`, not
+    // merely `schedule_id.is_some()` (code review, issue #607): the HTTP
+    // manual-backfill endpoint also persists a `schedule_id` (for carryover
+    // lineage) but uses `origin = "backfill"` and its own immediate-path
+    // dispatch never calls `record_schedule_run` either, so a throttled
+    // backfill fire must not count here -- otherwise a throttled backfill
+    // would inflate the metric while an unthrottled one (going through the
+    // same handler) never does.
+    let is_scheduled_fire = opts.origin.as_deref() == Some(crate::execution::ORIGIN_SCHEDULED);
 
     let params = crate::execution::StartWorkflowParams {
         workflow_name: &workflow_name,
@@ -1026,6 +1041,21 @@ async fn fire_due_on_conn(
                 // in the same query block as a window function, so the lock
                 // must be taken on the outer, window-function-free SELECT
                 // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
+                // `selected` orders by per-key rank (`rn`) first, `deferred_at`
+                // second -- not the reverse (code review, issue #607). With a
+                // flat `ORDER BY deferred_at ASC LIMIT $2`, enough
+                // concurrently-exhausted keys can still fill the *entire*
+                // batch with rows that can never fire (each capped at $1 by
+                // the WHERE clause, but nothing bounds how many *distinct*
+                // exhausted keys contribute their $1 rows before a newer,
+                // genuinely ready key's row is reached): e.g. 10 exhausted
+                // keys x 10 rows each already exhausts a 100-row batch,
+                // permanently starving an 11th key's single ready row every
+                // tick. Ordering by `rn` first means every distinct key's
+                // rank-1 (oldest) row is considered in the first "tier"
+                // before any key's rank-2 row is considered, so a ready
+                // key's row is examined as long as the number of distinct
+                // backlogged keys does not itself exceed the batch size.
                 let due_sql = "
                     WITH candidates AS (
                         SELECT id, deferred_at,
@@ -1036,7 +1066,7 @@ async fn fire_due_on_conn(
                     ),
                     selected AS (
                         SELECT id FROM candidates WHERE rn <= $1
-                        ORDER BY deferred_at ASC LIMIT $2
+                        ORDER BY rn ASC, deferred_at ASC LIMIT $2
                     )
                     SELECT t.id, t.workflow_name, t.throttle_key, t.bucket_key, t.workflow_id,
                            t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id
@@ -1379,6 +1409,23 @@ mod tests {
             err.contains(">= 1.0"),
             "error should explain the >= 1.0 floor: {err}"
         );
+    }
+
+    /// Code-review fix (issue #607): an infinite (or NaN) explicit burst
+    /// passes `b >= 1.0` (IEEE 754 comparison) but, inserted verbatim as the
+    /// bucket's initial `tokens`, degrades `LEAST(burst, tokens + refill)` to
+    /// an unbounded, ever-growing allowance -- effectively disabling the
+    /// throttle for that key.
+    #[test]
+    fn from_rate_str_rejects_infinite_explicit_burst() {
+        let err =
+            ThrottlePolicy::from_rate_str("100/m", Some(f64::INFINITY), None, None).unwrap_err();
+        assert!(err.contains("finite"), "{err}");
+    }
+
+    #[test]
+    fn from_rate_str_rejects_nan_explicit_burst() {
+        assert!(ThrottlePolicy::from_rate_str("100/m", Some(f64::NAN), None, None).is_err());
     }
 
     /// Same bug, reached via a *defaulted* burst: a fractional per-unit rate

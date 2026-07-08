@@ -33,8 +33,8 @@ use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::throttle::{
-    AdmitThrottleParams, THROTTLE_FIRE_BATCH_SIZE, ThrottleAdmission, bucket_key,
-    fire_due_throttled_starts, reserve_or_defer, throttle_backlog_by_key,
+    AdmitThrottleParams, THROTTLE_FIRE_BATCH_SIZE, THROTTLE_FIRE_PER_KEY_CAP, ThrottleAdmission,
+    bucket_key, fire_due_throttled_starts, reserve_or_defer, throttle_backlog_by_key,
 };
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::HandlerRegistry;
@@ -1269,6 +1269,112 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
     );
 }
 
+/// Code-review fix (issue #607, P1): the per-key cap (`THROTTLE_FIRE_PER_KEY_CAP`)
+/// bounds how many rows a *single* key can contribute to a scanner tick's
+/// candidate set, but with the original flat `ORDER BY deferred_at ASC LIMIT
+/// $2` outer selection, enough concurrently-exhausted keys can still fill
+/// the *entire* batch budget with rows that can never fire: 10 exhausted
+/// keys, each with exactly `THROTTLE_FIRE_PER_KEY_CAP` (10) permanently-stuck
+/// rows, already exhausts a 100-row (`THROTTLE_FIRE_BATCH_SIZE`) batch --
+/// permanently starving an 11th key's single, genuinely ready row every
+/// tick, even though it's newer than all of them. Fixed by ordering the
+/// candidate selection by per-key rank first (`rn ASC, deferred_at ASC`):
+/// every distinct key's oldest row is considered in the first "tier" before
+/// any key's second-oldest row is considered.
+#[tokio::test]
+async fn scanner_does_not_starve_a_fresh_key_behind_many_exhausted_keys() {
+    use diesel_async::RunQueryDsl;
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+
+    // 10 distinct "exhausted" keys, each with exactly THROTTLE_FIRE_PER_KEY_CAP
+    // rows and no corresponding bucket row ever created -- try_consume_rate_limit_token
+    // can never debit a nonexistent bucket, so these rows are permanently
+    // stuck. 10 keys x 10 rows = 100 rows total, exactly filling
+    // THROTTLE_FIRE_BATCH_SIZE.
+    for key_idx in 0..10 {
+        let key = format!("exhausted-{key_idx}");
+        let bkey = bucket_key(wf, &key);
+        for row_idx in 0..THROTTLE_FIRE_PER_KEY_CAP {
+            diesel::sql_query(
+                "INSERT INTO harvest_start_throttle \
+                 (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, \
+                  input, start_options, deferred_at, expires_at, shard_id, created_at) \
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'default', 'null'::jsonb, \
+                          '{}'::jsonb, NOW(), NULL, 0, NOW())",
+            )
+            .bind::<diesel::sql_types::Text, _>(wf)
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .bind::<diesel::sql_types::Text, _>(&bkey)
+            .bind::<diesel::sql_types::Text, _>(format!("exhausted-{key_idx}-{row_idx}"))
+            .execute(&mut conn)
+            .await
+            .expect("insert exhausted row");
+        }
+    }
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM harvest_start_throttle"
+        )
+        .await,
+        100,
+        "100 permanently-stuck rows across 10 exhausted keys"
+    );
+
+    // A fresh, 11th key's single row, deferred strictly after all 100
+    // exhausted rows (so it is the *newest* by deferred_at) and given a
+    // real, debitable token.
+    let fresh_key = "fresh";
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            fresh_key,
+            "fresh-seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("fresh key seed consumes its burst token");
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            fresh_key,
+            "fresh-job",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("fresh key row defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+
+    // Refill the fresh key's bucket so the scanner can debit it this tick.
+    set_bucket_tokens(&mut conn, &bucket_key(wf, fresh_key), 1.0).await;
+
+    let fired = drain(&mut conn, &metrics).await;
+    assert_eq!(
+        fired, 1,
+        "the fresh key's ready row must fire despite 100 unrelated \
+         exhausted rows exactly filling the batch cap"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, fresh_key).await,
+        0,
+        "the fresh key's row must have fired this tick, proving it wasn't starved"
+    );
+}
+
 // ── `skip_size_check` ordering fix (issue #607 round 4) ─────────────────────
 //
 // Round 3 added an early oversized-input rejection at 4 call sites, running
@@ -2109,5 +2215,80 @@ async fn scanner_fire_of_a_non_scheduled_deferral_does_not_record_schedule_run_m
         metrics.schedule_runs.lock().unwrap().is_empty(),
         "an HTTP/batch-originated (non-scheduled) throttled fire must not \
          record a schedule-run metric"
+    );
+}
+
+/// Code-review fix (issue #607): the HTTP manual-backfill endpoint's
+/// throttle wiring persists `schedule_id` (for carryover lineage, #488) just
+/// like the scheduler-tick/buffered-run branches do, but its own immediate
+/// (unthrottled) dispatch path never calls `record_schedule_run` -- so
+/// gating solely on `schedule_id.is_some()` would let a *throttled* backfill
+/// fire inflate `harvest.schedule.runs` while an *unthrottled* backfill
+/// (through the exact same handler) never does. Must be gated on
+/// `origin == "scheduled"`, not merely the presence of a schedule_id.
+#[tokio::test]
+async fn scanner_fire_of_a_backfill_deferral_does_not_record_schedule_run_metric() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+    let key = "backfill-key";
+    let bkey = bucket_key(wf, key);
+    let wf_id = "backfill-deferred-job";
+
+    // Drain the sole burst token first (burst must be >= 1.0 -- see the
+    // scheduled-deferral test above for why).
+    reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf,
+            throttle_key: key,
+            workflow_id: "backfill-seed",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("seed consumes the burst token");
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf,
+            throttle_key: key,
+            workflow_id: wf_id,
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions {
+                // Mirrors the HTTP schedule_backfill endpoint's throttle
+                // wiring: schedule_id IS set (for carryover), but origin is
+                // "backfill", not "scheduled".
+                schedule_id: Some(Uuid::new_v4()),
+                origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL.to_string()),
+                ..Default::default()
+            },
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+
+    set_bucket_tokens(&mut conn, &bkey, 1.0).await;
+
+    let fired = drain(&mut conn, &metrics).await;
+    assert_eq!(fired, 1);
+    assert!(
+        metrics.schedule_runs.lock().unwrap().is_empty(),
+        "a backfill-originated throttled fire must not record a \
+         schedule-run metric, matching the unthrottled backfill path's own \
+         behavior (it never calls record_schedule_run either)"
     );
 }
