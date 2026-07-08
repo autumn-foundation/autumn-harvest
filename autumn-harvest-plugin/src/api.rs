@@ -5420,6 +5420,33 @@ pub async fn run_batch_executor_once(
 }
 
 #[cfg(test)]
+mod operator_reason_tests {
+    use super::{OPERATOR_REASON_MAX_CHARS, truncate_operator_reason};
+
+    #[test]
+    fn short_reason_passes_through_untouched() {
+        assert_eq!(truncate_operator_reason("INC-42"), "INC-42");
+    }
+
+    #[test]
+    fn long_reason_is_capped_at_500_chars() {
+        let long = "x".repeat(2000);
+        let truncated = truncate_operator_reason(&long);
+        assert_eq!(truncated.chars().count(), OPERATOR_REASON_MAX_CHARS);
+    }
+
+    #[test]
+    fn multibyte_reason_truncates_on_char_boundary() {
+        // 600 snowmen: 3 bytes each — a byte-based cut at 500 would split a
+        // codepoint; the char-based cut keeps exactly 500 whole chars.
+        let long = "\u{2603}".repeat(600);
+        let truncated = truncate_operator_reason(&long);
+        assert_eq!(truncated.chars().count(), OPERATOR_REASON_MAX_CHARS);
+        assert!(truncated.chars().all(|c| c == '\u{2603}'));
+    }
+}
+
+#[cfg(test)]
 mod stack_state_tests {
     use super::is_terminal_state;
 
@@ -12548,7 +12575,7 @@ async fn erase_workflow_payloads_handler(
     let reason = request
         .reason
         .as_deref()
-        .map(|r| r.chars().take(500).collect::<String>())
+        .map(truncate_operator_reason)
         .unwrap_or_default();
 
     let exec_id = parse_execution_id(&id)?;
@@ -12714,7 +12741,12 @@ async fn retry_activity_now(
 /// performed the force-fail, or `forced: false, already_forced: true` for an
 /// idempotent repeat on an already-forced task. Returns 404 for unknown task
 /// IDs or wrong workflow, 409 for tasks that are not force-failable (not
-/// RUNNING, genuinely failed, or a workflow task).
+/// RUNNING, genuinely failed, a workflow task, or the owning execution is
+/// already terminal — a sealed run's history must never grow another
+/// `ActivityFailed`).
+///
+/// The optional `reason` is truncated to 500 chars at this boundary (see
+/// `truncate_operator_reason`) before it is durably recorded.
 ///
 /// Note: local activities run inline on the workflow worker and have no
 /// `harvest_task_queue` row — `fail-now` does not apply to them (404).
@@ -12740,6 +12772,10 @@ async fn fail_activity_now(
         serde_json::from_slice(&body)
             .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
     };
+    // Truncate the reason at the API boundary (mirrors erase-payloads): it is
+    // written durably into the forced event's message, `details.reason`, and
+    // the task-row envelope, so it must be bounded server-side.
+    let reason = request.reason.as_deref().map(truncate_operator_reason);
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
@@ -12799,7 +12835,7 @@ async fn fail_activity_now(
         &mut conn,
         exec_id.as_uuid(),
         task_id,
-        request.reason.as_deref(),
+        reason.as_deref(),
     )
     .await;
 
@@ -21644,6 +21680,20 @@ fn parse_duration_amount(
 pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
     raw.parse::<ExecutionId>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid execution id '{raw}'")))
+}
+
+/// Maximum length (in `char`s) of an operator-supplied `reason` accepted at
+/// the API boundary before truncation.
+pub(crate) const OPERATOR_REASON_MAX_CHARS: usize = 500;
+
+/// Truncate an operator-supplied `reason` at the API boundary so the core
+/// never persists an arbitrarily long string (the reason is written durably
+/// into event messages, `details.reason`, task-row envelopes, and audit
+/// rows). Char-based (`.chars().take(..)`), so multi-byte UTF-8 input can
+/// never be split mid-codepoint. Shared by the erase-payloads (#495) and
+/// activity fail-now (#765) handlers.
+pub(crate) fn truncate_operator_reason(reason: &str) -> String {
+    reason.chars().take(OPERATOR_REASON_MAX_CHARS).collect()
 }
 
 fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {

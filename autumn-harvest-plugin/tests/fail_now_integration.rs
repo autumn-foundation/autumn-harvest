@@ -194,10 +194,23 @@ fn build_pool(url: &str) -> DbPool {
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
-    let api_state = HarvestApiState::new();
     // The admin-gated fail-now route is guarded by `require_harvest_admin`;
     // open the boundary so the integration suite can reach the handler.
-    api_state.set_admin_auth_boundary(true);
+    build_app_with_admin_boundary(pool, true)
+}
+
+/// Like [`build_app`] but WITHOUT the outer-auth-boundary declaration, so the
+/// built-in `require_harvest_admin` guard applies — mirrors the
+/// `redrive_requires_admin` precedent in `dlq_redrive_integration.rs`.
+fn build_app_no_admin(pool: &DbPool) -> HarvestApiApp {
+    build_app_with_admin_boundary(pool, false)
+}
+
+fn build_app_with_admin_boundary(pool: &DbPool, boundary: bool) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    if boundary {
+        api_state.set_admin_auth_boundary(true);
+    }
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -212,6 +225,10 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
+/// Actor identity sent as `x-harvest-actor` on every request — the header the
+/// default `HarvestApiState::extract_actor` reads into audit rows.
+const TEST_ACTOR: &str = "alice@ops";
+
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -221,6 +238,7 @@ async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, 
                 .uri(uri)
                 .header("content-type", "application/json")
                 .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -328,6 +346,12 @@ struct CountRow {
     n: i64,
 }
 
+#[derive(diesel::QueryableByName)]
+struct ActorRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    actor: String,
+}
+
 #[tokio::test]
 async fn force_fail_over_http_returns_202_and_writes_audit_row() {
     let (url, _container) = setup_database().await;
@@ -383,6 +407,21 @@ async fn force_fail_over_http_returns_202_and_writes_audit_row() {
     .await
     .expect("audit count");
     assert_eq!(audit.n, 1, "one succeeded audit row must exist");
+
+    // The audit row attributes the call to the x-harvest-actor header value
+    // (read by the default `extract_actor`), not "anonymous".
+    let actor: ActorRow = diesel::sql_query(
+        "SELECT actor FROM harvest_audit_log \
+         WHERE operation = 'activity.fail_now' AND target_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(task_id.to_string())
+    .get_result(&mut conn)
+    .await
+    .expect("audit actor");
+    assert_eq!(
+        actor.actor, TEST_ACTOR,
+        "audit row must record the header actor"
+    );
 }
 
 #[tokio::test]
@@ -474,4 +513,86 @@ async fn unknown_task_returns_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+}
+
+#[tokio::test]
+async fn unknown_execution_returns_404() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Well-formed execution id that routes to the default shard but has no
+    // row — the execution lock reports NotFound before any task lookup.
+    let exec_id = ExecutionId::new();
+    let task_id = Uuid::new_v4();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/activities/{task_id}/fail-now"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+}
+
+#[tokio::test]
+async fn malformed_activity_id_returns_404_and_failed_audit_row() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (exec_id, _activity_id) = seed_execution_with_scheduled_activity(&pool).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/activities/not-a-uuid/fail-now"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+
+    // The rejected call is visible in the audit log as a failed
+    // activity.fail_now operation targeting the malformed id.
+    let mut conn = pool.get().await.expect("pooled conn");
+    let audit: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_audit_log \
+         WHERE operation = 'activity.fail_now' AND status = 'failed' AND target_id = 'not-a-uuid'",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("audit count");
+    assert_eq!(audit.n, 1, "one failed audit row must exist");
+}
+
+#[tokio::test]
+async fn fail_now_requires_admin() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_no_admin(&pool);
+
+    let (exec_id, activity_id) = seed_execution_with_scheduled_activity(&pool).await;
+    let task_id = seed_task(&pool, exec_id, activity_id, "activity", "RUNNING").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/activities/{task_id}/fail-now"),
+        json!({}),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+        "fail-now must be admin-guarded, got {status} (body: {body})"
+    );
+
+    // The request was rejected before the handler ran: task untouched.
+    let mut conn = pool.get().await.expect("pooled conn");
+    let row: TaskStateRow = diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("task state");
+    assert_eq!(
+        row.state, "RUNNING",
+        "guarded request must not mutate the task"
+    );
 }

@@ -212,6 +212,19 @@ async fn eris_unauthenticated_cancel_workflow_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_fail_activity_now_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/activities/00000000-0000-0000-0000-000000000002/fail-now",
+            r#"{"reason": "operator request"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_query_workflow_is_accessible() {
     let app = unauthenticated_app();
     let res = app
