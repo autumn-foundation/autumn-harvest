@@ -285,11 +285,12 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        // Sized at 8 (issue #688): the schedule_backfill route holds `sched_conn`
-        // for the budget accounting plus a per-slot exec conn — 2 concurrent
-        // connections per in-flight backfill — so the two-concurrent-request money
-        // test (2 requests × 2 conns) needs headroom rather than sitting on a
-        // knife's edge at max_size(4).
+        // Sized at 8 for comfortable headroom under the concurrent-request money
+        // test. Since the Codex F4 fix, a single-shard backfill reuses the per-slot
+        // exec conn for budget accounting and holds exactly one connection at a time
+        // (proven pool-size-1 safe by
+        // `backfill_single_shard_pool_size_one_does_not_deadlock`), so 8 is generous
+        // rather than a floor.
         .max_size(8)
         .build()
         .expect("failed to build test pool")
@@ -5216,6 +5217,53 @@ async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_on
         count_workflow_executions_by_name_from_url(&database_url, name).await,
         1,
         "exactly one execution row must exist for the schedule"
+    );
+}
+
+/// F4 regression (issue #688 review, Codex): with a web DB pool of size 1
+/// (single-shard), a non-dry-run backfill must NOT self-deadlock. Before the fix
+/// the route held a dedicated schedule-shard connection across the dispatch loop
+/// while each slot also checked out a per-slot exec conn — two concurrent
+/// connections against a size-1 pool wedge forever (the route waits on a
+/// connection it already holds). The fix reuses the per-slot exec conn for budget
+/// accounting when the schedule and exec shards share a pool, so the route holds
+/// exactly one connection at a time again (restoring pre-#688 pool-size-1 safety).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
+    let (database_url, _container) = setup_test_database_url().await;
+    // Deliberately size the pool at 1: exercising the exact F4 self-deadlock
+    // condition (pool.rs only forbids size 0, so 1 is a valid production config).
+    let pool = {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url.as_str());
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("failed to build size-1 test pool")
+    };
+    let name = "backfill_pool_size_one_wf";
+    // Unlimited budget so every planned slot actually dispatches, exercising the
+    // reserve + transition budget path on the single shared connection.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-05-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let uri = format!("/admin/schedules/{}/backfill", schedule.id);
+    let body = json!({ "from": from, "to": to });
+
+    // If the route self-deadlocks on the size-1 pool this times out (a clear
+    // failure) rather than hanging the whole test binary indefinitely.
+    let (status, json) = tokio::time::timeout(Duration::from_secs(20), post_json(&app, uri, body))
+        .await
+        .expect("backfill on a size-1 pool must return, not self-deadlock");
+
+    assert_eq!(status, StatusCode::OK, "backfill body: {json}");
+    assert!(
+        json["dispatched"].as_u64().unwrap() >= 1,
+        "at least one slot should dispatch, body: {json}"
     );
 }
 

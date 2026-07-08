@@ -90,8 +90,9 @@ use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStat
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
-    ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
+    ensure_dag_schedule, next_run_after_pub, parse_schedule_from_expr_pub,
+    plan_backfill_timestamps, scheduled_workflow_id_pub, trigger_unified_dag,
+    update_workflow_schedule,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -16998,6 +16999,31 @@ macro_rules! clear_stale_max_runs_exhaustion_stmt {
     }};
 }
 
+/// Build the "re-arm `next_run_at`" UPDATE used by `release_backfill_budget_slot`
+/// (issue #688 review, Codex F3) after the clear above actually un-exhausts a
+/// `max_runs_exhausted` row. A scheduler *tick* that exhausts the schedule nulls
+/// `next_run_at` (`tick_one_workflow_schedule` in scheduler.rs), and the due-list
+/// query requires `next_run_at IS NOT NULL` — so when a concurrent tick exhausts
+/// the row DURING a backfill and the backfill then releases below cap, clearing
+/// the exhaustion alone would leave the schedule un-exhausted yet off the
+/// due-list. This restores the forward pointer to the next slot after now (an
+/// approximation the tick later refines with calendar/skip adjustments on its
+/// next firing). Guarded on `next_run_at IS NULL` so the common intra-backfill
+/// case (where our own transition never nulled it) is a no-op, and on
+/// `exhausted_at IS NULL` so we only re-arm a row we just un-exhausted.
+macro_rules! rearm_backfill_next_run_stmt {
+    ($schedule_id:expr, $next:expr, $at:expr) => {{
+        use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+        diesel::update(
+            sdsl::harvest_schedules
+                .find($schedule_id)
+                .filter(sdsl::exhausted_at.is_null())
+                .filter(sdsl::next_run_at.is_null()),
+        )
+        .set((sdsl::next_run_at.eq($next), sdsl::updated_at.eq($at)))
+    }};
+}
+
 /// Atomically reserve one `max_runs` slot for a backfill dispatch (issue #688),
 /// mirroring `trigger_schedule_now`'s pre-increment. Runs on the schedule's own
 /// shard. Returns `Ok(Some(new_runs_started))` when a slot was reserved (the
@@ -17033,22 +17059,24 @@ async fn reserve_backfill_budget_slot(
 /// pointer and returns to the due-list correctly once un-exhausted.
 ///
 /// Conservative by design: at worst a released slot leaves the schedule marked
-/// exhausted with a spare slot (never an over-run). Both UPDATEs are best-effort
+/// exhausted with a spare slot (never an over-run). All UPDATEs are best-effort
 /// and warn on error so a leaked `+1` or a stale exhaustion is diagnosable rather
 /// than silently drifting.
 ///
-/// Known narrow cross-actor limitation: if a scheduler *tick* exhausts the
-/// schedule (which nulls `next_run_at`) DURING an in-flight backfill and the
-/// backfill then releases below cap, the clear above resets `exhausted_at` but
-/// `next_run_at` stays NULL (the tick nulled it), leaving the schedule off the
-/// due-list until a subsequent schedule PATCH (limit-raise recomputes
-/// `next_run_at`) or server restart. Same class as the in-memory
-/// `live_runs_started`-snapshot tick limitation; a full fix (recompute here or
-/// serialize backfill under the HA claim) is out of scope.
+/// `rearm_next` (issue #688 review, Codex F3): when the clear above actually
+/// un-exhausts a `max_runs_exhausted` row that a concurrent scheduler *tick*
+/// nulled `next_run_at` on while exhausting it mid-backfill, re-arm the forward
+/// pointer so the schedule returns to the due-list rather than being stranded
+/// off it until an unrelated PATCH/restart. `rearm_next` is the next slot after
+/// the release's timestamp (`None` for a manual schedule with no expr → no
+/// re-arm), an approximation the tick refines with calendar/skip on its next
+/// firing. Guarded (see `rearm_backfill_next_run_stmt!`) so the common
+/// intra-backfill case (our own transition never nulls `next_run_at`) is a no-op.
 async fn release_backfill_budget_slot(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
     at: chrono::DateTime<chrono::Utc>,
+    rearm_next: Option<chrono::DateTime<chrono::Utc>>,
 ) {
     use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
     if let Err(e) = diesel::update(sdsl::harvest_schedules.find(schedule_id))
@@ -17068,16 +17096,37 @@ async fn release_backfill_budget_slot(
     // If the decrement dropped runs_started back below the cap, clear a
     // max_runs exhaustion the row may have picked up from a *concurrent* near-cap
     // backfill reservation's transition (issue #688 review, Codex). Guarded so an
-    // end_at exhaustion is never resurrected; does NOT touch next_run_at.
-    if let Err(e) = clear_stale_max_runs_exhaustion_stmt!(schedule_id, at)
+    // end_at exhaustion is never resurrected.
+    match clear_stale_max_runs_exhaustion_stmt!(schedule_id, at)
         .execute(sched_conn)
         .await
     {
-        tracing::warn!(
-            schedule_id = %schedule_id,
-            error = %e,
-            "issue #688: failed to clear stale max_runs exhaustion on backfill budget release"
-        );
+        Ok(cleared_rows) => {
+            // Only when we ACTUALLY un-exhausted a max_runs exhaustion (F3): a
+            // concurrent tick that exhausted+nulled next_run_at mid-backfill would
+            // otherwise leave the un-exhausted schedule off the due-list. Re-arm
+            // the forward pointer (guarded on next_run_at IS NULL so the common
+            // case where our own transition never nulled it is a no-op).
+            if cleared_rows > 0
+                && let Some(next) = rearm_next
+                && let Err(e) = rearm_backfill_next_run_stmt!(schedule_id, next, at)
+                    .execute(sched_conn)
+                    .await
+            {
+                tracing::warn!(
+                    schedule_id = %schedule_id,
+                    error = %e,
+                    "issue #688: failed to re-arm next_run_at after clearing a tick-nulled max_runs exhaustion"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                schedule_id = %schedule_id,
+                error = %e,
+                "issue #688: failed to clear stale max_runs exhaustion on backfill budget release"
+            );
+        }
     }
 }
 
@@ -17591,19 +17640,25 @@ async fn schedule_backfill(
     };
     let mut dispatched_this_call: i64 = 0;
     let mut budget_hit = false;
-    // Atomic per-slot max_runs reservation runs on the schedule's own shard
-    // (issue #688); schedule rows may live on a non-default shard than the
+    // Atomic per-slot max_runs reservation runs on the schedule's OWN shard
+    // (issue #688); schedule rows may live on a different shard than the
     // execution shard, exactly like trigger_schedule_now's budget accounting.
     //
-    // Pool-connection consideration: `sched_conn` is held across the whole dispatch
-    // loop, but it holds NO DB lock across the per-slot start await — each
-    // reserve/release/transition is an autonomous autocommit statement. In a
-    // single-shard deployment (`schedule_shard == default shard`) each in-flight
-    // backfill therefore holds 2 concurrent pool connections (sched_conn + the
-    // per-slot exec conn), so N concurrent backfills need a pool of at least ~2N
-    // to avoid a checkout deadlock — bounded by, and less demanding than,
-    // trigger_schedule_now's existing 3-connection hold on the same route.
-    let mut sched_conn = acquire_conn(pool.pool_for(schedule_shard)).await?;
+    // Pool-connection safety (issue #688 review, Codex F4): the schedule-shard
+    // connection used for budget accounting is chosen per loop arm below. In a
+    // SINGLE-shard deployment the schedule shard and the execution shard are the
+    // SAME pool, so we must NOT hold a second dedicated schedule connection across
+    // the loop while each slot also checks out a per-slot exec `conn` — with a web
+    // pool of size 1 (pool.rs only forbids size 0) that self-deadlocks (the route
+    // waits on a connection it already holds). The original pre-#688 backfill held
+    // exactly one connection at a time and was pool-size-1 safe; to keep that, when
+    // `schedule_shard == exec_shard` (`same_pool`) budget ops reuse the per-slot
+    // exec `conn` — all budget statements are sequential, never two concurrent
+    // connections. Only for a GENUINELY different pool (multi-shard) do we hold a
+    // separate schedule connection across the loop, where concurrent holds across
+    // distinct pools don't contend. Assumption: distinct ShardIds map to distinct
+    // pools in standard single/multi-shard topologies (single-shard always has
+    // schedule_shard == exec_shard).
 
     match kind {
         ScheduleKind::Workflow => {
@@ -17614,6 +17669,18 @@ async fn schedule_backfill(
             // unique index on (workflow_name, workflow_id) prevents the scheduler from
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
+            // Budget-connection selection (Codex F4): the workflow exec shard is the
+            // default shard. When it equals the schedule shard, budget ops run on the
+            // per-slot exec `conn` (pool-size-1 safe); otherwise hold a separate
+            // schedule-pool connection across the loop (a distinct pool, safe to hold
+            // concurrently with the exec pool).
+            let exec_shard = runtime.router.default_shard();
+            let same_pool = schedule_shard == exec_shard;
+            let mut sched_conn_opt = if same_pool {
+                None
+            } else {
+                Some(acquire_conn(pool.pool_for(schedule_shard)).await?)
+            };
             for (original_slot, _fire_time) in &timestamp_pairs {
                 // Once the atomic DB max_runs reservation (issue #688) fails for one
                 // slot the budget is exhausted for every remaining slot too; report
@@ -17786,8 +17853,13 @@ async fn schedule_backfill(
                 // actually attempt to start; every non-committing path below releases
                 // it via `release_backfill_budget_slot`.
                 let now = chrono::Utc::now();
-                let reserved_runs_started =
-                    match reserve_backfill_budget_slot(&mut sched_conn, schedule_id, now).await {
+                // Re-arm target for a release that clears a tick-nulled exhaustion (F3).
+                let rearm_next = next_run_after_pub(parsed_schedule.as_ref(), now);
+                let reserved_runs_started = {
+                    // same_pool → reuse the per-slot exec `conn`; else the separate
+                    // schedule connection. `conn` is not otherwise borrowed here.
+                    let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                    match reserve_backfill_budget_slot(budget_conn, schedule_id, now).await {
                         Ok(Some(v)) => v,
                         Ok(None) => {
                             budget_hit = true;
@@ -17805,7 +17877,8 @@ async fn schedule_backfill(
                             failed += 1;
                             continue;
                         }
-                    };
+                    }
+                };
 
                 // Start-throttle admission (issue #607): pace backfill admissions,
                 // defer the excess rather than admitting an entire backfill window
@@ -17838,7 +17911,9 @@ async fn schedule_backfill(
                     {
                         Ok(skip) => skip,
                         Err(e) => {
-                            release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                            let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                            release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                                .await;
                             shard_failures.push(BackfillShardFailure {
                                 shard_id: 0,
                                 reason: e.to_string(),
@@ -17851,7 +17926,9 @@ async fn schedule_backfill(
                         let observed =
                             serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                         if observed > effective_cap {
-                            release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                            let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                            release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                                .await;
                             skipped += 1;
                             *skipped_reasons
                                 .entry("oversized_input".to_string())
@@ -17925,8 +18002,9 @@ async fn schedule_backfill(
                                     .record_start_throttled(&wf_name);
                                 dispatched += 1;
                                 dispatched_this_call += 1;
+                                let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
                                 transition_backfill_exhausted_if_reached(
-                                    &mut sched_conn,
+                                    budget_conn,
                                     schedule_id,
                                     reserved_runs_started,
                                     schedule.max_runs,
@@ -17944,8 +18022,14 @@ async fn schedule_backfill(
                                 // request can't double-count the slot as
                                 // dispatched or double-spend max_runs budget
                                 // for it (code review, issue #607).
-                                release_backfill_budget_slot(&mut sched_conn, schedule_id, now)
-                                    .await;
+                                let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                                release_backfill_budget_slot(
+                                    budget_conn,
+                                    schedule_id,
+                                    now,
+                                    rearm_next,
+                                )
+                                .await;
                                 skipped += 1;
                                 *skipped_reasons
                                     .entry("already_exists".to_string())
@@ -17965,7 +18049,9 @@ async fn schedule_backfill(
                             // as a no-op; no token reserved, fall through.
                         }
                         Err(e) => {
-                            release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                            let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                            release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                                .await;
                             shard_failures.push(BackfillShardFailure {
                                 shard_id: 0,
                                 reason: e.to_string(),
@@ -18040,8 +18126,9 @@ async fn schedule_backfill(
                     Ok(started) if started.created => {
                         dispatched += 1;
                         dispatched_this_call += 1;
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
                         transition_backfill_exhausted_if_reached(
-                            &mut sched_conn,
+                            budget_conn,
                             schedule_id,
                             reserved_runs_started,
                             schedule.max_runs,
@@ -18051,29 +18138,35 @@ async fn schedule_backfill(
                     }
                     Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
                         // AC-a: an id-reuse short-circuit consumed no admission —
-                        // release the reserved max_runs slot (issue #688) and
-                        // refund the reserved throttle token, if any was reserved.
-                        release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                        // refund the reserved throttle token FIRST (that `&mut conn`
+                        // borrow must end before `budget_conn` may re-borrow `conn`
+                        // in the same_pool case), then release the reserved max_runs
+                        // slot (issue #688).
                         if let Some(ref bucket) = backfill_throttle_bucket {
                             let _ =
                                 autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
                                     .await;
                         }
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                        release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                            .await;
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(e) => {
-                        // No run admitted — release the reserved max_runs slot
-                        // (issue #688) and refund the reserved throttle token
-                        // before propagating the failure.
-                        release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                        // No run admitted — refund the reserved throttle token FIRST
+                        // (borrow-ordering, as above), then release the reserved
+                        // max_runs slot (issue #688) before propagating the failure.
                         if let Some(ref bucket) = backfill_throttle_bucket {
                             let _ =
                                 autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
                                     .await;
                         }
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                        release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                            .await;
                         shard_failures.push(BackfillShardFailure {
                             shard_id: 0,
                             reason: e.to_string(),
@@ -18087,6 +18180,15 @@ async fn schedule_backfill(
             let dag_name = name.clone();
             let shard_id = runtime.router().pick_for_dag(&dag_name);
             let shard_pool = pool.pool_for(shard_id);
+            // Budget-connection selection (Codex F4): when the DAG exec shard equals
+            // the schedule shard, budget ops run on the per-slot exec `conn`
+            // (pool-size-1 safe); otherwise hold a separate schedule-pool connection.
+            let same_pool = schedule_shard == shard_id;
+            let mut sched_conn_opt = if same_pool {
+                None
+            } else {
+                Some(acquire_conn(pool.pool_for(schedule_shard)).await?)
+            };
 
             for (original_slot, _fire_time) in &timestamp_pairs {
                 // Once the atomic DB max_runs reservation (issue #688) fails for one
@@ -18235,8 +18337,13 @@ async fn schedule_backfill(
                 // BEFORE committing to a start (issue #688). Placed after the prior-run
                 // and admission checks; every non-committing path below releases it.
                 let now = chrono::Utc::now();
-                let reserved_runs_started =
-                    match reserve_backfill_budget_slot(&mut sched_conn, schedule_id, now).await {
+                // Re-arm target for a release that clears a tick-nulled exhaustion (F3).
+                let rearm_next = next_run_after_pub(parsed_schedule.as_ref(), now);
+                let reserved_runs_started = {
+                    // same_pool → reuse the per-slot exec `conn`; else the separate
+                    // schedule connection. `conn` is not otherwise borrowed here.
+                    let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                    match reserve_backfill_budget_slot(budget_conn, schedule_id, now).await {
                         Ok(Some(v)) => v,
                         Ok(None) => {
                             budget_hit = true;
@@ -18254,7 +18361,8 @@ async fn schedule_backfill(
                             failed += 1;
                             continue;
                         }
-                    };
+                    }
+                };
 
                 let start_result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
@@ -18307,8 +18415,9 @@ async fn schedule_backfill(
                     Ok(started) if started.created => {
                         dispatched += 1;
                         dispatched_this_call += 1;
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
                         transition_backfill_exhausted_if_reached(
-                            &mut sched_conn,
+                            budget_conn,
                             schedule_id,
                             reserved_runs_started,
                             schedule.max_runs,
@@ -18318,21 +18427,27 @@ async fn schedule_backfill(
                     }
                     Ok(_) => {
                         // RejectDuplicate → already exists; release the reserved slot (#688).
-                        release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                        release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                            .await;
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(autumn_harvest::HarvestError::AlreadyExists { .. }) => {
-                        release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                        release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                            .await;
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(e) => {
-                        release_backfill_budget_slot(&mut sched_conn, schedule_id, now).await;
+                        let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
+                        release_backfill_budget_slot(budget_conn, schedule_id, now, rearm_next)
+                            .await;
                         shard_failures.push(BackfillShardFailure {
                             shard_id: shard_id.as_i32(),
                             reason: e.to_string(),
@@ -28619,6 +28734,32 @@ mod tests {
         assert!(
             sql.contains(r#""exhausted_reason" = $"#),
             "must set exhausted_reason (to NULL), got: {sql}"
+        );
+    }
+
+    #[test]
+    fn rearm_backfill_next_run_generates_the_guarded_rearm_update() {
+        // Shape-check the release-path re-arm UPDATE without a DB (issue #688
+        // review, Codex F3): after the clear un-exhausts a max_runs_exhausted row,
+        // it must re-arm next_run_at only when it is currently NULL and the row is
+        // now un-exhausted (exhausted_at IS NULL), and must SET next_run_at. Built
+        // via the SAME macro the live `release_backfill_budget_slot` executes, so
+        // editing the guard or the SET clause there breaks this test.
+        let at = chrono::Utc::now();
+        let next = at + chrono::Duration::seconds(120);
+        let stmt = rearm_backfill_next_run_stmt!(uuid::Uuid::nil(), next, at);
+        let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
+        assert!(
+            sql.contains(r#""harvest_schedules"."exhausted_at" IS NULL"#),
+            "must only re-arm a row we just un-exhausted (exhausted_at IS NULL), got: {sql}"
+        );
+        assert!(
+            sql.contains(r#""harvest_schedules"."next_run_at" IS NULL"#),
+            "must guard on next_run_at IS NULL so the common case is a no-op, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#"SET "next_run_at" = $"#),
+            "must set next_run_at to the re-arm target, got: {sql}"
         );
     }
 
