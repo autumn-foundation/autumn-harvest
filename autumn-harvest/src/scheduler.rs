@@ -2420,6 +2420,11 @@ async fn tick_one_workflow_schedule(
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
+    // A throttled fire (issue #607) durably defers before any execution row
+    // exists -- count it toward max_active_runs/overlap so a schedule can't
+    // dispatch past its own concurrency limit while an earlier fire is still
+    // sitting in the throttle queue (code review, issue #607).
+    running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
 
     if running >= i64::from(schedule.max_active_runs) {
         let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
@@ -2786,6 +2791,125 @@ async fn tick_one_workflow_schedule(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
         );
+
+        // Start-throttle admission (issue #607): pace scheduled fires, defer the
+        // excess. A deferred fire counts as dispatched (the slot is consumed so
+        // it is not re-fired) and is admitted later by the throttle scanner; its
+        // schedule_id/scheduled_for/origin are persisted so carryover (#488) and
+        // run-history (#534) lineage survive the deferral. On reserve the token
+        // is refunded below if the start short-circuits under the reuse policy.
+        let mut scheduled_throttle_bucket: Option<String> = None;
+        if let Some(throttle_policy) = wf_info.and_then(|info| info.throttle) {
+            let throttle_key = throttle_policy.key_expr.map_or_else(
+                || Some(String::new()),
+                |k| crate::throttle::resolve_throttle_key(k, &input),
+            );
+            if let Some(resolved_throttle_key) = throttle_key {
+                let effective_cap = wf_info
+                    .and_then(|info| info.max_input_bytes)
+                    .map_or(registry.max_workflow_input_bytes, |per| {
+                        per.max(registry.max_workflow_input_bytes)
+                    });
+                // Fail fast on an oversized input rather than persisting a
+                // pending row that would fail at fire time on every scanner
+                // tick (code-review fix, issue #607). Returning the error here
+                // -- rather than falling through to defer -- mirrors the
+                // non-throttled path's `return Err(error)` a few lines below:
+                // `dispatched`/`last_dispatched_at`/`last_original_slot_dispatched`
+                // are never touched, so `last_run_at` is not advanced and the
+                // next tick retries the same firing. Skipped when
+                // `reserve_or_defer` would resolve via `Bypassed` or an
+                // idempotent attach to an already-pending row.
+                let skip_cap_check = crate::throttle::skip_size_check(
+                    conn,
+                    wf_name,
+                    &workflow_id,
+                    Some("reject_duplicate"),
+                )
+                .await?;
+                if !skip_cap_check && effective_cap > 0 {
+                    let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                    if observed > effective_cap {
+                        return Err(crate::error::HarvestError::PayloadTooLarge {
+                            kind: crate::error::PayloadKind::WorkflowInput,
+                            observed_bytes: observed,
+                            cap_bytes: effective_cap,
+                            workflow_type: wf_name.to_string(),
+                            activity_name: None,
+                        });
+                    }
+                }
+                let effective_retry = schedule
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|v| {
+                        serde_json::from_value::<crate::policy::RetryPolicy>(v.clone()).ok()
+                    })
+                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone()))
+                    .and_then(|p| serde_json::to_value(&p).ok());
+                let start_options = crate::debounce::DebounceStartOptions {
+                    reuse_policy: Some("reject_duplicate".to_string()),
+                    execution_timeout_secs: wf_info
+                        .and_then(|info| info.execution_timeout)
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map(|d| d.num_seconds()),
+                    memo: None,
+                    search_attrs: None,
+                    sla_secs: sla.map(|d| d.num_seconds()),
+                    context_headers: None,
+                    priority: None,
+                    concurrency_key: concurrency_key.clone(),
+                    concurrency_limit,
+                    owner: owner.map(str::to_string),
+                    runbook_url: runbook_url.map(str::to_string),
+                    severity: severity.map(str::to_string),
+                    max_execution_timeout_ceiling_secs: None,
+                    max_workflow_input_bytes: Some(effective_cap),
+                    trace_context: None,
+                    workflow_retry_policy: effective_retry,
+                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                    completion_callbacks: None,
+                    schedule_id: Some(schedule.id),
+                    scheduled_for: Some(*original_slot),
+                    origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
+                };
+                match crate::throttle::reserve_or_defer(
+                    conn,
+                    crate::throttle::AdmitThrottleParams {
+                        workflow_name: wf_name,
+                        throttle_key: &resolved_throttle_key,
+                        workflow_id: &workflow_id,
+                        queue_name: dispatch_queue,
+                        input: input.clone(),
+                        start_options,
+                        refill_per_sec: throttle_policy.refill_per_sec,
+                        burst: throttle_policy.burst,
+                        schedule_to_start: throttle_policy.schedule_to_start,
+                        shard_id: current_shard.as_i32(),
+                    },
+                )
+                .await
+                {
+                    Ok(crate::throttle::ThrottleAdmission::Deferred(_)) => {
+                        metrics.record_start_throttled(wf_name);
+                        dispatched += 1;
+                        last_dispatched_at = Some(*scheduled_for);
+                        last_original_slot_dispatched = Some(*original_slot);
+                        continue;
+                    }
+                    Ok(crate::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                        scheduled_throttle_bucket = Some(bucket_key);
+                    }
+                    Ok(crate::throttle::ThrottleAdmission::Bypassed) => {
+                        // Active execution already resolves this reuse policy as a
+                        // no-op/immediate reject; no token reserved, fall through to
+                        // the normal start below.
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
         let start_result = crate::execution::start_or_load_workflow_execution(
             conn,
             StartWorkflowParams {
@@ -2844,6 +2968,10 @@ async fn tick_one_workflow_schedule(
                 last_original_slot_dispatched = Some(*original_slot);
                 if outcome.created() {
                     metrics.record_schedule_run("workflow", wf_name);
+                } else if let Some(ref bucket) = scheduled_throttle_bucket {
+                    // AC-a: RejectDuplicate returned an existing run — no admission,
+                    // refund the reserved throttle token.
+                    let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
                 }
                 tracing::info!(
                     workflow_name = %wf_name,
@@ -2873,6 +3001,11 @@ async fn tick_one_workflow_schedule(
                 .await;
             }
             Err(error) => {
+                // No run admitted — refund the reserved throttle token before
+                // propagating.
+                if let Some(ref bucket) = scheduled_throttle_bucket {
+                    let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                }
                 // Propagate the error so last_run_at is not advanced — the next
                 // tick will retry the same firing rather than silently dropping it.
                 tracing::warn!(
@@ -3591,13 +3724,19 @@ async fn drain_buffered_schedule_runs(
             continue;
         }
 
-        let running: i64 = harvest_workflow_executions::table
+        let mut running: i64 = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
             .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
+        // A throttled fire durably defers before any execution row exists --
+        // count it toward max_active_runs so this loop can't drain more
+        // buffered slots than the schedule's true remaining capacity allows
+        // while an earlier fire is still sitting in the throttle queue
+        // (code review, issue #607).
+        running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
 
         let available = i64::from(schedule.max_active_runs).saturating_sub(running);
         if available <= 0 {
@@ -3713,6 +3852,124 @@ async fn drain_buffered_schedule_runs(
                 "harvest: dispatching buffered scheduled workflow run"
             );
 
+            // Effective per-workflow input cap (issue #607 code review): this
+            // loop previously enforced no cap at all on either the throttle or
+            // immediate path (`None`/`0` are both "no cap" sentinels to
+            // `StartWorkflowParams`/`DebounceStartOptions`). Mirrors the
+            // scheduler-tick path's `effective_cap` computation.
+            let effective_cap = wf_info
+                .and_then(|info| info.max_input_bytes)
+                .map_or(registry.max_workflow_input_bytes, |per| {
+                    per.max(registry.max_workflow_input_bytes)
+                });
+
+            // Start-throttle admission (issue #607): pace buffered/backfilled fires,
+            // defer the excess. A deferred fire counts as dispatched (advances the
+            // slot) and is admitted later by the throttle scanner with its
+            // schedule_id/scheduled_for/origin preserved for carryover (#488).
+            let mut buffered_throttle_bucket: Option<String> = None;
+            if let Some(throttle_policy) = wf_info.and_then(|info| info.throttle) {
+                let throttle_key = throttle_policy.key_expr.map_or_else(
+                    || Some(String::new()),
+                    |k| crate::throttle::resolve_throttle_key(k, &input),
+                );
+                if let Some(resolved_throttle_key) = throttle_key {
+                    // Fail fast on an oversized input rather than persisting a
+                    // pending row that would fail at fire time on every
+                    // scanner tick. `break` (not `return Err`) matches this
+                    // loop's own failure-handling convention below: drop this
+                    // and any remaining buffered slots this tick rather than
+                    // retrying a permanently-failing input forever. Skipped
+                    // when `reserve_or_defer` would resolve via `Bypassed` or
+                    // an idempotent attach to an already-pending row.
+                    let skip_cap_check = crate::throttle::skip_size_check(
+                        conn,
+                        wf_name,
+                        &workflow_id,
+                        Some("reject_duplicate"),
+                    )
+                    .await?;
+                    if !skip_cap_check && effective_cap > 0 {
+                        let observed =
+                            serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                        if observed > effective_cap {
+                            tracing::warn!(
+                                workflow_name = %wf_name,
+                                workflow_id = %workflow_id,
+                                buffered_for = %scheduled_for,
+                                observed_bytes = observed,
+                                cap_bytes = effective_cap,
+                                "harvest: buffered scheduled workflow input exceeds cap; dropping slot"
+                            );
+                            break;
+                        }
+                    }
+                    let effective_retry = schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| {
+                            serde_json::from_value::<crate::policy::RetryPolicy>(v.clone()).ok()
+                        })
+                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone()))
+                        .and_then(|p| serde_json::to_value(&p).ok());
+                    let start_options = crate::debounce::DebounceStartOptions {
+                        reuse_policy: Some("reject_duplicate".to_string()),
+                        execution_timeout_secs: None,
+                        memo: None,
+                        search_attrs: None,
+                        sla_secs: sla.map(|d| d.num_seconds()),
+                        context_headers: None,
+                        priority: None,
+                        concurrency_key: concurrency_key.clone(),
+                        concurrency_limit,
+                        owner: owner.map(str::to_string),
+                        runbook_url: runbook_url.map(str::to_string),
+                        severity: severity.map(str::to_string),
+                        max_execution_timeout_ceiling_secs: None,
+                        max_workflow_input_bytes: Some(effective_cap),
+                        trace_context: None,
+                        workflow_retry_policy: effective_retry,
+                        max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                        completion_callbacks: None,
+                        schedule_id: Some(schedule.id),
+                        scheduled_for: Some(scheduled_for),
+                        origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
+                    };
+                    match crate::throttle::reserve_or_defer(
+                        conn,
+                        crate::throttle::AdmitThrottleParams {
+                            workflow_name: wf_name,
+                            throttle_key: &resolved_throttle_key,
+                            workflow_id: &workflow_id,
+                            queue_name: dispatch_queue,
+                            input: input.clone(),
+                            start_options,
+                            refill_per_sec: throttle_policy.refill_per_sec,
+                            burst: throttle_policy.burst,
+                            schedule_to_start: throttle_policy.schedule_to_start,
+                            shard_id: current_shard.as_i32(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(crate::throttle::ThrottleAdmission::Deferred(_)) => {
+                            metrics.record_start_throttled(wf_name);
+                            dispatched += 1;
+                            continue;
+                        }
+                        Ok(crate::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                            buffered_throttle_bucket = Some(bucket_key);
+                        }
+                        Ok(crate::throttle::ThrottleAdmission::Bypassed) => {
+                            // Active execution already resolves this reuse policy as a
+                            // no-op/immediate reject; no token reserved, fall through to
+                            // the normal start below.
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
             let start_result = crate::execution::start_or_load_workflow_execution(
                 conn,
                 crate::execution::StartWorkflowParams {
@@ -3731,7 +3988,7 @@ async fn drain_buffered_schedule_runs(
                     concurrency_key,
                     concurrency_limit,
                     priority: Priority::default(),
-                    max_workflow_input_bytes: 0,
+                    max_workflow_input_bytes: effective_cap,
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
@@ -3762,6 +4019,9 @@ async fn drain_buffered_schedule_runs(
                     dispatched += 1;
                     if outcome.created() {
                         metrics.record_schedule_run("workflow", wf_name);
+                    } else if let Some(ref bucket) = buffered_throttle_bucket {
+                        // AC-a: RejectDuplicate returned an existing run — refund.
+                        let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
                     }
                     tracing::info!(
                         workflow_name = %wf_name,
@@ -3791,6 +4051,10 @@ async fn drain_buffered_schedule_runs(
                     .await;
                 }
                 Err(error) => {
+                    // No run admitted — refund the reserved throttle token.
+                    if let Some(ref bucket) = buffered_throttle_bucket {
+                        let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                    }
                     // Drop the failing slot rather than re-inserting it. Re-queuing a
                     // permanently-failing slot (e.g. deleted workflow, bad input) would
                     // create an infinite retry loop on every scheduler tick. Transient

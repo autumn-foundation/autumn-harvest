@@ -613,6 +613,33 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Pending throttle records — one row per DEFERRED start (issue #607).
+    harvest_start_throttle (id) {
+        id            -> Uuid,
+        workflow_name -> Text,
+        /// Resolved throttle key ("" for an unkeyed / global-per-workflow throttle).
+        throttle_key  -> Text,
+        /// Token-bucket key in `harvest_rate_limit_buckets`.
+        bucket_key    -> Text,
+        workflow_id   -> Text,
+        queue_name    -> Text,
+        /// The deferred start's input payload.
+        input         -> Jsonb,
+        /// Serialised start options (opaque JSONB).
+        start_options -> Jsonb,
+        /// FIFO drain order.
+        deferred_at   -> Timestamptz,
+        /// `schedule_to_start` stale-out deadline (NULL = deferred indefinitely).
+        expires_at    -> Nullable<Timestamptz>,
+        /// Shard this record was routed to (for operator visibility).
+        shard_id      -> Int4,
+        created_at    -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Pending event batch records — one row per `(workflow_name, batch_key)` (issue #518).
     harvest_event_batches (id) {
         id                -> Uuid,
@@ -738,6 +765,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
     harvest_debounce,
+    harvest_start_throttle,
     harvest_event_batches,
     harvest_payload_refs,
     harvest_completion_deliveries,

@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_harvest_start_throttle_workflow_id;
