@@ -8979,26 +8979,51 @@ async fn batch_start_workflows(
             // block an idempotent re-attach.  The DB call is made lazily — only
             // when the gate is actually active — so there is no overhead on the
             // common path where no gate is set.
+            //
+            // A retry can equally land on an already-pending *throttle* row
+            // (code review, issue #607, mirroring the same fix on the single-
+            // start route): `reserve_or_defer`'s own idempotency shortcut in
+            // Phase 2 below would resolve it to that same pending row without
+            // creating anything new — also not a fresh admission — so the gate
+            // must not block that case either. Checked only when this item's
+            // workflow actually resolves a throttle policy.
             let is_idempotent_retry = if item.workflow_id.is_some() {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
-                        Ok(mut pre_conn) => harvest_workflow_executions::table
-                            .filter(
-                                harvest_workflow_executions::workflow_name.eq(&item.workflow_name),
-                            )
-                            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                            .filter(
-                                // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
-                                // or TERMINATED is returned without inserting a new one.
-                                harvest_workflow_executions::state
-                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                            )
-                            .select(harvest_workflow_executions::id)
-                            .first::<uuid::Uuid>(&mut pre_conn)
-                            .await
-                            .optional()
-                            .unwrap_or(None)
-                            .is_some(),
+                        Ok(mut pre_conn) => {
+                            let has_execution = harvest_workflow_executions::table
+                                .filter(
+                                    harvest_workflow_executions::workflow_name
+                                        .eq(&item.workflow_name),
+                                )
+                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                                .filter(
+                                    // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
+                                    // or TERMINATED is returned without inserting a new one.
+                                    harvest_workflow_executions::state
+                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                )
+                                .select(harvest_workflow_executions::id)
+                                .first::<uuid::Uuid>(&mut pre_conn)
+                                .await
+                                .optional()
+                                .unwrap_or(None)
+                                .is_some();
+                            has_execution
+                                || (workflow_resolving_throttle(
+                                    &runtime.registry,
+                                    &item.workflow_name,
+                                    item.input.as_ref().unwrap_or(&Value::Null),
+                                )
+                                .is_some()
+                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                                        &mut pre_conn,
+                                        &item.workflow_name,
+                                        &workflow_id,
+                                    )
+                                    .await
+                                    .unwrap_or(false))
+                        }
                         Err(_) => false,
                     },
                     Err(_) => false,
@@ -15344,6 +15369,16 @@ async fn trigger_schedule_now(
         Err(e) => {
             // Undo the pre-increment so the budget reflects actual started workflows.
             rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+            // Refund the reserved throttle token too (code review, issue #607):
+            // a failed start never admitted anything, so leaving the token
+            // spent would drain the bucket for every repeated transient/
+            // configuration failure, artificially deferring later manual or
+            // scheduled fires behind a bucket that never actually paced a
+            // successful start.
+            if let Some(ref bucket) = trigger_throttle_bucket {
+                let _ =
+                    autumn_harvest::queue::refund_rate_limit_token(&mut exec_conn, bucket).await;
+            }
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_SCHEDULE_TRIGGER,

@@ -903,6 +903,104 @@ async fn manual_trigger_starts_immediately_when_token_available() {
     );
 }
 
+/// Code-review fix (issue #607 round 9): when a manual trigger for a
+/// throttled workflow reserves a token and the subsequent start call then
+/// fails, the old code rolled back the `runs_started` budget pre-increment
+/// but never refunded the reserved throttle token -- draining one bucket
+/// token per failed trigger even though nothing was ever admitted, so
+/// repeated transient/configuration failures could defer later manual or
+/// scheduled fires behind an artificially empty bucket. Verifies the token
+/// IS refunded: a Postgres trigger deterministically forces the first
+/// manual trigger's start to fail after a token was reserved (burst = 1);
+/// once the forcing trigger is removed, a second manual trigger for the
+/// SAME throttle key still fires immediately rather than deferring --
+/// proof the first call's token made it back into the bucket.
+#[tokio::test]
+async fn manual_trigger_refunds_its_token_when_the_start_fails() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    let schedule_id =
+        insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
+
+    // Force every INSERT into harvest_workflow_executions for this workflow
+    // to fail, so the reserved-token start call deterministically errors.
+    diesel::sql_query(
+        "CREATE OR REPLACE FUNCTION _test_reject_workflow_insert() RETURNS TRIGGER AS $$
+         BEGIN
+             IF NEW.workflow_name = 'sync_tenant' THEN
+                 RAISE EXCEPTION 'simulated insert failure for test';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql;",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create forcing function");
+    diesel::sql_query(
+        "CREATE TRIGGER _test_reject_workflow_insert_trigger \
+         BEFORE INSERT ON harvest_workflow_executions \
+         FOR EACH ROW EXECUTE FUNCTION _test_reject_workflow_insert();",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("install forcing trigger");
+
+    let (status1, body1) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status1,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the forced insert failure must surface as a start failure: {body1:?}"
+    );
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        0,
+        "the forced failure must not have created an execution"
+    );
+
+    // Remove the forcing trigger so the next start can actually succeed.
+    diesel::sql_query(
+        "DROP TRIGGER _test_reject_workflow_insert_trigger ON harvest_workflow_executions;",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("remove forcing trigger");
+
+    // A second manual trigger for the same key: with burst = 1 and no
+    // refund, the sole token would already be spent from the first
+    // (failed) attempt, so this would durably defer instead of firing.
+    let (status2, body2) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK, "second trigger request: {body2:?}");
+    assert_eq!(
+        body2["outcome"],
+        json!("fired"),
+        "the refunded token must still be available for a later trigger: {body2:?}"
+    );
+    assert_eq!(
+        execution_count(&mut conn, "sync_tenant").await,
+        1,
+        "exactly one execution should exist after the successful second trigger"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        0,
+        "the second trigger must not have durably deferred"
+    );
+}
+
 #[tokio::test]
 async fn under_limit_starts_then_defers_excess_and_backlog_is_visible() {
     let (url, _container) = setup_database().await;
@@ -1107,6 +1205,118 @@ async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policie
         backlog.as_array().map(Vec::len),
         Some(0),
         "no pending throttle row should be created for a rejected item: {backlog:?}"
+    );
+}
+
+/// Code-review fix (issue #607 round 9): `batch_start_workflows`'s Phase 1
+/// admission-gate check's idempotent-retry bypass only checked whether an
+/// explicit `workflow_id` already had an active *execution* -- not an
+/// already-pending *throttle* row -- mirroring the same gap the single-start
+/// route had (round 7). A batch retry for a `workflow_id` durably deferred in
+/// `harvest_start_throttle` was wrongly rejected once a gate activated, even
+/// though `reserve_or_defer`'s own idempotency shortcut in Phase 2 would
+/// resolve it to the same pending row without creating any new admission.
+/// Verifies the gate bypass now also recognizes a pending throttle row for
+/// batch items, while a genuinely fresh `workflow_id` in the same batch call
+/// is still blocked.
+#[tokio::test]
+async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, api_state) = build_app_with_state(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    // First request: bucket empty, defers durably.
+    seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
+    let (status1, body1) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "batch-gate-retry-job",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::OK, "first batch request: {body1:?}");
+    assert_eq!(
+        body1["results"][0]["status"],
+        json!("deferred"),
+        "{body1:?}"
+    );
+    assert_eq!(throttle_row_count(&mut conn, "sync_tenant").await, 1);
+
+    // Arm a fleet-wide admission gate blocking all new admissions.
+    api_state.initialize_gate_cache(vec![autumn_harvest::AdmissionGate {
+        id: autumn_harvest::AdmissionGateId(uuid::Uuid::new_v4()),
+        scope: autumn_harvest::GateScope::Fleet,
+        reason: "incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        expires_at: None,
+    }]);
+
+    // Retry the same item (same explicit workflow_id): must NOT be blocked by
+    // the gate, and must NOT create a second pending row.
+    let (status2, body2) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "batch-gate-retry-job",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK, "retry batch request: {body2:?}");
+    assert_eq!(
+        body2["results"][0]["status"],
+        json!("deferred"),
+        "retry must bypass the gate via the pending-throttle-row shortcut: {body2:?}"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        1,
+        "no second pending row should be created"
+    );
+
+    // Sanity: a genuinely NEW workflow_id in the same batch call is still
+    // blocked by the same gate.
+    let (status3, body3) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "batch-gate-retry-job-fresh",
+                    "input": { "tenant_id": "acme" },
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status3,
+        StatusCode::OK,
+        "fresh-item batch request: {body3:?}"
+    );
+    assert_eq!(
+        body3["results"][0]["status"],
+        json!("rejected"),
+        "a genuinely fresh item must still be blocked by the gate: {body3:?}"
     );
 }
 
