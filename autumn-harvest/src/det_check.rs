@@ -912,13 +912,16 @@ fn is_allowed_combinator_path(path: &str) -> bool {
 ///    matching, so `det_check` must tolerate them too (#980 Codex P2).
 /// 3. The full qualified path ending at the name is extracted by walking
 ///    backward over the contiguous run of path bytes (identifier bytes and
-///    `:`), then matched exactly against [`is_allowed_combinator_path`]. A path
-///    run immediately preceded by `.` is a method call and is rejected.
+///    `:`), then matched exactly against [`is_allowed_combinator_path`] after a
+///    single optional leading `::` is stripped (so an absolute path like
+///    `::futures::future::select` matches, mirroring the macro lint's
+///    `path_to_string`, which ignores `leading_colon`). A path run immediately
+///    preceded by `.` is a method call and is rejected.
 ///
 /// This is path-precise, so an unrelated helper of the same tail name under a
-/// different root (`crate::future::select`, `my_dsl::select_all`) is never
-/// flagged — mirroring the macro lint's exact-path matching — with or without a
-/// turbofish.
+/// different root (`crate::future::select`, `my_dsl::select_all`,
+/// `::my_dsl::select_all`) is never flagged — mirroring the macro lint's
+/// exact-path matching — with or without a leading `::` or a turbofish.
 fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
     let bytes = code.as_bytes();
     let name_len = pattern.len();
@@ -948,7 +951,14 @@ fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
             return false;
         }
         let path = &code[run_start..name_end];
-        is_allowed_combinator_path(path)
+        // Strip a single optional leading `::` (absolute path), mirroring the
+        // syn-based HVG010 macro lint's `path_to_string`, which ignores
+        // `leading_colon`. So `::futures::future::select(a, b)` normalizes to
+        // `futures::future::select` and is flagged — matching the compile-time
+        // guardrail — while `::my_dsl::select_all(v)` normalizes to
+        // `my_dsl::select_all` and stays unflagged (#980 Codex P2).
+        let normalized = path.strip_prefix("::").unwrap_or(path);
+        is_allowed_combinator_path(normalized)
     })
 }
 

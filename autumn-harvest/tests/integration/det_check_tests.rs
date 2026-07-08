@@ -1650,6 +1650,51 @@ fn det011_does_not_flag_turbofished_non_futures_or_method_forms() {
 }
 
 #[test]
+fn det011_flags_absolute_futures_combinator_paths() {
+    // An absolute path (leading `::`) must be flagged exactly like its relative
+    // form: the syn-based HVG010 macro lint's `path_to_string` ignores
+    // `leading_colon`, so `::futures::future::select(a, b)` hard-blocks at
+    // compile time and det_check must match it too (#980 Codex absolute-path
+    // finding). Turbofished absolute forms are covered too. Each is exactly one
+    // DET011 finding.
+    for call in [
+        "let _ = ::futures::future::select(a, b).await;",
+        "let _ = ::futures::future::select_all::<Vec<_>>(v).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "absolute-path combinator `{call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_absolute_non_futures_combinator_paths() {
+    // Stripping the leading `::` must NOT make a non-futures absolute path
+    // match: normalizing `::my_dsl::select_all` yields `my_dsl::select_all`,
+    // which is not an allowed combinator path, so it stays unflagged (mirrors
+    // the macro lint's exact-path matching).
+    for call in [
+        "let _ = ::my_dsl::select_all(v);",
+        "let _ = ::crate::future::select(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "absolute non-futures path `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
 fn det011_does_not_flag_method_call_forms_of_combinators() {
     // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
     // free-function combinators — they must not be flagged, mirroring the AST
