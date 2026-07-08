@@ -14015,69 +14015,11 @@ async fn list_schedules(
     let entries = schedules
         .into_iter()
         .map(|s| {
-            let (kind, name) = if let Some(ref dag_name) = s.dag_name {
-                (ScheduleKind::Dag, dag_name.clone())
-            } else if let Some(ref wf_name) = s.workflow_name {
-                (ScheduleKind::Workflow, wf_name.clone())
-            } else {
-                // Should not occur given the CHECK constraint, but handle gracefully.
-                (ScheduleKind::Dag, String::new())
-            };
             let last_backfill = recent_backfills
                 .get(&s.id)
                 .cloned()
                 .map(BackfillSummary::from);
-            let eft = effective_fire_time(s.id, s.next_run_at, s.jitter_secs);
-            let buffered_count =
-                autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-            let remaining_runs = s
-                .max_runs
-                .map(|max| remaining_runs_budget(max, s.runs_started));
-            let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
-                s.catchup_policy.as_deref(),
-                s.catchup_window_secs,
-                s.catchup,
-            );
-            ScheduleEntry {
-                id: s.id,
-                kind,
-                name,
-                schedule_expr: s.schedule_expr,
-                timezone: s.timezone,
-                is_paused: s.is_paused,
-                paused_at: s.paused_at,
-                paused_by: s.paused_by,
-                pause_reason: s.pause_reason,
-                next_run_at: s.next_run_at,
-                last_run_at: s.last_run_at,
-                max_active_runs: s.max_active_runs,
-                catchup: s.catchup,
-                last_backfill,
-                jitter_secs: s.jitter_secs,
-                effective_fire_time: eft,
-                overlap_policy: s.overlap_policy,
-                buffered_count,
-                buffer_all_max: s.buffer_all_max,
-                calendar_name: s.calendar_name,
-                skip_policy: s.skip_policy,
-                consecutive_failure_limit: s.consecutive_failure_limit,
-                consecutive_failure_count: s.consecutive_failure_count,
-                auto_paused_at: s.auto_paused_at,
-                end_at: s.end_at,
-                max_runs: s.max_runs,
-                runs_started: s.runs_started,
-                remaining_runs,
-                exhausted_at: s.exhausted_at,
-                exhausted_reason: s.exhausted_reason,
-                catchup_policy_effective: effective_policy.as_str().to_string(),
-                catchup_window_secs: s.catchup_window_secs,
-                catchup_dropped_last_recovery: s.last_catchup_dropped,
-                last_catchup_at: s.last_catchup_at,
-                retry_policy: s
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
-            }
+            schedule_entry_from_row(s, last_backfill)
         })
         .collect();
     Ok(Json(entries))
@@ -14111,68 +14053,12 @@ async fn get_schedule(
 
     let s = found.ok_or_else(|| AutumnError::not_found_msg(format!("schedule {id}")))?;
 
-    let (kind, name) = if let Some(ref dag_name) = s.dag_name {
-        (ScheduleKind::Dag, dag_name.clone())
-    } else if let Some(ref wf_name) = s.workflow_name {
-        (ScheduleKind::Workflow, wf_name.clone())
-    } else {
-        (ScheduleKind::Dag, String::new())
-    };
-
     let last_backfill = load_recent_backfills(&api_state, std::slice::from_ref(&s.id))
         .await
         .remove(&s.id)
         .map(BackfillSummary::from);
 
-    let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-    let remaining_runs = s
-        .max_runs
-        .map(|max| remaining_runs_budget(max, s.runs_started));
-    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
-        s.catchup_policy.as_deref(),
-        s.catchup_window_secs,
-        s.catchup,
-    );
-    Ok(Json(ScheduleEntry {
-        effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
-        jitter_secs: s.jitter_secs,
-        id: s.id,
-        kind,
-        name,
-        schedule_expr: s.schedule_expr,
-        timezone: s.timezone,
-        is_paused: s.is_paused,
-        paused_at: s.paused_at,
-        paused_by: s.paused_by,
-        pause_reason: s.pause_reason,
-        next_run_at: s.next_run_at,
-        last_run_at: s.last_run_at,
-        max_active_runs: s.max_active_runs,
-        catchup: s.catchup,
-        last_backfill,
-        overlap_policy: s.overlap_policy.clone(),
-        buffered_count,
-        buffer_all_max: s.buffer_all_max,
-        calendar_name: s.calendar_name.clone(),
-        skip_policy: s.skip_policy.clone(),
-        consecutive_failure_limit: s.consecutive_failure_limit,
-        consecutive_failure_count: s.consecutive_failure_count,
-        auto_paused_at: s.auto_paused_at,
-        end_at: s.end_at,
-        max_runs: s.max_runs,
-        runs_started: s.runs_started,
-        remaining_runs,
-        exhausted_at: s.exhausted_at,
-        exhausted_reason: s.exhausted_reason,
-        catchup_policy_effective: effective_policy.as_str().to_string(),
-        catchup_window_secs: s.catchup_window_secs,
-        catchup_dropped_last_recovery: s.last_catchup_dropped,
-        last_catchup_at: s.last_catchup_at,
-        retry_policy: s
-            .retry_policy
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-    }))
+    Ok(Json(schedule_entry_from_row(s, last_backfill)))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -14572,56 +14458,9 @@ async fn upsert_workflow_schedule_and_read_back(
         .await
         .map_err(database_error)
         .map_err(map_error)?;
-    let buffered_count =
-        autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
-    let remaining_runs = row
-        .max_runs
-        .map(|max| remaining_runs_budget(max, row.runs_started));
-    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
-        row.catchup_policy.as_deref(),
-        row.catchup_window_secs,
-        row.catchup,
-    );
-    Ok(ScheduleEntry {
-        effective_fire_time: effective_fire_time(row.id, row.next_run_at, row.jitter_secs),
-        jitter_secs: row.jitter_secs,
-        id: row.id,
-        kind: ScheduleKind::Workflow,
-        name: ws.workflow_name.clone(),
-        schedule_expr: row.schedule_expr,
-        timezone: row.timezone,
-        is_paused: row.is_paused,
-        paused_at: row.paused_at,
-        paused_by: row.paused_by,
-        pause_reason: row.pause_reason,
-        next_run_at: row.next_run_at,
-        last_run_at: row.last_run_at,
-        max_active_runs: row.max_active_runs,
-        catchup: row.catchup,
-        last_backfill: None, // newly created; no backfill history yet
-        overlap_policy: row.overlap_policy,
-        buffered_count,
-        buffer_all_max: row.buffer_all_max,
-        calendar_name: row.calendar_name,
-        skip_policy: row.skip_policy,
-        consecutive_failure_limit: row.consecutive_failure_limit,
-        consecutive_failure_count: row.consecutive_failure_count,
-        auto_paused_at: row.auto_paused_at,
-        end_at: row.end_at,
-        max_runs: row.max_runs,
-        runs_started: row.runs_started,
-        remaining_runs,
-        exhausted_at: row.exhausted_at,
-        exhausted_reason: row.exhausted_reason,
-        catchup_policy_effective: effective_policy.as_str().to_string(),
-        catchup_window_secs: row.catchup_window_secs,
-        catchup_dropped_last_recovery: row.last_catchup_dropped,
-        last_catchup_at: row.last_catchup_at,
-        retry_policy: row
-            .retry_policy
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-    })
+    // Newly created/updated via the registration upsert; no backfill history
+    // is loaded here (mirrors the pre-existing behavior).
+    Ok(schedule_entry_from_row(row, None))
 }
 
 #[allow(clippy::too_many_lines)]
