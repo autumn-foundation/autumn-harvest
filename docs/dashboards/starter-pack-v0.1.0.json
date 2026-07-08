@@ -3655,6 +3655,118 @@
           }
         }
       ]
+    },
+    {
+      "id": 85,
+      "type": "row",
+      "title": "Sagas",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      },
+      "panels": [
+        {
+          "id": 86,
+          "type": "timeseries",
+          "title": "Saga compensations",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 62
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_saga_compensated_total{workflow=~\"$workflow\",queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_saga_compensation_spike (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_spike) Real compensation sequences entered (issue #801) \u2014 counted exactly once per unwind, at unwind start. A sustained rise above the workflow's baseline is the earliest downstream-outage signal: forward saga steps are failing and rolling back en masse."
+        },
+        {
+          "id": 87,
+          "type": "timeseries",
+          "title": "Saga compensation failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 62
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_saga_compensation_failed_total{workflow=~\"$workflow\",queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_saga_compensation_failed (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed) Unwinds that finished with at least one compensation error (issue #801) \u2014 the dangling-state case (HarvestError::SagaCompensationFailed). Any increase warrants a page: committed side effects were left un-rolled-back and need manual reconciliation. Distinct from harvest_workflow_terminal{outcome=\"failed\"}."
+        }
+      ]
     }
   ]
 }

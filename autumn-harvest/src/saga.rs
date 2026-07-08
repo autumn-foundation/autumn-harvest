@@ -73,6 +73,36 @@ type Compensation<'ctx> = Box<dyn FnOnce() -> BoxFuture<'ctx, HarvestResult<()>>
 /// placed *directly inside* the compensation closure (rather than inside an
 /// activity invoked by the closure) will break replay.
 ///
+/// # Observability (issue #801)
+///
+/// Every **non-empty** unwind (a [`compensate_all`](Self::compensate_all)
+/// call or an automatic step-failure rollback with at least one pending
+/// compensation) emits the counter `harvest.saga.compensated{workflow, queue}`
+/// **exactly once per real compensation sequence**, and an unwind that
+/// finishes with at least one compensation error additionally emits
+/// `harvest.saga.compensation_failed{workflow, queue}` — the alertable
+/// dangling-state signal, fired even when the author catches
+/// [`HarvestError::SagaCompensationFailed`] and completes normally.
+///
+/// Exactly-once across replays is keyed to durable `MarkerRecorded` dedup
+/// markers (`saga_compensated:{seq}` at unwind start, in the same command
+/// batch as the first compensation's own dispatch; `saga_compensation_failed:{seq}`
+/// at failed-unwind end). Replays — the only resume mechanism Harvest has —
+/// observe the marker and stay silent, while pre-#801 marker-less histories
+/// replay untouched and uncounted (the matcher's tolerant `Absent` arm never
+/// moves the cursor). No new `WorkflowEvent` variant and no migration are
+/// involved; the markers are opaque names on the existing `MarkerRecorded`
+/// variant, exactly like `fan_out:{n}` / `race:{seq}` / `patch:{id}`.
+///
+/// Accepted edges (documented in `docs/saga.md`): an unwind entered with
+/// unconsumed non-marker events at the cursor is conservatively uncounted; a
+/// **pure in-memory** unwind (zero durable footprint) that crash-resumes
+/// within one decision cycle can re-count (at-least-once) — the metric
+/// mirror of the "compensations re-run wholesale" idempotency contract; and
+/// a history recorded by #801+ code does not replay under pre-#801 builds
+/// (roll forward, never back — the same forward-compat rule as every marker
+/// feature).
+///
 /// ## Examples
 ///
 /// ```rust
@@ -215,6 +245,21 @@ impl<'ctx> Saga<'ctx> {
     }
 
     async fn run_compensations(&mut self) -> Result<(), Vec<String>> {
+        // AC6 (issue #801): an empty unwind is not a compensation sequence —
+        // no seq allocated, no marker, no metric. Behaviorally identical to
+        // the zero-iteration loop this early return replaces.
+        if self.compensations.is_empty() {
+            return Ok(());
+        }
+
+        // Counted at unwind start (the earliest outage signal), deduped
+        // across replays by the durable `saga_compensated:{seq}` marker —
+        // recorded in the same command batch as the first compensation's own
+        // dispatch, so a crash at any point mid-unwind resumes silent. The
+        // returned observation carries the unwind's disposition; the failure
+        // observe below follows it (invariant: failed ≤ compensated).
+        let observation = self.ctx.observe_saga_unwind_start(self.compensations.len());
+
         let mut errors = Vec::new();
 
         while let Some(compensation) = self.compensations.pop() {
@@ -226,6 +271,14 @@ impl<'ctx> Saga<'ctx> {
         if errors.is_empty() {
             Ok(())
         } else {
+            // The dangling-state signal (`harvest.saga.compensation_failed`),
+            // emitted here rather than at the worker terminal boundary so an
+            // author-caught failure is still observed. Keyed to the unwind's
+            // start disposition: a counted unwind's failure is always counted
+            // (even past a trailing un-awaited signal), an uncounted unwind's
+            // failure stays uncounted.
+            self.ctx
+                .observe_saga_unwind_failed(observation, errors.len());
             Err(errors)
         }
     }

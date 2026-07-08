@@ -16,6 +16,8 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_shard_unready",
     "harvest_no_compatible_worker",
     "harvest_workflow_non_determinism",
+    "harvest_saga_compensation_spike",
+    "harvest_saga_compensation_failed",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -60,6 +62,8 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_activity_retries_total",
     "harvest_worker_slots_in_use",
     "harvest_worker_slots_available",
+    "harvest_saga_compensated_total",
+    "harvest_saga_compensation_failed_total",
 ];
 
 #[test]
@@ -165,6 +169,31 @@ fn prometheus_examples_use_stable_bounded_harvest_metrics() {
             }
         }
     }
+}
+
+#[test]
+fn saga_spike_alert_absolute_floor_fires_without_a_baseline() {
+    // Round-4 hardening (issue #801, Codex review): a NEW or long-dormant
+    // workflow has no samples in the `offset 1h` baseline window, so a bare
+    // `> 4 * rate(... offset 1h)` comparison yields no series and the
+    // absolute 1/min floor never fires for the FIRST rollback wave — the
+    // exact case the alert exists for. The `or <current> * 0` arm defaults
+    // the baseline to a zero-valued series with matching labels; pin that
+    // fallback textually so it cannot be silently simplified away.
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let spike = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_saga_compensation_spike"))
+        .expect("saga compensation spike alert must exist");
+    let expr = spike["prometheus"]["expressions"][0]["expr"]
+        .as_str()
+        .expect("spike alert must carry a PromQL expression");
+    assert!(
+        expr.contains("or sum by (workflow) (rate(harvest_saga_compensated_total[5m])) * 0"),
+        "spike alert baseline must default to a zero-valued, label-matched series so the \
+         absolute floor fires with no baseline samples: {expr}"
+    );
 }
 
 #[test]

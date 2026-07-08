@@ -1769,3 +1769,65 @@ async fn test_worker_session_auto_resolved_host_is_stable_across_replay() {
     });
     assert_eq!(Some(first_host), acquired_host);
 }
+
+// ─────────── saga metric labels through the harness (issue #801) ───────────
+
+/// Saga workflow with an activity-backed forward step (forces a real
+/// suspension/iteration boundary) and a manual compensated unwind.
+fn compensating_saga_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async {
+                ctx.execute_activity_raw("reserve", Value::Null, "default")
+                    .await
+            },
+            |_| async { Ok::<_, autumn_harvest::HarvestError>(()) },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        saga.compensate_all().await.map_err(|e| e.to_string())?;
+        Ok(json!("compensated"))
+    })
+}
+
+/// Recorder capturing the saga counters with their labels.
+#[derive(Default)]
+struct SagaLabelRecorder {
+    compensated: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for SagaLabelRecorder {
+    fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+        self.compensated
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_owned(), queue.to_owned()));
+    }
+}
+
+/// Issue #801 post-review P3: `with_workflow_name`/`with_queue_name` thread
+/// real metric labels into the harness contexts, and the counter still fires
+/// exactly once across the multiple iterations the env drives.
+#[tokio::test]
+async fn test_env_threads_workflow_and_queue_labels_into_saga_metrics() {
+    let recorder = std::sync::Arc::new(SagaLabelRecorder::default());
+    let env = WorkflowTestEnv::new()
+        .with_metrics(recorder.clone())
+        .with_workflow_name("book_trip")
+        .with_queue_name("payments")
+        .mock_activity("reserve", |_| Ok(json!("rsv-1")));
+
+    let outcome = env.run(compensating_saga_workflow, Value::Null).await;
+    assert_eq!(outcome.result, Ok(json!("compensated")));
+
+    assert_eq!(
+        recorder.compensated.lock().unwrap().as_slice(),
+        &[("book_trip".to_owned(), "payments".to_owned())],
+        "the harness must thread real workflow/queue labels and the counter \
+         must fire exactly once across the env's iterations"
+    );
+}

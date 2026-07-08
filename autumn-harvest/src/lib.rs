@@ -304,7 +304,9 @@ pub use policy::{
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
-pub use replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch, SignalOrTimerMatch};
+pub use replay::{
+    HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch, SignalOrTimerMatch,
+};
 #[cfg(feature = "db")]
 pub use reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,

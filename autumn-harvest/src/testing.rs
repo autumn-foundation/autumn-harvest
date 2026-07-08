@@ -50,8 +50,8 @@ use serde_json::Value;
 use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{
-    WorkflowOutcome, run_workflow_canary, run_workflow_strict, run_workflow_strict_advancing_clock,
-    run_workflow_with_state_advancing_clock,
+    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_canary, run_workflow_strict,
+    run_workflow_strict_advancing_clock, run_workflow_with_state_advancing_clock,
 };
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
@@ -2295,6 +2295,14 @@ pub struct WorkflowTestEnv {
     /// Defaults to `NoOpMetrics`; inject a counting recorder to assert that
     /// `ctx.metrics()` calls fire exactly once per logical occurrence.
     metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    /// Logical workflow type name threaded into the `WorkflowContext` so
+    /// engine metrics emitted from inside the workflow (e.g. the saga
+    /// compensation counters, issue #801) carry a real `workflow` label.
+    /// Defaults to `""` (matching legacy contexts).
+    workflow_name: String,
+    /// Task queue name threaded into the `WorkflowContext` so in-context
+    /// engine metrics carry a real `queue` label. Defaults to `""`.
+    queue_name: String,
 }
 
 impl Default for WorkflowTestEnv {
@@ -2322,6 +2330,8 @@ impl WorkflowTestEnv {
             last_error: None,
             scheduled_time: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            workflow_name: String::new(),
+            queue_name: String::new(),
         }
     }
 
@@ -2509,6 +2519,26 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the logical workflow type name for the contexts this env builds,
+    /// so engine metrics emitted from inside the workflow — e.g. the saga
+    /// compensation counters (issue #801) — carry a real `workflow` label
+    /// instead of the legacy `""` default. Pairs with
+    /// [`with_metrics`](Self::with_metrics) for label-content assertions.
+    #[must_use]
+    pub fn with_workflow_name(mut self, name: impl Into<String>) -> Self {
+        self.workflow_name = name.into();
+        self
+    }
+
+    /// Set the task queue name for the contexts this env builds, so
+    /// in-context engine metrics carry a real `queue` label instead of the
+    /// legacy `""` default. Pairs with [`with_metrics`](Self::with_metrics).
+    #[must_use]
+    pub fn with_queue_name(mut self, queue: impl Into<String>) -> Self {
+        self.queue_name = queue.into();
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -2574,6 +2604,24 @@ impl WorkflowTestEnv {
 
         let start_time = self.simulated_now;
 
+        // Thread the configured workflow/queue names into the context (via
+        // the executor's span-meta plumbing, the same path the worker uses)
+        // so engine metrics emitted from inside the workflow carry real
+        // labels a test can assert on.
+        let span_meta = if self.workflow_name.is_empty() && self.queue_name.is_empty() {
+            None
+        } else {
+            Some(WorkflowExecuteSpanMeta {
+                workflow_name: self.workflow_name.clone(),
+                workflow_id: String::new(),
+                shard_id: 0,
+                queue_name: self.queue_name.clone(),
+                is_replay: false,
+                link_traceparent: None,
+                build_id: None,
+            })
+        };
+
         for _iter in 0..MAX_TEST_ITERATIONS {
             let (outcome, pending_cmds, _span) = run_workflow_with_state_advancing_clock(
                 exec_id,
@@ -2581,7 +2629,7 @@ impl WorkflowTestEnv {
                 handler,
                 input.clone(),
                 self.state.clone(),
-                None,
+                span_meta.as_ref(),
                 self.metrics.clone(),
             )
             .await;

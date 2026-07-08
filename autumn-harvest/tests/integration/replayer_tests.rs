@@ -3104,3 +3104,387 @@ async fn replayer_replays_signal_handler_workflow_with_only_one_signal() {
         "single-signal fixture must replay successfully: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Saga compensation observability (issue #801)
+// ---------------------------------------------------------------------------
+
+/// Saga workflow with an activity-backed forward step + compensation, ending
+/// in a manual `compensate_all()` unwind — the durable compensation pattern
+/// documented in docs/saga.md.
+fn saga_compensated_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async {
+                ctx.execute_activity_raw("reserve", Value::Null, "default")
+                    .await
+            },
+            move |rsv: Value| async move {
+                ctx.execute_activity_raw("release", rsv, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        saga.compensate_all().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("compensated"))
+    })
+}
+
+/// History for `saga_compensated_workflow` as recorded by #801+ code: the
+/// `saga_compensated:{seq}` dedup marker sits between the forward step's
+/// events and the compensation activity's events.
+fn saga_marker_history() -> Vec<WorkflowEvent> {
+    let reserve_id = ActivityExecId::new();
+    let release_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: reserve_id,
+            name: "reserve".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: reserve_id,
+            output: serde_json::json!("rsv-1"),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: "release".into(),
+            input: serde_json::json!("rsv-1"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: Value::Null,
+        },
+    ]
+}
+
+/// Same shape as recorded by pre-#801 code: no saga marker anywhere.
+fn saga_pre_marker_history() -> Vec<WorkflowEvent> {
+    saga_marker_history()
+        .into_iter()
+        .filter(|event| !matches!(event, WorkflowEvent::MarkerRecorded { .. }))
+        .collect()
+}
+
+/// Recorder counting only the two saga counters (everything else no-ops).
+#[derive(Default)]
+struct SagaCounterRecorder {
+    compensated: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for SagaCounterRecorder {
+    fn record_saga_compensated(&self, _workflow_name: &str, _queue: &str) {
+        self.compensated
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_saga_compensation_failed(&self, _workflow_name: &str, _queue: &str) {
+        self.failed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A marker-bearing (#801+) saga history replays deterministically.
+#[tokio::test]
+async fn replayer_succeeds_for_saga_history_with_compensation_markers() {
+    let report = WorkflowReplayer::new()
+        .register_fn("saga_compensated_workflow", saga_compensated_workflow)
+        .replay_from_events(saga_marker_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "marker-bearing saga history must replay cleanly: {report}"
+    );
+}
+
+/// Replay of a recorded unwind emits zero saga metrics — the counters fire
+/// only on the live frontier where the marker is first recorded.
+#[tokio::test]
+async fn replayer_replay_emits_no_saga_metrics() {
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn("saga_compensated_workflow", saga_compensated_workflow)
+        .with_metrics(recorder.clone())
+        .replay_from_events(saga_marker_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "fixture must replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a full-history replay must emit no saga.compensated samples"
+    );
+    assert_eq!(
+        recorder.failed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a full-history replay must emit no saga.compensation_failed samples"
+    );
+}
+
+/// Backward compat (AC7): a pre-#801 marker-less saga history replays
+/// untouched under the instrumented code — the Absent arm is non-mutating.
+#[tokio::test]
+async fn replayer_succeeds_for_pre_marker_saga_history() {
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn("saga_compensated_workflow", saga_compensated_workflow)
+        .with_metrics(recorder.clone())
+        .replay_from_events(saga_pre_marker_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "pre-#801 marker-less saga history must replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "legacy histories are never counted retroactively"
+    );
+}
+
+/// Failed-unwind workflow for the post-review P2-1 persisted shape: one saga
+/// step (in-memory forward, activity-backed compensation that terminally
+/// failed), the author catches `SagaCompensationFailed`, consumes the
+/// duplicate webhook signal, and completes normally.
+fn saga_failed_unwind_with_trailing_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async { Ok::<_, autumn_harvest::HarvestError>(serde_json::json!("rsv-1")) },
+            move |rsv: Value| async move {
+                ctx.execute_activity_raw("release", rsv, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if saga.compensate_all().await.is_ok() {
+            return Err("compensation unexpectedly succeeded".to_string());
+        }
+        // Author-caught dangling state; consume the duplicate cancel webhook
+        // signal that arrived at the final unwind cycle's wake, then complete.
+        let _ = ctx
+            .wait_for_signal("dup_cancel")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("dangling_state_logged"))
+    })
+}
+
+/// The exact history the P2-1 fix persists: the failure marker recorded PAST
+/// the drained trailing signal. This must replay deterministically with zero
+/// fresh samples — the money proof that the new marker position is
+/// replay-consistent.
+#[tokio::test]
+async fn replayer_succeeds_for_failed_unwind_history_with_trailing_signal() {
+    let release_id = ActivityExecId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: "release".into(),
+            input: serde_json::json!("rsv-1"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: release_id,
+            error: "release rejected".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            non_retryable: false,
+            details: None,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "dup_cancel".into(),
+            payload: serde_json::json!({"retry": true}),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensation_failed:1".into(),
+            details: serde_json::json!(1),
+        },
+    ];
+
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "saga_failed_unwind_with_trailing_signal_workflow",
+            saga_failed_unwind_with_trailing_signal_workflow,
+        )
+        .with_metrics(recorder.clone())
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the failure marker recorded past a drained trailing signal must \
+         replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder.failed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a full-history replay of the failed unwind emits no fresh samples"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+/// Cancel-and-compensate workflow for the marker-past-cancellation shape.
+fn saga_cancel_and_compensate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async { Ok::<_, autumn_harvest::HarvestError>("flight-1") },
+            |_| async { Ok::<_, autumn_harvest::HarvestError>(()) },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if ctx.is_cancelled() {
+            saga.compensate_all().await.map_err(|e| e.to_string())?;
+            return Ok(serde_json::json!("cancelled_and_compensated"));
+        }
+        Ok(serde_json::json!("completed"))
+    })
+}
+
+/// The cancel-and-compensate persisted shape: the `saga_compensated:{seq}`
+/// marker recorded AFTER the (never-consumed) `WorkflowCancelled` lifecycle
+/// event. Must replay deterministically with zero fresh samples.
+#[tokio::test]
+async fn replayer_succeeds_for_cancel_and_compensate_history_with_marker() {
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(1),
+        },
+    ];
+
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "saga_cancel_and_compensate_workflow",
+            saga_cancel_and_compensate_workflow,
+        )
+        .with_metrics(recorder.clone())
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the compensated marker recorded past the cancellation event must \
+         replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a replay of the recorded cancel-and-compensate unwind emits nothing"
+    );
+}
+
+/// Codex P2 (PR #973 review): the normal terminal shape for a **pre-#801**
+/// cancelled run is `[..., WorkflowCancelled]` with NO saga marker anywhere —
+/// the cancellation event itself is the last recorded event. A replay probe
+/// of that history against the cancel-and-compensate workflow must stay
+/// uncounted and command-free: the matcher's cancellation-transparency
+/// lookahead reports the frontier, but a `WorkflowReplayer` run is a pure
+/// read — it must never retroactively count an old history nor push a fresh
+/// marker command mid-replay.
+#[tokio::test]
+async fn replayer_pre_marker_cancelled_history_stays_uncounted() {
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCancelled {
+            reason: "operator shutdown".into(),
+        },
+    ];
+
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "saga_cancel_and_compensate_workflow",
+            saga_cancel_and_compensate_workflow,
+        )
+        .with_metrics(recorder.clone())
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a pre-#801 marker-less cancelled history must replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a replay probe must never retroactively count a pre-#801 cancelled history"
+    );
+    assert_eq!(recorder.failed.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

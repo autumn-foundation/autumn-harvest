@@ -8548,3 +8548,276 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
     let claimed_item = claimed_by_new.expect("New worker should successfully claim task");
     assert_eq!(claimed_item.id, task_id);
 }
+
+// ---------------------------------------------------------------------------
+// Saga compensation observability (issue #801)
+// ---------------------------------------------------------------------------
+
+static SAGA_CANCEL_FLIGHT_RUNS: AtomicUsize = AtomicUsize::new(0);
+static SAGA_CANCEL_HOTEL_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Records the two saga counters (with their labels) emitted through the
+/// worker's real telemetry wiring; every other `MetricsRecorder` method stays
+/// a no-op default. Labels are recorded here and asserted after the run —
+/// never asserted inside the callback, which runs on the worker task and
+/// would surface a label regression as a confusing poison-pill FAILED
+/// instead of a clear assertion message (issue #801 post-review).
+#[derive(Default)]
+struct SagaE2eRecorder {
+    compensated: std::sync::Mutex<Vec<(String, String)>>,
+    compensation_failed: AtomicUsize,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for SagaE2eRecorder {
+    fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+        self.compensated
+            .lock()
+            .expect("saga e2e recorder lock")
+            .push((workflow_name.to_owned(), queue.to_owned()));
+    }
+
+    fn record_saga_compensation_failed(&self, _workflow_name: &str, _queue: &str) {
+        self.compensation_failed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn saga_flight_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("flight-1")) })
+}
+
+fn saga_hotel_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("hotel-1")) })
+}
+
+fn saga_cancel_flight_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        SAGA_CANCEL_FLIGHT_RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::Value::Null)
+    })
+}
+
+fn saga_cancel_hotel_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        SAGA_CANCEL_HOTEL_RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::Value::Null)
+    })
+}
+
+/// Two activity-backed forward steps with activity-backed compensations, then
+/// an in-line step-3 failure that triggers the LIFO unwind. Every activity
+/// boundary forces a full from-scratch replay of the workflow function — the
+/// exact code path a worker crash-resume takes (crash-resume = re-claim +
+/// replay; there is no other resume mechanism).
+fn saga_metrics_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+
+        saga.step(
+            || async {
+                ctx.execute_activity_raw("saga_reserve_flight", serde_json::Value::Null, "default")
+                    .await
+            },
+            move |flight: serde_json::Value| async move {
+                ctx.execute_activity_raw("saga_cancel_flight", flight, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        saga.step(
+            || async {
+                ctx.execute_activity_raw("saga_reserve_hotel", serde_json::Value::Null, "default")
+                    .await
+            },
+            move |hotel: serde_json::Value| async move {
+                ctx.execute_activity_raw("saga_cancel_hotel", hotel, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Step 3 fails outright — rollback_after unwinds both compensations.
+        saga.step(
+            || async {
+                Err::<serde_json::Value, _>(HarvestError::WorkflowFailed {
+                    name: "e2e_test_workflow".into(),
+                    reason: "tour sold out".into(),
+                })
+            },
+            |_: serde_json::Value| async { Ok::<_, HarvestError>(()) },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::Value::Null)
+    })
+}
+
+fn saga_activity_info(
+    name: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "integration_e2e",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("default"),
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler,
+    }
+}
+
+/// AC3 e2e — the compensated counter fires exactly once across the many
+/// genuine decision cycles a real worker takes through an activity-backed
+/// unwind, and each compensation activity executes exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decision_cycles() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    SAGA_CANCEL_FLIGHT_RUNS.store(0, Ordering::SeqCst);
+    SAGA_CANCEL_HOTEL_RUNS.store(0, Ordering::SeqCst);
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, serde_json::json!({"trip": "e2e"})).await;
+
+    let recorder = Arc::new(SagaE2eRecorder::default());
+    let telemetry = Arc::new(
+        autumn_harvest::telemetry::TelemetryConfig::builder()
+            .metrics(Arc::clone(&recorder) as Arc<dyn autumn_harvest::telemetry::MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: saga_metrics_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![
+            saga_activity_info("saga_reserve_flight", saga_flight_activity),
+            saga_activity_info("saga_reserve_hotel", saga_hotel_activity),
+            saga_activity_info("saga_cancel_flight", saga_cancel_flight_activity),
+            saga_activity_info("saga_cancel_hotel", saga_cancel_hotel_activity),
+        ],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    let worker = build_runtime_worker("worker-saga-metrics", 2, 2, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
+    let execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // The workflow failed with the original step error (compensations all
+    // succeeded, so no SagaCompensationFailed).
+    let error = execution.error.expect("failed execution must carry error");
+    assert!(
+        error.contains("tour sold out"),
+        "workflow error must carry the original step failure, got: {error}"
+    );
+
+    // Exactly-once across every decision cycle of the unwind, with the real
+    // worker-threaded labels (asserted here, after the run, so a regression
+    // reads as a clear assertion failure rather than an in-worker panic).
+    assert_eq!(
+        recorder
+            .compensated
+            .lock()
+            .expect("saga e2e recorder lock")
+            .as_slice(),
+        &[("e2e_test_workflow".to_owned(), "default".to_owned())],
+        "harvest.saga.compensated must fire exactly once per real unwind, \
+         labeled with the workflow type and claimed queue"
+    );
+    assert_eq!(
+        AtomicUsize::load(&recorder.compensation_failed, Ordering::SeqCst),
+        0,
+        "a fully-successful unwind must not touch the failure counter"
+    );
+
+    // Each compensation activity executed exactly once.
+    assert_eq!(
+        AtomicUsize::load(&SAGA_CANCEL_FLIGHT_RUNS, Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        AtomicUsize::load(&SAGA_CANCEL_HOTEL_RUNS, Ordering::SeqCst),
+        1
+    );
+
+    // The durable dedup marker is in history exactly once.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let marker_count = history
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if name == "saga_compensated:1")
+        })
+        .count();
+    assert_eq!(
+        marker_count, 1,
+        "exactly one saga_compensated marker in history"
+    );
+}
