@@ -3368,7 +3368,12 @@ async fn workflow_detail_ui_renders_decoded_input() {
     // decoded (PR #936 review, round 5) — their plaintext must not appear
     // anywhere in the page.
     {
-        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        // `load_history_undecoded`: the seeded `WorkflowStarted` input is a
+        // "reverse"-codec envelope, and the strict `load_history` (identity-only
+        // registry) hard-errors `UnknownPayloadCodec` on it — the exact
+        // strict-loader behavior PR #936 round 2 documented. The raw loader is
+        // the correct fixture tool for reading `next_event_id` here.
+        let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("load history");
         autumn_harvest::store::append_events(
