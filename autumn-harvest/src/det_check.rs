@@ -496,6 +496,10 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
         }
     }
 
+    // NOTE: DET010 findings are appended AFTER the substring-table findings
+    // above, so a report's findings are grouped by pass, not strictly sorted
+    // by source line across rules. Consumers needing line order should sort
+    // on `location.line`.
     report.merge(check_hash_iteration(wf_name, body_lines, file));
 
     report
@@ -542,6 +546,8 @@ const DET010_COMMAND_MARKERS: &[&str] = &[
     ".execute_local_activity",
     ".timer(",
     ".side_effect(",
+    // ctx.race() schedules durable commands per branch (issue #600).
+    ".race(",
 ];
 
 const DET010_MESSAGE: &str = "Iterating a HashMap/HashSet inside a workflow function observes hash-randomized \
@@ -554,64 +560,202 @@ const DET010_ALTERNATIVE: &str = "Use a BTreeMap/BTreeSet for any collection the
      into a Vec and sort() it before iterating: `let mut keys: Vec<_> = \
      map.keys().cloned().collect(); keys.sort();`.";
 
+/// The guardrail-catalog spelling of this rule. Honored as a suppression
+/// alias (AC5, issue #785): `// harvest-suppress: HVG011 "reason"` suppresses
+/// a DET010 finding exactly like the DET010 spelling, and is echoed into
+/// [`DetCheckReport::suppressions`] with the id the author actually wrote.
+const DET010_HVG_ALIAS: &str = "HVG011";
+
+/// Bound on how many continuation lines a multi-line `let` statement is
+/// joined across before the binding parse gives up (defaults to not-tracked).
+const DET010_LET_JOIN_BUDGET: usize = 16;
+
+/// A positional event on one stripped source line, processed in byte order so
+/// braces, `let` bindings, and `for` loops interleave exactly as written.
+enum Det010Event {
+    Open,
+    Close,
+    Let,
+    For,
+}
+
+/// Outcome of parsing one `let` statement for DET010 binding tracking.
+enum Det010LetBinding {
+    /// A single plain ident binding — tracked (`is_hash`) or masked (`!is_hash`).
+    Simple { ident: String, is_hash: bool },
+    /// A pattern binding (destructuring, enum variant, let-else): every
+    /// plausibly-bound ident is masked (never tracked — unknown shapes
+    /// default to NOT flagging, false positives are the top risk).
+    PatternMask(Vec<String>),
+}
+
 /// Single ordered pass over a workflow body: track hash-typed `let` bindings
-/// (last-binding-wins per ident), then flag `for … in` loops over a tracked
-/// binding, with command-aware severity and `harvest-suppress` support.
+/// in a lexical scope stack (brace depth opens/closes scopes; a non-hash
+/// binding MASKS an outer tracked binding rather than deleting it, so scope
+/// exit restores the outer state — PR #970 review, P1-C), then flag
+/// `for … in` loops over a tracked binding, with command-aware severity and
+/// `harvest-suppress` support (DET010 or its HVG011 catalog alias).
+///
+/// LEXER CAVEAT (shared with DET001–DET009, pre-existing): the line-based
+/// lexer does not track multi-line string literals — the continuation lines
+/// of a string opened on an earlier line are lexed as code, so string content
+/// that *looks like* a `let`/`for`/brace can perturb binding tracking. Keep
+/// multi-line strings out of workflow bodies (they are almost always test
+/// fixtures) or suppress the resulting finding.
 fn check_hash_iteration(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheckReport {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let mut report = DetCheckReport::default();
-    let mut tracked: HashSet<String> = HashSet::new();
     let stripped: Vec<String> = body_lines
         .iter()
         .map(|&(_, line)| strip_unparseable_content(line))
         .collect();
+    // Per-line brace/marker metadata, computed once (single pass) so the
+    // per-finding loop-body severity scan is O(1) per interior line —
+    // adversarial unbalanced-brace input can no longer make it quadratic
+    // (PR #970 review, P2-A).
+    let meta: Vec<Det010LineMeta> = stripped.iter().map(|l| det010_line_meta(l)).collect();
+
+    // Lexical scope stack: ident → is-hash. Lookup walks innermost-out.
+    let mut scopes: Vec<HashMap<String, bool>> = vec![HashMap::new()];
+    // For-loop pattern idents awaiting the loop body's `{`: masked into the
+    // scope that brace opens, so the mask covers exactly the body extent.
+    let mut pending_masks: Vec<String> = Vec::new();
 
     for (idx, &(source_line, raw_line)) in body_lines.iter().enumerate() {
         let code = &stripped[idx];
 
-        // Bindings first: a `let` and a `for` on the same line appear in that
-        // source order.
-        record_det010_bindings(code, &mut tracked);
+        for (pos, event) in det010_line_events(code) {
+            match event {
+                Det010Event::Open => {
+                    let mut scope = HashMap::new();
+                    for ident in std::mem::take(&mut pending_masks) {
+                        scope.insert(ident, false);
+                    }
+                    scopes.push(scope);
+                }
+                Det010Event::Close => {
+                    if scopes.len() > 1 {
+                        scopes.pop();
+                    }
+                }
+                Det010Event::Let => {
+                    let stmt = det010_let_statement_text(&stripped, idx, pos + 3);
+                    match det010_parse_let(&stmt) {
+                        Det010LetBinding::Simple { ident, is_hash } => {
+                            if let Some(scope) = scopes.last_mut() {
+                                scope.insert(ident, is_hash);
+                            }
+                        }
+                        Det010LetBinding::PatternMask(idents) => {
+                            if let Some(scope) = scopes.last_mut() {
+                                for ident in idents {
+                                    scope.insert(ident, false);
+                                }
+                            }
+                        }
+                    }
+                }
+                Det010Event::For => {
+                    let after_for = &code[pos + 3..];
+                    let header = after_for
+                        .find('{')
+                        .map_or(after_for, |brace| &after_for[..brace]);
+                    let Some(in_pos) = header.rfind(" in ") else {
+                        continue;
+                    };
+                    // Queue the loop pattern's idents: they mask outer
+                    // bindings for the body extent (applied at the body `{`).
+                    pending_masks.extend(det010_pattern_mask_idents(&header[..in_pos]));
 
-        let Some(ident) = det010_for_loop_target(code, &tracked) else {
-            continue;
-        };
+                    let Some(ident) = det010_for_target(&header[in_pos + 4..], &scopes) else {
+                        continue;
+                    };
 
-        let prev_line = if idx > 0 { body_lines[idx - 1].1 } else { "" };
-        if let Some(reason) = find_suppression(DET010_ID, raw_line, prev_line) {
-            report.suppressions.push(DetSuppression {
-                rule_id: DET010_ID.to_string(),
-                reason,
-                location: DetLocation {
-                    file: file.to_string(),
-                    line: source_line,
-                },
-            });
-            continue;
+                    let prev_line = if idx > 0 { body_lines[idx - 1].1 } else { "" };
+                    let severity = if det010_loop_body_has_command(&stripped, &meta, idx, pos) {
+                        DetSeverity::Error
+                    } else {
+                        DetSeverity::Warning
+                    };
+                    det010_emit_for_finding(
+                        &mut report,
+                        wf_name,
+                        file,
+                        source_line,
+                        (raw_line, prev_line),
+                        &ident,
+                        severity,
+                    );
+                }
+            }
         }
-
-        let severity = if det010_loop_body_has_command(&stripped, idx) {
-            DetSeverity::Error
-        } else {
-            DetSeverity::Warning
-        };
-        report.findings.push(DetFinding {
-            rule_id: DET010_ID,
-            severity,
-            workflow_name: Some(wf_name.to_string()),
-            location: Some(DetLocation {
-                file: file.to_string(),
-                line: source_line,
-            }),
-            message: format!(
-                "[{DET010_ID}] {DET010_MESSAGE} (iterated hash-typed binding: `{ident}`)"
-            ),
-            alternative: DET010_ALTERNATIVE,
-        });
     }
 
     report
+}
+
+/// Collects the positional events of one stripped line, sorted by byte offset.
+fn det010_line_events(code: &str) -> Vec<(usize, Det010Event)> {
+    let mut events: Vec<(usize, Det010Event)> = Vec::new();
+    for (pos, ch) in code.char_indices() {
+        match ch {
+            '{' => events.push((pos, Det010Event::Open)),
+            '}' => events.push((pos, Det010Event::Close)),
+            _ => {}
+        }
+    }
+    for pos in word_positions(code, "let") {
+        events.push((pos, Det010Event::Let));
+    }
+    for pos in word_positions(code, "for") {
+        events.push((pos, Det010Event::For));
+    }
+    events.sort_by_key(|&(pos, _)| pos);
+    events
+}
+
+/// Records a DET010 finding — or, when a `harvest-suppress` comment for
+/// DET010 (or its HVG011 catalog alias, AC5) is present, the suppression,
+/// echoed with the exact id the author wrote.
+fn det010_emit_for_finding(
+    report: &mut DetCheckReport,
+    wf_name: &str,
+    file: &str,
+    source_line: u32,
+    (raw_line, prev_line): (&str, &str),
+    ident: &str,
+    severity: DetSeverity,
+) {
+    let suppression = find_suppression(DET010_ID, raw_line, prev_line)
+        .map(|reason| (DET010_ID.to_string(), reason))
+        .or_else(|| {
+            find_suppression(DET010_HVG_ALIAS, raw_line, prev_line)
+                .map(|reason| (DET010_HVG_ALIAS.to_string(), reason))
+        });
+    if let Some((rule_id, reason)) = suppression {
+        report.suppressions.push(DetSuppression {
+            rule_id,
+            reason,
+            location: DetLocation {
+                file: file.to_string(),
+                line: source_line,
+            },
+        });
+        return;
+    }
+
+    report.findings.push(DetFinding {
+        rule_id: DET010_ID,
+        severity,
+        workflow_name: Some(wf_name.to_string()),
+        location: Some(DetLocation {
+            file: file.to_string(),
+            line: source_line,
+        }),
+        message: format!("[{DET010_ID}] {DET010_MESSAGE} (iterated hash-typed binding: `{ident}`)"),
+        alternative: DET010_ALTERNATIVE,
+    });
 }
 
 const fn is_ident_byte(b: u8) -> bool {
@@ -632,66 +776,295 @@ fn word_positions(code: &str, word: &str) -> Vec<usize> {
         .collect()
 }
 
-fn contains_word(code: &str, word: &str) -> bool {
-    !word_positions(code, word).is_empty()
-}
-
 const fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Updates `tracked` for every `let` binding on this (comment/string-stripped)
-/// line. A binding whose statement (up to the next `;` or end of line)
-/// mentions `HashMap`/`HashSet` as a whole word — type annotation,
-/// constructor call, or `.collect::<HashMap<..>>()` turbofish alike — marks
-/// the ident; any other `let` re-binding of that ident untracks it
-/// (last-binding-wins / shadowing). Destructuring patterns bind no single
-/// ident and are ignored — unknown binding shapes default to NOT tracking,
-/// since false positives are the top risk.
-fn record_det010_bindings(code: &str, tracked: &mut std::collections::HashSet<String>) {
-    for pos in word_positions(code, "let") {
-        let after_let = code[pos + 3..].trim_start();
-        let after_mut = after_let.strip_prefix("mut ").unwrap_or(after_let);
-        let ident: String = after_mut
-            .trim_start()
-            .chars()
-            .take_while(|&c| is_ident_char(c))
-            .collect();
-        if ident.is_empty() {
-            continue;
-        }
+/// Text of one `let` statement (everything after the `let` keyword, up to but
+/// not including the terminating `;`), joining continuation lines when the
+/// statement spans multiple source lines (PR #970 review, P2-D).
+///
+/// Join rules (conservative — a failed join defaults to not-tracked):
+/// - the same-line remainder ends the join at the first `;` or brace;
+/// - up to [`DET010_LET_JOIN_BUDGET`] brace-free continuation lines are
+///   appended (a continuation line with a brace aborts the join so block
+///   structure is never swallowed);
+/// - the join is a non-consuming LOOKAHEAD: the main event loop still
+///   processes the continuation lines normally afterwards.
+fn det010_let_statement_text(stripped: &[String], idx: usize, after_let_start: usize) -> String {
+    let remainder = &stripped[idx][after_let_start..];
+    if let Some(end) = remainder.find(';') {
+        return remainder[..end].to_string();
+    }
+    if let Some(end) = remainder.find(['{', '}']) {
+        return remainder[..end].to_string();
+    }
 
-        let stmt_end = code[pos..].find(';').map_or(code.len(), |rel| pos + rel);
-        let stmt = &code[pos..stmt_end];
-        if contains_word(stmt, "HashMap") || contains_word(stmt, "HashSet") {
-            tracked.insert(ident);
+    let mut joined = remainder.to_string();
+    for line in stripped.iter().skip(idx + 1).take(DET010_LET_JOIN_BUDGET) {
+        if line.contains(['{', '}']) {
+            break;
+        }
+        joined.push(' ');
+        if let Some(end) = line.find(';') {
+            joined.push_str(&line[..end]);
+            break;
+        }
+        joined.push_str(line);
+    }
+    joined
+}
+
+/// Collects the idents a pattern plausibly binds so they can be masked.
+/// Lowercase-/underscore-initial words only (skips type and variant names
+/// like `Some`/`Point`) and the binding-mode keywords. Over-collection is
+/// safe: masking means "not hash", so at worst a legitimate finding is
+/// missed, never a false positive introduced.
+fn det010_pattern_mask_idents(pattern: &str) -> Vec<String> {
+    let bytes = pattern.as_bytes();
+    let mut idents = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &pattern[start..i];
+            let first = word.chars().next().unwrap_or('0');
+            if (first.is_ascii_lowercase() || first == '_')
+                && !matches!(word, "mut" | "ref" | "box" | "let")
+            {
+                idents.push(word.to_string());
+            }
         } else {
-            tracked.remove(&ident);
+            i += 1;
+        }
+    }
+    idents
+}
+
+/// Parses one `let` statement (text after the `let` keyword) into a DET010
+/// binding decision. Positional, not word-containment: a statement that
+/// merely *mentions* `HashMap` somewhere (`Vec<HashMap<..>>` annotation,
+/// `load_ids::<HashMap<..>>()` call turbofish) is NOT tracked — only a type
+/// annotation that *starts with* `HashMap`/`HashSet` (path prefix stripped),
+/// a `HashMap::new()`-family constructor call, or a
+/// `.collect::<HashMap<..>>()` turbofish (incl. `Result`/`Option`-wrapped)
+/// tracks the binding (PR #970 review, P1-B).
+fn det010_parse_let(stmt: &str) -> Det010LetBinding {
+    let s = stmt.trim_start();
+    let s = s.strip_prefix("mut ").map_or(s, str::trim_start);
+    let ident: String = s.chars().take_while(|&c| is_ident_char(c)).collect();
+    let rest = s[ident.len()..].trim_start();
+
+    // Pattern shapes — destructuring `(a, b)`, enum variants `Some(x)`,
+    // struct patterns `Point { x }` — bind no single trackable ident: mask
+    // every plausibly-bound ident instead (shadowing, never tracking).
+    if ident.is_empty() || rest.starts_with('(') || rest.starts_with('{') || rest.starts_with("::")
+    {
+        let pattern_part = stmt.split('=').next().unwrap_or(stmt);
+        return Det010LetBinding::PatternMask(det010_pattern_mask_idents(pattern_part));
+    }
+
+    let mut is_hash = false;
+    if let Some(after_colon) = rest.strip_prefix(':') {
+        let (type_text, init) = det010_split_type_and_init(after_colon);
+        is_hash = det010_type_is_hash(type_text) || init.is_some_and(det010_init_is_hash);
+    } else if let Some(init) = rest.strip_prefix('=') {
+        is_hash = det010_init_is_hash(init);
+    }
+    Det010LetBinding::Simple { ident, is_hash }
+}
+
+/// Splits `": Type = init"` content (text after the annotation colon) into
+/// the type text and the optional initializer. The initializer `=` is the
+/// first `=` at angle-bracket depth <= 0 that does not begin `==` (an
+/// associated-type binding `Item = X` inside `<..>` is at depth > 0; the `>`
+/// of a fn-pointer `->` return arrow can push the running depth negative,
+/// hence `<=`).
+fn det010_split_type_and_init(after_colon: &str) -> (&str, Option<&str>) {
+    let bytes = after_colon.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b'=' if depth <= 0 && bytes.get(i + 1) != Some(&b'=') => {
+                return (&after_colon[..i], Some(&after_colon[i + 1..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (after_colon, None)
+}
+
+/// `true` when a type annotation text names a hash collection at its ROOT:
+/// optional leading path segments (`std::collections::`), then
+/// `HashMap`/`HashSet` followed by `<`, whitespace, or end. `Vec<HashMap<..>>`
+/// and `Option<HashMap<..>>` do not match — the hash type is nested, not the
+/// binding's own type.
+fn det010_type_is_hash(type_text: &str) -> bool {
+    let mut t = type_text.trim();
+    t = t.strip_prefix("::").unwrap_or(t).trim_start();
+    loop {
+        let ident_len = t.bytes().take_while(|&b| is_ident_byte(b)).count();
+        if ident_len == 0 {
+            return false;
+        }
+        let (head, tail) = t.split_at(ident_len);
+        let tail = tail.trim_start();
+        if head == "HashMap" || head == "HashSet" {
+            return tail.is_empty() || tail.starts_with('<');
+        }
+        match tail.strip_prefix("::") {
+            Some(rest) => t = rest.trim_start(),
+            None => return false,
         }
     }
 }
 
-/// If this stripped line contains a `for … in <expr> {` loop whose iterated
-/// expression is a tracked hash-typed binding — a bare ident, `&ident` /
+const DET010_HASH_CTORS: &[&str] = &[
+    "new",
+    "from",
+    "from_iter",
+    "with_capacity",
+    "with_hasher",
+    "with_capacity_and_hasher",
+    "default",
+];
+
+/// Byte index just past the `>` matching a leading `<`, or `None`.
+fn det010_skip_angle(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `true` when the initializer contains a `HashMap::ctor(..)` /
+/// `HashSet::ctor(..)` constructor call (any path prefix; tolerates a type
+/// turbofish, `HashMap::<K, V>::new()`).
+fn det010_init_has_hash_ctor(init: &str) -> bool {
+    for word in ["HashMap", "HashSet"] {
+        for pos in word_positions(init, word) {
+            let mut rest = &init[pos + word.len()..];
+            let Some(r) = rest.strip_prefix("::") else {
+                continue;
+            };
+            rest = r;
+            if rest.starts_with('<') {
+                let Some(end) = det010_skip_angle(rest) else {
+                    continue;
+                };
+                let Some(r) = rest[end..].strip_prefix("::") else {
+                    continue;
+                };
+                rest = r;
+            }
+            let ctor_len = rest.bytes().take_while(|&b| is_ident_byte(b)).count();
+            let (ctor, after) = rest.split_at(ctor_len);
+            if DET010_HASH_CTORS.contains(&ctor) && after.trim_start().starts_with('(') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `true` when a `.collect::<..>()` turbofish in the initializer targets a
+/// hash collection, including the `Result<HashMap<..>, E>` /
+/// `Option<HashMap<..>>` wrapped forms (the wrapper's first generic argument
+/// is what `?`/unwrap yields). `.collect::<Vec<HashMap<..>>>()` does not
+/// match — the produced collection is the Vec.
+fn det010_collect_targets_hash(init: &str) -> bool {
+    const NEEDLE: &str = ".collect::<";
+    let mut search = init;
+    while let Some(pos) = search.find(NEEDLE) {
+        let after = &search[pos + NEEDLE.len()..];
+        if det010_turbofish_is_hash(after) {
+            return true;
+        }
+        search = after;
+    }
+    false
+}
+
+fn det010_turbofish_is_hash(turbofish: &str) -> bool {
+    let mut t = turbofish.trim_start();
+    t = t.strip_prefix("::").unwrap_or(t).trim_start();
+    loop {
+        let ident_len = t.bytes().take_while(|&b| is_ident_byte(b)).count();
+        if ident_len == 0 {
+            return false;
+        }
+        let (head, tail) = t.split_at(ident_len);
+        let tail = tail.trim_start();
+        match head {
+            "HashMap" | "HashSet" => {
+                return tail.is_empty()
+                    || tail.starts_with('<')
+                    || tail.starts_with('>')
+                    || tail.starts_with(',');
+            }
+            // Fallible / optional collect: unwrap into the first generic arg.
+            "Result" | "Option" => match tail.strip_prefix('<') {
+                Some(rest) => t = rest.trim_start(),
+                None => return false,
+            },
+            _ => match tail.strip_prefix("::") {
+                Some(rest) => t = rest.trim_start(),
+                None => return false,
+            },
+        }
+    }
+}
+
+fn det010_init_is_hash(init: &str) -> bool {
+    det010_init_has_hash_ctor(init) || det010_collect_targets_hash(init)
+}
+
+/// Innermost-out scope lookup: the nearest binding of `ident` decides.
+fn det010_scope_lookup(scopes: &[std::collections::HashMap<String, bool>], ident: &str) -> bool {
+    for scope in scopes.iter().rev() {
+        if let Some(&is_hash) = scope.get(ident) {
+            return is_hash;
+        }
+    }
+    false
+}
+
+/// If a `for` loop header's iterated expression (`expr` is the text after
+/// ` in `) is a tracked hash-typed binding — a bare ident, `&ident` /
 /// `&mut ident`, or exactly one argument-free [`DET010_ITER_METHODS`] call on
 /// the ident — returns the binding ident.
-fn det010_for_loop_target(
-    code: &str,
-    tracked: &std::collections::HashSet<String>,
+fn det010_for_target(
+    expr: &str,
+    scopes: &[std::collections::HashMap<String, bool>],
 ) -> Option<String> {
-    let for_pos = word_positions(code, "for").into_iter().next()?;
-    let after_for = &code[for_pos + 3..];
-    let header = after_for
-        .find('{')
-        .map_or(after_for, |brace| &after_for[..brace]);
-    let in_pos = header.rfind(" in ")?;
-    let expr = header[in_pos + 4..].trim();
+    let expr = expr.trim();
     let expr = expr.strip_prefix("&mut ").unwrap_or(expr);
     let expr = expr.strip_prefix('&').unwrap_or(expr).trim();
 
     // Bare tracked ident.
     if !expr.is_empty() && expr.chars().all(is_ident_char) {
-        return tracked.contains(expr).then(|| expr.to_string());
+        return det010_scope_lookup(scopes, expr).then(|| expr.to_string());
     }
 
     // Exactly one argument-free iteration method call: `ident.method()`.
@@ -703,45 +1076,131 @@ fn det010_for_loop_target(
     if !DET010_ITER_METHODS.contains(&method) {
         return None;
     }
-    tracked.contains(ident).then(|| ident.to_string())
+    det010_scope_lookup(scopes, ident).then(|| ident.to_string())
 }
 
-/// Scans the loop body starting at `start` (the `for` line itself) for
-/// command markers, using brace depth over the stripped lines to bound the
-/// body's extent. On the line where the loop closes, only text before the
-/// closing brace is searched.
-fn det010_loop_body_has_command(stripped: &[String], start: usize) -> bool {
-    let mut depth: u32 = 0;
+/// Per-line metadata for the loop-body severity scan, computed once per body.
+struct Det010LineMeta {
+    /// Net brace delta of the whole line.
+    delta: i32,
+    /// Minimum running brace delta within the line (detects a close that
+    /// dips the depth to zero even when the net delta does not).
+    min_delta: i32,
+    /// Whether the line contains any `{`.
+    has_open: bool,
+    /// Whether the line contains any [`DET010_COMMAND_MARKERS`] substring.
+    has_marker: bool,
+}
+
+fn det010_line_meta(line: &str) -> Det010LineMeta {
+    let mut delta = 0i32;
+    let mut min_delta = 0i32;
+    let mut has_open = false;
+    for ch in line.chars() {
+        match ch {
+            '{' => {
+                delta += 1;
+                has_open = true;
+            }
+            '}' => {
+                delta -= 1;
+                min_delta = min_delta.min(delta);
+            }
+            _ => {}
+        }
+    }
+    Det010LineMeta {
+        delta,
+        min_delta,
+        has_open,
+        has_marker: det010_contains_marker(line),
+    }
+}
+
+fn det010_contains_marker(text: &str) -> bool {
+    DET010_COMMAND_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// Char-level brace walk over one line segment. Updates `depth`/`entered` and
+/// returns the byte position (within the segment) of the brace that closes
+/// the loop body, if reached.
+fn det010_scan_segment(segment: &str, depth: &mut i64, entered: &mut bool) -> Option<usize> {
+    for (pos, ch) in segment.char_indices() {
+        match ch {
+            '{' => {
+                *depth += 1;
+                *entered = true;
+            }
+            '}' => {
+                if *depth > 0 {
+                    *depth -= 1;
+                }
+                if *entered && *depth == 0 {
+                    return Some(pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Scans the loop body for command markers to decide DET010 severity.
+///
+/// The scan starts at the `for` token's byte offset on the `for` line
+/// (`for_pos`) — a command or an enclosing `{` BEFORE the `for` on the same
+/// line can neither inflate the severity nor drag the depth accounting past
+/// the loop's own close (PR #970 review, P3.2). Interior lines use the
+/// precomputed per-line [`Det010LineMeta`] so each is O(1) unless it is the
+/// line the body actually closes on — unbalanced-brace input therefore costs
+/// O(lines) per finding instead of an O(bytes-to-EOF) rescan (P2-A).
+fn det010_loop_body_has_command(
+    stripped: &[String],
+    meta: &[Det010LineMeta],
+    start: usize,
+    for_pos: usize,
+) -> bool {
+    let mut depth: i64 = 0;
     let mut entered = false;
 
-    for line in stripped.iter().skip(start) {
-        let mut close_pos = None;
-        for (pos, ch) in line.char_indices() {
-            match ch {
-                '{' => {
-                    depth += 1;
-                    entered = true;
-                }
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if entered && depth == 0 {
-                        close_pos = Some(pos);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+    // First line: char scan from the `for` token.
+    let first = &stripped[start][for_pos..];
+    if let Some(close) = det010_scan_segment(first, &mut depth, &mut entered) {
+        return det010_contains_marker(&first[..close]);
+    }
+    if det010_contains_marker(first) {
+        return true;
+    }
 
-        let search = close_pos.map_or(line.as_str(), |pos| &line[..pos]);
-        if DET010_COMMAND_MARKERS
-            .iter()
-            .any(|marker| search.contains(marker))
-        {
+    for j in (start + 1)..stripped.len() {
+        let line = &stripped[j];
+        if entered {
+            if depth + i64::from(meta[j].min_delta) <= 0 {
+                // The body closes somewhere on this line — exact-position scan.
+                if let Some(close) = det010_scan_segment(line, &mut depth, &mut entered) {
+                    return det010_contains_marker(&line[..close]);
+                }
+                if det010_contains_marker(line) {
+                    return true;
+                }
+            } else {
+                if meta[j].has_marker {
+                    return true;
+                }
+                depth += i64::from(meta[j].delta);
+            }
+        } else if meta[j].has_open {
+            // Multi-line loop header: char-scan the line that opens the body.
+            if let Some(close) = det010_scan_segment(line, &mut depth, &mut entered) {
+                return det010_contains_marker(&line[..close]);
+            }
+            if det010_contains_marker(line) {
+                return true;
+            }
+        } else if meta[j].has_marker {
             return true;
-        }
-        if close_pos.is_some() {
-            return false;
         }
     }
 
