@@ -53,15 +53,15 @@ use crate::telemetry::{
     METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
     METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
     METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATUS,
-    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
-    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_QUERY_DURATION,
-    METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_OLDEST_PENDING_AGE,
-    METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED,
-    METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_AUTO_PAUSED,
-    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
-    METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_SESSION_ACQUISITION, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION,
-    METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
+    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_PAYLOAD_BYTES,
+    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
+    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE,
+    METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED,
+    METRIC_SCHEDULE_AUTO_PAUSED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
+    METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_SESSION_ACQUISITION, METRIC_TASK_QUARANTINED,
+    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
     METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
     METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
@@ -69,8 +69,8 @@ use crate::telemetry::{
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
     METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
     METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
-    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SessionAcquisitionOutcome, SlotType,
-    TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -391,6 +391,44 @@ impl MetricsRecorder for MetricsRsRecorder {
         .record(duration_secs);
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn record_payload_observed(
+        &self,
+        kind: &crate::error::PayloadKind,
+        workflow_type: &str,
+        activity_name: Option<&str>,
+        observed_bytes: u64,
+    ) {
+        // Two-arm optional-label pattern (mirrors record_external_signal_sent):
+        // non-activity payloads omit `activity.name` rather than emitting an
+        // empty label value.
+        if let Some(activity_name) = activity_name {
+            histogram!(
+                METRIC_PAYLOAD_BYTES,
+                "payload.kind" => kind.to_string(),
+                METRIC_LABEL_WORKFLOW_TYPE => workflow_type.to_owned(),
+                METRIC_LABEL_ACTIVITY_NAME => activity_name.to_owned(),
+            )
+            .record(observed_bytes as f64);
+        } else {
+            histogram!(
+                METRIC_PAYLOAD_BYTES,
+                "payload.kind" => kind.to_string(),
+                METRIC_LABEL_WORKFLOW_TYPE => workflow_type.to_owned(),
+            )
+            .record(observed_bytes as f64);
+        }
+    }
+
+    fn record_payload_rejected(&self, kind: &crate::error::PayloadKind, workflow_type: &str) {
+        counter!(
+            METRIC_PAYLOAD_REJECTED,
+            "payload.kind" => kind.to_string(),
+            METRIC_LABEL_WORKFLOW_TYPE => workflow_type.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_query_completed(&self, query_name: &str, duration_secs: f64, success: bool) {
         histogram!(
             METRIC_QUERY_DURATION,
@@ -551,6 +589,15 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_task_timeout(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_TASK_TIMEOUT,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_timeout(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_TIMEOUT,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
         )
