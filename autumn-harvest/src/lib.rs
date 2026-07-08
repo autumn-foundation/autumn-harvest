@@ -145,6 +145,8 @@ pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+/// Workflow-start throttle — pace admissions, defer the excess (issue #607).
+pub mod throttle;
 pub mod types;
 pub mod update;
 /// Read-only per-tenant/per-workflow usage aggregation (issue #596).
@@ -302,7 +304,7 @@ pub use policy::{
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
-pub use replay::{HistoryMatch, HistoryMatcher, SignalOrTimerMatch};
+pub use replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch, SignalOrTimerMatch};
 #[cfg(feature = "db")]
 pub use reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,

@@ -1905,6 +1905,10 @@ pub(crate) struct StartWorkflowRequest {
     /// before the workflow is admitted; a non-allowlisted target rejects the
     /// start with `422` and a machine-readable reason.
     completion_callbacks: Option<Value>,
+    /// Caller-supplied trace/correlation headers threaded onto the execution row.
+    context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
+    priority: Option<autumn_harvest::types::Priority>,
 }
 
 impl StartWorkflowRequest {
@@ -1932,6 +1936,8 @@ impl StartWorkflowRequest {
             batch_max_size: None,
             batch_max_wait: None,
             completion_callbacks: None,
+            context_headers: None,
+            priority: None,
         }
     }
 
@@ -1968,6 +1974,8 @@ impl StartWorkflowRequest {
             batch_max_size: None,
             batch_max_wait: None,
             completion_callbacks: None,
+            context_headers: None,
+            priority: None,
         }
     }
 }
@@ -3106,6 +3114,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(debounce_status).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/start-throttle",
+            // Admin-gated: the response includes raw throttle_key values, which
+            // resolve from user/tenant-derived fields (issue #607). Parity with
+            // /admin/debounce and /admin/concurrency.
+            get(start_throttle_status).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/rate-limits",
             get(list_rate_limits).route_layer(require_admin.clone()),
         )
@@ -3619,6 +3634,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/concurrency"),
         ("GET", "/admin/usage"),
         ("GET", "/admin/debounce"),
+        ("GET", "/admin/start-throttle"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         ("GET", "/admin/circuits"),
@@ -4457,6 +4473,7 @@ pub const fn management_api_response_fields()
         ),
         ("GET", "/batches/pending", None),
         ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
+        ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
@@ -7682,6 +7699,31 @@ fn workflow_has_resolving_debounce(
         })
 }
 
+/// Resolve an applicable start-throttle policy for a workflow start (issue #607).
+///
+/// Returns `Some((policy, resolved_key))` when a throttle applies:
+/// - a **keyed** throttle applies only when its key resolves against the input
+///   (`resolved_key` = the resolved value);
+/// - an **unkeyed** (global-per-workflow) throttle always applies
+///   (`resolved_key` = `""`).
+///
+/// Returns `None` when there is no throttle policy, or a keyed throttle whose
+/// key does not resolve — in which case the start proceeds on the normal path.
+fn workflow_resolving_throttle(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+    input: &Value,
+) -> Option<(autumn_harvest::throttle::ThrottlePolicy, String)> {
+    let policy = *registry.workflows.get(workflow_name)?.throttle.as_ref()?;
+    policy.key_expr.map_or_else(
+        || Some((policy, String::new())),
+        |k| {
+            autumn_harvest::throttle::resolve_throttle_key(k, input)
+                .map(|resolved| (policy, resolved))
+        },
+    )
+}
+
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -7879,6 +7921,21 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
+    // Start-throttle applicability (issue #607). A throttle is mutually exclusive
+    // with debounce/batch: those collapse a burst into one run, a throttle paces
+    // and defers every start — combining them has no coherent semantics.
+    let throttle_applies =
+        workflow_resolving_throttle(&runtime.registry, &workflow_name, &input).is_some();
+    if throttle_applies && (is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "start throttle is mutually exclusive with debounce and batching"
+            })),
+        )
+            .into_response();
+    }
+
     // issue #377: check admission gates before touching the DB.
     if !is_debounced_start && !has_batch_policy {
         let wf_owner = runtime
@@ -7896,22 +7953,43 @@ pub(crate) async fn start_workflow(
             // exists on this shard.  start_or_load_workflow_execution with
             // AllowDuplicate (or AllowDuplicateFailedOnly for live runs) would
             // return it without creating new work, so the gate must not block.
+            //
+            // A retry can equally land on an already-pending *throttle* row
+            // (code review, issue #607): `reserve_or_defer`'s own idempotency
+            // shortcut (step 1) would resolve it to that same pending row
+            // without creating anything new -- also not a fresh admission --
+            // so the gate must not block that case either. Checked only when
+            // this workflow actually resolves a throttle policy, to avoid an
+            // extra round-trip for the common non-throttled case.
             let is_idempotent_retry = if explicit_workflow_id {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
-                        Ok(mut pre_conn) => harvest_workflow_executions::table
-                            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
-                            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                            .filter(
-                                harvest_workflow_executions::state
-                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                            )
-                            .select(harvest_workflow_executions::id)
-                            .first::<uuid::Uuid>(&mut pre_conn)
-                            .await
-                            .optional()
-                            .unwrap_or(None)
-                            .is_some(),
+                        Ok(mut pre_conn) => {
+                            let has_execution = harvest_workflow_executions::table
+                                .filter(
+                                    harvest_workflow_executions::workflow_name.eq(&workflow_name),
+                                )
+                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                                .filter(
+                                    harvest_workflow_executions::state
+                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                )
+                                .select(harvest_workflow_executions::id)
+                                .first::<uuid::Uuid>(&mut pre_conn)
+                                .await
+                                .optional()
+                                .unwrap_or(None)
+                                .is_some();
+                            has_execution
+                                || (throttle_applies
+                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                                        &mut pre_conn,
+                                        &workflow_name,
+                                        &workflow_id,
+                                    )
+                                    .await
+                                    .unwrap_or(false))
+                        }
                         Err(_) => false,
                     },
                     Err(_) => false,
@@ -8484,8 +8562,8 @@ pub(crate) async fn start_workflow(
                     memo: request.memo.clone(),
                     search_attrs: request.search_attrs.clone(),
                     sla_secs: effective_sla_secs,
-                    context_headers: None,
-                    priority: None,
+                    context_headers: request.context_headers.clone(),
+                    priority: request.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
                     owner: info_owner.map(str::to_string),
@@ -8497,6 +8575,9 @@ pub(crate) async fn start_workflow(
                     workflow_retry_policy: debounce_workflow_retry_policy,
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                     completion_callbacks: completion_callbacks.clone(),
+                    schedule_id: None,
+                    scheduled_for: None,
+                    origin: None,
                 },
             };
 
@@ -8780,8 +8861,8 @@ pub(crate) async fn start_workflow(
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
                 sla_secs: effective_sla_secs,
-                context_headers: None,
-                priority: None,
+                context_headers: request.context_headers.clone(),
+                priority: request.priority.map(Priority::as_i32),
                 concurrency_key: concurrency_key.clone(),
                 concurrency_limit,
                 owner: info_owner.map(str::to_string),
@@ -8793,6 +8874,9 @@ pub(crate) async fn start_workflow(
                 workflow_retry_policy: batch_workflow_retry_policy,
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                 completion_callbacks: completion_callbacks.clone(),
+                schedule_id: None,
+                scheduled_for: None,
+                origin: None,
             },
         };
 
@@ -8935,6 +9019,181 @@ pub(crate) async fn start_workflow(
                 .map_or(sla, |hard| sla.min(hard))
         });
 
+    // Start-throttle admission (issue #607): pace admissions, defer the excess.
+    // Runs after the admission gate (checked above) so halt (gate) always beats
+    // pace (throttle), and after the effective SLA/timeout are resolved so a
+    // deferred start carries the same effective options as an immediate one.
+    // On reserve the token is refunded below if the start short-circuits under a
+    // reuse policy (a start that consumed no admission consumes no token, AC-a).
+    let mut throttle_reserved: Option<String> = None;
+    if let Some((throttle_policy, resolved_throttle_key)) =
+        workflow_resolving_throttle(&runtime.registry, &workflow_name, &input)
+    {
+        // A throttle defers until a token frees, so an explicit scheduled start
+        // (start_at/delay) is contradictory — reject the combination.
+        if request.start_at.is_some() || delay.is_some() {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("throttle cannot be combined with start_at or delay"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return AutumnError::bad_request_msg(
+                "throttle cannot be combined with start_at or delay",
+            )
+            .into_response();
+        }
+        // Fail fast on an oversized input rather than persisting a pending row
+        // that would fail at fire time on every scanner tick. Skipped when
+        // `reserve_or_defer` would resolve this call via `Bypassed` (an
+        // active execution already satisfies the reuse policy) or an
+        // idempotent attach to an already-pending row -- neither inserts a
+        // fresh row, so a retry carrying a stale/oversized body must not be
+        // rejected (code-review fix, issue #607).
+        let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+            &mut conn,
+            &workflow_name,
+            &workflow_id,
+            request.reuse_policy.as_deref(),
+        )
+        .await
+        {
+            Ok(skip) => skip,
+            Err(e) => return map_error(e).into_response(),
+        };
+        if !skip_cap_check && effective_wf_cap > 0 {
+            let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+            if observed > effective_wf_cap {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("workflow input exceeds cap"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return AutumnError::bad_request_msg(format!(
+                    "workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)",
+                ))
+                .into_response();
+            }
+        }
+
+        let start_options = autumn_harvest::debounce::DebounceStartOptions {
+            reuse_policy: request.reuse_policy.clone(),
+            execution_timeout_secs: request.execution_timeout_secs.or_else(|| {
+                info_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map(|d| d.num_seconds())
+            }),
+            memo: request.memo.clone(),
+            search_attrs: request.search_attrs.clone(),
+            sla_secs: effective_sla.map(|d| d.num_seconds()),
+            context_headers: request.context_headers.clone(),
+            priority: request.priority.map(Priority::as_i32),
+            concurrency_key: concurrency_key.clone(),
+            concurrency_limit,
+            owner: owner.map(str::to_string),
+            runbook_url: runbook_url.map(str::to_string),
+            severity: severity.map(str::to_string),
+            max_execution_timeout_ceiling_secs: api_state
+                .max_workflow_execution_timeout()
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds()),
+            max_workflow_input_bytes: Some(effective_wf_cap),
+            trace_context: trace_ctx.clone(),
+            workflow_retry_policy: workflow_retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok()),
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            completion_callbacks: completion_callbacks.clone(),
+            schedule_id: None,
+            scheduled_for: None,
+            origin: None,
+        };
+
+        match autumn_harvest::throttle::reserve_or_defer(
+            &mut conn,
+            autumn_harvest::throttle::AdmitThrottleParams {
+                workflow_name: &workflow_name,
+                throttle_key: &resolved_throttle_key,
+                workflow_id: &workflow_id,
+                queue_name: &queue_name,
+                input: input.clone(),
+                start_options,
+                refill_per_sec: throttle_policy.refill_per_sec,
+                burst: throttle_policy.burst,
+                schedule_to_start: throttle_policy.schedule_to_start,
+                shard_id: shard.as_i32(),
+            },
+        )
+        .await
+        {
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(outcome)) => {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_start_throttled(&workflow_name);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(outcome.workflow_id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(error = %audit_err, "audit insert failed for throttled workflow.start");
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "throttled": true,
+                        "workflow_name": workflow_name,
+                        "workflow_id": outcome.workflow_id,
+                        "throttle_key": outcome.throttle_key,
+                        "deferred_at": outcome.deferred_at,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                throttle_reserved = Some(bucket_key);
+                // Fall through to the normal start on the same connection.
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                // Active execution already resolves this reuse policy as a
+                // no-op/immediate reject; no token reserved, fall through to
+                // the normal start below.
+            }
+            Err(e) => return map_error(e).into_response(),
+        }
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
@@ -8959,7 +9218,7 @@ pub(crate) async fn start_workflow(
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
-            priority: Priority::default(),
+            priority: request.priority.unwrap_or_default(),
             max_workflow_input_bytes: effective_wf_cap,
             start_at: request.start_at,
             delay,
@@ -8967,7 +9226,7 @@ pub(crate) async fn start_workflow(
             owner,
             runbook_url,
             severity,
-            context_headers: None,
+            context_headers: request.context_headers.clone(),
             sla: effective_sla,
             schedule_id: None,
             scheduled_for: None,
@@ -8989,6 +9248,11 @@ pub(crate) async fn start_workflow(
         }) => {
             // AlreadyExists is a non-error outcome for some reuse policies;
             // record it as a failed audit so the caller can see the conflict.
+            // AC-a: an id-reuse short-circuit consumed no admission — refund the
+            // throttle token reserved above.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
             let exec_id_str = existing_exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -9014,6 +9278,11 @@ pub(crate) async fn start_workflow(
                 .into_response()
         }
         Err(e) => {
+            // The start failed for an unrelated reason; no run was admitted, so
+            // refund the reserved throttle token.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
             let err_str = e.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -9032,6 +9301,13 @@ pub(crate) async fn start_workflow(
             map_error(e).into_response()
         }
         Ok(start) => {
+            // AC-a: a start that attached to an existing run (rather than
+            // creating one) consumed no admission — refund the reserved token.
+            if !start.created
+                && let Some(ref bucket) = throttle_reserved
+            {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
             let exec_id_str = start.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -9194,6 +9470,37 @@ async fn batch_start_workflows(
                  debounced start must use POST /workflows/{0}/start",
                 item.workflow_name
             ))
+        } else if request.atomic
+            && workflow_resolving_throttle(
+                &runtime.registry,
+                &item.workflow_name,
+                item.input.as_ref().unwrap_or(&Value::Null),
+            )
+            .is_some()
+        {
+            // A start-throttle admission (issue #607) can durably defer before any
+            // execution row exists, and the per-item throttle block below reports a
+            // deferral as `Deferred`, not `Started`/`Rejected` -- a third outcome
+            // atomic batches have no way to express (they are all-or-nothing
+            // synchronous inserts; a deferral is neither a commit nor a rejection).
+            // Unlike debounce (rejected only when a fresh start is certain, i.e. no
+            // workflow_id), determining whether a throttled item would attach to an
+            // already-active execution (bypassing the bucket, same as a plain start)
+            // versus admit fresh requires a DB lookup this in-memory pre-validation
+            // pass deliberately doesn't perform (issue #357) -- so every atomic item
+            // for a throttled workflow is rejected unconditionally, the conservative
+            // choice that closes the bypass without a false admit. Reject here (not
+            // silently skip the throttle check as before) so an atomic batch can
+            // never circumvent a workflow's rate policy by simply setting
+            // atomic=true; use a non-atomic (atomic=false) batch or the standalone
+            // start route instead, both of which honor the throttle.
+            Some(format!(
+                "workflow '{0}' has a start-throttle policy; a throttled start \
+                 cannot be expressed atomically (it may durably defer rather than \
+                 start or fail) — use POST /workflows/{0}/start or a non-atomic \
+                 batch (atomic=false) instead",
+                item.workflow_name
+            ))
         } else {
             // Debounce for an explicit-id item is NOT rejected here: an idempotent
             // retry (existing workflow_id) must still return the existing run.
@@ -9204,6 +9511,7 @@ async fn batch_start_workflows(
         if let Some(reason) = err {
             pre_rejected.push(BatchStartItemResult {
                 index: idx,
+                workflow_id: item.workflow_id.clone(),
                 status: BatchStartItemStatus::Rejected,
                 execution_id: None,
                 error: Some(reason),
@@ -9322,26 +9630,51 @@ async fn batch_start_workflows(
             // block an idempotent re-attach.  The DB call is made lazily — only
             // when the gate is actually active — so there is no overhead on the
             // common path where no gate is set.
+            //
+            // A retry can equally land on an already-pending *throttle* row
+            // (code review, issue #607, mirroring the same fix on the single-
+            // start route): `reserve_or_defer`'s own idempotency shortcut in
+            // Phase 2 below would resolve it to that same pending row without
+            // creating anything new — also not a fresh admission — so the gate
+            // must not block that case either. Checked only when this item's
+            // workflow actually resolves a throttle policy.
             let is_idempotent_retry = if item.workflow_id.is_some() {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
-                        Ok(mut pre_conn) => harvest_workflow_executions::table
-                            .filter(
-                                harvest_workflow_executions::workflow_name.eq(&item.workflow_name),
-                            )
-                            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                            .filter(
-                                // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
-                                // or TERMINATED is returned without inserting a new one.
-                                harvest_workflow_executions::state
-                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                            )
-                            .select(harvest_workflow_executions::id)
-                            .first::<uuid::Uuid>(&mut pre_conn)
-                            .await
-                            .optional()
-                            .unwrap_or(None)
-                            .is_some(),
+                        Ok(mut pre_conn) => {
+                            let has_execution = harvest_workflow_executions::table
+                                .filter(
+                                    harvest_workflow_executions::workflow_name
+                                        .eq(&item.workflow_name),
+                                )
+                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                                .filter(
+                                    // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
+                                    // or TERMINATED is returned without inserting a new one.
+                                    harvest_workflow_executions::state
+                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                )
+                                .select(harvest_workflow_executions::id)
+                                .first::<uuid::Uuid>(&mut pre_conn)
+                                .await
+                                .optional()
+                                .unwrap_or(None)
+                                .is_some();
+                            has_execution
+                                || (workflow_resolving_throttle(
+                                    &runtime.registry,
+                                    &item.workflow_name,
+                                    item.input.as_ref().unwrap_or(&Value::Null),
+                                )
+                                .is_some()
+                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                                        &mut pre_conn,
+                                        &item.workflow_name,
+                                        &workflow_id,
+                                    )
+                                    .await
+                                    .unwrap_or(false))
+                        }
                         Err(_) => false,
                     },
                     Err(_) => false,
@@ -9368,6 +9701,7 @@ async fn batch_start_workflows(
                 .record_admission_blocked(scope_kind, reason_label);
             gate_rejected.push(BatchStartItemResult {
                 index: idx,
+                workflow_id: Some(workflow_id.clone()),
                 status: BatchStartItemStatus::Rejected,
                 execution_id: None,
                 error: Some(format!(
@@ -9431,7 +9765,7 @@ async fn batch_start_workflows(
     // failure returns 409 after items 0..N-1 were already started.
     if request.atomic {
         let mut schema_violations: Vec<BatchStartItemResult> = Vec::new();
-        for (idx, _) in shard_groups.values().flatten() {
+        for (idx, workflow_id) in shard_groups.values().flatten() {
             let item = &request.items[*idx];
             let input = item.input.clone().unwrap_or(Value::Null);
             if let Some(info) = runtime.registry.workflows.get(&item.workflow_name)
@@ -9449,6 +9783,7 @@ async fn batch_start_workflows(
                     .join("; ");
                 schema_violations.push(BatchStartItemResult {
                     index: *idx,
+                    workflow_id: Some(workflow_id.clone()),
                     status: BatchStartItemStatus::Rejected,
                     execution_id: None,
                     error: Some(format!("input validation failed: {err_msg}")),
@@ -9490,10 +9825,11 @@ async fn batch_start_workflows(
             Err(e) => {
                 // All items on this shard are rejected due to connection failure.
                 let err_str = e.to_string();
-                for (idx, _) in shard_items {
+                for (idx, workflow_id) in shard_items {
                     rejected_count += 1;
                     results.push(BatchStartItemResult {
                         index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
                         status: BatchStartItemStatus::Rejected,
                         execution_id: None,
                         error: Some(err_str.clone()),
@@ -9544,6 +9880,7 @@ async fn batch_start_workflows(
                     .join("; ");
                 results.push(BatchStartItemResult {
                     index: *idx,
+                    workflow_id: Some(workflow_id.clone()),
                     status: BatchStartItemStatus::Rejected,
                     execution_id: None,
                     error: Some(format!("input validation failed: {err_msg}")),
@@ -9627,6 +9964,162 @@ async fn batch_start_workflows(
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
             let item_workflow_retry_policy = info_retry_policy;
 
+            // Start-throttle admission (issue #607) — best-effort batches only.
+            // Atomic batches are all-or-nothing synchronous inserts, which is
+            // fundamentally incompatible with pacing/deferral, so throttle does
+            // not apply to them. On defer, the item is reported `deferred` (not a
+            // failure) and the durable pending row is admitted later by the
+            // scanner. On reserve, the token is refunded below if the start
+            // short-circuits (AC-a).
+            let mut item_throttle_bucket: Option<String> = None;
+            if !request.atomic
+                && let Some((throttle_policy, resolved_throttle_key)) =
+                    workflow_resolving_throttle(&runtime.registry, &item.workflow_name, &input)
+            {
+                // Mutual exclusion mirrors the single-start endpoint (issue #607):
+                // debounce collapses a burst into one run, throttle paces and
+                // defers every start — combining them has no coherent semantics.
+                // Reject the item explicitly rather than silently reserving (and
+                // then wasting) a throttle token that the debounce gate would
+                // reject the fresh start under anyway.
+                if workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input) {
+                    rejected_count += 1;
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(
+                            "start throttle is mutually exclusive with debounce".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+                // Fail fast on an oversized input rather than persisting a
+                // pending row that would fail at fire time on every scanner
+                // tick (code-review fix, issue #607): mirrors the single-start
+                // throttle path's early cap check. Skipped when
+                // `reserve_or_defer` would resolve via `Bypassed` or an
+                // idempotent attach to an already-pending row -- neither
+                // inserts a fresh row, so a retry with a stale/oversized body
+                // must not be rejected.
+                let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+                    &mut conn,
+                    &item.workflow_name,
+                    workflow_id,
+                    None,
+                )
+                .await
+                {
+                    Ok(skip) => skip,
+                    Err(e) => {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: None,
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                };
+                if !skip_cap_check && effective_wf_cap > 0 {
+                    let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                    if observed > effective_wf_cap {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: None,
+                            error: Some(format!(
+                                "workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)"
+                            )),
+                        });
+                        continue;
+                    }
+                }
+                let start_options = autumn_harvest::debounce::DebounceStartOptions {
+                    reuse_policy: None,
+                    execution_timeout_secs: None,
+                    memo: None,
+                    search_attrs: item.search_attributes.clone(),
+                    sla_secs: sla.map(|d| d.num_seconds()),
+                    context_headers: item.context_headers.clone(),
+                    priority: item.priority.map(Priority::as_i32),
+                    concurrency_key: concurrency_key.clone(),
+                    concurrency_limit,
+                    owner: owner.map(str::to_string),
+                    runbook_url: runbook_url.map(str::to_string),
+                    severity: severity.map(str::to_string),
+                    max_execution_timeout_ceiling_secs: max_exec_timeout_ceiling
+                        .map(|d| d.num_seconds()),
+                    max_workflow_input_bytes: Some(effective_wf_cap),
+                    trace_context: trace_ctx.clone(),
+                    workflow_retry_policy: item_workflow_retry_policy
+                        .as_ref()
+                        .and_then(|p| serde_json::to_value(p).ok()),
+                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                    completion_callbacks: None,
+                    schedule_id: None,
+                    scheduled_for: None,
+                    origin: None,
+                };
+                match autumn_harvest::throttle::reserve_or_defer(
+                    &mut conn,
+                    autumn_harvest::throttle::AdmitThrottleParams {
+                        workflow_name: &item.workflow_name,
+                        throttle_key: &resolved_throttle_key,
+                        workflow_id,
+                        queue_name: &queue_name,
+                        input: input.clone(),
+                        start_options,
+                        refill_per_sec: throttle_policy.refill_per_sec,
+                        burst: throttle_policy.burst,
+                        schedule_to_start: throttle_policy.schedule_to_start,
+                        shard_id: shard.as_i32(),
+                    },
+                )
+                .await
+                {
+                    Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(_)) => {
+                        runtime
+                            .registry
+                            .telemetry()
+                            .metrics
+                            .record_start_throttled(&item.workflow_name);
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
+                            status: BatchStartItemStatus::Deferred,
+                            execution_id: None,
+                            error: None,
+                        });
+                        continue;
+                    }
+                    Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                        item_throttle_bucket = Some(bucket_key);
+                    }
+                    Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                        // Active execution already resolves this reuse policy as a
+                        // no-op/immediate reject; no token reserved, fall through to
+                        // the normal start below.
+                    }
+                    Err(e) => {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: None,
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                }
+            }
+
             // Debounced item: AllowDuplicate returns an existing run unchanged
             // (idempotent retry — allowed), but a *fresh* start must go through
             // debounce admission. reject_fresh_if_debounced makes the start path
@@ -9651,7 +10144,7 @@ async fn batch_start_workflows(
                     max_execution_timeout_ceiling: max_exec_timeout_ceiling,
                     concurrency_key,
                     concurrency_limit,
-                    priority: Priority::default(),
+                    priority: item.priority.unwrap_or_default(),
                     max_workflow_input_bytes: effective_wf_cap,
                     start_at: None,
                     delay: None,
@@ -9659,7 +10152,7 @@ async fn batch_start_workflows(
                     owner,
                     runbook_url,
                     severity,
-                    context_headers: None,
+                    context_headers: item.context_headers.clone(),
                     sla,
                     schedule_id: None,
                     scheduled_for: None,
@@ -9716,14 +10209,22 @@ async fn batch_start_workflows(
                     if started.created {
                         results.push(BatchStartItemResult {
                             index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
                             status: BatchStartItemStatus::Started,
                             execution_id: Some(started.exec_id.to_string()),
                             error: None,
                         });
                     } else {
+                        // AC-a: attached to an existing run — no admission, refund.
+                        if let Some(ref bucket) = item_throttle_bucket {
+                            let _ =
+                                autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
+                                    .await;
+                        }
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,
+                            workflow_id: Some(workflow_id.clone()),
                             status: BatchStartItemStatus::Rejected,
                             execution_id: Some(started.exec_id.to_string()),
                             error: Some(format!(
@@ -9756,10 +10257,16 @@ async fn batch_start_workflows(
                     }
                 }
                 Err(e) => {
+                    // The start failed — no run admitted, refund the reserved token.
+                    if let Some(ref bucket) = item_throttle_bucket {
+                        let _ =
+                            autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+                    }
                     rejected_count += 1;
                     let err_str = e.to_string();
                     results.push(BatchStartItemResult {
                         index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
                         status: BatchStartItemStatus::Rejected,
                         execution_id: None,
                         error: Some(err_str.clone()),
@@ -15210,6 +15717,236 @@ async fn trigger_schedule_now(
                 .and_then(|info| info.retry_policy.clone())
         });
 
+    // Start-throttle admission (issue #607 code review): a manual trigger-now
+    // must pace like scheduled/backfilled fires rather than always admitting
+    // immediately -- otherwise an operator repeatedly hitting this route
+    // could bypass a throttled workflow's declared rate/burst entirely. DAG
+    // schedules resolve no throttle policy here (`DagInfo` has no `throttle`
+    // field, and a unified DAG's auto-registered shadow `WorkflowInfo` never
+    // carries one either), so this is a no-op for the DAG branch by
+    // construction -- unlike `schedule_backfill`, no explicit kind check is
+    // needed. A deferred trigger still counts as a spent run-budget slot
+    // (mirrors the scheduler-tick/backfill precedent: the pre-incremented
+    // `runs_started` above is NOT rolled back), so a repeatedly-triggered
+    // throttled schedule can't also bypass its own `max_runs` budget by
+    // piling up pending rows.
+    let mut trigger_throttle_bucket: Option<String> = None;
+    if let Some((throttle_policy, resolved_throttle_key)) =
+        workflow_resolving_throttle(&runtime.registry, &workflow_name, &input)
+    {
+        let effective_cap = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|info| info.max_input_bytes)
+            .map_or(runtime.registry.max_workflow_input_bytes, |per| {
+                per.max(runtime.registry.max_workflow_input_bytes)
+            });
+        // Mirrors the size-check-ordering fix applied at every other call
+        // site (issue #607 round 4): skip the cap check when
+        // `reserve_or_defer` would resolve via `Bypassed` or an idempotent
+        // attach to an already-pending row. `workflow_id` here is always
+        // freshly generated per request, so this is mostly defensive, but
+        // keeps the primitive's contract uniform across every call site.
+        let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+            &mut exec_conn,
+            &workflow_name,
+            &workflow_id,
+            Some("allow_duplicate"),
+        )
+        .await
+        {
+            Ok(skip) => skip,
+            Err(e) => {
+                rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("throttle_admission_failed"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(&schedule_display_name, "start_failed");
+                return Err(map_error(e));
+            }
+        };
+        if !skip_cap_check && effective_cap > 0 {
+            let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+            if observed > effective_cap {
+                rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("rejected_oversized_input"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(
+                        &schedule_display_name,
+                        "rejected_oversized_input",
+                    );
+                return Err(AutumnError::bad_request_msg(format!(
+                    "workflow input ({observed} bytes) exceeds cap ({effective_cap} bytes)"
+                )));
+            }
+        }
+        let start_options = autumn_harvest::debounce::DebounceStartOptions {
+            reuse_policy: Some("allow_duplicate".to_string()),
+            execution_timeout_secs: info_execution_timeout.map(|d| d.num_seconds()),
+            memo: None,
+            search_attrs: None,
+            sla_secs: sla.map(|d| d.num_seconds()),
+            context_headers: None,
+            priority: None,
+            concurrency_key: concurrency_key.clone(),
+            concurrency_limit,
+            owner: owner.map(str::to_string),
+            runbook_url: runbook_url.map(str::to_string),
+            severity: severity.map(str::to_string),
+            max_execution_timeout_ceiling_secs: api_state
+                .max_workflow_execution_timeout()
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            max_workflow_input_bytes: Some(effective_cap),
+            trace_context: None,
+            workflow_retry_policy: manual_trigger_retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok()),
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            completion_callbacks: None,
+            schedule_id: Some(schedule_id),
+            scheduled_for: None,
+            origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER.to_string()),
+        };
+        match autumn_harvest::throttle::reserve_or_defer(
+            &mut exec_conn,
+            autumn_harvest::throttle::AdmitThrottleParams {
+                workflow_name: &workflow_name,
+                throttle_key: &resolved_throttle_key,
+                workflow_id: &workflow_id,
+                queue_name: &queue_name,
+                input: input.clone(),
+                start_options,
+                refill_per_sec: throttle_policy.refill_per_sec,
+                burst: throttle_policy.burst,
+                schedule_to_start: throttle_policy.schedule_to_start,
+                shard_id: trigger_exec_shard.as_i32(),
+            },
+        )
+        .await
+        {
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(_)) => {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_start_throttled(&workflow_name);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: Some("deferred"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                // The pre-increment above already wrote runs_started =
+                // runs_started + 1. If that new value reaches max_runs,
+                // transition to exhausted now, exactly like the "fired"
+                // success path below -- a deferred fire still spends budget.
+                {
+                    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+                    let new_runs_started = schedule.runs_started.saturating_add(1);
+                    if schedule
+                        .max_runs
+                        .is_some_and(|max| max > 0 && new_runs_started >= max)
+                    {
+                        let _ = diesel::update(
+                            sdsl::harvest_schedules
+                                .find(schedule.id)
+                                .filter(sdsl::exhausted_at.is_null()),
+                        )
+                        .set((
+                            sdsl::exhausted_at.eq(Some(triggered_at)),
+                            sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+                            sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                            sdsl::updated_at.eq(triggered_at),
+                        ))
+                        .execute(&mut sched_conn)
+                        .await;
+                    }
+                }
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(&schedule_display_name, "deferred");
+                return Ok(Json(ScheduleTriggerResponse {
+                    execution_id: None,
+                    workflow_id,
+                    triggered_at,
+                    outcome: "deferred".to_string(),
+                }));
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                trigger_throttle_bucket = Some(bucket_key);
+            }
+            Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                // Active execution already resolves this reuse policy as a
+                // no-op; no token reserved, fall through to the normal start.
+            }
+            Err(e) => {
+                rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("throttle_admission_failed"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(&schedule_display_name, "start_failed");
+                return Err(map_error(e));
+            }
+        }
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut exec_conn,
         StartWorkflowParams {
@@ -15268,43 +16005,30 @@ async fn trigger_schedule_now(
     .await;
 
     let (exec_id_out, outcome) = match result {
-        Ok(exec_result) => (Some(exec_result.exec_id.as_uuid()), "fired"),
+        Ok(exec_result) => {
+            // AC-a (issue #607): an id-reuse short-circuit that attached to an
+            // existing run instead of creating one must refund its reserved
+            // token, mirroring every other admission call site.
+            if !exec_result.created
+                && let Some(ref bucket) = trigger_throttle_bucket
+            {
+                let _ =
+                    autumn_harvest::queue::refund_rate_limit_token(&mut exec_conn, bucket).await;
+            }
+            (Some(exec_result.exec_id.as_uuid()), "fired")
+        }
         Err(e) => {
             // Undo the pre-increment so the budget reflects actual started workflows.
-            // Do NOT guard on exhausted_at IS NULL: a scheduler tick could have raced
-            // and set exhausted_at after our pre-increment, so the guard would silently
-            // skip the rollback and leave runs_started inflated (issue #478).
-            {
-                use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
-                let _ = diesel::update(sdsl::harvest_schedules.find(schedule.id))
-                    .set((
-                        sdsl::runs_started.eq(sdsl::runs_started - 1),
-                        sdsl::updated_at.eq(triggered_at),
-                    ))
-                    .execute(&mut sched_conn)
-                    .await;
-                // If the decrement brought runs_started below max_runs, clear any
-                // exhaustion that our (now-reversed) pre-increment may have caused.
-                // next_run_at is intentionally not restored here — a future
-                // upsert_workflow_schedule call (e.g. on server restart for
-                // code-declared schedules) will recalculate it.
-                let _ = diesel::update(
-                    sdsl::harvest_schedules
-                        .find(schedule.id)
-                        .filter(sdsl::exhausted_at.is_not_null())
-                        .filter(sdsl::max_runs.is_null().or(diesel::dsl::sql::<
-                            diesel::sql_types::Bool,
-                        >(
-                            "runs_started < max_runs"
-                        ))),
-                )
-                .set((
-                    sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                    sdsl::exhausted_reason.eq(None::<String>),
-                    sdsl::updated_at.eq(triggered_at),
-                ))
-                .execute(&mut sched_conn)
-                .await;
+            rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
+            // Refund the reserved throttle token too (code review, issue #607):
+            // a failed start never admitted anything, so leaving the token
+            // spent would drain the bucket for every repeated transient/
+            // configuration failure, artificially deferring later manual or
+            // scheduled fires behind a bucket that never actually paced a
+            // successful start.
+            if let Some(ref bucket) = trigger_throttle_bucket {
+                let _ =
+                    autumn_harvest::queue::refund_rate_limit_token(&mut exec_conn, bucket).await;
             }
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -15385,6 +16109,51 @@ async fn trigger_schedule_now(
         triggered_at,
         outcome: outcome.to_string(),
     }))
+}
+
+/// Undo `trigger_schedule_now`'s pre-incremented `runs_started` budget slot
+/// when the trigger did not end up producing a run — a start failure, or
+/// (issue #607) an oversized input / throttle-admission error caught before
+/// the start primitive is ever called. Do NOT guard the decrement on
+/// `exhausted_at IS NULL`: a scheduler tick could have raced and set
+/// `exhausted_at` after the pre-increment, so the guard would silently skip
+/// the rollback and leave `runs_started` inflated (issue #478). If the
+/// decrement brought `runs_started` below `max_runs`, clear any exhaustion the
+/// (now-reversed) pre-increment may have caused; `next_run_at` is
+/// intentionally not restored here — a future `upsert_workflow_schedule` call
+/// (e.g. on server restart for code-declared schedules) will recalculate it.
+async fn rollback_manual_trigger_budget(
+    sched_conn: &mut diesel_async::AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+    let _ = diesel::update(sdsl::harvest_schedules.find(schedule_id))
+        .set((
+            sdsl::runs_started.eq(sdsl::runs_started - 1),
+            sdsl::updated_at.eq(at),
+        ))
+        .execute(sched_conn)
+        .await;
+    let _ = diesel::update(
+        sdsl::harvest_schedules
+            .find(schedule_id)
+            .filter(sdsl::exhausted_at.is_not_null())
+            .filter(
+                sdsl::max_runs
+                    .is_null()
+                    .or(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                        "runs_started < max_runs",
+                    )),
+            ),
+    )
+    .set((
+        sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        sdsl::exhausted_reason.eq(None::<String>),
+        sdsl::updated_at.eq(at),
+    ))
+    .execute(sched_conn)
+    .await;
 }
 
 // ── Schedule backfill (issue #177) ────────────────────────────────────────────
@@ -15779,6 +16548,76 @@ async fn schedule_backfill(
             }));
         }
     };
+    // A throttled scheduled/backfill fire (issue #607) durably defers before any
+    // `harvest_workflow_executions` row exists, so `running_at_start` above alone
+    // undercounts a workflow schedule's true in-flight commitment: a separate,
+    // later backfill request recomputing it from scratch would not see an
+    // earlier request's still-pending deferred slots (they never became a
+    // RUNNING/PAUSED execution) and could dispatch past `max_active_runs` --
+    // the throttle scanner later fires those pending rows without re-checking
+    // the schedule's overlap gate, so the violation would otherwise go uncaught
+    // (code review, issue #607). DAG schedules have no throttle field at all
+    // (`DagInfo` carries none), so this only applies to workflow schedules,
+    // matching the earlier fix's precedent of scoping throttle-aware overlap
+    // counting (`tick_one_workflow_schedule`/`drain_buffered_schedule_runs` in
+    // scheduler.rs) to workflows only.
+    let running_at_start = if kind == ScheduleKind::Workflow {
+        match query_pending_throttle_count(&pool, &name).await {
+            Ok(pending) => running_at_start + pending,
+            Err(count_failures) => {
+                let status = "partial";
+                let error_summary = Some("one or more shard failures");
+                write_backfill_log(
+                    &pool,
+                    schedule_id,
+                    &actor,
+                    &source,
+                    request.from,
+                    request.to,
+                    false,
+                    total,
+                    0,
+                    0,
+                    total,
+                    status,
+                    error_summary,
+                    started_at,
+                )
+                .await;
+                let id_str = schedule_id.to_string();
+                write_audit(
+                    &pool,
+                    &actor,
+                    &source,
+                    req_id.as_deref(),
+                    route,
+                    &id_str,
+                    STATUS_FAILED,
+                    error_summary,
+                )
+                .await;
+
+                return Ok(Json(ScheduleBackfillResponse {
+                    status: status.to_string(),
+                    schedule_id,
+                    kind,
+                    name,
+                    from: request.from,
+                    to: request.to,
+                    planned_timestamps: fire_times.clone(),
+                    total,
+                    dispatched: 0,
+                    skipped: 0,
+                    failed: total,
+                    skipped_reasons,
+                    partial_shard_failures: count_failures,
+                    paused_schedule_warning,
+                }));
+            }
+        }
+    } else {
+        running_at_start
+    };
     let mut dispatched_this_call: i64 = 0;
 
     match kind {
@@ -15938,6 +16777,162 @@ async fn schedule_backfill(
                     continue;
                 }
 
+                // Start-throttle admission (issue #607): pace backfill admissions,
+                // defer the excess rather than admitting an entire backfill window
+                // at once. A deferred slot counts as dispatched (the timestamp is
+                // consumed; schedule_id/scheduled_for/origin=backfill are persisted
+                // so carryover (#488) and run-history (#534) lineage survive the
+                // deferral) and is admitted later by the throttle scanner. Mirrors
+                // `tick_one_workflow_schedule`'s throttle block (scheduler.rs) and
+                // the size-check-ordering fix applied there and at the other three
+                // call sites (issue #607 round 4).
+                let mut backfill_throttle_bucket: Option<String> = None;
+                if let Some((throttle_policy, resolved_throttle_key)) =
+                    workflow_resolving_throttle(&runtime.registry, &wf_name, &input)
+                {
+                    let effective_cap = runtime
+                        .registry
+                        .workflows
+                        .get(&wf_name)
+                        .and_then(|info| info.max_input_bytes)
+                        .map_or(runtime.registry.max_workflow_input_bytes, |per| {
+                            per.max(runtime.registry.max_workflow_input_bytes)
+                        });
+                    let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
+                        &mut conn,
+                        &wf_name,
+                        &workflow_id,
+                        Some("reject_duplicate"),
+                    )
+                    .await
+                    {
+                        Ok(skip) => skip,
+                        Err(e) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: e.to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    if !skip_cap_check && effective_cap > 0 {
+                        let observed =
+                            serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                        if observed > effective_cap {
+                            skipped += 1;
+                            *skipped_reasons
+                                .entry("oversized_input".to_string())
+                                .or_insert(0) += 1;
+                            continue;
+                        }
+                    }
+                    let effective_retry = schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| {
+                            serde_json::from_value::<autumn_harvest::policy::RetryPolicy>(v.clone())
+                                .ok()
+                        })
+                        .or_else(|| {
+                            runtime
+                                .registry
+                                .workflows
+                                .get(&wf_name)
+                                .and_then(|info| info.retry_policy.clone())
+                        })
+                        .and_then(|p| serde_json::to_value(&p).ok());
+                    let start_options = autumn_harvest::debounce::DebounceStartOptions {
+                        reuse_policy: Some("reject_duplicate".to_string()),
+                        execution_timeout_secs: None,
+                        memo: None,
+                        search_attrs: None,
+                        sla_secs: sla.map(|d| d.num_seconds()),
+                        context_headers: None,
+                        priority: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
+                        owner: owner.map(str::to_string),
+                        runbook_url: runbook_url.map(str::to_string),
+                        severity: severity.map(str::to_string),
+                        max_execution_timeout_ceiling_secs: None,
+                        max_workflow_input_bytes: Some(effective_cap),
+                        trace_context: None,
+                        workflow_retry_policy: effective_retry,
+                        max_workflow_attempts_ceiling: runtime
+                            .registry
+                            .max_workflow_attempts_ceiling,
+                        completion_callbacks: None,
+                        schedule_id: Some(schedule_id),
+                        scheduled_for: Some(*original_slot),
+                        origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL.to_string()),
+                    };
+                    match autumn_harvest::throttle::reserve_or_defer(
+                        &mut conn,
+                        autumn_harvest::throttle::AdmitThrottleParams {
+                            workflow_name: &wf_name,
+                            throttle_key: &resolved_throttle_key,
+                            workflow_id: &workflow_id,
+                            queue_name: dispatch_queue,
+                            input: input.clone(),
+                            start_options,
+                            refill_per_sec: throttle_policy.refill_per_sec,
+                            burst: throttle_policy.burst,
+                            schedule_to_start: throttle_policy.schedule_to_start,
+                            shard_id: runtime.router.default_shard().as_i32(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(outcome)) => {
+                            if outcome.fresh {
+                                runtime
+                                    .registry
+                                    .telemetry()
+                                    .metrics
+                                    .record_start_throttled(&wf_name);
+                                dispatched += 1;
+                                dispatched_this_call += 1;
+                            } else {
+                                // A repeated backfill call for a window whose
+                                // slot is still durably deferred from an
+                                // earlier call resolves to the *same* pending
+                                // row (`reserve_or_defer`'s idempotency
+                                // shortcut), not a new admission. Report it as
+                                // already-consumed rather than a fresh
+                                // dispatch, so a repeated identical backfill
+                                // request can't double-count the slot as
+                                // dispatched or double-spend max_runs budget
+                                // for it (code review, issue #607).
+                                skipped += 1;
+                                *skipped_reasons
+                                    .entry("already_exists".to_string())
+                                    .or_insert(0) += 1;
+                            }
+                            continue;
+                        }
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved {
+                            bucket_key,
+                        }) => {
+                            backfill_throttle_bucket = Some(bucket_key);
+                            // Fall through to the normal start below, on the same
+                            // connection.
+                        }
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Bypassed) => {
+                            // Active execution already resolves this reuse policy
+                            // as a no-op; no token reserved, fall through.
+                        }
+                        Err(e) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: e.to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    }
+                }
+
                 let result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -16004,12 +16999,26 @@ async fn schedule_backfill(
                         dispatched_this_call += 1;
                     }
                     Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
+                        // AC-a: an id-reuse short-circuit consumed no admission —
+                        // refund the reserved throttle token, if any was reserved.
+                        if let Some(ref bucket) = backfill_throttle_bucket {
+                            let _ =
+                                autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
+                                    .await;
+                        }
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
                             .or_insert(0) += 1;
                     }
                     Err(e) => {
+                        // No run admitted — refund the reserved throttle token
+                        // before propagating the failure.
+                        if let Some(ref bucket) = backfill_throttle_bucket {
+                            let _ =
+                                autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket)
+                                    .await;
+                        }
                         shard_failures.push(BackfillShardFailure {
                             shard_id: 0,
                             reason: e.to_string(),
@@ -16387,6 +17396,44 @@ async fn query_running_count_best_effort(
     name: &str,
 ) -> i64 {
     query_running_count(pool, kind, name).await.unwrap_or(0)
+}
+
+/// Fan out across shards summing pending (not-yet-fired) start-throttle rows
+/// (issue #607) for workflow `name`, mirroring `query_running_count`'s shape
+/// and shard scope. Used to fold a workflow schedule's already-deferred
+/// backfill slots into `running_at_start` so a subsequent, separate backfill
+/// request can't dispatch (and defer) past `max_active_runs` while an earlier
+/// request's deferred slots are still sitting in the throttle queue, never
+/// having become a real execution `query_running_count` alone would see.
+async fn query_pending_throttle_count(
+    pool: &HarvestDbPool,
+    name: &str,
+) -> Result<i64, Vec<BackfillShardFailure>> {
+    let mut total = 0i64;
+    let mut failures = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            failures.push(BackfillShardFailure {
+                shard_id: shard_id.as_i32(),
+                reason: "failed to acquire connection while counting pending throttled \
+                         backfill slots"
+                    .to_string(),
+            });
+            continue;
+        };
+        match autumn_harvest::throttle::pending_throttle_count_for_workflow(&mut conn, name).await {
+            Ok(count) => total += count,
+            Err(e) => failures.push(BackfillShardFailure {
+                shard_id: shard_id.as_i32(),
+                reason: format!("failed to count pending throttled backfill slots: {e}"),
+            }),
+        }
+    }
+    if failures.is_empty() {
+        Ok(total)
+    } else {
+        Err(failures)
+    }
 }
 
 /// Count how many of the planned timestamps already have an execution or DAG run.
@@ -18129,6 +19176,36 @@ async fn debounce_status(
     });
 
     Ok(Json(all_records))
+}
+
+/// `GET /admin/start-throttle` — per-`(workflow, throttle_key)` deferred-start
+/// backlog, so an operator can confirm a throttle is active and watch the
+/// backlog drain (issue #607). Cross-shard: concatenates each shard's
+/// per-key rows (not summed — a key's backlog on shard A and shard B remain
+/// separate entries, each keeping its own `shard_id`).
+async fn start_throttle_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::throttle::ThrottleBacklogEntry>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut all: Vec<autumn_harvest::throttle::ThrottleBacklogEntry> = Vec::new();
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let rows = autumn_harvest::throttle::throttle_backlog_by_key(&mut conn)
+            .await
+            .map_err(map_error)?;
+        all.extend(rows);
+    }
+
+    // Descending by backlog size, then a stable key order for a deterministic view.
+    all.sort_by(|a, b| {
+        b.deferred_count
+            .cmp(&a.deferred_count)
+            .then(a.workflow_name.cmp(&b.workflow_name))
+            .then(a.throttle_key.cmp(&b.throttle_key))
+    });
+
+    Ok(Json(all))
 }
 
 async fn pending_event_batches(
@@ -24768,6 +25845,7 @@ mod tests {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 sla: None,
                 owner: None,
@@ -26661,6 +27739,7 @@ mod tests {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,
@@ -26682,6 +27761,7 @@ mod tests {
 
                     debounce: None,
                     batch: None,
+                    throttle: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,

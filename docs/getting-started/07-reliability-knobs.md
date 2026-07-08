@@ -107,16 +107,50 @@ down to `execution_timeout`** at start time. Pause suspends the SLA clock
 parked run never false-breaches.
 
 **Workflow versioning.** When you change an in-flight workflow's logic,
-fence the divergence with `ctx.version()` so old executions replay their
-recorded path while new executions take the new branch:
+fence the divergence with `ctx.patched()` — the recommended default for the
+overwhelmingly common two-state (before/after) change — so old executions
+replay their recorded path while new executions take the new branch:
 
 ```rust
-if ctx.version("v2-tax-flow", 1, 2) >= 2 {
+if ctx.patched("v2-tax-flow") {
     ctx.execute_activity_raw("compute_tax_v2", input, "default").await?;
 } else {
     ctx.execute_activity_raw("compute_tax_v1", input, "default").await?;
 }
 ```
+
+Retire the gate with a three-deploy sequence:
+
+1. **Introduce** — the `if ctx.patched(id) { new } else { old }` fence above.
+   New executions record a `patch:{id}` marker and take the new branch;
+   pre-patch executions keep replaying the old branch. One caveat: a fresh
+   run whose first-task history ends in un-awaited signals at the gate point
+   — canonically every **signal-with-start** run, whose signal is staged
+   before first dispatch — takes the *old* branch and records no marker
+   (deliberate parity with `ctx.version()`), so drain checks must count
+   these marker-less runs too.
+2. **Deprecate** — once every pre-patch run has drained (see the "Patched
+   gates" section of `docs/runbooks/version-gate-retirement.md` — the
+   runbook's `version-usage` / retirement-check CLI tooling only sees
+   `version:` markers, **not** patch gates; use that section's raw SQL
+   drain queries), replace the fence with `ctx.deprecate_patch(id);`
+   followed by the unconditional new code. The recorded markers become
+   transparent to replay, so marker-bearing runs still replay cleanly.
+3. **Remove** — once every marker-bearing run has drained, delete the
+   `deprecate_patch` call entirely.
+
+`ctx.version()` remains the explicit escape hatch for gates that need **more
+than two** concurrent versions:
+
+```rust
+if ctx.version("v2-tax-flow", 1, 3) >= 2 {
+    // …
+}
+```
+
+Histories recorded by a two-version `ctx.version(id, 1, 2)` gate interop with
+`ctx.patched(id)` — the version marker is observed as patched, so you can
+migrate a gate in place.
 
 **Cron / interval schedules for workflows.** Register any workflow on a
 schedule with `HarvestPlugin::schedule(...)`. When you need a graph of

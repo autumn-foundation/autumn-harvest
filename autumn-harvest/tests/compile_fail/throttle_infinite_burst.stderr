@@ -1,0 +1,5 @@
+error: throttle `burst` must be a finite number
+ --> tests/compile_fail/throttle_infinite_burst.rs:7:37
+  |
+7 | #[workflow(throttle(rate = "100/m", burst = 1e400))]
+  |                                     ^^^^^^^^^^^^^

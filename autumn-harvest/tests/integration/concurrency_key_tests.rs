@@ -22,6 +22,7 @@ fn workflow_info_has_concurrency_fields() {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
 
         owner: None,
@@ -52,6 +53,7 @@ fn workflow_info_with_concurrency_policy() {
 
         debounce: None,
         batch: None,
+        throttle: None,
         max_input_bytes: None,
 
         owner: None,

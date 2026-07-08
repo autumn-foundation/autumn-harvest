@@ -303,6 +303,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -2937,6 +2938,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -3076,6 +3078,7 @@ async fn ui_trigger_preserves_dag_metadata() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

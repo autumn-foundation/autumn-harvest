@@ -95,6 +95,8 @@ mod slot_tuner_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
+mod throttle_tests;
+#[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
 mod typed_stubs_tests;

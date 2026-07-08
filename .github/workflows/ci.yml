@@ -51,6 +51,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run no-db tests
         run: cargo test -p autumn-harvest --no-default-features
+      - name: Run testing-feature integration tests (replayer)
+        run: cargo test -p autumn-harvest --no-default-features --features testing --test integration
       - name: Run classic (non-unified) DAG tests
         run: cargo test -p autumn-harvest --no-default-features --features db --lib
       - name: Compile db-backed tests

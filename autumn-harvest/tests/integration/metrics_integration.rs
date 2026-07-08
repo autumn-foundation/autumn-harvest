@@ -753,6 +753,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -978,6 +979,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1123,6 +1125,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1275,6 +1278,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1428,6 +1432,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1450,6 +1455,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1652,6 +1658,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1832,6 +1839,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1854,6 +1862,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2026,6 +2035,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2048,6 +2058,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2362,6 +2373,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -2579,6 +2591,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
             concurrency: None,
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -3203,6 +3216,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
             concurrency: None,
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

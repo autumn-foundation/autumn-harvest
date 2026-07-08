@@ -246,3 +246,86 @@ final retirement gate should cover all shards.
     HARVEST_URL: ${{ vars.HARVEST_URL }}
     HARVEST_TOKEN: ${{ secrets.HARVEST_TOKEN }}
 ```
+
+---
+
+## Patched gates (issue #687)
+
+`ctx.patched(id)` / `ctx.deprecate_patch(id)` (the boolean two-state gate)
+record a `patch:{id}` marker instead of a `version:{id}` marker.
+
+> **The CLI tooling above does NOT see patch gates.** `harvest
+> version-usage` and `harvest version-gate-retirement --check` filter on
+> `MarkerRecorded` names matching `version:%` only — for a `patched()` gate
+> they return an **empty / "safe" report even while marker-bearing (or
+> pre-patch) executions are still in flight**. Do not use them to prove a
+> patch gate has drained. Extending the tooling to `patch:` markers is the
+> named follow-up slice (the patch-id visibility endpoint is explicitly out
+> of scope for issue #687); until it ships, use the raw SQL below, run
+> **against every shard database**.
+
+### Drain check before deploy 3 (remove the `deprecate_patch` call)
+
+Deploy 3 is safe only when **zero non-terminal executions still carry the
+marker**. Include the interop `version:{id}` spelling — `deprecate_patch`
+consumes both:
+
+```sql
+-- Non-terminal executions still carrying a patch/version marker for <id>.
+-- Must return zero rows on every shard before deploy 3.
+SELECT DISTINCT
+    w.id AS workflow_exec_id,
+    w.workflow_name,
+    w.state,
+    w.started_at,
+    w.shard_id
+FROM harvest_events e
+INNER JOIN harvest_workflow_executions w
+    ON w.id = e.workflow_exec_id
+WHERE e.event_type = 'MarkerRecorded'
+  AND e.event_data #>> '{data,name}' IN ('patch:<id>', 'version:<id>')
+  AND w.state IN ('RUNNING', 'SUSPENDED', 'PAUSED');
+```
+
+### Drain check before deploy 2 (replace the fence with `deprecate_patch`)
+
+Deploy 2 is safe only when **zero non-terminal executions of the gated
+workflow type have NO marker** — those are pre-patch runs still replaying
+the old branch, and replaying them against unconditional new code diverges.
+This inverse query is the one that also catches the signal-with-start /
+trailing-signal runs described below (they never record a marker, so only a
+"no marker" check can find them):
+
+```sql
+-- Non-terminal executions of the gated workflow type with NO patch/version
+-- marker for <id>. Must return zero rows on every shard before deploy 2.
+SELECT
+    w.id AS workflow_exec_id,
+    w.workflow_name,
+    w.state,
+    w.started_at,
+    w.shard_id
+FROM harvest_workflow_executions w
+WHERE w.workflow_name = '<workflow_name>'
+  AND w.state IN ('RUNNING', 'SUSPENDED', 'PAUSED')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM harvest_events e
+      WHERE e.workflow_exec_id = w.id
+        AND e.event_type = 'MarkerRecorded'
+        AND e.event_data #>> '{data,name}' IN ('patch:<id>', 'version:<id>')
+  );
+```
+
+### Signal-with-start and trailing-signal runs never record the marker
+
+A fresh execution whose first workflow task's history ends in un-awaited
+signals at the gate point — canonically **every signal-with-start run**,
+since the signal is staged before first dispatch, so the history is
+`[WorkflowStarted, SignalReceived]` — takes the **old** branch and records
+**no** marker, forever, per-execution-deterministically. This is deliberate,
+conservative parity with `ctx.version()` (the history is ambiguous with a
+phase-0 run parked at a first-line `wait_for_signal`). Consequence for this
+runbook: such runs are invisible to any marker-presence query and show up
+only in the deploy-2 inverse query above — always run it before deploy 2,
+even if you believe every new run "must have" recorded the marker.

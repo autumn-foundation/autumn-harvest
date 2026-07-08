@@ -389,15 +389,18 @@ filter and compatibility declarations are unaffected.
 ## Scenario B: Breaking deploy (new code cannot replay old history)
 
 Use this when the new binary changes execution order in a way that would corrupt
-in-flight workflows if replayed. Requires using `ctx.version()` gates to guard
-the breaking branch.
+in-flight workflows if replayed. Requires gating the breaking branch — with
+`ctx.patched()` for the common two-state before/after change, or `ctx.version()`
+when more than two versions must coexist.
 
-**Step 1 — Gate the breaking code branch in the workflow with `ctx.version()`.**
+**Step 1 — Gate the breaking code branch.**
+
+`ctx.patched()` is the default two-state fence (issue #687):
 
 ```rust
 #[workflow]
 async fn my_workflow(ctx: &WorkflowContext, ...) -> Result<(), String> {
-    if ctx.version("add-step-2", 1, 2).await? >= 2 {
+    if ctx.patched("add-step-2") {
         // new code path — runs for any execution that reaches this code for the first time
         ctx.schedule_activity(new_step, ...).await?;
     }
@@ -405,8 +408,22 @@ async fn my_workflow(ctx: &WorkflowContext, ...) -> Result<(), String> {
 }
 ```
 
-`ctx.version()` emits a `VersionMarker` event on first call and replays the
-recorded marker on re-entry, so the branch is stable across replays.
+`ctx.version()` remains the escape hatch for gates that need **more than two**
+concurrent versions (note it is synchronous and infallible — no `.await`, no `?`):
+
+```rust
+#[workflow]
+async fn my_workflow(ctx: &WorkflowContext, ...) -> Result<(), String> {
+    if ctx.version("add-step-2", 1, 2) >= 2 {
+        // new code path — runs for any execution that reaches this code for the first time
+        ctx.schedule_activity(new_step, ...).await?;
+    }
+    // existing steps ...
+}
+```
+
+Both record a marker event on first live call and replay the recorded marker
+on re-entry, so the branch is stable across replays.
 
 **Step 2 — Deploy new workers and set the policy (same as Scenario A steps 1 and 3).**
 
@@ -511,7 +528,7 @@ Response fields:
 |---------|-----|
 | Retiring old workers before `safe_to_retire` | Check reachability; in-flight executions will be orphaned |
 | Forgetting to declare compat in Scenario A | New workers skip old-build tasks; old-build executions stall |
-| Breaking deploy without `ctx.version()` gate | New workers corrupt in-flight histories on replay; use version gates |
+| Breaking deploy without a `ctx.patched()` / `ctx.version()` gate | New workers corrupt in-flight histories on replay; use a patched gate (or a version gate for >2 versions) |
 | Rollback without updating the build policy | New starts continue landing on the bad build; set policy back first |
 | Empty `build_id` on new workers | Legacy sentinel — the worker claims any task, bypassing all routing |
 
@@ -599,7 +616,7 @@ harvest canary --sample-size 200 --json
 2. **If Canary Passes:** The candidate build is compatible with all sampled running executions. You can safely deploy the new workers, declare compatibility (e.g. `declare_compat("sha-new", "sha-old")`), and advance the routing policy.
 3. **If Canary Fails:** Replay safety is compromised. You must either:
    - Fix the non-determinism in the candidate build.
-   - Use `ctx.version()` gates to isolate the new behavior.
+   - Use `ctx.patched()` (or `ctx.version()` for >2 versions) gates to isolate the new behavior.
    - Run the deploy as a breaking deploy (Scenario B).
 
 ---

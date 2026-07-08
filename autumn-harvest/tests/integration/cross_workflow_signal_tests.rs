@@ -261,6 +261,7 @@ async fn test_same_shard_not_found_retry() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -283,6 +284,7 @@ async fn test_same_shard_not_found_retry() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -454,6 +456,7 @@ async fn test_cross_shard_outbox_delivery() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -476,6 +479,7 @@ async fn test_cross_shard_outbox_delivery() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -637,6 +641,7 @@ async fn test_grace_window_expiration() {
 
             debounce: None,
             batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -772,6 +777,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -794,6 +800,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
 
                 debounce: None,
                 batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,

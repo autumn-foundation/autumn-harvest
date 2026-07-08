@@ -310,6 +310,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // aggregation over already-durable data, companion to /admin/concurrency.
     ("GET /admin/usage", RouteClass::ReadOnly),
     ("GET /admin/debounce", RouteClass::ReadOnly),
+    ("GET /admin/start-throttle", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
         "GET /admin/workflow-types/reachability",
@@ -529,6 +530,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/concurrency",
     "GET /admin/usage",
     "GET /admin/debounce",
+    "GET /admin/start-throttle",
     "GET /admin/history/exports",
     "GET /admin/external-handoffs",
     "GET /admin/external-handoffs/{token}",
@@ -625,6 +627,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/concurrency", None),
     ("GET /admin/usage", None),
     ("GET /admin/debounce", None),
+    ("GET /admin/start-throttle", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),

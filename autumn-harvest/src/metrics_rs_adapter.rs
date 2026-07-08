@@ -67,10 +67,10 @@ use crate::telemetry::{
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
     METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
-    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
-    WorkflowStatus,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SessionAcquisitionOutcome, SlotType,
+    TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -637,6 +637,17 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_DEBOUNCE_FIRED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_start_throttled(&self, workflow_name: &str) {
+        // The resolved throttle key is intentionally not a label (unbounded
+        // cardinality — ADR-0001 §7); per-key backlog is exposed via the
+        // /admin/start-throttle endpoint.
+        counter!(
+            METRIC_WORKFLOW_START_THROTTLED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
         )
         .increment(1);
     }
