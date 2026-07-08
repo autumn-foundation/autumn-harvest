@@ -72,13 +72,19 @@ jobs:
       - name: Run macros tests
         run: cargo test -p autumn-harvest-macros
       - name: Compile plugin integration tests
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --no-run
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --no-run
       - name: Run Docker-backed integration tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
+      - name: Run plugin read-path decode integration tests (issue #608)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test read_path_decode_integration -- --test-threads=1
+      - name: Run plugin UI integration tests
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test ui_integration -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds

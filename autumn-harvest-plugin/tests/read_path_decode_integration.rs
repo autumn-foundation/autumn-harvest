@@ -6,12 +6,11 @@
 //! (single + batch), describe, `/history`, `/stack`, `/dead-letters`, and the
 //! SSE event stream.
 //!
-//! **Seeding note:** every engine write path passes identity codecs today
-//! (research for #608 confirmed real codecs are consumed only by the client
-//! handle), so these tests synthesize envelope-bearing rows directly — an
-//! envelope is just a JSON object, and identity-codec persistence stores it
-//! verbatim. That simulates the future/foreign write path the read-path
-//! decoder must serve.
+//! **Seeding note:** every engine write path persists via identity codecs
+//! (real codecs are consumed only by the client handle path), so these tests
+//! synthesize envelope-bearing rows directly — an envelope is just a JSON
+//! object, and identity-codec persistence stores it verbatim. That simulates
+//! the future/foreign write path the read-path decoder must serve.
 //!
 //! **Sandbox note:** no Docker is available in the authoring sandbox, so this
 //! file is compile-checked only (`cargo test --no-run`), matching the
@@ -26,7 +25,9 @@ use autumn_harvest::payload_codec::{
     UNDECODABLE_REASON_UNKNOWN_CODEC,
 };
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
-use autumn_harvest::schema::{harvest_audit_log, harvest_events, harvest_workflow_executions};
+use autumn_harvest::schema::{
+    harvest_audit_log, harvest_events, harvest_task_queue, harvest_workflow_executions,
+};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority, ShardId};
@@ -281,12 +282,12 @@ fn build_app_with(pool: &DbPool, config: &AppConfig<'_>) -> HarvestApiApp {
         api_state.set_admin_auth_boundary(true);
     }
     if config.codecs {
-        // NEW API (issue #608): mirror the codec registry into the api state,
-        // the way plugin.rs mirrors the SSRF policy.
+        // Mirror the codec registry into the api state, the way plugin.rs
+        // mirrors the SSRF policy (issue #608).
         api_state.set_payload_codecs(reverse_codecs());
     }
     if config.decode_on_read {
-        // NEW API (issue #608): the deployment-level opt-in flag.
+        // The deployment-level opt-in flag (issue #608).
         api_state.set_decode_payloads_on_read(true);
     }
     if let Some(url) = config.notification_url {
@@ -474,6 +475,44 @@ async fn append_events(
         .expect("append events");
 }
 
+/// Seeds a pending activity task-queue row (the row backing the `/stack`
+/// pending-activities panel) for `exec_id`, optionally with a stored
+/// heartbeat checkpoint payload. Returns the recorded activity id.
+async fn seed_pending_activity(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    input: Value,
+    heartbeat_details: Option<Value>,
+) -> ActivityExecId {
+    let activity_id = ActivityExecId::new();
+    let mut params = autumn_harvest::queue::EnqueueParams::new(
+        "default",
+        autumn_harvest::queue::TaskType::Activity,
+        input,
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("charge_card".to_string());
+    params.activity_id = Some(activity_id.as_uuid());
+    autumn_harvest::queue::enqueue(conn, &params)
+        .await
+        .expect("seed pending activity task");
+    if let Some(checkpoint) = heartbeat_details {
+        diesel::update(
+            harvest_task_queue::table
+                .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+                .filter(harvest_task_queue::activity_id.eq(Some(activity_id.as_uuid()))),
+        )
+        .set((
+            harvest_task_queue::heartbeat_details.eq(Some(checkpoint)),
+            harvest_task_queue::last_heartbeat_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .expect("seed heartbeat checkpoint");
+    }
+    activity_id
+}
+
 /// Audit rows for `OP_PAYLOAD_DECODE_READ`, as `(target_id, route_or_command,
 /// error_summary)` triples, oldest first.
 async fn decode_audit_rows(
@@ -544,6 +583,45 @@ async fn responses_byte_identical_when_flag_off() {
             "plaintext must NOT appear with the flag off for {uri}: {body}"
         );
     }
+
+    // /stack is the one surface whose response schema changed (the new
+    // optional PendingActivity.input field): with the flag off the field must
+    // be omitted entirely — no `input` key, no ciphertext, no plaintext — so
+    // the JSON stays byte-identical to a pre-#608 build.
+    let stack_exec = seed_running(&mut conn, "flag-off-stack", json!({})).await;
+    seed_pending_activity(
+        &mut conn,
+        stack_exec,
+        envelope_for(&json!({"card": "pii-alpha"})),
+        None,
+    )
+    .await;
+    let stack_uri = format!("/workflows/{stack_exec}/stack");
+    let (base_status, base_body) = get_raw(&baseline, &stack_uri).await;
+    let (off_status, off_body) = get_raw(&flag_off, &stack_uri).await;
+    assert_eq!(base_status, StatusCode::OK);
+    assert_eq!(base_status, off_status, "status must match for {stack_uri}");
+    assert_eq!(
+        base_body, off_body,
+        "flag-off stack body must be byte-identical to baseline"
+    );
+    let stack_body = String::from_utf8_lossy(&base_body);
+    assert!(
+        stack_body.contains("pending_activities"),
+        "fixture sanity: the seeded pending activity must appear: {stack_body}"
+    );
+    assert!(
+        stack_body.contains("charge_card"),
+        "fixture sanity: the seeded pending activity row must render: {stack_body}"
+    );
+    assert!(
+        !stack_body.contains("\"input\""),
+        "flag-off stack JSON must omit the input key entirely: {stack_body}"
+    );
+    assert!(
+        !stack_body.contains("pii-alpha") && !stack_body.contains("_harvest_codec_envelope"),
+        "flag-off stack must surface neither plaintext nor ciphertext input: {stack_body}"
+    );
 }
 
 /// AC2: `GET /workflows/{id}/result` returns the decoded output and error
@@ -588,6 +666,57 @@ async fn result_endpoint_returns_decoded_output_and_error_when_enabled() {
         body["error"], "boom",
         "TEXT error column must be decoded via decode_error_string_lossy: {body}"
     );
+}
+
+/// AC2 (long-poll): `GET /workflows/{id}/result?wait=…` routes through the
+/// same decode + audit helper as the zero-wait snapshot. An already-terminal
+/// execution returns immediately, so no real waiting happens.
+#[tokio::test]
+async fn result_long_poll_wait_returns_decoded_output_and_audits_once() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // The long-poll path requires the LISTEN/NOTIFY handle client.
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: true,
+            decode_on_read: true,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "decoded-result-wait", json!({})).await;
+    mark_completed(
+        &mut conn,
+        exec_id,
+        envelope_for(&json!({"answer": 42, "pii": "pii-alpha"})),
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/result?wait=5")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["state"], "completed");
+    assert_eq!(
+        body["output"]["pii"], "pii-alpha",
+        "long-poll output must be decoded: {body}"
+    );
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains("_harvest_codec_envelope"),
+        "no envelope may leak on the long-poll path: {body}"
+    );
+
+    let audit = decode_audit_rows(&mut conn).await;
+    assert_eq!(
+        audit.len(),
+        1,
+        "exactly one payload.decode_read row for the long-poll read: {audit:?}"
+    );
+    assert_eq!(audit[0].0.as_deref(), Some(exec_id.to_string().as_str()));
+    assert_eq!(audit[0].1, "GET /workflows/{id}/result");
 }
 
 /// AC3: the single-execution history export decodes each event payload under
@@ -771,7 +900,8 @@ async fn describe_and_history_pages_emit_decoded_payloads() {
     );
 }
 
-/// AC4 (part 2): the stack/describe pending-activity input is decoded.
+/// AC4 (part 2): the stack/describe pending-activity input and heartbeat
+/// checkpoint are decoded.
 #[tokio::test]
 async fn stack_pending_activity_input_is_decoded() {
     let (url, _container) = setup_database().await;
@@ -780,31 +910,28 @@ async fn stack_pending_activity_input_is_decoded() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let exec_id = seed_running(&mut conn, "stack-decoded", json!({})).await;
-    let activity_id = ActivityExecId::new();
     let activity_input = envelope_for(&json!({"card": "pii-alpha"}));
+    // Seed the pending task-queue row backing the stack panel, with a stored
+    // heartbeat checkpoint that is itself an envelope (decoded before the
+    // #503 cap projection).
+    let activity_id = seed_pending_activity(
+        &mut conn,
+        exec_id,
+        activity_input.clone(),
+        Some(envelope_for(&json!({"progress": "pii-checkpoint"}))),
+    )
+    .await;
     append_events(
         &mut conn,
         exec_id,
         &[WorkflowEvent::ActivityScheduled {
             activity_id,
             name: "charge_card".to_string(),
-            input: activity_input.clone(),
+            input: activity_input,
             queue: "default".to_string(),
         }],
     )
     .await;
-    // Seed the pending task-queue row backing the stack panel.
-    let mut params = autumn_harvest::queue::EnqueueParams::new(
-        "default",
-        autumn_harvest::queue::TaskType::Activity,
-        activity_input,
-    );
-    params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.activity_name = Some("charge_card".to_string());
-    params.activity_id = Some(activity_id.as_uuid());
-    autumn_harvest::queue::enqueue(&mut conn, &params)
-        .await
-        .expect("seed pending activity task");
 
     let (status, stack) = get_json(&app, &format!("/workflows/{exec_id}/stack")).await;
     assert_eq!(status, StatusCode::OK, "body: {stack}");
@@ -812,6 +939,10 @@ async fn stack_pending_activity_input_is_decoded() {
     assert!(
         stack_str.contains("pii-alpha"),
         "pending-activity input must be decoded on the stack surface: {stack_str}"
+    );
+    assert!(
+        stack_str.contains("pii-checkpoint"),
+        "the heartbeat checkpoint must be decoded on the stack surface: {stack_str}"
     );
     assert!(
         !stack_str.contains("_harvest_codec_envelope"),

@@ -87,9 +87,11 @@ pub struct LossyDecodeOutcome {
 
 impl LossyDecodeOutcome {
     /// Whether the walk decoded or marked at least one envelope.
+    // No arithmetic: `merged` saturates, so `decoded + failed` could overflow
+    // after a saturated merge — keep the predicate addition-free.
     #[must_use]
     pub const fn touched(&self) -> bool {
-        self.decoded + self.failed > 0
+        self.decoded > 0 || self.failed > 0
     }
 
     /// Saturating merge for multi-field / multi-row accumulation.
@@ -1045,6 +1047,103 @@ mod tests {
             "JSON that is not exactly a codec envelope must be left untouched"
         );
         assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn decode_error_string_lossy_failure_returns_serialized_marker() {
+        // The fourth branch: the raw string IS exactly a serialized envelope,
+        // but the codec's decode fails — the response copy gets the marker
+        // serialized to a string, counted as `failed: 1`, and neither the
+        // ciphertext nor the codec's own error text is echoed.
+        let codecs = lossy_test_codecs();
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(b"opaque-bytes");
+        let raw = serde_json::to_string(&serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "failing",
+            "data": ciphertext_b64,
+        }))
+        .unwrap();
+
+        let (rewritten, outcome) = codecs.decode_error_string_lossy(&raw);
+
+        let rewritten = rewritten.expect("a failed decode must rewrite to the marker string");
+        let marker: Value = serde_json::from_str(&rewritten).expect("marker string is JSON");
+        assert_eq!(
+            marker,
+            undecodable_marker("failing", UNDECODABLE_REASON_CODEC_ERROR)
+        );
+        assert!(
+            !rewritten.contains(&ciphertext_b64) && !rewritten.contains("simulated bad key"),
+            "neither ciphertext nor codec error text may be echoed: {rewritten}"
+        );
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 0,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn decode_error_string_lossy_serializes_non_string_decoded_json() {
+        // The doc-comment contract: a decoded plain string comes back
+        // unwrapped, but any other decoded JSON is returned serialized.
+        let codecs = lossy_test_codecs();
+        let envelope = reverse_envelope(&serde_json::json!({"code": 500}));
+        let raw = serde_json::to_string(&envelope).unwrap();
+
+        let (rewritten, outcome) = codecs.decode_error_string_lossy(&raw);
+
+        assert_eq!(
+            rewritten.as_deref(),
+            Some(r#"{"code":500}"#),
+            "non-string decoded JSON must be returned compact-serialized"
+        );
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decode_value_lossy_transforms_envelope_shaped_business_plaintext() {
+        // Known limit (documented in docs/operations/read-path-decode.md):
+        // envelopes are purely self-describing, so business data stored as
+        // plaintext (identity write path) that is byte-for-byte a codec
+        // envelope — at any nesting depth — is indistinguishable from a real
+        // envelope and IS transformed by the walk: decoded when its codec_id
+        // is registered, replaced with a marker when not.
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "batch": [
+                {"business": reverse_envelope(&serde_json::json!({"n": 1}))},
+                {"business": unknown_codec_envelope()},
+            ]
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(
+            value["batch"][0]["business"],
+            serde_json::json!({"n": 1}),
+            "registered codec_id ⇒ decoded even though it was business data"
+        );
+        assert_eq!(
+            value["batch"][1]["business"],
+            undecodable_marker("kms-rotated-away", UNDECODABLE_REASON_UNKNOWN_CODEC),
+            "unregistered codec_id ⇒ the business object degrades to a marker"
+        );
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 1
+            }
+        );
     }
 
     #[test]

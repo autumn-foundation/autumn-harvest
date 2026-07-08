@@ -15,6 +15,7 @@ use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::extract::{Path, Query};
 use autumn_web::reexports::axum;
+use autumn_web::session::Session;
 use axum::Extension;
 use axum::Form;
 use axum::Router;
@@ -73,8 +74,6 @@ use autumn_harvest::{
     cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
     terminate_workflow_execution,
 };
-
-use autumn_web::session::Session;
 
 use crate::api::{
     HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
@@ -1142,6 +1141,7 @@ async fn decode_and_audit_workflow_detail(
         "GET /ui/workflows/{id}",
         Some(exec_id.shard()),
         outcome,
+        Some(SOURCE_UI),
     )
     .await;
 }
@@ -1824,6 +1824,7 @@ async fn list_dead_letters_ui(
             "GET /ui/dead-letters",
             None,
             outcome,
+            Some(SOURCE_UI),
         )
         .await;
     }

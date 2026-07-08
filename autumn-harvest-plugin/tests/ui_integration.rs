@@ -3196,7 +3196,7 @@ fn envelope_608(plain: &Value) -> Value {
 fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
-    // NEW API (issue #608): codec registry mirror + deployment opt-in.
+    // Codec registry mirror + deployment opt-in (issue #608).
     api_state.set_payload_codecs(decode_test_codecs());
     api_state.set_decode_payloads_on_read(true);
     api_state.install_storage_pool(HarvestDbPool::from(build_test_pool(database_url)));
@@ -3227,6 +3227,22 @@ async fn count_decode_audit_rows(database_url: &str) -> i64 {
         .get_result(&mut conn)
         .await
         .expect("failed to count decode audit rows")
+}
+
+/// The `source` column of every `payload.decode_read` audit row — UI page
+/// renders must attribute their rows to `SOURCE_UI` like every other audit
+/// row ui.rs writes.
+async fn decode_audit_sources(database_url: &str) -> Vec<String> {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for audit sources");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_PAYLOAD_DECODE_READ))
+        .select(harvest_audit_log::source)
+        .load(&mut conn)
+        .await
+        .expect("failed to load decode audit sources")
 }
 
 /// Issue #608 (DLQ UI): the dead-letter page renders the decoded task input
@@ -3292,6 +3308,7 @@ async fn dlq_ui_page_renders_decoded_payloads_and_audits() {
 /// Issue #608 (workflow detail UI): the detail page renders the decoded
 /// workflow input instead of the stored envelope.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui_renders_decoded_input() {
     let (database_url, _container) = setup_test_database_url().await;
 
@@ -3342,6 +3359,65 @@ async fn workflow_detail_ui_renders_decoded_input() {
     .await
     .expect("workflow insert should succeed");
 
+    // Blocked-on panel + timeline fixtures (issue #608, AC4): an
+    // envelope-bearing timeline event, a pending activity whose stored
+    // heartbeat checkpoint is an envelope, and an unconsumed signal whose
+    // payload is an envelope. The panel renders the checkpoint and the
+    // timeline renders each event's data; the blocked-on activity *input*
+    // and signal *payload* are decoded too (they feed the audit outcome)
+    // but the panel does not render them, so they have no HTML assertion.
+    {
+        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        autumn_harvest::store::append_events(
+            &mut conn,
+            exec_id,
+            &[autumn_harvest::WorkflowEvent::ActivityScheduled {
+                activity_id: autumn_harvest::types::ActivityExecId::new(),
+                name: "charge_card".to_string(),
+                input: envelope_608(&json!({"card": "pii-detail-event"})),
+                queue: "default".to_string(),
+            }],
+            history.next_event_id,
+        )
+        .await
+        .expect("append timeline event");
+
+        let mut params = autumn_harvest::queue::EnqueueParams::new(
+            "default",
+            autumn_harvest::queue::TaskType::Activity,
+            envelope_608(&json!({"card": "pii-detail-task-input"})),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some("charge_card".to_string());
+        autumn_harvest::queue::enqueue(&mut conn, &params)
+            .await
+            .expect("seed pending activity task");
+        diesel::update(
+            harvest_task_queue::table
+                .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+        )
+        .set((
+            harvest_task_queue::heartbeat_details.eq(Some(envelope_608(
+                &json!({"progress": "pii-detail-checkpoint"}),
+            ))),
+            harvest_task_queue::last_heartbeat_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed heartbeat checkpoint");
+
+        autumn_harvest::signal::send_signal(
+            &mut conn,
+            exec_id,
+            "approval",
+            envelope_608(&json!({"approver": "pii-detail-signal"})),
+        )
+        .await
+        .expect("seed pending signal");
+    }
+
     let app = build_decode_enabled_api_with_ui_app(&database_url);
 
     let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}")).await;
@@ -3351,8 +3427,24 @@ async fn workflow_detail_ui_renders_decoded_input() {
         "workflow detail must render the decoded input: {html}"
     );
     assert!(
+        html.contains("pii-detail-event"),
+        "the timeline must render decoded event payloads: {html}"
+    );
+    assert!(
+        html.contains("pii-detail-checkpoint"),
+        "the blocked-on panel must render the decoded heartbeat checkpoint: {html}"
+    );
+    assert!(
         !html.contains("_harvest_codec_envelope"),
         "workflow detail must not render the raw envelope: {html}"
+    );
+
+    // UI-originated decode rows carry `source: ui`, matching every other
+    // audit row ui.rs writes.
+    let sources = decode_audit_sources(&database_url).await;
+    assert!(
+        !sources.is_empty() && sources.iter().all(|s| s == "ui"),
+        "UI decode audit rows must carry source=ui: {sources:?}"
     );
 
     // The stored row keeps its ciphertext (read-path only, append-only safe).

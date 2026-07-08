@@ -311,6 +311,10 @@ impl HarvestPlugin {
     /// Note: with [`Self::api_with_auth`], the embedder boundary makes every
     /// request that reaches the API an admin — decode then applies to all of
     /// them, which is exactly the boundary's contract.
+    ///
+    /// See `docs/operations/read-path-decode.md` for the full operator guide,
+    /// including the provenance caveat (decoded values are not authenticated)
+    /// and the deliberately-undecoded list surfaces.
     #[must_use]
     pub const fn decode_payloads_on_read(mut self) -> Self {
         self.decode_payloads_on_read = true;
@@ -509,6 +513,17 @@ impl Plugin for HarvestPlugin {
             None
         };
 
+        // Issue #608: deployment-level opt-in for read-path payload decoding,
+        // co-located with the codec-registry mirror so both are in place
+        // before the HTTP server binds — no boot window where a
+        // decode-eligible request sees a default identity-only registry
+        // (`try_build` clones the registry verbatim, so this pre-build view
+        // is identical to the post-build one). Mirroring is unconditional
+        // and cheap; behavior is controlled by the flag + per-request admin
+        // gate. Must run before `builder` is moved into the runtime slot.
+        api_state.set_payload_codecs(builder.payload_codecs().clone());
+        api_state.set_decode_payloads_on_read(decode_payloads_on_read);
+
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             runtime: None,
@@ -517,10 +532,6 @@ impl Plugin for HarvestPlugin {
         // HTTP server bind and the boot-time gate load is safely rejected.
         api_state.arm_gate_cache_fail_closed();
         api_state.set_admin_auth_boundary(api_middleware.is_some());
-        // Issue #608: deployment-level opt-in for read-path payload decoding.
-        // The codec registry itself is mirrored in start_harvest_runtime once
-        // the builder is built; this flag alone changes nothing without it.
-        api_state.set_decode_payloads_on_read(decode_payloads_on_read);
 
         let startup_slot = Arc::clone(&slot);
         let shutdown_slot = Arc::clone(&slot);
@@ -689,11 +700,9 @@ async fn start_harvest_runtime(
     // which every `BuiltHarvest` consumer (this plugin and the standalone
     // runner) funnels through.
     api_state.set_completion_callback_ssrf_policy(built.completion_callback_config().ssrf_policy());
-    // Mirror the codec registry for read-path payload decoding (issue #608).
-    // Unconditional and cheap; behavior is controlled by the
-    // decode_payloads_on_read opt-in flag (set in Plugin::build) plus the
-    // per-request admin gate.
-    api_state.set_payload_codecs(built.payload_codecs().clone());
+    // The read-path decode codec registry (issue #608) is mirrored in
+    // `Plugin::build`, together with the opt-in flag, so it is in place
+    // before the HTTP server binds — not here.
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.

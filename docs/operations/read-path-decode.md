@@ -1,12 +1,12 @@
-# Read-path payload decoding (issue #608)
+# Read-path payload decoding
 
 Issue #143 shipped `PayloadCodec` so embedders can encrypt workflow payloads
 at rest, but the operator read surfaces (management API + Vantage UI) always
 returned the stored bytes — on an encryption-at-rest deployment every triage
-screen showed opaque ciphertext. Read-path decoding closes that gap: with an
-explicit opt-in, admin reads are decoded server-side using the same in-process
-codec registry the engine already holds. No sidecar codec server, no second
-key distribution.
+screen showed opaque ciphertext. Read-path decoding (issue #608) closes that
+gap: with an explicit opt-in, admin reads are decoded server-side using the
+same in-process codec registry the engine already holds. No sidecar codec
+server, no second key distribution.
 
 ## Opt-in
 
@@ -58,8 +58,46 @@ whole management API, not a new widening.
 | SSE `GET /executions/{id}/events/stream` | every frame (backfill + live), decoder resolved once at stream open |
 | Vantage UI | workflow detail page (input/output cards, timeline, blocked-on panel) and the DLQ page |
 
+### Deliberately undecoded surfaces
+
+Two payload-carrying read surfaces are **not** decoded, by design, even with
+the flag on and an admin session:
+
+| Surface | Rationale |
+|---|---|
+| `GET /workflows` (the list endpoint, including the stalled-workflow loader) | Row counts are unbounded and each row flattens a full execution (input/output/memo/search_attrs/error); per-row decoding would put an O(rows × fields) codec cost on the fleet-navigation path. Lists are navigational — click through to the describe/detail views, which decode. |
+| `GET /dags/{dag_name}/runs` | Same shape and rationale: an unbounded list of full execution rows used for navigation; the per-run detail surfaces decode. |
+
+On an encrypted deployment these list responses show stored envelopes for the
+same executions whose detail views show plaintext — that is expected, not a
+bug.
+
 Stored rows are **never** mutated — decoding happens on the in-memory
 response copy only. The append-only event invariant is untouched.
+
+## Provenance caveat — decoded values are not authenticated
+
+A codec envelope is purely self-describing (`{"_harvest_codec_envelope": 1,
+"codec_id", "data"}`): nothing binds it to "written by the engine's encode
+path". The identity codec is always registered, and workflow inputs, signal
+payloads, and activity error strings are caller-influenced — so **any writer
+who can start a workflow (or shape an error string) can seed envelope-shaped
+data**, and every decoded surface will render whatever the registered codec
+yields for it, with no provenance indicator. During incident triage this
+means a decoded view can display attacker-chosen "plaintext" that differs
+from the bytes the workflow actually consumed (the stored bytes themselves
+are what the engine ran on and are never altered).
+
+When byte-level fidelity matters — forensics, disputes — read the stored
+bytes instead: turn the flag off, use a non-admin session on an ungated
+route, or use an undecoded surface such as the `GET /workflows` list. A
+per-request raw escape hatch (`?decode=false`) is a possible follow-up, not
+part of this slice.
+
+Relatedly, nothing in the `PayloadCodec` trait requires authenticated
+encryption; prefer an AEAD codec so tampered ciphertext fails decode outright
+(the `codec_error` vs `invalid_json` reason split is visible only to admin
+sessions, but an AEAD codec removes the distinction as a signal entirely).
 
 ## Graceful per-field degradation
 
@@ -83,11 +121,26 @@ target execution — never payload content). A request that finds no envelopes
 writes no row, so flipping the flag on a non-encrypted deployment is
 audit-silent. The SSE stream is the one exception: frame counts are
 unknowable up front, so it audits once at stream open whenever decode mode is
-active for that stream (mirroring `execution.stream.open`). Audit inserts are
-best-effort — an insert failure never fails the read.
+active for that stream (mirroring `execution.stream.open`) — every stream
+(re)open writes its own row, including automatic EventSource reconnects, so
+reconnect-happy clients multiply rows. Audit inserts are best-effort — an
+insert failure never fails the read.
+
+Two attribution details:
+
+- `GET /workflows/{id}/result` audits the **requested** execution id — the
+  durable handle the operator asked about — even when the returned output
+  belongs to a ContinuedAsNew/retry successor the endpoint's chain walk
+  resolved (same logical run, same shard).
+- Vantage UI page renders write their rows with `source: "ui"` (like every
+  other UI-originated audit row); API reads carry the header-derived source
+  (default `"api"`).
 
 ## Known limits
 
+- `GET /workflows` (list, incl. the stalled loader) and
+  `GET /dags/{dag_name}/runs` are deliberately undecoded — see "Deliberately
+  undecoded surfaces" above.
 - `GET /dead-letters/aggregate` is unchanged: `failure_signature` groups over
   the stored (possibly ciphertext) error first-line. Counts and ids remain
   correct; signatures on an encrypted deployment group by ciphertext shape.
@@ -95,5 +148,14 @@ best-effort — an insert failure never fails the read.
   envelopes appear wherever a writer (e.g. the client handle path or a future
   write-side integration) stored them. The read path decodes any envelope it
   finds and passes everything else through untouched.
+- Because the walk is envelope-driven, business data stored as plaintext that
+  happens to be byte-for-byte a codec envelope — at any nesting depth — is
+  transformed on the decoded view: decoded when its `codec_id` is registered,
+  replaced with an `_harvest_undecodable` marker when not (see the provenance
+  caveat above; the stored bytes are never altered).
 - Offload envelopes (`_harvest_offload_envelope`, issue #524) and erasure
-  tombstones (`_harvest_erased`, issue #495) pass through untouched.
+  tombstones (`_harvest_erased`, issue #495) pass through untouched. In
+  particular, decode-on-read never inflates offload refs: an offloaded field
+  still surfaces as its opaque offload reference (and the offloaded blob's
+  content remains ciphertext under an encrypting codec) even with decoding
+  active.

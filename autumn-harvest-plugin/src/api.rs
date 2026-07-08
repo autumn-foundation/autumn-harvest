@@ -3307,6 +3307,10 @@ pub(crate) async fn read_path_decoder(
         return None;
     }
     let is_admin = has_harvest_admin_access(api_state, session).await;
+    // `flag` is known `true` here, so this re-check is redundant on purpose:
+    // it keeps the truth-table-pinned `decode_gate` predicate as the one
+    // authoritative production consumer of the security decision. Do not
+    // "simplify" this to `if !is_admin` — that would orphan the pinned gate.
     if !decode_gate(flag, is_admin) {
         return None;
     }
@@ -3329,6 +3333,12 @@ pub(crate) fn extension_session(maybe_session: Option<Extension<Session>>) -> Op
 /// least one codec envelope (issue #608, AC8). Never fails the read; never
 /// records payload content (the outcome carries counts only, and none of the
 /// recorded fields derive from payload bytes).
+///
+/// `source_override` pins the audit row's `source` for surfaces whose
+/// provenance is not header-derived: ui.rs call sites pass
+/// `Some(SOURCE_UI)` (matching every other audit row that file writes);
+/// API handlers pass `None` to keep the header-derived default.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn audit_decoded_read(
     api_state: &HarvestApiState,
     headers: &axum::http::HeaderMap,
@@ -3337,6 +3347,7 @@ pub(crate) async fn audit_decoded_read(
     route: &'static str,
     shard: Option<ShardId>,
     outcome: LossyDecodeOutcome,
+    source_override: Option<&'static str>,
 ) {
     if !outcome.touched() {
         return;
@@ -3349,6 +3360,7 @@ pub(crate) async fn audit_decoded_read(
         return;
     };
     let (actor, source, request_id) = audit_context(headers, api_state);
+    let source = source_override.map_or(source, str::to_string);
     let record = NewAuditRecord {
         actor: &actor,
         operation: OP_PAYLOAD_DECODE_READ,
@@ -5769,6 +5781,7 @@ async fn export_workflow_history(
                     "GET /workflows/{id}/history/export",
                     Some(exec_id.shard()),
                     outcome,
+                    None,
                 )
                 .await;
             }
@@ -5810,6 +5823,7 @@ async fn export_workflow_histories(
                     "GET /admin/history/exports",
                     None,
                     outcome,
+                    None,
                 )
                 .await;
             }
@@ -5915,6 +5929,7 @@ async fn get_workflow(
             "GET /workflows/{id}",
             Some(exec_id.shard()),
             outcome,
+            None,
         )
         .await;
     }
@@ -6096,6 +6111,7 @@ async fn get_workflow_history(
             "GET /workflows/{id}/history",
             Some(exec_id.shard()),
             outcome,
+            None,
         )
         .await;
     }
@@ -6361,6 +6377,11 @@ async fn respond_with_workflow_result(
         if let Some(error) = result.error.as_mut() {
             outcome = outcome.merged(decode_error_field(codecs, error));
         }
+        // The audit target is deliberately the *requested* exec id — the
+        // durable handle the operator asked about — even when the snapshot
+        // belongs to a ContinuedAsNew/retry successor the chain walk resolved
+        // (same logical run, same shard). Documented in the audit-contract
+        // section of docs/operations/read-path-decode.md.
         let target = exec_id.to_string();
         audit_decoded_read(
             api_state,
@@ -6370,6 +6391,7 @@ async fn respond_with_workflow_result(
             "GET /workflows/{id}/result",
             Some(exec_id.shard()),
             outcome,
+            None,
         )
         .await;
     }
@@ -7384,6 +7406,7 @@ async fn get_workflow_stack(
             "GET /workflows/{id}/stack",
             Some(exec_id.shard()),
             decode_outcome,
+            None,
         )
         .await;
     }
@@ -16468,6 +16491,7 @@ async fn list_dead_letters(
             "GET /dead-letters",
             None,
             outcome,
+            None,
         )
         .await;
     }
@@ -19880,6 +19904,9 @@ async fn stream_execution_events(
         // a stream, so one payload.decode_read row is written at stream open
         // whenever decode mode is active — a deliberate, documented superset
         // of the ≥1-envelope predicate the request/response surfaces use.
+        // Every stream (re)open writes its own row, including automatic
+        // EventSource reconnects (each reconnect is a fresh HTTP request
+        // through this handler), so reconnect-happy clients multiply rows.
         if decoder.is_some() {
             let decode_ar = NewAuditRecord {
                 actor: &audit_actor,
@@ -26795,6 +26822,276 @@ mod tests {
         assert!(
             !decoded_frame.contains("_harvest_codec_envelope"),
             "decoded frame must not leak the envelope: {decoded_frame}"
+        );
+    }
+
+    /// Byte-reversal test codec + envelope fixtures shared by the #608 unit
+    /// tests below (the SSE frame test above keeps its own local copy).
+    #[derive(Debug)]
+    struct ReverseReadPathCodec;
+
+    impl autumn_harvest::payload_codec::PayloadCodec for ReverseReadPathCodec {
+        fn codec_id(&self) -> &'static str {
+            "reverse"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+            let mut v = raw.to_vec();
+            v.reverse();
+            Ok(v)
+        }
+        fn decode(
+            &self,
+            encoded: &[u8],
+        ) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+            let mut v = encoded.to_vec();
+            v.reverse();
+            Ok(v)
+        }
+    }
+
+    fn read_path_test_codecs() -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseReadPathCodec));
+        codecs
+    }
+
+    /// Builds a well-formed `reverse` codec envelope for `plain` by
+    /// round-tripping through the public `encode_event` (no base64 dep needed
+    /// in this crate).
+    fn read_path_envelope(plain: &serde_json::Value) -> serde_json::Value {
+        let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: plain.clone(),
+        };
+        let encoded = read_path_test_codecs()
+            .encode_event(&event)
+            .expect("encode event");
+        let envelope = encoded["data"]["output"].clone();
+        assert_eq!(
+            envelope["_harvest_codec_envelope"], 1,
+            "fixture sanity: read_path_envelope must produce a codec envelope"
+        );
+        envelope
+    }
+
+    fn stub_workflow_execution() -> WorkflowExecution {
+        WorkflowExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "decode-wf".to_string(),
+            workflow_id: "wf-1".to_string(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            input: serde_json::json!(null),
+            output: None,
+            error: None,
+            parent_id: None,
+            sticky_worker_id: None,
+            queue_name: "default".to_string(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            created_at: chrono::Utc::now(),
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            paused_at: None,
+            pause_reason: None,
+            pause_actor: None,
+            current_details: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            nd_blocked_at: None,
+            nd_block_reason: None,
+            nd_block_count: 0,
+            completion_callbacks: None,
+        }
+    }
+
+    #[test]
+    fn decode_workflow_execution_fields_decodes_all_payload_fields() {
+        // The hand-maintained field census of the describe surface: `input`,
+        // `output`, `memo`, `search_attrs` (JSONB) and `error` (TEXT). A
+        // field silently dropped from decode_workflow_execution_fields would
+        // fail the corresponding assertion here.
+        let codecs = read_path_test_codecs();
+        let mut execution = stub_workflow_execution();
+        execution.input = read_path_envelope(&serde_json::json!({"user": "pii-input"}));
+        execution.output = Some(read_path_envelope(
+            &serde_json::json!({"receipt": "pii-output"}),
+        ));
+        execution.memo = Some(read_path_envelope(&serde_json::json!({"note": "pii-memo"})));
+        execution.search_attrs = Some(read_path_envelope(
+            &serde_json::json!({"tenant": "pii-attrs"}),
+        ));
+        execution.error = Some(
+            serde_json::to_string(&read_path_envelope(&serde_json::json!("pii-error")))
+                .expect("serialize envelope"),
+        );
+
+        let outcome = decode_workflow_execution_fields(&mut execution, &codecs);
+
+        assert_eq!(execution.input, serde_json::json!({"user": "pii-input"}));
+        assert_eq!(
+            execution.output,
+            Some(serde_json::json!({"receipt": "pii-output"}))
+        );
+        assert_eq!(
+            execution.memo,
+            Some(serde_json::json!({"note": "pii-memo"}))
+        );
+        assert_eq!(
+            execution.search_attrs,
+            Some(serde_json::json!({"tenant": "pii-attrs"}))
+        );
+        assert_eq!(execution.error.as_deref(), Some("pii-error"));
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 5,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decode_workflow_execution_fields_counts_failures_per_field() {
+        let codecs = read_path_test_codecs();
+        let mut execution = stub_workflow_execution();
+        execution.input = read_path_envelope(&serde_json::json!({"ok": true}));
+        execution.output = Some(serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "kms-rotated-away",
+            "data": "e30=",
+        }));
+
+        let outcome = decode_workflow_execution_fields(&mut execution, &codecs);
+
+        assert_eq!(execution.input, serde_json::json!({"ok": true}));
+        let output = execution.output.expect("output present");
+        assert!(
+            output
+                .get(autumn_harvest::payload_codec::UNDECODABLE_MARKER_KEY)
+                .is_some(),
+            "an undecodable field degrades to the typed marker: {output}"
+        );
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 1,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn pending_activity_input_field_is_omitted_when_none() {
+        // AC1's byte-identity guarantee for /stack hangs on this serde
+        // contract: `input: None` (flag off / non-admin) must not even emit
+        // the key, so pre-#608 responses are reproduced byte-for-byte.
+        let off = pending_with_checkpoint(None);
+        assert!(off.input.is_none(), "fixture sanity: input starts None");
+        let off_json = serde_json::to_string(&off).expect("serialize");
+        assert!(
+            !off_json.contains("\"input\""),
+            "flag-off PendingActivity JSON must omit the input key entirely: {off_json}"
+        );
+
+        let on = PendingActivity {
+            input: Some(serde_json::json!({"card": "4242"})),
+            ..off
+        };
+        let on_json = serde_json::to_string(&on).expect("serialize");
+        assert!(
+            on_json.contains("\"input\":{\"card\":\"4242\"}"),
+            "decode-active PendingActivity JSON must carry the input: {on_json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_with_workflow_result_decodes_output_and_error_fields() {
+        use autumn_harvest::WorkflowResultState;
+
+        let codecs = read_path_test_codecs();
+        // No storage pool installed: audit_decoded_read early-returns, so the
+        // decode legs are testable without a database.
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let exec_id = ExecutionId::new();
+
+        let completed = WorkflowResult {
+            state: WorkflowResultState::Completed,
+            output: Some(read_path_envelope(&serde_json::json!({"answer": 42}))),
+            error: None,
+            completed_at: Some(chrono::Utc::now()),
+        };
+
+        // Active decoder: the JSONB output is decoded on the response copy.
+        let response = respond_with_workflow_result(
+            &api_state,
+            &headers,
+            exec_id,
+            completed.clone(),
+            Some(&codecs),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+        assert_eq!(json_body["output"], serde_json::json!({"answer": 42}));
+        assert!(
+            !String::from_utf8_lossy(&body).contains("_harvest_codec_envelope"),
+            "decoded result must not leak the envelope"
+        );
+
+        // None decoder: passthrough — the stored envelope survives verbatim.
+        let response =
+            respond_with_workflow_result(&api_state, &headers, exec_id, completed, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("_harvest_codec_envelope"),
+            "with no decoder the stored ciphertext must pass through"
+        );
+
+        // TEXT error leg: a stringified envelope decodes to the plain string.
+        let failed = WorkflowResult {
+            state: WorkflowResultState::Failed,
+            output: None,
+            error: Some(
+                serde_json::to_string(&read_path_envelope(&serde_json::json!("boom")))
+                    .expect("serialize envelope"),
+            ),
+            completed_at: Some(chrono::Utc::now()),
+        };
+        let response =
+            respond_with_workflow_result(&api_state, &headers, exec_id, failed, Some(&codecs))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+        assert_eq!(
+            json_body["error"], "boom",
+            "TEXT error must decode via decode_error_string_lossy: {json_body}"
         );
     }
 }
