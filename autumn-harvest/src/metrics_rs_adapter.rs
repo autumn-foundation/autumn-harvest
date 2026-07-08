@@ -47,13 +47,14 @@ use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED,
     METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_GATES_ACTIVE,
     METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED, METRIC_COMPLETION_TRIGGER_FIRED,
-    METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT,
-    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
-    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
-    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
-    METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
-    METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATUS,
-    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_PAYLOAD_BYTES,
+    METRIC_COMPLETION_TRIGGER_SKIPPED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES,
+    METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
+    METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
+    METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_QUERY,
+    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCOPE,
+    METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER,
+    METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_PAYLOAD_BYTES,
     METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
     METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE,
@@ -639,6 +640,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_completion_trigger_skipped(&self, trigger_id: &str, reason: &str) {
+        counter!(
+            METRIC_COMPLETION_TRIGGER_SKIPPED,
+            METRIC_LABEL_TRIGGER => trigger_id.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_admission_blocked(&self, scope_kind: &str, reason_hash: &str) {
         // Bound cardinality: use the first 8 hex chars of a FNV-1a hash of the
         // reason string rather than the raw free-text label (ADR-0001 §7).
@@ -848,6 +858,8 @@ mod tests {
         rec.record_workflow_nondeterministic_block("wf", "q");
         rec.record_schedule_to_start("q", 1.5);
         rec.record_queue_oldest_pending_age("q", 30.0);
+        rec.record_completion_trigger_fired("trigger-uuid", "started");
+        rec.record_completion_trigger_skipped("trigger-uuid", "condition_unmet");
     }
 
     // -----------------------------------------------------------------------
@@ -867,6 +879,15 @@ mod tests {
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
+    }
+
+    #[test]
+    fn record_completion_trigger_skipped_does_not_panic_for_all_reasons() {
+        // Output-guard skip counter bridge (issue #810). Must not panic with
+        // no global recorder installed; both bounded reason values covered.
+        let rec = MetricsRsRecorder;
+        rec.record_completion_trigger_skipped("trigger-uuid", "condition_unmet");
+        rec.record_completion_trigger_skipped("trigger-uuid", "condition_invalid");
     }
 
     #[test]

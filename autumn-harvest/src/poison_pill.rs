@@ -240,6 +240,7 @@ mod scanner {
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         error: &str,
+        metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
     ) -> HarvestResult<(
         Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
         Vec<DeferredTriggerStart>,
@@ -353,7 +354,7 @@ mod scanner {
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::Failed,
-            None,
+            metrics,
         )
         .await?;
         deferred.extend(failed_triggers);
@@ -493,8 +494,13 @@ mod scanner {
 
                     let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
                         Some(exec_uuid) => {
-                            fail_owning_workflow(conn, execution_id_from_uuid(exec_uuid), &error)
-                                .await?
+                            fail_owning_workflow(
+                                conn,
+                                execution_id_from_uuid(exec_uuid),
+                                &error,
+                                Some(metrics),
+                            )
+                            .await?
                         }
                         None => (None, Vec::new(), Vec::new()),
                     };

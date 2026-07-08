@@ -255,6 +255,15 @@ pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 /// `validation_failed` | `payload_too_large`).
 pub const METRIC_COMPLETION_TRIGGER_FIRED: &str = "harvest.completion_trigger.fires";
 
+/// Counter: a completion trigger's output guard skipped a fire (issue #810).
+///
+/// Deliberately a **separate** counter from
+/// [`METRIC_COMPLETION_TRIGGER_FIRED`], whose `outcome="skipped"` already
+/// means "workflow-id reuse dedupe at start" — do not overload.
+///
+/// Attributes: `trigger`, `reason` (`condition_unmet` | `condition_invalid`).
+pub const METRIC_COMPLETION_TRIGGER_SKIPPED: &str = "harvest.completion_trigger.skipped";
+
 /// Counter: incremented each time `POST /admin/schedules/{id}/trigger` fires a
 /// one-off run (issue #343).
 ///
@@ -1168,6 +1177,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// `"validation_failed"`, `"payload_too_large"`.
     fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
         let _ = (trigger_id, outcome);
+    }
+
+    /// A completion trigger's output guard skipped a fire (issue #810).
+    ///
+    /// `reason` is one of: `"condition_unmet"` (guard evaluated `false`) or
+    /// `"condition_invalid"` (stored condition unparseable/over-cap —
+    /// fail-closed skip). Emitted only when the resolved-skip fires row is
+    /// freshly inserted; a redelivery of an already-resolved skip records
+    /// `"deduped"` on [`Self::record_completion_trigger_fired`] instead.
+    fn record_completion_trigger_skipped(&self, trigger_id: &str, reason: &str) {
+        let _ = (trigger_id, reason);
     }
 
     /// A new workflow start was blocked by an active admission gate (issue #377).
@@ -2185,6 +2205,14 @@ mod tests {
         assert_eq!(
             METRIC_QUEUE_OLDEST_PENDING_AGE,
             "harvest.queue.oldest_pending_age"
+        );
+        assert_eq!(
+            METRIC_COMPLETION_TRIGGER_FIRED,
+            "harvest.completion_trigger.fires"
+        );
+        assert_eq!(
+            METRIC_COMPLETION_TRIGGER_SKIPPED,
+            "harvest.completion_trigger.skipped"
         );
     }
 

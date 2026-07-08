@@ -7567,6 +7567,7 @@ async fn suspended_command_event_count(
     Ok(update_events.saturating_add(1))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn move_workflow_to_dlq_for_history_cap(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -7575,6 +7576,7 @@ async fn move_workflow_to_dlq_for_history_cap(
     worker_id: &str,
     parent_exec_id: Option<ExecutionId>,
     reason: DeadLetterReason,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     let reason = reason.to_string();
 
@@ -7629,7 +7631,7 @@ async fn move_workflow_to_dlq_for_history_cap(
                     conn,
                     exec_id,
                     crate::completion_trigger::TerminalState::Failed,
-                    None,
+                    metrics,
                 )
                 .await?;
                 deferred.extend(failed_triggers);
@@ -7687,6 +7689,7 @@ async fn fail_workflow_for_history_cap(
         worker_id,
         execution.parent_id.map(execution_id_from_uuid),
         reason,
+        Some(telemetry.metrics.as_ref()),
     )
     .await?;
 
@@ -11972,7 +11975,7 @@ pub async fn quarantine_workflow_task_timeout(
                                     conn,
                                     exec_id,
                                     crate::completion_trigger::TerminalState::Failed,
-                                    None,
+                                    Some(metrics),
                                 )
                                 .await?;
                             deferred.extend(triggers);

@@ -425,6 +425,7 @@ mod db_tests {
         include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
         "\n",
         include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+        include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
         include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
         include_str!("../../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
         include_str!("../../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),

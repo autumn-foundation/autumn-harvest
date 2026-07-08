@@ -145,6 +145,9 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
     ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260708000001_harvest_completion_trigger_condition/up.sql"
+    ),
     include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
     include_str!(
         "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
@@ -1474,6 +1477,7 @@ async fn test_static_trigger_sync_and_cleanup() {
         target_workflow_name: "target_wf".to_string(),
         input_mapping: autumn_harvest::completion_trigger::InputMapping::Passthrough,
         queue_name: None,
+        condition: None,
     };
 
     // 1. Sync one trigger
@@ -1961,6 +1965,7 @@ async fn test_trigger_compensating_rollback_restores_existing() {
                 input_mapping: json!({"type": "Passthrough"}),
                 queue_name: None,
                 is_static: false,
+                condition: None,
             })
             .execute(&mut conn)
             .await
@@ -2090,6 +2095,7 @@ async fn test_exact_pool_routing_cross_shard() {
             input_mapping: json!({"type": "Passthrough"}),
             queue_name: None,
             is_static: false,
+            condition: None,
         })
         .execute(&mut conn0)
         .await
@@ -2215,6 +2221,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 target_workflow_name: "target".to_string(),
                 input_mapping: autumn_harvest::completion_trigger::InputMapping::Passthrough,
                 queue_name: None,
+                condition: None,
             },
         ])
         .build();
@@ -2560,4 +2567,497 @@ async fn test_trigger_emits_fire_metric_outcomes() {
         .await
         .unwrap();
     assert_eq!(target_count, 1);
+}
+
+// ─── issue #810: output-guarded (conditional) completion triggers ────────────
+
+/// Capturing recorder for both the fires counter and the new skip counter.
+#[derive(Default)]
+struct GuardCapturingMetrics {
+    fires: std::sync::Mutex<Vec<(String, String)>>,
+    skips: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for GuardCapturingMetrics {
+    fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
+        self.fires
+            .lock()
+            .unwrap()
+            .push((trigger_id.to_string(), outcome.to_string()));
+    }
+
+    fn record_completion_trigger_skipped(&self, trigger_id: &str, reason: &str) {
+        self.skips
+            .lock()
+            .unwrap()
+            .push((trigger_id.to_string(), reason.to_string()));
+    }
+}
+
+async fn start_and_complete_source(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    output: Value,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(output)),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
+    exec_id
+}
+
+async fn load_fire_row(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+    trigger_id: uuid::Uuid,
+) -> Option<autumn_harvest::models::CompletionTriggerFireDb> {
+    use autumn_harvest::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+    fires_dsl::harvest_completion_trigger_fires
+        .filter(fires_dsl::source_exec_id.eq(source_exec_id.as_uuid()))
+        .filter(fires_dsl::trigger_id.eq(trigger_id))
+        .select(autumn_harvest::models::CompletionTriggerFireDb::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .unwrap()
+}
+
+async fn target_exec_count(
+    conn: &mut AsyncPgConnection,
+    trigger_id: uuid::Uuid,
+    source_exec_id: ExecutionId,
+) -> i64 {
+    let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .count()
+        .get_result(conn)
+        .await
+        .unwrap()
+}
+
+/// AC1/AC3/AC4/AC5 (issue #810): a guarded trigger fires when the condition
+/// is met, skips (recorded + metered, exactly-once) when unmet or the path is
+/// missing, and a co-registered unconditional trigger keeps byte-identical
+/// legacy behavior throughout.
+#[tokio::test]
+async fn test_condition_gate_fire_skip_and_exactly_once() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    // Guarded trigger: fire only for amount > 1000.
+    let guarded_id = uuid::Uuid::new_v4();
+    let (status, created) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": guarded_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"},
+            "condition": {
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 1000}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // The registration response echoes the stored condition.
+    assert_eq!(created["condition"]["type"], "GreaterThan");
+
+    // Unconditional (legacy) control trigger on the same source.
+    let legacy_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": legacy_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Guarded trigger referencing a path the output never carries: must skip
+    // cleanly (defined result, never a panic or an error).
+    let missing_path_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": missing_path_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"},
+            "condition": {"type": "Eq", "data": {"path": "nonexistent.field", "value": 1}}
+        }),
+    )
+    .await;
+
+    // ── Source A: condition met (amount 1500 > 1000). ──────────────────────
+    let metrics_a = GuardCapturingMetrics::default();
+    let source_a =
+        start_and_complete_source(&mut conn, "guard-src-a", json!({"amount": 1500})).await;
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_a,
+        TerminalState::Completed,
+        Some(&metrics_a),
+    )
+    .await
+    .unwrap();
+
+    // Guarded + legacy triggers both started their targets; missing-path skipped.
+    assert_eq!(target_exec_count(&mut conn, guarded_id, source_a).await, 1);
+    assert_eq!(target_exec_count(&mut conn, legacy_id, source_a).await, 1);
+    assert_eq!(
+        target_exec_count(&mut conn, missing_path_id, source_a).await,
+        0
+    );
+    // Fired rows record NULL outcome; the missing-path skip records its reason.
+    let fired_row = load_fire_row(&mut conn, source_a, guarded_id)
+        .await
+        .unwrap();
+    assert_eq!(fired_row.outcome, None);
+    let missing_row = load_fire_row(&mut conn, source_a, missing_path_id)
+        .await
+        .unwrap();
+    assert_eq!(missing_row.outcome.as_deref(), Some("condition_unmet"));
+    let skips = metrics_a.skips.lock().unwrap().clone();
+    assert_eq!(
+        skips,
+        vec![(missing_path_id.to_string(), "condition_unmet".to_string())]
+    );
+
+    // ── Source B: condition unmet (amount 500). ─────────────────────────────
+    let metrics_b = GuardCapturingMetrics::default();
+    let source_b =
+        start_and_complete_source(&mut conn, "guard-src-b", json!({"amount": 500})).await;
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_b),
+    )
+    .await
+    .unwrap();
+
+    // Guarded trigger skipped — zero target-side visibility rows — while the
+    // legacy trigger still fired (full backward compatibility).
+    assert_eq!(target_exec_count(&mut conn, guarded_id, source_b).await, 0);
+    assert_eq!(target_exec_count(&mut conn, legacy_id, source_b).await, 1);
+    let skip_row = load_fire_row(&mut conn, source_b, guarded_id)
+        .await
+        .unwrap();
+    assert_eq!(skip_row.outcome.as_deref(), Some("condition_unmet"));
+    let skips_b = metrics_b.skips.lock().unwrap().clone();
+    assert!(
+        skips_b.contains(&(guarded_id.to_string(), "condition_unmet".to_string())),
+        "expected a condition_unmet skip for the guarded trigger, got {skips_b:?}"
+    );
+
+    // ── Redelivery of B's terminal: resolved-skip stays skipped (AC5). ─────
+    let metrics_redeliver = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_redeliver),
+    )
+    .await
+    .unwrap();
+    // Still no target, no second skip metric — the dedupe signal fires instead.
+    assert_eq!(target_exec_count(&mut conn, guarded_id, source_b).await, 0);
+    assert!(metrics_redeliver.skips.lock().unwrap().is_empty());
+    let fires_redeliver = metrics_redeliver.fires.lock().unwrap().clone();
+    assert!(
+        fires_redeliver.contains(&(guarded_id.to_string(), "deduped".to_string())),
+        "expected the redelivered skip to dedupe, got {fires_redeliver:?}"
+    );
+
+    // ── Skip-then-loosen: a `condition_unmet` resolution is FINAL (AC5). ───
+    // Loosening the condition to one B's output would now satisfy and
+    // redelivering the terminal must never late-fire — the resolved-skip row
+    // dedupes exactly like a fire.
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(guarded_id))
+            .set(triggers_dsl::condition.eq(Some(json!({
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 100}
+            }))))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let metrics_loosened = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_loosened),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        target_exec_count(&mut conn, guarded_id, source_b).await,
+        0,
+        "a skipped terminal must never late-fire after a condition edit"
+    );
+    assert!(metrics_loosened.skips.lock().unwrap().is_empty());
+    let fires_loosened = metrics_loosened.fires.lock().unwrap().clone();
+    assert!(
+        fires_loosened.contains(&(guarded_id.to_string(), "deduped".to_string())),
+        "expected the loosened-condition redelivery to dedupe, got {fires_loosened:?}"
+    );
+}
+
+/// issue #810 fail-closed contract: an unparseable stored condition never
+/// fires the target — the skip increments the counter with the distinct
+/// `condition_invalid` reason and the terminal commit never errors. No fires
+/// row is written (mirroring the `validation_failed` precedent), so the pair
+/// is left *unresolved* rather than durably suppressed: a later re-entry into
+/// evaluation re-evaluates it and can still fire once the condition is
+/// repaired — a mixed-version deploy window can never durably resolve the
+/// pair. Note the honest recovery contract (PR #972 review): production has
+/// no scanner that re-visits unresolved pairs, so such a re-entry is NOT
+/// guaranteed — this test invokes evaluation again by hand to pin that a
+/// re-entry, when one happens, is never wedged by the earlier skip.
+#[tokio::test]
+async fn test_invalid_stored_condition_fails_closed() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Corrupt the stored condition directly (bypasses both registration
+    // validators, simulating a row written by a different/newer build).
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(trigger_id))
+            .set(triggers_dsl::condition.eq(Some(json!({"type": "Regex", "data": {}}))))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    let metrics = GuardCapturingMetrics::default();
+    let source = start_and_complete_source(&mut conn, "guard-src-invalid", json!({"x": 1})).await;
+    evaluate_triggers_for_execution(&mut conn, source, TerminalState::Completed, Some(&metrics))
+        .await
+        .unwrap();
+
+    // No target start, no fires row (the pair stays unresolved, not durably
+    // suppressed), but the skip counter fired with the distinct reason.
+    assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 0);
+    assert!(
+        load_fire_row(&mut conn, source, trigger_id).await.is_none(),
+        "an invalid-condition skip must not write a permanent fires row"
+    );
+    let skips = metrics.skips.lock().unwrap().clone();
+    assert_eq!(
+        skips,
+        vec![(trigger_id.to_string(), "condition_invalid".to_string())]
+    );
+
+    // Manual re-entry after the operator repairs the condition (or the fleet
+    // is upgraded to a build that understands it): the pair is still
+    // re-evaluable and fires normally — never wedged by the earlier skip.
+    // (Production offers no guaranteed re-entry for an already-terminal
+    // execution; this pins the *can still fire* half of the contract.)
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(trigger_id))
+            .set(triggers_dsl::condition.eq(Some(
+                json!({"type": "Eq", "data": {"path": "x", "value": 1}}),
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let metrics_fixed = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source,
+        TerminalState::Completed,
+        Some(&metrics_fixed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 1);
+    let fired_row = load_fire_row(&mut conn, source, trigger_id).await.unwrap();
+    assert_eq!(fired_row.outcome, None);
+    assert!(metrics_fixed.skips.lock().unwrap().is_empty());
+}
+
+/// issue #810 registration surface: invalid condition JSON is rejected with a
+/// 400 JSON error — unknown operator, over-cap, and malformed-path all via the
+/// handler's explicit `decode_trigger_condition` (the field rides the request
+/// as raw JSON precisely so axum's typed Json extractor can't surface an
+/// unknown operator as a 422 plain-text rejection) — never silently dropped;
+/// a valid condition round-trips through GET.
+#[tokio::test]
+async fn test_condition_registration_rejects_invalid_with_400() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Unknown operator → 400 (handler-level decode; a typed Json-extractor
+    // field would instead return axum's 422 with a plain-text body).
+    let (status, _) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": {"type": "Regex", "data": {"path": "a", "value": ".*"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Over the nesting-depth cap → 400 (explicit validate()).
+    let mut over_deep = json!({"type": "Exists", "data": {"path": "a"}});
+    for _ in 0..autumn_harvest::MAX_CONDITION_DEPTH {
+        over_deep = json!({"type": "All", "data": [over_deep]});
+    }
+    let (status, body) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": over_deep
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    // Malformed dotted path → 400.
+    let (status, _) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": {"type": "Exists", "data": {"path": "a..b"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nothing was registered by the rejected attempts; a valid guarded
+    // registration lands and the list endpoint echoes the condition.
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list, json!([]));
+    let (status, created) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": {"type": "In", "data": {"path": "region", "values": ["EU", "UK"]}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["condition"]["type"], "In");
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["condition"]["data"]["path"], "region");
+
+    // Full-replacement upsert semantics: re-POSTing the same trigger id
+    // WITHOUT a `condition` clears the stored guard (the trigger reverts to
+    // unconditional) — pinned so the documented footgun stays documented-true.
+    let trigger_id = created["id"].as_str().unwrap().to_string();
+    let (status, replaced) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(replaced["condition"], serde_json::Value::Null);
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["condition"], serde_json::Value::Null);
 }

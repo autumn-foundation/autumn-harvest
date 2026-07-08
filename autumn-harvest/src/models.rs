@@ -964,6 +964,8 @@ pub struct CompletionTriggerDb {
     pub is_static: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Optional output guard AST (issue #810). NULL = unconditional.
+    pub condition: Option<serde_json::Value>,
 }
 
 /// Insertable model for registering/creating a completion trigger.
@@ -977,6 +979,8 @@ pub struct NewCompletionTriggerDb {
     pub input_mapping: serde_json::Value,
     pub queue_name: Option<String>,
     pub is_static: bool,
+    /// Optional output guard AST (issue #810). NULL = unconditional.
+    pub condition: Option<serde_json::Value>,
 }
 
 /// Queryable model representing a fired completion trigger event instance.
@@ -987,6 +991,9 @@ pub struct CompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
     pub fired_at: DateTime<Utc>,
+    /// NULL = fired; `condition_unmet` / `condition_invalid` =
+    /// resolved-skipped by the output guard (issue #810).
+    pub outcome: Option<String>,
 }
 
 /// Insertable model for registering a fired completion trigger.
@@ -995,6 +1002,8 @@ pub struct CompletionTriggerFireDb {
 pub struct NewCompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
+    /// NULL = fired; Some(reason) = resolved-skipped (issue #810).
+    pub outcome: Option<String>,
 }
 
 /// Queryable model representing a deferred completion trigger outbox task.

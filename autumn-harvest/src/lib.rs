@@ -224,7 +224,10 @@ pub use calendar::{
 pub use calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
-pub use completion_trigger::{CompletionTrigger, InputMapping, TerminalState};
+pub use completion_trigger::{
+    CompletionTrigger, ConditionGate, InputMapping, MAX_CONDITION_DEPTH, MAX_CONDITION_IN_VALUES,
+    MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
+};
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
     DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder, RaceWinner, Session, SessionOptions,
