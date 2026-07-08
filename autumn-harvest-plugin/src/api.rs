@@ -14381,48 +14381,98 @@ async fn get_schedule_decisions(
 /// echo `next_run_at` and, critically, `404` an unknown id rather than returning a
 /// silently-empty run list (issue #762).
 ///
-/// A not-found result is `404` only when every shard was reachable; if any shard
-/// was unreachable the row's existence is indeterminate, so it returns `503`
-/// rather than lying with a definitive `404` (issue #762 review). Never `500`.
+/// A not-found result is `404` only when every *expected* shard — every shard
+/// with a live pool **and** every shard the router already knows about — was
+/// queried successfully; if any expected shard could not be checked (no
+/// configured pool yet mid a shard-add rollout, an unreachable connection, or a
+/// per-shard lookup error) the row's existence is indeterminate, so it returns
+/// `503` rather than lying with a definitive `404` (issue #762 review). Never
+/// `500`.
+///
+/// The 404-vs-503 decision itself is the pure [`resolve_not_found_outcome`] so
+/// it can be unit-tested without a database or shard fan-out.
 async fn resolve_schedule_for_runs(
-    pool: &HarvestDbPool,
+    api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
 ) -> Result<HarvestSchedule, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
+    // Consult every shard the router knows about, not just those with a live
+    // pool — a shard mid a shard-add rollout (readable_shards widened before
+    // this process has its pool wired up) must count as unreachable, not be
+    // silently omitted. Mirrors `workflow_reachability`/`workflow_count`.
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
+
     let mut any_shard_unreachable = false;
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for shard_id in &expected {
+        // Router-known but poolless (mid shard-add): can't check it, so treat
+        // it as unreachable — a not-found result becomes 503-indeterminate
+        // rather than an authoritative 404.
+        let Some(shard_pool) = pools.get(shard_id) else {
+            any_shard_unreachable = true;
+            continue;
+        };
         // An unreachable shard is skipped rather than 500ing the whole request
         // (mirroring the run fan-out's partial-result philosophy).
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             any_shard_unreachable = true;
             continue;
         };
-        let row: Option<HarvestSchedule> = dsl::harvest_schedules
+        let row: Result<Option<HarvestSchedule>, _> = dsl::harvest_schedules
             .find(schedule_id)
             .select(HarvestSchedule::as_select())
             .first(&mut conn)
             .await
-            .optional()
-            .map_err(database_error)
-            .map_err(map_error)?;
-        if let Some(row) = row {
-            return Ok(row);
+            .optional();
+        match row {
+            Ok(Some(row)) => return Ok(row),
+            Ok(None) => {}
+            // A per-shard lookup error (DB restarted after checkout, shard
+            // mid-migration) is treated like an unreachable shard: mark it and
+            // keep scanning, so a schedule living on a *later* healthy shard is
+            // still resolved instead of returning a blanket 503.
+            Err(_) => any_shard_unreachable = true,
         }
     }
 
-    if any_shard_unreachable {
-        // Not found, but at least one shard was unreachable — existence is
-        // indeterminate. Never lie with a 404, never 500.
-        Err(AutumnError::service_unavailable_msg(format!(
-            "cannot determine whether schedule {schedule_id} exists: one or more \
-             shards are unreachable; retry once shards recover"
-        )))
-    } else {
-        // Not found and every shard was reachable — genuinely unknown.
-        Err(AutumnError::not_found_msg(format!(
+    match resolve_not_found_outcome(any_shard_unreachable) {
+        // Not found, but at least one expected shard could not be checked —
+        // existence is indeterminate. Never lie with a 404, never 500.
+        ScheduleExistenceOutcome::Indeterminate => {
+            Err(AutumnError::service_unavailable_msg(format!(
+                "cannot determine whether schedule {schedule_id} exists: one or more \
+                 shards are unreachable; retry once shards recover"
+            )))
+        }
+        // Not found and every expected shard was reachable — genuinely unknown.
+        ScheduleExistenceOutcome::NotFound => Err(AutumnError::not_found_msg(format!(
             "schedule {schedule_id}"
-        )))
+        ))),
+    }
+}
+
+/// The 404-vs-503 decision for a not-found schedule lookup (issue #762 review).
+///
+/// Pure so it can be unit-tested without a database or shard fan-out.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ScheduleExistenceOutcome {
+    /// Every expected shard was queried successfully and none had the row — the
+    /// id is genuinely unknown, so an authoritative `404`.
+    NotFound,
+    /// The row wasn't found but at least one expected shard could not be checked
+    /// (no configured pool, unreachable connection, or a per-shard lookup
+    /// error) — existence is indeterminate, so `503` rather than a lying `404`.
+    Indeterminate,
+}
+
+/// Decide 404 vs 503 for a not-found schedule: an authoritative `404` only when
+/// every expected shard was checked successfully, otherwise `503`.
+const fn resolve_not_found_outcome(any_shard_unreachable: bool) -> ScheduleExistenceOutcome {
+    if any_shard_unreachable {
+        ScheduleExistenceOutcome::Indeterminate
+    } else {
+        ScheduleExistenceOutcome::NotFound
     }
 }
 
@@ -14464,7 +14514,10 @@ async fn list_schedule_runs_handler(
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let schedule = resolve_schedule_for_runs(&pool, schedule_id).await?;
+    // Existence + next_run_at resolution consults the full expected shard set
+    // (router ∪ pools), so it 503s rather than 404s when a shard couldn't be
+    // checked; the runs fan-out below keeps its own partial/complete status.
+    let schedule = resolve_schedule_for_runs(&api_state, schedule_id).await?;
     let next_run_at = schedule.next_run_at;
 
     // Fetch limit + 1 per shard so the merge can detect whether a further page
@@ -26335,6 +26388,24 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// A not-found schedule is an authoritative 404 only when every expected
+    /// shard was successfully checked; if any expected shard could not be
+    /// checked (unreachable, per-shard lookup error, or no configured pool) the
+    /// row's existence is indeterminate → 503, never a lying 404 (issue #762).
+    #[test]
+    fn resolve_not_found_outcome_maps_reachability_to_404_or_503() {
+        assert_eq!(
+            resolve_not_found_outcome(false),
+            ScheduleExistenceOutcome::NotFound,
+            "all expected shards checked, none had the row → authoritative 404"
+        );
+        assert_eq!(
+            resolve_not_found_outcome(true),
+            ScheduleExistenceOutcome::Indeterminate,
+            "an expected shard could not be checked → 503 indeterminate"
+        );
     }
 
     /// A typo'd field name on the PATCH body must be a deserialization error

@@ -843,3 +843,77 @@ async fn schedule_on_down_shard_is_indeterminate_not_404() {
         "existence is indeterminate while a shard is down; must be 503, not 404, got body {body:?}"
     );
 }
+
+#[tokio::test]
+async fn lookup_error_on_earlier_shard_still_resolves_on_later_shard() {
+    // issue #762 review (finding 2): a per-shard schedule-lookup ERROR (as opposed
+    // to an unreachable connection) on an earlier-queried shard must NOT
+    // short-circuit the request with a blanket 503. The existence scan continues,
+    // so a schedule living on a *later* healthy shard is still resolved (200).
+    //
+    // Shard 0's database is created but never migrated, so its `harvest_schedules`
+    // SELECT errors ("relation does not exist") — the connection acquires fine, it
+    // is the query that fails, exercising the new `Err(_) => continue` arm rather
+    // than the acquire-failure arm. Shard 1 is healthy and owns the schedule.
+    //
+    // NB: the router-known-but-poolless shard case (finding 1) funnels into the
+    // same `any_shard_unreachable` flag + `resolve_not_found_outcome` decision but
+    // cannot be modelled here — `build_app` installs no runtime, so `api_state`
+    // has no router and `expected_shards` reduces to the live pool keys. That path
+    // is covered by the pure unit test `resolve_not_found_outcome_*` in `api.rs`.
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let empty = format!("harvest_shard_{}", Uuid::new_v4().simple());
+    let healthy = format!("harvest_shard_{}", Uuid::new_v4().simple());
+
+    let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("admin connect");
+    for db in [&empty, &healthy] {
+        diesel::sql_query(format!("CREATE DATABASE {db}"))
+            .execute(&mut admin)
+            .await
+            .expect("create db");
+    }
+    let url0 = format!("postgres://postgres:postgres@{host}:{port}/{empty}");
+    let url1 = format!("postgres://postgres:postgres@{host}:{port}/{healthy}");
+    // Migrate only shard 1; shard 0 stays schema-less so its lookup errors.
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url1)
+            .await
+            .expect("shard connect");
+        diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, INIT_SQL)
+            .await
+            .expect("migrate shard 1");
+    }
+    let sid = Uuid::new_v4();
+    // Schedule lives on the healthy later shard (queried after the erroring one).
+    seed_schedule(&url1, sid, None).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url0));
+    pools.insert(ShardId::new(1), build_pool(&url1));
+    let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let app = build_app(storage);
+
+    let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a lookup error on shard 0 must not blanket-503 when shard 1 owns the \
+         schedule; got body {body:?}"
+    );
+    // The schedule resolved, so next_run_at is present (null here — none seeded)
+    // and the row was found rather than 404/503.
+    assert!(
+        body.get("runs").is_some(),
+        "resolved schedule yields a runs response, got {body:?}"
+    );
+    let _container = container;
+}
