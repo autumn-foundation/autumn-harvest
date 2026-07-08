@@ -747,6 +747,16 @@ type FiredThrottle = (
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
     Vec<(String, String)>,
+    // Whether this fire should count toward `harvest.schedule.runs` (issue
+    // #607 code review): true only when the deferred start carried
+    // schedule-lineage (`schedule_id.is_some()`, set by the scheduler-tick
+    // and buffered/backfill-fire throttle branches) and actually created a
+    // fresh execution, mirroring those callers' own immediate-path gate
+    // (`if outcome.created() { metrics.record_schedule_run(...) }`) so a
+    // throttled scheduled fire is counted exactly once, on the same terms as
+    // an unthrottled one -- never for HTTP-start/batch-originated throttled
+    // fires, which carry no schedule_id and were never counted here either.
+    bool,
 );
 
 /// Delete a single pending throttle row by id.
@@ -852,6 +862,12 @@ async fn fire_claimed_throttle_row(
     let owner = opts.owner;
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
+    // Only a schedule-lineage fire (scheduler-tick / buffered-backfill-fire
+    // throttle branches persist schedule_id) should ever count toward
+    // `harvest.schedule.runs` -- an HTTP-start or batch-originated throttled
+    // fire carries no schedule_id and must not be counted (issue #607 code
+    // review).
+    let is_scheduled_fire = opts.schedule_id.is_some();
 
     let params = crate::execution::StartWorkflowParams {
         workflow_name: &workflow_name,
@@ -921,6 +937,7 @@ async fn fire_claimed_throttle_row(
                 deferred_starts,
                 deferred_checks,
                 cancel_metrics,
+                is_scheduled_fire && started.created,
             )))
         }
         // The workflow_id is already taken under the reuse policy — drop the row
@@ -1058,7 +1075,15 @@ pub async fn fire_due_throttled_starts(
         conn: &mut diesel_async::AsyncPgConnection,
     ) -> usize {
         let count = fired.len();
-        for (workflow_name, queue_name, deferred_starts, deferred_checks, cancel_metrics) in fired {
+        for (
+            workflow_name,
+            queue_name,
+            deferred_starts,
+            deferred_checks,
+            cancel_metrics,
+            is_scheduled_run,
+        ) in fired
+        {
             for start in deferred_starts {
                 start.spawn();
             }
@@ -1078,7 +1103,15 @@ pub async fn fire_due_throttled_starts(
                     crate::telemetry::WorkflowStatus::Cancelled,
                 );
             }
-            let _ = (&workflow_name, &queue_name);
+            // A throttled scheduler-tick / buffered-backfill-fire dispatch is
+            // counted here, on the same terms its immediate-path sibling
+            // uses (`if outcome.created() { metrics.record_schedule_run(...) }`)
+            // -- otherwise `harvest.schedule.runs` silently undercounts every
+            // scheduled slot that happened to defer (issue #607 code review).
+            if is_scheduled_run {
+                metrics.record_schedule_run("workflow", &workflow_name);
+            }
+            let _ = &queue_name;
         }
         count
     }

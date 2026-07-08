@@ -199,6 +199,12 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260707000000_harvest_start_throttle_bucket_deferred_idx/up.sql"
     ),
+    "\n",
+    // issue #607 code review: index for the (workflow_name, workflow_id)
+    // idempotent-retry lookup.
+    include_str!(
+        "../../autumn-harvest/migrations/20260708000000_harvest_start_throttle_workflow_id_idx/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;

@@ -96,6 +96,18 @@ fn is_valid_rate(s: &str) -> bool {
     n.is_finite() && n > 0.0 && matches!(unit.trim(), "s" | "m" | "h")
 }
 
+/// The per-period count of an already-validated rate string (e.g. `"100/m"`
+/// -> `100.0`, `"0.5/s"` -> `0.5`). Only call after [`is_valid_rate`] has
+/// confirmed the string is well-formed -- mirrors
+/// `autumn_harvest::throttle::RateSpec::per_period_count`'s runtime parsing
+/// so the macro's compile-time check agrees with `ThrottlePolicy::from_rate_str`'s
+/// defaulted-burst rejection (issue #607 code review).
+fn rate_per_period_count(s: &str) -> f64 {
+    s.split_once('/')
+        .and_then(|(count, _unit)| count.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
     /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
@@ -353,6 +365,22 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     "throttle requires `rate = \"...\"` (e.g. `rate = \"100/m\"`)",
                 )
             })?;
+            // A sub-unit rate (e.g. "0.5/s") with no explicit `burst` would
+            // default the bucket capacity to that same sub-one value, which
+            // can never successfully debit a token -- `ThrottlePolicy::
+            // from_rate_str` rejects this at runtime, but by then the
+            // generated companion function's `.expect(...)` panics at
+            // workflow-registration time instead of failing to compile.
+            // Reject it here instead (issue #607 code review).
+            if burst.is_none() && rate_per_period_count(&rate) < 1.0 {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "throttle rate '{rate}' has a per-period count below 1.0; \
+                         pass an explicit burst >= 1.0 to use a sub-unit rate"
+                    ),
+                ));
+            }
             result.throttle = Some(ThrottleArgs {
                 rate,
                 burst,

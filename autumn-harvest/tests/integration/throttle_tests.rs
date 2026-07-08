@@ -153,6 +153,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../migrations/20260707000000_harvest_start_throttle_bucket_deferred_idx/up.sql"
     ),
+    "\n",
+    // issue #607 code review: index for the (workflow_name, workflow_id)
+    // idempotent-retry lookup.
+    include_str!("../../migrations/20260708000000_harvest_start_throttle_workflow_id_idx/up.sql"),
 );
 
 // ── Metrics recorder ─────────────────────────────────────────────────────────
@@ -160,6 +164,7 @@ const INIT_SQL: &str = concat!(
 #[derive(Debug, Default)]
 struct RecordingMetrics {
     throttled: Mutex<Vec<String>>,
+    schedule_runs: Mutex<Vec<(String, String)>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
@@ -168,6 +173,13 @@ impl MetricsRecorder for RecordingMetrics {
             .lock()
             .unwrap()
             .push(workflow_name.to_owned());
+    }
+
+    fn record_schedule_run(&self, kind: &str, name: &str) {
+        self.schedule_runs
+            .lock()
+            .unwrap()
+            .push((kind.to_owned(), name.to_owned()));
     }
 }
 
@@ -1861,5 +1873,137 @@ async fn buffered_drain_drops_oversized_slot_before_deferring() {
     assert!(
         remaining.is_empty(),
         "the oversized slot must be dropped, not left in buffered_runs to retry forever: {remaining:?}"
+    );
+}
+
+// ── Schedule-run metric on a throttled fire (issue #607 code review) ───────
+//
+// The scheduler-tick and buffered/backfill-fire throttle branches persist
+// `schedule_id`/`scheduled_for`/`origin` into the deferred row's
+// `start_options` so the eventual scanner-driven fire is attributed exactly
+// as an immediate fire would be (carryover, run-history). That attribution
+// must extend to `harvest.schedule.runs` too -- otherwise every scheduled
+// slot that happened to defer silently undercounts the metric even though
+// it is later dispatched.
+
+#[tokio::test]
+async fn scanner_fire_of_a_scheduled_deferral_records_schedule_run_metric() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+    let key = "sched-key";
+    let bkey = bucket_key(wf, key);
+    let wf_id = "scheduled-deferred-job";
+
+    // Drain the sole burst token first (burst must be >= 1.0 -- a bucket
+    // capacity of 0.0 could never debit a token no matter what
+    // `set_bucket_tokens` sets afterward, since the debit query caps refill
+    // at `burst`) so the real admission below genuinely defers.
+    reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf,
+            throttle_key: key,
+            workflow_id: "seed",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("seed consumes the burst token");
+
+    let admit = reserve_or_defer(
+        &mut conn,
+        AdmitThrottleParams {
+            workflow_name: wf,
+            throttle_key: key,
+            workflow_id: wf_id,
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: DebounceStartOptions {
+                schedule_id: Some(Uuid::new_v4()),
+                origin: Some("scheduled".to_string()),
+                ..Default::default()
+            },
+            refill_per_sec: 0.0001,
+            burst: 1.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+
+    // Refill exactly to the bucket's capacity so the scanner can fire it.
+    set_bucket_tokens(&mut conn, &bkey, 1.0).await;
+
+    let fired = drain(&mut conn, &metrics).await;
+    assert_eq!(fired, 1);
+    assert_eq!(
+        *metrics.schedule_runs.lock().unwrap(),
+        vec![("workflow".to_string(), wf.to_string())],
+        "a throttled scheduled fire must record exactly one schedule-run metric"
+    );
+}
+
+#[tokio::test]
+async fn scanner_fire_of_a_non_scheduled_deferral_does_not_record_schedule_run_metric() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+    let wf = "sync_tenant";
+    let key = "http-key";
+    let bkey = bucket_key(wf, key);
+    let wf_id = "http-deferred-job";
+
+    // Drain the sole burst token first (see comment above).
+    reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            "seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed consumes the burst token");
+
+    // Mirrors an HTTP-start/batch-originated throttled admission: no
+    // schedule_id in start_options.
+    let admit = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("defers");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+
+    set_bucket_tokens(&mut conn, &bkey, 1.0).await;
+
+    let fired = drain(&mut conn, &metrics).await;
+    assert_eq!(fired, 1);
+    assert!(
+        metrics.schedule_runs.lock().unwrap().is_empty(),
+        "an HTTP/batch-originated (non-scheduled) throttled fire must not \
+         record a schedule-run metric"
     );
 }
