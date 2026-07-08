@@ -56,6 +56,13 @@ pub const ERROR_TYPE_SESSION_BROKEN: &str = "SessionBroken";
 /// to tell an operator intervention apart from a genuine activity error.
 /// Always non-retryable: the override skips every remaining retry attempt
 /// regardless of retry policy.
+///
+/// This error type is engine-reserved for the operator force-fail endpoint:
+/// activity code that fabricates it (returns an `ActivityFailure` carrying
+/// this type itself) will make a later fail-now call misreport
+/// `already_forced: true` instead of the documented `409` — harmless at the
+/// state-machine level (the idempotent branch performs zero writes) but
+/// misleading in the response.
 pub const ERROR_TYPE_OPERATOR_FORCE_FAILED: &str = "OperatorForceFailed";
 
 /// Typed failure carrier for activity handlers.
@@ -160,6 +167,12 @@ impl ActivityFailure {
     /// The operator-supplied `reason` (if any) is appended to the message and
     /// carried in `details.reason` so workflow code and audit trails can read
     /// it back.
+    ///
+    /// [`ERROR_TYPE_OPERATOR_FORCE_FAILED`] is engine-reserved for the
+    /// force-fail endpoint: activity code that fabricates this failure itself
+    /// will make a later fail-now call misreport `already_forced: true`
+    /// instead of the documented `409` (harmless — zero writes — but
+    /// misleading).
     #[must_use]
     pub fn operator_force_failed(reason: Option<&str>) -> Self {
         let mut details = serde_json::json!({ "forced_by_operator": true });

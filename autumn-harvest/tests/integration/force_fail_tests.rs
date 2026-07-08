@@ -239,6 +239,29 @@ async fn insert_running_activity_task(
     task_id
 }
 
+/// Insert a claimed, in-flight (RUNNING) activity task row with a NULL
+/// `activity_id` — the legacy pre-#516 row shape whose pending event is
+/// resolved by the name-based fallback in `pending_activity_id_for_task`.
+async fn insert_legacy_running_activity_task(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Uuid {
+    let task_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, input, state, \
+          attempt, max_attempts, worker_id, started_at) \
+         VALUES ($1, 'default', 'activity', $2, 'hung_activity', '{}'::jsonb, 'RUNNING', \
+                 1, 5, 'hung-worker', NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("insert legacy running activity task");
+    task_id
+}
+
 /// Insert a parked workflow task (state RUNNING, `worker_id` NULL,
 /// `started_at` NULL — the shape `wake_workflow_task`'s primary re-pend
 /// targets).
@@ -277,6 +300,42 @@ async fn load_task_row(conn: &mut AsyncPgConnection, task_id: Uuid) -> TaskRow {
         .get_result::<TaskRow>(conn)
         .await
         .expect("task row query")
+}
+
+#[derive(QueryableByName)]
+struct ExecStateRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+}
+
+async fn execution_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
+    diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .get_result::<ExecStateRow>(conn)
+        .await
+        .expect("execution state query")
+        .state
+}
+
+/// Append a terminal `ActivityCompleted` event for `activity_id` on top of
+/// the two seed events (`WorkflowStarted` + `ActivityScheduled`).
+async fn append_activity_completed(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+) {
+    let history = store::load_history(conn, exec_id).await.expect("history");
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("done"),
+        }],
+        history.next_event_id,
+    )
+    .await
+    .expect("append terminal event");
 }
 
 fn count_activity_failed_events(events: &[WorkflowEvent], activity_id: ActivityExecId) -> usize {
@@ -350,6 +409,14 @@ async fn running_task_is_force_failed() {
         }
         other => panic!("expected ActivityFailed, got {other:?}"),
     }
+
+    // The owning workflow is NOT terminated: it advances to its own
+    // failure/compensation path, so the execution row stays RUNNING.
+    assert_eq!(
+        execution_state(&mut conn, exec_id).await,
+        "RUNNING",
+        "force-fail must never terminate the owning execution"
+    );
 }
 
 #[tokio::test]
@@ -436,6 +503,23 @@ async fn second_call_is_idempotent_no_op() {
         1,
         "re-issuing the call must not append a second terminal event"
     );
+
+    // Zero-writes idempotency: the stored task-row envelope still carries the
+    // FIRST call's reason — the second call's "second" reason was never
+    // persisted anywhere.
+    let row = load_task_row(&mut conn, task_id).await;
+    let stored = row.error.expect("forced row stores the failure envelope");
+    let full = parse_error_payload_full(&stored);
+    assert!(
+        full.message.contains("first"),
+        "stored envelope must keep the first reason, got: {}",
+        full.message
+    );
+    assert!(
+        !full.message.contains("second"),
+        "the idempotent no-op must not overwrite the stored reason, got: {}",
+        full.message
+    );
 }
 
 // ── conflicts (409) ──────────────────────────────────────────────────────────
@@ -502,6 +586,113 @@ async fn genuinely_failed_task_returns_conflict() {
         matches!(result, Err(HarvestError::Config(_))),
         "FAILED-with-genuine-error task must conflict (NOT idempotent success), got: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn terminal_execution_returns_conflict() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let activity_id = ActivityExecId::new();
+    seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
+    // Stray RUNNING activity row on a FAILED execution — reachable because a
+    // plain workflow failure does NOT fail open activity rows.
+    let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', error = 'wf boom' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal execution FAILED");
+
+    let events_before = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history")
+        .events
+        .len();
+
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
+    assert!(
+        matches!(result, Err(HarvestError::Config(_))),
+        "terminal execution must conflict (409) — a sealed run's history must \
+         never grow another ActivityFailed, got: {result:?}"
+    );
+
+    // Zero writes: task row untouched, no event appended.
+    let row = load_task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "RUNNING", "task row must be untouched");
+    let events_after = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history")
+        .events
+        .len();
+    assert_eq!(events_after, events_before, "no event may be appended");
+}
+
+#[tokio::test]
+async fn terminal_history_with_running_row_returns_conflict() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let activity_id = ActivityExecId::new();
+    seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
+    // History already carries a terminal event for the activity while the
+    // task row is (anomalously) still RUNNING.
+    append_activity_completed(&mut conn, exec_id, activity_id).await;
+    let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
+
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
+    assert!(
+        matches!(result, Err(HarvestError::Config(_))),
+        "terminal-in-history must conflict (409) — a second terminal event \
+         for the same activity_id is never appended, got: {result:?}"
+    );
+
+    // Task row untouched; history still carries exactly ONE terminal event
+    // for the activity (the seeded ActivityCompleted).
+    let row = load_task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "RUNNING", "task row must be untouched");
+    let history = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history");
+    let terminal = history
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ActivityCompleted { activity_id: id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id: id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id: id, .. }
+                    if *id == activity_id
+            )
+        })
+        .count();
+    assert_eq!(
+        terminal, 1,
+        "history must still carry exactly one terminal event for the activity"
+    );
+}
+
+#[tokio::test]
+async fn legacy_task_terminal_history_returns_conflict_not_404() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let activity_id = ActivityExecId::new();
+    seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
+    append_activity_completed(&mut conn, exec_id, activity_id).await;
+    // Legacy row shape: activity_id NULL — resolution falls back to the
+    // name-based lookup, whose NotFound must NOT leak through as a 404 for
+    // the terminal-in-history case (it is the same documented 409 as the
+    // id-resolved branch).
+    let task_id = insert_legacy_running_activity_task(&mut conn, exec_id).await;
+
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
+    assert!(
+        matches!(result, Err(HarvestError::Config(_))),
+        "legacy terminal-in-history must be a 409 Config, not a 404 NotFound, got: {result:?}"
+    );
+    let row = load_task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "RUNNING", "task row must be untouched");
 }
 
 #[tokio::test]

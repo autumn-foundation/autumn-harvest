@@ -360,6 +360,25 @@ fn find_pending_scheduled_activity_by_id(
     }
 }
 
+/// `true` when any `ActivityScheduled` event named `activity_name` already
+/// has a terminal event (`ActivityCompleted`/`ActivityFailed`/
+/// `ActivityTimedOut`) recorded in `history`.
+///
+/// Used by [`force_fail_activity`]'s legacy-row branch (`activity_id = NULL`
+/// on the task row): the name-based fallback in
+/// [`pending_activity_id_for_task`] reports "no pending activity" as
+/// `NotFound` without distinguishing "never scheduled" from "already
+/// terminal", and only the latter is the documented `409` conflict.
+fn named_activity_has_terminal_event(history: &[WorkflowEvent], activity_name: &str) -> bool {
+    history.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::ActivityScheduled { activity_id, name, .. }
+                if name == activity_name && has_activity_terminal_event(history, *activity_id)
+        )
+    })
+}
+
 fn has_activity_terminal_event(
     history: &[WorkflowEvent],
     activity_id: crate::types::ActivityExecId,
@@ -878,6 +897,17 @@ enum ForceFailClassification {
     NotRunning,
 }
 
+/// The `409` returned when a force-fail target's history already carries a
+/// terminal event for the activity. Shared by [`force_fail_activity`]'s
+/// id-resolved (`Ok(None)`) and legacy name-resolved branches so the two
+/// paths cannot drift apart.
+fn terminal_history_conflict(activity_name: &str, task_id: uuid::Uuid) -> HarvestError {
+    HarvestError::Config(format!(
+        "activity '{activity_name}' (task {task_id}) already has a terminal \
+         event recorded in history; refusing to append a second terminal event"
+    ))
+}
+
 fn classify_force_fail_target(
     task_type: &str,
     state: &str,
@@ -937,20 +967,43 @@ fn classify_force_fail_target(
 /// - **No DLQ row** is inserted, matching `finalize_activity_failure`'s
 ///   deliberate non-DLQ posture for activity failures (an activity DLQ entry
 ///   would be un-replayable once a terminal `ActivityFailed` event exists).
+/// - **Terminal executions are guarded**: if the owning execution is already
+///   in a terminal state per [`crate::erase::is_terminal_state`]
+///   (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/
+///   `TERMINATED`), this returns a `409` conflict without
+///   touching the task row — a sealed run's history must never grow another
+///   `ActivityFailed` after its terminal event. A stray `RUNNING` activity
+///   row on a terminal execution is reachable (a plain workflow failure does
+///   NOT fail open activity rows), so this guard is load-bearing, not
+///   theoretical. The guard also wins over the idempotent already-forced
+///   short-circuit: a retried fail-now against a since-sealed run reports
+///   the terminal conflict (still zero writes) rather than
+///   `already_forced: true`.
 /// - If the row is still `RUNNING` but history already carries a terminal
 ///   event for the activity (a state [`enforce_activity_timeout`] treats as
 ///   a no-op), this returns a `409` conflict instead of appending — the
 ///   invariant is that a second terminal event for the same `activity_id` is
-///   never appended.
+///   never appended. This state is believed unreachable via engine paths
+///   (every terminal-event appender flips the row inside the same locked
+///   transaction), so the `409` is a defensive invariant guard; the stuck
+///   `RUNNING` row only reconciles if the in-flight worker attempt
+///   eventually returns.
+/// - **Workflow-level retry (issue #523) interaction**: if the owning
+///   workflow has a workflow-level retry policy and propagates this error to
+///   workflow failure, the run is retried fresh and the activity
+///   re-dispatched — use cancel/terminate instead if the goal is to stop the
+///   run.
 ///
 /// # Errors
 ///
 /// - [`HarvestError::NotFound`] (→ 404) — unknown execution, unknown task
 ///   id, or a task belonging to a different workflow.
-/// - [`HarvestError::Config`] (→ 409 via `conflict_from`) — a workflow task
-///   rather than an activity task, or any non-RUNNING state that is not the
-///   idempotent already-forced case.
+/// - [`HarvestError::Config`] (→ 409 via `conflict_from`) — the owning
+///   execution is already terminal, a workflow task rather than an activity
+///   task, or any non-RUNNING state that is not the idempotent
+///   already-forced case.
 /// - [`HarvestError::Database`] — Postgres error.
+#[allow(clippy::too_many_lines)]
 pub async fn force_fail_activity(
     conn: &mut AsyncPgConnection,
     workflow_exec_id: uuid::Uuid,
@@ -968,7 +1021,7 @@ pub async fn force_fail_activity(
             // Lock ordering (harvest_task_queue convention, see the comment in
             // `enforce_external_task_timeouts`): execution row FIRST, then the
             // task row.
-            let (_execution, history) =
+            let (execution, history) =
                 lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
 
             let task: Option<TaskQueueItem> = dsl::harvest_task_queue
@@ -985,6 +1038,24 @@ pub async fn force_fail_activity(
                     "activity task {task_id} not found for workflow {workflow_exec_id}"
                 )));
             };
+
+            // Terminal-execution guard: a sealed run's history must never
+            // grow another `ActivityFailed` after its terminal event (a plain
+            // workflow failure does NOT fail open activity rows, so a stray
+            // RUNNING row on a FAILED execution is reachable), and an
+            // operator retrying a fail-now script against a run that has
+            // since sealed must get an honest conflict rather than a
+            // misleading `202`. Checked after the task-existence check so an
+            // unknown task id still reports `404` first, and before
+            // classification so even the zero-write idempotent
+            // already-forced case reports the terminal conflict.
+            if crate::erase::is_terminal_state(&execution.state) {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {workflow_exec_id} is already terminal ({}); \
+                     its activities cannot be force-failed",
+                    execution.state
+                )));
+            }
 
             match classify_force_fail_target(&task.task_type, &task.state, task.error.as_deref()) {
                 ForceFailClassification::NotAnActivityTask => {
@@ -1020,20 +1091,41 @@ pub async fn force_fail_activity(
                 )));
             };
 
-            let Some(activity_id) =
-                pending_activity_id_for_task(&history.events, &task, &activity_name)?
-            else {
-                // History already carries a terminal event for this activity
-                // even though the row is still RUNNING. Appending here could
-                // double-terminal the activity, so refuse with a conflict —
-                // `enforce_activity_timeout` treats the same edge as a no-op,
-                // and the row will reconcile through the worker's own
-                // finalize path.
-                return Err(HarvestError::Config(format!(
-                    "activity '{activity_name}' (task {task_id}) already has a terminal \
-                     event recorded in history; refusing to append a second terminal event"
-                )));
-            };
+            // History already carrying a terminal event for this activity
+            // while the row is still RUNNING is believed unreachable via
+            // engine paths (every terminal-event appender flips the row in
+            // the same locked transaction), but if it ever occurs — e.g. via
+            // manual surgery — appending here could double-terminal the
+            // activity. Refuse with a defensive-invariant `409` conflict,
+            // mirroring `enforce_activity_timeout`'s no-op treatment of the
+            // same edge; the stuck RUNNING row only reconciles if the
+            // in-flight worker attempt eventually returns.
+            let activity_id =
+                match pending_activity_id_for_task(&history.events, &task, &activity_name) {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        return Err(terminal_history_conflict(&activity_name, task_id));
+                    }
+                    // Legacy rows (`activity_id = NULL`) resolve through the
+                    // name-based fallback, whose `NotFound` cannot distinguish
+                    // "never scheduled" from "already terminal". Map the
+                    // terminal-in-history case onto the same documented `409` as
+                    // the `Ok(None)` branch above instead of letting it
+                    // `?`-propagate as a `404`. `pending_activity_id_for_task`
+                    // itself is deliberately unchanged — its other callers
+                    // (worker finalize, broken-session reclaim) depend on the
+                    // current contract.
+                    Err(HarvestError::NotFound(_))
+                        if task.activity_id.is_none()
+                            && named_activity_has_terminal_event(
+                                &history.events,
+                                &activity_name,
+                            ) =>
+                    {
+                        return Err(terminal_history_conflict(&activity_name, task_id));
+                    }
+                    Err(e) => return Err(e),
+                };
 
             // Build the typed failure once and derive both persisted forms
             // from it: the wire envelope stored on the task row, and the
@@ -2640,6 +2732,78 @@ mod tests {
                 "activity task in state {state} must classify NotRunning"
             );
         }
+    }
+
+    // ── named_activity_has_terminal_event (issue #765, legacy-row 409) ─────
+
+    fn scheduled(name: &str, activity_id: crate::types::ActivityExecId) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: name.to_string(),
+            input: serde_json::Value::Null,
+            queue: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn named_terminal_true_when_scheduled_activity_completed() {
+        let id = crate::types::ActivityExecId::new();
+        let history = vec![
+            scheduled("hung_activity", id),
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id,
+                output: serde_json::Value::Null,
+            },
+        ];
+        assert!(named_activity_has_terminal_event(&history, "hung_activity"));
+    }
+
+    #[test]
+    fn named_terminal_false_when_activity_still_pending() {
+        let id = crate::types::ActivityExecId::new();
+        let history = vec![scheduled("hung_activity", id)];
+        assert!(!named_activity_has_terminal_event(
+            &history,
+            "hung_activity"
+        ));
+    }
+
+    #[test]
+    fn named_terminal_false_when_never_scheduled() {
+        let other = crate::types::ActivityExecId::new();
+        let history = vec![
+            scheduled("other_activity", other),
+            WorkflowEvent::ActivityFailed {
+                activity_id: other,
+                error: "boom".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: false,
+                details: None,
+            },
+        ];
+        assert!(!named_activity_has_terminal_event(
+            &history,
+            "hung_activity"
+        ));
+    }
+
+    #[test]
+    fn named_terminal_true_when_any_same_named_schedule_is_terminal() {
+        // Two scheduled activities share a name; one terminal is enough —
+        // this mirrors the name-based fallback's inability to tell which one
+        // a legacy (activity_id = NULL) task row corresponds to.
+        let a = crate::types::ActivityExecId::new();
+        let b = crate::types::ActivityExecId::new();
+        let history = vec![
+            scheduled("hung_activity", a),
+            scheduled("hung_activity", b),
+            WorkflowEvent::ActivityTimedOut {
+                activity_id: a,
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+        ];
+        assert!(named_activity_has_terminal_event(&history, "hung_activity"));
     }
 
     #[test]
