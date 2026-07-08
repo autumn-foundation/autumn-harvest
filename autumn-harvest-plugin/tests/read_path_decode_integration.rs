@@ -807,6 +807,72 @@ async fn history_export_skips_decode_under_redacted_policy() {
     );
 }
 
+/// PR #936 review: export size enforcement runs on the *decoded* document.
+/// An export whose encoded envelope pushes it over `max_bytes` but whose
+/// decoded form fits must succeed when decoding is enabled, and the reported
+/// `size_limit.actual_bytes` must be the serialized size of the exact
+/// response body (one source of truth). Flag-off keeps the pre-existing
+/// behavior byte-identical: the stored (encoded) document is measured and
+/// rejected with 413.
+#[tokio::test]
+async fn history_export_size_limit_is_enforced_on_the_decoded_document() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "export-size", json!({})).await;
+    // Decoded payload ~3 KB; its base64 envelope is ~4/3 larger, so a 4000
+    // byte limit sits between the decoded (~3.4 KB) and encoded (~4.5 KB)
+    // document sizes.
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: envelope_for(&json!({"blob": "a".repeat(3000)})),
+        }],
+    )
+    .await;
+    mark_completed(&mut conn, exec_id, json!(null)).await;
+
+    let uri = format!("/workflows/{exec_id}/history/export?payload_policy=full&max_bytes=4000");
+
+    // Flag off: the stored (encoded) document is over the limit — rejected,
+    // exactly as before this feature.
+    let flag_off = build_flag_off_app(&pool);
+    let (status, _bytes) = get_raw(&flag_off, &uri).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "flag-off measures the stored (encoded) document, which exceeds max_bytes"
+    );
+
+    // Decode enabled: the decoded document fits, so the export succeeds and
+    // its size accounting reflects the decoded bytes actually returned.
+    let app = build_decode_app(&pool);
+    let (status, bytes) = get_raw(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let document: Value = serde_json::from_slice(&bytes).expect("export document JSON");
+    let actual_bytes = usize::try_from(
+        document["size_limit"]["actual_bytes"]
+            .as_u64()
+            .expect("actual_bytes"),
+    )
+    .expect("actual_bytes fits usize");
+    assert_eq!(
+        actual_bytes,
+        bytes.len(),
+        "actual_bytes must be the serialized size of the exact returned document"
+    );
+    assert!(
+        actual_bytes <= 4000,
+        "the decoded document must fit under max_bytes: {actual_bytes}"
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(&"a".repeat(3000)),
+        "the export must carry the decoded payload"
+    );
+}
+
 /// AC3 (batch): `GET /admin/history/exports?payload_policy=full` decodes each
 /// export entry and writes exactly one audit row for the whole request.
 #[tokio::test]

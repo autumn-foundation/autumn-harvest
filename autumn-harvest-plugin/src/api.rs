@@ -69,7 +69,7 @@ use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::external_task;
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
-    HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
 };
 use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, CompletionTriggerDb, DeadLetter, HarvestCalendar, HarvestSchedule,
@@ -5793,38 +5793,46 @@ async fn export_workflow_history(
         Err(error) => return map_error(error).into_response(),
     };
 
-    match export_history_for_execution(&execution, history.events, &query) {
-        Ok(mut document) => {
-            // Read-path payload decoding (issue #608): Full policy only —
-            // decoding only to redact would be pointless plaintext exposure,
-            // so Redacted exports skip the decoder (and the audit) entirely.
-            if query.payload_policy == HistoryPayloadPolicy::Full
-                && let Some(codecs) =
-                    read_path_decoder(&api_state, extension_session(maybe_session)).await
-            {
-                let mut outcome = LossyDecodeOutcome::default();
-                for event in &mut document.events {
-                    outcome = outcome.merged(codecs.decode_value_lossy(event));
-                }
-                let target = exec_id.to_string();
-                // Reuse the handler's own (execution-shard) connection — a
-                // second pool acquire while it is live can stall a size-1
-                // pool (PR #936 review).
-                audit_decoded_read(
-                    &api_state,
-                    Some(&mut conn),
-                    &headers,
-                    TARGET_WORKFLOW,
-                    Some(&target),
-                    "GET /workflows/{id}/history/export",
-                    Some(exec_id.shard()),
-                    outcome,
-                    None,
-                )
-                .await;
-            }
-            Json(document).into_response()
-        }
+    // Read-path payload decoding (issue #608): Full policy only — decoding
+    // only to redact would be pointless plaintext exposure, so Redacted
+    // exports skip the decoder (and the audit) entirely. The decoder is
+    // resolved *before* the export and threaded into it so decoding happens
+    // ahead of the `max_bytes` measurement (PR #936 review) — the size
+    // enforcement and `size_limit.actual_bytes` reflect the decoded document.
+    let decoder = if query.payload_policy == HistoryPayloadPolicy::Full {
+        read_path_decoder(&api_state, extension_session(maybe_session)).await
+    } else {
+        None
+    };
+    let mut outcome = LossyDecodeOutcome::default();
+    let result = export_history_for_execution(
+        &execution,
+        history.events,
+        &query,
+        decoder.as_ref(),
+        &mut outcome,
+    );
+    if decoder.is_some() {
+        let target = exec_id.to_string();
+        // Reuse the handler's own (execution-shard) connection — a second
+        // pool acquire while it is live can stall a size-1 pool (PR #936
+        // review). Audited even when the export is rejected for size below:
+        // the decode has already happened by then.
+        audit_decoded_read(
+            &api_state,
+            Some(&mut conn),
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            "GET /workflows/{id}/history/export",
+            Some(exec_id.shard()),
+            outcome,
+            None,
+        )
+        .await;
+    }
+    match result {
+        Ok(document) => Json(document).into_response(),
         Err(error) => history_export_error_response(error),
     }
 }
@@ -5839,23 +5847,26 @@ async fn export_workflow_histories(
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    match load_history_exports_from_shards(&api_state, &query).await {
-        Ok(mut response) => {
-            // Read-path payload decoding (issue #608): Full policy only; one
-            // audit row per request, accumulated across every export entry.
-            if query.payload_policy == HistoryPayloadPolicy::Full
-                && let Some(codecs) =
-                    read_path_decoder(&api_state, extension_session(maybe_session)).await
-            {
-                let mut outcome = LossyDecodeOutcome::default();
-                for export in &mut response.exports {
-                    for event in &mut export.events {
-                        outcome = outcome.merged(codecs.decode_value_lossy(event));
-                    }
-                }
+    // Read-path payload decoding (issue #608): Full policy only; one audit
+    // row per request, accumulated across every export entry. The decoder is
+    // threaded into each per-candidate export so decoding happens ahead of
+    // that entry's `max_bytes` measurement (PR #936 review) — size
+    // enforcement and `size_limit.actual_bytes` reflect the decoded bytes.
+    let decoder = if query.payload_policy == HistoryPayloadPolicy::Full {
+        read_path_decoder(&api_state, extension_session(maybe_session)).await
+    } else {
+        None
+    };
+    let mut outcome = LossyDecodeOutcome::default();
+    match load_history_exports_from_shards(&api_state, &query, decoder.as_ref(), &mut outcome).await
+    {
+        Ok(response) => {
+            if decoder.is_some() {
                 // No live connection here: the per-shard export loads are
                 // scoped inside `load_history_exports_from_shards`, so the
-                // pool-acquiring branch is safe (PR #936 review).
+                // pool-acquiring branch is safe (PR #936 review). The
+                // outcome also counts entries that were decoded and then
+                // rejected for size — the decode already happened for them.
                 audit_decoded_read(
                     &api_state,
                     None,
@@ -19256,54 +19267,73 @@ pub(crate) async fn load_stalled_workflows_from_shards(
     Ok(rows)
 }
 
+// `decoder`/`outcome`: read-path payload decoding (issue #608) is applied
+// *inside* the export — before the `max_bytes` measurement — so
+// `size_limit.actual_bytes` and the size rejection always reflect the decoded
+// bytes the caller actually receives, never a stale pre-decode measurement
+// (PR #936 review). The decoder is ignored under the Redacted policy.
 fn export_history_for_execution(
     execution: &WorkflowExecution,
     events: Vec<WorkflowEvent>,
     query: &HistoryExportQuery,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
     let context_headers = execution.context_headers.as_ref().and_then(|v| {
         serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
     });
-    export_history(HistoryExportRequest {
-        workflow_name: execution.workflow_name.clone(),
-        execution_id: ExecutionId::from_uuid(execution.id),
-        shard_id: execution.shard_id,
-        state: execution.state.clone(),
-        events,
-        exported_at: chrono::Utc::now(),
-        payload_policy: query.payload_policy,
-        max_bytes: Some(query.max_bytes),
-        context_headers,
-    })
+    export_history_decoded(
+        HistoryExportRequest {
+            workflow_name: execution.workflow_name.clone(),
+            execution_id: ExecutionId::from_uuid(execution.id),
+            shard_id: execution.shard_id,
+            state: execution.state.clone(),
+            events,
+            exported_at: chrono::Utc::now(),
+            payload_policy: query.payload_policy,
+            max_bytes: Some(query.max_bytes),
+            context_headers,
+        },
+        decoder,
+        outcome,
+    )
 }
 
 fn export_history_for_candidate(
     candidate: &HistoryExportCandidate,
     events: Vec<WorkflowEvent>,
     query: &HistoryExportQuery,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
-    export_history(HistoryExportRequest {
-        workflow_name: candidate.workflow_name.clone(),
-        execution_id: ExecutionId::from_uuid(candidate.id),
-        shard_id: candidate.shard_id,
-        state: candidate.state.clone(),
-        events,
-        exported_at: chrono::Utc::now(),
-        payload_policy: query.payload_policy,
-        max_bytes: Some(query.max_bytes),
-        context_headers: None,
-    })
+    export_history_decoded(
+        HistoryExportRequest {
+            workflow_name: candidate.workflow_name.clone(),
+            execution_id: ExecutionId::from_uuid(candidate.id),
+            shard_id: candidate.shard_id,
+            state: candidate.state.clone(),
+            events,
+            exported_at: chrono::Utc::now(),
+            payload_policy: query.payload_policy,
+            max_bytes: Some(query.max_bytes),
+            context_headers: None,
+        },
+        decoder,
+        outcome,
+    )
 }
 
 async fn load_history_exports_from_shards(
     api_state: &HarvestApiState,
     query: &HistoryBatchExportQuery,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryBatchExportResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut work = HistoryBatchExportWork::default();
 
     collect_history_export_candidates_from_shards(&pool, query, &mut work).await;
-    export_selected_history_candidates(&pool, query, &mut work).await;
+    export_selected_history_candidates(&pool, query, &mut work, decoder, outcome).await;
     if let Some(shard_id) = query.shard_id
         && !work.saw_requested_shard
     {
@@ -19352,6 +19382,8 @@ async fn export_selected_history_candidates(
     pool: &HarvestDbPool,
     query: &HistoryBatchExportQuery,
     work: &mut HistoryBatchExportWork,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
 ) {
     sort_history_export_candidates(&mut work.candidates);
     let single_query = HistoryExportQuery {
@@ -19363,7 +19395,7 @@ async fn export_selected_history_candidates(
         if work.exports.len() >= query.limit {
             break;
         }
-        export_history_candidate(pool, &candidate, &single_query, work).await;
+        export_history_candidate(pool, &candidate, &single_query, work, decoder, outcome).await;
     }
 }
 
@@ -19372,6 +19404,8 @@ async fn export_history_candidate(
     candidate: &HistoryExportCandidate,
     query: &HistoryExportQuery,
     work: &mut HistoryBatchExportWork,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
 ) {
     let shard_id = candidate.shard_id;
     let exec_id = ExecutionId::from_uuid(candidate.id);
@@ -19399,7 +19433,7 @@ async fn export_history_candidate(
             return;
         }
     };
-    match export_history_for_candidate(candidate, history.events, query) {
+    match export_history_for_candidate(candidate, history.events, query, decoder, outcome) {
         Ok(document) => work.exports.push(document),
         Err(HistoryExportError::SizeLimitExceeded {
             actual_bytes,

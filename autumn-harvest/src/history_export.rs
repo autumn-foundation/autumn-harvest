@@ -1,6 +1,7 @@
 //! Export workflow event histories to replay fixtures and Mermaid diagrams.
 
 use crate::event::WorkflowEvent;
+use crate::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use crate::types::ExecutionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -174,10 +175,50 @@ pub enum HistoryExportError {
 pub fn export_history(
     request: HistoryExportRequest,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
+    let mut outcome = LossyDecodeOutcome::default();
+    export_history_decoded(request, None, &mut outcome)
+}
+
+/// [`export_history`] with an optional read-path payload decoder (issue #608).
+///
+/// Under [`HistoryPayloadPolicy::Full`] with `Some(decoder)`, every exported
+/// event is tolerantly decoded ([`PayloadCodecs::decode_value_lossy`])
+/// **before** the document is assembled and measured, so `max_bytes`
+/// enforcement and `size_limit.actual_bytes` reflect the decoded bytes the
+/// caller actually receives — never a stale pre-decode measurement (PR #936
+/// review): a decoded export that fits is not rejected because its encoded
+/// envelopes were over the limit, and a decoded export that exceeds the limit
+/// is rejected instead of shipping oversized while reporting a smaller size.
+///
+/// The decoder is ignored under [`HistoryPayloadPolicy::Redacted`] — redacted
+/// exports replace payload fields wholesale (envelope included) and must
+/// never materialize plaintext. `None` is byte-identical to
+/// [`export_history`].
+///
+/// `outcome` accumulates decode/marker counts (never content) across calls —
+/// including calls that return [`HistoryExportError`], since decoding has
+/// already happened by then — so callers can audit every decode, even one
+/// whose export was subsequently rejected for size.
+///
+/// # Errors
+///
+/// Same as [`export_history`].
+pub fn export_history_decoded(
+    request: HistoryExportRequest,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) -> Result<HistoryExportDocument, HistoryExportError> {
     let max_bytes = request
         .max_bytes
         .unwrap_or(DEFAULT_HISTORY_EXPORT_MAX_BYTES);
-    let events = export_events(&request.events, request.payload_policy)?;
+    let mut events = export_events(&request.events, request.payload_policy)?;
+    if request.payload_policy == HistoryPayloadPolicy::Full
+        && let Some(codecs) = decoder
+    {
+        for event in &mut events {
+            *outcome = outcome.merged(codecs.decode_value_lossy(event));
+        }
+    }
     let mut document = HistoryExportDocument {
         schema: HISTORY_EXPORT_SCHEMA.to_string(),
         version: HISTORY_EXPORT_VERSION,
@@ -1321,6 +1362,151 @@ mod tests {
         assert!(
             !json.contains("_harvest_codec_envelope") && !json.contains("bm90LXJlYWwt"),
             "Redacted export must replace the payload field wholesale, envelope included: {json}"
+        );
+        assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
+    }
+
+    // --- issue #608, PR #936 review: `export_history_decoded` runs the
+    // read-path decoder *before* the document is measured, so `max_bytes`
+    // enforcement and `size_limit.actual_bytes` always describe the decoded
+    // bytes the caller actually receives.
+
+    /// Test codec whose decode ignores the stored ciphertext and returns a
+    /// fixed plaintext, so tests can independently size the encoded envelope
+    /// (via the base64 `data` length) and the decoded result.
+    struct FixedPlaintextCodec {
+        plaintext: String,
+    }
+
+    impl crate::payload_codec::PayloadCodec for FixedPlaintextCodec {
+        fn codec_id(&self) -> &'static str {
+            "fixed-plaintext"
+        }
+
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, crate::payload_codec::CodecError> {
+            Ok(raw.to_vec())
+        }
+
+        fn decode(&self, _encoded: &[u8]) -> Result<Vec<u8>, crate::payload_codec::CodecError> {
+            Ok(self.plaintext.clone().into_bytes())
+        }
+    }
+
+    fn fixed_plaintext_registry(plaintext_json: &str) -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.register(std::sync::Arc::new(FixedPlaintextCodec {
+            plaintext: plaintext_json.to_string(),
+        }));
+        codecs
+    }
+
+    fn fixed_plaintext_envelope(encoded_len: usize) -> Value {
+        use base64::Engine as _;
+        serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "fixed-plaintext",
+            "data": base64::engine::general_purpose::STANDARD.encode(vec![b'x'; encoded_len]),
+        })
+    }
+
+    fn envelope_export_request(envelope: Value, max_bytes: usize) -> HistoryExportRequest {
+        use crate::types::ExecutionId;
+        HistoryExportRequest {
+            workflow_name: "encrypted_flow".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "COMPLETED".to_string(),
+            events: vec![WorkflowEvent::WorkflowCompleted { output: envelope }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(max_bytes),
+            context_headers: None,
+        }
+    }
+
+    #[test]
+    fn decoded_export_exceeding_max_bytes_is_rejected_with_decoded_size() {
+        // Tiny envelope (fits comfortably), huge decoded plaintext (does not).
+        let plaintext = format!("\"{}\"", "a".repeat(8192));
+        let codecs = fixed_plaintext_registry(&plaintext);
+        let request = envelope_export_request(fixed_plaintext_envelope(8), 2048);
+
+        // Sanity: without a decoder the encoded document fits.
+        let mut ignored = LossyDecodeOutcome::default();
+        export_history_decoded(request.clone(), None, &mut ignored)
+            .expect("encoded document must fit under max_bytes");
+        assert!(!ignored.touched(), "no decoder => no decode outcome");
+
+        let mut outcome = LossyDecodeOutcome::default();
+        let error = export_history_decoded(request, Some(&codecs), &mut outcome)
+            .expect_err("decoded document must exceed max_bytes");
+        match error {
+            HistoryExportError::SizeLimitExceeded {
+                actual_bytes,
+                max_bytes,
+            } => {
+                assert_eq!(max_bytes, 2048);
+                assert!(
+                    actual_bytes > 8192,
+                    "actual_bytes must describe the decoded document, \
+                     not the small encoded one: {actual_bytes}"
+                );
+            }
+            other @ HistoryExportError::Serialization(_) => {
+                panic!("expected SizeLimitExceeded, got {other}")
+            }
+        }
+        // The decode happened before the rejection — the outcome survives the
+        // error so callers can still audit it.
+        assert_eq!(outcome.decoded, 1);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[test]
+    fn oversized_envelope_with_small_decoded_form_exports_within_max_bytes() {
+        // Big envelope (over the limit encoded), tiny decoded plaintext.
+        let codecs = fixed_plaintext_registry("\"tiny\"");
+        let request = envelope_export_request(fixed_plaintext_envelope(6000), 4096);
+
+        // Sanity: without a decoder the encoded document is over the limit —
+        // the pre-fix behavior rejected this export outright.
+        let mut ignored = LossyDecodeOutcome::default();
+        export_history_decoded(request.clone(), None, &mut ignored)
+            .expect_err("encoded document must exceed max_bytes");
+
+        let mut outcome = LossyDecodeOutcome::default();
+        let document = export_history_decoded(request, Some(&codecs), &mut outcome)
+            .expect("decoded document fits and must export");
+        assert_eq!(document.events[0]["data"]["output"], "tiny");
+        assert_eq!(outcome.decoded, 1);
+        assert!(
+            document.size_limit.actual_bytes <= 4096,
+            "size accounting must reflect the decoded document: {}",
+            document.size_limit.actual_bytes
+        );
+        // One source of truth: the reported size is the serialized size of
+        // the exact document the caller receives.
+        let serialized = serde_json::to_vec(&document).expect("serialize").len();
+        assert_eq!(document.size_limit.actual_bytes, serialized);
+    }
+
+    #[test]
+    fn redacted_export_ignores_the_decoder_entirely() {
+        let codecs = fixed_plaintext_registry("\"tiny\"");
+        let mut request = envelope_export_request(fixed_plaintext_envelope(64), 64 * 1024);
+        request.payload_policy = HistoryPayloadPolicy::Redacted;
+
+        let mut outcome = LossyDecodeOutcome::default();
+        let document = export_history_decoded(request, Some(&codecs), &mut outcome)
+            .expect("redacted export must succeed");
+        assert!(
+            !outcome.touched(),
+            "Redacted policy must never run the decoder"
+        );
+        let json = serde_json::to_string(&document).expect("serialize");
+        assert!(
+            !json.contains("tiny") && !json.contains("_harvest_codec_envelope"),
+            "Redacted export must contain neither plaintext nor the envelope: {json}"
         );
         assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
     }
