@@ -152,7 +152,11 @@ fn main() {
     );
 }
 
-#[cfg(test)]
+// Gated on the `testing` feature as well as `test`: the example itself must
+// keep building under `--no-default-features` (which CI exercises), while
+// `autumn_harvest::testing` only exists for external consumers when the
+// `testing` feature is enabled.
+#[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
     use autumn_harvest::event::WorkflowEvent;
