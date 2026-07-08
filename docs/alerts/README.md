@@ -92,9 +92,12 @@ Recommended check cadence:
 
 1. Wire metrics if you use Prometheus/Grafana. See `docs/telemetry.md`.
 2. Import the native metric expressions from `starter-pack-v0.1.0.json`.
-3. Add API checks for readiness rules that are not native metrics.
-4. Link each alert to `docs/runbooks/harvest-alerts.md`.
-5. Run the drills in `docs/runbooks/synthetic-incident-drills.md` before
+3. Import the companion Grafana dashboard pack
+   (`../dashboards/starter-pack-v0.1.0.json`) — every rule in this pack maps
+   to a named panel; the mapping table is in `../dashboards/README.md`.
+4. Add API checks for readiness rules that are not native metrics.
+5. Link each alert to `docs/runbooks/harvest-alerts.md`.
+6. Run the drills in `docs/runbooks/synthetic-incident-drills.md` before
    calling the deployment production-ready.
 
 No rule in this pack requires a new `WorkflowEvent` variant, event-history

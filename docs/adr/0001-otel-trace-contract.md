@@ -226,6 +226,12 @@ configured):
 
 ### 7. Metric catalogue
 
+> **Note:** the table below is a historical snapshot. The authoritative
+> catalogue is the set of `METRIC_*` constants in `telemetry.rs`, machine-
+> enforced (100% dashboard coverage) by
+> `autumn-harvest/tests/integration/dashboard_pack_docs.rs` and visualized by
+> `docs/dashboards/starter-pack-v0.1.0.json`.
+
 The following metrics are defined by the constants in `telemetry.rs`. The
 `MetricsRecorder` trait method that drives each metric is listed alongside it.
 
