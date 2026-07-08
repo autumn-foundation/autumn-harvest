@@ -651,6 +651,14 @@ enum HistoryCommand {
         #[arg(long, value_name = "PATH")]
         output_file: Option<PathBuf>,
     },
+    /// Generate a `PlantUML` sequence diagram for a single execution.
+    PlantumlSequence {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Write the `PlantUML` diagram to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        output_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1797,7 +1805,8 @@ fn history_output_file(cli: &Cli) -> Option<&Path> {
         Commands::History {
             command:
                 HistoryCommand::Export { output_file, .. }
-                | HistoryCommand::ExportBatch { output_file, .. },
+                | HistoryCommand::ExportBatch { output_file, .. }
+                | HistoryCommand::PlantumlSequence { output_file, .. },
         } => output_file.as_deref(),
         _ => None,
     }
@@ -2040,6 +2049,28 @@ pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliE
 }
 
 fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
+    if let Commands::History {
+        command: HistoryCommand::PlantumlSequence { .. },
+    } = &cli.command
+    {
+        if let Some(events_val) = value.get("events") {
+            let events: Vec<autumn_harvest::event::WorkflowEvent> = serde_json::from_value(events_val.clone()).map_err(|e| CliError::ReadJson {
+                label: "parse history events",
+                path: "history.events".into(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            })?;
+            return autumn_harvest::history_export::export_plantuml_sequence(&events).map_err(|e| CliError::ReadJson {
+                label: "export plantuml sequence",
+                path: "history.events".into(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+            });
+        }
+        return Err(CliError::ReadJson {
+            label: "parse history export",
+            path: "events".into(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, "missing events array"),
+        });
+    }
     let state_filtered = completion_delivery_list_state_filter(cli)
         .map(|state| filter_completion_deliveries_by_state(value, state));
     let value = state_filtered.as_ref().unwrap_or(value);
@@ -3850,6 +3881,13 @@ fn history_request(command: &HistoryCommand) -> ApiRequest {
                 "/workflows/{}/history/export?{}",
                 path_segment(execution_id),
                 encode_query_params(&params)
+            ))
+        }
+        HistoryCommand::PlantumlSequence { execution_id, .. } => {
+            // We fetch the history in redacted form, which is safe for sharing diagrams
+            ApiRequest::get(format!(
+                "/workflows/{}/history/export?payload_policy=redacted",
+                path_segment(execution_id)
             ))
         }
         HistoryCommand::ExportBatch {

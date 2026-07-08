@@ -282,6 +282,7 @@ pub use history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
     HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
     HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
+    export_plantuml_sequence,
 };
 pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,

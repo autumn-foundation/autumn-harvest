@@ -883,6 +883,525 @@ impl MermaidExporter {
     }
 }
 
+/// Export a slice of workflow events into a `PlantUML` sequence diagram.
+///
+/// Converts a workflow history into a standard `PlantUML` format sequence diagram,
+/// mapping events (like `ActivityScheduled`, `ChildWorkflowStarted`) into lifelines
+/// and messages.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_plantuml_sequence(events: &[WorkflowEvent]) -> Result<String, std::fmt::Error> {
+    let mut exporter = PlantumlExporter::new();
+    exporter.export(events)?;
+    Ok(exporter.out)
+}
+
+struct PlantumlExporter {
+    out: String,
+    participants: std::collections::HashSet<String>,
+}
+
+impl PlantumlExporter {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            participants: std::collections::HashSet::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn export(&mut self, events: &[WorkflowEvent]) -> Result<(), std::fmt::Error> {
+        writeln!(self.out, "@startuml")?;
+        writeln!(self.out, "autonumber")?;
+        writeln!(self.out, "participant WF as \"Workflow\"")?;
+
+        self.participants.insert("WF".to_string());
+
+        for event in events {
+            match event {
+                WorkflowEvent::WorkflowStarted { .. }
+                | WorkflowEvent::WorkflowCompleted { .. }
+                | WorkflowEvent::WorkflowFailed { .. }
+                | WorkflowEvent::WorkflowCancelled { .. }
+                | WorkflowEvent::WorkflowContinuedAsNew { .. }
+                | WorkflowEvent::WorkflowResetFork { .. }
+                | WorkflowEvent::WorkflowResetTerminated { .. }
+                | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+                | WorkflowEvent::WorkflowExecutionPaused { .. }
+                | WorkflowEvent::WorkflowExecutionResumed { .. }
+                | WorkflowEvent::WorkflowRedriven { .. }
+                | WorkflowEvent::WorkflowRetryScheduled { .. } => {
+                    self.handle_workflow_event(event)?;
+                }
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. } => {
+                    self.handle_activity_event(event)?;
+                }
+                WorkflowEvent::TimerStarted { .. } | WorkflowEvent::TimerFired { .. } => {
+                    self.handle_timer_event(event)?;
+                }
+                WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. } => {
+                    self.handle_child_workflow_event(event)?;
+                }
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. } => {
+                    self.handle_misc_event(event)?;
+                }
+                WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::ActivityCompletedExternally { .. }
+                | WorkflowEvent::ActivityFailedExternally { .. }
+                | WorkflowEvent::ActivityExternalDeadlineExtended { .. } => {
+                    self.handle_external_activity_event(event)?;
+                }
+                WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::LocalActivityExhausted { .. } => {
+                    self.handle_local_activity_event(event)?;
+                }
+                WorkflowEvent::UpdateAdmitted { .. }
+                | WorkflowEvent::UpdateCompleted { .. }
+                | WorkflowEvent::UpdateFailed { .. } => {
+                    self.handle_update_event(event)?;
+                }
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. } => {
+                    self.handle_external_signal_event(event)?;
+                }
+                WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. } => {
+                    self.handle_external_cancel_event(event)?;
+                }
+            }
+        }
+        writeln!(self.out, "@enduml")?;
+        Ok(())
+    }
+
+    fn handle_workflow_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::WorkflowStarted { .. } => {
+                writeln!(self.out, "hnote over WF : Workflow Started")?;
+            }
+            WorkflowEvent::WorkflowCompleted { .. } => {
+                writeln!(self.out, "hnote over WF : Workflow Completed")?;
+            }
+            WorkflowEvent::WorkflowFailed { error } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(self.out, "hnote over WF : Workflow Failed: {safe_error}")?;
+            }
+            WorkflowEvent::WorkflowCancelled { reason } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "hnote over WF : Workflow Cancelled: {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => {
+                writeln!(
+                    self.out,
+                    "hnote over WF : Continued As New (next: {new_exec_id})"
+                )?;
+            }
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id,
+                reset_to_event_id,
+                reason,
+                ..
+            } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "hnote over WF : Reset Fork from {reset_from_exec_id} at event {reset_to_event_id}: {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowResetTerminated {
+                reset_to_exec_id,
+                reason,
+                ..
+            } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "hnote over WF : Reset Terminated (forked to {reset_to_exec_id}): {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowExecutionTimedOut { deadline, .. } => {
+                writeln!(
+                    self.out,
+                    "hnote over WF : Workflow Execution Timed Out (deadline: {deadline})"
+                )?;
+            }
+            WorkflowEvent::WorkflowExecutionPaused { .. } => {
+                writeln!(self.out, "hnote over WF : Workflow Paused")?;
+            }
+            WorkflowEvent::WorkflowExecutionResumed { .. } => {
+                writeln!(self.out, "hnote over WF : Workflow Resumed")?;
+            }
+            WorkflowEvent::WorkflowRedriven { .. } => {
+                writeln!(self.out, "hnote over WF : Workflow Redriven")?;
+            }
+            WorkflowEvent::WorkflowRetryScheduled { attempt, .. } => {
+                writeln!(
+                    self.out,
+                    "hnote over WF : Retry Scheduled (attempt {attempt})"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_activity_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                name, activity_id, ..
+            } => {
+                let participant = format!("Activity_{name}");
+                if self.participants.insert(participant.clone()) {
+                    writeln!(
+                        self.out,
+                        "participant {participant} as \"Activity: {name}\""
+                    )?;
+                }
+                writeln!(
+                    self.out,
+                    "WF -> {participant}: Schedule (ID: {activity_id})"
+                )?;
+                writeln!(self.out, "activate {participant}")?;
+            }
+            WorkflowEvent::ActivityStarted {
+                worker_id,
+                activity_id,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Activity Started (ID: {activity_id}) on {worker_id}"
+                )?;
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Activity Completed (ID: {activity_id})"
+                )?;
+            }
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error,
+                attempt,
+                ..
+            } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "note right of WF : Activity Failed (ID: {activity_id}, attempt: {attempt}): {safe_error}"
+                )?;
+            }
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type,
+            } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Activity Timed Out (ID: {activity_id}, type: {timeout_type:?})"
+                )?;
+            }
+            WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Activity Heartbeat (ID: {activity_id})"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_timer_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::TimerStarted { timer_id, .. } => {
+                writeln!(self.out, "WF -> WF: Start Timer (ID: {timer_id})")?;
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                writeln!(self.out, "WF -> WF: Timer Fired (ID: {timer_id})")?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_child_workflow_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name,
+                ..
+            } => {
+                let participant = format!("Child_{workflow_name}");
+                if self.participants.insert(participant.clone()) {
+                    writeln!(
+                        self.out,
+                        "participant {participant} as \"Child WF: {workflow_name}\""
+                    )?;
+                }
+                writeln!(
+                    self.out,
+                    "WF -> {participant}: Start Child (ID: {child_id})"
+                )?;
+                writeln!(self.out, "activate {participant}")?;
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Child Completed (ID: {child_id})"
+                )?;
+            }
+            WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "note right of WF : Child Failed (ID: {child_id}): {safe_error}"
+                )?;
+            }
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } => {
+                let participant = format!("Child_{workflow_name}");
+                if self.participants.insert(participant.clone()) {
+                    writeln!(
+                        self.out,
+                        "participant {participant} as \"Child WF: {workflow_name}\""
+                    )?;
+                }
+                writeln!(
+                    self.out,
+                    "WF ->> {participant}: Spawn Detached Child (ID: {child_id})"
+                )?;
+                writeln!(self.out, "activate {participant}")?;
+            }
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id, action, ..
+            } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Child Cascade Applied (ID: {child_id}): {action}"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_misc_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::SignalReceived { signal_name, .. } => {
+                writeln!(self.out, "-> WF: Signal Received: {signal_name}")?;
+            }
+            WorkflowEvent::MarkerRecorded { name, .. } => {
+                writeln!(self.out, "hnote over WF : Marker: {name}")?;
+            }
+            WorkflowEvent::SideEffectRecorded { kind, .. } => {
+                let kind_str = serde_json::to_string(kind).unwrap_or_else(|_| "Unknown".into());
+                writeln!(self.out, "hnote over WF : Side Effect: {kind_str}")?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_external_activity_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ActivityAwaitingExternal {
+                name, activity_id, ..
+            } => {
+                let participant = format!("ExtActivity_{name}");
+                if self.participants.insert(participant.clone()) {
+                    writeln!(
+                        self.out,
+                        "participant {participant} as \"Ext Activity: {name}\""
+                    )?;
+                }
+                writeln!(
+                    self.out,
+                    "WF -> {participant}: Await External (ID: {activity_id})"
+                )?;
+                writeln!(self.out, "activate {participant}")?;
+            }
+            WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : External Activity Completed (ID: {activity_id})"
+                )?;
+            }
+            WorkflowEvent::ActivityFailedExternally {
+                activity_id, error, ..
+            } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "note right of WF : External Activity Failed (ID: {activity_id}): {safe_error}"
+                )?;
+            }
+            WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : External Activity Deadline Extended (ID: {activity_id})"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_local_activity_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::LocalActivityScheduled {
+                name, activity_id, ..
+            } => {
+                writeln!(
+                    self.out,
+                    "WF -> WF: Schedule Local Activity: {name} (ID: {activity_id})"
+                )?;
+            }
+            WorkflowEvent::LocalActivityCompleted { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Local Activity Completed (ID: {activity_id})"
+                )?;
+            }
+            WorkflowEvent::LocalActivityFailed {
+                activity_id, error, ..
+            } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "note right of WF : Local Activity Failed (ID: {activity_id}): {safe_error}"
+                )?;
+            }
+            WorkflowEvent::LocalActivityExhausted { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : Local Activity Exhausted (ID: {activity_id})"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_update_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::UpdateAdmitted {
+                name, update_id, ..
+            } => {
+                writeln!(self.out, "-> WF: Update Admitted: {name} (ID: {update_id})")?;
+            }
+            WorkflowEvent::UpdateCompleted { update_id, .. } => {
+                writeln!(self.out, "WF -> WF: Update Completed (ID: {update_id})")?;
+            }
+            WorkflowEvent::UpdateFailed { update_id, error } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "WF -> WF: Update Failed (ID: {update_id}): {safe_error}"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_external_signal_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalSignalRequested {
+                signal_name,
+                signal_id,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "WF -> WF: Request External Signal: {signal_name} (ID: {signal_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : External Signal Delivered (ID: {signal_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : External Signal Failed (ID: {signal_id}): {reason_code}"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_external_cancel_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => {
+                writeln!(
+                    self.out,
+                    "WF -> WF: Request External Cancel (ID: {cancel_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : External Cancel Delivered (ID: {cancel_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id,
+                reason_code,
+            } => {
+                writeln!(
+                    self.out,
+                    "note right of WF : External Cancel Failed (ID: {cancel_id}): {reason_code}"
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +1414,45 @@ mod tests {
         let diagram = export_mermaid_sequence(&events).expect("export should succeed");
         assert!(diagram.contains("sequenceDiagram"));
         assert!(diagram.contains("participant WF as Workflow"));
+    }
+
+    #[test]
+    fn test_export_plantuml_sequence_empty() {
+        let events = vec![];
+        let diagram = export_plantuml_sequence(&events).expect("export should succeed");
+        assert!(diagram.contains("@startuml"));
+        assert!(diagram.contains("participant WF as \"Workflow\""));
+        assert!(diagram.contains("@enduml"));
+    }
+
+    #[test]
+    fn test_export_plantuml_sequence_basic_workflow() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({}),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "download_file".to_string(),
+                input: serde_json::json!({}),
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!({}),
+            },
+        ];
+
+        let diagram = export_plantuml_sequence(&events).unwrap();
+        assert!(diagram.contains("hnote over WF : Workflow Started"));
+        assert!(
+            diagram.contains("participant Activity_download_file as \"Activity: download_file\"")
+        );
+        assert!(diagram.contains("WF -> Activity_download_file: Schedule (ID: "));
+        assert!(diagram.contains("hnote over WF : Workflow Completed"));
     }
 
     #[test]
