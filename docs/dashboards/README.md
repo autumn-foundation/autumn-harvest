@@ -131,6 +131,8 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_activity_retry_storm` | Activities | Activity retry rate | [runbook](../runbooks/harvest-alerts.md#harvest_activity_retry_storm) |
 | `harvest_activity_retry_storm_critical` | Activities | Activity retry rate (same panel; page tier > 20/s) | [runbook](../runbooks/harvest-alerts.md#harvest_activity_retry_storm) |
 | `harvest_workflow_non_determinism` | Workflow health | Non-determinism detections (+ Non-determinism blocks entered) | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_non_determinism) |
+| `harvest_saga_compensation_spike` | Sagas | Saga compensations | [runbook](../runbooks/harvest-alerts.md#harvest_saga_compensation_spike) |
+| `harvest_saga_compensation_failed` | Sagas | Saga compensation failures | [runbook](../runbooks/harvest-alerts.md#harvest_saga_compensation_failed) |
 
 ### Readiness-style alerts (no native metric)
 

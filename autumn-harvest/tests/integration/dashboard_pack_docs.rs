@@ -84,6 +84,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_debounced_total",
     "harvest_workflow_debounce_fired_total",
     "harvest_workflow_start_throttled_total",
+    "harvest_saga_compensated_total",
+    "harvest_saga_compensation_failed_total",
     "harvest_activity_failed_total",
     "harvest_activity_attempts_total",
     "harvest_activity_retries_total",
@@ -198,6 +200,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_workflow_debounce_fired", &["workflow", "queue"]),
     ("harvest_workflow_start_throttled", &["workflow"]),
     ("harvest_workflow_history_oversized", &["workflow"]),
+    ("harvest_saga_compensated", &["workflow", "queue"]),
+    ("harvest_saga_compensation_failed", &["workflow", "queue"]),
     (
         "harvest_activity_duration",
         &["activity", "queue", "status", "error_type"],
