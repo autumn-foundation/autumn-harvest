@@ -1,6 +1,12 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use autumn_harvest::{ExecutionId, HarvestError, Saga, WorkflowContext, WorkflowEvent};
+use autumn_harvest::telemetry::{
+    METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, MetricsRecorder,
+};
+use autumn_harvest::{
+    ExecutionId, HarvestError, HarvestResult, Saga, WorkflowCommand, WorkflowContext, WorkflowEvent,
+};
 use chrono::Utc;
 use serde_json::Value;
 
@@ -688,4 +694,429 @@ async fn saga_compensation_idempotency_under_replay() {
             "non-idempotent compensation reads ambient state and releases the wrong resource on replay"
         );
     }
+}
+
+// ── Saga compensation observability (issue #801) ───────────────────────────
+
+/// Buffers the two saga counters (name + workflow/queue labels) so tests can
+/// assert exact emission counts across simulated crash-replay cycles.
+#[derive(Default)]
+struct SagaRecordingMetrics {
+    samples: Mutex<Vec<(&'static str, String, String)>>,
+}
+
+impl SagaRecordingMetrics {
+    fn count(&self, metric: &str) -> usize {
+        self.samples
+            .lock()
+            .expect("saga metrics lock should not be poisoned")
+            .iter()
+            .filter(|(name, _, _)| *name == metric)
+            .count()
+    }
+
+    fn labels(&self, metric: &str) -> Vec<(String, String)> {
+        self.samples
+            .lock()
+            .expect("saga metrics lock should not be poisoned")
+            .iter()
+            .filter(|(name, _, _)| *name == metric)
+            .map(|(_, wf, q)| (wf.clone(), q.clone()))
+            .collect()
+    }
+}
+
+impl MetricsRecorder for SagaRecordingMetrics {
+    fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+        self.samples.lock().expect("lock").push((
+            METRIC_SAGA_COMPENSATED,
+            workflow_name.to_owned(),
+            queue.to_owned(),
+        ));
+    }
+
+    fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
+        self.samples.lock().expect("lock").push((
+            METRIC_SAGA_COMPENSATION_FAILED,
+            workflow_name.to_owned(),
+            queue.to_owned(),
+        ));
+    }
+}
+
+fn started_history() -> Vec<WorkflowEvent> {
+    vec![WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }]
+}
+
+fn saga_marker(name: &str, details: u64) -> WorkflowEvent {
+    WorkflowEvent::MarkerRecorded {
+        name: name.to_owned(),
+        details: Value::from(details),
+    }
+}
+
+fn observed_context(
+    history: Vec<WorkflowEvent>,
+    recorder: Arc<SagaRecordingMetrics>,
+) -> WorkflowContext {
+    WorkflowContext::for_replay(ExecutionId::new(), history)
+        .with_workflow_name("book_trip")
+        .with_queue_name("default")
+        .with_metrics(recorder)
+}
+
+fn marker_command_names(commands: &[WorkflowCommand]) -> Vec<String> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordMarker { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One decision cycle of the three-step in-memory compensated saga used by
+/// the crash-replay test — mirrors `run_compensated_saga_once` but against a
+/// caller-supplied context so metrics/commands can be observed.
+async fn run_three_step_compensated_saga(
+    ctx: &WorkflowContext,
+    comp_log: &Arc<Mutex<Vec<String>>>,
+) {
+    let mut saga = Saga::new(ctx);
+
+    saga.step(
+        || async { Ok::<_, HarvestError>("charge-001".to_string()) },
+        {
+            let comp_log = Arc::clone(comp_log);
+            move |charge_id| async move {
+                comp_log
+                    .lock()
+                    .expect("lock")
+                    .push(format!("refund:{charge_id}"));
+                Ok::<_, HarvestError>(())
+            }
+        },
+    )
+    .await
+    .expect("charge step ok");
+
+    saga.step(
+        || async { Ok::<_, HarvestError>("inventory-002".to_string()) },
+        {
+            let comp_log = Arc::clone(comp_log);
+            move |inv_id| async move {
+                comp_log
+                    .lock()
+                    .expect("lock")
+                    .push(format!("release_inventory:{inv_id}"));
+                Ok::<_, HarvestError>(())
+            }
+        },
+    )
+    .await
+    .expect("inventory step ok");
+
+    saga.step(
+        || async { Ok::<_, HarvestError>("seat-003".to_string()) },
+        {
+            let comp_log = Arc::clone(comp_log);
+            move |seat_id| async move {
+                comp_log
+                    .lock()
+                    .expect("lock")
+                    .push(format!("release_seat:{seat_id}"));
+                Ok::<_, HarvestError>(())
+            }
+        },
+    )
+    .await
+    .expect("seat step ok");
+
+    saga.compensate_all()
+        .await
+        .expect("compensations should succeed");
+}
+
+/// AC3 primary — exactly-once under crash + replay.
+///
+/// Cycle 1 is the live unwind (history = `[WorkflowStarted]`): the counter
+/// fires once and the durable `saga_compensated:{seq}` dedup marker is pushed
+/// as a `RecordMarker` command in the same batch. Cycle 2 simulates the
+/// crash-resume: the worker persisted cycle 1's batch, so the marker is now in
+/// history; compensations re-run wholesale (the documented idempotency
+/// contract) but the counter must NOT double-count.
+#[tokio::test]
+async fn saga_compensated_metric_emitted_once_across_crash_replay() {
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let comp_log = Arc::new(Mutex::new(Vec::new()));
+
+    // Cycle 1 — live unwind.
+    let ctx = observed_context(started_history(), Arc::clone(&recorder));
+    run_three_step_compensated_saga(&ctx, &comp_log).await;
+    assert_eq!(entries(&comp_log).len(), 3, "all three compensations ran");
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 1);
+    let markers = marker_command_names(&ctx.drain_commands());
+    assert_eq!(
+        markers,
+        vec!["saga_compensated:1".to_owned()],
+        "the dedup marker must be recorded durably with the unwind's own batch"
+    );
+
+    // Cycle 2 — crash-resume replay (marker persisted in history).
+    let mut history = started_history();
+    history.push(saga_marker("saga_compensated:1", 3));
+    let ctx2 = observed_context(history, Arc::clone(&recorder));
+    run_three_step_compensated_saga(&ctx2, &comp_log).await;
+    assert_eq!(
+        entries(&comp_log).len(),
+        6,
+        "compensations re-ran on replay (documented idempotency contract)"
+    );
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATED),
+        1,
+        "counter must reflect real compensation sequences, not the replay count"
+    );
+    assert!(
+        marker_command_names(&ctx2.drain_commands()).is_empty(),
+        "a replayed unwind records no fresh marker"
+    );
+}
+
+/// AC2 — the dangling-state case gets a distinct counter, emitted exactly
+/// once, independent of `harvest.workflow.terminal` (which this recorder
+/// never observes: emission happens in-Saga, not at the worker terminal
+/// boundary).
+#[tokio::test]
+async fn saga_compensation_failed_metric_distinct_and_once() {
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+
+    // Cycle 1 — live unwind whose single compensation fails.
+    let ctx = observed_context(started_history(), Arc::clone(&recorder));
+    {
+        let mut saga = Saga::new(&ctx);
+        saga.step(
+            || async { Ok::<_, HarvestError>("payment-1".to_string()) },
+            |_| async { Err::<(), _>(workflow_failed("refund gateway down")) },
+        )
+        .await
+        .expect("payment step ok");
+
+        let error = saga.compensate_all().await.expect_err("unwind must fail");
+        let HarvestError::SagaCompensationFailed {
+            compensation_errors,
+            ..
+        } = error
+        else {
+            panic!("expected SagaCompensationFailed");
+        };
+        assert_eq!(compensation_errors.len(), 1);
+    }
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 1);
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 1);
+    let markers = marker_command_names(&ctx.drain_commands());
+    assert_eq!(
+        markers,
+        vec![
+            "saga_compensated:1".to_owned(),
+            "saga_compensation_failed:1".to_owned(),
+        ],
+        "start marker at unwind start, failure marker at failed-unwind end"
+    );
+
+    // Cycle 2 — replay with both markers persisted: no new samples.
+    let mut history = started_history();
+    history.push(saga_marker("saga_compensated:1", 1));
+    history.push(saga_marker("saga_compensation_failed:1", 1));
+    let ctx2 = observed_context(history, Arc::clone(&recorder));
+    {
+        let mut saga = Saga::new(&ctx2);
+        saga.step(
+            || async { Ok::<_, HarvestError>("payment-1".to_string()) },
+            |_| async { Err::<(), _>(workflow_failed("refund gateway down")) },
+        )
+        .await
+        .expect("payment step ok");
+        let _ = saga.compensate_all().await.expect_err("unwind still fails");
+    }
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 1);
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 1);
+    assert!(marker_command_names(&ctx2.drain_commands()).is_empty());
+
+    // Labels carry workflow + queue (AC1), never an execution id — enforced
+    // by construction: the recorder only ever receives the two strings.
+    assert_eq!(
+        recorder.labels(METRIC_SAGA_COMPENSATION_FAILED),
+        vec![("book_trip".to_owned(), "default".to_owned())]
+    );
+}
+
+/// The failure counter fires even when the workflow author catches
+/// `SagaCompensationFailed` and completes normally — a case worker-boundary
+/// emission would structurally miss.
+#[tokio::test]
+async fn saga_compensation_failed_emitted_even_when_author_catches_error() {
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(started_history(), Arc::clone(&recorder));
+
+    let mut saga = Saga::new(&ctx);
+    saga.step(
+        || async { Ok::<_, HarvestError>("rsv-1".to_string()) },
+        |_| async { Err::<(), _>(workflow_failed("release rejected")) },
+    )
+    .await
+    .expect("step ok");
+
+    // Author catches the dangling-state error and continues; the workflow
+    // would go on to COMPLETE.
+    match saga.compensate_all().await {
+        Err(HarvestError::SagaCompensationFailed { .. }) => { /* logged, workflow continues */ }
+        other => panic!("expected SagaCompensationFailed, got {other:?}"),
+    }
+
+    assert_eq!(
+        recorder.count(METRIC_SAGA_COMPENSATION_FAILED),
+        1,
+        "in-Saga emission must observe an author-caught compensation failure"
+    );
+}
+
+/// AC6 — a saga that never compensates emits nothing new: zero samples, zero
+/// marker commands. The success path is byte-identical to pre-#801 behavior.
+#[tokio::test]
+async fn saga_success_path_emits_no_saga_metrics_and_no_marker_commands() {
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(started_history(), Arc::clone(&recorder));
+
+    let mut saga = Saga::new(&ctx);
+    for _ in 0..3 {
+        saga.step(
+            || async { Ok::<_, HarvestError>("ok") },
+            |_| async { Ok::<_, HarvestError>(()) },
+        )
+        .await
+        .expect("step ok");
+    }
+    assert_eq!(saga.pending_compensation_count(), 3);
+
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 0);
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 0);
+    assert!(ctx.drain_commands().is_empty());
+}
+
+/// An empty `compensate_all` (nothing pending) is not a compensation
+/// sequence: no seq allocated, no marker, no metric.
+#[tokio::test]
+async fn saga_empty_compensate_all_emits_nothing() {
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(started_history(), Arc::clone(&recorder));
+
+    let mut saga = Saga::new(&ctx);
+    saga.compensate_all()
+        .await
+        .expect("empty compensation is Ok");
+
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 0);
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 0);
+    assert!(ctx.drain_commands().is_empty());
+}
+
+/// Activity-backed saga flow used by the backward-compat test: one forward
+/// step whose compensation dispatches an activity, then a manual unwind.
+async fn activity_backed_saga_flow(ctx: &WorkflowContext) -> HarvestResult<()> {
+    let mut saga = Saga::new(ctx);
+    saga.step(
+        || async {
+            ctx.execute_activity_raw("reserve", Value::Null, "default")
+                .await
+        },
+        move |rsv: Value| async move {
+            ctx.execute_activity_raw("release", rsv, "default")
+                .await
+                .map(|_| ())
+        },
+    )
+    .await?;
+    saga.compensate_all().await
+}
+
+/// AC7 backward-compat money test — a pre-#801 history (no saga markers)
+/// replays untouched and uncounted:
+///
+/// (a) a fully recorded legacy unwind replays to completion with no
+///     divergence, no metric, and no fresh marker command;
+/// (b) a legacy history captured *mid-unwind* (compensation activity
+///     scheduled but not yet completed) resumes by suspending on that
+///     activity — never a `NonDeterministic` failure, never an emission.
+#[tokio::test]
+async fn pre_801_history_mid_unwind_replays_clean_and_uncounted() {
+    let reserve_id = autumn_harvest::types::ActivityExecId::new();
+    let release_id = autumn_harvest::types::ActivityExecId::new();
+
+    let full_legacy_history = || {
+        let mut events = started_history();
+        events.extend([
+            WorkflowEvent::ActivityScheduled {
+                activity_id: reserve_id,
+                name: "reserve".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: reserve_id,
+                output: serde_json::json!("rsv-1"),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: release_id,
+                name: "release".into(),
+                input: serde_json::json!("rsv-1"),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: release_id,
+                output: Value::Null,
+            },
+        ]);
+        events
+    };
+
+    // (a) Fully recorded legacy unwind — replays clean, zero emissions.
+    let recorder = Arc::new(SagaRecordingMetrics::default());
+    let ctx = observed_context(full_legacy_history(), Arc::clone(&recorder));
+    activity_backed_saga_flow(&ctx)
+        .await
+        .expect("legacy marker-less history must replay without divergence");
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 0);
+    assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 0);
+    assert!(
+        marker_command_names(&ctx.drain_commands()).is_empty(),
+        "no fresh saga marker may be recorded into a legacy history position"
+    );
+
+    // (b) Mid-unwind legacy history — the compensation activity is scheduled
+    // but has no terminal yet. The resumed unwind must suspend on it (the
+    // pre-#801 resume shape), not diverge and not emit.
+    let mut mid_unwind = full_legacy_history();
+    mid_unwind.pop(); // drop the release ActivityCompleted
+    let recorder2 = Arc::new(SagaRecordingMetrics::default());
+    let ctx2 = observed_context(mid_unwind, Arc::clone(&recorder2));
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(200), activity_backed_saga_flow(&ctx2)).await;
+    assert!(
+        outcome.is_err(),
+        "mid-unwind resume must suspend awaiting the in-flight compensation \
+         activity, got {outcome:?}"
+    );
+    assert_eq!(recorder2.count(METRIC_SAGA_COMPENSATED), 0);
+    assert_eq!(recorder2.count(METRIC_SAGA_COMPENSATION_FAILED), 0);
+    assert!(
+        marker_command_names(&ctx2.drain_commands()).is_empty(),
+        "the suspended cycle's command batch must carry no saga marker"
+    );
 }

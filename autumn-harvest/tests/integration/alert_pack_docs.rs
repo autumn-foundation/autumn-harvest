@@ -16,6 +16,8 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_shard_unready",
     "harvest_no_compatible_worker",
     "harvest_workflow_non_determinism",
+    "harvest_saga_compensation_spike",
+    "harvest_saga_compensation_failed",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -60,6 +62,8 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_activity_retries_total",
     "harvest_worker_slots_in_use",
     "harvest_worker_slots_available",
+    "harvest_saga_compensated_total",
+    "harvest_saga_compensation_failed_total",
 ];
 
 #[test]

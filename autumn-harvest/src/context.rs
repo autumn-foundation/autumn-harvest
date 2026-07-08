@@ -23,7 +23,7 @@ use crate::builder::{
 use crate::error::{HarvestError, HarvestResult, NonDeterministicDetails, PayloadKind};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
-use crate::replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch};
+use crate::replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch};
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
@@ -1413,6 +1413,13 @@ pub struct WorkflowContext {
     /// so each session has a stable, unique `session:{seq}` marker name across
     /// replays, mirroring `fan_out_seq`/`race_seq`.
     session_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming saga compensation dedup
+    /// markers (issue #801). Each non-empty `Saga` unwind increments this
+    /// once so each compensation sequence has stable, unique
+    /// `saga_compensated:{seq}` / `saga_compensation_failed:{seq}` marker
+    /// names across replays, mirroring `fan_out_seq`/`race_seq`/`session_seq`.
+    /// Numbers are never released once allocated.
+    saga_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -1446,6 +1453,11 @@ pub struct WorkflowContext {
     /// Logical workflow type name for use in `PayloadTooLarge` errors.
     /// Empty string when not known (legacy contexts, update handlers).
     workflow_name: String,
+    /// Task queue name the current workflow task was claimed from, threaded
+    /// by the executor from `WorkflowExecuteSpanMeta.queue_name` (issue #801)
+    /// so in-context engine metrics can carry the `queue` label. Empty string
+    /// when not known (legacy contexts, testing, update handlers).
+    queue_name: String,
     /// Business-level workflow identifier (e.g. "subscription-123").
     /// Empty when not known (legacy contexts, testing, update handlers).
     /// Set by the worker via `with_workflow_id` before executing the handler.
@@ -1740,6 +1752,7 @@ impl WorkflowContext {
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            saga_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1750,6 +1763,7 @@ impl WorkflowContext {
             strict_replay: false,
             canary_mode: false,
             workflow_name: String::new(),
+            queue_name: String::new(),
             workflow_id: String::new(),
             build_id: None,
             nd_details: Mutex::new(None),
@@ -1852,6 +1866,7 @@ impl WorkflowContext {
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            saga_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1862,6 +1877,7 @@ impl WorkflowContext {
             strict_replay: false,
             canary_mode: false,
             workflow_name: String::new(),
+            queue_name: String::new(),
             workflow_id: String::new(),
             build_id: None,
             nd_details: Mutex::new(None),
@@ -1901,6 +1917,7 @@ impl WorkflowContext {
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            saga_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1911,6 +1928,7 @@ impl WorkflowContext {
             strict_replay: false,
             canary_mode: false,
             workflow_name: String::new(),
+            queue_name: String::new(),
             workflow_id: String::new(),
             build_id: None,
             nd_details: Mutex::new(None),
@@ -2028,6 +2046,17 @@ impl WorkflowContext {
     #[must_use]
     pub fn with_workflow_name(mut self, name: impl Into<String>) -> Self {
         self.workflow_name = name.into();
+        self
+    }
+
+    /// Set the task queue name the current workflow task was claimed from.
+    ///
+    /// Called by the executor (from `WorkflowExecuteSpanMeta.queue_name`) so
+    /// that in-context engine metrics — the saga compensation counters
+    /// (issue #801) — can carry the `queue` label alongside `workflow`.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue: impl Into<String>) -> Self {
+        self.queue_name = queue.into();
         self
     }
 
@@ -3210,6 +3239,78 @@ impl WorkflowContext {
         self.match_history(|m| {
             m.deprecate_patch(patch_id);
         });
+    }
+
+    // ── Saga compensation observability (issue #801) ──────────────────
+
+    /// Allocate the next saga unwind sequence number (mirrors
+    /// `next_fan_out_seq`/`next_race_seq`/`next_session_seq`). Numbers are
+    /// never released once allocated.
+    fn next_saga_seq(&self) -> u32 {
+        let mut seq = self.saga_seq.lock().expect("saga_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Observe the start of a non-empty saga compensation unwind
+    /// (called by [`Saga`](crate::saga::Saga)'s `run_compensations`).
+    ///
+    /// Allocates this unwind's deterministic sequence number and matches its
+    /// `saga_compensated:{seq}` dedup marker against recorded history:
+    ///
+    /// - **Live frontier** — records the marker (a plain `RecordMarker`
+    ///   bookkeeping command, persisted in the same batch as the unwind's
+    ///   own first dispatch) and emits `harvest.saga.compensated` exactly
+    ///   once, labeled `workflow` + `queue`.
+    /// - **Recorded / absent** — emits nothing: a replayed unwind was already
+    ///   counted, and a pre-#801 marker-less history is never counted
+    ///   retroactively (nor mutated — the cursor is left untouched so the
+    ///   recorded events still match the compensation's own commands).
+    ///
+    /// Returns the sequence number for the matching
+    /// [`observe_saga_unwind_failed`](Self::observe_saga_unwind_failed) call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher, commands, or seq mutex is poisoned.
+    pub(crate) fn observe_saga_unwind_start(&self, pending: usize) -> u32 {
+        let seq = self.next_saga_seq();
+        let name = crate::replay::saga_compensated_marker_name(seq);
+        if self.match_history(|m| m.match_saga_marker(&name)) == SagaMarkerMatch::LiveFrontier {
+            self.push_command(WorkflowCommand::RecordMarker {
+                name,
+                details: Value::from(pending as u64),
+            });
+            self.metrics
+                .record_saga_compensated(&self.workflow_name, &self.queue_name);
+        }
+        seq
+    }
+
+    /// Observe a saga unwind finishing with at least one compensation error —
+    /// the `SagaCompensationFailed` dangling-state case (issue #801).
+    ///
+    /// Same three-state dedup discipline as
+    /// [`observe_saga_unwind_start`](Self::observe_saga_unwind_start), against
+    /// the `saga_compensation_failed:{seq}` marker: emits
+    /// `harvest.saga.compensation_failed` exactly once on the live frontier,
+    /// stays silent on replay and on pre-#801 histories. Emission happens
+    /// in-Saga (not at the worker terminal boundary), so an author-caught
+    /// failure in a workflow that goes on to COMPLETE is still counted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher, commands, or seq mutex is poisoned.
+    pub(crate) fn observe_saga_unwind_failed(&self, seq: u32, error_count: usize) {
+        let name = crate::replay::saga_compensation_failed_marker_name(seq);
+        if self.match_history(|m| m.match_saga_marker(&name)) == SagaMarkerMatch::LiveFrontier {
+            self.push_command(WorkflowCommand::RecordMarker {
+                name,
+                details: Value::from(error_count as u64),
+            });
+            self.metrics
+                .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+        }
     }
 
     // ── Core activity dispatch ────────────────────────────────────────
@@ -13945,5 +14046,136 @@ mod tests {
         assert!(matches!(result, Err(HarvestError::Cancelled(_))));
         // Cancellation must be checked before any command is pushed.
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    // ── Saga compensation observability (issue #801) ─────────────────────
+
+    /// Test double counting the two saga counters and capturing their labels.
+    #[derive(Default)]
+    struct SagaMetricCounter {
+        compensated: std::sync::Mutex<Vec<(String, String)>>,
+        failed: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::telemetry::MetricsRecorder for SagaMetricCounter {
+        fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+            self.compensated
+                .lock()
+                .unwrap()
+                .push((workflow_name.to_owned(), queue.to_owned()));
+        }
+
+        fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
+            self.failed
+                .lock()
+                .unwrap()
+                .push((workflow_name.to_owned(), queue.to_owned()));
+        }
+    }
+
+    fn started_history() -> Vec<WorkflowEvent> {
+        vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }]
+    }
+
+    #[test]
+    fn observe_saga_unwind_start_emits_once_live_then_never_on_replay() {
+        // Cycle 1 — live frontier: exactly one emission plus a durable
+        // RecordMarker command in the same batch as the unwind's dispatch.
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_history())
+            .with_metrics(recorder.clone());
+        let seq = ctx.observe_saga_unwind_start(3);
+        assert_eq!(seq, 1);
+        assert_eq!(recorder.compensated.lock().unwrap().len(), 1);
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            WorkflowCommand::RecordMarker { name, details } => {
+                assert_eq!(name, "saga_compensated:1");
+                assert_eq!(*details, Value::from(3u64));
+            }
+            other => panic!("expected RecordMarker, got {other:?}"),
+        }
+
+        // Cycle 2 — replay with the marker persisted in history (the worker
+        // persisted cycle 1's batch): the same recorder sees no new sample
+        // and no new marker command.
+        let mut history = started_history();
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: Value::from(3u64),
+        });
+        let ctx2 =
+            WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
+        let seq2 = ctx2.observe_saga_unwind_start(3);
+        assert_eq!(seq2, 1, "seq allocation is deterministic per call site");
+        assert_eq!(
+            recorder.compensated.lock().unwrap().len(),
+            1,
+            "a replayed unwind must not re-emit the counter"
+        );
+        assert!(ctx2.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn observe_saga_unwind_failed_emits_once_live_then_never_on_replay() {
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_history())
+            .with_metrics(recorder.clone());
+        let seq = ctx.observe_saga_unwind_start(2);
+        ctx.observe_saga_unwind_failed(seq, 1);
+        assert_eq!(recorder.failed.lock().unwrap().len(), 1);
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 2);
+        match &commands[1] {
+            WorkflowCommand::RecordMarker { name, details } => {
+                assert_eq!(name, "saga_compensation_failed:1");
+                assert_eq!(*details, Value::from(1u64));
+            }
+            other => panic!("expected RecordMarker, got {other:?}"),
+        }
+
+        // Replay with both markers recorded — no new samples.
+        let mut history = started_history();
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: Value::from(2u64),
+        });
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "saga_compensation_failed:1".into(),
+            details: Value::from(1u64),
+        });
+        let ctx2 =
+            WorkflowContext::for_replay(ExecutionId::new(), history).with_metrics(recorder.clone());
+        let seq2 = ctx2.observe_saga_unwind_start(2);
+        ctx2.observe_saga_unwind_failed(seq2, 1);
+        assert_eq!(recorder.compensated.lock().unwrap().len(), 1);
+        assert_eq!(recorder.failed.lock().unwrap().len(), 1);
+        assert!(ctx2.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn observe_saga_unwind_uses_workflow_and_queue_labels() {
+        let recorder = std::sync::Arc::new(SagaMetricCounter::default());
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_history())
+            .with_workflow_name("book_trip")
+            .with_queue_name("payments")
+            .with_metrics(recorder.clone());
+        let seq = ctx.observe_saga_unwind_start(1);
+        ctx.observe_saga_unwind_failed(seq, 1);
+        assert_eq!(
+            recorder.compensated.lock().unwrap().as_slice(),
+            &[("book_trip".to_owned(), "payments".to_owned())]
+        );
+        assert_eq!(
+            recorder.failed.lock().unwrap().as_slice(),
+            &[("book_trip".to_owned(), "payments".to_owned())]
+        );
     }
 }

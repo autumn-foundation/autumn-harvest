@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_DISPATCHED, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
-    METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics,
-    WorkflowStatus,
+    METRIC_QUEUE_DISPATCHED, METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED,
+    METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
+    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -187,6 +187,26 @@ impl MetricsRecorder for RecordingMetrics {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_QUEUE_DISPATCHED,
             labels: vec![("queue", queue_name.to_owned())],
+        });
+    }
+
+    fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SAGA_COMPENSATED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
+
+    fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SAGA_COMPENSATION_FAILED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
         });
     }
 }
@@ -389,6 +409,44 @@ fn schedule_skipped_reason_values_match_adr() {
     assert!(reasons.contains(&"paused".to_owned()));
     assert!(reasons.contains(&"max_active_runs_reached".to_owned()));
     assert!(reasons.contains(&"catchup_disabled".to_owned()));
+}
+
+#[test]
+fn saga_counters_reachable_and_never_labeled_by_execution_id() {
+    // Issue #801: both saga counters must be reachable via the trait with
+    // exactly the workflow + queue labels — execution.id is forbidden by
+    // construction (ADR-0001 §7).
+    let rec = RecordingMetrics::default();
+    rec.record_saga_compensated("book_trip", "payments");
+    rec.record_saga_compensation_failed("book_trip", "payments");
+
+    let samples = rec.drain();
+    assert_eq!(samples.len(), 2);
+
+    let compensated = samples
+        .iter()
+        .find(|s| s.name == METRIC_SAGA_COMPENSATED)
+        .expect("harvest.saga.compensated not sampled");
+    let failed = samples
+        .iter()
+        .find(|s| s.name == METRIC_SAGA_COMPENSATION_FAILED)
+        .expect("harvest.saga.compensation_failed not sampled");
+
+    for sample in [compensated, failed] {
+        let keys: Vec<&str> = sample.labels.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["workflow", "queue"],
+            "saga counters must carry exactly workflow + queue labels; got {sample:?}"
+        );
+        for (key, _) in &sample.labels {
+            assert!(
+                !key.contains("execution_id") && !key.contains("execution.id"),
+                "execution.id must never be a metric label (metric '{}')",
+                sample.name
+            );
+        }
+    }
 }
 
 #[test]

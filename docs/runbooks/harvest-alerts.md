@@ -751,3 +751,130 @@ Escalate to the downstream owner for external dependency outages. Escalate to th
 if the retry policy is misconfigured. Page (`harvest_activity_retry_storm_critical`) when the retry
 rate exceeds 20/s — at that scale the task queue backlog will grow and other queues will be starved.
 
+
+## harvest_saga_compensation_spike
+
+**What a compensation spike means:** sagas are rolling back en masse. Each
+`harvest.saga.compensated` increment is one real `compensate_all` /
+step-failure unwind actually running forward (exactly once per sequence —
+replays never re-count), so an elevated rate means many workflows hit a
+failing forward step and are undoing already-committed work. This is the
+canonical *leading* indicator of a downstream-dependency outage: it fires as
+soon as unwinds start, before retry exhaustion, DLQ growth, or terminal
+workflow failures become visible.
+
+### Triage steps
+
+1. Read the `workflow` label on the spiking series to identify which saga
+   workflow type is rolling back, and `queue` to locate the worker pool.
+2. Find the failing forward step: check
+   `harvest.activity.failed{workflow.type=<name>}` for the `error.type`
+   breakdown, and `harvest.activity.retries` for a concurrent retry storm on
+   the same activity.
+3. Inspect recent failures directly: `harvest workflow list --state FAILED
+   --workflow <name> | head -20` (or `GET /api/harvest/workflows?state=FAILED`)
+   and read the `error` field for the original step error.
+4. Check whether `harvest_saga_compensation_failed` is ALSO firing — a spike
+   plus failed compensations means dangling state is accumulating; treat as
+   the page, not the ticket.
+5. Check the downstream dependency the failing step calls (status page,
+   circuit breaker state via `GET /api/harvest/admin/circuits`).
+
+### Likely causes
+
+- A downstream dependency (payment gateway, inventory service, partner API)
+  started erroring, so forward steps fail and every in-flight saga unwinds.
+- A bad deploy of an activity that a mid-saga step depends on.
+- A legitimate business burst of rollbacks (mass cancellation event,
+  end-of-sale inventory exhaustion) — elevated but expected.
+
+### False positives
+
+A workflow type that compensates as part of its normal business flow (e.g. a
+quote-then-release pattern) has a non-zero baseline compensation rate — the
+starter expression is baseline-relative for exactly this reason, but tune the
+multiplier per workflow. A short burst after a dependency restart that
+self-resolves within one evaluation window is expected.
+
+### Safe actions
+
+1. If a downstream outage is confirmed, force-open the failing activity's
+   circuit breaker (`POST /api/harvest/admin/circuits/{activity}/force-open`)
+   so new sagas fail fast at the first step instead of committing work they
+   will immediately unwind.
+2. Pause the schedules or gate the admissions that feed the affected workflow
+   type until the downstream recovers.
+3. Let in-flight unwinds run — compensations are idempotent by contract and
+   the counter confirms they are progressing.
+
+### Escalation criteria
+
+Escalate to the downstream owner when the failing step's dependency is
+external. Page (rather than ticket) when the spike is sustained > 15 minutes,
+when `harvest_saga_compensation_failed` fires alongside it, or when the
+affected workflow type moves money or inventory.
+
+## harvest_saga_compensation_failed
+
+**What to do when a compensation fails:** a rollback itself failed
+(`HarvestError::SagaCompensationFailed`), so the system is holding
+partially-committed, dangling state — a charge that was not refunded, a
+reservation that was not released. Nothing in the engine will retry the
+failed compensation closure wholesale on its own timeline (a still-running
+execution's replay re-runs compensations, but a terminally-failed or
+author-caught one will not); every increment therefore represents work for a
+human until reconciled. The counter fires exactly once per failed unwind,
+including unwinds whose error the workflow author caught — it is deliberately
+separable from `harvest.workflow.terminal{outcome=failed}` so you can page on
+it alone.
+
+### Triage steps
+
+1. Identify the workflow type and queue from the metric labels.
+2. List candidate executions: `harvest workflow list --state FAILED
+   --workflow <name>` — the execution `error` field carries the
+   `SagaCompensationFailed` message with the original step error AND the
+   per-compensation error strings. For author-caught cases the run may be
+   COMPLETED; search the execution history for the failing compensation
+   activity's `ActivityFailed` event instead
+   (`GET /api/harvest/workflows/{execution_id}/history`).
+3. Read the `compensation_errors` list in the error message to see exactly
+   which compensations failed and why.
+4. Determine the dangling resource for each failed compensation (the forward
+   step's recorded output in history names it: charge id, reservation id).
+
+### Likely causes
+
+- The same downstream outage that triggered the unwind also broke the
+  compensation path (refund API down while charge API degraded).
+- A compensation activity with a bug or a missing idempotency guard.
+- A compensation depending on state the forward step no longer guarantees
+  (release-most-recent anti-pattern — see docs/saga.md).
+
+### False positives
+
+None by design — the counter has zero false negatives and each increment is
+a real failed unwind. If an increment is expected (e.g. a deliberately
+non-compensatable step), the workflow should not register a compensation for
+that step at all.
+
+### Safe actions
+
+1. Manually reconcile each dangling resource (issue the refund, release the
+   reservation) using the resource ids recorded in the execution history.
+2. If the compensation failure was transient and the execution is still
+   RUNNING (author caught and parked), a replay re-runs the compensation —
+   compensations are idempotent by contract, so re-driving the workflow task
+   is safe.
+3. Fix the compensation activity (or its downstream) before re-enabling the
+   traffic source; a broken compensation path turns every future rollback
+   into manual work.
+
+### Escalation criteria
+
+Page immediately — this is dangling state by definition. Escalate to the
+workflow owner for the reconciliation runbook of the specific resource, and
+to the downstream owner when the compensation path's dependency is the thing
+that failed. Escalate to the on-call engineering lead if increments continue
+accruing after the traffic source is paused (indicates unwinds still failing
+mid-flight).

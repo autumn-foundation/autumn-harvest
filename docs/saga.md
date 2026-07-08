@@ -140,16 +140,82 @@ compensation itself is durable and replay-safe.
 
 ---
 
+## Observability (issue #801)
+
+Compensation is a first-class, alertable signal. Two engine counters are
+emitted from inside `Saga::run_compensations` (the single choke point both
+`compensate_all()` and automatic step-failure rollback funnel through):
+
+| Metric | Fires | Labels |
+|--------|-------|--------|
+| `harvest.saga.compensated` | Exactly once per **real compensation sequence** — a non-empty unwind actually running forward, counted at unwind start | `workflow`, `queue` |
+| `harvest.saga.compensation_failed` | Exactly once per unwind that finishes with ≥1 compensation error (`HarvestError::SagaCompensationFailed` — the dangling-state case) | `workflow`, `queue` |
+
+`execution.id` is never a label (ADR-0001 §7). A saga that never compensates
+emits nothing; an empty `compensate_all()` is not a sequence.
+
+**Exactly-once across replays.** Compensations re-run wholesale on every
+replay (see the idempotency contract above), so the counters cannot simply
+fire per call. Each unwind is keyed to durable `MarkerRecorded` dedup
+markers reusing the existing event variant — `saga_compensated:{seq}`
+recorded at unwind start (persisted in the same command batch as the first
+compensation's own dispatch, so a crash at any point mid-unwind resumes
+silent) and `saga_compensation_failed:{seq}` recorded at failed-unwind end.
+The counter fires only when its marker is first recorded on the live
+frontier; every replay observes the marker and stays silent. **No new
+`WorkflowEvent` variant and no migration** — the markers are opaque names on
+`MarkerRecorded`, exactly like `fan_out:{n}` / `race:{seq}` / `patch:{id}`.
+
+**Backward compatibility.** A pre-#801 history (no saga markers) replays
+untouched and uncounted: the marker matcher's `Absent` arm never moves the
+cursor, so the recorded events still match the compensation's own commands —
+never a divergence, never a retroactive count.
+
+**In-Saga emission (not the worker terminal boundary).** The failure counter
+fires even when the workflow author catches `SagaCompensationFailed` and the
+run goes on to COMPLETE, and the compensated counter fires for
+cancel-and-compensate unwinds in runs that never terminally fail — both
+cases a terminal-boundary emission would structurally miss. It is therefore
+fully separable from `harvest.workflow.terminal{outcome=failed}`.
+
+**Accepted edges** (documented deliberately):
+
+- An unwind entered while unconsumed non-marker events sit at the replay
+  cursor (e.g. a post-restart replay with a trailing `WorkflowCancelled`) is
+  conservatively **uncounted** — for a metrics-only feature, a silent
+  under-count of a rare edge beats any chance of recording a marker at a
+  wrong history position.
+- A **pure in-memory** unwind (no compensation touches an activity, so the
+  cycle has zero durable footprint) that crash-resumes within one decision
+  cycle can re-count (at-least-once) — the metric mirror of the
+  "compensations re-run wholesale" contract.
+- **Forward compatibility:** a history recorded by #801+ code does not
+  replay under pre-#801 builds (the marker is unknown to the old matcher);
+  a rollback nd-blocks (#603, non-terminal, recoverable) until rolled
+  forward. Same rule as every marker feature.
+
+Starter alerts `harvest_saga_compensation_spike` and
+`harvest_saga_compensation_failed` ship in
+`docs/alerts/starter-pack-v0.1.0.json` with runbook sections in
+`docs/runbooks/harvest-alerts.md`.
+
+---
+
 ## Test coverage
 
-The three integration tests in `autumn-harvest/tests/saga_tests.rs` lock in
-these semantics:
+The integration tests in `autumn-harvest/tests/integration/saga_tests.rs`
+lock in these semantics:
 
 | Test | What it proves |
 |------|----------------|
 | `saga_cancellation_does_not_auto_compensate` | `Saga` leaves compensations pending when `ctx.is_cancelled()` is true; no automatic unwind occurs |
 | `saga_compensate_all_on_cancel_pattern` | The recommended explicit cancel-and-compensate pattern works end-to-end; LIFO order is preserved |
 | `saga_compensation_idempotency_under_replay` | On a simulated second execution (replay after crash), all compensations re-run; by-ID compensations are safe, release-most-recent would produce double-effects |
+| `saga_compensated_metric_emitted_once_across_crash_replay` | The `harvest.saga.compensated` counter reflects real compensation sequences, not the replay count — the durable marker suppresses re-emission on crash-resume (issue #801, AC3) |
+| `saga_compensation_failed_metric_distinct_and_once` | The failure counter is a distinct signal, emitted exactly once and deduped across replays by its own marker |
+| `saga_compensation_failed_emitted_even_when_author_catches_error` | An author-caught `SagaCompensationFailed` is still counted (in-Saga emission) |
+| `saga_success_path_emits_no_saga_metrics_and_no_marker_commands` | A saga that never compensates emits nothing new (issue #801, AC6) |
+| `pre_801_history_mid_unwind_replays_clean_and_uncounted` | A pre-#801 marker-less history — including one captured mid-unwind — replays without divergence and without emission |
 
 ---
 

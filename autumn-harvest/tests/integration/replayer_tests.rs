@@ -3104,3 +3104,169 @@ async fn replayer_replays_signal_handler_workflow_with_only_one_signal() {
         "single-signal fixture must replay successfully: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Saga compensation observability (issue #801)
+// ---------------------------------------------------------------------------
+
+/// Saga workflow with an activity-backed forward step + compensation, ending
+/// in a manual `compensate_all()` unwind — the durable compensation pattern
+/// documented in docs/saga.md.
+fn saga_compensated_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut saga = autumn_harvest::Saga::new(ctx);
+        saga.step(
+            || async {
+                ctx.execute_activity_raw("reserve", Value::Null, "default")
+                    .await
+            },
+            move |rsv: Value| async move {
+                ctx.execute_activity_raw("release", rsv, "default")
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        saga.compensate_all().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("compensated"))
+    })
+}
+
+/// History for `saga_compensated_workflow` as recorded by #801+ code: the
+/// `saga_compensated:{seq}` dedup marker sits between the forward step's
+/// events and the compensation activity's events.
+fn saga_marker_history() -> Vec<WorkflowEvent> {
+    let reserve_id = ActivityExecId::new();
+    let release_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: reserve_id,
+            name: "reserve".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: reserve_id,
+            output: serde_json::json!("rsv-1"),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: "release".into(),
+            input: serde_json::json!("rsv-1"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: Value::Null,
+        },
+    ]
+}
+
+/// Same shape as recorded by pre-#801 code: no saga marker anywhere.
+fn saga_pre_marker_history() -> Vec<WorkflowEvent> {
+    saga_marker_history()
+        .into_iter()
+        .filter(|event| !matches!(event, WorkflowEvent::MarkerRecorded { .. }))
+        .collect()
+}
+
+/// Recorder counting only the two saga counters (everything else no-ops).
+#[derive(Default)]
+struct SagaCounterRecorder {
+    compensated: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for SagaCounterRecorder {
+    fn record_saga_compensated(&self, _workflow_name: &str, _queue: &str) {
+        self.compensated
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_saga_compensation_failed(&self, _workflow_name: &str, _queue: &str) {
+        self.failed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A marker-bearing (#801+) saga history replays deterministically.
+#[tokio::test]
+async fn replayer_succeeds_for_saga_history_with_compensation_markers() {
+    let report = WorkflowReplayer::new()
+        .register_fn("saga_compensated_workflow", saga_compensated_workflow)
+        .replay_from_events(saga_marker_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "marker-bearing saga history must replay cleanly: {report}"
+    );
+}
+
+/// Replay of a recorded unwind emits zero saga metrics — the counters fire
+/// only on the live frontier where the marker is first recorded.
+#[tokio::test]
+async fn replayer_replay_emits_no_saga_metrics() {
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn("saga_compensated_workflow", saga_compensated_workflow)
+        .with_metrics(recorder.clone())
+        .replay_from_events(saga_marker_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "fixture must replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a full-history replay must emit no saga.compensated samples"
+    );
+    assert_eq!(
+        recorder.failed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a full-history replay must emit no saga.compensation_failed samples"
+    );
+}
+
+/// Backward compat (AC7): a pre-#801 marker-less saga history replays
+/// untouched under the instrumented code — the Absent arm is non-mutating.
+#[tokio::test]
+async fn replayer_succeeds_for_pre_marker_saga_history() {
+    let recorder = std::sync::Arc::new(SagaCounterRecorder::default());
+    let report = WorkflowReplayer::new()
+        .register_fn("saga_compensated_workflow", saga_compensated_workflow)
+        .with_metrics(recorder.clone())
+        .replay_from_events(saga_pre_marker_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "pre-#801 marker-less saga history must replay cleanly: {report}"
+    );
+    assert_eq!(
+        recorder
+            .compensated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "legacy histories are never counted retroactively"
+    );
+}

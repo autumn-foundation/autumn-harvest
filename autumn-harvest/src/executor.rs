@@ -568,6 +568,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     )
     .with_workflow_name(workflow_name)
     .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
+    .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_payload_caps(
         max_activity_input_bytes,

@@ -668,6 +668,70 @@
         "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism (pre-#603 terminally-failed rows only)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism"
+    },
+    {
+      "id": "harvest_saga_compensation_spike",
+      "status": "enforceable",
+      "signal_source": "harvest.saga.compensated counter (issue #801), incremented exactly once per real compensation sequence at unwind start.",
+      "default_threshold": "Ticket when the compensation rate for any workflow type is elevated for 5 minutes against its own baseline: rate(harvest_saga_compensated_total[5m]) > 4 * rate(harvest_saga_compensated_total[1h] offset 1h), min 1/min. Page on sustained (> 15 min) elevation. Tune per workflow volume.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "Sagas are rolling back at an elevated rate. A compensation spike is the canonical leading indicator that a downstream dependency is failing: forward steps succeed until one dependency starts erroring, and every affected saga then unwinds. The counter fires exactly once per real unwind (deduped across replays by a durable marker), so the rate reflects genuine rollback volume, not replay noise.",
+      "first_action": "Identify the spiking workflow label, then find the failing step: harvest workflow list --state FAILED --workflow <name> | head -20 and check harvest.activity.failed{workflow.type=<name>} for the error.type breakdown of the downstream that is failing.",
+      "dependencies": [
+        {
+          "ref": "#801",
+          "status": "shipped",
+          "surface": "harvest.saga.compensated{workflow, queue} counter emitted exactly once per compensation sequence"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "workflow and queue labels are bounded (registered workflow types / configured queues). execution.id is never a label. Compensation volume is workload-relative — a baseline-relative expression avoids paging on a workflow type that legitimately compensates often.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_saga_compensated_total[5m])) > 4 * sum by (workflow) (rate(harvest_saga_compensated_total[1h] offset 1h)) and sum by (workflow) (rate(harvest_saga_compensated_total[5m])) > (1/60)"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED",
+        "GET /api/harvest/dead-letters"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_saga_compensation_spike"
+    },
+    {
+      "id": "harvest_saga_compensation_failed",
+      "status": "enforceable",
+      "signal_source": "harvest.saga.compensation_failed counter (issue #801), incremented exactly once per unwind that finishes with at least one compensation error (HarvestError::SagaCompensationFailed).",
+      "default_threshold": "Page on ANY occurrence: increase(harvest_saga_compensation_failed_total[5m]) > 0.",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "A saga rollback itself failed, leaving the system in a partially-committed, dangling state (e.g. a charge that could not be refunded, a reservation that could not be released) that needs manual reconciliation. This signal is distinct from harvest.workflow.terminal{outcome=failed} and fires even when the workflow author catches the error and the run completes — every dangling state raises exactly one alertable increment.",
+      "first_action": "Find the affected executions: harvest workflow list --state FAILED --workflow <name>, then inspect each run's history for the failing compensation activity (GET /api/harvest/workflows/{id}/history) and reconcile the dangling resource manually (refund, release, restore).",
+      "dependencies": [
+        {
+          "ref": "#801",
+          "status": "shipped",
+          "surface": "harvest.saga.compensation_failed{workflow, queue} counter emitted exactly once per failed unwind, including author-caught failures"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Zero false negatives is the design goal: the counter is emitted in-Saga at the failure observation point, deduped across replays by a durable marker. workflow and queue labels are bounded; execution.id is never a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow, queue) (increase(harvest_saga_compensation_failed_total[5m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED",
+        "GET /api/harvest/workflows/{execution_id}/history"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed"
     }
   ]
 }

@@ -433,6 +433,37 @@ pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
 /// and must never appear here.
 pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_throttled";
 
+/// Counter: incremented exactly once per real saga compensation sequence
+/// (issue #801).
+///
+/// A "sequence" is a non-empty `Saga::compensate_all` / step-failure unwind
+/// actually running forward. Counted at unwind start on the live frontier,
+/// deduped across replays by the durable `saga_compensated:{seq}` marker, so
+/// the value reflects real sequences rather than the replay/re-registration
+/// count.
+///
+/// A compensation-rate spike is the canonical leading indicator that a
+/// downstream dependency is failing and sagas are rolling back en masse.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_SAGA_COMPENSATED: &str = "harvest.saga.compensated";
+
+/// Counter: incremented exactly once per saga unwind that finishes with at
+/// least one compensation error (issue #801).
+///
+/// This is the `HarvestError::SagaCompensationFailed` dangling-state case
+/// needing manual reconciliation.
+///
+/// Distinct from the generic `harvest.workflow.terminal{outcome=failed}`
+/// counter, and emitted in-Saga rather than at the worker terminal boundary,
+/// so it fires even when the workflow author catches the error and the run
+/// goes on to COMPLETE.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_SAGA_COMPENSATION_FAILED: &str = "harvest.saga.compensation_failed";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
@@ -1778,6 +1809,29 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (path, outcome);
     }
 
+    /// A saga compensation sequence started running forward (issue #801).
+    ///
+    /// Emitted **exactly once per real unwind** — on the live frontier where
+    /// the durable `saga_compensated:{seq}` dedup marker is first recorded;
+    /// replays of a recorded unwind never re-emit.
+    ///
+    /// Maps to the counter `harvest.saga.compensated{workflow, queue}`.
+    fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A saga unwind finished with at least one compensation error — the
+    /// `SagaCompensationFailed` dangling-state case (issue #801).
+    ///
+    /// Emitted exactly once per failed unwind, independent of whether the
+    /// author propagates or catches the error, and separable from
+    /// `harvest.workflow.terminal{outcome=failed}`.
+    ///
+    /// Maps to the counter `harvest.saga.compensation_failed{workflow, queue}`.
+    fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
     /// Whether this recorder actually forwards samples anywhere.
     ///
     /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
@@ -2971,5 +3025,46 @@ mod tests {
         // because the signature is (name, value, labels) with no exec-id param.
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_user_counter("harvest.user.orders", 1, &[("tier", "gold")]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Saga compensation observability (issue #801)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn saga_metric_constants_are_stable() {
+        // The saga compensation counters are specified by ADR-0001 §7 naming
+        // convention (instrument.noun); alert-pack PromQL depends on the
+        // rendered Prometheus names, so the constants must never drift.
+        assert_eq!(METRIC_SAGA_COMPENSATED, "harvest.saga.compensated");
+        assert_eq!(
+            METRIC_SAGA_COMPENSATION_FAILED,
+            "harvest.saga.compensation_failed"
+        );
+    }
+
+    #[test]
+    fn record_saga_compensated_has_noop_default() {
+        // MetricsRecorder::record_saga_compensated must exist with a no-op
+        // default body so existing MetricsRecorder implementations compile
+        // without changes (AC4).
+        let rec = NoOpMetrics;
+        rec.record_saga_compensated("book_trip", "default");
+    }
+
+    #[test]
+    fn record_saga_compensation_failed_has_noop_default() {
+        // Same additive no-op-default contract for the dangling-state counter.
+        let rec = NoOpMetrics;
+        rec.record_saga_compensation_failed("book_trip", "default");
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_saga_counters() {
+        // ADR-0001 §7 cardinality rule: execution.id is span-only. Verified
+        // by construction — both methods accept exactly (workflow_name, queue).
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_saga_compensated("billing", "default");
+        rec.record_saga_compensation_failed("billing", "default");
     }
 }

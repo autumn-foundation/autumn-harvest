@@ -329,6 +329,8 @@ metric is emitted in the source code.
 | `harvest.workflow.start_throttled` | Counter | `api.rs` (HTTP/batch) + `scheduler.rs` (scheduled/buffered fires) — once per workflow start deferred by a start throttle because the per-key token bucket was empty (issue #607) |
 | `harvest.webhook.received` | Counter | `webhook_receiver.rs` — every request that reaches an inbound webhook receiver route, regardless of outcome (issue #344) |
 | `harvest.webhook.rejected` | Counter | `webhook_receiver.rs` — every inbound webhook request rejected: signature/timestamp/replay verification failure, payload parse failure, mapping-function rejection, or missing idempotency key. Never fires for `accepted`/`idempotent_replay` (issue #344) |
+| `harvest.saga.compensated` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_start`), exactly once per real compensation sequence: a non-empty `compensate_all` / step-failure unwind actually running forward (issue #801) |
+| `harvest.saga.compensation_failed` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_failed`), exactly once per unwind ending with ≥1 compensation error — the `SagaCompensationFailed` dangling-state case, counted even when the author catches the error (issue #801) |
 
 ### Label sets
 
@@ -356,10 +358,34 @@ metric is emitted in the source code.
 | `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
 | `harvest.webhook.received` | `path` (registered `#[webhook(path = ...)]` bindings only, closed set), `outcome` (`accepted\|idempotent_replay\|verify_failed\|parse_failed\|missing_idempotency\|internal_error`) |
 | `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
+| `harvest.saga.compensated` | `workflow`, `queue` |
+| `harvest.saga.compensation_failed` | `workflow`, `queue` |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by
 construction — no `record_*` method accepts an `ExecutionId`.
+
+### Saga compensation metrics (issue #801)
+
+`harvest.saga.compensated` counts **compensation sequences that started
+running forward** (unwind start — the earliest outage signal), and
+`harvest.saga.compensation_failed` counts **unwinds that finished with at
+least one error** (the dangling-state page). The exactly-once contract is
+keyed to durable `MarkerRecorded` dedup markers (`saga_compensated:{seq}` /
+`saga_compensation_failed:{seq}`): the counter fires only when the marker is
+first recorded on the live frontier, so the documented "compensations re-run
+on every replay" contract never double-counts, and pre-#801 marker-less
+histories are never counted retroactively. The failure counter is emitted
+in-Saga rather than at the worker terminal boundary, so it is separable from
+`harvest.workflow.terminal{outcome=failed}` and fires even when the workflow
+author catches `SagaCompensationFailed` and the run completes. **Crash-window
+caveat:** the sample is emitted in-process alongside the durable marker
+write; for the documented durable pattern (compensations invoking activities)
+the marker persists with the unwind's first dispatch batch, making the
+crash-mid-unwind scenario exactly-once, while a *pure in-memory* unwind
+(zero durable footprint) that crash-resumes within a single decision cycle
+can re-count (at-least-once) — the metric mirror of the "compensations
+re-run wholesale" idempotency contract in `docs/saga.md`.
 
 ---
 

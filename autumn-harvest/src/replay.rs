@@ -240,6 +240,47 @@ pub(crate) fn version_marker_name(change_id: &str) -> String {
     format!("version:{change_id}")
 }
 
+/// Result of matching a saga compensation dedup marker against recorded
+/// history (issue #801).
+///
+/// Mirrors [`PatchMarkerMatch`]'s three-state shape (minus the patch-specific
+/// deprecation memo / `version:` interop / same-cycle latch, none of which
+/// apply here): the caller
+/// ([`crate::context::WorkflowContext::observe_saga_unwind_start`] /
+/// [`observe_saga_unwind_failed`](crate::context::WorkflowContext::observe_saga_unwind_failed))
+/// must distinguish "the marker was recorded" (stay silent) from "we are on
+/// the live frontier" (record a fresh marker AND emit the counter — the
+/// exactly-once point) from "replaying a pre-#801 marker-less history"
+/// (stay silent, touch nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SagaMarkerMatch {
+    /// A saga marker with this exact name was consumed at the cursor — the
+    /// unwind was already counted on a previous cycle. The caller emits
+    /// nothing.
+    Recorded,
+    /// Replaying, but no marker with this name at this position — a pre-#801
+    /// history (or an unwind entered with unconsumed events at the cursor).
+    /// The cursor is not advanced, so the recorded event still matches the
+    /// next command; the caller records nothing and emits nothing.
+    Absent,
+    /// Past recorded history — the first live execution of this unwind. The
+    /// caller records a fresh marker and emits the counter exactly here.
+    LiveFrontier,
+}
+
+/// Marker name recorded at unwind start by `Saga`'s compensation
+/// instrumentation (issue #801). `seq` is the per-context saga sequence
+/// number, deterministic per call site across replays.
+pub(crate) fn saga_compensated_marker_name(seq: u32) -> String {
+    format!("saga_compensated:{seq}")
+}
+
+/// Marker name recorded when a saga unwind finishes with at least one
+/// compensation error (issue #801).
+pub(crate) fn saga_compensation_failed_marker_name(seq: u32) -> String {
+    format!("saga_compensation_failed:{seq}")
+}
+
 /// Terminal outcome for an early-drained external signal.
 #[derive(Debug, Clone)]
 enum StashedSignalTerminal {
@@ -3679,6 +3720,61 @@ impl HistoryMatcher {
         present
     }
 
+    // ── Saga compensation markers (issue #801) ────────────────────────────
+
+    /// Match a saga compensation dedup marker (`saga_compensated:{seq}` or
+    /// `saga_compensation_failed:{seq}`) against recorded history.
+    ///
+    /// Clones [`Self::match_patch_marker`]'s tolerant scan discipline —
+    /// the mechanism that exists precisely to retrofit markers into an
+    /// existing API without breaking already-recorded histories:
+    ///
+    /// 1. Past the end of cursor-based history →
+    ///    [`SagaMarkerMatch::LiveFrontier`] (the caller records a fresh
+    ///    marker and emits the counter — the exactly-once point).
+    /// 2. After draining early signal events, if only stashed signal events
+    ///    remained → [`SagaMarkerMatch::Absent`] (conservative: a
+    ///    drained-signal-only frontier is a recorded position; never record
+    ///    or emit there, mirroring `patched()`'s signal-with-start caveat).
+    /// 3. A `MarkerRecorded` at the cursor with exactly `marker_name` →
+    ///    consume it, return [`SagaMarkerMatch::Recorded`].
+    /// 4. Anything else at the cursor → [`SagaMarkerMatch::Absent`], cursor
+    ///    untouched. This is the backward-compat arm: a pre-#801 history
+    ///    mid-unwind holds the first compensation's `ActivityScheduled` here
+    ///    and must proceed unharmed — no divergence, no emission, no marker.
+    pub fn match_saga_marker(&mut self, marker_name: &str) -> SagaMarkerMatch {
+        self.advance_to_next_unconsumed_event();
+
+        // Check BEFORE draining: if already past cursor-based history, this
+        // is a genuinely new unwind → the caller records a fresh marker.
+        if !self.is_replaying() {
+            return SagaMarkerMatch::LiveFrontier;
+        }
+
+        // Now safe to drain ExternalSignal events that may precede this
+        // marker in a mixed batch.
+        self.drain_early_signals();
+
+        // After draining: if the cursor is past the end (only stashed signal
+        // events were the remaining history), this is a recorded position —
+        // stay silent instead of recording a new marker.
+        if !self.is_replaying() {
+            return SagaMarkerMatch::Absent;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, .. } if *name == marker_name => {
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                SagaMarkerMatch::Recorded
+            }
+            // No marker at the current position — pre-#801 history (or an
+            // unwind entered with unconsumed events at the cursor). Don't
+            // advance the cursor.
+            _ => SagaMarkerMatch::Absent,
+        }
+    }
+
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
 
     /// Match the count marker for a fan-out group against history.
@@ -4611,6 +4707,109 @@ mod tests {
             "deprecate_patch must see a version marker recorded this cycle"
         );
         assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Recorded);
+    }
+
+    // ── Saga compensation markers (issue #801) ───────────────────────────
+
+    #[test]
+    fn matcher_saga_marker_live_frontier_on_empty_history() {
+        // Past the end of history — the first live unwind. The caller records
+        // a fresh marker and emits the counter exactly here.
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(
+            matcher.match_saga_marker("saga_compensated:1"),
+            SagaMarkerMatch::LiveFrontier
+        );
+    }
+
+    #[test]
+    fn matcher_saga_marker_recorded_consumes_marker() {
+        // A previously recorded marker at the cursor is consumed and reported
+        // as Recorded — the caller stays silent (no re-emit on replay).
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(3),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_saga_marker("saga_compensated:1"),
+            SagaMarkerMatch::Recorded
+        );
+        assert_eq!(matcher.position(), 1);
+    }
+
+    #[test]
+    fn matcher_saga_marker_absent_on_foreign_event_leaves_cursor() {
+        // Backward-compat money arm: a pre-#801 history holds the unwind's
+        // first compensation activity where the marker would sit. The match
+        // must be non-mutating so the recorded event still matches the next
+        // command cleanly — never a divergence, never an emit.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "release_reservation".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_saga_marker("saga_compensated:1"),
+            SagaMarkerMatch::Absent
+        );
+        // Cursor must NOT advance — the event isn't consumed …
+        assert_eq!(matcher.position(), 0);
+        // … so the compensation activity at the cursor still matches cleanly.
+        let activity = matcher.match_activity("release_reservation");
+        assert!(matches!(activity, HistoryMatch::Matched { .. }));
+    }
+
+    #[test]
+    fn matcher_saga_marker_absent_after_draining_trailing_signals() {
+        // Conservative post-drain arm (exact parity with match_patch_marker):
+        // a history whose tail is un-awaited signals at the unwind point is a
+        // recorded position — never the live frontier. No marker, no emit.
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "kick".into(),
+            payload: serde_json::json!({"n": 1}),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_saga_marker("saga_compensated:1"),
+            SagaMarkerMatch::Absent,
+            "a trailing-signal history must be treated as a recorded position"
+        );
+    }
+
+    #[test]
+    fn matcher_saga_marker_distinguishes_seq_by_name() {
+        // Two unwinds in one workflow get distinct seq-numbered markers; a
+        // lookup for seq 2 must not consume seq 1's marker.
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "saga_compensated:1".into(),
+            details: serde_json::json!(2),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_saga_marker("saga_compensated:2"),
+            SagaMarkerMatch::Absent
+        );
+        assert_eq!(matcher.position(), 0);
+        // The correctly-named lookup still consumes it.
+        assert_eq!(
+            matcher.match_saga_marker("saga_compensated:1"),
+            SagaMarkerMatch::Recorded
+        );
+        assert_eq!(matcher.position(), 1);
     }
 
     #[test]
