@@ -416,7 +416,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (shard) (harvest_dlq_entries{shard=~\"$shard\"})",
+          "expr": "max by (shard) (harvest_dlq_entries{shard=~\"$shard\"})",
           "legendFormat": "shard {{shard}}",
           "datasource": {
             "type": "prometheus",
@@ -424,7 +424,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_dlq_growth (docs/runbooks/harvest-alerts.md#harvest_dlq_growth) Dead-letter queue depth per shard. Any growth for critical workflows is page-worthy."
+      "description": "Alert: harvest_dlq_growth (docs/runbooks/harvest-alerts.md#harvest_dlq_growth) Dead-letter queue depth per shard. max by (shard) avoids replica double-counting: every worker replica samples the same shard-global count. Any growth for critical workflows is page-worthy."
     },
     {
       "id": 8,
@@ -466,14 +466,14 @@
         {
           "refId": "A",
           "expr": "harvest_worker_slots_in_use / (harvest_worker_slots_in_use + harvest_worker_slots_available)",
-          "legendFormat": "{{slot_type}}",
+          "legendFormat": "{{slot_type}} @ {{instance}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           }
         }
       ],
-      "description": "Alert: harvest_worker_slot_saturation (docs/runbooks/harvest-alerts.md#harvest_worker_slot_saturation) Dispatch-slot utilization per slot_type (issue #531). Pair with queue depth: slots saturated AND backlog growing = worker bottleneck; slots free while backlog grows = downstream bottleneck. 90%/5m is a starter default."
+      "description": "Alert: harvest_worker_slot_saturation (docs/runbooks/harvest-alerts.md#harvest_worker_slot_saturation) Dispatch-slot utilization per slot_type (issue #531). Pair with queue depth: slots saturated AND backlog growing = worker bottleneck; slots free while backlog grows = downstream bottleneck. 90%/5m is a starter default. Charted per worker replica (each replica owns its slots), so the legend carries the instance label."
     },
     {
       "id": 9,
@@ -844,7 +844,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (workflow) (harvest_workflow_history_oversized{workflow=~\"$workflow\"})",
+              "expr": "max by (workflow) (harvest_workflow_history_oversized{workflow=~\"$workflow\"})",
               "legendFormat": "{{workflow}}",
               "datasource": {
                 "type": "prometheus",
@@ -852,7 +852,7 @@
               }
             }
           ],
-          "description": "Executions whose history has crossed the warning threshold of the history cap."
+          "description": "Executions whose history has crossed the warning threshold of the history cap. max by (workflow) avoids replica double-counting: each replica samples the same fleet-wide count."
         },
         {
           "id": 17,
@@ -1518,7 +1518,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "harvest_admission_gates_active",
+              "expr": "max(harvest_admission_gates_active)",
               "legendFormat": "active gates",
               "datasource": {
                 "type": "prometheus",
@@ -1526,7 +1526,7 @@
               }
             }
           ],
-          "description": "Number of currently-armed admission gates. Non-zero outside an incident window deserves a look."
+          "description": "Number of currently-armed admission gates. Non-zero outside an incident window deserves a look. max() collapses the identical per-replica samples of the shared gate count."
         },
         {
           "id": 32,
@@ -1696,7 +1696,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_activity_failure_surge (docs/runbooks/harvest-alerts.md#harvest_activity_failure_surge) Failed activity completions per second. Starter default: page above 5% of completions or > 10 failures in 5m for a critical activity."
+          "description": "Alert: harvest_activity_failure_surge (docs/runbooks/harvest-alerts.md#harvest_activity_failure_surge) Failed activity completions per second (absolute rate \u2014 the alert\u2019s companion 5%-of-completions ratio form is readable from the Activity success ratio panel). Starter default: page above 5% of completions or > 10 failures in 5m for a critical activity."
         },
         {
           "id": 36,
@@ -1737,7 +1737,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\",queue=~\"$queue\"}[$__rate_interval])) / sum by (activity, queue) (rate(harvest_activity_attempts_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "expr": "(sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\",queue=~\"$queue\"}[$__rate_interval])) or on(activity, queue) (0 * sum by (activity, queue) (rate(harvest_activity_attempts_total{queue=~\"$queue\"}[$__rate_interval])))) / sum by (activity, queue) (rate(harvest_activity_attempts_total{queue=~\"$queue\"}[$__rate_interval]))",
               "legendFormat": "{{activity}} / {{queue}}",
               "datasource": {
                 "type": "prometheus",
@@ -1745,7 +1745,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_activity_success_ratio (docs/runbooks/harvest-alerts.md#harvest_activity_success_ratio) Completed attempts / all attempts within the single harvest.activity.attempts family (issue #528). Starter default: page below 90% over 5m."
+          "description": "Alert: harvest_activity_success_ratio (docs/runbooks/harvest-alerts.md#harvest_activity_success_ratio) Completed attempts / all attempts within the single harvest.activity.attempts family (issue #528). Starter default: page below 90% over 5m. The or-on()-zero guard mirrors the alert expression so a 100%-failing activity renders 0 rather than No data."
         },
         {
           "id": 37,
@@ -1843,7 +1843,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_activity_retry_storm (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Alert: harvest_activity_retry_storm_critical (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm_critical) Retries actually enqueued per second \u2014 the authoritative retry-storm signal. Starter defaults: ticket > 5/s, page > 20/s, both over 5m."
+          "description": "Alert: harvest_activity_retry_storm (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Alert: harvest_activity_retry_storm_critical (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Retries actually enqueued per second \u2014 the authoritative retry-storm signal. Starter defaults: ticket > 5/s, page > 20/s, both over 5m."
         }
       ]
     },
@@ -2167,14 +2167,14 @@
             {
               "refId": "A",
               "expr": "harvest_worker_slot_target",
-              "legendFormat": "{{slot_type}}",
+              "legendFormat": "{{slot_type}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
             }
           ],
-          "description": "Current tuner slot target per slot_type (issue #548) \u2014 confirms live behaviour stays inside the operator band."
+          "description": "Current tuner slot target per slot_type (issue #548) \u2014 confirms live behaviour stays inside the operator band. Per-replica series (each worker tunes its own slots), so the legend carries the instance label."
         },
         {
           "id": 47,
@@ -2278,7 +2278,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "rate(harvest_timer_started_total[$__rate_interval])",
+              "expr": "sum(rate(harvest_timer_started_total[$__rate_interval]))",
               "legendFormat": "timers started",
               "datasource": {
                 "type": "prometheus",
@@ -2602,7 +2602,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "increase(harvest_schedule_decision_write_failed_total[1h])",
+              "expr": "sum(increase(harvest_schedule_decision_write_failed_total[1h]))",
               "legendFormat": "write failures",
               "datasource": {
                 "type": "prometheus",
@@ -2924,7 +2924,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (shard) (harvest_shard_stranded_pending{shard=~\"$shard\"})",
+              "expr": "max by (shard) (harvest_shard_stranded_pending{shard=~\"$shard\"})",
               "legendFormat": "shard {{shard}}",
               "datasource": {
                 "type": "prometheus",
@@ -2932,7 +2932,7 @@
               }
             }
           ],
-          "description": "Eligible pending tasks with no live worker able to claim them, per shard."
+          "description": "Eligible pending tasks with no live worker able to claim them, per shard. max by (shard) avoids replica double-counting of the shared per-shard sample."
         }
       ]
     },
@@ -2987,7 +2987,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "topk(10, harvest_concurrency_in_flight)",
+              "expr": "topk(10, max by (key) (harvest_concurrency_in_flight))",
               "legendFormat": "{{key}}",
               "datasource": {
                 "type": "prometheus",
@@ -3036,7 +3036,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "topk(10, harvest_concurrency_deferred)",
+              "expr": "topk(10, max by (key) (harvest_concurrency_deferred))",
               "legendFormat": "{{key}}",
               "datasource": {
                 "type": "prometheus",
@@ -3085,7 +3085,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "topk(10, harvest_rate_limit_tokens_available)",
+              "expr": "topk(10, max by (key) (harvest_rate_limit_tokens_available))",
               "legendFormat": "tokens {{key}}",
               "datasource": {
                 "type": "prometheus",
@@ -3094,7 +3094,7 @@
             },
             {
               "refId": "B",
-              "expr": "topk(10, harvest_rate_limit_refill_rate)",
+              "expr": "topk(10, max by (key) (harvest_rate_limit_refill_rate))",
               "legendFormat": "refill {{key}}",
               "datasource": {
                 "type": "prometheus",
@@ -3223,7 +3223,7 @@
               }
             }
           ],
-          "description": "Observed payload sizes by payload kind (issue #252). Bridged in the metrics-rs adapter by issue #754."
+          "description": "Observed payload sizes by payload kind (issue #252). Bridged in the metrics-rs adapter by issue #754, but the engine has no emission call sites for harvest.payload.bytes as of v0.1.0 (pre-existing issue #252 gap) \u2014 this panel stays empty until emission is wired; see the issue #754 review."
         },
         {
           "id": 72,
@@ -3272,7 +3272,7 @@
               }
             }
           ],
-          "description": "Payloads rejected by the byte-cap guard (issue #252). Bridged in the metrics-rs adapter by issue #754."
+          "description": "Payloads rejected by the byte-cap guard (issue #252). Bridged in the metrics-rs adapter by issue #754, but the engine has no emission call sites for harvest.payload.rejected as of v0.1.0 (pre-existing issue #252 gap) \u2014 this panel stays empty until emission is wired; see the issue #754 review."
         },
         {
           "id": 73,
@@ -3586,7 +3586,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
+            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
           }
         },
         {
@@ -3601,7 +3601,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
+            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
           }
         },
         {
@@ -3616,7 +3616,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
+            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
           }
         },
         {
@@ -3631,7 +3631,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
+            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
           }
         },
         {
@@ -3646,7 +3646,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution-id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
+            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution_id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
           }
         }
       ]

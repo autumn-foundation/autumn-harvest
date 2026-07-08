@@ -22,7 +22,8 @@ pack's `threshold_policy`.
    guard enforces ≥ 36).
 2. **A Prometheus datasource** scraping your Harvest workers. The dashboard
    never hardcodes a datasource — every panel resolves through the
-   `$datasource` template variable, so you pick the datasource at import time.
+   `$datasource` template variable, so you pick the datasource after import
+   (see the import steps below).
 3. **The `metrics-rs` feature with `MetricsRsRecorder`** wired into your
    Harvest builder, exported through `metrics-exporter-prometheus` (or an
    equivalent `metrics`-crate exporter). See `docs/telemetry.md` for the
@@ -39,13 +40,38 @@ pack's `threshold_policy`.
 
 ## Importing the Dashboard
 
+### Grafana UI
+
 1. In Grafana: **Dashboards → New → Import**.
-2. Upload `starter-pack-v0.1.0.json` (or paste its contents).
-3. When prompted, select your Prometheus datasource for the `Data source`
-   variable. That is the only prompt — nothing else is environment-specific.
-4. Save. The dashboard keeps the stable uid `harvest-starter-pack`, so
-   re-importing a newer pack version upgrades the same dashboard in place
-   instead of creating a duplicate.
+2. Upload `starter-pack-v0.1.0.json` (or paste its contents), then click
+   **Load** and **Import**.
+3. The import wizard shows **no datasource prompt**: the JSON deliberately
+   ships without an `__inputs` block, and every panel resolves through the
+   `$datasource` template variable instead. After import, pick your
+   Prometheus datasource from the **Data source** dropdown at the top of the
+   dashboard — nothing else is environment-specific.
+4. Save (the variable selection persists with the dashboard). The dashboard
+   keeps the stable uid `harvest-starter-pack`, so re-importing a newer pack
+   version upgrades the same dashboard in place instead of creating a
+   duplicate.
+
+### HTTP API
+
+The dashboards API expects the model wrapped in a `{"dashboard": …}`
+envelope — POSTing the raw file body is rejected:
+
+```bash
+jq -n --slurpfile dash docs/dashboards/starter-pack-v0.1.0.json \
+   '{dashboard: $dash[0], overwrite: true}' |
+curl -sS -X POST "$GRAFANA_URL/api/dashboards/db" \
+  -H "Authorization: Bearer $GRAFANA_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @-
+```
+
+`overwrite: true` upgrades the existing `harvest-starter-pack` dashboard in
+place. Select the Prometheus datasource via the **Data source** dropdown on
+first view, exactly as with the UI import.
 
 ## Coverage
 
@@ -69,7 +95,7 @@ dashboard grows one.
 
 ## Layout
 
-One always-expanded **Overview** row curates the six signals a first
+One always-expanded **Overview** row curates the seven signals a first
 responder needs (start rate, terminal outcomes, failure ratio, queue depth,
 schedule-to-start p99, DLQ depth, worker slot utilization). Every other row
 is collapsed and lazy-loaded by Grafana, grouped by subsystem: workflow
@@ -103,7 +129,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_workflow_failure_rate` | Overview | Workflow failure ratio | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_failure_rate) |
 | `harvest_activity_success_ratio` | Activities | Activity success ratio | [runbook](../runbooks/harvest-alerts.md#harvest_activity_success_ratio) |
 | `harvest_activity_retry_storm` | Activities | Activity retry rate | [runbook](../runbooks/harvest-alerts.md#harvest_activity_retry_storm) |
-| `harvest_activity_retry_storm_critical` | Activities | Activity retry rate (page tier, > 20/s) | [runbook](../runbooks/harvest-alerts.md#harvest_activity_retry_storm) |
+| `harvest_activity_retry_storm_critical` | Activities | Activity retry rate (same panel; page tier > 20/s) | [runbook](../runbooks/harvest-alerts.md#harvest_activity_retry_storm) |
 | `harvest_workflow_non_determinism` | Workflow health | Non-determinism detections (+ Non-determinism blocks entered) | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_non_determinism) |
 
 ### Readiness-style alerts (no native metric)
@@ -135,9 +161,15 @@ series (concurrency / rate limits) deliberately get `topk(10, …)` panels and
 **no** template variable: key values are derived from tenant input and are
 only bounded by author discipline.
 
-Multi-replica note: sampler gauges (e.g. `harvest_queue_depth`) are sampled
-by every worker replica, so gauge panels aggregate with `max by (queue)`
-rather than `sum` to avoid replica double-counting.
+Multi-replica note: **replica-global** sampler gauges — every worker replica
+samples the same shared DB-derived value (`harvest_queue_depth`,
+`harvest_queue_oldest_pending_age`, `harvest_dlq_entries`,
+`harvest_shard_stranded_pending`, `harvest_workflow_history_oversized`,
+`harvest_admission_gates_active`, and the per-key concurrency / rate-limit
+gauges) — aggregate with `max`, never `sum`, to avoid replica
+double-counting. **Replica-local** gauges, where each replica owns its own
+value (`harvest_worker_slots_in_use` / `_available`), sum correctly across
+the fleet; the per-replica slot panels legend the `instance` label instead.
 
 ## Versioning
 
@@ -151,5 +183,12 @@ one.
 No panel in this pack requires a new `WorkflowEvent` variant, a migration,
 or an exporter change beyond the issue #754 metrics-rs adapter bridge fix
 (`harvest.workflow.timeout`, `harvest.payload.bytes`,
-`harvest.payload.rejected` — previously catalogued but unreachable from a
-Prometheus scrape).
+`harvest.payload.rejected` — previously catalogued but not bridged by the
+adapter). Bridged ≠ emitted: `harvest.workflow.timeout` is emitted
+end-to-end (the timeout scanner calls the recorder), so its panel populates
+immediately; the two payload byte-cap metrics still have **no engine
+emission call sites** as of v0.1.0 (a pre-existing issue #252 gap — the cap
+sites construct the error without calling the recorder), so the two
+payload-cap panels stay empty until emission is wired. Both panels say so in
+their descriptions; wiring the emission is a known follow-up from the issue
+#754 review.

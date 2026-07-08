@@ -608,8 +608,10 @@ Low-traffic workflow types produce unstable ratios over short windows — a
 single failure in a 5-minute window with two terminal runs is 50%. Alert only
 on workflow types with steady baseline traffic, or lengthen the window.
 Deliberate operator terminations and cancellations are separate `outcome`
-values and never count toward this ratio; `continued_as_new` is excluded from
-the denominator by the pack's expression.
+values and never count toward this ratio's numerator; `continued_as_new` is
+excluded from the denominator by the **dashboard** pack's ratio panel — the
+alert pack's default expression carries no such exclusion, so add it to your
+alert expression if continue-as-new volume is significant.
 
 ### Safe actions
 
