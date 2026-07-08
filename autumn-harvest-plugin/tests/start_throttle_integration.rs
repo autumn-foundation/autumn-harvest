@@ -299,6 +299,34 @@ fn build_app(pool: &DbPool, info: WorkflowInfo) -> HarvestApiApp {
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
+/// Like `build_app`, but also returns the `HarvestApiState` handle so a test
+/// can arm an admission gate (issue #377) after the app is built -- needed
+/// to reproduce the gate-vs-pending-throttle-retry interaction (code review,
+/// issue #607). `HarvestApiState` is `Clone` over shared `Arc` internals
+/// (including the gate cache), so mutating this handle affects the router
+/// built from its clone.
+fn build_app_with_state(pool: &DbPool, info: WorkflowInfo) -> (HarvestApiApp, HarvestApiState) {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+
+    let registry = HandlerRegistry::new(vec![info], vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("throttle-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    ));
+
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+    (app, api_state)
+}
+
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -416,6 +444,23 @@ async fn throttle_row_count(conn: &mut diesel_async::AsyncPgConnection, wf_name:
     .await
     .expect("count throttle rows")
     .count
+}
+
+async fn runs_started_for_schedule(
+    conn: &mut diesel_async::AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+) -> i32 {
+    #[derive(diesel::QueryableByName)]
+    struct RunsStarted {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        runs_started: i32,
+    }
+    diesel::sql_query("SELECT runs_started FROM harvest_schedules WHERE id = $1")
+        .bind::<SqlUuid, _>(schedule_id)
+        .get_result::<RunsStarted>(conn)
+        .await
+        .expect("read runs_started")
+        .runs_started
 }
 
 /// Like `insert_workflow_schedule`, but with a caller-specified
@@ -687,6 +732,95 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
     );
 }
 
+/// Code-review fix (issue #607 round 7): `schedule_backfill`'s throttle
+/// branch treated every `Deferred` outcome as a fresh dispatch, even when
+/// `reserve_or_defer` actually resolved to an *already-existing* pending row
+/// for the same `workflow_id` (its own idempotency shortcut) -- e.g. an
+/// operator repeating the exact same backfill window while the first call's
+/// throttled slot is still durably pending. That double-counted the slot in
+/// `dispatched`/`dispatched_this_call`, which then double-spent the
+/// schedule's `max_runs` budget for a call that created nothing new.
+/// Verifies a repeated identical backfill window reports the already-
+/// pending slot as skipped (`already_exists`), not dispatched, and does not
+/// advance `runs_started` a second time.
+#[tokio::test]
+async fn repeated_backfill_call_does_not_double_count_an_already_pending_throttle_row() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    // Pre-empty the bucket so the sole planned slot defers immediately on
+    // the first call.
+    seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
+    let schedule_id =
+        insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
+
+    let now = chrono::Utc::now();
+    let window = json!({ "from": now, "to": now });
+
+    let (status1, body1) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/backfill"),
+        window.clone(),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::OK, "first backfill call: {body1:?}");
+    assert_eq!(body1["dispatched"], json!(1), "{body1:?}");
+    assert_eq!(body1["skipped"], json!(0), "{body1:?}");
+    assert_eq!(throttle_row_count(&mut conn, "sync_tenant").await, 1);
+    let runs_started_after_first = runs_started_for_schedule(&mut conn, schedule_id).await;
+    assert_eq!(
+        runs_started_after_first, 1,
+        "the first, genuinely-fresh deferral must spend one run-budget slot"
+    );
+
+    // Repeat the exact same window: the single planned slot resolves to the
+    // exact same deterministic workflow_id, which already has a pending
+    // throttle row from the first call.
+    let (status2, body2) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/backfill"),
+        window,
+    )
+    .await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "second (repeated) backfill call: {body2:?}"
+    );
+    assert_eq!(
+        body2["dispatched"],
+        json!(0),
+        "the already-pending slot must not be reported as freshly dispatched: {body2:?}"
+    );
+    assert_eq!(
+        body2["skipped"],
+        json!(1),
+        "the already-pending slot must be reported as skipped: {body2:?}"
+    );
+    let reasons2 = body2["skipped_reasons"]
+        .as_object()
+        .expect("skipped_reasons object");
+    assert_eq!(
+        reasons2.get("already_exists"),
+        Some(&json!(1)),
+        "skip reason must name already_exists, not silently double-count: {body2:?}"
+    );
+
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        1,
+        "no second pending throttle row should have been created"
+    );
+    assert_eq!(
+        runs_started_for_schedule(&mut conn, schedule_id).await,
+        runs_started_after_first,
+        "the repeated call must not spend a second run-budget slot for the \
+         same already-pending row"
+    );
+}
+
 /// Code-review fix (issue #607 round 6): `POST /admin/schedules/{id}/trigger`
 /// (manual trigger-now) previously called the start primitive directly with
 /// no throttle check at all -- unlike scheduled and backfilled fires, which
@@ -817,6 +951,80 @@ async fn under_limit_starts_then_defers_excess_and_backlog_is_visible() {
         .expect("acme backlog present");
     assert_eq!(acme["deferred_count"], json!(3));
     assert_eq!(acme["workflow_name"], json!("sync_tenant"));
+}
+
+/// Code-review fix (issue #607 round 7): the admission gate's (#377)
+/// idempotent-retry bypass only checked for an existing non-terminal
+/// *execution*, not an existing *pending throttle row* -- so a retry for an
+/// explicit `workflow_id` that is already durably deferred in
+/// `harvest_start_throttle` was wrongly blocked with a `503` once a gate
+/// activated, even though `reserve_or_defer`'s own idempotency shortcut
+/// resolves the retry to the exact same pending row without creating any
+/// new admission. Verifies the gate bypass now also recognizes a pending
+/// throttle row, while a genuinely fresh `workflow_id` is still blocked.
+#[tokio::test]
+async fn retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, api_state) = build_app_with_state(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    // First request: bucket empty, defers durably.
+    seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
+    let (status1, body1) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({ "workflow_id": "gate-retry-job", "input": { "tenant_id": "acme" } }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::ACCEPTED, "first request: {body1:?}");
+    assert_eq!(body1["throttled"], json!(true), "{body1:?}");
+    assert_eq!(throttle_row_count(&mut conn, "sync_tenant").await, 1);
+
+    // Arm a fleet-wide admission gate blocking all new admissions.
+    api_state.initialize_gate_cache(vec![autumn_harvest::AdmissionGate {
+        id: autumn_harvest::AdmissionGateId(uuid::Uuid::new_v4()),
+        scope: autumn_harvest::GateScope::Fleet,
+        reason: "incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        expires_at: None,
+    }]);
+
+    // Retry with the exact same explicit workflow_id: must NOT be blocked by
+    // the gate (it resolves to the same already-pending row, not a fresh
+    // admission), and must NOT create a second pending row.
+    let (status2, body2) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({ "workflow_id": "gate-retry-job", "input": { "tenant_id": "acme" } }),
+    )
+    .await;
+    assert_eq!(
+        status2,
+        StatusCode::ACCEPTED,
+        "retry must bypass the gate via the pending-throttle-row shortcut: {body2:?}"
+    );
+    assert_eq!(body2["throttled"], json!(true), "{body2:?}");
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        1,
+        "no second pending row should be created"
+    );
+
+    // Sanity: a genuinely NEW workflow_id is still blocked by the same gate.
+    let (status3, body3) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({ "workflow_id": "gate-retry-job-fresh", "input": { "tenant_id": "acme" } }),
+    )
+    .await;
+    assert_eq!(
+        status3,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a genuinely fresh start must still be blocked by the gate: {body3:?}"
+    );
 }
 
 #[tokio::test]

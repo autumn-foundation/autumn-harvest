@@ -7302,22 +7302,43 @@ pub(crate) async fn start_workflow(
             // exists on this shard.  start_or_load_workflow_execution with
             // AllowDuplicate (or AllowDuplicateFailedOnly for live runs) would
             // return it without creating new work, so the gate must not block.
+            //
+            // A retry can equally land on an already-pending *throttle* row
+            // (code review, issue #607): `reserve_or_defer`'s own idempotency
+            // shortcut (step 1) would resolve it to that same pending row
+            // without creating anything new -- also not a fresh admission --
+            // so the gate must not block that case either. Checked only when
+            // this workflow actually resolves a throttle policy, to avoid an
+            // extra round-trip for the common non-throttled case.
             let is_idempotent_retry = if explicit_workflow_id {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
-                        Ok(mut pre_conn) => harvest_workflow_executions::table
-                            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
-                            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                            .filter(
-                                harvest_workflow_executions::state
-                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                            )
-                            .select(harvest_workflow_executions::id)
-                            .first::<uuid::Uuid>(&mut pre_conn)
-                            .await
-                            .optional()
-                            .unwrap_or(None)
-                            .is_some(),
+                        Ok(mut pre_conn) => {
+                            let has_execution = harvest_workflow_executions::table
+                                .filter(
+                                    harvest_workflow_executions::workflow_name.eq(&workflow_name),
+                                )
+                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                                .filter(
+                                    harvest_workflow_executions::state
+                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                )
+                                .select(harvest_workflow_executions::id)
+                                .first::<uuid::Uuid>(&mut pre_conn)
+                                .await
+                                .optional()
+                                .unwrap_or(None)
+                                .is_some();
+                            has_execution
+                                || (throttle_applies
+                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                                        &mut pre_conn,
+                                        &workflow_name,
+                                        &workflow_id,
+                                    )
+                                    .await
+                                    .unwrap_or(false))
+                        }
                         Err(_) => false,
                     },
                     Err(_) => false,
@@ -16177,14 +16198,31 @@ async fn schedule_backfill(
                     )
                     .await
                     {
-                        Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(_)) => {
-                            runtime
-                                .registry
-                                .telemetry()
-                                .metrics
-                                .record_start_throttled(&wf_name);
-                            dispatched += 1;
-                            dispatched_this_call += 1;
+                        Ok(autumn_harvest::throttle::ThrottleAdmission::Deferred(outcome)) => {
+                            if outcome.fresh {
+                                runtime
+                                    .registry
+                                    .telemetry()
+                                    .metrics
+                                    .record_start_throttled(&wf_name);
+                                dispatched += 1;
+                                dispatched_this_call += 1;
+                            } else {
+                                // A repeated backfill call for a window whose
+                                // slot is still durably deferred from an
+                                // earlier call resolves to the *same* pending
+                                // row (`reserve_or_defer`'s idempotency
+                                // shortcut), not a new admission. Report it as
+                                // already-consumed rather than a fresh
+                                // dispatch, so a repeated identical backfill
+                                // request can't double-count the slot as
+                                // dispatched or double-spend max_runs budget
+                                // for it (code review, issue #607).
+                                skipped += 1;
+                                *skipped_reasons
+                                    .entry("already_exists".to_string())
+                                    .or_insert(0) += 1;
+                            }
                             continue;
                         }
                         Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved {

@@ -339,6 +339,17 @@ pub struct ThrottleDeferOutcome {
     pub workflow_id: String,
     pub throttle_key: String,
     pub deferred_at: DateTime<Utc>,
+    /// `true` when this call durably inserted a brand-new pending row;
+    /// `false` when it instead resolved to an *already-existing* pending row
+    /// for this `workflow_id` via `reserve_or_defer`'s idempotency shortcut
+    /// (step 1) -- e.g. a client retry, or an operator repeating the same
+    /// `schedule_backfill` window while an earlier call's deferred slots are
+    /// still pending. A caller that tracks "how many new admissions did this
+    /// call make" (budget spend, dispatched counters) must gate on `fresh`
+    /// rather than treating every `Deferred` as a new admission (code
+    /// review, issue #607) -- otherwise a repeated call double-counts and
+    /// double-spends budget for a no-op idempotent attach.
+    pub fresh: bool,
 }
 
 /// Result of [`reserve_or_defer`].
@@ -496,6 +507,7 @@ async fn existing_pending_throttle_for_workflow_id(
         workflow_id: workflow_id.to_string(),
         throttle_key: r.throttle_key,
         deferred_at: r.deferred_at,
+        fresh: false,
     }))
 }
 
@@ -733,6 +745,7 @@ pub async fn reserve_or_defer(
         workflow_id: params.workflow_id.to_string(),
         throttle_key: params.throttle_key.to_string(),
         deferred_at: now,
+        fresh: true,
     }))
 }
 

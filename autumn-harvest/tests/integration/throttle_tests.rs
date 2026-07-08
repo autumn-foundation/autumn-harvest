@@ -1725,6 +1725,73 @@ async fn oversized_key_resolves_to_existing_pending_row() {
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
 }
 
+/// Code-review fix (issue #607 round 7): `ThrottleDeferOutcome::fresh` must
+/// distinguish a brand-new pending row (this call durably inserted it) from
+/// an idempotent attach to an already-existing pending row (a retry for the
+/// same `workflow_id` resolved via `reserve_or_defer`'s own step-1
+/// shortcut) -- callers that count admissions (e.g. `schedule_backfill`'s
+/// `dispatched`/`max_runs` budget) must not treat the latter as a new
+/// admission.
+#[tokio::test]
+async fn fresh_deferral_is_true_only_on_the_first_insert_not_on_a_retry() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let wf = "sync_tenant";
+    let key = "acme";
+    let wf_id = "fresh-flag-job";
+
+    let first = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            0.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("first admission defers");
+    let ThrottleAdmission::Deferred(first_outcome) = first else {
+        panic!("expected Deferred, got {first:?}");
+    };
+    assert!(
+        first_outcome.fresh,
+        "the first admission durably inserts a brand-new pending row"
+    );
+    assert_eq!(throttle_row_count(&mut conn, key).await, 1);
+
+    let retry = reserve_or_defer(
+        &mut conn,
+        params(
+            wf,
+            key,
+            wf_id,
+            serde_json::json!({}),
+            0.0001,
+            0.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("a retry for the same workflow_id resolves to the existing row");
+    let ThrottleAdmission::Deferred(retry_outcome) = retry else {
+        panic!("expected Deferred, got {retry:?}");
+    };
+    assert!(
+        !retry_outcome.fresh,
+        "a retry landing on the already-pending row must not be reported fresh"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, key).await,
+        1,
+        "no second row should have been inserted"
+    );
+}
+
 #[tokio::test]
 async fn oversized_key_still_rejected_for_a_genuinely_fresh_admission() {
     let (mut conn, _url, _c) = setup_db().await;
