@@ -81,17 +81,29 @@ fn metrics_rs_recorder_wires_into_telemetry_config() {
 // (nothing registered), not just "does not panic".
 // ---------------------------------------------------------------------------
 
+/// Which `metrics::Recorder` registration method the adapter routed a key
+/// through. The dashboard pack's series allowlist (`_total` counters,
+/// `_bucket`/`_sum`/`_count` histograms, bare gauges) rests on the adapter
+/// registering each metric as the documented instrument, so the tests assert
+/// the kind, not just the key name and labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstrumentKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
 #[derive(Default)]
 struct CapturingRecorder {
-    keys: Mutex<Vec<Key>>,
+    keys: Mutex<Vec<(InstrumentKind, Key)>>,
 }
 
 impl CapturingRecorder {
-    fn capture(&self, key: &Key) {
+    fn capture(&self, kind: InstrumentKind, key: &Key) {
         self.keys
             .lock()
             .expect("capturing recorder mutex poisoned")
-            .push(key.clone());
+            .push((kind, key.clone()));
     }
 }
 
@@ -101,24 +113,24 @@ impl Recorder for CapturingRecorder {
     fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
     fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
-        self.capture(key);
+        self.capture(InstrumentKind::Counter, key);
         Counter::noop()
     }
 
     fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
-        self.capture(key);
+        self.capture(InstrumentKind::Gauge, key);
         Gauge::noop()
     }
 
     fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
-        self.capture(key);
+        self.capture(InstrumentKind::Histogram, key);
         Histogram::noop()
     }
 }
 
-/// Runs `f` against a capturing local recorder and returns every metric key
-/// the adapter registered during the call.
-fn captured_keys(f: impl FnOnce()) -> Vec<Key> {
+/// Runs `f` against a capturing local recorder and returns every
+/// (instrument kind, metric key) pair the adapter registered during the call.
+fn captured_keys(f: impl FnOnce()) -> Vec<(InstrumentKind, Key)> {
     let recorder = CapturingRecorder::default();
     metrics::with_local_recorder(&recorder, f);
     recorder
@@ -131,13 +143,24 @@ fn labels_of(key: &Key) -> Vec<(&str, &str)> {
     key.labels().map(|l| (l.key(), l.value())).collect()
 }
 
-fn find_key<'a>(keys: &'a [Key], name: &str) -> &'a Key {
-    keys.iter().find(|k| k.name() == name).unwrap_or_else(|| {
-        panic!(
-            "expected the adapter to register `{name}` (issue #754 bridge fix); registered keys: {:?}",
-            keys.iter().map(|k| k.name().to_owned()).collect::<Vec<_>>()
-        )
-    })
+fn find_key<'a>(keys: &'a [(InstrumentKind, Key)], name: &str, kind: InstrumentKind) -> &'a Key {
+    let (found_kind, key) = keys
+        .iter()
+        .find(|(_, k)| k.name() == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the adapter to register `{name}` (issue #754 bridge fix); registered keys: {:?}",
+                keys.iter()
+                    .map(|(_, k)| k.name().to_owned())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        *found_kind, kind,
+        "`{name}` must be registered as a {kind:?} (the dashboard's series \
+         suffix ground truth depends on the instrument type), got {found_kind:?}"
+    );
+    key
 }
 
 #[test]
@@ -145,7 +168,7 @@ fn record_workflow_timeout_bridges_to_metrics_registry() {
     let keys = captured_keys(|| {
         MetricsRsRecorder.record_workflow_timeout("onboarding", "default");
     });
-    let key = find_key(&keys, "harvest.workflow.timeout");
+    let key = find_key(&keys, "harvest.workflow.timeout", InstrumentKind::Counter);
     let labels = labels_of(key);
     assert!(
         labels.contains(&("workflow", "onboarding")),
@@ -167,7 +190,7 @@ fn record_payload_observed_bridges_histogram_with_activity_name() {
             4096,
         );
     });
-    let key = find_key(&keys, "harvest.payload.bytes");
+    let key = find_key(&keys, "harvest.payload.bytes", InstrumentKind::Histogram);
     let labels = labels_of(key);
     assert!(
         labels.contains(&("payload.kind", "ActivityInput")),
@@ -195,7 +218,7 @@ fn record_payload_observed_bridges_histogram_without_activity_name() {
             1024,
         );
     });
-    let key = find_key(&keys, "harvest.payload.bytes");
+    let key = find_key(&keys, "harvest.payload.bytes", InstrumentKind::Histogram);
     let labels = labels_of(key);
     assert!(
         labels.contains(&("payload.kind", "WorkflowInput")),
@@ -216,7 +239,7 @@ fn record_payload_rejected_bridges_counter() {
     let keys = captured_keys(|| {
         MetricsRsRecorder.record_payload_rejected(&PayloadKind::ActivityResult, "onboarding");
     });
-    let key = find_key(&keys, "harvest.payload.rejected");
+    let key = find_key(&keys, "harvest.payload.rejected", InstrumentKind::Counter);
     let labels = labels_of(key);
     assert!(
         labels.contains(&("payload.kind", "ActivityResult")),

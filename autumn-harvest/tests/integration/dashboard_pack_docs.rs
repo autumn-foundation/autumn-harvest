@@ -46,15 +46,21 @@ const SUPPLEMENTAL_METRICS: &[&str] = &[
 ///
 /// Deliberately empty: the issue #754 adapter fix bridged
 /// `harvest.workflow.timeout`, `harvest.payload.bytes`, and
-/// `harvest.payload.rejected`. If a future `METRIC_*` constant ships without
+/// `harvest.payload.rejected`. Note that bridged ≠ emitted:
+/// `harvest.workflow.timeout` is emitted end-to-end (`timeout.rs` calls the
+/// recorder), but the two payload byte-cap metrics still have **zero engine
+/// emission call sites** (a pre-existing issue #252 gap — the cap sites
+/// construct `HarvestError::PayloadTooLarge` without calling the recorder),
+/// so their panels stay empty until emission is wired; the panels and the
+/// dashboards README say so. If a future `METRIC_*` constant ships without
 /// an adapter bridge, either bridge it or add it here with a comment naming
 /// the issue that tracks the gap — never silently drop dashboard coverage.
 const EXPECTED_UNBRIDGED: &[&str] = &[];
 
 /// Every Prometheus series name a dashboard query is allowed to reference.
 ///
-/// This is the type-suffix-aware ground truth, derived from the instrument
-/// each metric is registered as in `metrics_rs_adapter.rs` and the
+/// This is the type-suffix-aware ground truth, hand-mirrored from the
+/// instrument each metric is registered as in `metrics_rs_adapter.rs` and the
 /// normalization table in `docs/alerts/README.md` (dots → underscores;
 /// counters gain `_total`; histograms surface only as
 /// `_bucket`/`_count`/`_sum`; gauges are bare). A bare counter token or a
@@ -147,8 +153,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_concurrency_deferred",
 ];
 
-/// Per-series label ground truth (Prometheus-normalized label names), taken
-/// from the label sets each bridge method registers in
+/// Per-series label ground truth (Prometheus-normalized label names),
+/// hand-mirrored from the label sets each bridge method registers in
 /// `metrics_rs_adapter.rs`. Drives the variable-applicability check: a
 /// `workflow=~`/`queue=~`/`shard=~` selector may only appear in an expression
 /// whose series actually carry that label.
@@ -260,6 +266,15 @@ const FORBIDDEN_QUERY_SUBSTRINGS: &[&str] = &[
     "execution.id",
     "execution_id",
     "harvest.execution.id",
+    // The remaining unbounded identifiers from telemetry.rs's own
+    // `validate_user_metric` forbidden-label set.
+    "run_id",
+    "idempotency_key",
+    "workflow.id",
+    "workflow_id",
+    "activity.id",
+    "activity_id",
+    "harvest.activity.id",
     "activity.name=",
     "workflow.type=",
     "error.type=",
@@ -518,10 +533,15 @@ fn metric_types_are_handled_correctly() {
         let exprs = panel_exprs(panel);
         for expr in &exprs {
             for token in harvest_metric_tokens(expr) {
-                if token.ends_with("_total") {
+                // `_sum`/`_count` histogram series are cumulative counters
+                // too: graphed raw they yield a since-process-start value,
+                // not the panel's intended rolling window.
+                if token.ends_with("_total") || token.ends_with("_sum") || token.ends_with("_count")
+                {
                     assert!(
                         expr.contains("rate(") || expr.contains("increase("),
-                        "panel {} graphs counter `{token}` without rate()/increase(): {expr}",
+                        "panel {} graphs cumulative series `{token}` without \
+                         rate()/increase(): {expr}",
                         panel_name(panel)
                     );
                 }
@@ -577,6 +597,7 @@ fn template_variables_apply_only_where_labels_exist() {
         for expr in panel_exprs(panel) {
             for (selector, label) in [
                 ("workflow=~", "workflow"),
+                ("workflow_type=~", "workflow_type"),
                 ("queue=~", "queue"),
                 ("shard=~", "shard"),
             ] {
@@ -603,6 +624,81 @@ fn template_variables_apply_only_where_labels_exist() {
     }
 }
 
+#[test]
+fn template_variable_queries_reference_allowlisted_series() {
+    // A broken `label_values(...)` query resolves to an empty value set in
+    // Grafana, silently emptying every `=~"$var"`-filtered panel — the one
+    // layer the panel-expr checks cannot see. Validate the templating layer
+    // with the same allowlist / label / forbidden-token rigor.
+    let labels_by_base: BTreeMap<&str, &[&str]> = SERIES_LABELS.iter().copied().collect();
+    let allowed: BTreeSet<&str> = DASHBOARD_PROMETHEUS_SERIES.iter().copied().collect();
+
+    let dashboard = read_dashboard();
+    let variables = dashboard["templating"]["list"]
+        .as_array()
+        .expect("dashboard must define templating.list");
+
+    let mut query_variables_seen = 0usize;
+    for variable in variables {
+        let name = variable["name"].as_str().unwrap_or("<unnamed>");
+        if variable["type"].as_str() != Some("query") {
+            continue;
+        }
+        query_variables_seen += 1;
+
+        for text in templating_query_strings(variable) {
+            for forbidden in FORBIDDEN_QUERY_SUBSTRINGS {
+                assert!(
+                    !text.contains(forbidden),
+                    "template variable `{name}` query contains forbidden token \
+                     `{forbidden}`: {text}"
+                );
+            }
+
+            let inner = text
+                .strip_prefix("label_values(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "template variable `{name}` query must be of the form \
+                         `label_values(<series>, <label>)`, got: {text}"
+                    )
+                });
+            let (series, label) = inner.split_once(',').unwrap_or_else(|| {
+                panic!(
+                    "template variable `{name}` label_values query must name a \
+                     series AND a label (the unscoped single-argument form is \
+                     slow on large Prometheus installs), got: {text}"
+                )
+            });
+            let series = series.trim();
+            let label = label.trim();
+
+            assert!(
+                allowed.contains(series),
+                "template variable `{name}` sources from unknown/incorrectly-suffixed \
+                 series `{series}` — the variable would resolve to an empty value set \
+                 and silently empty every panel filtered by it: {text}"
+            );
+            let base = base_series(series);
+            let series_labels = labels_by_base.get(base.as_str()).unwrap_or_else(|| {
+                panic!("no SERIES_LABELS entry for series `{base}` used by variable `{name}`")
+            });
+            assert!(
+                series_labels.contains(&label),
+                "template variable `{name}` extracts label `{label}` from series \
+                 `{series}`, which does not carry that label: {text}"
+            );
+        }
+    }
+
+    assert!(
+        query_variables_seen >= 3,
+        "expected at least the workflow/queue/shard query variables, \
+         found {query_variables_seen}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Alert ↔ panel ↔ runbook loop
 // ---------------------------------------------------------------------------
@@ -613,17 +709,63 @@ fn every_alert_rule_maps_to_a_panel() {
     let dashboard_raw = read_doc(DASHBOARD_PATH);
     // Data-driven off the alert pack's own rule list so a new rule (e.g. a
     // saga alert) goes red here until the dashboard grows a matching panel.
+    //
+    // Matching is exact-token (word-boundary), never substring: the pack has
+    // a real substring pair (`harvest_activity_retry_storm` ⊂
+    // `harvest_activity_retry_storm_critical`), so a naive `contains` lets
+    // the base rule's entire mapping silently vanish from both encodings.
     for rule_id in alert_rule_ids() {
         assert!(
-            readme.contains(&rule_id),
-            "docs/dashboards/README.md alert↔panel mapping table is missing rule `{rule_id}`"
+            readme.contains(&format!("`{rule_id}`")),
+            "docs/dashboards/README.md alert↔panel mapping table is missing rule \
+             `{rule_id}` (ids are backtick-wrapped table cells)"
         );
         assert!(
-            dashboard_raw.contains(&rule_id),
+            contains_exact_alert_ref(&dashboard_raw, &rule_id),
             "dashboard JSON has no panel referencing alert rule `{rule_id}` \
-             (panel description or readiness text panel)"
+             as an exact `Alert: {rule_id}` token (panel description or \
+             readiness text panel)"
         );
     }
+
+    // Reverse pass: a stale README mapping-table row for a rule that was
+    // removed from the alert pack must also go red.
+    let rule_ids: BTreeSet<String> = alert_rule_ids().into_iter().collect();
+    for line in readme.lines() {
+        let Some(rest) = line.strip_prefix("| `harvest_") else {
+            continue;
+        };
+        let row_id = rest
+            .split('`')
+            .next()
+            .map(|suffix| format!("harvest_{suffix}"))
+            .expect("split always yields a first element");
+        assert!(
+            rule_ids.contains(&row_id),
+            "docs/dashboards/README.md mapping table row names `{row_id}`, \
+             which is not a rule in the alert pack (stale row?)"
+        );
+    }
+}
+
+/// True when `raw` contains `Alert: {rule_id}` followed by a non-identifier
+/// boundary (so `Alert: harvest_activity_retry_storm` never matches inside
+/// `Alert: harvest_activity_retry_storm_critical`).
+fn contains_exact_alert_ref(raw: &str, rule_id: &str) -> bool {
+    let needle = format!("Alert: {rule_id}");
+    let mut offset = 0usize;
+    while let Some(relative) = raw[offset..].find(&needle) {
+        let end = offset + relative + needle.len();
+        let boundary = raw[end..]
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_');
+        if boundary {
+            return true;
+        }
+        offset = end;
+    }
+    false
 }
 
 #[test]
@@ -660,6 +802,41 @@ fn alert_runbook_anchors_resolve() {
 }
 
 #[test]
+fn dashboard_runbook_anchor_references_resolve() {
+    // Panel descriptions and readiness text panels embed
+    // `harvest-alerts.md#<anchor>` references; a dangling anchor strands the
+    // paged operator at the top of the runbook. Every referenced anchor must
+    // resolve to a real `## <anchor>` heading (exact heading-line match — no
+    // prefix "resolution").
+    let dashboard_raw = read_doc(DASHBOARD_PATH);
+    let runbook = read_doc(RUNBOOK_PATH);
+
+    let marker = "harvest-alerts.md#";
+    let mut anchors = BTreeSet::new();
+    let mut offset = 0usize;
+    while let Some(relative) = dashboard_raw[offset..].find(marker) {
+        let start = offset + relative + marker.len();
+        let end = dashboard_raw[start..]
+            .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .map_or(dashboard_raw.len(), |rel| start + rel);
+        anchors.insert(dashboard_raw[start..end].to_owned());
+        offset = end;
+    }
+    assert!(
+        !anchors.is_empty(),
+        "dashboard JSON must carry runbook anchor references"
+    );
+
+    for anchor in anchors {
+        assert!(
+            markdown_section(&runbook, &anchor).is_some(),
+            "dashboard references dangling runbook anchor \
+             `harvest-alerts.md#{anchor}` — no `## {anchor}` heading exists"
+        );
+    }
+}
+
+#[test]
 fn dashboard_readme_documents_prerequisites() {
     let readme = read_doc(DASHBOARD_README_PATH);
     for required in [
@@ -674,9 +851,9 @@ fn dashboard_readme_documents_prerequisites() {
         // versioning / upgrade-in-place semantics.
         DASHBOARD_UID,
         PACK_VERSION,
-        // the alert↔panel mapping table headers.
-        "Alert",
-        "Panel",
+        // the alert↔panel mapping table header row (not just the words
+        // "Alert"/"Panel", which almost any prose satisfies).
+        "| Alert rule id | Row | Panel | Runbook |",
     ] {
         assert!(
             readme.contains(required),
@@ -808,10 +985,38 @@ fn panel_exprs(panel: &Value) -> Vec<&str> {
         .map(|targets| {
             targets
                 .iter()
+                // A hidden target renders nothing — it must not satisfy the
+                // coverage check ("covered" by a query no operator can see).
+                .filter(|target| target["hide"].as_bool() != Some(true))
                 .filter_map(|target| target["expr"].as_str())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Collects the query strings of one templating variable: the `query` field
+/// (plain string or Grafana's `{query: "..."}` object form) plus the
+/// `definition` string when present.
+fn templating_query_strings(variable: &Value) -> Vec<&str> {
+    let mut out = Vec::new();
+    match &variable["query"] {
+        Value::String(query) => out.push(query.as_str()),
+        Value::Object(object) => {
+            if let Some(query) = object.get("query").and_then(Value::as_str) {
+                out.push(query);
+            }
+        }
+        _ => {}
+    }
+    if let Some(definition) = variable["definition"].as_str() {
+        out.push(definition);
+    }
+    assert!(
+        !out.is_empty(),
+        "query-type template variable `{}` carries no query string",
+        variable["name"]
+    );
+    out
 }
 
 fn all_exprs(dashboard: &Value) -> Vec<&str> {
@@ -852,9 +1057,28 @@ fn harvest_metric_tokens(expr: &str) -> Vec<String> {
         .collect()
 }
 
+/// Resolves a markdown `## <heading>` section by exact heading-line match.
+///
+/// A raw substring search would resolve a dangling anchor that happens to be
+/// a prefix of a real heading (`#harvest_activity_retry` "resolving" against
+/// `## harvest_activity_retry_storm`), or match `## x` mid-line/in a code
+/// block — so the heading must be a complete line of its own.
 fn markdown_section<'a>(document: &'a str, heading: &str) -> Option<&'a str> {
     let marker = format!("## {heading}");
-    let start = document.find(&marker)?;
+    let mut offset = 0usize;
+    let start = loop {
+        let relative = document[offset..].find(&marker)?;
+        let start = offset + relative;
+        let at_line_start = start == 0 || document.as_bytes()[start - 1] == b'\n';
+        let line_end = document[start..]
+            .find('\n')
+            .map_or(document.len(), |rel| start + rel);
+        let exact_heading_line = document[start..line_end].trim_end() == marker;
+        if at_line_start && exact_heading_line {
+            break start;
+        }
+        offset = start + marker.len();
+    };
     let after_start = start + marker.len();
     let end = document[after_start..]
         .find("\n## ")
