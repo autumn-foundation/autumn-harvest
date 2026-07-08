@@ -53,6 +53,8 @@ jobs:
         run: cargo test -p autumn-harvest --no-default-features
       - name: Run testing-feature integration tests (replayer)
         run: cargo test -p autumn-harvest --no-default-features --features testing --test integration
+      - name: Run metrics-rs adapter integration tests (issue #754)
+        run: cargo test -p autumn-harvest --no-default-features --features testing,metrics-rs --test integration -- metrics_rs_adapter
       - name: Run classic (non-unified) DAG tests
         run: cargo test -p autumn-harvest --no-default-features --features db --lib
       - name: Compile db-backed tests
