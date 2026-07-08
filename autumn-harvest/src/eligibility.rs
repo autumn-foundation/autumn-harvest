@@ -1,6 +1,55 @@
+//! Worker capability routing and label evaluation.
+//!
+//! This module provides the logic to parse capability requirements strings
+//! (e.g., `gpu = true, region in [us-east-1, eu-west-1]`) and match them against
+//! a worker's provided capability labels.
+//!
+//! By evaluating these requirements before assigning tasks, the orchestrator ensures
+//! that tasks are only routed to workers with the hardware or configuration necessary
+//! to execute them successfully.
+//!
+//! # Examples
+//!
+//! ```
+//! use autumn_harvest::eligibility::{parse_requirements, matches_requirements, Requirement};
+//! use std::collections::HashMap;
+//!
+//! // Parse a requirement string from a task definition
+//! let reqs = parse_requirements("os = 'linux', region in [us-east-1, us-west-2]").unwrap();
+//!
+//! // Worker registers with the following labels
+//! let mut worker_labels = HashMap::new();
+//! worker_labels.insert("os".to_string(), "linux".to_string());
+//! worker_labels.insert("region".to_string(), "us-west-2".to_string());
+//!
+//! // Evaluate eligibility
+//! let is_eligible = matches_requirements(&reqs, &worker_labels);
+//! assert!(is_eligible);
+//! ```
+
 use std::collections::HashMap;
 
 /// A single capability requirement for task execution.
+///
+/// Represents parsed conditions that a worker's labels must satisfy.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_harvest::eligibility::Requirement;
+///
+/// // An exact match condition
+/// let exact_req = Requirement::Exact {
+///     key: "gpu".to_string(),
+///     value: "true".to_string(),
+/// };
+///
+/// // A set membership condition
+/// let in_req = Requirement::In {
+///     key: "region".to_string(),
+///     values: vec!["eu-west-1".to_string(), "eu-central-1".to_string()],
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Requirement {
     /// Exact match requirement: `key = "value"`.
@@ -24,9 +73,30 @@ fn strip_quotes(s: &str) -> &str {
 ///
 /// Supports exact matches like `key = "value"` and set membership like
 /// `key in ["a", "b"]`. Handles spaces and quotes robustly.
+///
 /// # Errors
 ///
 /// Returns an error string if the requirement syntax is invalid or if it contains an empty key.
+///
+/// # Examples
+///
+/// Successfully parsing valid requirements:
+/// ```
+/// use autumn_harvest::eligibility::{parse_requirements, Requirement};
+///
+/// let reqs = parse_requirements("gpu = true, region in [us-east-1, us-west-2]").unwrap();
+/// assert_eq!(reqs.len(), 2);
+/// assert!(matches!(reqs[0], Requirement::Exact { .. }));
+/// assert!(matches!(reqs[1], Requirement::In { .. }));
+/// ```
+///
+/// Invalid requirements result in an error:
+/// ```
+/// use autumn_harvest::eligibility::parse_requirements;
+///
+/// let err = parse_requirements("invalid syntax").unwrap_err();
+/// assert!(err.contains("invalid requirement syntax"));
+/// ```
 pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -191,6 +261,31 @@ fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
 }
 
 /// Evaluates if a worker's capability labels satisfy the requirements.
+///
+/// All requirements in the slice must be satisfied (logical AND) for the
+/// worker to be considered eligible.
+///
+/// # Examples
+///
+/// A worker must meet all requirements to be eligible:
+///
+/// ```
+/// use autumn_harvest::eligibility::{Requirement, matches_requirements};
+/// use std::collections::HashMap;
+///
+/// let reqs = vec![
+///     Requirement::Exact { key: "gpu".to_string(), value: "true".to_string() }
+/// ];
+///
+/// let mut labels = HashMap::new();
+///
+/// // The worker is missing the required 'gpu' label
+/// assert!(!matches_requirements(&reqs, &labels));
+///
+/// // Now the worker has the required label
+/// labels.insert("gpu".to_string(), "true".to_string());
+/// assert!(matches_requirements(&reqs, &labels));
+/// ```
 #[must_use]
 pub fn matches_requirements<S: std::hash::BuildHasher>(
     requirements: &[Requirement],
