@@ -212,10 +212,17 @@ commit):
 
 * **Missing path or explicit `null`** ⇒ every comparison operator (`Eq`/`NotEq`/ordering/`In`)
   evaluates `false`. Test absence explicitly with `Not(Exists)` and nullness with `IsNull`.
-* **Numeric coercion**: for `Eq`/`NotEq`/`In`, when both sides are JSON numbers they compare
-  as `f64` (so `1 == 1.0`); otherwise comparison is strict JSON equality (a number never
-  equals a numeric string). The ordering operators are **numeric-only** — non-numeric
-  operands yield `false`.
+* **Numeric coercion**: two **integers** compare exactly across the full `i64`/`u64` range
+  (mixed signs included) — distinct integers above 2^53 (snowflake-style IDs) never collapse.
+  When at least one side is a genuine float, both sides compare as `f64` (so `1 == 1.0`;
+  mixed int/float pairs above 2^53 follow `f64` precision). Otherwise comparison is strict
+  JSON equality (a number never equals a numeric string, and the coercion never recurses
+  into arrays or objects — `Eq { value: {"a": 1} }` against a projected `{"a": 1.0}` is
+  strict inequality). The ordering operators are **numeric-only** — non-numeric operands
+  yield `false`.
+* **`NotEq` vs `Not(Eq)`**: `NotEq` on a missing/null path is `false` (comparisons require
+  presence), while `Not(Eq(..))` on the same path is `true` (`Not` is pure negation). Pick
+  deliberately — they differ exactly when the path is absent or null.
 * A non-`Completed` source usually has a `NULL` recorded output, which evaluates as a literal
   JSON `null` root: member paths are all missing, so comparisons are `false` — but a
   `Not(Exists(..))`-style guard can still meaningfully fire. Guards are output-only by design
@@ -233,6 +240,10 @@ registration surfaces — `HarvestBuilder::try_build()` (builder error) and
 * malformed dotted paths (empty segments, e.g. `"a..b"`, `".a"`)
 * unknown operators (a serde deserialization error → `400`; never silently dropped)
 
+There is no separate byte-size cap on condition payloads: over HTTP, total condition bytes
+are bounded by axum's default request body limit (2 MiB), and evaluation is a linear walk
+with no amplification.
+
 ### Skips are recorded exactly-once and observable
 
 A condition-skip is **resolved-skipped**, not silently dropped:
@@ -240,18 +251,36 @@ A condition-skip is **resolved-skipped**, not silently dropped:
 * The `(source_exec_id, trigger_id)` row is inserted into
   `harvest_completion_trigger_fires` through the same `ON CONFLICT DO NOTHING` PK path a real
   fire uses, with the skip reason recorded in the additive `outcome` column
-  (`NULL` = fired, `condition_unmet` / `condition_invalid` = skipped). A re-delivered
-  terminal (e.g. the parent-close cascade re-entering evaluation) dedupes against that row
-  exactly like a real fire — a skipped terminal can never late-fire.
+  (`NULL` = fired, `condition_unmet` = skipped). A re-delivered terminal (e.g. the
+  parent-close cascade re-entering evaluation) dedupes against that row exactly like a real
+  fire — a skipped terminal can never late-fire, even if the condition is later loosened.
+  Note the row's `fired_at` column records the **resolution** time — the moment the pair was
+  durably decided (fire *or* skip) — not necessarily a fire.
 * The new counter `harvest.completion_trigger.skipped{trigger, reason}` increments once per
-  fresh skip (see Telemetry below).
+  fresh skip (see Telemetry below). Coverage caveat: on the operator cancel/terminate and
+  parent-close-cascade terminal paths the counter is best-effort (no metrics recorder is
+  threaded there today), so the fires-row `outcome` column is the **authoritative** skip
+  record; the counter is emitted on the worker, timeout-scanner, poison-pill, history-cap,
+  and workflow-task-timeout paths.
 
 ### Fail-closed on invalid stored conditions
 
 If a stored `condition` no longer parses (or violates the caps — e.g. a row written by a
-different build), the trigger **fails closed**: the fire is skipped, recorded with the
-distinct reason `condition_invalid`, and a warning is logged. Harvest never fires on an
-unintelligible guard and never errors the source's terminal commit.
+different build during a mixed-version deploy), the trigger **fails closed, retryably**: the
+fire is skipped with the distinct reason `condition_invalid`, a warning is logged, and — unlike
+a `condition_unmet` skip — **no fires row is written** (mirroring the `validation_failed`
+precedent). "This binary cannot understand the guard" is an inherently transient state, so a
+later redelivery re-evaluates the pair once the fleet is upgraded or the operator repairs the
+condition, instead of being permanently wedged by a decision made during the skew window.
+Harvest never fires on an unintelligible guard and never errors the source's terminal commit.
+
+### Re-registering a trigger replaces the whole definition
+
+`POST /admin/completion-triggers` (and the builder sync) has full-replacement upsert
+semantics: re-POSTing an existing trigger `id` overwrites every field — **omitting
+`condition` clears a previously registered guard**, silently reverting the trigger to
+unconditional. Always include the current `condition` when updating any other field of a
+guarded trigger.
 
 ---
 
@@ -271,11 +300,15 @@ Returns a list of all registered completion triggers in the deployment (read fro
     "terminal_states": ["Completed"],
     "target_workflow_name": "downstream-reporting",
     "input_mapping": {"type": "Passthrough"},
+    "condition": null,
     "created_at": "2026-06-03T07:00:00Z",
     "updated_at": "2026-06-03T07:00:00Z"
   }
 ]
 ```
+
+The `condition` field is always present in responses (`null` = unconditional); see
+[Conditional Triggers](#conditional-triggers--output-guards-issue-810) for its shape.
 
 ### 2. POST `/admin/completion-triggers`
 Dynamically registers or updates a completion trigger. The engine propagates trigger registrations across all shards.
@@ -292,9 +325,17 @@ Dynamically registers or updates a completion trigger. The engine propagates tri
   "input_mapping": {
     "type": "Projection",
     "data": "results.summary"
+  },
+  "condition": {
+    "type": "GreaterThan",
+    "data": {"path": "results.amount", "value": 1000}
   }
 }
 ```
+
+The optional `condition` output guard is validated at registration (`400` on an unknown
+operator, over-cap tree, or malformed path — see Conditional Triggers above). Upserts are
+full-replacement: omitting `condition` on a re-POST clears any previously stored guard.
 
 **Response (201 Created)**:
 ```json
@@ -306,6 +347,10 @@ Dynamically registers or updates a completion trigger. The engine propagates tri
   "input_mapping": {
     "type": "Projection",
     "data": "results.summary"
+  },
+  "condition": {
+    "type": "GreaterThan",
+    "data": {"path": "results.amount", "value": 1000}
   },
   "created_at": "2026-06-03T07:01:00Z",
   "updated_at": "2026-06-03T07:01:00Z"
@@ -321,7 +366,7 @@ Completion triggers emit the `harvest.completion_trigger.fires` metric counter t
 | Metric | Instrument | Labels | Description |
 |--------|------------|--------|-------------|
 | `harvest.completion_trigger.fires` | Counter | `trigger`, `outcome` | Emitted on every completion-trigger evaluation. See the `outcome` values below. |
-| `harvest.completion_trigger.skipped` | Counter | `trigger`, `reason` | Emitted once per fresh output-guard skip (issue #810). `reason` is `condition_unmet` (guard evaluated false) or `condition_invalid` (stored condition unparseable/over-cap — fail-closed). A redelivered, already-resolved skip records `deduped` on the fires counter instead. |
+| `harvest.completion_trigger.skipped` | Counter | `trigger`, `reason` | Emitted on output-guard skips (issue #810). `reason` is `condition_unmet` (guard evaluated false; emitted once per fresh skip — a redelivered, already-resolved skip records `deduped` on the fires counter instead) or `condition_invalid` (stored condition unparseable/over-cap — retryable fail-closed, no fires row, so it re-emits on every redelivery until the condition is fixed). |
 
 The `outcome` label takes one of:
 
@@ -329,7 +374,7 @@ The `outcome` label takes one of:
 |-----------|---------|
 | `started` | The target execution was successfully created (new run). |
 | `skipped` | The dedup ledger admitted the fire, but start-or-load resolved to an already-existing run rather than creating a new one (`created == false`). |
-| `deduped` | The `harvest_completion_trigger_fires` idempotency ledger already had a row for `(source_exec_id, trigger_id)` — this is a duplicate fire and no target was started. |
+| `deduped` | The `harvest_completion_trigger_fires` idempotency ledger already had a row for `(source_exec_id, trigger_id)` — a duplicate delivery of an already-resolved fire **or output-guard skip** (issue #810); no target was started. |
 | `validation_failed` | The mapped input failed validation against the target workflow's published input schema; the target was not started. |
 | `payload_too_large` | The mapped input exceeded the target workflow's max input byte cap; the target was not started (permanent error). |
 

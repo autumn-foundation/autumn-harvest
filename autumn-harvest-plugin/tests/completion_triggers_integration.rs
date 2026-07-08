@@ -2829,11 +2829,51 @@ async fn test_condition_gate_fire_skip_and_exactly_once() {
         fires_redeliver.contains(&(guarded_id.to_string(), "deduped".to_string())),
         "expected the redelivered skip to dedupe, got {fires_redeliver:?}"
     );
+
+    // ── Skip-then-loosen: a `condition_unmet` resolution is FINAL (AC5). ───
+    // Loosening the condition to one B's output would now satisfy and
+    // redelivering the terminal must never late-fire — the resolved-skip row
+    // dedupes exactly like a fire.
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(guarded_id))
+            .set(triggers_dsl::condition.eq(Some(json!({
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 100}
+            }))))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let metrics_loosened = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_loosened),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        target_exec_count(&mut conn, guarded_id, source_b).await,
+        0,
+        "a skipped terminal must never late-fire after a condition edit"
+    );
+    assert!(metrics_loosened.skips.lock().unwrap().is_empty());
+    let fires_loosened = metrics_loosened.fires.lock().unwrap().clone();
+    assert!(
+        fires_loosened.contains(&(guarded_id.to_string(), "deduped".to_string())),
+        "expected the loosened-condition redelivery to dedupe, got {fires_loosened:?}"
+    );
 }
 
 /// issue #810 fail-closed contract: an unparseable stored condition never
-/// fires the target — the skip is recorded with the distinct
-/// `condition_invalid` reason and the terminal commit never errors.
+/// fires the target — the skip increments the counter with the distinct
+/// `condition_invalid` reason and the terminal commit never errors. The
+/// fail-closed decision is **retryable** (no fires row is written, mirroring
+/// the `validation_failed` precedent), so once the condition is repaired a
+/// redelivery re-evaluates and can still fire — a mixed-version deploy
+/// window can never permanently resolve the pair.
 #[tokio::test]
 async fn test_invalid_stored_condition_fails_closed() {
     let _lock = TEST_MUTEX
@@ -2875,14 +2915,45 @@ async fn test_invalid_stored_condition_fails_closed() {
         .await
         .unwrap();
 
+    // No target start, no fires row (the skip is retryable, not a permanent
+    // resolution), but the skip counter fired with the distinct reason.
     assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 0);
-    let row = load_fire_row(&mut conn, source, trigger_id).await.unwrap();
-    assert_eq!(row.outcome.as_deref(), Some("condition_invalid"));
+    assert!(
+        load_fire_row(&mut conn, source, trigger_id).await.is_none(),
+        "an invalid-condition skip must not write a permanent fires row"
+    );
     let skips = metrics.skips.lock().unwrap().clone();
     assert_eq!(
         skips,
         vec![(trigger_id.to_string(), "condition_invalid".to_string())]
     );
+
+    // Re-entry after the operator repairs the condition (or the fleet is
+    // upgraded to a build that understands it): the pair is still
+    // re-evaluable and fires normally — never wedged by the earlier skip.
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(trigger_id))
+            .set(triggers_dsl::condition.eq(Some(
+                json!({"type": "Eq", "data": {"path": "x", "value": 1}}),
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let metrics_fixed = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source,
+        TerminalState::Completed,
+        Some(&metrics_fixed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 1);
+    let fired_row = load_fire_row(&mut conn, source, trigger_id).await.unwrap();
+    assert_eq!(fired_row.outcome, None);
+    assert!(metrics_fixed.skips.lock().unwrap().is_empty());
 }
 
 /// issue #810 registration surface: invalid condition JSON is rejected with a
@@ -2959,4 +3030,24 @@ async fn test_condition_registration_rejects_invalid_with_400() {
     let (_, list) = get_json(&app, "/admin/completion-triggers").await;
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["condition"]["data"]["path"], "region");
+
+    // Full-replacement upsert semantics: re-POSTing the same trigger id
+    // WITHOUT a `condition` clears the stored guard (the trigger reverts to
+    // unconditional) — pinned so the documented footgun stays documented-true.
+    let trigger_id = created["id"].as_str().unwrap().to_string();
+    let (status, replaced) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(replaced["condition"], serde_json::Value::Null);
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["condition"], serde_json::Value::Null);
 }

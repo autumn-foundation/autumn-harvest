@@ -83,12 +83,19 @@ pub const MAX_CONDITION_IN_VALUES: usize = 64;
 ///   `null` value); **`IsNull`** is `true` only when the path is present AND
 ///   the value is exactly `null` — so `Exists`/`IsNull` genuinely distinguish
 ///   present-null from absent.
-/// - **Numeric coercion rule**: for `Eq`/`NotEq`/`In`, when both the
-///   projected value and the candidate are JSON numbers they compare as
-///   `f64` (so `1 == 1.0`); otherwise comparison is strict `Value` equality
-///   (a number never equals a numeric string). The ordering operators
+/// - **Numeric coercion rule**: for `Eq`/`NotEq`/`In` and the ordering
+///   operators, two **integers** compare exactly (full `i64`/`u64` range,
+///   mixed signs included — distinct integers above 2^53 never collapse);
+///   when at least one side is a genuine float, both sides coerce to `f64`
+///   (so `1 == 1.0`, with `f64` precision governing mixed int/float pairs
+///   above 2^53). Otherwise comparison is strict `Value` equality (a number
+///   never equals a numeric string; the coercion never recurses into arrays
+///   or objects). The ordering operators
 ///   (`GreaterThan`/`GreaterThanOrEq`/`LessThan`/`LessThanOrEq`) are
 ///   **numeric-only**: unless both sides are numbers the result is `false`.
+///   Note the deliberate asymmetry: `NotEq` on a missing/null path is
+///   `false` (comparisons require presence), while `Not(Eq(..))` is `true`
+///   (`Not` is pure negation).
 /// - `All([])` is `true`, `Any([])` is `false` (conventional identities).
 ///
 /// A source that reached a non-`Completed` terminal state typically has a
@@ -113,13 +120,29 @@ pub enum TriggerCondition {
     Not(Box<Self>),
 }
 
-/// Equality with the documented numeric-coercion rule: both sides numeric ⇒
-/// compare as `f64`; otherwise strict `Value` equality.
+/// Exact integer view of a JSON number: `Some` only when the value is an
+/// integer (`i64` or `u64` — both embed losslessly in `i128`). A genuine
+/// float (`1.0`) or a non-number is `None`.
+fn as_exact_int(v: &Value) -> Option<i128> {
+    v.as_i64()
+        .map(i128::from)
+        .or_else(|| v.as_u64().map(i128::from))
+}
+
+/// Equality with the documented numeric-coercion rule: two integers compare
+/// **exactly** (via `i128`, covering the full `i64`/`u64` range and mixed
+/// signs), so distinct integers above 2^53 — snowflake-style IDs — never
+/// collapse through lossy `f64` coercion. Only when at least one side is a
+/// genuine float do both sides coerce to `f64` (so `1 == 1.0`); otherwise
+/// strict `Value` equality.
 fn values_eq(projected: &Value, candidate: &Value) -> bool {
+    if let (Some(a), Some(b)) = (as_exact_int(projected), as_exact_int(candidate)) {
+        return a == b;
+    }
     if let (Some(a), Some(b)) = (projected.as_f64(), candidate.as_f64()) {
-        // Deterministic exact f64 comparison — integers are exact in f64 up
-        // to 2^53 and the coercion exists only so `1 == 1.0`; no epsilon
-        // fuzzing (that would make the guard non-obvious to reason about).
+        // Deterministic exact f64 comparison — this branch is only reached
+        // when at least one side is a genuine float; no epsilon fuzzing
+        // (that would make the guard non-obvious to reason about).
         #[allow(clippy::float_cmp)]
         return a == b;
     }
@@ -127,7 +150,11 @@ fn values_eq(projected: &Value, candidate: &Value) -> bool {
 }
 
 /// Numeric-only ordering comparison; `false` unless both sides are numbers.
+/// Two integers compare exactly (`i128`); mixed int/float falls back to `f64`.
 fn values_cmp(projected: &Value, candidate: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(a), Some(b)) = (as_exact_int(projected), as_exact_int(candidate)) {
+        return Some(a.cmp(&b));
+    }
     match (projected.as_f64(), candidate.as_f64()) {
         (Some(a), Some(b)) => a.partial_cmp(&b),
         _ => None,
@@ -260,21 +287,35 @@ fn validate_condition_path(path: &str) -> Result<(), String> {
 pub enum ConditionGate {
     /// No condition, or condition evaluated `true`: fire as today.
     Pass,
-    /// Condition evaluated `false`: record a resolved-skip, do not start.
+    /// Condition evaluated `false`: record a resolved-skip (durable fires
+    /// row), do not start.
     Unmet,
     /// Stored condition failed to deserialize or violates the boundedness
-    /// caps: **fail closed** — record a resolved-skip with a distinct reason,
-    /// never fire on an unintelligible guard, never error the terminal commit.
+    /// caps: **fail closed, retryably** — skip with a distinct reason and a
+    /// warning, never fire on an unintelligible guard, never error the
+    /// terminal commit. Unlike `Unmet` (a final, correct decision over
+    /// recorded output), `Invalid` means "this binary cannot understand the
+    /// guard" — inherently transient (mixed-version deploy skew, operator
+    /// repair), so **no fires row is written** (mirroring the
+    /// `validation_failed` precedent) and a later redelivery re-evaluates
+    /// once the fleet/condition is fixed.
     Invalid,
 }
 
 /// Pure gate: `None` = unconditional (byte-identical legacy behavior).
+///
+/// Evaluates the stored condition against the source output **as stored** —
+/// raw bytes from `harvest_workflow_executions.output`. Engine write paths
+/// always store the plaintext handler output there (payload codecs/offload
+/// apply only to the `harvest_events` copy), so guards see real output today.
 #[must_use]
 pub fn gate_stored_condition(stored: Option<&Value>, source_output: &Value) -> ConditionGate {
     let Some(raw) = stored else {
         return ConditionGate::Pass;
     };
-    serde_json::from_value::<TriggerCondition>(raw.clone()).map_or(ConditionGate::Invalid, |cond| {
+    // `&Value` implements `serde::Deserializer`, so no clone is needed — this
+    // runs inside every terminal transaction for every trigger on the source.
+    TriggerCondition::deserialize(raw).map_or(ConditionGate::Invalid, |cond| {
         if cond.validate().is_err() {
             ConditionGate::Invalid
         } else if cond.evaluate(source_output) {
@@ -761,44 +802,52 @@ pub fn evaluate_triggers_for_execution<'a>(
             // mapping, so issue #748 can later change input assembly without
             // touching guard semantics. Pure and deterministic: the same
             // recorded output yields the same fire/skip decision on every
-            // redelivery. A skip is recorded as resolved through the same
+            // redelivery. An UNMET guard is a final decision over recorded
+            // output and is recorded as resolved through the same
             // ON CONFLICT DO NOTHING fires-row PK path as a real fire (AC5),
             // so cascade re-entry dedupes identically. An unparseable or
-            // over-cap stored condition FAILS CLOSED (skip, distinct reason)
-            // rather than firing on an unintelligible guard or erroring the
-            // terminal commit.
-            let gate = gate_stored_condition(trigger_db.condition.as_ref(), &source_output);
-            if gate != ConditionGate::Pass {
-                let reason = if gate == ConditionGate::Unmet {
-                    "condition_unmet"
-                } else {
+            // over-cap stored condition FAILS CLOSED but RETRYABLY: skip
+            // with the distinct `condition_invalid` reason and NO fires row
+            // (mirroring the `validation_failed` precedent below), so a
+            // later redelivery re-evaluates once the fleet is upgraded or
+            // the operator repairs the condition — a "this binary cannot
+            // understand the guard" state must never permanently resolve
+            // the pair. Neither case fires or errors the terminal commit.
+            match gate_stored_condition(trigger_db.condition.as_ref(), &source_output) {
+                ConditionGate::Pass => {}
+                ConditionGate::Invalid => {
                     tracing::warn!(
                         trigger_id = %trigger_db.id,
                         "Completion trigger has an unparseable/invalid stored condition; \
-                         failing closed (skip)."
+                         failing closed (retryable skip, no fires row)."
                     );
-                    "condition_invalid"
-                };
-                let inserted = diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
-                    .values(&NewCompletionTriggerFireDb {
-                        source_exec_id: exec_id.as_uuid(),
-                        trigger_id: trigger_db.id,
-                        outcome: Some(reason.to_string()),
-                    })
-                    .on_conflict_do_nothing()
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                if let Some(m) = metrics {
-                    if inserted > 0 {
-                        m.record_completion_trigger_skipped(&trigger_name, reason);
-                    } else {
-                        // Redelivery of an already-resolved (fired or
-                        // skipped) pair — same dedupe signal as today.
-                        m.record_completion_trigger_fired(&trigger_name, "deduped");
+                    if let Some(m) = metrics {
+                        m.record_completion_trigger_skipped(&trigger_name, "condition_invalid");
                     }
+                    continue;
                 }
-                continue;
+                ConditionGate::Unmet => {
+                    let inserted = diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
+                        .values(&NewCompletionTriggerFireDb {
+                            source_exec_id: exec_id.as_uuid(),
+                            trigger_id: trigger_db.id,
+                            outcome: Some("condition_unmet".to_string()),
+                        })
+                        .on_conflict_do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    if let Some(m) = metrics {
+                        if inserted > 0 {
+                            m.record_completion_trigger_skipped(&trigger_name, "condition_unmet");
+                        } else {
+                            // Redelivery of an already-resolved (fired or
+                            // skipped) pair — same dedupe signal as today.
+                            m.record_completion_trigger_fired(&trigger_name, "deduped");
+                        }
+                    }
+                    continue;
+                }
             }
 
             let input_mapping: InputMapping = serde_json::from_value(trigger_db.input_mapping)
@@ -1461,6 +1510,142 @@ mod tests {
     }
 
     #[test]
+    fn condition_large_integers_compare_exactly() {
+        // Two distinct integers above 2^53 must never compare equal: the
+        // exact-integer fast path bypasses lossy f64 coercion entirely
+        // (2^53 = 9007199254740992; +1 is unrepresentable in f64).
+        let out = json!({
+            "id": 9_007_199_254_740_993_u64,          // 2^53 + 1
+            "big": u64::MAX,                          // above i64::MAX
+            "neg": -1_i64,
+        });
+        assert!(
+            !TriggerCondition::Eq {
+                path: "id".into(),
+                value: json!(9_007_199_254_740_992_u64), // 2^53 — distinct
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            TriggerCondition::Eq {
+                path: "id".into(),
+                value: json!(9_007_199_254_740_993_u64),
+            }
+            .evaluate(&out)
+        );
+        // u64 above i64::MAX: distinct neighbors stay distinct.
+        assert!(
+            !TriggerCondition::Eq {
+                path: "big".into(),
+                value: json!(u64::MAX - 1),
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            TriggerCondition::Eq {
+                path: "big".into(),
+                value: json!(u64::MAX),
+            }
+            .evaluate(&out)
+        );
+        // In-list membership uses the same exact path.
+        assert!(
+            !TriggerCondition::In {
+                path: "id".into(),
+                values: vec![json!(9_007_199_254_740_992_u64)],
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            TriggerCondition::In {
+                path: "id".into(),
+                values: vec![json!(9_007_199_254_740_993_u64)],
+            }
+            .evaluate(&out)
+        );
+        // Ordering on large integers is exact too (f64 would see these as equal).
+        assert!(
+            TriggerCondition::GreaterThan {
+                path: "id".into(),
+                value: json!(9_007_199_254_740_992_u64),
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            TriggerCondition::LessThan {
+                path: "big".into(),
+                value: json!(u64::MAX),
+            }
+            .evaluate(&json!({"big": u64::MAX - 1}))
+        );
+        // Mixed sign: a negative i64 never equals (and always orders below)
+        // a u64 above i64::MAX.
+        assert!(
+            !TriggerCondition::Eq {
+                path: "neg".into(),
+                value: json!(u64::MAX),
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            TriggerCondition::LessThan {
+                path: "neg".into(),
+                value: json!(u64::MAX),
+            }
+            .evaluate(&out)
+        );
+        // Mixed int/float still coerces through f64: `1 == 1.0`.
+        let small = json!({"n": 1});
+        assert!(
+            TriggerCondition::Eq {
+                path: "n".into(),
+                value: json!(1.0),
+            }
+            .evaluate(&small)
+        );
+    }
+
+    #[test]
+    fn condition_eq_bool_vs_number_is_false() {
+        // A bool is not a number: no coercion, strict Value inequality.
+        let out = json!({"flag": true});
+        assert!(
+            !TriggerCondition::Eq {
+                path: "flag".into(),
+                value: json!(1),
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            !TriggerCondition::GreaterThan {
+                path: "flag".into(),
+                value: json!(0),
+            }
+            .evaluate(&out)
+        );
+    }
+
+    #[test]
+    fn condition_midpath_scalar_traversal_is_missing() {
+        // Walking a member path THROUGH a scalar resolves to missing → false
+        // for comparisons, false for Exists.
+        let out = json!({"amount": 1500});
+        assert!(
+            !TriggerCondition::Eq {
+                path: "amount.sub".into(),
+                value: json!(1500),
+            }
+            .evaluate(&out)
+        );
+        assert!(
+            !TriggerCondition::Exists {
+                path: "amount.sub".into(),
+            }
+            .evaluate(&out)
+        );
+    }
+
+    #[test]
     fn condition_in_exists_isnull_semantics() {
         let out = output();
         assert!(
@@ -1683,6 +1868,14 @@ mod tests {
         cond
     }
 
+    fn nested_not(depth: usize) -> TriggerCondition {
+        let mut cond = TriggerCondition::Exists { path: "a".into() };
+        for _ in 1..depth {
+            cond = TriggerCondition::Not(Box::new(cond));
+        }
+        cond
+    }
+
     fn wide_all(leaves: usize) -> TriggerCondition {
         TriggerCondition::All(
             (0..leaves)
@@ -1696,6 +1889,9 @@ mod tests {
         // Depth: exactly the cap passes; one more is rejected.
         assert!(nested_all(MAX_CONDITION_DEPTH).validate().is_ok());
         assert!(nested_all(MAX_CONDITION_DEPTH + 1).validate().is_err());
+        // The `Not` arm counts toward the depth cap identically.
+        assert!(nested_not(MAX_CONDITION_DEPTH).validate().is_ok());
+        assert!(nested_not(MAX_CONDITION_DEPTH + 1).validate().is_err());
         // Node count: a combinator + leaves totalling the cap passes; +1 rejected.
         assert!(wide_all(MAX_CONDITION_NODES - 1).validate().is_ok());
         assert!(wide_all(MAX_CONDITION_NODES).validate().is_err());
@@ -1768,6 +1964,13 @@ mod tests {
         let over_cap = serde_json::to_value(nested_all(MAX_CONDITION_DEPTH + 1)).unwrap();
         assert_eq!(
             gate_stored_condition(Some(&over_cap), &out),
+            ConditionGate::Invalid
+        );
+        // A stored JSONB `'null'` (JSON null, not SQL NULL — only writable
+        // via direct SQL / external tooling) is Some(&Value::Null): a parse
+        // error → Invalid, fail closed, never a legacy-style Pass.
+        assert_eq!(
+            gate_stored_condition(Some(&Value::Null), &out),
             ConditionGate::Invalid
         );
     }

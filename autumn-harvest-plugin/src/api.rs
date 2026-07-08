@@ -29109,8 +29109,11 @@ mod tests {
         }));
         assert!(bad.is_err());
 
-        // Over-cap conditions deserialize fine but fail validate() — the
-        // handler's explicit check turns this into a 400.
+        // Over-cap conditions deserialize fine but fail `validate()` — the
+        // property the handler's explicit pre-insert check relies on. (This
+        // pins only the validate() outcome; the end-to-end 400 for an
+        // over-cap body is proven by
+        // `completion_triggers_integration.rs::test_condition_registration_rejects_invalid_with_400`.)
         let mut over_deep = TriggerCondition::Exists { path: "a".into() };
         for _ in 0..autumn_harvest::MAX_CONDITION_DEPTH {
             over_deep = TriggerCondition::All(vec![over_deep]);

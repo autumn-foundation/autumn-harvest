@@ -2206,6 +2206,14 @@ mod tests {
             METRIC_QUEUE_OLDEST_PENDING_AGE,
             "harvest.queue.oldest_pending_age"
         );
+        assert_eq!(
+            METRIC_COMPLETION_TRIGGER_FIRED,
+            "harvest.completion_trigger.fires"
+        );
+        assert_eq!(
+            METRIC_COMPLETION_TRIGGER_SKIPPED,
+            "harvest.completion_trigger.skipped"
+        );
     }
 
     #[test]

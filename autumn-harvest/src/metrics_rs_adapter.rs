@@ -858,6 +858,8 @@ mod tests {
         rec.record_workflow_nondeterministic_block("wf", "q");
         rec.record_schedule_to_start("q", 1.5);
         rec.record_queue_oldest_pending_age("q", 30.0);
+        rec.record_completion_trigger_fired("trigger-uuid", "started");
+        rec.record_completion_trigger_skipped("trigger-uuid", "condition_unmet");
     }
 
     // -----------------------------------------------------------------------
@@ -877,6 +879,15 @@ mod tests {
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
+    }
+
+    #[test]
+    fn record_completion_trigger_skipped_does_not_panic_for_all_reasons() {
+        // Output-guard skip counter bridge (issue #810). Must not panic with
+        // no global recorder installed; both bounded reason values covered.
+        let rec = MetricsRsRecorder;
+        rec.record_completion_trigger_skipped("trigger-uuid", "condition_unmet");
+        rec.record_completion_trigger_skipped("trigger-uuid", "condition_invalid");
     }
 
     #[test]
