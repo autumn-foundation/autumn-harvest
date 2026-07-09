@@ -8,12 +8,18 @@
 //! startup is exercised by the testcontainers integration test.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::effective_config::{EffectiveConfigView, PayloadCapsView, PoolConfigView};
+use autumn_harvest::retention::RetentionConfig;
+use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
-use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest_plugin::api::{
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
+};
 use autumn_web::AppState;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::http::{Method, Request, StatusCode};
@@ -86,6 +92,23 @@ fn sample_view() -> EffectiveConfigView {
     )
 }
 
+/// Install a minimal, DB-free runtime so `HarvestApiState::runtime()` succeeds —
+/// the readiness gate the handler now requires before serving the snapshot
+/// (issue #695 review, P2). Mirrors the runtime shape the crate's internal
+/// tests build.
+fn install_minimal_runtime(api_state: &HarvestApiState) {
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        None,
+        Vec::new(),
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+}
+
 #[tokio::test]
 async fn eris_unauthenticated_effective_config_is_blocked() {
     let app = app_with_api_state(HarvestApiState::new());
@@ -105,9 +128,32 @@ async fn effective_config_fails_closed_when_snapshot_not_installed() {
 }
 
 #[tokio::test]
+async fn effective_config_snapshot_present_but_runtime_not_installed_fails_closed() {
+    // Regression for the issue #695 review P2: the snapshot is captured early in
+    // plugin startup, before the runtime is installed. A present snapshot must
+    // NOT, on its own, make the endpoint serve a 200 — otherwise a request in the
+    // startup window (or after a startup step errored before `install`) would see
+    // config for a fleet that is not running. The runtime-not-installed gate must
+    // fail closed even though the snapshot is present.
+    let api_state = HarvestApiState::new();
+    api_state.set_effective_config(sample_view());
+    // Deliberately do NOT install a runtime.
+    let app = app_with_api_state(api_state);
+
+    let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
+    assert_ne!(res.status(), StatusCode::OK);
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn effective_config_happy_path_returns_secret_free_view() {
     let api_state = HarvestApiState::new();
     api_state.set_effective_config(sample_view());
+    // The handler gates on the runtime being installed (issue #695 review, P2),
+    // so a happy-path 200 requires an installed runtime alongside the snapshot.
+    install_minimal_runtime(&api_state);
     let app = app_with_api_state(api_state);
 
     let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();

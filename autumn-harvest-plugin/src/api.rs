@@ -5389,6 +5389,15 @@ async fn admin_status(
 async fn effective_config(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<autumn_harvest::effective_config::EffectiveConfigView>, AutumnError> {
+    // Gate readiness on the runtime being installed, exactly like every other
+    // management handler (issue #695 review, P2). The snapshot is captured early
+    // in plugin startup — before the fallible multi-shard checks and before
+    // `install(runtime)` — so a present snapshot is NOT a readiness signal on its
+    // own: without this gate the endpoint could 200 during the startup window
+    // while `runtime()` still reports "not started", or keep serving a stale
+    // snapshot if a later startup step errored and never installed a runtime.
+    // Requiring the runtime fails closed in both cases.
+    api_state.runtime().map_err(map_error)?;
     let view = api_state.effective_config().ok_or_else(|| {
         map_error(HarvestError::Config(
             "harvest runtime is not started".to_string(),
