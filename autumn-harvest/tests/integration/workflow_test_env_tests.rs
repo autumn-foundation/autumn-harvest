@@ -1333,6 +1333,11 @@ async fn test_timer_advances_virtual_clock() {
 
 // ── issue #749: sleep_until absolute-deadline durable timer ────────────────────
 
+/// A fixed instant firmly in the future (2035-01-01T00:00:00Z), shared between
+/// the future-deadline workflow and its test so the test can reconstruct the
+/// exact `remaining_secs_until(deadline, frozen_now)` math.
+const SLEEP_UNTIL_FUTURE_DEADLINE_TS: i64 = 2_051_222_400;
+
 /// Sleeps until a fixed future instant; reports the virtual-clock delta so the
 /// test can check internal consistency against the recorded timer duration.
 fn sleep_until_future_workflow<'a>(
@@ -1341,8 +1346,7 @@ fn sleep_until_future_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let t0 = ctx.now().timestamp();
-        // A fixed instant firmly in the future (year 2035).
-        let deadline = chrono::DateTime::from_timestamp(2_051_222_400, 0).unwrap();
+        let deadline = chrono::DateTime::from_timestamp(SLEEP_UNTIL_FUTURE_DEADLINE_TS, 0).unwrap();
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
@@ -1373,8 +1377,25 @@ async fn sleep_until_resolves_in_test_env_without_real_sleep() {
         .await;
     assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
 
-    // The recorded durable-timer duration and the virtual-clock delta must
-    // agree (robust to `system_now()` returning real wall time in tests).
+    // Read both the frozen `system_now()` capture (`SideEffectRecorded { Now }`,
+    // epoch-millis) and the recorded timer duration straight from history, then
+    // reconstruct the exact remaining-seconds math `sleep_until` performed. This
+    // is a genuine `sleep_until` assertion, not the test-env invariant that the
+    // virtual clock advances by whatever timer was started. `remaining_secs_until`
+    // is `pub(crate)` and unreachable from this external test crate, so the
+    // expected value is computed inline with the same round-up rule.
+    let frozen_millis = outcome
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::SideEffectRecorded {
+                kind: autumn_harvest::SideEffectKind::Now,
+                value,
+                ..
+            } => value.as_i64(),
+            _ => None,
+        })
+        .expect("a SideEffectRecorded(Now) event must freeze the wall clock");
     let timer_secs = outcome
         .events()
         .iter()
@@ -1383,12 +1404,26 @@ async fn sleep_until_resolves_in_test_env_without_real_sleep() {
             _ => None,
         })
         .expect("a TimerStarted event must be recorded");
-    let delta = outcome.result.unwrap()["delta"].as_u64().unwrap();
+
+    let frozen_now = chrono::DateTime::from_timestamp_millis(frozen_millis)
+        .expect("frozen millis must be a valid instant");
+    let deadline = chrono::DateTime::from_timestamp(SLEEP_UNTIL_FUTURE_DEADLINE_TS, 0).unwrap();
+    let delta = deadline.signed_duration_since(frozen_now);
+    let expected =
+        u64::try_from(delta.num_seconds() + i64::from(delta.subsec_nanos() > 0)).unwrap();
     assert_eq!(
-        delta, timer_secs,
-        "virtual clock must advance by exactly the recorded timer duration"
+        timer_secs, expected,
+        "recorded timer duration must equal remaining_secs_until(deadline, frozen_now)"
     );
     assert!(timer_secs > 0, "a future deadline must be a positive wait");
+
+    // ...and it resolves with no real sleep: the virtual clock advanced by
+    // exactly the recorded timer duration.
+    let reported_delta = outcome.result.unwrap()["delta"].as_u64().unwrap();
+    assert_eq!(
+        reported_delta, timer_secs,
+        "virtual clock must advance by exactly the recorded timer duration"
+    );
 }
 
 #[tokio::test]

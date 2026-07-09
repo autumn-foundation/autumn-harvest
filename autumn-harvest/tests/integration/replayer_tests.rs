@@ -852,22 +852,32 @@ fn sleep_until_history(
     (input, events, duration_secs)
 }
 
-/// The falsifiable bar for issue #749: the same `sleep_until` history replays
-/// deterministically N = 1000 times with zero divergences.
+/// The falsifiable bar for issue #749: `sleep_until` histories replay
+/// deterministically across N = 1000 runs with zero divergences. Each iteration
+/// builds a *distinct* fixture — the frozen `system_now()` instant and the
+/// deadline offset both vary with `i`, including deliberate sub-second jitter
+/// that exercises the round-up path — so this is 1000 varied cases, not one
+/// fixture cloned 1000 times.
 #[tokio::test]
 async fn sleep_until_replays_deterministically() {
-    let frozen_millis = 1_700_000_000_000_i64;
-    let deadline_millis = frozen_millis + 3_600_000; // one hour after the frozen now
-    let (_input, events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
-    assert_eq!(duration_secs, 3600, "fixture math must be consistent");
-
+    let base_frozen = 1_600_000_000_000_i64;
     let replayer = build_replayer();
-    for i in 0..1000 {
+    for i in 0..1000_i64 {
+        // Vary the frozen capture and the remaining offset deterministically;
+        // the `* 250ms` term walks the sub-second remainder through the round-up
+        // boundary (0, 250, 500, 750, 1000ms, ...).
+        let frozen_millis = base_frozen + i * 37_000;
+        let deadline_millis = frozen_millis + 3_600_000 + i * 250;
+        let (_input, events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
+        if i == 0 {
+            assert_eq!(duration_secs, 3600, "i=0 fixture math must be consistent");
+        }
+
         let report = replayer
             .replay_from_snapshot(make_snapshot(
                 "sleep_until_workflow",
                 ExecutionId::new(),
-                events.clone(),
+                events,
             ))
             .await;
         assert!(
@@ -899,10 +909,12 @@ async fn sleep_until_past_deadline_replays_deterministically() {
     );
 }
 
-/// A mutated timer duration in an otherwise-valid `sleep_until` history surfaces
-/// as ordinary timer non-determinism — NOT a panic, NOT `ReplaySucceeded`.
+/// A mutated timer *duration* in an otherwise-valid `sleep_until` history
+/// surfaces as ordinary timer non-determinism — NOT a panic, NOT
+/// `ReplaySucceeded`. (Renamed from `..._reorder_...`: this mutates the recorded
+/// duration, not event order.)
 #[tokio::test]
-async fn sleep_until_reorder_surfaces_as_timer_nondeterminism() {
+async fn sleep_until_duration_mismatch_surfaces_as_timer_nondeterminism() {
     let frozen_millis = 1_700_000_000_000_i64;
     let deadline_millis = frozen_millis + 3_600_000;
     let (_input, mut events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
@@ -933,6 +945,41 @@ async fn sleep_until_reorder_surfaces_as_timer_nondeterminism() {
             }
         ),
         "a mutated sleep_until timer must be detected as TimerMismatch, got: {report}"
+    );
+}
+
+/// A genuine *structural* divergence: the frozen `SideEffectRecorded { Now }`
+/// event is dropped from history (as if a code change removed the `system_now()`
+/// capture that `sleep_until` performs), so on replay the first history-consulting
+/// call diverges. Must surface as a classified non-determinism — NOT a panic,
+/// NOT `ReplaySucceeded`.
+#[tokio::test]
+async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
+    let frozen_millis = 1_700_000_000_000_i64;
+    let deadline_millis = frozen_millis + 3_600_000;
+    let (_input, events, _duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
+
+    // Drop the SideEffectRecorded(Now) capture (events[1]), leaving
+    // [WorkflowStarted, TimerStarted, TimerFired].
+    let mut structural = events;
+    structural.remove(1);
+
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "sleep_until_workflow",
+            ExecutionId::new(),
+            structural,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::SideEffectDrift,
+                ..
+            }
+        ),
+        "dropping the frozen system_now() capture must surface as SideEffectDrift, got: {report}"
     );
 }
 

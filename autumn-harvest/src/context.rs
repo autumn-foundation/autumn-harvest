@@ -1156,20 +1156,24 @@ fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
 ///
 /// - A past-or-equal deadline clamps to `0` (never wraps into a multi-year
 ///   sleep) — the durable timer then fires on the next poll.
-/// - A sub-second remainder is rounded **up** to the next whole second, so the
-///   wait never resolves *before* the deadline (harvest timers have whole-second
-///   granularity).
-/// - An astronomically distant deadline saturates to `u64::MAX`; the worker's
-///   `chrono_duration_from_secs` then surfaces it as a `Config` error at persist,
-///   exactly like an overflowing `ctx.timer` duration.
+/// - Any positive sub-second remainder is rounded **up** to the next whole
+///   second (nanosecond-precise, matching `wait_for_signal_timeout`), so the
+///   wait never resolves *before* the deadline (harvest timers have
+///   whole-second granularity).
+/// - A defensive fallback saturates to `u64::MAX` for a delta whose whole
+///   seconds overflow `i64`→`u64`; this is unreachable for any chrono-valid
+///   `DateTime<Utc>` pair (chrono's own range caps the delta far below that),
+///   but were it hit the worker's `chrono_duration_from_secs` would surface it
+///   as a `Config` error at persist, exactly like an overflowing `ctx.timer`
+///   duration.
 pub(crate) fn remaining_secs_until(deadline: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
-    let delta_ms = deadline.signed_duration_since(now).num_milliseconds();
-    if delta_ms <= 0 {
+    let delta = deadline.signed_duration_since(now);
+    if delta <= chrono::Duration::zero() {
         return 0;
     }
-    let secs = delta_ms / 1000;
-    let round_up = i64::from(delta_ms % 1000 != 0);
-    u64::try_from(secs + round_up).unwrap_or(u64::MAX)
+    let secs = delta.num_seconds();
+    let round_up = i64::from(delta.subsec_nanos() > 0);
+    u64::try_from(secs.saturating_add(round_up)).unwrap_or(u64::MAX)
 }
 
 /// Options for [`WorkflowContext::create_session`] (issue #606).
@@ -3917,6 +3921,23 @@ impl WorkflowContext {
     /// to a `ctx.timer` timer of the same computed duration. Like `ctx.timer`, exactly
     /// one timer suspends per call and it cannot share a suspension batch with
     /// activity/child-workflow/signal commands.
+    ///
+    /// # Usage notes
+    ///
+    /// - **Derive `deadline` from deterministic state** — a workflow input, a prior
+    ///   activity output, or `ctx.system_now()` — never from `chrono::Utc::now()`
+    ///   directly (that is the non-deterministic path this method exists to replace).
+    /// - **Prefer [`WorkflowContext::timer`] for a purely *relative* wait** (e.g. "wait
+    ///   30s"). `sleep_until` captures `system_now()` to convert an absolute instant
+    ///   into a relative duration; if you already have the duration, `ctx.timer` skips
+    ///   that redundant `SideEffectRecorded` capture.
+    /// - **In [`crate::testing::WorkflowTestEnv`]**, the internal `system_now()` reads
+    ///   the *real* wall clock rather than the virtual `ctx.now()`, so a `ctx.now()`
+    ///   read taken after the wait aligns with `deadline` only when the env's virtual
+    ///   clock is set close to real "now".
+    /// - **`timer_id` dedups by id** in `harvest_timers` (a re-park with the same id
+    ///   reuses the row); avoid the engine-reserved `__`-prefixed id namespace, exactly
+    ///   as with [`WorkflowContext::timer`].
     ///
     /// # Errors
     ///
@@ -9975,6 +9996,25 @@ mod tests {
         assert_eq!(remaining_secs_until(at(1_500), now), 2);
         assert_eq!(remaining_secs_until(at(1), now), 1);
         assert_eq!(remaining_secs_until(at(999), now), 1);
+        // Sub-millisecond remainders round up too (nanosecond-precise) — the
+        // millisecond-granular `at()` helper cannot express these, so build the
+        // deadlines with micro/nanosecond offsets directly.
+        assert_eq!(
+            remaining_secs_until(now + chrono::Duration::microseconds(500), now),
+            1
+        );
+        assert_eq!(
+            remaining_secs_until(now + chrono::Duration::nanoseconds(1), now),
+            1
+        );
+        // A whole second plus a single nanosecond still rounds up to 2.
+        assert_eq!(
+            remaining_secs_until(
+                now + chrono::Duration::seconds(1) + chrono::Duration::nanoseconds(1),
+                now
+            ),
+            2
+        );
         // Exactly whole seconds do not round up.
         assert_eq!(remaining_secs_until(at(2_000), now), 2);
         // Large future.
@@ -10026,8 +10066,16 @@ mod tests {
             panic!("second command must be StartTimer, got {cmds:?}");
         };
         assert_eq!(timer_id.as_str(), "wake");
+        // ~3600s, but the exact whole-second value depends on sub-second timing:
+        // `deadline` is a full-precision `Utc::now() + 1h` while the internal
+        // `system_now()` capture truncates to whole milliseconds. When both land
+        // in the same wall-clock millisecond, the remaining delta is `1h + frac_ms`
+        // and the nanosecond-precise round-up honestly yields 3601; when a
+        // millisecond or two elapses between the two reads it is 3600 (or 3599
+        // under load). All three are correct "never resolve before the deadline"
+        // outcomes.
         assert!(
-            (3599..=3600).contains(duration_secs),
+            (3599..=3601).contains(duration_secs),
             "expected ~3600s remaining, got {duration_secs}"
         );
     }
