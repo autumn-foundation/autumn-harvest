@@ -1,5 +1,6 @@
 //! Time-based retention janitor for completed workflow history.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "db")]
@@ -89,6 +90,15 @@ pub struct RetentionConfig {
     /// Maximum age in seconds for closed workflows before they are eligible for deletion.
     /// If `None`, workflow history retention is disabled.
     pub max_age_secs: Option<u64>,
+    /// Per-workflow-type retention overrides keyed by registered workflow name,
+    /// each mapping to its own max-age in seconds (matching `max_age_secs`).
+    ///
+    /// A completed execution whose `workflow_name` has an override is retained
+    /// for that type's age instead of the global `max_age_secs`. A type with no
+    /// override falls back to the global `max_age_secs`; if neither is set, that
+    /// type is never deleted. Uses [`BTreeMap`] for deterministic ordering and
+    /// serialization. Issue #737.
+    pub overrides: BTreeMap<String, u64>,
     /// How often the background retention job wakes up to scan for expired data.
     pub tick_interval_secs: u64,
     /// The maximum number of records to process in a single transaction/batch.
@@ -111,6 +121,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             max_age_secs: None,
+            overrides: BTreeMap::new(),
             tick_interval_secs: DEFAULT_TICK_INTERVAL.as_secs(),
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
@@ -129,6 +140,33 @@ impl RetentionConfig {
             max_age_secs: Some(max_age.as_secs()),
             ..Self::default()
         }
+    }
+
+    /// Register a per-workflow-type retention override (issue #737).
+    ///
+    /// The named workflow type is retained for `max_age` instead of the global
+    /// `max_age`. Overrides are validated against the same
+    /// `MIN_MAX_AGE..=MAX_MAX_AGE` bounds as the global `max_age` at build time.
+    #[must_use]
+    pub fn with_workflow_override(
+        mut self,
+        workflow_name: impl Into<String>,
+        max_age: Duration,
+    ) -> Self {
+        self.overrides.insert(workflow_name.into(), max_age.as_secs());
+        self
+    }
+
+    /// Bulk-register per-workflow-type retention overrides (issue #737).
+    #[must_use]
+    pub fn with_workflow_overrides(
+        mut self,
+        iter: impl IntoIterator<Item = (String, Duration)>,
+    ) -> Self {
+        for (name, max_age) in iter {
+            self.overrides.insert(name, max_age.as_secs());
+        }
+        self
     }
 
     /// Override the audit log retention window.
@@ -157,6 +195,53 @@ impl RetentionConfig {
     #[must_use]
     pub fn max_age(&self) -> Option<Duration> {
         self.max_age_secs.map(Duration::from_secs)
+    }
+
+    /// Resolves the effective history max-age for a given workflow type (issue #737).
+    ///
+    /// Returns the per-type override if one is registered for `workflow_name`,
+    /// otherwise the global `max_age`. Returns `None` when neither is set — in
+    /// which case that type's history is never deleted.
+    #[must_use]
+    pub fn effective_max_age(&self, workflow_name: &str) -> Option<Duration> {
+        self.overrides
+            .get(workflow_name)
+            .copied()
+            .map(Duration::from_secs)
+            .or_else(|| self.max_age())
+    }
+
+    /// The smallest effective retention age across the global `max_age` and all
+    /// per-type overrides (issue #737).
+    ///
+    /// This is the SQL candidate pre-filter age: the smallest age yields the
+    /// cutoff closest to "now", which is a correct *superset* of every
+    /// deletable row (any row deletable under a type-specific age `age(T)`
+    /// satisfies `completed_at < now - age(T) <= now - min_age`). The scanner
+    /// then applies the exact per-type age to each candidate in Rust.
+    ///
+    /// Returns `None` iff the global `max_age` is unset *and* there are no
+    /// overrides.
+    #[must_use]
+    pub fn loosest_cutoff_age(&self) -> Option<Duration> {
+        self.max_age()
+            .into_iter()
+            .chain(self.overrides.values().copied().map(Duration::from_secs))
+            .min()
+    }
+
+    /// Returns `true` if workflow-history retention should run this tick, i.e.
+    /// either the global `max_age` or at least one per-type override is set
+    /// (issue #737).
+    #[must_use]
+    pub fn history_retention_active(&self) -> bool {
+        self.loosest_cutoff_age().is_some()
+    }
+
+    /// Read access to the per-workflow-type retention overrides (issue #737).
+    #[must_use]
+    pub const fn workflow_overrides(&self) -> &BTreeMap<String, u64> {
+        &self.overrides
     }
 
     /// Translates the raw numeric tick value into a standard [`Duration`] for the scheduler loop.
@@ -193,6 +278,19 @@ impl RetentionConfig {
                 MIN_MAX_AGE.as_secs(),
                 MAX_MAX_AGE.as_secs()
             ));
+        }
+        // Each per-type override is validated against the same bounds as the
+        // global max_age; an out-of-range override fails the build rather than
+        // silently clamping (issue #737, AC5).
+        for (name, secs) in &self.overrides {
+            let age = Duration::from_secs(*secs);
+            if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
+                return Err(format!(
+                    "retention override for '{name}' must be between {}s and {}s",
+                    MIN_MAX_AGE.as_secs(),
+                    MAX_MAX_AGE.as_secs()
+                ));
+            }
         }
         Ok(())
     }
@@ -1164,6 +1262,137 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    // --- Issue #737: per-workflow-type history retention overrides ---
+
+    #[test]
+    fn test_effective_max_age_resolution() {
+        // override present -> override wins over global
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("slow_wf", Duration::from_secs(7200));
+        assert_eq!(
+            config.effective_max_age("slow_wf"),
+            Some(Duration::from_secs(7200))
+        );
+        // no override for this type -> falls back to global
+        assert_eq!(
+            config.effective_max_age("other_wf"),
+            Some(Duration::from_secs(3600))
+        );
+
+        // no global, override present -> override for that type, None for others
+        let mut config = RetentionConfig::default();
+        config.max_age_secs = None;
+        let config = config.with_workflow_override("only_wf", Duration::from_secs(500));
+        assert_eq!(
+            config.effective_max_age("only_wf"),
+            Some(Duration::from_secs(500))
+        );
+        assert_eq!(config.effective_max_age("other_wf"), None);
+
+        // neither -> None (never delete)
+        let config = RetentionConfig::default();
+        assert_eq!(config.effective_max_age("anything"), None);
+    }
+
+    #[test]
+    fn test_loosest_cutoff_age() {
+        // global only
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert_eq!(
+            config.loosest_cutoff_age(),
+            Some(Duration::from_secs(3600))
+        );
+
+        // global + overrides -> min of all
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("longer", Duration::from_secs(7200))
+            .with_workflow_override("shorter", Duration::from_secs(600));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(600)));
+
+        // no global, overrides only -> min override
+        let mut config = RetentionConfig::default();
+        config.max_age_secs = None;
+        let config = config
+            .with_workflow_override("a", Duration::from_secs(900))
+            .with_workflow_override("b", Duration::from_secs(300));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(300)));
+
+        // global present but larger than an override -> override wins as loosest
+        let config = RetentionConfig::with_max_age(Duration::from_secs(5000))
+            .with_workflow_override("tiny", Duration::from_secs(100));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(100)));
+
+        // neither -> None
+        let config = RetentionConfig::default();
+        assert_eq!(config.loosest_cutoff_age(), None);
+    }
+
+    #[test]
+    fn test_history_retention_active() {
+        // both unset
+        let config = RetentionConfig::default();
+        assert!(!config.history_retention_active());
+
+        // global set
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(config.history_retention_active());
+
+        // only overrides set
+        let mut config = RetentionConfig::default();
+        config.max_age_secs = None;
+        let config = config.with_workflow_override("wf", Duration::from_secs(60));
+        assert!(config.history_retention_active());
+    }
+
+    #[test]
+    fn test_validate_overrides_bounds() {
+        // below MIN_MAX_AGE
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(0));
+        assert!(config.validate().is_err());
+
+        // above MAX_MAX_AGE
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(60 * 60 * 24 * 365 * 20));
+        assert!(config.validate().is_err());
+
+        // in range
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(7200));
+        assert!(config.validate().is_ok());
+
+        // empty overrides + valid global -> Ok
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_overrides_backward_compat_empty() {
+        // With no overrides, effective_max_age(any) == max_age() for all names.
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(config.workflow_overrides().is_empty());
+        assert_eq!(config.effective_max_age("any_wf"), config.max_age());
+        assert_eq!(config.effective_max_age("another"), config.max_age());
+    }
+
+    #[test]
+    fn test_with_workflow_overrides_bulk() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_overrides([
+                ("a".to_string(), Duration::from_secs(100)),
+                ("b".to_string(), Duration::from_secs(200)),
+            ]);
+        assert_eq!(config.workflow_overrides().len(), 2);
+        assert_eq!(
+            config.effective_max_age("a"),
+            Some(Duration::from_secs(100))
+        );
+        assert_eq!(
+            config.effective_max_age("b"),
+            Some(Duration::from_secs(200))
+        );
     }
 
     #[test]

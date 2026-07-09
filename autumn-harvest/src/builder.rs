@@ -1099,7 +1099,7 @@ impl HarvestBuilder {
 
     /// Configure retention janitor behavior for completed workflow history.
     #[must_use]
-    pub const fn retention(mut self, retention: RetentionConfig) -> Self {
+    pub fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
         self
     }
