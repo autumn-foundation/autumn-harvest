@@ -1686,9 +1686,7 @@ mod tests {
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "boom".into(),
-            },
+            WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::WorkflowCancelled {
                 reason: "operator".into(),
             },
