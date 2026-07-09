@@ -590,7 +590,7 @@
           {
             "name": "idempotency_key",
             "required": false,
-            "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined)."
+            "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."
           }
         ]
       },
@@ -625,7 +625,7 @@
         },
         {
           "status": 503,
-          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts)."
+          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
         },
         {
           "status": 500,

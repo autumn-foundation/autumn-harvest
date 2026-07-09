@@ -405,6 +405,50 @@ mod db_impl {
         }
     }
 
+    /// Read-only probe for a live (within-window) start idempotency claim.
+    ///
+    /// Returns the claimed execution's id when a claim row for `(workflow_name,
+    /// key)` exists, was created within `window_secs`, **and** still points at a
+    /// live execution (the JOIN mirrors [`reserve_start_idempotency`]'s
+    /// `Duplicate` classification — a within-window claim whose execution was
+    /// retention-deleted is *not* a dedup hit, it reclaims to a fresh start).
+    ///
+    /// Used by the admission-gate idempotent-retry bypass (issue #808): a keyed
+    /// replay of an already-successful start resolves to a `200` no-op, so it is
+    /// **not** fresh admission and a raised gate must not reject it. Side-effect
+    /// free (no upsert, no reclaim) — a genuinely fresh keyed start finds no
+    /// claim and still passes through the gate normally.
+    ///
+    /// # Errors
+    /// Propagates database failures.
+    pub async fn lookup_live_start_idempotency_claim(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        key: &str,
+        window_secs: f64,
+    ) -> HarvestResult<Option<ExecutionId>> {
+        #[derive(diesel::QueryableByName)]
+        struct ClaimedId {
+            #[diesel(sql_type = diesel::sql_types::Uuid)]
+            id: uuid::Uuid,
+        }
+        let row: Option<ClaimedId> = diesel::sql_query(
+            "SELECT we.id \
+             FROM harvest_start_idempotency si \
+             JOIN harvest_workflow_executions we ON we.id = si.workflow_exec_id \
+             WHERE si.workflow_name = $1 AND si.idempotency_key = $2 \
+               AND si.created_at > now() - make_interval(secs => $3)",
+        )
+        .bind::<diesel::sql_types::Text, _>(workflow_name)
+        .bind::<diesel::sql_types::Text, _>(key)
+        .bind::<diesel::sql_types::Double, _>(window_secs)
+        .get_result(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+        Ok(row.map(|r| ExecutionId::from_uuid(r.id)))
+    }
+
     /// Repoint an existing claim at the execution the start actually resolved to.
     ///
     /// The reserve upsert writes the claim pointing at the *reserved*
@@ -546,6 +590,6 @@ mod db_impl {
 
 #[cfg(feature = "db")]
 pub use db_impl::{
-    purge_expired_start_idempotency, repoint_start_idempotency_claim, reserve_start_idempotency,
-    sweep_expired_start_idempotency,
+    lookup_live_start_idempotency_claim, purge_expired_start_idempotency,
+    repoint_start_idempotency_claim, reserve_start_idempotency, sweep_expired_start_idempotency,
 };

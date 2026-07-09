@@ -671,3 +671,188 @@ async fn multi_shard_same_key_converges_on_one_execution() {
         execution_count(&mut c0, "order_flow").await + execution_count(&mut c1, "order_flow").await;
     assert_eq!(total, 1, "exactly one execution across both shards");
 }
+
+/// FINDING 1 (Codex P1, issue #808): when the caller supplies an EXPLICIT
+/// `workflow_id`, a keyed start must route by `workflow_id` (not the key) so the
+/// reuse-policy matrix and the shard-local `(name, workflow_id)` uniqueness
+/// invariant are preserved. Here a prior run with an explicit `workflow_id`
+/// exists on the `workflow_id`-derived shard; a same-`workflow_id` keyed start
+/// with `reject_duplicate` must see it and 409 — NOT create a second run on the
+/// key-derived shard. The (wid, key) pair is chosen so the two rules genuinely
+/// route to different shards, so a regression to key-routing would 201 instead.
+#[tokio::test]
+async fn explicit_workflow_id_keyed_start_preserves_reject_duplicate() {
+    let (url0, _c0) = setup_database().await;
+    let (url1, _c1) = setup_database().await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(ShardId::new(0), pool0);
+    map.insert(ShardId::new(1), pool1);
+    let sharded = ShardedDbPool::from_map(map, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    // Choose a (workflow_id, key) pair that routes to DIFFERENT shards, so this
+    // test would fail (201, duplicate run) under the pre-fix key-routing.
+    let wf = "order_flow";
+    let key = "delivery-42";
+    let key_shard = router.pick_for_idempotency_key(wf, key);
+    let mut chosen_wid = None;
+    for i in 0..10_000 {
+        let wid = format!("wid-{i}");
+        if router.pick_for_new_workflow(wf, &wid) != key_shard {
+            chosen_wid = Some(wid);
+            break;
+        }
+    }
+    let wid = chosen_wid.expect("some workflow_id routes to a shard other than the key's");
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded));
+    let registry = HandlerRegistry::new(vec![plain_info(wf)], vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("idem-explicit-wid".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router,
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    // Prior run: explicit workflow_id, NO key → routes by workflow_id.
+    let (s0, b0) = post_start(
+        &app,
+        wf,
+        json!({"input": {"n": 1}, "workflow_id": wid}),
+        None,
+    )
+    .await;
+    assert_eq!(s0, StatusCode::CREATED, "prior run: {b0}");
+
+    // Keyed start, SAME explicit workflow_id, reject_duplicate → must 409
+    // (routes by workflow_id, sees the prior run), not 201 on the key shard.
+    let (s1, b1) = post_start(
+        &app,
+        wf,
+        json!({"input": {"n": 2}, "workflow_id": wid, "reuse_policy": "reject_duplicate"}),
+        Some(key),
+    )
+    .await;
+    assert_eq!(
+        s1,
+        StatusCode::CONFLICT,
+        "reuse policy must be preserved for an explicit workflow_id: {b1}"
+    );
+
+    // Exactly one execution total across both shards (no duplicate created).
+    let mut c0 = raw_connect(&url0).await;
+    let mut c1 = raw_connect(&url1).await;
+    let total = execution_count(&mut c0, wf).await + execution_count(&mut c1, wf).await;
+    assert_eq!(total, 1, "no duplicate run created on the key shard");
+}
+
+/// FINDING 1 (Codex P1, issue #808): an explicit-`workflow_id` keyed start still
+/// dedups a same-`(workflow_id, key)` retry — both route by `workflow_id` to the
+/// same shard, hit the same claim row, and the second returns the same
+/// execution_id as a 200 no-op.
+#[tokio::test]
+async fn explicit_workflow_id_keyed_retry_dedups() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    let body = json!({"input": {"n": 1}, "workflow_id": "cart-7"});
+    let (s1, b1) = post_start(&app, "order_flow", body.clone(), Some("evt-1")).await;
+    assert_eq!(s1, StatusCode::CREATED, "first: {b1}");
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    let (s2, b2) = post_start(&app, "order_flow", body, Some("evt-1")).await;
+    assert_eq!(s2, StatusCode::OK, "retry dedups: {b2}");
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FINDING 2 (Codex P2, issue #808): a keyed replay of an already-successful
+/// start must bypass a raised admission gate (the reserve path resolves it to a
+/// 200 no-op — not fresh admission). A genuinely fresh keyed start is still
+/// gated.
+#[tokio::test]
+async fn keyed_replay_bypasses_a_raised_admission_gate() {
+    use autumn_harvest::{AdmissionGate, AdmissionGateId, GateScope};
+
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+
+    // Build the app inline so we can manipulate the gate cache.
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let registry = HandlerRegistry::new(vec![plain_info("order_flow")], vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("idem-gate".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    ));
+
+    let raise_gate = || {
+        api_state.initialize_gate_cache(vec![AdmissionGate {
+            id: AdmissionGateId(uuid::Uuid::new_v4()),
+            scope: GateScope::WorkflowName("order_flow".to_string()),
+            reason: "incident".to_string(),
+            message: None,
+            created_by: "op".to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+        }]);
+    };
+    let lift_gate = || api_state.initialize_gate_cache(vec![]);
+
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    // 1. Gate raised → a FRESH keyed start is rejected (503), as today.
+    raise_gate();
+    let (s0, _b0) = post_start(&app, "order_flow", json!({"input": {}}), Some("G")).await;
+    assert_eq!(
+        s0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a fresh keyed start must still be gated"
+    );
+
+    // 2. Lift the gate and create the run + claim for key "G".
+    lift_gate();
+    let (s1, b1) = post_start(&app, "order_flow", json!({"input": {}}), Some("G")).await;
+    assert_eq!(s1, StatusCode::CREATED, "{b1}");
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    // 3. Re-raise the gate; a same-key RETRY must bypass it → 200 dedup.
+    raise_gate();
+    let (s2, b2) = post_start(&app, "order_flow", json!({"input": {}}), Some("G")).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "a keyed replay must bypass the raised gate: {b2}"
+    );
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}

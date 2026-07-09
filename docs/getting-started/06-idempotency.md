@@ -123,6 +123,28 @@ Semantics:
 - Shard-local, and it introduces **no new event** — the dedup happens before
   `WorkflowStarted` is ever appended, so replay is unaffected.
 
+### Consistency caveat in multi-shard deployments
+
+The claim row and its execution are **shard-local**, so a keyed start's shard is
+chosen deterministically from either the key or the `workflow_id`:
+
+- **`workflow_id` omitted** (auto-generated): the start routes by the **key**
+  `(workflow_name, idempotency_key)`. Same-key retries co-locate on one shard and
+  dedup — routing by the per-request `workflow_id` would scatter them.
+- **`workflow_id` supplied** (explicit business identity): the start routes by
+  `(workflow_name, workflow_id)`, exactly as a non-keyed start does. This keeps
+  the run on the shard that owns `(name, workflow_id)`, so the `reuse_policy`
+  matrix and the `(name, workflow_id)` uniqueness invariant still apply — a keyed
+  `reject_duplicate` start still `409`s against an existing run, and never
+  silently creates a second run on a different shard. Same-`workflow_id` retries
+  still co-locate (the `workflow_id` is constant) and dedup on the key.
+
+For keyed dedup to converge, **be consistent about supplying vs. omitting
+`workflow_id` across retries of the same delivery** — mixing the two within one
+delivery's retries routes them to different shards, so the second would not see
+the first's claim. Pick one shape per delivery. In a single-shard deployment this
+is moot (everything is on one shard).
+
 See the [start route in the management-API contract](../api-contract.json) for
 the full request/response schema.
 

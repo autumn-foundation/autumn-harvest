@@ -8175,16 +8175,33 @@ pub(crate) async fn start_workflow(
 
     // Compute target shard early so the gate check can filter by shard-scoped gates.
     //
-    // issue #808: a request-scoped `idempotency_key` must route by the KEY
-    // (rendezvous over `(workflow_name, idempotency_key)`), NOT by the
-    // per-request `workflow_id` (which is auto-generated when omitted). Routing
-    // a keyed start by `workflow_id` would scatter same-key retries across
-    // shards in a multi-shard deployment — a separate `harvest_start_idempotency`
-    // claim row per shard, hence a separate execution per shard — defeating the
-    // dedup guarantee. The claim row, its execution, and the per-shard expiry
-    // sweep therefore all use this same key-derived shard. The no-key path is
-    // byte-for-byte unchanged (routes by `workflow_id`).
-    let shard = if let Some(ref key) = idempotency_key {
+    // issue #808: a request-scoped `idempotency_key` routes by the KEY
+    // (rendezvous over `(workflow_name, idempotency_key)`) — but ONLY when the
+    // `workflow_id` was auto-generated (omitted). In that case there is no
+    // stable business identity to preserve, and the per-request `workflow_id`
+    // varies per retry, so routing by `workflow_id` would scatter same-key
+    // retries across shards in a multi-shard deployment (a separate
+    // `harvest_start_idempotency` claim row per shard, hence a separate
+    // execution per shard), defeating dedup — routing by the key is what
+    // co-locates them.
+    //
+    // When the caller supplies an EXPLICIT `workflow_id`, route by
+    // `workflow_id` instead (the pre-#808 behavior). An explicit `workflow_id`
+    // is a stable business identity: routing by it *also* co-locates same-key
+    // retries (the `workflow_id` is constant across them) AND keeps the start
+    // on the shard that owns `(workflow_name, workflow_id)`, which the
+    // reuse-policy matrix and the shard-local `(name, workflow_id)` uniqueness
+    // invariant depend on. Routing a keyed-and-explicit start by the key would
+    // land it on the key-derived shard, where `start_or_load_workflow_execution`
+    // cannot see an existing `(name, workflow_id)` run living on the
+    // `workflow_id`-derived shard — silently breaking `RejectDuplicate` /
+    // `AllowDuplicate` and the uniqueness invariant. Consistency caveat: for
+    // keyed dedup to converge, a client must be consistent about supplying vs.
+    // omitting `workflow_id` across retries of the same delivery (mixing the two
+    // routes to different shards). The no-key path is byte-for-byte unchanged.
+    let shard = if let Some(ref key) = idempotency_key
+        && !explicit_workflow_id
+    {
         runtime.router.pick_for_idempotency_key(&workflow_name, key)
     } else {
         runtime
@@ -8330,34 +8347,68 @@ pub(crate) async fn start_workflow(
             // so the gate must not block that case either. Checked only when
             // this workflow actually resolves a throttle policy, to avoid an
             // extra round-trip for the common non-throttled case.
-            let is_idempotent_retry = if explicit_workflow_id {
+            //
+            // issue #808: a keyed replay of an already-successful start is also
+            // not fresh admission — the idempotency reserve path would resolve
+            // it to a `200` no-op returning the existing execution. Without this
+            // probe, raising a gate during an incident would reject retries of
+            // *already-done* work exactly when at-least-once retry storms matter
+            // most. The `(workflow_name, workflow_id)` execution check above
+            // misses this because the common keyed case auto-generates a fresh
+            // `workflow_id` per retry, so we probe the keyed claim on the same
+            // key-derived `shard` selected above. A genuinely fresh keyed start
+            // finds no live claim and still passes through the gate normally.
+            let is_idempotent_retry = if explicit_workflow_id || idempotency_key.is_some() {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
                         Ok(mut pre_conn) => {
-                            let has_execution = harvest_workflow_executions::table
-                                .filter(
-                                    harvest_workflow_executions::workflow_name.eq(&workflow_name),
+                            let keyed_replay = if let Some(ref key) = idempotency_key {
+                                let window_secs =
+                                    api_state.start_idempotency_window().as_secs_f64();
+                                autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
+                                    &mut pre_conn,
+                                    &workflow_name,
+                                    key,
+                                    window_secs,
                                 )
-                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                                .filter(
-                                    harvest_workflow_executions::state
-                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                                )
-                                .select(harvest_workflow_executions::id)
-                                .first::<uuid::Uuid>(&mut pre_conn)
                                 .await
-                                .optional()
                                 .unwrap_or(None)
-                                .is_some();
-                            has_execution
-                                || (throttle_applies
-                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
-                                        &mut pre_conn,
-                                        &workflow_name,
-                                        &workflow_id,
-                                    )
-                                    .await
-                                    .unwrap_or(false))
+                                .is_some()
+                            } else {
+                                false
+                            };
+                            let explicit_wid_retry = explicit_workflow_id
+                                && {
+                                    let has_execution = harvest_workflow_executions::table
+                                        .filter(
+                                            harvest_workflow_executions::workflow_name
+                                                .eq(&workflow_name),
+                                        )
+                                        .filter(
+                                            harvest_workflow_executions::workflow_id
+                                                .eq(&workflow_id),
+                                        )
+                                        .filter(
+                                            harvest_workflow_executions::state
+                                                .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                        )
+                                        .select(harvest_workflow_executions::id)
+                                        .first::<uuid::Uuid>(&mut pre_conn)
+                                        .await
+                                        .optional()
+                                        .unwrap_or(None)
+                                        .is_some();
+                                    has_execution
+                                    || (throttle_applies
+                                        && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                                            &mut pre_conn,
+                                            &workflow_name,
+                                            &workflow_id,
+                                        )
+                                        .await
+                                        .unwrap_or(false))
+                                };
+                            keyed_replay || explicit_wid_retry
                         }
                         Err(_) => false,
                     },
