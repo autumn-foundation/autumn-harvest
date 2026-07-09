@@ -30,11 +30,22 @@
 //! | kind | key | scheduled by | ended by | wait/exec split |
 //! |---|---|---|---|---|
 //! | activity | `activity_id` | `ActivityScheduled` | `ActivityCompleted`/`ActivityFailed`/`ActivityTimedOut` | present ⇔ an `ActivityStarted` was recorded |
+//! | activity (external, issue #92) | `activity_id` | `ActivityAwaitingExternal` | `ActivityCompletedExternally`/`ActivityFailedExternally`/`ActivityTimedOut` | never (no claim/start event) |
 //! | local_activity | `activity_id` | `LocalActivityScheduled` | `LocalActivityCompleted`/`LocalActivityExhausted` | never (no claim event) |
 //! | timer | `timer_id` | `TimerStarted` | `TimerFired` | never |
 //! | child_workflow | `child_id` | `ChildWorkflowStarted` | `ChildWorkflowCompleted`/`ChildWorkflowFailed` | never (parent records no child-start ts) |
 //! | side_effect | — | `SideEffectRecorded` (point) | same event | never |
 //! | signal_wait | — | previous event's ts | `SignalReceived` | never |
+//!
+//! Timers are paired by **occurrence, not id**: a `timer_id` reused across
+//! loop iterations (`ctx.timer("poll", 60)` per iteration) produces one step per
+//! occurrence, each `TimerFired` closing the oldest still-open step for that id.
+//!
+//! External activities (issue #92) are represented **as `activity` steps** — the
+//! step-kind set is bounded and does not gain a seventh kind. A bare
+//! `LocalActivityFailed` **without** a following `LocalActivityExhausted` is a
+//! mid-retry crash: the local activity is still in progress (`Pending`), not
+//! terminal — only `LocalActivityCompleted`/`LocalActivityExhausted` close it.
 //!
 //! ### `attempt` derivation
 //!
@@ -157,6 +168,13 @@ pub struct TimelineStep {
     pub total_ms: i64,
     /// Queue-wait split (`start_ts - scheduled_at`); `Some` only when a start
     /// timestamp was recorded (regular activities). Paired with [`Self::exec_ms`].
+    ///
+    /// **Caveat (retried activity):** the split is measured against the *last*
+    /// attempt's `ActivityStarted`, but `scheduled_at` is the *original*
+    /// `ActivityScheduled`. So for a retried activity `wait_ms` spans all prior
+    /// attempts' execution and backoff, not only queue wait — treat it as an
+    /// **upper bound** on queue wait. (Sibling to the [`Self::attempt`]
+    /// lower-bound caveat.)
     pub wait_ms: Option<i64>,
     /// Execution split (`ended_at - start_ts`); `Some` only when a start
     /// timestamp was recorded. `None` → only [`Self::total_ms`] is meaningful.
@@ -164,7 +182,14 @@ pub struct TimelineStep {
     /// The unit's outcome.
     pub outcome: StepOutcome,
     /// Final attempt number for kinds that retry (activity, `local_activity`);
-    /// `None` for kinds that don't.
+    /// `None` for kinds that don't (timers, child workflows, external
+    /// activities, side effects, signal waits).
+    ///
+    /// **Caveat (lower bound):** derived as the max `attempt` field on the id's
+    /// `ActivityFailed`/`LocalActivityFailed`/`LocalActivityExhausted` events
+    /// (default `1`). Success and timeout events carry no attempt field, so a
+    /// succeeded-after-N-failures step reports `N`, not the true final `N+1` —
+    /// treat it as a **lower bound** on the final attempt number.
     pub attempt: Option<i32>,
 }
 
@@ -279,6 +304,15 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
     // Timestamp of the previous recorded row, for signal-wait measurement.
     let mut prev_ts: Option<DateTime<Utc>> = None;
 
+    // Timers are paired by OCCURRENCE, not whole-history dedup: the idiomatic
+    // poll-loop reuses a constant `timer_id` (`ctx.timer("poll", 60)` per
+    // iteration). Each `TimerStarted` opens a NEW step; each `TimerFired` closes
+    // the OLDEST still-open step for that id (timers fire in start order). This
+    // FIFO of open acc indices per `timer_id` keeps N iterations as N steps
+    // instead of one collapsed step spanning every nap plus the inter-nap work.
+    let mut timer_open: std::collections::HashMap<String, std::collections::VecDeque<usize>> =
+        std::collections::HashMap::new();
+
     for (index, TimelineEventRow { timestamp, event }) in rows.iter().enumerate() {
         let ts = *timestamp;
         match event {
@@ -304,7 +338,11 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                     acc.outcome = None;
                 }
             }
-            WorkflowEvent::ActivityCompleted { activity_id, .. } => {
+            // Regular and external completions close the step identically; an
+            // external activity shares the `act:{activity_id}` key (see the
+            // external-activity block below).
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => {
                 if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     acc.close(ts, StepOutcome::Completed);
                 }
@@ -322,6 +360,38 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
                 if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     acc.close(ts, StepOutcome::TimedOut);
+                }
+            }
+
+            // ── external activity (issue #92) ────────────────────────
+            // An external activity is dispatched via `ActivityAwaitingExternal`
+            // (not `ActivityScheduled`) and completed/failed via the management
+            // API, which appends `ActivityCompletedExternally`/
+            // `ActivityFailedExternally` (both terminal per the replay contract).
+            // There is no claim/start event, so — like a child workflow — the
+            // wait/exec split is never available (`split_applicable = false`);
+            // only `total_ms` is reported. Represented AS `StepKind::Activity`
+            // (the step-kind set is bounded; external activities are activities).
+            // It shares the `act:{activity_id}` key with the regular-activity
+            // terminal handlers above, so `ActivityCompletedExternally` (folded
+            // into the `ActivityCompleted` arm), `ActivityTimedOut` (a shared
+            // terminal), and the `ActivityFailedExternally` arm below all close it
+            // correctly.
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id, name, ..
+            } => ensure_scheduled(&mut accs, &mut keyed, format!("act:{activity_id}"), || {
+                Acc::scheduled(
+                    StepKind::Activity,
+                    Some(name.clone()),
+                    ts,
+                    index,
+                    false,
+                    false,
+                )
+            }),
+            WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
+                    acc.close(ts, StepOutcome::Failed);
                 }
             }
 
@@ -343,16 +413,24 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
-            // A retryable `LocalActivityFailed` and the terminal
-            // `LocalActivityExhausted` are handled identically: bump the attempt
-            // counter and mark failed (last-writer-wins — a later `Completed`
-            // overwrites a mid-retry failure).
+            // A bare `LocalActivityFailed` (without a following
+            // `LocalActivityExhausted`) means the worker crashed between retries:
+            // the activity is STILL IN PROGRESS, not terminal. Record the attempt
+            // only — do NOT close the step. It stays Pending unless a later
+            // `LocalActivityCompleted` (retry succeeded) or `LocalActivityExhausted`
+            // (retry budget spent) terminates it.
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
                 attempt,
                 ..
+            } => {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
+                    acc.record_attempt(*attempt);
+                }
             }
-            | WorkflowEvent::LocalActivityExhausted {
+            // `LocalActivityExhausted` is the terminal failure marker: record the
+            // final attempt and close the step as Failed.
+            WorkflowEvent::LocalActivityExhausted {
                 activity_id,
                 attempt,
                 ..
@@ -363,22 +441,27 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 }
             }
 
-            // ── timer ────────────────────────────────────────────────
+            // ── timer (paired by occurrence, FIFO per timer_id) ──────
             WorkflowEvent::TimerStarted { timer_id, .. } => {
-                ensure_scheduled(&mut accs, &mut keyed, format!("timer:{timer_id}"), || {
-                    Acc::scheduled(
-                        StepKind::Timer,
-                        Some(timer_id.to_string()),
-                        ts,
-                        index,
-                        false,
-                        false,
-                    )
-                });
+                let idx = accs.len();
+                accs.push(Acc::scheduled(
+                    StepKind::Timer,
+                    Some(timer_id.to_string()),
+                    ts,
+                    index,
+                    false,
+                    false,
+                ));
+                timer_open
+                    .entry(timer_id.to_string())
+                    .or_default()
+                    .push_back(idx);
             }
             WorkflowEvent::TimerFired { timer_id } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("timer:{timer_id}")) {
-                    acc.close(ts, StepOutcome::Fired);
+                if let Some(queue) = timer_open.get_mut(&timer_id.to_string())
+                    && let Some(idx) = queue.pop_front()
+                {
+                    accs[idx].close(ts, StepOutcome::Fired);
                 }
             }
 
@@ -1242,5 +1325,472 @@ mod tests {
         assert_eq!(sj["outcome"], "timed_out");
         let back: TimelineStep = serde_json::from_value(sj).unwrap();
         assert_eq!(back, step);
+    }
+
+    // ── FIX 1: local activity mid-retry (bare LocalActivityFailed) is pending ──
+
+    #[test]
+    fn local_activity_failed_mid_retry_is_pending() {
+        // A running execution (completed_at = None) whose local-activity history
+        // ends on a bare `LocalActivityFailed` (no `LocalActivityExhausted`) means
+        // the worker crashed between retries: the activity is STILL IN PROGRESS,
+        // not terminal. It must be Pending, ended_at None, total to now.
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::LocalActivityScheduled {
+                    activity_id: a1,
+                    name: "checksum".into(),
+                    input: serde_json::Value::Null,
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: a1,
+                    error: "boom".into(),
+                    attempt: 1,
+                },
+            ),
+        ];
+        let tl = derive(&rows, None, 500);
+        let la = find(&tl.steps, StepKind::LocalActivity);
+        assert_eq!(la.outcome, StepOutcome::Pending);
+        assert_eq!(la.ended_at, None);
+        assert_eq!(la.total_ms, 490); // 500 (now) - 10 (scheduled)
+        assert_eq!(la.attempt, Some(1));
+    }
+
+    #[test]
+    fn local_activity_failed_then_completed_is_completed() {
+        // A retryable `LocalActivityFailed` followed by a `LocalActivityCompleted`
+        // (retry eventually succeeded) → Completed, measured to the completion ts.
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::LocalActivityScheduled {
+                    activity_id: a1,
+                    name: "checksum".into(),
+                    input: serde_json::Value::Null,
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: a1,
+                    error: "boom".into(),
+                    attempt: 1,
+                },
+            ),
+            row(
+                40,
+                WorkflowEvent::LocalActivityCompleted {
+                    activity_id: a1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(50), 50);
+        let la = find(&tl.steps, StepKind::LocalActivity);
+        assert_eq!(la.outcome, StepOutcome::Completed);
+        assert_eq!(la.ended_at, Some(at(40)));
+        assert_eq!(la.total_ms, 30); // 40 - 10
+        assert_eq!(la.attempt, Some(1), "one prior failed attempt recorded");
+    }
+
+    // ── FIX 2: a reused timer_id must produce N distinct timer steps ──
+
+    #[test]
+    fn reused_timer_id_produces_distinct_steps() {
+        // The idiomatic poll-loop reuses a constant timer id (`ctx.timer("poll",
+        // 60)` per iteration). Each occurrence must be its own timer step, paired
+        // by start order (FIFO), NOT collapsed into one step spanning all naps.
+        let poll = TimerId::new("poll");
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            // iteration 1: nap 10..20
+            row(
+                10,
+                WorkflowEvent::TimerStarted {
+                    timer_id: poll.clone(),
+                    duration_secs: 60,
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::TimerFired {
+                    timer_id: poll.clone(),
+                },
+            ),
+            // some inter-nap work
+            row(
+                22,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "poll_once".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+            row(
+                24,
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: a1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+            // iteration 2: nap 30..45
+            row(
+                30,
+                WorkflowEvent::TimerStarted {
+                    timer_id: poll.clone(),
+                    duration_secs: 60,
+                },
+            ),
+            row(
+                45,
+                WorkflowEvent::TimerFired {
+                    timer_id: poll.clone(),
+                },
+            ),
+            // iteration 3: nap 50..70
+            row(
+                50,
+                WorkflowEvent::TimerStarted {
+                    timer_id: poll.clone(),
+                    duration_secs: 60,
+                },
+            ),
+            row(70, WorkflowEvent::TimerFired { timer_id: poll }),
+        ];
+        let tl = derive(&rows, Some(80), 80);
+        let timers: Vec<&TimelineStep> = tl
+            .steps
+            .iter()
+            .filter(|s| s.step_kind == StepKind::Timer)
+            .collect();
+        assert_eq!(timers.len(), 3, "three distinct timer steps");
+        assert_eq!(tl.rollup.step_count_by_kind.get("timer"), Some(&3));
+        // Per-iteration totals: 10, 15, 20 — NOT one collapsed 60ms span.
+        assert_eq!(timers[0].total_ms, 10, "iter 1 nap");
+        assert_eq!(timers[0].scheduled_at, at(10));
+        assert_eq!(timers[0].ended_at, Some(at(20)));
+        assert_eq!(timers[1].total_ms, 15, "iter 2 nap");
+        assert_eq!(timers[1].scheduled_at, at(30));
+        assert_eq!(timers[1].ended_at, Some(at(45)));
+        assert_eq!(timers[2].total_ms, 20, "iter 3 nap");
+        assert_eq!(timers[2].scheduled_at, at(50));
+        assert_eq!(timers[2].ended_at, Some(at(70)));
+        // Every timer step fired.
+        for t in &timers {
+            assert_eq!(t.outcome, StepOutcome::Fired);
+        }
+    }
+
+    #[test]
+    fn reused_timer_id_last_unfired_stays_pending() {
+        // Two starts of the same id, one fire → oldest closes (FIFO), the second
+        // remains pending.
+        let poll = TimerId::new("poll");
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::TimerStarted {
+                    timer_id: poll.clone(),
+                    duration_secs: 60,
+                },
+            ),
+            row(
+                30,
+                WorkflowEvent::TimerStarted {
+                    timer_id: poll.clone(),
+                    duration_secs: 60,
+                },
+            ),
+            row(25, WorkflowEvent::TimerFired { timer_id: poll }),
+        ];
+        let tl = derive(&rows, None, 100);
+        let timers: Vec<&TimelineStep> = tl
+            .steps
+            .iter()
+            .filter(|s| s.step_kind == StepKind::Timer)
+            .collect();
+        assert_eq!(timers.len(), 2);
+        // First (scheduled @10) fired @25; second (scheduled @30) pending → to now.
+        assert_eq!(timers[0].outcome, StepOutcome::Fired);
+        assert_eq!(timers[0].ended_at, Some(at(25)));
+        assert_eq!(timers[1].outcome, StepOutcome::Pending);
+        assert_eq!(timers[1].ended_at, None);
+        assert_eq!(timers[1].total_ms, 70); // 100 - 30
+    }
+
+    // ── FIX 3: external activities render as `activity` steps (no split) ──
+
+    #[test]
+    fn external_activity_completed_renders_as_activity_step() {
+        let a1 = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: a1,
+                    token,
+                    name: "charge_card".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                    schedule_to_close_secs: 3600,
+                },
+            ),
+            row(
+                3610,
+                WorkflowEvent::ActivityCompletedExternally {
+                    activity_id: a1,
+                    token,
+                    output: serde_json::Value::Null,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(3620), 3620);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.name.as_deref(), Some("charge_card"));
+        assert_eq!(act.outcome, StepOutcome::Completed);
+        assert_eq!(act.total_ms, 3600); // 3610 - 10
+        assert_eq!(act.wait_ms, None, "external activity has no claim/start ts");
+        assert_eq!(act.exec_ms, None, "external activity has no split");
+        assert_eq!(
+            act.attempt, None,
+            "external activity does not report attempt"
+        );
+        assert_eq!(act.ended_at, Some(at(3610)));
+        // No start ts → contributes its full total to busy.
+        assert_eq!(tl.rollup.busy_ms, 3600);
+        assert_eq!(tl.rollup.wait_ms, 0);
+    }
+
+    #[test]
+    fn external_activity_failed_renders_as_activity_step() {
+        let a1 = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: a1,
+                    token,
+                    name: "verify".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                    schedule_to_close_secs: 60,
+                },
+            ),
+            row(
+                70,
+                WorkflowEvent::ActivityFailedExternally {
+                    activity_id: a1,
+                    token,
+                    error: "rejected".into(),
+                    retryable: false,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(80), 80);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.step_kind, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::Failed);
+        assert_eq!(act.total_ms, 60);
+        assert_eq!(act.wait_ms, None);
+        assert_eq!(act.exec_ms, None);
+    }
+
+    #[test]
+    fn external_activity_in_flight_is_pending() {
+        // Awaiting an external system for a long time, still running.
+        let a1 = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: a1,
+                    token,
+                    name: "await_human".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                    schedule_to_close_secs: 86_400,
+                },
+            ),
+        ];
+        let tl = derive(&rows, None, 10_000);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::Pending);
+        assert_eq!(act.ended_at, None);
+        assert_eq!(act.total_ms, 9_990);
+    }
+
+    // ── Adversarial: orphan terminal event with no scheduling event ──
+
+    #[test]
+    fn orphan_terminal_event_is_ignored() {
+        // A terminal event whose scheduling event is absent (e.g. truncated
+        // history) must be safely ignored — no panic, no phantom step.
+        let a1 = ActivityExecId::new();
+        let c1 = ExecutionId::new();
+        let t1 = TimerId::new("ghost");
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: a1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: c1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+            row(30, WorkflowEvent::TimerFired { timer_id: t1 }),
+        ];
+        let tl = derive(&rows, Some(40), 40);
+        assert!(tl.steps.is_empty(), "no scheduling events → no steps");
+        assert!(tl.rollup.slowest_step.is_none());
+    }
+
+    // ── Adversarial: two steps with the SAME scheduled_at → stable tie-break ──
+
+    #[test]
+    fn same_scheduled_at_stable_first_appearance_tie_break() {
+        let a1 = ActivityExecId::new();
+        let a2 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "first".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+            row(
+                10, // identical scheduled_at
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a2,
+                    name: "second".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: a1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+            row(
+                30,
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: a2,
+                    output: serde_json::Value::Null,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(40), 40);
+        assert_eq!(tl.steps.len(), 2);
+        assert_eq!(
+            tl.steps[0].name.as_deref(),
+            Some("first"),
+            "stable by first appearance"
+        );
+        assert_eq!(tl.steps[1].name.as_deref(), Some("second"));
+    }
+
+    // ── Adversarial: back-to-back signals → each a distinct step ──
+
+    #[test]
+    fn back_to_back_signals_each_distinct_step() {
+        let rows = vec![
+            started(0),
+            row(
+                30,
+                WorkflowEvent::SignalReceived {
+                    signal_name: "s1".into(),
+                    payload: serde_json::Value::Null,
+                },
+            ),
+            row(
+                50,
+                WorkflowEvent::SignalReceived {
+                    signal_name: "s2".into(),
+                    payload: serde_json::Value::Null,
+                },
+            ),
+            row(
+                55,
+                WorkflowEvent::SignalReceived {
+                    signal_name: "s3".into(),
+                    payload: serde_json::Value::Null,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(60), 60);
+        let sigs: Vec<&TimelineStep> = tl
+            .steps
+            .iter()
+            .filter(|s| s.step_kind == StepKind::SignalWait)
+            .collect();
+        assert_eq!(sigs.len(), 3);
+        assert_eq!(tl.rollup.step_count_by_kind.get("signal_wait"), Some(&3));
+        // s1 measured from started_at(0)→30; s2 from prev event(30)→50; s3 (50)→55.
+        assert_eq!(sigs[0].scheduled_at, at(0));
+        assert_eq!(sigs[0].total_ms, 30);
+        assert_eq!(sigs[1].scheduled_at, at(30));
+        assert_eq!(sigs[1].total_ms, 20);
+        assert_eq!(sigs[2].scheduled_at, at(50));
+        assert_eq!(sigs[2].total_ms, 5);
+    }
+
+    // ── Adversarial: COMPLETED run with an open step → measured to completed_at ──
+
+    #[test]
+    fn completed_run_open_step_measures_to_completed_at_not_now() {
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "never_finished".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+        ];
+        // Execution is terminal at 100, but `now` is far in the future (900).
+        let tl = derive(&rows, Some(100), 900);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::Pending);
+        assert_eq!(act.ended_at, None);
+        assert_eq!(
+            act.total_ms, 90,
+            "open step measures to completed_at(100), not now(900)"
+        );
+        assert_eq!(tl.rollup.total_wall_clock_ms, 100);
     }
 }

@@ -556,3 +556,112 @@ async fn timeline_running_open_step_is_pending() {
         act["total_ms"]
     );
 }
+
+/// (5) AC6: a **classic** DAG run lives only in `harvest_dag_runs` and has NO
+/// matching `harvest_workflow_executions` row — classic DAGs are not on the
+/// standard execution path — so its timeline returns `404` with the explanatory
+/// message. This makes the AC6 promise falsifiable beyond a random unknown UUID.
+#[tokio::test]
+async fn timeline_classic_dag_run_returns_404() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    // Insert a classic DAG run row (raw SQL — `harvest_dag_runs` is not in the
+    // Diesel schema module). Route the id to shard 0 so `db_conn_for_execution`
+    // resolves deterministically; there is deliberately no execution row for it.
+    let dag_run_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_dag_runs \
+         (id, dag_name, logical_date, data_interval_start, data_interval_end) \
+         VALUES ($1, 'nightly_etl', NOW(), NOW(), NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(dag_run_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let (status, body) = get_json(&app, &format!("/workflows/{dag_run_id}/timeline")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.to_string()
+            .contains("classic DAG runs are not on the execution path"),
+        "404 body must explain classic DAG runs are off-path: {body}"
+    );
+}
+
+/// (6) AC6/L1: a **unified** DAG run lowers onto the standard execution path — it
+/// IS a `harvest_workflow_executions` row with an ordinary
+/// `ActivityScheduled`/`ActivityStarted`/`ActivityCompleted` history — so its
+/// timeline reconstructs exactly like a plain workflow run and returns `200`.
+/// This is behaviorally identical to a plain workflow execution, which is the
+/// point: the route serves unified DAGs with no special-casing.
+#[tokio::test]
+async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let t0 = Utc::now() - Duration::seconds(30);
+    // A unified DAG start creates a normal execution row (same as a workflow).
+    let exec_id = seed_running(&mut conn, "unified-dag-run").await;
+    set_started_at(&mut conn, exec_id, t0).await;
+
+    let mut next = max_event_id(&mut conn, exec_id).await + 1;
+    let a1 = ActivityExecId::new();
+    // The unified-DAG handler dispatches each node through `execute_activity_raw`,
+    // so a node renders as an ordinary activity step.
+    insert_event(
+        &mut conn,
+        exec_id,
+        next,
+        &WorkflowEvent::ActivityScheduled {
+            activity_id: a1,
+            name: "extract".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        t0 + Duration::seconds(2),
+    )
+    .await;
+    next += 1;
+    insert_event(
+        &mut conn,
+        exec_id,
+        next,
+        &WorkflowEvent::ActivityStarted {
+            activity_id: a1,
+            worker_id: WorkerId::new("w-1"),
+        },
+        t0 + Duration::seconds(3),
+    )
+    .await;
+    next += 1;
+    insert_event(
+        &mut conn,
+        exec_id,
+        next,
+        &WorkflowEvent::ActivityCompleted {
+            activity_id: a1,
+            output: Value::Null,
+        },
+        t0 + Duration::seconds(9),
+    )
+    .await;
+
+    mark_completed(&mut conn, exec_id, t0 + Duration::seconds(10)).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK, "unified DAG is a workflow: {body}");
+    assert_eq!(body["state"], "COMPLETED");
+
+    let steps = body["steps"].as_array().expect("steps is an array");
+    let act = find_step(steps, "activity");
+    assert_eq!(act["name"], "extract");
+    assert_eq!(act["outcome"], "completed");
+    assert_eq!(act["total_ms"], 7_000); // +2s → +9s
+    assert_eq!(act["wait_ms"], 1_000); // +2s → +3s
+    assert_eq!(act["exec_ms"], 6_000); // +3s → +9s
+}

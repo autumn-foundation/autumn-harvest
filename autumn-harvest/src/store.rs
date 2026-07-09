@@ -693,7 +693,15 @@ pub async fn load_history_undecoded(
 /// harmless and must not make the strict identity-only [`load_history`] path
 /// hard-error `UnknownPayloadCodec`.
 ///
-/// No pagination — the full history is returned. **Never use this for replay or
+/// **Known limitation — unbounded load.** No pagination or `LIMIT`: the *entire*
+/// event history is loaded (consistent with replay's full load), even though
+/// this is an HTTP-triggerable read surface. A hard cap is deliberately **not**
+/// imposed, because a silently-truncated history would make the timeline rollup
+/// (busy/wait attribution, slowest step) wrong rather than merely incomplete.
+/// Bounding the history size is instead the workflow author's responsibility via
+/// continue-as-new discipline (the ≤500-event target); a run that ignores that
+/// discipline and accumulates a very large history will make this loader (and the
+/// timeline derivation) proportionally expensive. **Never use this for replay or
 /// any engine execution path**; it is a read-surface loader only.
 ///
 /// # Errors
