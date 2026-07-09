@@ -456,14 +456,26 @@ impl RetentionRuntime {
 
                 // Workflow-history retention: runs when the global max_age OR
                 // any per-workflow-type override is configured (issue #737).
-                if let Some(loosest_age) = config.loosest_cutoff_age() {
+                // Resolve the loosest cutoff age up front. `None` here means
+                // either no retention age is configured (the common case) OR —
+                // fail-safe — the configured loosest age is unrepresentable as a
+                // `chrono::Duration` (unreachable for validated ages, which are
+                // bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range). In the
+                // latter case we skip the workflow-history retention phase this
+                // tick and retain everything, rather than falling back to a zero
+                // cutoff that would make `loose_cutoff == now` and over-select
+                // nearly every completed row. The audit/schedule purges below
+                // still run.
+                if let Some(loose_chrono) = config
+                    .loosest_cutoff_age()
+                    .and_then(|age| chrono::Duration::from_std(age).ok())
+                {
                     // Compute `now` once so every shard's per-candidate
                     // resolution uses a single consistent clock; `loose_cutoff`
                     // is the smallest-effective-age SQL pre-filter (a superset
                     // of every deletable row across all types).
                     let now = Utc::now();
-                    let loose_cutoff =
-                        now - chrono::Duration::from_std(loosest_age).unwrap_or_default();
+                    let loose_cutoff = now - loose_chrono;
                     let tick_futures = pools.iter_shards().map(|(shard, pool)| {
                         let pool = pool.clone();
                         let config = config.clone();
@@ -904,8 +916,25 @@ async fn run_shard_tick(
                 .await?;
                 continue;
             };
-            let resolved_cutoff =
-                now - chrono::Duration::from_std(age).unwrap_or_else(|_| chrono::Duration::zero());
+            let Ok(chrono_age) = chrono::Duration::from_std(age) else {
+                // Unrepresentable duration (unreachable for validated ages, which
+                // are bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range); fail
+                // safe toward RETAINING the row rather than deleting it. A zero
+                // fallback would make `resolved_cutoff = now`, deleting nearly
+                // every completed row — the wrong failure mode for a retention
+                // janitor. Routine skip.
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            };
+            let resolved_cutoff = now - chrono_age;
             if completed_at >= resolved_cutoff {
                 // The loosest-cutoff SQL pre-filter is a superset; this type is
                 // not old enough under its own effective age. Routine skip, and
