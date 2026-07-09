@@ -153,16 +153,19 @@ fn workflow_mcp_composes_with_other_attributes() {
 
 // ── typed workflow failures (issue #767) ──────────────────────────────────────
 
+#[cfg(feature = "testing")]
 #[workflow]
 async fn wf_typed_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), WorkflowFailure> {
     Err(WorkflowFailure::new("ValidationRejected", "bad").non_retryable())
 }
 
+#[cfg(feature = "testing")]
 #[workflow]
 async fn wf_string_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), String> {
     Err("boom".into())
 }
 
+#[cfg(feature = "testing")]
 #[test]
 fn workflow_typed_failure_encodes_wire_envelope() {
     let info = __autumn_workflow_info_wf_typed_fail();
@@ -178,6 +181,7 @@ fn workflow_typed_failure_encodes_wire_envelope() {
     assert_eq!(decoded.message, "bad");
 }
 
+#[cfg(feature = "testing")]
 #[test]
 fn workflow_string_failure_stays_untyped() {
     let info = __autumn_workflow_info_wf_string_fail();

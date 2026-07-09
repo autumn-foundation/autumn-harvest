@@ -8,6 +8,7 @@
 
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure};
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{
     HarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -1230,6 +1231,112 @@ fn parent_workflow_with_continue_as_new_child<'a>(
             .await
             .map_err(|e| e.to_string())
     })
+}
+
+// ── issue #767: typed child failure → parent branches on error_type ──────────
+
+/// A child that fails with a *typed* `WorkflowFailure` whose class is taken
+/// from the input `{"category": "..."}`. The message text is deliberately
+/// unique per category so the parent proves it routes on the typed class, not
+/// on message text.
+fn typed_failing_child_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let category = input
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string();
+        let message = format!("child rejected the request for {category} at 12:00:03Z");
+        Err(WorkflowFailure::new(category, message)
+            .with_details(serde_json::json!({ "source": "child" }))
+            .non_retryable()
+            .into_workflow_error_payload())
+    })
+}
+
+/// Parent that spawns the typed-failing child and routes on its typed
+/// `error_type` (issue #767) — ZERO substring matching. The parent *completes*
+/// (it is not itself failed) so the worker-loop test can assert a deterministic
+/// branch output.
+fn parent_branches_on_typed_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match ctx
+            .spawn_child_workflow_raw("typed_failing_child_workflow", input)
+            .await
+        {
+            Ok(v) => Ok(serde_json::json!({ "branch": "child_ok", "child": v })),
+            Err(e) => {
+                let branch = match e.workflow_error_type() {
+                    Some("ValidationRejected") => "reject_and_notify",
+                    Some("BudgetExceeded") => "escalate_to_finance",
+                    Some("UpstreamUnavailable") => "reschedule",
+                    Some(_) => "generic_typed",
+                    None => "untyped",
+                };
+                Ok(serde_json::json!({
+                    "branch": branch,
+                    "observed_error_type": e.workflow_error_type(),
+                    "non_retryable": e.is_workflow_non_retryable(),
+                }))
+            }
+        }
+    })
+}
+
+fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                mcp: false,
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_branches_on_typed_child_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                mcp: false,
+                name: "typed_failing_child_workflow",
+                module: "integration_e2e",
+                handler: typed_failing_child_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
 }
 
 /// First-generation handler used by the continue-as-new e2e test: it
@@ -2612,6 +2719,118 @@ async fn worker_completes_parent_workflow_after_child_workflow_round_trip() {
             WorkflowEvent::WorkflowCompleted { .. },
         ]
     ));
+}
+
+/// Issue #767 success metric (DB, real worker loop): a child that fails with a
+/// *typed* `WorkflowFailure` surfaces its `error_type`/`non_retryable` to the
+/// parent, which branches on the typed class (never the message) across ≥3
+/// categories. Also asserts AC4: the child's `execution.error` column carries
+/// the human message, not the wire envelope; and the child's own history
+/// terminal `WorkflowFailed` event carries the typed fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_parent_branches_on_typed_child_failure_across_categories() {
+    for (category, expected_branch) in [
+        ("ValidationRejected", "reject_and_notify"),
+        ("BudgetExceeded", "escalate_to_finance"),
+        ("UpstreamUnavailable", "reschedule"),
+    ] {
+        let (database_url, _container) = setup_test_database_url().await;
+        let mut conn =
+            <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+                .await
+                .expect("failed to connect to Postgres container");
+
+        let parent_exec_id = insert_workflow_execution(&mut conn).await;
+        enqueue_started_workflow_task(
+            &mut conn,
+            parent_exec_id,
+            serde_json::json!({ "category": category }),
+        )
+        .await;
+
+        let worker = build_runtime_worker(
+            "worker-e2e-typed-child-failure",
+            2,
+            1,
+            typed_child_failure_registry(),
+        );
+        let pool = build_test_pool(&database_url);
+        let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+        let parent_execution =
+            wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+        worker.shutdown();
+        handle.await.expect("worker task should join");
+
+        // The parent completed on the branch dictated by the child's typed class.
+        let output = parent_execution.output.expect("parent output");
+        assert_eq!(
+            output.get("branch").and_then(serde_json::Value::as_str),
+            Some(expected_branch),
+            "category {category}: parent must branch on the typed error_type"
+        );
+        assert_eq!(
+            output
+                .get("observed_error_type")
+                .and_then(serde_json::Value::as_str),
+            Some(category),
+            "category {category}: parent must observe the typed error_type"
+        );
+        assert_eq!(
+            output.get("non_retryable").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "category {category}: parent must observe the non_retryable flag"
+        );
+
+        // The child ended FAILED; its own history terminal WorkflowFailed carries
+        // the typed fields, and its error column is the human message (AC4).
+        let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+        assert_eq!(child_execs.len(), 1, "exactly one child execution");
+        let child = &child_execs[0];
+        assert_eq!(child.state, "FAILED");
+        // AC4: human message, not the wire envelope.
+        let child_error = child.error.clone().expect("child error");
+        assert!(
+            child_error.contains(&format!("child rejected the request for {category}")),
+            "child.error must be the human message, got: {child_error}"
+        );
+        assert!(
+            !child_error.contains("harvest_workflow_failure_v1"),
+            "child.error must NOT be the wire envelope, got: {child_error}"
+        );
+
+        let child_history = load_history_from_url(
+            &database_url,
+            child.id.to_string().parse().expect("child id parses"),
+        )
+        .await;
+        let typed = child_history.events.iter().find_map(|e| match e {
+            WorkflowEvent::WorkflowFailed {
+                error_type,
+                non_retryable,
+                details,
+                ..
+            } => Some((error_type.clone(), *non_retryable, details.clone())),
+            _ => None,
+        });
+        let (et, nr, details) = typed.expect("child history has a WorkflowFailed event");
+        assert_eq!(et.as_deref(), Some(category), "child WorkflowFailed error_type");
+        assert_eq!(nr, Some(true), "child WorkflowFailed non_retryable");
+        assert_eq!(details, Some(serde_json::json!({ "source": "child" })));
+
+        // Parent history: child failure recorded as a typed ChildWorkflowFailed.
+        let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+        let child_failed_type = parent_history.events.iter().find_map(|e| match e {
+            WorkflowEvent::ChildWorkflowFailed { error_type, .. } => Some(error_type.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            child_failed_type.expect("parent has ChildWorkflowFailed").as_deref(),
+            Some(category),
+            "parent's ChildWorkflowFailed must carry the typed error_type"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
