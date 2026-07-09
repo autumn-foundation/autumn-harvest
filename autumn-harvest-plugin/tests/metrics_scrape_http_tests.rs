@@ -61,6 +61,10 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
     recorder.record_schedule_run("cron", "nightly_report");
     recorder.record_schedule_skipped("cron", "nightly_report", "overlap");
     recorder.record_retention_tick(0, 100, 42, 0.5);
+    // Issue #737: the retention deletion counter is now labeled by workflow type
+    // and emitted via record_retention_deleted (record_retention_tick no longer
+    // emits it, to avoid double-count).
+    recorder.record_retention_deleted("onboarding", 42);
     // These four back the engine's own is_enabled()-gated background
     // samplers (queue depth/DLQ depth samplers' oldest-age query, the
     // stranded-work scanner, the worker-slot sampler) -- implemented so
@@ -102,7 +106,7 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
         "# TYPE harvest_schedule_skipped_total counter",
         "harvest_schedule_skipped_total{kind=\"cron\",name=\"nightly_report\",reason=\"overlap\"} 1",
         "# TYPE harvest_retention_deleted_total counter",
-        "harvest_retention_deleted_total{shard=\"0\"} 42",
+        "harvest_retention_deleted_total{workflow=\"onboarding\"} 42",
         "# TYPE harvest_queue_oldest_pending_age gauge",
         "harvest_queue_oldest_pending_age{queue=\"default\"} 12.5",
         "# TYPE harvest_worker_slots_in_use gauge",

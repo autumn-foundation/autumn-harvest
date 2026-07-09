@@ -61,6 +61,7 @@ mod payload_offload_replay_tests;
 mod poison_pill_tests;
 mod priority_tests;
 mod query_deadlock;
+mod query_terminal_tests;
 mod query_tests;
 mod queue_fairness_tests;
 mod redrive_tests;
@@ -73,6 +74,7 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+mod retention_overrides_tests;
 mod retry_now_tests;
 mod saga_tests;
 mod schedule_decisions;
