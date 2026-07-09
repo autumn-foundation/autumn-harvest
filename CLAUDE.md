@@ -2,6 +2,10 @@
 
 Postgres-backed durable workflow engine, companion to the Autumn web framework. Provides event-sourced workflow execution with activities, signals, timers, child workflows, and DAG scheduling.
 
+## Changelog entries
+
+Do not edit the `### Phase Status` list below (or `CHANGELOG.md`) in a feature PR — that shared list is what causes cross-PR merge conflicts. Instead add your changelog entry as a new fragment file `docs/changelog.d/pr-<number>-<slug>.md` (see `docs/changelog.d/README.md`). A periodic maintenance sweep folds fragments back into the phase list.
+
 ## Workspace Structure
 
 ```
