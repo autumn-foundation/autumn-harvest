@@ -1222,6 +1222,8 @@ let status: String = harvest.query_workflow("order_workflow", "order-456", "get_
 
 **Processing:** Queries execute against the workflow's cached state on the sticky worker (if available). If no cached state exists, the engine replays the workflow to its current point and executes the query handler. Queries never block — if the workflow is in a suspended state, the query reads whatever state is available.
 
+**Terminal workflows (issue #612):** Queries also work against *closed* executions (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`TERMINATED`) for post-mortem state inspection. The engine replays the full history to the function's return and serves the query against the workflow's **final** reconstructed internal state (a `FAILED` run therefore answers with its computed internal state, not the error string). This is read-only — serving a query appends zero events and performs zero writes. Status codes: `200` on success; `404` for an unregistered query name or a fully-deleted (pruned) execution row; `410 Gone` "history unavailable" when the row is present but its history is unqueryable (pruned by retention, released on reset, or payloads erased); `408` if replay exceeds the configured `query_timeout`. The previous `409` for terminal runs is retired.
+
 ### 11.3 Workflow Cancellation
 
 Cancellation is a special signal. When a workflow is cancelled:

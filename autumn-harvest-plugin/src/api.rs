@@ -65,7 +65,9 @@ use autumn_harvest::calendar::{
 use autumn_harvest::completion_trigger::{InputMapping, TerminalState, TriggerCondition};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
+use autumn_harvest::erase;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::executor::{QueryReplayOutcome, drive_query_replay};
 use autumn_harvest::external_task;
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
@@ -13621,29 +13623,12 @@ pub(crate) async fn signal_workflow(
     ))
 }
 
-/// Waker that records whether `wake()` was called synchronously during a poll.
-///
-/// Used by [`hydrate_ctx_for_query`] to distinguish genuine command-based
-/// suspension (waker never fired) from ordinary async yields like
-/// `tokio::task::yield_now()` (waker fires immediately, signalling the caller
-/// to re-poll).
-struct WokenFlag(std::sync::atomic::AtomicBool);
-
-impl futures::task::ArcWake for WokenFlag {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        std::sync::atomic::AtomicBool::store(
-            &arc_self.0,
-            true,
-            std::sync::atomic::Ordering::Release,
-        );
-    }
-}
-
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
+    query_label: &str,
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
@@ -13651,10 +13636,13 @@ async fn hydrate_ctx_for_query(
         .await
         .map_err(map_error)?;
 
-    // Queries are only meaningful on running workflows.
-    if is_terminal_state(&execution.state) {
-        return Err(map_error(HarvestError::WorkflowNotRunning(exec_id)));
-    }
+    // Terminal executions are now queryable for post-mortem state inspection
+    // (issue #612): the workflow function is driven to completion (full history
+    // drained) and the query is served against its final reconstructed state.
+    // Running/suspended executions keep the pre-#612 behaviour byte-for-byte:
+    // the drive stops at the first genuine suspension and the query reads the
+    // current partial state.
+    let terminal = is_terminal_state(&execution.state);
 
     let workflow = runtime
         .registry
@@ -13675,6 +13663,16 @@ async fn hydrate_ctx_for_query(
     // DB operations for the entire duration of the workflow replay.
     drop(conn);
 
+    // A PII-erased terminal history (issue #495) replays structurally but over
+    // `{"_harvest_erased": true}` payloads, which would compute a misleading
+    // answer. Reject it explicitly (410) rather than serve tombstoned state.
+    if terminal && erase::history_events_contain_tombstone(&history.events) {
+        return Err(map_error(HarvestError::HistoryUnavailable {
+            exec_id,
+            reason: "payloads erased".to_string(),
+        }));
+    }
+
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history.events,
@@ -13694,44 +13692,41 @@ async fn hydrate_ctx_for_query(
         ctx.register_declarative_query_handler(h);
     }
 
-    // Drive the workflow future until it genuinely suspends on a workflow
-    // command (activity, signal wait, timer). Recorded events resolve via
-    // pre-sent oneshot channels so the entire history replays synchronously.
-    // Some workflows interleave ordinary async yields (e.g. yield_now) before
-    // registering query handlers; the WokenFlag waker detects those and keeps
-    // us polling. A wall-clock deadline (query_timeout) prevents spinning on a
-    // misbehaving workflow.
-    let deadline = std::time::Instant::now() + api_state.query_timeout();
-    let flag = Arc::new(WokenFlag(std::sync::atomic::AtomicBool::new(false)));
-    {
-        let waker = futures::task::waker_ref(&flag);
-        let mut poll_cx = std::task::Context::from_waker(&waker);
-        let handler_fut = (workflow.handler)(&ctx, execution.input.clone());
-        tokio::pin!(handler_fut);
-        loop {
-            std::sync::atomic::AtomicBool::store(
-                &flag.0,
-                false,
-                std::sync::atomic::Ordering::Release,
-            );
-            match handler_fut.as_mut().poll(&mut poll_cx) {
-                std::task::Poll::Ready(_) => break,
-                std::task::Poll::Pending => {
-                    let was_woken = std::sync::atomic::AtomicBool::load(
-                        &flag.0,
-                        std::sync::atomic::Ordering::Acquire,
-                    );
-                    if !was_woken || std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    // Waker was signalled immediately — the future yielded but
-                    // wants to be re-polled (e.g. yield_now). Keep driving.
-                }
-            }
-        }
-    }
+    // Drive the workflow future in replay, bounded by `query_timeout`. The
+    // shared driver stops at either `Poll::Ready` (full history drained), a
+    // genuine workflow-command suspension, or the deadline. Recorded events
+    // resolve via pre-sent oneshot channels so the entire history replays
+    // synchronously; this is read-only and appends no events / performs no
+    // writes (issue #612 AC4).
+    let outcome = drive_query_replay(
+        &ctx,
+        workflow.handler,
+        execution.input.clone(),
+        api_state.query_timeout(),
+    );
 
-    Ok(ctx)
+    if terminal {
+        match outcome {
+            QueryReplayOutcome::ReachedTerminal => Ok(ctx),
+            QueryReplayOutcome::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
+                query_name: query_label.to_string(),
+                timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
+                    .unwrap_or(u64::MAX),
+            })),
+            // The recorded history is insufficient to reach the workflow's
+            // final state — pruned by retention or released on reset. Never
+            // serve a partial/empty answer; surface a distinct 410.
+            QueryReplayOutcome::Suspended => Err(map_error(HarvestError::HistoryUnavailable {
+                exec_id,
+                reason: "pruned by retention or history released".to_string(),
+            })),
+        }
+    } else {
+        // Running/suspended: serve whatever state the drive reconstructed,
+        // exactly as before #612 — the drive naturally stops at the first
+        // suspension (or the deadline) for a partial, still-growing history.
+        Ok(ctx)
+    }
 }
 
 /// `GET /workflows/{id}/query/{query_name}` — query with no args (backward compat).
@@ -13740,7 +13735,7 @@ async fn query_workflow(
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, &query_name).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
 
     let harvest_result = ctx.execute_query(&query_name);
@@ -13782,7 +13777,7 @@ async fn query_workflow_post(
     body: Bytes,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, &query_name).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
     let args: Value = if body.is_empty() {
         Value::Null
@@ -13818,7 +13813,7 @@ async fn list_workflow_queries(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, "history replay").await?;
     let mut names = ctx.list_query_names();
     names.sort(); // deterministic order for UI
     Ok(Json(names))
@@ -22878,6 +22873,13 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             "query '{query_name}' timed out after {timeout_ms}ms"
         ))
         .with_status(axum::http::StatusCode::REQUEST_TIMEOUT),
+        // The execution row is present but its history is unqueryable (pruned by
+        // retention, released on reset, or payloads erased) — distinct from a
+        // fully-deleted row (404). Issue #612.
+        HarvestError::HistoryUnavailable { reason, .. } => {
+            AutumnError::bad_request_msg(format!("history unavailable: {reason}"))
+                .with_status(axum::http::StatusCode::GONE)
+        }
         HarvestError::Config(message)
         | HarvestError::NonDeterministic {
             reason: message, ..

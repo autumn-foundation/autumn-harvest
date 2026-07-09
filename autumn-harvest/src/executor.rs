@@ -80,6 +80,98 @@ pub struct WorkflowExecuteSpanMeta {
     pub build_id: Option<String>,
 }
 
+/// Classification of a bounded, read-only query-replay drive (issue #612).
+///
+/// A query drives the workflow handler purely in replay against recorded
+/// history — emitting no commands and appending no events — to reconstruct the
+/// context state its registered query handlers read. This enum reports where
+/// that drive stopped so the caller can decide how to respond:
+///
+/// - [`ReachedTerminal`](Self::ReachedTerminal): the handler ran to `Poll::Ready`
+///   (`Ok` **or** `Err`), i.e. the full history was drained and the context now
+///   reflects the workflow's final reconstructed state.
+/// - [`Suspended`](Self::Suspended): the handler blocked on a workflow command
+///   (activity/timer/signal) before reaching `Poll::Ready`, i.e. the recorded
+///   history is insufficient to reconstruct the final state (pruned/released).
+/// - [`TimedOut`](Self::TimedOut): the drive exceeded the supplied deadline
+///   before reaching `Poll::Ready` (a workflow spinning on replay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryReplayOutcome {
+    /// The handler reached `Poll::Ready`; the context holds final state.
+    ReachedTerminal,
+    /// The handler suspended before completing; history is insufficient.
+    Suspended,
+    /// The drive exceeded the supplied deadline.
+    TimedOut,
+}
+
+/// Waker used by [`drive_query_replay`] to detect immediate re-wakes (e.g. a
+/// workflow that calls `tokio::task::yield_now()` — the waker fires synchronously,
+/// signalling the driver to re-poll rather than treat the `Pending` as a genuine
+/// workflow-command suspension).
+struct QueryReplayWaker(std::sync::atomic::AtomicBool);
+
+impl futures::task::ArcWake for QueryReplayWaker {
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Drive a workflow handler future purely in replay, bounded by `timeout`, and
+/// classify where it stopped (issue #612).
+///
+/// This is **read-only**: it never persists anything. The provided `ctx` must
+/// already be a replay context (built via
+/// [`WorkflowContext::for_replay_with_state_and_history_policy`]) with its query
+/// handlers registered; recorded events resolve synchronously via pre-sent
+/// oneshot channels, so the whole history replays without I/O. The returned
+/// [`QueryReplayOutcome`] tells the caller whether the context now reflects the
+/// workflow's final state ([`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal)),
+/// stopped at a genuine suspension with insufficient history
+/// ([`Suspended`](QueryReplayOutcome::Suspended)), or blew the deadline
+/// ([`TimedOut`](QueryReplayOutcome::TimedOut)).
+///
+/// The `Ok`/`Err` return value of the workflow function is intentionally
+/// ignored — a `FAILED` run still reconstructs its final internal state, which
+/// is exactly what a post-mortem query wants to read.
+#[must_use]
+pub fn drive_query_replay(
+    ctx: &WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    timeout: Duration,
+) -> QueryReplayOutcome {
+    use std::future::Future;
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let flag = std::sync::Arc::new(QueryReplayWaker(std::sync::atomic::AtomicBool::new(false)));
+    let waker = futures::task::waker_ref(&flag);
+    let mut poll_cx = std::task::Context::from_waker(&waker);
+    let handler_fut = handler(ctx, input);
+    tokio::pin!(handler_fut);
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // Check the deadline before polling so an already-elapsed (or zero)
+        // deadline classifies deterministically as TimedOut without a hang.
+        if std::time::Instant::now() >= deadline {
+            return QueryReplayOutcome::TimedOut;
+        }
+        flag.0.store(false, Ordering::Release);
+        match handler_fut.as_mut().poll(&mut poll_cx) {
+            Poll::Ready(_) => return QueryReplayOutcome::ReachedTerminal,
+            Poll::Pending => {
+                if !flag.0.load(Ordering::Acquire) {
+                    // Not woken → genuine suspension on a workflow command.
+                    return QueryReplayOutcome::Suspended;
+                }
+                // Woken immediately (e.g. yield_now) — keep driving.
+            }
+        }
+    }
+}
+
 /// Run a workflow function through replay and live execution.
 ///
 /// Builds a [`WorkflowContext`] from the provided event history, invokes the

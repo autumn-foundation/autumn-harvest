@@ -125,6 +125,36 @@ pub fn is_terminal_state(state: &str) -> bool {
     )
 }
 
+/// Returns `true` if any event in `events` carries an erasure tombstone in one
+/// of its payload fields (issue #495).
+///
+/// A PII-erased terminal history still replays *structurally* (event types,
+/// order, and IDs are untouched), so a post-mortem query would drive it to
+/// completion and then compute against `{"_harvest_erased": true}` payloads — a
+/// subtly wrong answer. Callers serving queries on terminal executions (issue
+/// #612) use this to reject such histories explicitly rather than return
+/// misleading state.
+///
+/// The scan serialises each [`WorkflowEvent`] to its adjacently-tagged JSON form
+/// and recursively looks for the canonical tombstone object; it is cheap enough
+/// for the 10k-events-under-200ms replay budget.
+#[must_use]
+pub fn history_events_contain_tombstone(events: &[crate::event::WorkflowEvent]) -> bool {
+    events.iter().any(|event| {
+        serde_json::to_value(event).is_ok_and(|value| value_contains_tombstone(&value))
+    })
+}
+
+/// Recursively reports whether `value` (or any nested value) is the erasure
+/// tombstone `{"_harvest_erased": true}`.
+fn value_contains_tombstone(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => is_tombstone(value) || map.values().any(value_contains_tombstone),
+        Value::Array(items) => items.iter().any(value_contains_tombstone),
+        _ => false,
+    }
+}
+
 // ── Outcome types ─────────────────────────────────────────────────────────────
 
 /// A child execution that was skipped because it is not yet terminal.
