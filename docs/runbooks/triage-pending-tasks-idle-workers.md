@@ -14,6 +14,32 @@ Use this runbook when an alert fires indicating that tasks are sitting in `PENDI
 > below. `heartbeat_details` is `null` for activities that have not yet flushed
 > a heartbeat and for local activities (which do not heartbeat).
 
+> **Why is this activity retrying?** If a `pending_activities[]` (or
+> `pending_local_activities[]`) entry has a `next_retry_at` in the future, it is
+> backing off after a failure rather than blocked on eligibility. The same
+> `GET /workflows/{exec_id}/stack` response now carries a `last_failure` object
+> on that entry (issue #773). Read it to see *why* the activity keeps failing
+> (e.g. a downstream `503`, a validation error) without a second round-trip or a
+> manual `harvest_events` query. `last_failure` is omitted entirely for an
+> activity that has never failed, so its presence alone flags a retrying task.
+>
+> **What's in `last_failure` depends on the activity kind** — because retryable
+> failures are not event-sourced:
+>
+> - For a **backing-off regular (task-queue) activity** — the common retry-loop
+>   case — the message comes from the task row's `error` column (what the worker
+>   writes when it reschedules a retryable failure; no `ActivityFailed` event is
+>   appended). You get `error` (the message) and `attempt`, with
+>   `error_type: "Error"`, `non_retryable: false`, and `failed_at`/`details`
+>   omitted (the task row has no failure timestamp or structured detail).
+> - For a **local activity** (and any event-sourced failure) the full typed set
+>   is present, including `failed_at` (the event timestamp).
+>
+> This reduced regular-activity shape is deliberate: event-sourcing every
+> retryable failure would require a schema migration, which #773 intentionally
+> avoids. Continue with the eligibility triage below only once you have ruled out
+> a downstream-caused retry loop.
+
 To triage eligibility blocks, call the eligibility explainer API:
 
 ```text
