@@ -295,10 +295,16 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Returns `true` if any retention features (workflow history, audit log, or schedule decision purging) are enabled.
+    /// Returns `true` if any retention features (workflow history, per-type
+    /// history overrides, audit log, or schedule decision purging) are enabled.
+    ///
+    /// Per-workflow-type overrides count as enabling workflow-history retention
+    /// even when the global `max_age` is unset (issue #737), so an
+    /// overrides-only configuration still spawns the janitor.
     #[must_use]
-    pub const fn enabled(&self) -> bool {
+    pub fn enabled(&self) -> bool {
         self.max_age_secs.is_some()
+            || !self.overrides.is_empty()
             || self.audit_retention_days > 0
             || self.schedule_decision_retention_days > 0
     }
@@ -1539,6 +1545,17 @@ mod tests {
             schedule_decision_retention_days: 7,
             ..Default::default()
         };
+        assert!(config.enabled());
+
+        // Overrides-only (no global max_age, no audit/schedule purging) still
+        // enables the janitor (issue #737).
+        let config = RetentionConfig {
+            max_age_secs: None,
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        }
+        .with_workflow_override("wf", Duration::from_secs(3600));
         assert!(config.enabled());
     }
 
