@@ -187,6 +187,40 @@ fn schedule_update_route_is_classified() {
     );
 }
 
+/// The single-activity force-fail route (issue #765) must be registered in the
+/// live route registry, classified Mutating, and mapped to its audit
+/// operation.
+///
+/// Mirrors `workflow_count_route_is_classified`: `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router, so this pin closes that gap for the new route.
+#[test]
+fn fail_now_route_is_classified_and_audited() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, OP_ACTIVITY_FAIL_NOW, RouteClass,
+    };
+
+    let route = "POST /workflows/{id}/activities/{activity_exec_id}/fail-now";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && *class == RouteClass::Mutating),
+        "{route} must be classified Mutating in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && *op == Some(OP_ACTIVITY_FAIL_NOW)),
+        "{route} must be mapped to OP_ACTIVITY_FAIL_NOW in ALL_MUTATION_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {

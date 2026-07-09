@@ -1175,6 +1175,75 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force-fail exactly one hung in-flight (RUNNING) activity task. Appends ActivityFailed with the distinct error_type 'OperatorForceFailed' through the existing recording path (no new event variant), marks the task row FAILED with the typed failure envelope, and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path -- it is NOT terminated. Remaining retry attempts are skipped regardless of retry policy (the forced failure is non-retryable by construction), and a late result from the worker still running the activity is ignored (no double-apply). Only RUNNING activity tasks of a non-terminal execution are force-failable. Note: if the owning workflow has a workflow-level retry policy (issue #523) and propagates this error to workflow failure, the run is retried fresh and the activity re-dispatched -- use cancel/terminate instead if the goal is to stop the run. Local activities run inline and have no task-queue row -- this endpoint does not apply to them (404).",
+      "idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event. Idempotency wins over the terminal-execution guard: a retry issued after the woken workflow has consumed the forced failure and sealed its own run (the expected aftermath of a successful force-fail) still returns the no-op success rather than the terminal 409.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "activity_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable reason recorded in the forced ActivityFailed event's message and details (e.g. an incident id). Truncated server-side to 500 characters."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "activity_exec_id",
+          "activity_name",
+          "queue",
+          "forced",
+          "already_forced",
+          "error_type"
+        ],
+        "field_notes": {
+          "forced": "true when this call performed the force-fail; false when a prior force-fail was detected (idempotent no-op).",
+          "already_forced": "true when the task was already force-failed by an earlier call -- zero writes were performed.",
+          "error_type": "Always 'OperatorForceFailed' -- the distinct failure cause workflow code can match on (HarvestError::is_operator_force_failed) to tell an operator intervention apart from a genuine activity error."
+        }
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed workflow execution id, or malformed JSON request body."
+        },
+        {
+          "status": 404,
+          "description": "Execution or activity task not found, including a task belonging to a different workflow, or activity_exec_id is not a valid UUID. Local activities have no task-queue row and return 404. Note: external-handoff activity IDs are a different id-space from task-queue PKs; passing one will return 404."
+        },
+        {
+          "status": 409,
+          "description": "Task is not force-failable: the owning execution is already terminal (COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED) and the task is not already-forced (an already-forced task returns the idempotent 202 no-op even on a sealed run), the task is not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), the id names a workflow task rather than an activity task, or history already carries a terminal event for the activity."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/workflows/{id}/completion-deliveries",
       "category": "workflow",

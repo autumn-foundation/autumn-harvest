@@ -302,6 +302,33 @@ fn jitter_timer_workflow<'a>(
     })
 }
 
+/// Workflow that branches on the operator force-fail cause (issue #765):
+/// a genuine success completes normally; an `OperatorForceFailed` activity
+/// error routes to a compensation activity; any other error propagates.
+fn force_failed_compensating_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match ctx
+            .execute_activity_raw("charge_card", Value::Null, "default")
+            .await
+        {
+            Ok(v) => Ok(serde_json::json!({"charged": v})),
+            Err(e) if e.is_operator_force_failed() => {
+                // The workflow advances to its own compensation path — it is
+                // NOT terminated (issue #765 AC).
+                let r = ctx
+                    .execute_activity_raw("release_hold", Value::Null, "default")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"compensated": r}))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Helper: build canonical event history
 // ---------------------------------------------------------------------------
@@ -408,6 +435,58 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("jitter_timer_workflow", jitter_timer_workflow)
         .register_fn("current_details_workflow", current_details_workflow)
         .register_fn("session_pipeline_workflow", session_pipeline_workflow)
+        .register_fn(
+            "force_failed_compensating_workflow",
+            force_failed_compensating_workflow,
+        )
+}
+
+/// History recorded by a run whose `charge_card` activity was force-failed by
+/// an operator (issue #765): the forced failure rides the *existing*
+/// `ActivityFailed` variant (no new event variant), carrying the distinct
+/// `OperatorForceFailed` `error_type`; the workflow then ran its compensation
+/// activity on the live frontier.
+fn force_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let charge_id = ActivityExecId::new();
+    let release_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: charge_id,
+            name: "charge_card".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: charge_id,
+            error: "activity force-failed by operator: incident INC-42".into(),
+            attempt: 1,
+            error_type: "OperatorForceFailed".into(),
+            non_retryable: true,
+            details: Some(serde_json::json!({
+                "forced_by_operator": true,
+                "reason": "incident INC-42",
+            })),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: "release_hold".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: serde_json::json!("hold released"),
+        },
+    ];
+    (exec_id, events)
 }
 
 /// History for `session_pipeline_workflow`, parameterized by the recorded
@@ -477,6 +556,37 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         events,
         context_headers: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// (a0) Operator force-fail replays deterministically down the workflow's own
+//      failure/compensation branch (issue #765 AC: the forced ActivityFailed
+//      is a plain, existing event — replay must recognize the distinct
+//      OperatorForceFailed cause and take the same branch every time).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn replay_force_failed_activity_takes_compensation_branch_deterministically() {
+    let (exec_id, events) = force_failed_history();
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "force_failed_compensating_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a history containing an operator-forced ActivityFailed must replay \
+         deterministically down the compensation branch, got: {report}"
+    );
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -277,6 +277,16 @@ fn workflow_resume_is_covered() {
 }
 
 #[test]
+fn workflow_fail_activity_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "fail-activity",
+        "00000000-0000-0000-0000-000000000001",
+        "11111111-1111-4111-8111-111111111111",
+    ]);
+}
+
+#[test]
 fn workflow_reset_is_covered() {
     assert_covered(&[
         "workflow",
@@ -691,6 +701,18 @@ fn dag_pause_body_fields_are_documented() {
 #[test]
 fn dag_unpause_body_fields_are_documented() {
     assert_body_fields_documented(&["dag", "unpause", "my_dag"]);
+}
+
+#[test]
+fn workflow_fail_activity_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "fail-activity",
+        "00000000-0000-0000-0000-000000000001",
+        "11111111-1111-4111-8111-111111111111",
+        "--reason",
+        "hung in flight",
+    ]);
 }
 
 #[test]

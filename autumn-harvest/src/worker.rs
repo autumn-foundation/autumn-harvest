@@ -2064,7 +2064,11 @@ fn configured_retry_policy(task: &TaskQueueItem) -> HarvestResult<Option<RetryPo
         .map_err(HarvestError::from)
 }
 
-fn task_attempt(task: &TaskQueueItem) -> u32 {
+/// 1-based attempt counter for event recording. `pub(crate)` so
+/// `timeout::force_fail_activity` (issue #765) fills the forced
+/// `ActivityFailed` event's `attempt` field the exact same way the worker's
+/// own `finalize_activity_failure` does.
+pub(crate) fn task_attempt(task: &TaskQueueItem) -> u32 {
     u32::try_from(task.attempt.max(1)).unwrap_or(1)
 }
 

@@ -47,6 +47,24 @@ pub const ERROR_TYPE_CIRCUIT_OPEN: &str = "CircuitOpen";
 /// in place would loop forever against a dead host.
 pub const ERROR_TYPE_SESSION_BROKEN: &str = "SessionBroken";
 
+/// Stable error-type name for operator-forced activity failures (issue #765).
+///
+/// Synthesised by [`crate::timeout::force_fail_activity`] when an operator
+/// force-fails a hung in-flight activity via the management API. Workflow
+/// authors match on this in their `Err` arm (or via
+/// [`HarvestError::is_operator_force_failed`](crate::error::HarvestError::is_operator_force_failed))
+/// to tell an operator intervention apart from a genuine activity error.
+/// Always non-retryable: the override skips every remaining retry attempt
+/// regardless of retry policy.
+///
+/// This error type is engine-reserved for the operator force-fail endpoint:
+/// activity code that fabricates it (returns an `ActivityFailure` carrying
+/// this type itself) will make a later fail-now call misreport
+/// `already_forced: true` instead of the documented `409` — harmless at the
+/// state-machine level (the idempotent branch performs zero writes) but
+/// misleading in the response.
+pub const ERROR_TYPE_OPERATOR_FORCE_FAILED: &str = "OperatorForceFailed";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility
@@ -137,6 +155,35 @@ impl ActivityFailure {
             )
         };
         Self::non_retryable(ERROR_TYPE_CIRCUIT_OPEN, message).with_details(details)
+    }
+
+    /// Construct the non-retryable failure used when an operator force-fails
+    /// a hung in-flight activity (issue #765).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_OPERATOR_FORCE_FAILED`] and the
+    /// failure is non-retryable so every remaining retry attempt is skipped —
+    /// the whole point of the override is to stop the retry curve dead and
+    /// hand the outcome to the workflow's own failure/compensation path.
+    /// The operator-supplied `reason` (if any) is appended to the message and
+    /// carried in `details.reason` so workflow code and audit trails can read
+    /// it back.
+    ///
+    /// [`ERROR_TYPE_OPERATOR_FORCE_FAILED`] is engine-reserved for the
+    /// force-fail endpoint: activity code that fabricates this failure itself
+    /// will make a later fail-now call misreport `already_forced: true`
+    /// instead of the documented `409` (harmless — zero writes — but
+    /// misleading).
+    #[must_use]
+    pub fn operator_force_failed(reason: Option<&str>) -> Self {
+        let mut details = serde_json::json!({ "forced_by_operator": true });
+        let message = reason.map_or_else(
+            || "activity force-failed by operator".to_string(),
+            |reason| {
+                details["reason"] = serde_json::json!(reason);
+                format!("activity force-failed by operator: {reason}")
+            },
+        );
+        Self::non_retryable(ERROR_TYPE_OPERATOR_FORCE_FAILED, message).with_details(details)
     }
 }
 
@@ -529,5 +576,84 @@ mod tests {
         let payload = ActivityFailure::non_retryable("X", "y").into_error_payload();
         assert!(failure_is_non_retryable(&payload, None));
         assert!(!failure_is_non_retryable("plain string", None));
+    }
+
+    // ── operator force-fail (issue #765) ──────────────────────────────────
+
+    #[test]
+    fn operator_force_failed_is_non_retryable_typed_failure() {
+        let f = ActivityFailure::operator_force_failed(None);
+        assert_eq!(f.error_type, ERROR_TYPE_OPERATOR_FORCE_FAILED);
+        assert_eq!(f.error_type, "OperatorForceFailed");
+        assert!(
+            f.non_retryable,
+            "operator force-fail must skip all remaining retries"
+        );
+        assert_eq!(f.message, "activity force-failed by operator");
+    }
+
+    #[test]
+    fn operator_force_failed_appends_reason_to_message_and_details() {
+        let f = ActivityFailure::operator_force_failed(Some("stuck on dead downstream"));
+        assert_eq!(
+            f.message,
+            "activity force-failed by operator: stuck on dead downstream"
+        );
+        let details = f.details.expect("details carry the operator context");
+        assert_eq!(details["forced_by_operator"], true);
+        assert_eq!(details["reason"], "stuck on dead downstream");
+    }
+
+    #[test]
+    fn operator_force_failed_without_reason_omits_reason_detail() {
+        let f = ActivityFailure::operator_force_failed(None);
+        let details = f.details.expect("details carry the operator context");
+        assert_eq!(details["forced_by_operator"], true);
+        assert!(
+            details.get("reason").is_none(),
+            "no reason given → no reason detail"
+        );
+    }
+
+    #[test]
+    fn operator_force_failed_round_trips_through_wire_format() {
+        // Replay safety: the synthesised failure must survive the same wire
+        // envelope every other typed failure uses, so the recorded
+        // ActivityFailed event reproduces the OperatorForceFailed outcome on
+        // replay and `parse_error_payload_full` (the exact decoder
+        // `finalize_activity_failure` uses) recovers it losslessly.
+        let payload =
+            ActivityFailure::operator_force_failed(Some("incident INC-42")).into_error_payload();
+        assert!(payload.contains("harvest_activity_failure_v1"));
+        let full = parse_error_payload_full(&payload);
+        assert_eq!(full.error_type, ERROR_TYPE_OPERATOR_FORCE_FAILED);
+        assert!(full.non_retryable);
+        assert_eq!(
+            full.message,
+            "activity force-failed by operator: incident INC-42"
+        );
+        assert_eq!(
+            full.details.expect("details survive the envelope")["reason"],
+            "incident INC-42"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn operator_force_failed_is_non_retryable_regardless_of_retry_policy() {
+        // The override stops retrying regardless of retry policy (issue #765
+        // AC): even a generous policy that lists nothing as non-retryable must
+        // classify the forced failure as terminal.
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 100,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 2.0,
+            max_interval: std::time::Duration::from_secs(60),
+            non_retryable_errors: vec![],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let payload = ActivityFailure::operator_force_failed(None).into_error_payload();
+        assert!(failure_is_non_retryable(&payload, Some(&policy)));
+        assert!(failure_is_non_retryable(&payload, None));
     }
 }
