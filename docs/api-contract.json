@@ -485,7 +485,8 @@
           "pending_child_workflows",
           "checkpoints_truncated_for_budget",
           "last_event_id"
-        ]
+        ],
+        "notes": "Each entry in pending_activities and pending_local_activities carries an optional nested last_failure object (issue #773) — {error_type, error, attempt, non_retryable, failed_at?, details?} — omitted entirely when the activity has never failed, so healthy-run responses stay byte-identical to pre-#773 builds. It answers \"why is this activity retrying?\" alongside the next_retry_at countdown without a second round-trip. Availability of the fields differs by activity kind because retryable failures are not event-sourced (an AC2-vs-AC5 reconciliation; #773 adds no migration): for a backing-off REGULAR (task-queue) activity — the primary case — last_failure is sourced from the harvest_task_queue.error column that queue::requeue_for_retry sets on each retryable failure (no ActivityFailed event is appended), so error and attempt are present, error_type defaults to \"Error\", non_retryable is false, and failed_at/details are omitted (the task row has no failure timestamp or structured detail); for LOCAL activities (and any event-sourced failure) last_failure is sourced from the most recent LocalActivityFailed event and includes failed_at (the event timestamp), with error_type \"Error\", non_retryable false, and no details. When read-path payload decoding (issue #608) is active for the request, last_failure.error is tolerantly decoded like every other payload field."
       },
       "error_responses": [
         {

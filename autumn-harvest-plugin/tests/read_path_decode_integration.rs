@@ -518,6 +518,38 @@ async fn seed_pending_activity(
     activity_id
 }
 
+/// Seed a pending activity in the real BACKING-OFF state (issue #773): a
+/// `PENDING` task-queue row whose `error` column carries the last retryable
+/// failure message, a bumped `attempt`, and a future `scheduled_at`. This is
+/// what `queue::requeue_for_retry` actually writes — a retryable regular
+/// failure appends NO `ActivityFailed` event, so the stack handler must source
+/// `last_failure` from this column. `error` is written verbatim (pass an
+/// envelope to exercise the #608 decode path).
+async fn seed_backing_off_activity(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    input: Value,
+    error: &str,
+    attempt: i32,
+) -> ActivityExecId {
+    let activity_id = seed_pending_activity(conn, exec_id, input, None).await;
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(harvest_task_queue::activity_id.eq(Some(activity_id.as_uuid()))),
+    )
+    .set((
+        harvest_task_queue::state.eq("PENDING"),
+        harvest_task_queue::error.eq(Some(error.to_string())),
+        harvest_task_queue::attempt.eq(attempt),
+        harvest_task_queue::scheduled_at.eq(Utc::now() + chrono::Duration::seconds(30)),
+    ))
+    .execute(conn)
+    .await
+    .expect("seed backing-off task error/attempt/scheduled_at");
+    activity_id
+}
+
 /// Audit rows for `OP_PAYLOAD_DECODE_READ`, as `(target_id, route_or_command,
 /// error_summary)` triples, oldest first.
 async fn decode_audit_rows(
@@ -1042,6 +1074,136 @@ async fn stack_pending_activity_input_is_decoded() {
         json!(false),
         "the response-level input-budget flag must be present (and false) \
          when decoding is active: {stack_str}"
+    );
+}
+
+/// #773 (P1): a retrying (backing-off) REGULAR pending activity surfaces
+/// `last_failure` sourced from the task-row `harvest_task_queue.error` column —
+/// NOT from an `ActivityFailed` event, which a retryable failure never appends.
+/// The regular-path shape is: `error`/`attempt` from the task row,
+/// `error_type="Error"`, `non_retryable=false`, and `failed_at`/`details`
+/// omitted. A never-failed pending activity omits the field entirely
+/// (AC3/AC7). No decoding needed — plaintext here — so this runs on the plain
+/// app.
+#[tokio::test]
+async fn stack_pending_activity_surfaces_last_failure() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_plain_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    // Scenario 1: a backing-off regular activity — the REAL engine state after
+    // a retryable failure: PENDING task, error column set, attempt bumped,
+    // scheduled_at in the future, and NO ActivityFailed event in history.
+    let exec_id = seed_running(&mut conn, "stack-last-failure", json!({})).await;
+    seed_backing_off_activity(
+        &mut conn,
+        exec_id,
+        json!({"card": "1234"}),
+        "downstream 503",
+        3,
+    )
+    .await;
+
+    let (status, stack) = get_json(&app, &format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK, "body: {stack}");
+    let pending = &stack["pending_activities"][0];
+    let last_failure = &pending["last_failure"];
+    assert!(
+        last_failure.is_object(),
+        "a backing-off pending activity must carry last_failure: {stack}"
+    );
+    assert_eq!(last_failure["error"], json!("downstream 503"));
+    assert_eq!(
+        last_failure["attempt"],
+        json!(3),
+        "attempt from the task row: {stack}"
+    );
+    // Regular (task-row) path defaults.
+    assert_eq!(last_failure["error_type"], json!("Error"));
+    assert_eq!(last_failure["non_retryable"], json!(false));
+    // The task row has no failure timestamp and no structured detail — both keys
+    // are omitted.
+    assert!(
+        last_failure.get("failed_at").is_none(),
+        "regular task-row path must omit failed_at: {stack}"
+    );
+    assert!(
+        last_failure.get("details").is_none(),
+        "regular task-row path must omit details: {stack}"
+    );
+
+    // Scenario 2: a never-failed pending activity omits last_failure entirely.
+    let clean_exec = seed_running(&mut conn, "stack-no-failure", json!({})).await;
+    seed_pending_activity(&mut conn, clean_exec, json!({"card": "5678"}), None).await;
+    let (status, clean_stack) = get_json(&app, &format!("/workflows/{clean_exec}/stack")).await;
+    assert_eq!(status, StatusCode::OK, "body: {clean_stack}");
+    let clean_str = serde_json::to_string(&clean_stack).unwrap();
+    assert!(
+        clean_str.contains("pending_activities"),
+        "fixture sanity: pending activity must render: {clean_str}"
+    );
+    assert!(
+        !clean_str.contains("last_failure"),
+        "a never-failed pending activity must omit last_failure entirely: {clean_str}"
+    );
+}
+
+/// #773: a pending LOCAL activity surfaces `last_failure` from the most recent
+/// `LocalActivityFailed` event (local activities ARE event-sourced per attempt,
+/// unlike backing-off regular activities). The event/timestamp path populates
+/// `failed_at`; `error_type` defaults to `"Error"` and `non_retryable` to
+/// `false`. Plaintext here, so this runs on the plain app.
+#[tokio::test]
+async fn stack_pending_local_activity_surfaces_last_failure() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_plain_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "stack-local-last-failure", json!({})).await;
+    let activity_id = ActivityExecId::new();
+    // LocalActivityScheduled (still pending — no LocalActivityCompleted) plus a
+    // LocalActivityFailed for the same activity_id, so the local panel surfaces
+    // it as a pending local activity with its recorded failure (AC4).
+    append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "compute_checksum".to_string(),
+                input: json!({"blob": "abc"}),
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error: "checksum mismatch".to_string(),
+                attempt: 2,
+            },
+        ],
+    )
+    .await;
+
+    let (status, stack) = get_json(&app, &format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK, "body: {stack}");
+    let pending = &stack["pending_local_activities"][0];
+    let last_failure = &pending["last_failure"];
+    assert!(
+        last_failure.is_object(),
+        "a failed pending local activity must carry last_failure: {stack}"
+    );
+    assert_eq!(last_failure["error"], json!("checksum mismatch"));
+    assert_eq!(last_failure["attempt"], json!(2));
+    assert_eq!(last_failure["error_type"], json!("Error"));
+    assert_eq!(last_failure["non_retryable"], json!(false));
+    // The event-sourced path populates failed_at from the event timestamp.
+    assert!(
+        last_failure["failed_at"].is_string(),
+        "local (event) path must carry failed_at: {stack}"
+    );
+    assert!(
+        last_failure.get("details").is_none(),
+        "LocalActivityFailed carries no details: {stack}"
     );
 }
 
