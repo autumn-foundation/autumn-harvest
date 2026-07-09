@@ -385,7 +385,7 @@
         {
           "ref": "ADR-0001",
           "status": "accepted",
-          "surface": "bounded metric labels: shard"
+          "surface": "bounded metric labels: workflow"
         }
       ],
       "prometheus": {
@@ -394,7 +394,7 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "increase(harvest_retention_deleted_total{shard=\"0\"}[6h]) == 0"
+            "expr": "sum(increase(harvest_retention_deleted_total[6h])) == 0"
           }
         ]
       },

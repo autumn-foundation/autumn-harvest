@@ -91,6 +91,9 @@ jobs:
       - name: Run Docker-backed force-fail integration tests (issue #765)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- force_fail -- --test-threads=1
+      - name: Run retention override integration tests (issue #737)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests -- --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
