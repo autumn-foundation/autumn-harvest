@@ -59,6 +59,21 @@
 //! retry endpoint reject it as succeeded. A map-aware aggregate outcome is
 //! deferred to a #366 change that updates `node_outcome` and this view together.
 //!
+//! **Empty mapped fan-out** (issue #690 review, Codex). A mapped task over an
+//! *empty* upstream array is a special case of the same limitation: the unified
+//! DAG handler returns `TaskStatus::Succeeded` **without dispatching any
+//! instance** (`autumn-harvest-macros/src/dag.rs`, the `__n_instances == 0`
+//! guard), so the node appends **no** `ActivityScheduled`/activity events at all.
+//! With zero events for the node, [`node_outcome`](crate::dag_retry::node_outcome)
+//! returns [`NodeOutcome::NotAttempted`] and this view reports it as
+//! [`DagNodeStatus::Pending`] on a completed run — not `succeeded`. From history
+//! alone a zero-event, no-marker node is indistinguishable from a not-yet-reached
+//! node (and from a `SkipByTriggerRule` skip, which also records no marker — see
+//! the AC7 scope note below). This is **AC5-consistent** (`node_outcome` returns
+//! `NotAttempted` for the same history, so the graph and the #366 retry path
+//! agree); a precise `succeeded` classification is deferred to the same
+//! coordinated #366 change as the instance-collapse case above.
+//!
 //! ## Status classification (AC5 anchor)
 //!
 //! Base classification comes from [`crate::dag_retry::node_outcome`], the exact
@@ -1236,5 +1251,48 @@ mod tests {
         // history — both collapse to the latest-scheduled instance's outcome.
         let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
         assert_eq!(node_outcome(&plain, "a"), NodeOutcome::Succeeded);
+    }
+
+    #[test]
+    fn empty_mapped_fan_out_reports_pending_on_completed_run() {
+        // A mapped task over an EMPTY upstream array dispatches zero instances:
+        // the unified DAG handler returns TaskStatus::Succeeded without recording
+        // any ActivityScheduled/activity events for the node (dag.rs
+        // `__n_instances == 0` guard). With zero events, node_outcome returns
+        // NotAttempted and this view reports the node `pending` on a COMPLETED
+        // run — because from history alone an empty-mapped node is
+        // indistinguishable from a not-yet-reached node (and from a
+        // SkipByTriggerRule skip, which also records no marker).
+        //
+        // This test PINS that documented v1 behavior — NOT the ideal `succeeded`
+        // classification. It matches node_outcome's NotAttempted for the same
+        // history (AC5), and a precise fix is deferred to a coordinated #366
+        // change (same rationale as the instance-collapse case). Modelled as a
+        // two-node DAG where the mapped node `a` fans out over nothing while the
+        // downstream node `b` runs and succeeds — the mapped node still reports
+        // `pending`, not `succeeded`, even on a COMPLETED run.
+        let def = linear_dag(); // a -> b -> c -> d
+        let ib = ActivityExecId::new();
+        // `a` (the empty mapped fan-out) appends NO events; `b` runs & succeeds.
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("b", ib)),
+            (ts(2), activity_started(ib)),
+            (ts(3), completed(ib)),
+        ];
+        let nodes = build_run_graph(&def, &events, "COMPLETED");
+
+        // The empty-mapped node reports `pending` (the documented current
+        // behavior), not `succeeded`.
+        assert_eq!(node(&nodes, "a").status, DagNodeStatus::Pending);
+        assert_eq!(node(&nodes, "a").attempts, 0);
+        assert!(node(&nodes, "a").started_at.is_none());
+        // The downstream node that actually ran is succeeded.
+        assert_eq!(node(&nodes, "b").status, DagNodeStatus::Succeeded);
+
+        // AC5: node_outcome returns NotAttempted for the same zero-event history,
+        // so the graph and the #366 retry path agree.
+        let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
+        assert_eq!(node_outcome(&plain, "a"), NodeOutcome::NotAttempted);
     }
 }
