@@ -8171,10 +8171,17 @@ pub(crate) async fn start_workflow(
     // land it on the key-derived shard, where `start_or_load_workflow_execution`
     // cannot see an existing `(name, workflow_id)` run living on the
     // `workflow_id`-derived shard — silently breaking `RejectDuplicate` /
-    // `AllowDuplicate` and the uniqueness invariant. Consistency caveat: for
-    // keyed dedup to converge, a client must be consistent about supplying vs.
-    // omitting `workflow_id` across retries of the same delivery (mixing the two
-    // routes to different shards). The no-key path is byte-for-byte unchanged.
+    // `AllowDuplicate` and the uniqueness invariant. This branch is the
+    // resolution of the P1↔P2 routing tension (see docs/getting-started/
+    // 06-idempotency.md): always-route-by-key reintroduces the P1 duplicate-run
+    // for explicit-`workflow_id` starts, and always-route-by-`workflow_id`
+    // breaks the P2/AC3 auto-gen dedup case — the two cannot coexist under
+    // #808's shard-local, no-cross-shard-probe scope. Consistency caveat: for
+    // keyed dedup to converge, a client must supply a consistent `workflow_id`
+    // (same value, or consistently omitted) across retries of the same delivery
+    // — a retry that changes its explicit `workflow_id` is not a retry of the
+    // same delivery and can route to a different shard. The no-key path is
+    // byte-for-byte unchanged.
     let shard = if let Some(ref key) = idempotency_key
         && !explicit_workflow_id
     {

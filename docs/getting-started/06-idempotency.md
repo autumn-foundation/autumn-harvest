@@ -147,11 +147,24 @@ chosen deterministically from either the key or the `workflow_id`:
   silently creates a second run on a different shard. Same-`workflow_id` retries
   still co-locate (the `workflow_id` is constant) and dedup on the key.
 
-For keyed dedup to converge, **be consistent about supplying vs. omitting
-`workflow_id` across retries of the same delivery** — mixing the two within one
-delivery's retries routes them to different shards, so the second would not see
-the first's claim. Pick one shape per delivery. In a single-shard deployment this
-is moot (everything is on one shard).
+For keyed dedup to converge in a multi-shard deployment, a client must supply a
+**consistent `workflow_id`** — the *same* explicit value, or consistently
+*omit* it and let the server auto-generate — **across all retries of the same
+delivery**. A retry that carries a *different* explicit `workflow_id` is not a
+retry of the same logical delivery: it changes the business identity, can route
+to a different shard-local claim table, and may create a second run. This is
+inherent to shard-local dedup coexisting with the `(workflow_name, workflow_id)`
+reuse matrix — keyed starts with an explicit `workflow_id` route by
+`workflow_id` (so the `reuse_policy` matrix still sees an existing run on that
+identity's shard), and keyed starts with an omitted/auto-generated `workflow_id`
+route by the key. Routing *all* keyed starts by the key instead would break the
+reuse matrix for explicit-`workflow_id` starts whose existing run lives on the
+`workflow_id` shard (the matrix could no longer see it, silently creating a
+duplicate). The two placements cannot both be satisfied when the key and the
+`workflow_id` hash to different shards, and #808 scopes dedup as shard-local with
+no cross-shard probe — so the requirement is on the client: pick one
+`workflow_id` shape *and value* per delivery. In a single-shard deployment this
+is all moot (everything is on one shard).
 
 ### Known limitation — shard drain within the retention window
 

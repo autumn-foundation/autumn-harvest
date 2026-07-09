@@ -159,6 +159,13 @@ impl ShardRouter {
     /// applies (a keyed start still creates a brand-new workflow, so it must
     /// land on a writable shard).
     ///
+    /// The caller (`api.rs`) only routes here when the `workflow_id` was
+    /// auto-generated; an explicit `workflow_id` routes by `workflow_id`
+    /// instead. That split is the resolution of the P1↔P2 routing tension —
+    /// routing *all* keyed starts by the key would break the reuse-policy
+    /// matrix for explicit-`workflow_id` starts (see the routing comment in
+    /// `api.rs` and `docs/getting-started/06-idempotency.md`).
+    ///
     /// KNOWN LIMITATION (Codex #808 P2): because this reuses `pick_writable`
     /// verbatim, keyed dedup inherits the *exact* shard-drain behavior of
     /// `(workflow_name, workflow_id)` uniqueness. If a key first claims a run on
