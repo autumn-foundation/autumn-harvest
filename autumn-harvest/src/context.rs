@@ -3914,7 +3914,19 @@ impl WorkflowContext {
     ///
     /// **Sub-second precision:** deadlines are honored to the engine's whole-second
     /// timer granularity; a sub-second remainder is rounded **up**, so the wait
-    /// never resolves before `deadline`.
+    /// never fires *early due to truncation* — the round-up holds in the captured
+    /// frame (`now + ceil(deadline - now) >= deadline`).
+    ///
+    /// **Clock frame — absolute honoring is subject to worker↔database skew.** Like
+    /// every [`WorkflowContext::timer`], the durable timer's absolute fire instant is
+    /// anchored to the Postgres clock (`fires_at = db_now + remaining`), while
+    /// `remaining` is computed against the captured *worker* wall clock. Honoring
+    /// `deadline` to sub-second **absolute** precision therefore assumes NTP-synced
+    /// worker and database clocks; a worker running ahead of the database can fire
+    /// slightly early in DB-clock terms. The skew is normally well below the
+    /// whole-second timer granularity. The round-up eliminates truncation-induced
+    /// early fires, not clock skew — matching the hand-rolled `ctx.timer(id,
+    /// (deadline - system_now()).num_seconds())` pattern this method replaces.
     ///
     /// The timer lowers onto the existing `TimerStarted`/`TimerFired` events and the
     /// existing suspension/`match_timer` path — a `sleep_until` timer is byte-identical
