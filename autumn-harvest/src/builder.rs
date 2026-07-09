@@ -129,6 +129,11 @@ pub struct HarvestBuilder {
     /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
     /// optional custom deliverer.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    /// Retention window for request-scoped start idempotency keys (issue #808).
+    /// A repeated `idempotency_key` within this window deduplicates onto the same
+    /// execution; after it elapses the key is reusable. `None` uses
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
+    start_idempotency_window: Option<Duration>,
 }
 
 impl Default for HarvestBuilder {
@@ -166,6 +171,7 @@ impl Default for HarvestBuilder {
             usage_max_groups: None,
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
+            start_idempotency_window: None,
         }
     }
 }
@@ -278,6 +284,10 @@ pub struct BuiltHarvest {
     /// custom one — the plugin substitutes its default `reqwest`-based
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    /// Retention window for request-scoped start idempotency keys (issue #808).
+    /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
+    /// (24h) when unset on the builder.
+    pub start_idempotency_window: Duration,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -1265,6 +1275,28 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the retention window for request-scoped start idempotency keys
+    /// (issue #808).
+    ///
+    /// A repeated `idempotency_key` on `POST /workflows/{name}/start` within this
+    /// window deduplicates onto the same execution (returning it as a no-op);
+    /// once the window elapses, the same key is reusable. Defaults to
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
+    #[must_use]
+    pub const fn start_idempotency_window(mut self, window: Duration) -> Self {
+        self.start_idempotency_window = Some(window);
+        self
+    }
+
+    /// The configured start-idempotency retention window, or `None` if unset
+    /// (the default 24h applies at build time).
+    ///
+    /// Read-only pre-build accessor (issue #695).
+    #[must_use]
+    pub const fn start_idempotency_window_config(&self) -> Option<Duration> {
+        self.start_idempotency_window
+    }
+
     /// Override the ceiling on the `[from, to]` window accepted by
     /// `GET /admin/usage` (issue #596).
     ///
@@ -1421,6 +1453,7 @@ impl HarvestBuilder {
     /// when activities sharing a `concurrency_key` declare different
     /// `max_concurrent` values, or when a [`WorkflowSchedule`] references a
     /// workflow name not registered on this builder.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
         self.retention
             .validate()
@@ -1526,6 +1559,9 @@ impl HarvestBuilder {
             usage_window_ceiling,
             usage_max_groups,
             completion_callback_config: self.completion_callback_config,
+            start_idempotency_window: self
+                .start_idempotency_window
+                .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
         })
     }
 }

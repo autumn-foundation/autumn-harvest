@@ -586,12 +586,17 @@
             "name": "completion_callbacks",
             "required": false,
             "description": "Per-execution completion-callback targets (issue #605): a JSON array of {url, filter} objects. Each target's URL is validated against the operator-configured SSRF host allowlist before admission; a non-allowlisted target rejects the start with 422."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined)."
           }
         ]
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -604,13 +609,15 @@
           "batched",
           "flushed",
           "batch_key",
-          "max_size"
+          "max_size",
+          "started_fresh",
+          "deduplicated"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, or when input exceeds the workflow input cap."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, or when idempotency_key is combined with a throttle/debounce/batch policy (issue #808)."
         },
         {
           "status": 409,

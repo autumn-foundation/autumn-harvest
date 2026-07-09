@@ -347,6 +347,11 @@ pub struct HarvestApiState {
     /// Default **off**: responses are byte-for-byte identical to a build
     /// without the feature.
     decode_payloads_on_read: Arc<Mutex<bool>>,
+    /// Retention window for request-scoped start idempotency keys (issue #808),
+    /// mirrored from `BuiltHarvest::start_idempotency_window` at startup so the
+    /// HTTP start route dedups a repeated `idempotency_key` within this window.
+    /// Defaults to 24h.
+    start_idempotency_window: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -390,6 +395,9 @@ impl Default for HarvestApiState {
                 autumn_harvest::payload_codec::PayloadCodecs::default(),
             )),
             decode_payloads_on_read: Arc::new(Mutex::new(false)),
+            start_idempotency_window: Arc::new(Mutex::new(
+                autumn_harvest::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+            )),
         }
     }
 }
@@ -720,6 +728,32 @@ impl HarvestApiState {
             .default_debounce_max_wait
             .lock()
             .expect("harvest api state lock poisoned") = max_wait;
+    }
+
+    /// Returns the retention window for request-scoped start idempotency keys
+    /// (issue #808). Defaults to 24h.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
+    pub fn start_idempotency_window(&self) -> std::time::Duration {
+        *self
+            .start_idempotency_window
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the start-idempotency retention window (issue #808).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_start_idempotency_window(&self, window: std::time::Duration) {
+        *self
+            .start_idempotency_window
+            .lock()
+            .expect("harvest api state lock poisoned") = window;
     }
 
     /// Returns the ceiling on the `[from, to]` window accepted by
@@ -1630,6 +1664,16 @@ pub(crate) struct StartWorkflowResponse {
     workflow_name: String,
     workflow_id: String,
     state: String,
+    /// `true` when this request created the execution, `false` when it
+    /// deduplicated onto an earlier same-`idempotency_key` start (issue #808).
+    /// Populated only on the idempotency-key path; omitted (byte-identical to a
+    /// pre-#808 response) otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_fresh: Option<bool>,
+    /// `true` when this request was a no-op that returned an existing execution
+    /// via a matching `idempotency_key` (issue #808). Omitted on the no-key path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deduplicated: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1933,6 +1977,15 @@ pub(crate) struct StartWorkflowRequest {
     context_headers: Option<std::collections::HashMap<String, String>>,
     /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
     priority: Option<autumn_harvest::types::Priority>,
+    /// Request-scoped idempotency key (issue #808). Two starts carrying the same
+    /// key (within the configured retention window, default 24h) converge on
+    /// exactly one execution — the second returns the same `execution_id` as a
+    /// no-op (`200`), with no second `WorkflowStarted` event. Dedup scope is
+    /// `(workflow_name, idempotency_key)`, independent of `workflow_id`. The
+    /// `Idempotency-Key` request header takes precedence over this field.
+    /// Mutually exclusive with a throttle / debounce / batch policy.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 impl StartWorkflowRequest {
@@ -1962,6 +2015,7 @@ impl StartWorkflowRequest {
             completion_callbacks: None,
             context_headers: None,
             priority: None,
+            idempotency_key: None,
         }
     }
 
@@ -2000,6 +2054,7 @@ impl StartWorkflowRequest {
             completion_callbacks: None,
             context_headers: None,
             priority: None,
+            idempotency_key: None,
         }
     }
 }
@@ -3844,6 +3899,7 @@ pub const fn management_api_request_fields()
                 "batch_max_size",
                 "batch_max_wait",
                 "completion_callbacks",
+                "idempotency_key",
             ]),
         ),
         (
@@ -4247,6 +4303,8 @@ pub const fn management_api_response_fields()
             // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
             // A debounced workflow (issue #499) instead returns 202 Accepted with the
             // debounce fields below (no execution_id exists until the scanner fires).
+            // With an idempotency_key (issue #808) the response also carries the
+            // started_fresh/deduplicated flags (200 on a dedup replay).
             Some(&[
                 "execution_id",
                 "workflow_name",
@@ -4260,6 +4318,8 @@ pub const fn management_api_response_fields()
                 "flushed",
                 "batch_key",
                 "max_size",
+                "started_fresh",
+                "deduplicated",
             ]),
         ),
         (
@@ -8040,6 +8100,40 @@ pub(crate) async fn start_workflow(
             return e.into_response();
         }
     };
+    // Request-scoped idempotency key (issue #808). The `Idempotency-Key` request
+    // header wins over the body `idempotency_key` field. A present-but-empty (or
+    // whitespace-only) key is a client error surfaced as `400`, never silently
+    // downgraded to a non-idempotent start.
+    let idempotency_key: Option<String> = {
+        let raw = if let Some(hv) = headers.get("idempotency-key") {
+            match hv.to_str() {
+                Ok(s) => Some(s.to_string()),
+                Err(_) => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "Idempotency-Key header must be valid UTF-8"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            request.idempotency_key.clone()
+        };
+        match raw {
+            Some(s) if s.trim().is_empty() => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "idempotency_key must not be empty" })),
+                )
+                    .into_response();
+            }
+            Some(s) => Some(s.trim().to_string()),
+            None => None,
+        }
+    };
+
     let explicit_workflow_id = request.workflow_id.is_some();
     let workflow_id = request
         .workflow_id
@@ -8149,6 +8243,20 @@ pub(crate) async fn start_workflow(
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "start throttle is mutually exclusive with debounce and batching"
+            })),
+        )
+            .into_response();
+    }
+
+    // issue #808: a request-scoped idempotency key requires a synchronous, single
+    // execution id to converge on. Throttle / debounce / batch all defer the
+    // start and return no exec id up front, so "converge on the same exec id" has
+    // no coherent meaning combined with them — reject the combination.
+    if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "idempotency_key cannot be combined with throttle/debounce/batch start"
             })),
         )
             .into_response();
@@ -9412,6 +9520,186 @@ pub(crate) async fn start_workflow(
         }
     }
 
+    // issue #808: request-scoped idempotency. The reserve + start run in a single
+    // transaction (reserve short-circuits the reuse-policy matrix entirely); a
+    // same-key retry converges on the same execution as a `200` no-op. This is
+    // mutually exclusive with throttle/debounce/batch (rejected above), so
+    // `throttle_reserved` is always `None` here and no token refund is needed.
+    if let Some(ref key) = idempotency_key {
+        let window_secs = api_state.start_idempotency_window().as_secs_f64();
+        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
+            &mut conn,
+            StartWorkflowParams {
+                workflow_name: &workflow_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: request
+                    .execution_timeout_secs
+                    .map(chrono::Duration::seconds)
+                    .or_else(|| {
+                        info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
+                    }),
+                memo: request.memo.clone(),
+                search_attrs: request.search_attrs.clone(),
+                reuse_policy,
+                trace_context: trace_ctx,
+                max_execution_timeout_ceiling: api_state
+                    .max_workflow_execution_timeout()
+                    .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+                concurrency_key,
+                concurrency_limit,
+                priority: request.priority.unwrap_or_default(),
+                max_workflow_input_bytes: effective_wf_cap,
+                start_at: request.start_at,
+                delay,
+                max_workflow_start_delay: max_delay_chrono,
+                owner,
+                runbook_url,
+                severity,
+                context_headers: request.context_headers.clone(),
+                sla: effective_sla,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                origin: None,
+                completion_callbacks,
+            },
+            key,
+            window_secs,
+            Some(runtime.registry.telemetry().metrics.as_ref()),
+        )
+        .await;
+
+        return match idem {
+            Ok(autumn_harvest::IdempotentStartOutcome::Started(start)) => {
+                let exec_id_str = start.exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(error = %audit_err, "audit insert failed for workflow.start");
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+                (
+                    if start.created {
+                        axum::http::StatusCode::CREATED
+                    } else {
+                        axum::http::StatusCode::OK
+                    },
+                    Json(StartWorkflowResponse {
+                        execution_id: start.exec_id.to_string(),
+                        workflow_name: start.workflow_name,
+                        workflow_id: start.workflow_id,
+                        state: start.state,
+                        started_fresh: Some(start.created),
+                        deduplicated: Some(false),
+                    }),
+                )
+                    .into_response()
+            }
+            Ok(autumn_harvest::IdempotentStartOutcome::Deduplicated {
+                exec_id: dup_exec_id,
+                workflow_id: dup_workflow_id,
+                state: dup_state,
+            }) => {
+                // A dedup replay is a successful, idempotent start — audit it as
+                // workflow.start succeeded pointing at the original execution.
+                let exec_id_str = dup_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    axum::http::StatusCode::OK,
+                    Json(StartWorkflowResponse {
+                        execution_id: dup_exec_id.to_string(),
+                        workflow_name: workflow_name.clone(),
+                        workflow_id: dup_workflow_id,
+                        state: dup_state,
+                        started_fresh: Some(false),
+                        deduplicated: Some(true),
+                    }),
+                )
+                    .into_response()
+            }
+            Err(HarvestError::AlreadyExists {
+                existing_exec_id,
+                existing_state,
+            }) => {
+                let exec_id_str = existing_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some("workflow already exists"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(AlreadyExistsResponse {
+                        existing_execution_id: existing_exec_id.to_string(),
+                        existing_state,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: None,
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                map_error(e).into_response()
+            }
+        };
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
@@ -9558,6 +9846,10 @@ pub(crate) async fn start_workflow(
                     workflow_name: start.workflow_name,
                     workflow_id: start.workflow_id,
                     state: start.state,
+                    // No-key path: omit the #808 flags so the response is
+                    // byte-for-byte identical to a pre-#808 build.
+                    started_fresh: None,
+                    deduplicated: None,
                 }),
             )
                 .into_response()
@@ -14122,6 +14414,8 @@ pub(crate) async fn trigger_dag_run_inner(
                     workflow_name: started.workflow_name,
                     workflow_id: started.workflow_id,
                     state: started.state,
+                    started_fresh: None,
+                    deduplicated: None,
                 }),
             ))
         }

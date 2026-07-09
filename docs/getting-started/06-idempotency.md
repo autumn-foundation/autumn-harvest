@@ -75,6 +75,57 @@ exactly. Full contract and curl examples:
 [signals chapter](04-signals.md#idempotent-standalone-signals-over-http-issue-521)
 and the [signal-delivery section of the management-API reference](../management-api.md#signal-delivery-post-workflowsidsignalsignal_name).
 
+## Idempotent workflow start — `idempotency_key` vs `workflow_id` (issue #808)
+
+The same at-least-once problem hits the **start** path: a webhook or event
+source that retries `POST /workflows/{name}/start` would launch a redundant
+execution on every redelivery. Two knobs deduplicate a start, and they answer
+**different questions**:
+
+| | `workflow_id` (business identity) | `idempotency_key` (delivery identity) |
+|---|---|---|
+| Answers | "Is this the *same logical run*?" | "Is this the *same request*?" |
+| Dedup scope | `(workflow_name, workflow_id)` via the `reuse_policy` matrix | `(workflow_name, idempotency_key)`, **independent of `workflow_id`** |
+| Works when `workflow_id` is auto-generated per request | No (each request is a new id) | **Yes** — that's the point |
+| On a duplicate | Depends on `reuse_policy` (may `409`, attach, or start fresh) | Always a `200` no-op returning the **same** `execution_id` |
+
+`idempotency_key` is checked **first** and short-circuits the `reuse_policy`
+matrix entirely. Supply it out-of-band via the `Idempotency-Key` request header
+(preferred — the raw body stays your workflow input) or the body
+`idempotency_key` field; the header wins when both are present.
+
+```bash
+# First delivery — creates the run (201, started_fresh: true).
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Idempotency-Key: webhook-evt-abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": 42}}'
+
+# Retry (same key) — no-op returning the SAME execution_id
+# (200, deduplicated: true, no second WorkflowStarted, no second task).
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Idempotency-Key: webhook-evt-abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": 42}}'
+```
+
+Semantics:
+
+- **Exactly one execution** even under N simultaneous same-key starts
+  (concurrency-safe by a composite-PK upsert).
+- **Retention window** (default 24h, `HarvestBuilder::start_idempotency_window`):
+  after it elapses the key is reusable and starts a fresh run.
+- **Byte-identical when unused** — a start with no key omits the
+  `started_fresh`/`deduplicated` response fields entirely.
+- **Empty key → `400`**; **combining a key with a throttle/debounce/batch
+  policy → `400`** (those defer the start and expose no synchronous
+  `execution_id` to converge on).
+- Shard-local, and it introduces **no new event** — the dedup happens before
+  `WorkflowStarted` is ever appended, so replay is unaffected.
+
+See the [start route in the management-API contract](../api-contract.json) for
+the full request/response schema.
+
 ---
 
 [← Child workflows](05-child-workflows.md) · [Index](README.md) · [Next: Reliability knobs →](07-reliability-knobs.md)
