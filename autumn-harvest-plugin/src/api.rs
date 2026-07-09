@@ -8087,30 +8087,6 @@ pub(crate) async fn start_workflow(
         .into_response();
     }
 
-    let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
-        Ok(p) => p,
-        Err(e) => {
-            if let Ok(pool) = api_state.storage_pool()
-                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-            {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_WORKFLOW_START,
-                    target_type: TARGET_WORKFLOW,
-                    target_id: Some(workflow_name.as_str()),
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: STATUS_FAILED,
-                    error_summary: Some("invalid reuse policy"),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
-            }
-            return e.into_response();
-        }
-    };
     // Request-scoped idempotency key (issue #808). The `Idempotency-Key` request
     // header wins over the body `idempotency_key` field. A present-but-empty (or
     // whitespace-only) key is a client error surfaced as `400`, never silently
@@ -8209,21 +8185,28 @@ pub(crate) async fn start_workflow(
             .pick_for_new_workflow(&workflow_name, &workflow_id)
     };
 
-    // issue #808 (Codex P2): a *committed* keyed replay short-circuits to the
-    // `200` no-op BEFORE any fresh-start-only rejection: the
-    // throttle/debounce/batch mutual-exclusion `400` below, the input-schema
-    // (#373) / completion-callback SSRF (#605) / delay-`start_at` validations,
-    // and the admission gate (#377). Those rules govern *fresh* work; a retry
-    // of an already-successful keyed start creates no new work, so tightening
-    // any of them between the original delivery and a retry must not reject the
-    // retry. In particular, if the workflow gained a throttle/debounce/batch
-    // policy *after* the original keyed start succeeded, an at-least-once retry
-    // must still return the existing execution as a `200` no-op — never the
-    // mutual-exclusion `400` — because the retry creates no deferred start. This
-    // probe therefore runs before the debounce/batch/throttle applicability is
-    // even computed; those apply only to a genuine fresh keyed start (a probe
-    // miss). We probe the keyed claim read-only on the same key-derived `shard`
-    // the
+    // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
+    // precede ALL fresh-start-only rejections (reuse-policy parse,
+    // throttle/debounce/batch mutual-exclusion, input-schema #373,
+    // completion-callback SSRF #605, delay/`start_at`, admission gate #377) so a
+    // retry of an already-successful key always returns the `200` no-op
+    // regardless of a now-invalid replay body or a policy tightened after the
+    // original delivery. Those rules govern *fresh* work; a retry of an
+    // already-successful keyed start creates no new work, so tightening any of
+    // them — or sending a now-invalid `reuse_policy` string, or the workflow
+    // gaining a throttle/debounce/batch policy — between the original delivery
+    // and a retry must not reject the retry. The probe therefore runs before
+    // `parse_reuse_policy` and before the debounce/batch/throttle applicability
+    // is even computed; those apply only to a genuine fresh keyed start (a probe
+    // miss). Only genuine prerequisites run above it: key validation, the
+    // registry/DAG 404/400 existence check, and workflow_id + shard resolution
+    // (needed to know which shard to probe). The `terminate_if_running` admin
+    // gate at the very top of the handler is an authorization boundary (not a
+    // fresh-start validation) and deliberately stays ahead of the probe — a
+    // non-admin must never be able to invoke that capability, and a legitimate
+    // idempotent retry comes from the same authorized caller anyway.
+    //
+    // We probe the keyed claim read-only on the same key-derived `shard` the
     // reserve below uses (so we observe the claim the original delivery wrote),
     // and a hit returns the original execution verbatim — standard
     // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
@@ -8298,6 +8281,37 @@ pub(crate) async fn start_workflow(
             }
         }
     }
+
+    // Fresh-start-only validation: parse the reuse policy. Runs AFTER the
+    // committed-replay probe above (issue #808, Codex P2) so a retry of an
+    // already-successful keyed start with a now-invalid `reuse_policy` string
+    // returns the `200` no-op rather than a `400` — the retry's body is
+    // irrelevant on a dedup hit. The parsed `reuse_policy` is only consumed by
+    // the reserve+start path further down.
+    let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid reuse policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
+    };
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced

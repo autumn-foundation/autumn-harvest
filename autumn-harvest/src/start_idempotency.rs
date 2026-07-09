@@ -72,36 +72,54 @@ pub const DEFAULT_START_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(24 * 
 /// per-tick cost on a large backlog.
 pub const START_IDEMPOTENCY_PURGE_BATCH: i64 = 1000;
 
-/// Process-global retention window (seconds) consulted by the background expiry
-/// sweep ([`purge_expired_start_idempotency`]).
+/// The default retention window expressed as `f64` seconds, for the const
+/// initializer of [`PURGE_WINDOW_SECS_BITS`] (`Duration::as_secs_f64` is not
+/// `const`).
+const DEFAULT_WINDOW_SECS_F64: f64 = 24.0 * 60.0 * 60.0;
+
+/// Process-global expiry-sweep retention window in **seconds**, stored as the
+/// bit pattern of an `f64` ([`f64::to_bits`]) so it carries the **same
+/// sub-second precision as the reserve path's `Duration::as_secs_f64()`**
+/// (issue #808, Codex P2).
+///
+/// The reserve `WHERE created_at <= now() - make_interval(secs => $window)`
+/// guard treats a key as live for exactly `window` seconds. If the sweep used a
+/// *truncated* whole-second window (`Duration::as_secs()`), a 1500 ms config
+/// would let the sweep DELETE a claim after 1.0 s while the reserve still
+/// considers it live until 1.5 s — a same-key retry at 1.2 s would then find no
+/// claim and start a **second** execution inside the configured window. Storing
+/// the window as `f64` seconds guarantees the sweep window *equals* the reserve
+/// window, so the sweep never deletes a claim the reserve still considers live.
 ///
 /// Set once at `Plugin::build` time from the same `HarvestBuilder` config the
 /// HTTP reserve path reads, via [`set_purge_window_secs`] — mirroring the
 /// `GLOBAL_CALLBACK_CONFIG` pattern (issue #605) so the sweep does not require a
 /// new parameter threaded through `enforce_timeouts_once` /
-/// `spawn_timeout_checker` and their many call sites. Stored as
-/// whole-second `u64` bits; defaults to [`DEFAULT_START_IDEMPOTENCY_WINDOW`].
-static PURGE_WINDOW_SECS: AtomicU64 = AtomicU64::new(24 * 60 * 60);
+/// `spawn_timeout_checker` and their many call sites. Defaults to
+/// [`DEFAULT_START_IDEMPOTENCY_WINDOW`].
+static PURGE_WINDOW_SECS_BITS: AtomicU64 = AtomicU64::new(DEFAULT_WINDOW_SECS_F64.to_bits());
 
 /// Set the process-global expiry-sweep retention window (issue #808).
 ///
 /// Called at plugin/runner startup from the configured
-/// `HarvestBuilder::start_idempotency_window`. A non-positive or unrepresentable
-/// duration falls back to [`DEFAULT_START_IDEMPOTENCY_WINDOW`].
+/// `HarvestBuilder::start_idempotency_window`. Stored with full sub-second
+/// precision (matching the reserve path). A non-positive or non-finite duration
+/// falls back to [`DEFAULT_START_IDEMPOTENCY_WINDOW`].
 pub fn set_purge_window_secs(window: Duration) {
-    let secs = window.as_secs();
-    let effective = if secs == 0 {
-        DEFAULT_START_IDEMPOTENCY_WINDOW.as_secs()
-    } else {
+    let secs = window.as_secs_f64();
+    let effective = if secs.is_finite() && secs > 0.0 {
         secs
+    } else {
+        DEFAULT_START_IDEMPOTENCY_WINDOW.as_secs_f64()
     };
-    PURGE_WINDOW_SECS.store(effective, Ordering::Relaxed);
+    PURGE_WINDOW_SECS_BITS.store(effective.to_bits(), Ordering::Relaxed);
 }
 
-/// The current process-global expiry-sweep retention window in seconds.
+/// The current process-global expiry-sweep retention window in seconds
+/// (sub-second precise), matching the reserve path's window exactly.
 #[must_use]
-pub fn purge_window_secs() -> u64 {
-    PURGE_WINDOW_SECS.load(Ordering::Relaxed)
+pub fn purge_window_secs() -> f64 {
+    f64::from_bits(PURGE_WINDOW_SECS_BITS.load(Ordering::Relaxed))
 }
 
 /// The `INSERT ... ON CONFLICT DO UPDATE` reserve/claim statement.
@@ -189,14 +207,32 @@ mod pure_tests {
     }
 
     #[test]
-    fn set_purge_window_clamps_zero_to_default() {
-        set_purge_window_secs(Duration::from_secs(7200));
-        assert_eq!(purge_window_secs(), 7200);
-        set_purge_window_secs(Duration::ZERO);
-        assert_eq!(
-            purge_window_secs(),
-            DEFAULT_START_IDEMPOTENCY_WINDOW.as_secs()
+    fn purge_window_precision_and_clamping() {
+        // Sub-second precision (issue #808, Codex P2): the sweep window must be
+        // >= the reserve window (`Duration::as_secs_f64()`) so the sweep never
+        // deletes a claim the reserve still considers live. A truncating u64
+        // store would make the sweep window 1.0s for a 1500ms config while the
+        // reserve treats the key as live until 1.5s — a sub-second dedup gap.
+        let window = Duration::from_millis(1500);
+        set_purge_window_secs(window);
+        let sweep_window = purge_window_secs();
+        assert!(
+            sweep_window >= window.as_secs_f64(),
+            "sweep window {sweep_window} must not be shorter than reserve window {}",
+            window.as_secs_f64()
         );
+        assert!((sweep_window - 1.5).abs() < 1e-9);
+
+        // Whole-second window round-trips exactly.
+        set_purge_window_secs(Duration::from_secs(7200));
+        assert!((purge_window_secs() - 7200.0).abs() < 1e-9);
+
+        // Non-positive falls back to the default window.
+        set_purge_window_secs(Duration::ZERO);
+        assert!(
+            (purge_window_secs() - DEFAULT_START_IDEMPOTENCY_WINDOW.as_secs_f64()).abs() < 1e-9
+        );
+
         // Restore default so ordering-independent test runs don't leak state.
         set_purge_window_secs(DEFAULT_START_IDEMPOTENCY_WINDOW);
     }
@@ -206,7 +242,7 @@ mod pure_tests {
 
 #[cfg(feature = "db")]
 mod db_impl {
-    use super::{StartIdempotencyReservation, reserve_start_idempotency_stmt, window_to_secs_f64};
+    use super::{StartIdempotencyReservation, reserve_start_idempotency_stmt};
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
     use diesel::OptionalExtension;
@@ -559,8 +595,10 @@ mod db_impl {
             .await
         }
 
-        let window_secs =
-            window_to_secs_f64(std::time::Duration::from_secs(super::purge_window_secs()));
+        // Sub-second precise (issue #808, Codex P2): use the same `f64`-seconds
+        // window the reserve path binds, so the sweep never deletes a claim the
+        // reserve still considers live.
+        let window_secs = super::purge_window_secs();
         let mut total = 0usize;
         match sharded_pool {
             Some(sp) if !shard_assignments.is_empty() => {
