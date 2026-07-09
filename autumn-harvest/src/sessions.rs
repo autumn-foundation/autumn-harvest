@@ -126,6 +126,16 @@ impl std::fmt::Display for BrokenSessionReason {
     }
 }
 
+/// The set of conditions used to evaluate if an active session should be marked broken.
+#[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SessionHealthConditions {
+    pub host_heartbeat_stale: bool,
+    pub host_status_draining_or_stopped: bool,
+    pub owning_workflow_terminal: bool,
+    pub lease_expired: bool,
+}
+
 /// Pure decision: should an `ACTIVE` session be marked `BROKEN`?
 ///
 /// Checked in priority order — a dead host is reported before a merely
@@ -134,20 +144,16 @@ impl std::fmt::Display for BrokenSessionReason {
 /// health or lease); an expired lease is checked last, and only once none
 /// of the above apply. Returns `None` when none of the conditions hold.
 #[must_use]
-#[allow(clippy::fn_params_excessive_bools)]
 pub const fn broken_session_reason(
-    host_heartbeat_stale: bool,
-    host_status_draining_or_stopped: bool,
-    owning_workflow_terminal: bool,
-    lease_expired: bool,
+    conditions: SessionHealthConditions,
 ) -> Option<BrokenSessionReason> {
-    if host_heartbeat_stale {
+    if conditions.host_heartbeat_stale {
         Some(BrokenSessionReason::HostWorkerLostHeartbeat)
-    } else if host_status_draining_or_stopped {
+    } else if conditions.host_status_draining_or_stopped {
         Some(BrokenSessionReason::HostWorkerDraining)
-    } else if owning_workflow_terminal {
+    } else if conditions.owning_workflow_terminal {
         Some(BrokenSessionReason::OwningWorkflowTerminal)
-    } else if lease_expired {
+    } else if conditions.lease_expired {
         Some(BrokenSessionReason::LeaseExpired)
     } else {
         None
@@ -700,12 +706,12 @@ async fn resolve_broken_reason(
         false
     };
 
-    Ok(broken_session_reason(
+    Ok(broken_session_reason(SessionHealthConditions {
         host_heartbeat_stale,
         host_status_draining_or_stopped,
         owning_workflow_terminal,
-        expired,
-    ))
+        lease_expired: expired,
+    }))
 }
 
 /// Mark one session `BROKEN` and fail every `PENDING`/`RUNNING` member
@@ -929,14 +935,27 @@ mod tests {
 
     #[test]
     fn broken_session_reason_none_when_healthy_and_leased() {
-        assert_eq!(broken_session_reason(false, false, false, false), None);
+        assert_eq!(
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: false,
+                owning_workflow_terminal: false,
+                lease_expired: false
+            }),
+            None
+        );
     }
 
     #[test]
     fn broken_session_reason_stale_heartbeat_wins_priority() {
         // All four conditions true -- heartbeat loss is reported first.
         assert_eq!(
-            broken_session_reason(true, true, true, true),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: true,
+                host_status_draining_or_stopped: true,
+                owning_workflow_terminal: true,
+                lease_expired: true
+            }),
             Some(BrokenSessionReason::HostWorkerLostHeartbeat)
         );
     }
@@ -944,7 +963,12 @@ mod tests {
     #[test]
     fn broken_session_reason_draining_reported_when_alive_but_draining() {
         assert_eq!(
-            broken_session_reason(false, true, false, false),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: true,
+                owning_workflow_terminal: false,
+                lease_expired: false
+            }),
             Some(BrokenSessionReason::HostWorkerDraining)
         );
     }
@@ -952,7 +976,12 @@ mod tests {
     #[test]
     fn broken_session_reason_lease_expired_reported_when_host_otherwise_fine() {
         assert_eq!(
-            broken_session_reason(false, false, false, true),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: false,
+                owning_workflow_terminal: false,
+                lease_expired: true
+            }),
             Some(BrokenSessionReason::LeaseExpired)
         );
     }
@@ -960,7 +989,12 @@ mod tests {
     #[test]
     fn broken_session_reason_draining_takes_priority_over_lease_expiry() {
         assert_eq!(
-            broken_session_reason(false, true, false, true),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: true,
+                owning_workflow_terminal: false,
+                lease_expired: true
+            }),
             Some(BrokenSessionReason::HostWorkerDraining)
         );
     }
@@ -968,7 +1002,12 @@ mod tests {
     #[test]
     fn broken_session_reason_owning_workflow_terminal_reported_when_host_otherwise_fine() {
         assert_eq!(
-            broken_session_reason(false, false, true, false),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: false,
+                owning_workflow_terminal: true,
+                lease_expired: false
+            }),
             Some(BrokenSessionReason::OwningWorkflowTerminal)
         );
     }
@@ -976,7 +1015,12 @@ mod tests {
     #[test]
     fn broken_session_reason_draining_takes_priority_over_owning_workflow_terminal() {
         assert_eq!(
-            broken_session_reason(false, true, true, false),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: true,
+                owning_workflow_terminal: true,
+                lease_expired: false
+            }),
             Some(BrokenSessionReason::HostWorkerDraining)
         );
     }
@@ -984,7 +1028,12 @@ mod tests {
     #[test]
     fn broken_session_reason_owning_workflow_terminal_takes_priority_over_lease_expiry() {
         assert_eq!(
-            broken_session_reason(false, false, true, true),
+            broken_session_reason(SessionHealthConditions {
+                host_heartbeat_stale: false,
+                host_status_draining_or_stopped: false,
+                owning_workflow_terminal: true,
+                lease_expired: true
+            }),
             Some(BrokenSessionReason::OwningWorkflowTerminal)
         );
     }
