@@ -4893,7 +4893,7 @@
       "path": "/admin/schedules/{id}/runs",
       "category": "schedule",
       "read_only": true,
-      "description": "List the workflow executions a schedule launched, newest-first, each with its terminal outcome and dispatch origin (scheduled/backfill/manual_trigger), plus a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing.",
+      "description": "List the workflow executions a schedule launched, newest-slot-first (ordered by scheduled_for, falling back to started_at for slot-less manual fires), each with its terminal state, a collapsed outcome (completed/failed/timed_out/cancelled/terminated/running), the first line of the error for terminally-failed runs, and the dispatch origin (scheduled/backfill/manual_trigger). Echoes the schedule's next_run_at and a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing. 404s an unknown schedule id.",
       "params": [
         {
           "name": "state",
@@ -4918,7 +4918,7 @@
         {
           "name": "limit",
           "type": "integer",
-          "description": "Maximum runs to return (default 100, max 1000). Reported via the echoed limit and next_cursor; never silently truncated."
+          "description": "Maximum runs to return (default 20, clamped 1-200). A value above 200 is clamped and reported via the echoed limit and next_cursor; a limit below 1 or non-integer is a 400."
         },
         {
           "name": "cursor",
@@ -4933,6 +4933,7 @@
         "fields": [
           "schedule_id",
           "status",
+          "next_run_at",
           "runs",
           "summary",
           "limit",
@@ -4943,11 +4944,15 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid state, origin, since/until, limit, or cursor."
+          "description": "Malformed schedule id, or invalid state, origin, since/until, limit, or cursor."
         },
         {
           "status": 404,
-          "description": "Schedule id is not a valid UUID."
+          "description": "Unknown schedule id: no schedule with that id was found and every shard was reachable, so its absence is authoritative."
+        },
+        {
+          "status": 503,
+          "description": "Indeterminate existence (retryable): the schedule id was not found and at least one shard is unreachable, so its absence cannot be confirmed. Retry once shards recover."
         }
       ]
     },

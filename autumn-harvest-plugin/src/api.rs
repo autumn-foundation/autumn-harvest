@@ -4835,6 +4835,7 @@ pub const fn management_api_response_fields()
             Some(&[
                 "schedule_id",
                 "status",
+                "next_run_at",
                 "runs",
                 "summary",
                 "limit",
@@ -14376,23 +14377,113 @@ async fn get_schedule_decisions(
 /// cadence summary that counts only `scheduled`-origin runs so a backfill storm or
 /// ad-hoc trigger never inflates the failure ratio. Fans out across shards and
 /// flags partial results when a shard is unavailable (never a hard 500).
-async fn list_schedule_runs_handler(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path(id_str): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
-) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+/// Resolve the schedule row (on whichever shard owns it) so the runs handler can
+/// echo `next_run_at` and, critically, `404` an unknown id rather than returning a
+/// silently-empty run list (issue #762).
+///
+/// A not-found result is `404` only when every *expected* shard — every shard
+/// with a live pool **and** every shard the router already knows about — was
+/// queried successfully; if any expected shard could not be checked (no
+/// configured pool yet mid a shard-add rollout, an unreachable connection, or a
+/// per-shard lookup error) the row's existence is indeterminate, so it returns
+/// `503` rather than lying with a definitive `404` (issue #762 review). Never
+/// `500`.
+///
+/// The 404-vs-503 decision itself is the pure [`resolve_not_found_outcome`] so
+/// it can be unit-tested without a database or shard fan-out.
+async fn resolve_schedule_for_runs(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+) -> Result<HarvestSchedule, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    // Consult every shard the router knows about, not just those with a live
+    // pool — a shard mid a shard-add rollout (readable_shards widened before
+    // this process has its pool wired up) must count as unreachable, not be
+    // silently omitted. Mirrors `workflow_reachability`/`workflow_count`.
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
+
+    let mut any_shard_unreachable = false;
+    for shard_id in &expected {
+        // Router-known but poolless (mid shard-add): can't check it, so treat
+        // it as unreachable — a not-found result becomes 503-indeterminate
+        // rather than an authoritative 404.
+        let Some(shard_pool) = pools.get(shard_id) else {
+            any_shard_unreachable = true;
+            continue;
+        };
+        // An unreachable shard is skipped rather than 500ing the whole request
+        // (mirroring the run fan-out's partial-result philosophy).
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            any_shard_unreachable = true;
+            continue;
+        };
+        let row: Result<Option<HarvestSchedule>, _> = dsl::harvest_schedules
+            .find(schedule_id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional();
+        match row {
+            Ok(Some(row)) => return Ok(row),
+            Ok(None) => {}
+            // A per-shard lookup error (DB restarted after checkout, shard
+            // mid-migration) is treated like an unreachable shard: mark it and
+            // keep scanning, so a schedule living on a *later* healthy shard is
+            // still resolved instead of returning a blanket 503.
+            Err(_) => any_shard_unreachable = true,
+        }
+    }
+
+    match resolve_not_found_outcome(any_shard_unreachable) {
+        // Not found, but at least one expected shard could not be checked —
+        // existence is indeterminate. Never lie with a 404, never 500.
+        ScheduleExistenceOutcome::Indeterminate => {
+            Err(AutumnError::service_unavailable_msg(format!(
+                "cannot determine whether schedule {schedule_id} exists: one or more \
+                 shards are unreachable; retry once shards recover"
+            )))
+        }
+        // Not found and every expected shard was reachable — genuinely unknown.
+        ScheduleExistenceOutcome::NotFound => Err(AutumnError::not_found_msg(format!(
+            "schedule {schedule_id}"
+        ))),
+    }
+}
+
+/// The 404-vs-503 decision for a not-found schedule lookup (issue #762 review).
+///
+/// Pure so it can be unit-tested without a database or shard fan-out.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ScheduleExistenceOutcome {
+    /// Every expected shard was queried successfully and none had the row — the
+    /// id is genuinely unknown, so an authoritative `404`.
+    NotFound,
+    /// The row wasn't found but at least one expected shard could not be checked
+    /// (no configured pool, unreachable connection, or a per-shard lookup
+    /// error) — existence is indeterminate, so `503` rather than a lying `404`.
+    Indeterminate,
+}
+
+/// Decide 404 vs 503 for a not-found schedule: an authoritative `404` only when
+/// every expected shard was checked successfully, otherwise `503`.
+const fn resolve_not_found_outcome(any_shard_unreachable: bool) -> ScheduleExistenceOutcome {
+    if any_shard_unreachable {
+        ScheduleExistenceOutcome::Indeterminate
+    } else {
+        ScheduleExistenceOutcome::NotFound
+    }
+}
+
+/// Validate the state/origin vocabularies up front so a typo is a `400`, not a
+/// silently-empty match.
+fn validate_run_filters(params: &schedule_runs::ScheduleRunsParams) -> Result<(), AutumnError> {
     const KNOWN_ORIGINS: [&str; 3] = [
         autumn_harvest::execution::ORIGIN_SCHEDULED,
         autumn_harvest::execution::ORIGIN_BACKFILL,
         autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER,
     ];
-
-    let schedule_id = parse_uuid(&id_str, "schedule id")?;
-    let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
-        .map_err(AutumnError::bad_request_msg)?;
-
-    // Validate the state/origin vocabularies up front so a typo is a 400, not a
-    // silently-empty match.
     for state in &params.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
             return Err(AutumnError::bad_request_msg(format!(
@@ -14407,8 +14498,86 @@ async fn list_schedule_runs_handler(
             )));
         }
     }
+    Ok(())
+}
 
-    let pool = api_state.storage_pool().map_err(map_error)?;
+/// Query one shard for its run list + cadence summary (issue #762).
+///
+/// Returns a [`schedule_runs::ShardRunsObservation`] rather than propagating
+/// errors so a single unreachable shard never fails the whole fan-out — the
+/// caller folds it into `build_runs_response`'s partial/unavailable status. A
+/// `None` pool (a shard the router knows about but for which this process has
+/// no pool wired up yet, mid a shard-add rollout) yields an unavailable
+/// observation rather than being silently omitted, mirroring
+/// `workflow_count::observe_shard`.
+async fn observe_schedule_runs_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    schedule_id: uuid::Uuid,
+    query: &autumn_harvest::ScheduleRunQuery,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> schedule_runs::ShardRunsObservation {
+    let unavailable = |error: String| schedule_runs::ShardRunsObservation {
+        shard_id,
+        runs: Vec::new(),
+        summary: Vec::new(),
+        error: Some(error),
+    };
+
+    let Some(pool) = pool else {
+        return unavailable(format!("shard {shard_id} has no configured storage pool"));
+    };
+    let mut conn = match acquire_conn(&pool).await {
+        Ok(conn) => conn,
+        Err(err) => return unavailable(err.to_string()),
+    };
+
+    let runs =
+        match autumn_harvest::list_schedule_runs(&mut conn, schedule_id, shard_id, query).await {
+            Ok(runs) => runs,
+            Err(err) => return unavailable(err.to_string()),
+        };
+
+    let summary = match autumn_harvest::schedule_run_state_summary(
+        &mut conn,
+        schedule_id,
+        shard_id,
+        since,
+        until,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(err) => return unavailable(err.to_string()),
+    };
+
+    schedule_runs::ShardRunsObservation {
+        shard_id,
+        runs,
+        summary,
+        error: None,
+    }
+}
+
+async fn list_schedule_runs_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+    let schedule_id = parse_uuid(&id_str, "schedule id")?;
+    let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
+        .map_err(AutumnError::bad_request_msg)?;
+
+    validate_run_filters(&params)?;
+
+    // Existence + next_run_at resolution consults the full expected shard set
+    // (router ∪ pools), so it 503s rather than 404s when a shard couldn't be
+    // checked; the runs fan-out below uses the *same* expected shard set so its
+    // partial/complete status can never read `complete` while a router-known
+    // shard was never queried (issue #762 review).
+    let schedule = resolve_schedule_for_runs(&api_state, schedule_id).await?;
+    let next_run_at = schedule.next_run_at;
 
     // Fetch limit + 1 per shard so the merge can detect whether a further page
     // exists across the combined keyset.
@@ -14421,75 +14590,33 @@ async fn list_schedule_runs_handler(
         limit: params.limit.saturating_add(1),
     };
 
+    // Fan out across every shard the router knows about (not just those with a
+    // live pool) — a router-known but poolless shard (mid a shard-add rollout)
+    // becomes an unavailable observation rather than being silently omitted, so
+    // `build_runs_response` reports `partial`/`unavailable` and never a false
+    // `complete`. Mirrors `workflow_count`/`workflow_reachability`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+
     let mut observations = Vec::new();
-    for (shard, shard_pool) in pool.iter_shards() {
-        let shard_id = shard.as_i32();
-        // Per-shard failures are recorded as an unavailable observation rather than
-        // failing the whole request, so one down shard yields a partial result.
-        let mut conn = match acquire_conn(shard_pool).await {
-            Ok(conn) => conn,
-            Err(err) => {
-                observations.push(schedule_runs::ShardRunsObservation {
-                    shard_id,
-                    runs: Vec::new(),
-                    summary: Vec::new(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-
-        let runs = match autumn_harvest::list_schedule_runs(
-            &mut conn,
-            schedule_id,
-            shard_id,
-            &query,
-        )
-        .await
-        {
-            Ok(runs) => runs,
-            Err(err) => {
-                observations.push(schedule_runs::ShardRunsObservation {
-                    shard_id,
-                    runs: Vec::new(),
-                    summary: Vec::new(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-
-        let summary = match autumn_harvest::schedule_run_state_summary(
-            &mut conn,
-            schedule_id,
-            shard_id,
-            params.since,
-            params.until,
-        )
-        .await
-        {
-            Ok(summary) => summary,
-            Err(err) => {
-                observations.push(schedule_runs::ShardRunsObservation {
-                    shard_id,
-                    runs: Vec::new(),
-                    summary: Vec::new(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-
-        observations.push(schedule_runs::ShardRunsObservation {
-            shard_id,
-            runs,
-            summary,
-            error: None,
-        });
+    for shard_id in &expected {
+        let pool = pools.get(shard_id).cloned();
+        observations.push(
+            observe_schedule_runs_shard(
+                *shard_id,
+                pool,
+                schedule_id,
+                &query,
+                params.since,
+                params.until,
+            )
+            .await,
+        );
     }
 
     Ok(Json(schedule_runs::build_runs_response(
         schedule_id,
+        next_run_at,
         params.limit,
         observations,
     )))
@@ -26713,6 +26840,79 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// A not-found schedule is an authoritative 404 only when every expected
+    /// shard was successfully checked; if any expected shard could not be
+    /// checked (unreachable, per-shard lookup error, or no configured pool) the
+    /// row's existence is indeterminate → 503, never a lying 404 (issue #762).
+    #[test]
+    fn resolve_not_found_outcome_maps_reachability_to_404_or_503() {
+        assert_eq!(
+            resolve_not_found_outcome(false),
+            ScheduleExistenceOutcome::NotFound,
+            "all expected shards checked, none had the row → authoritative 404"
+        );
+        assert_eq!(
+            resolve_not_found_outcome(true),
+            ScheduleExistenceOutcome::Indeterminate,
+            "an expected shard could not be checked → 503 indeterminate"
+        );
+    }
+
+    /// A router-known-but-poolless expected shard (mid a shard-add rollout) must
+    /// become an *unavailable* run observation — never be silently omitted — so
+    /// the fan-out's `build_runs_response` status reads `partial`/`unavailable`
+    /// rather than a false `complete` (issue #762 review). No DB needed: the
+    /// `None`-pool arm returns synchronously without touching a pool.
+    #[tokio::test]
+    async fn observe_schedule_runs_shard_poolless_shard_is_unavailable_not_complete() {
+        let query = autumn_harvest::ScheduleRunQuery {
+            states: Vec::new(),
+            origins: Vec::new(),
+            since: None,
+            until: None,
+            cursor: None,
+            limit: 21,
+        };
+
+        let obs = observe_schedule_runs_shard(
+            7,
+            None, // router-known shard, no pool wired up yet
+            uuid::Uuid::new_v4(),
+            &query,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(obs.shard_id, 7);
+        assert!(
+            obs.error.is_some(),
+            "a poolless expected shard must be an unavailable observation, not skipped"
+        );
+        assert!(obs.runs.is_empty());
+        assert!(obs.summary.is_empty());
+
+        // The unavailable observation, combined with a healthy inspected shard,
+        // must drive the report status to `partial` — never `complete`.
+        let inspected = schedule_runs::ShardRunsObservation {
+            shard_id: 0,
+            runs: Vec::new(),
+            summary: Vec::new(),
+            error: None,
+        };
+        let resp = schedule_runs::build_runs_response(
+            uuid::Uuid::new_v4(),
+            None,
+            20,
+            vec![inspected, obs],
+        );
+        assert_eq!(
+            resp.status,
+            schedule_runs::RunsReportStatus::Partial,
+            "one inspected + one unavailable expected shard → partial, not complete"
+        );
     }
 
     /// A typo'd field name on the PATCH body must be a deserialization error

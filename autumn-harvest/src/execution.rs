@@ -3738,6 +3738,27 @@ pub struct ScheduleRunRow {
     /// Dispatch origin: `scheduled` / `backfill` / `manual_trigger`. `None` only for
     /// pre-migration rows whose origin could not be reconstructed.
     pub origin: Option<String>,
+    /// Terminal failure cause, as stored on the execution row. Carries the raw
+    /// `error` column verbatim (the plugin layer gates it to terminally-failed runs
+    /// and truncates to the first line for display); `None` when the run has no
+    /// recorded error.
+    pub error: Option<String>,
+}
+
+impl ScheduleRunRow {
+    /// The logical-slot sort key: the run's `scheduled_for` slot, falling back to
+    /// `started_at` for a slot-less (`manual_trigger`) fire.
+    ///
+    /// This is the newest-slot-first ordering key (issue #762): runs are ordered by
+    /// `COALESCE(scheduled_for, started_at) DESC` so a scheduled run sorts by the slot
+    /// it fired for (matching #488's carryover ordering) rather than by completion or
+    /// start time, while a slot-less manual fire keeps a deterministic position via
+    /// its `started_at`. The plugin cross-shard merge and keyset cursor use the same
+    /// key so pagination stays consistent.
+    #[must_use]
+    pub fn sort_key(&self) -> chrono::DateTime<Utc> {
+        self.nominal_fire_time.unwrap_or(self.started_at)
+    }
 }
 
 /// Filters + keyset cursor for [`list_schedule_runs`] (issue #534).
@@ -3755,92 +3776,114 @@ pub struct ScheduleRunQuery {
     pub since: Option<chrono::DateTime<Utc>>,
     /// Upper bound (exclusive) on `started_at`.
     pub until: Option<chrono::DateTime<Utc>>,
-    /// Keyset cursor: return only rows strictly before `(started_at, id)` in the
-    /// `started_at DESC, id DESC` ordering.
+    /// Keyset cursor: return only rows strictly before `(sort_key, id)` in the
+    /// `COALESCE(scheduled_for, started_at) DESC, id DESC` ordering, where `sort_key`
+    /// is the logical-slot key ([`ScheduleRunRow::sort_key`]).
     pub cursor: Option<(chrono::DateTime<Utc>, Uuid)>,
     /// Maximum rows to return. The caller typically passes `limit + 1` to detect
     /// whether a further page exists.
     pub limit: i64,
 }
 
-/// List the executions a schedule launched, newest-first (issue #534).
+/// SQL for [`list_schedule_runs`] (issue #762).
+///
+/// Ordered by the logical-slot key `COALESCE(scheduled_for, started_at) DESC, id
+/// DESC` (newest-slot-first, matching #488's carryover ordering) so a slot-less
+/// `manual_trigger` fire keeps a deterministic position via its `started_at`. The
+/// same coalesced key drives the keyset cursor so pagination is stable and the
+/// cross-shard merge is well-defined. Params: `$1` = `schedule_id`, `$2` = `shard_id`
+/// (prevents double-counting when two logical shards share one physical database),
+/// `$3` = state filter array (empty = all), `$4` = origin filter array (empty = all),
+/// `$5`/`$6` = optional `since`/`until` bounds on `started_at`, `$7`/`$8` = optional
+/// keyset cursor `(sort_key, id)`, `$9` = row limit.
+const LIST_SCHEDULE_RUNS_SQL: &str = "
+SELECT
+    id,
+    scheduled_for,
+    started_at,
+    completed_at,
+    state::TEXT AS state,
+    origin,
+    error
+FROM harvest_workflow_executions
+WHERE schedule_id = $1::UUID
+  AND shard_id    = $2::INT4
+  AND (cardinality($3::TEXT[]) = 0 OR state = ANY($3::TEXT[]))
+  AND (cardinality($4::TEXT[]) = 0 OR origin = ANY($4::TEXT[]))
+  AND ($5::TIMESTAMPTZ IS NULL OR started_at >= $5::TIMESTAMPTZ)
+  AND ($6::TIMESTAMPTZ IS NULL OR started_at <  $6::TIMESTAMPTZ)
+  AND ($7::TIMESTAMPTZ IS NULL
+       OR COALESCE(scheduled_for, started_at) < $7::TIMESTAMPTZ
+       OR (COALESCE(scheduled_for, started_at) = $7::TIMESTAMPTZ AND id < $8::UUID))
+ORDER BY COALESCE(scheduled_for, started_at) DESC, id DESC
+LIMIT $9::BIGINT
+";
+
+#[derive(Debug, diesel::QueryableByName)]
+struct ScheduleRunSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    scheduled_for: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    started_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    completed_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    origin: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    error: Option<String>,
+}
+
+/// List the executions a schedule launched, newest-slot-first (issues #534, #762).
 ///
 /// Shard-local: a schedule's runs may be spread across shards, so the plugin layer
 /// fans this out across `iter_shards()` and merges the per-shard results with a
-/// keyset merge. Ordered `started_at DESC, id DESC` so the cursor is stable and the
-/// cross-shard merge is well-defined.
+/// keyset merge. Ordered `COALESCE(scheduled_for, started_at) DESC, id DESC` (the
+/// logical-slot key) so the cursor is stable, slot-less manual fires keep a
+/// deterministic position, and the cross-shard merge is well-defined.
 pub async fn list_schedule_runs(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
     shard_id: i32,
     query: &ScheduleRunQuery,
 ) -> HarvestResult<Vec<ScheduleRunRow>> {
-    use crate::schema::harvest_workflow_executions::dsl;
-    use diesel::prelude::*;
+    use diesel::sql_types::Uuid as SqlUuid;
+    use diesel::sql_types::{Array, BigInt, Integer, Nullable, Text, Timestamptz};
     use diesel_async::RunQueryDsl;
 
-    let mut q = harvest_workflow_executions::table
-        .filter(dsl::schedule_id.eq(schedule_id))
-        .filter(dsl::shard_id.eq(shard_id))
-        .into_boxed();
+    let (cursor_ts, cursor_id) = match query.cursor {
+        Some((ts, id)) => (Some(ts), Some(id)),
+        None => (None, None),
+    };
 
-    if !query.states.is_empty() {
-        q = q.filter(dsl::state.eq_any(query.states.clone()));
-    }
-    if !query.origins.is_empty() {
-        q = q.filter(dsl::origin.eq_any(query.origins.clone()));
-    }
-    if let Some(since) = query.since {
-        q = q.filter(dsl::started_at.ge(since));
-    }
-    if let Some(until) = query.until {
-        q = q.filter(dsl::started_at.lt(until));
-    }
-    if let Some((cursor_ts, cursor_id)) = query.cursor {
-        // Keyset: (started_at, id) < (cursor_ts, cursor_id) under the DESC ordering.
-        q = q.filter(
-            dsl::started_at
-                .lt(cursor_ts)
-                .or(dsl::started_at.eq(cursor_ts).and(dsl::id.lt(cursor_id))),
-        );
-    }
-
-    let rows = q
-        .order((dsl::started_at.desc(), dsl::id.desc()))
-        .limit(query.limit.max(0).saturating_add(1))
-        .select((
-            dsl::id,
-            dsl::scheduled_for,
-            dsl::started_at,
-            dsl::completed_at,
-            dsl::state,
-            dsl::origin,
-        ))
-        .load::<(
-            Uuid,
-            Option<chrono::DateTime<Utc>>,
-            chrono::DateTime<Utc>,
-            Option<chrono::DateTime<Utc>>,
-            String,
-            Option<String>,
-        )>(conn)
+    let rows = diesel::sql_query(LIST_SCHEDULE_RUNS_SQL)
+        .bind::<SqlUuid, _>(schedule_id)
+        .bind::<Integer, _>(shard_id)
+        .bind::<Array<Text>, _>(query.states.clone())
+        .bind::<Array<Text>, _>(query.origins.clone())
+        .bind::<Nullable<Timestamptz>, _>(query.since)
+        .bind::<Nullable<Timestamptz>, _>(query.until)
+        .bind::<Nullable<Timestamptz>, _>(cursor_ts)
+        .bind::<Nullable<SqlUuid>, _>(cursor_id)
+        .bind::<BigInt, _>(query.limit.max(0).saturating_add(1))
+        .load::<ScheduleRunSqlRow>(conn)
         .await
         .map_err(database_error)?;
 
     Ok(rows
         .into_iter()
-        .map(
-            |(execution_id, nominal_fire_time, started_at, completed_at, state, origin)| {
-                ScheduleRunRow {
-                    execution_id,
-                    nominal_fire_time,
-                    started_at,
-                    completed_at,
-                    state,
-                    origin,
-                }
-            },
-        )
+        .map(|r| ScheduleRunRow {
+            execution_id: r.id,
+            nominal_fire_time: r.scheduled_for,
+            started_at: r.started_at,
+            completed_at: r.completed_at,
+            state: r.state,
+            origin: r.origin,
+            error: r.error,
+        })
         .collect())
 }
 

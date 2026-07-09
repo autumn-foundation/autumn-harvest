@@ -342,16 +342,169 @@ async fn seed_run(
     exec_id.as_uuid()
 }
 
+/// Insert a minimal `harvest_schedules` row so the runs endpoint can resolve the
+/// schedule (existence gate + `next_run_at` echo, issue #762). All other columns
+/// rely on their migration-level DB defaults.
+async fn seed_schedule(url: &str, schedule_id: Uuid, next_run_at: Option<DateTime<Utc>>) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .expect("connect");
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules (id, workflow_name, next_run_at) VALUES ($1, $2, $3)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(schedule_id)
+    .bind::<diesel::sql_types::Text, _>("nightly_etl")
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run_at)
+    .execute(&mut conn)
+    .await
+    .expect("insert schedule");
+}
+
 #[tokio::test]
-async fn unknown_schedule_id_returns_empty_complete() {
+async fn unknown_schedule_id_returns_404() {
+    // issue #762: a real-but-unknown schedule id is a 404, never a silent empty list.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let sid = Uuid::new_v4();
+    let (status, _) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn next_run_at_is_echoed() {
+    // issue #762: the response echoes the schedule's next expected fire.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let sid = Uuid::new_v4();
+    let next = Utc::now() + Duration::hours(3);
+    seed_schedule(&url, sid, Some(next)).await;
     let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "complete");
+    assert!(
+        body["next_run_at"].is_string(),
+        "next_run_at echoed, got {:?}",
+        body["next_run_at"]
+    );
+    // No runs seeded, but the schedule exists → OK with an empty list (not 404).
     assert_eq!(body["runs"].as_array().unwrap().len(), 0);
-    assert_eq!(body["summary"]["total"], 0);
+}
+
+#[tokio::test]
+async fn outcome_and_error_are_surfaced_per_run() {
+    // issue #762: each run carries a collapsed `outcome`; `error` is the first line,
+    // only for terminally-failed runs.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let sid = Uuid::new_v4();
+    seed_schedule(&url, sid, None).await;
+    let base = Utc::now() - Duration::hours(2);
+
+    let ok = seed_run(
+        &url,
+        0,
+        sid,
+        Some("scheduled"),
+        Some(base),
+        "COMPLETED",
+        base,
+    )
+    .await;
+    let failed = seed_run(
+        &url,
+        0,
+        sid,
+        Some("scheduled"),
+        Some(base + Duration::hours(1)),
+        "FAILED",
+        base + Duration::hours(1),
+    )
+    .await;
+    // Give the failed run a multi-line error to prove first-line truncation.
+    {
+        use autumn_harvest::schema::harvest_workflow_executions::dsl;
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+            .await
+            .expect("connect");
+        diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(failed)))
+            .set(dsl::error.eq("card declined: insufficient funds\nstack frame 2"))
+            .execute(&mut conn)
+            .await
+            .expect("set error");
+    }
+
+    let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = body["runs"].as_array().unwrap();
+
+    let find = |id: Uuid| {
+        runs.iter()
+            .find(|r| r["execution_id"] == id.to_string())
+            .unwrap()
+    };
+    let ok_run = find(ok);
+    assert_eq!(ok_run["outcome"], "completed");
+    assert!(ok_run["error"].is_null(), "completed run has no error");
+
+    let failed_run = find(failed);
+    assert_eq!(failed_run["outcome"], "failed");
+    assert_eq!(
+        failed_run["error"], "card declined: insufficient funds",
+        "first line only"
+    );
+}
+
+#[tokio::test]
+async fn runs_ordered_by_slot_across_page_boundary() {
+    // issue #762: newest-slot-first ordering (not started_at) survives keyset paging.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let sid = Uuid::new_v4();
+    seed_schedule(&url, sid, None).await;
+    let base = Utc::now() - Duration::hours(12);
+
+    // Slots strictly decrease; start times deliberately shuffled so slot != start.
+    let starts = [4, 1, 7, 2, 9];
+    let mut expected_by_slot: Vec<(i64, Uuid)> = Vec::new();
+    for (i, s) in starts.iter().enumerate() {
+        let i = i64::try_from(i).unwrap();
+        let slot = base + Duration::hours(10 - i);
+        let id = seed_run(
+            &url,
+            0,
+            sid,
+            Some("scheduled"),
+            Some(slot),
+            "COMPLETED",
+            base + Duration::hours(*s),
+        )
+        .await;
+        expected_by_slot.push((10 - i, id));
+    }
+    // expected_by_slot already in slot-DESC order (10,9,8,7,6).
+
+    // Page through with limit=2 and stitch the pages together.
+    let mut collected: Vec<String> = Vec::new();
+    let mut uri = format!("/admin/schedules/{sid}/runs?limit=2");
+    loop {
+        let (status, body) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        for r in body["runs"].as_array().unwrap() {
+            collected.push(r["execution_id"].as_str().unwrap().to_string());
+        }
+        match body["next_cursor"].as_str() {
+            Some(cur) => uri = format!("/admin/schedules/{sid}/runs?limit=2&cursor={cur}"),
+            None => break,
+        }
+    }
+
+    let expected: Vec<String> = expected_by_slot
+        .iter()
+        .map(|(_, id)| id.to_string())
+        .collect();
+    assert_eq!(
+        collected, expected,
+        "slot-DESC order preserved across pages"
+    );
 }
 
 #[tokio::test]
@@ -382,6 +535,7 @@ async fn origins_are_separated_and_summary_is_cadence_only() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let sid = Uuid::new_v4();
+    seed_schedule(&url, sid, None).await;
     let base = Utc::now() - Duration::hours(4);
 
     // Scheduled cadence: 2 succeeded, 1 failed.
@@ -463,6 +617,7 @@ async fn state_filter_and_newest_first_ordering() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let sid = Uuid::new_v4();
+    seed_schedule(&url, sid, None).await;
     let base = Utc::now() - Duration::hours(6);
 
     seed_run(
@@ -529,6 +684,7 @@ async fn limit_reported_and_cursor_paginates() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let sid = Uuid::new_v4();
+    seed_schedule(&url, sid, None).await;
     let base = Utc::now() - Duration::hours(8);
 
     for i in 0..5 {
@@ -577,6 +733,8 @@ async fn merges_across_shards() {
     let ((url0, url1), _c) = setup_two_shards().await;
     let app = build_app(two_shard_storage(&url0, &url1));
     let sid = Uuid::new_v4();
+    // The schedule row lives on one shard (shard 0); runs may spread across both.
+    seed_schedule(&url0, sid, None).await;
     let base = Utc::now() - Duration::hours(2);
 
     seed_run(
@@ -617,6 +775,8 @@ async fn one_shard_down_is_partial_not_500() {
     let ((url0, url1), _c) = setup_two_shards().await;
     let app = build_app(two_shard_storage(&url0, &url1));
     let sid = Uuid::new_v4();
+    // Schedule + healthy run on shard 0, which is queried before the down shard 1.
+    seed_schedule(&url0, sid, None).await;
     let base = Utc::now() - Duration::hours(1);
     seed_run(
         &url0,
@@ -651,4 +811,115 @@ async fn one_shard_down_is_partial_not_500() {
         .iter()
         .any(|s| s["status"] == "unavailable");
     assert!(unavailable, "the down shard is named in the report");
+}
+
+#[tokio::test]
+async fn schedule_on_down_shard_is_indeterminate_not_404() {
+    // issue #762 review: a schedule that genuinely EXISTS but whose owning shard is
+    // unreachable must be reported as INDETERMINATE (503), never as a definitive 404
+    // (which would lie about existence). Mirrors `one_shard_down_is_partial_not_500`
+    // but seeds the schedule on the DOWN shard so the existence lookup can't resolve
+    // it while a shard is unreachable.
+    let ((url0, url1), _c) = setup_two_shards().await;
+    let sid = Uuid::new_v4();
+    // Schedule lives on shard 1, which we will make unreachable.
+    seed_schedule(&url1, sid, None).await;
+
+    // Point shard 1 at a database that does not exist so its pool fails; shard 0 is
+    // healthy but does not own the schedule.
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url0));
+    pools.insert(
+        ShardId::new(1),
+        build_pool(&url1.replace("harvest_shard_", "missing_db_")),
+    );
+    let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let app = build_app(storage);
+
+    let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "existence is indeterminate while a shard is down; must be 503, not 404, got body {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn lookup_error_on_earlier_shard_still_resolves_on_later_shard() {
+    // issue #762 review (finding 2): a per-shard schedule-lookup ERROR (as opposed
+    // to an unreachable connection) on an earlier-queried shard must NOT
+    // short-circuit the request with a blanket 503. The existence scan continues,
+    // so a schedule living on a *later* healthy shard is still resolved (200).
+    //
+    // Shard 0's database is created but never migrated, so its `harvest_schedules`
+    // SELECT errors ("relation does not exist") — the connection acquires fine, it
+    // is the query that fails, exercising the new `Err(_) => continue` arm rather
+    // than the acquire-failure arm. Shard 1 is healthy and owns the schedule.
+    //
+    // NB: the router-known-but-poolless shard case (finding 1) funnels into the
+    // same `any_shard_unreachable` flag + `resolve_not_found_outcome` decision
+    // (existence gate) AND, since the fan-out now iterates the same
+    // `expected_shards` set, into an unavailable run observation (fan-out) — but
+    // neither can be modelled here: `build_app` installs no runtime, so
+    // `api_state` has no router and `expected_shards` reduces to the live pool
+    // keys. Those paths are covered by the pure unit tests
+    // `resolve_not_found_outcome_*` and
+    // `observe_schedule_runs_shard_poolless_shard_is_unavailable_not_complete`
+    // in `api.rs`. The fan-out's query-error → `partial` path is covered
+    // end-to-end by `one_shard_down_is_partial_not_500`.
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let empty = format!("harvest_shard_{}", Uuid::new_v4().simple());
+    let healthy = format!("harvest_shard_{}", Uuid::new_v4().simple());
+
+    let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("admin connect");
+    for db in [&empty, &healthy] {
+        diesel::sql_query(format!("CREATE DATABASE {db}"))
+            .execute(&mut admin)
+            .await
+            .expect("create db");
+    }
+    let url0 = format!("postgres://postgres:postgres@{host}:{port}/{empty}");
+    let url1 = format!("postgres://postgres:postgres@{host}:{port}/{healthy}");
+    // Migrate only shard 1; shard 0 stays schema-less so its lookup errors.
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url1)
+            .await
+            .expect("shard connect");
+        diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, INIT_SQL)
+            .await
+            .expect("migrate shard 1");
+    }
+    let sid = Uuid::new_v4();
+    // Schedule lives on the healthy later shard (queried after the erroring one).
+    seed_schedule(&url1, sid, None).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url0));
+    pools.insert(ShardId::new(1), build_pool(&url1));
+    let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let app = build_app(storage);
+
+    let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a lookup error on shard 0 must not blanket-503 when shard 1 owns the \
+         schedule; got body {body:?}"
+    );
+    // The schedule resolved, so next_run_at is present (null here — none seeded)
+    // and the row was found rather than 404/503.
+    assert!(
+        body.get("runs").is_some(),
+        "resolved schedule yields a runs response, got {body:?}"
+    );
+    let _container = container;
 }

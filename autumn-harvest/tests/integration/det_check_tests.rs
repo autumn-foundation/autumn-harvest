@@ -1352,3 +1352,497 @@ fn det010_finding_carries_metadata() {
         finding.alternative
     );
 }
+
+// ── DET011: select! / futures select combinators (issue #799) ─────────────
+//
+// The det_check twin of guardrail HVG010 (SelectMacro, issue #600). HVG010 is
+// the compile-time / catalog id; det_check surfaces the same hazard as DET011
+// (DET010 was the prior det_check maximum). Catches BOTH the select MACROS
+// (`tokio::select!`, `futures::select!`, `select_biased!`) and the distinctive
+// futures combinator FUNCTIONS (`futures::future::select(`, `select_all(`,
+// `select_ok(`, `try_select(`). Racing ctx-managed awaitables is always a
+// determinism hazard, so DET011 is an Error (no command-aware downgrade).
+
+#[test]
+fn det011_flags_tokio_select_macro_as_error() {
+    let src = wf(
+        "tokio::select! {\n        _ = ctx.timer(\"t\", 60) => {}\n        _ = ctx.wait_for_signal(\"s\") => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET011")
+        .unwrap_or_else(|| panic!("expected DET011 finding, got: {report:?}"));
+    assert!(
+        matches!(finding.severity, DetSeverity::Error),
+        "select! in a workflow must be an Error, got: {finding:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn det011_flags_futures_select_macro() {
+    let src = wf(
+        "futures::select! {\n        a = fut_a.fuse() => {}\n        b = fut_b.fuse() => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "futures::select! must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_select_biased_macro() {
+    let src = wf(
+        "select_biased! {\n        a = fut_a.fuse() => {}\n        b = fut_b.fuse() => {}\n    }",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "select_biased! must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_select_macro_is_flagged_exactly_once_no_double_count() {
+    // A line with a single `tokio::select!` must yield exactly ONE DET011
+    // finding — the `select!` and `select_biased!` macro patterns must not both
+    // fire on the same line (#980 Codex P2). The engine dedupes per-rule-per-line
+    // via `continue 'rules`, so this confirms the boundary guard did not
+    // accidentally introduce a second match.
+    for macro_call in [
+        "tokio::select! { _ = a => {} }",
+        "futures::select! { _ = a => {} }",
+        "select! { _ = a => {} }",
+        "select_biased! { _ = a => {} }",
+    ] {
+        let src = wf(macro_call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "`{macro_call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
+    // An unrelated macro whose name merely ENDS in `select!` / `select_biased!`
+    // must NOT be flagged — the backward path walk absorbs the leading ident
+    // bytes into a non-matching path (`sql_select` / `my_select`), keeping
+    // det_check in agreement with the compile-time HVG010 guardrail (which
+    // matches macro paths exactly and accepts these) (#980 Codex P2 review).
+    for call in [
+        "sql_select! { columns }",
+        "let _ = my_select!();",
+        "let _ = foo_select_biased!();",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "`{call}` must NOT be flagged for DET011, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_qualified_non_select_macros() {
+    // #980 Codex P2 (the qualified-macro-path false positive): a `select!` /
+    // `select_biased!` macro under an UNRELATED root path must NOT be flagged.
+    // The earlier ident-boundary-only check false-positived on any `::` prefix
+    // (the byte before `select!` is `:`, which is not an identifier byte);
+    // the full-path match resolves these to paths outside the allowed set —
+    // exactly as the compile-time HVG010 `visit_macro` leaves them un-flagged.
+    for call in [
+        "crate::ui::select! { columns }",
+        "let _ = my::select_biased! { a };",
+        "foo::bar::select! { x }",
+        "x::select! { y }",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "qualified non-select macro `{call}` must NOT be flagged for DET011, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_flags_absolute_path_select_macro() {
+    // An absolute-path select macro normalizes to `tokio::select` (the single
+    // optional leading `::` is stripped, mirroring `visit_macro`'s
+    // `path_to_string` ignoring `leading_colon`) and IS flagged, exactly once.
+    let src = wf("::tokio::select! { _ = a => {} }");
+    let report = check_source(&src, "test.rs");
+    let count = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET011")
+        .count();
+    assert_eq!(
+        count, 1,
+        "`::tokio::select!` must be flagged exactly once (normalized to tokio::select), got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_qualified_future_select_combinator() {
+    let src = wf("let _ = futures::future::select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "futures::future::select(..) combinator must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_short_form_future_select_combinator() {
+    // The `use futures::future; future::select(a, b)` short form must be flagged
+    // too, matching the AST macro visitor which recognizes `future::select`
+    // (#980 Codex P2). Exactly one DET011 finding is emitted for a qualified
+    // call even though the short-form pattern is a suffix of it — the engine
+    // emits at most one finding per rule per line.
+    let src = wf("let _ = future::select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET011")
+            .count(),
+        1,
+        "short-form `future::select(..)` must be flagged exactly once, got: {report:?}"
+    );
+
+    let qualified = wf("let _ = futures::future::select(a, b).await;");
+    let qreport = check_source(&qualified, "test.rs");
+    assert_eq!(
+        qreport
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET011")
+            .count(),
+        1,
+        "qualified `futures::future::select(..)` must be flagged exactly once (no double-count), got: {qreport:?}"
+    );
+}
+
+#[test]
+fn det011_does_not_flag_method_or_suffix_forms_of_future_select() {
+    // A `.select()` method call and a module whose name merely ends in `future`
+    // must NOT be flagged for the `future::select(` pattern — the call-position
+    // boundary guard excludes a preceding `.` or identifier char (#980 Codex P2).
+    for call in [
+        "let _ = x.select();",
+        "let _ = builder.select(cols);",
+        "let _ = my_future::select(a, b);",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "`{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_flags_bare_distinctive_combinators() {
+    for call in ["select_all(v)", "select_ok(v)", "try_select(a, b)"] {
+        let src = wf(&format!("let _ = {call}.await;"));
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "bare `{call}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_qualified_non_futures_combinator_paths() {
+    // A qualified call whose full path is outside the futures allowed set must
+    // NOT be flagged — det_check now extracts the FULL path ending at the call
+    // and matches it exactly against the same set as the macro lint's
+    // `is_select_combinator_path`, so a same-tail-name helper under a different
+    // root is rejected exactly as the compile-time HVG010 guardrail rejects it
+    // (#980 Codex P2 review).
+    for call in [
+        "let _ = crate::future::select(a, b).await;",
+        "let _ = my_dsl::select_all(v);",
+        "let _ = foo::try_select(a, b);",
+        "let _ = bar::future::select_ok(v);",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "qualified non-futures path `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_flags_futures_qualified_and_short_form_combinators() {
+    // The `futures`-anchored qualified forms and their `future::…` short forms
+    // for every distinctive name must all be flagged (#980 Codex P2). Bare
+    // `select(` remains unflagged (deliberately not in the allowed set).
+    for call in [
+        "let _ = futures::future::select(a, b).await;",
+        "let _ = future::select(a, b).await;",
+        "let _ = futures::future::select_all(v).await;",
+        "let _ = future::select_all(v).await;",
+        "let _ = futures::future::select_ok(v).await;",
+        "let _ = future::select_ok(v).await;",
+        "let _ = futures::future::try_select(a, b).await;",
+        "let _ = future::try_select(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "futures combinator `{call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+    // Bare `select(...)` is deliberately NOT flagged.
+    let src = wf("let _ = select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "bare `select(..)` must NOT be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_flags_turbofished_combinator_calls() {
+    // A turbofish (and defensive whitespace) between the combinator name and the
+    // call `(` must NOT hide the call from det_check: the syn-based HVG010 macro
+    // lint strips path arguments before matching and DOES hard-block these
+    // forms, so det_check must too, or the text pre-check green-lights code the
+    // compile-time guardrail rejects (#980 Codex P2). Each is exactly one
+    // DET011 finding.
+    for call in [
+        "let _ = futures::future::select::<_, _>(a, b).await;",
+        "let _ = future::select_all::<Vec<_>>(v).await;",
+        "let _ = select_all::<Vec<_>>(v).await;",
+        "let _ = try_select::<_,_>(a, b).await;",
+        "let _ = select_ok::<Vec<Box<T>>>(v).await;",
+        "let _ = future::select ::<_, _> (a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "turbofished combinator `{call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_turbofished_non_futures_or_method_forms() {
+    // The turbofish tolerance must NOT loosen path precision: a qualified call
+    // under a non-futures root, or a method call, stays unflagged even WITH a
+    // turbofish (mirrors the macro lint's exact-path matching). Bare `select`
+    // has no allowed form (turbofished or not) and stays unflagged.
+    for call in [
+        "let _ = crate::future::select::<_,_>(a, b).await;",
+        "let _ = my_dsl::select_all::<T>(v);",
+        "let _ = foo::try_select::<_, _>(a, b);",
+        "let _ = bar::future::select_ok::<T>(v);",
+        "let _ = x.select_all::<T>();",
+        "let _ = q.try_select::<_,_>(a, b);",
+        "let _ = select::<_,_>(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "turbofished form `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+    // A macro whose name merely ends in `select` is still not a combinator,
+    // regardless of any turbofish elsewhere on the line.
+    for call in ["sql_select! { foo }", "my_select!(a, b)"] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "suffix macro `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_flags_absolute_futures_combinator_paths() {
+    // An absolute path (leading `::`) must be flagged exactly like its relative
+    // form: the syn-based HVG010 macro lint's `path_to_string` ignores
+    // `leading_colon`, so `::futures::future::select(a, b)` hard-blocks at
+    // compile time and det_check must match it too (#980 Codex absolute-path
+    // finding). Turbofished absolute forms are covered too. Each is exactly one
+    // DET011 finding.
+    for call in [
+        "let _ = ::futures::future::select(a, b).await;",
+        "let _ = ::futures::future::select_all::<Vec<_>>(v).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "DET011")
+                .count(),
+            1,
+            "absolute-path combinator `{call}` must be flagged exactly once, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_absolute_non_futures_combinator_paths() {
+    // Stripping the leading `::` must NOT make a non-futures absolute path
+    // match: normalizing `::my_dsl::select_all` yields `my_dsl::select_all`,
+    // which is not an allowed combinator path, so it stays unflagged (mirrors
+    // the macro lint's exact-path matching).
+    for call in [
+        "let _ = ::my_dsl::select_all(v);",
+        "let _ = ::crate::future::select(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "absolute non-futures path `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_method_call_forms_of_combinators() {
+    // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
+    // free-function combinators — they must not be flagged, mirroring the AST
+    // visitor's structural exclusion of method-call receivers (#799 P2 review).
+    for call in [
+        "let _ = x.select_all();",
+        "let _ = q.try_select(a, b);",
+        "let _ = builder.select_ok(cols);",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            !report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "method-call form `{call}` must NOT be flagged, got: {report:?}"
+        );
+    }
+    // A free-function call and the qualified plain-select combinator MUST still
+    // be flagged.
+    for call in [
+        "let _ = select_all(v).await;",
+        "let _ = futures::future::select(a, b).await;",
+    ] {
+        let src = wf(call);
+        let report = check_source(&src, "test.rs");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET011"),
+            "free-function combinator `{call}` must be flagged, got: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn det011_does_not_flag_unrelated_code() {
+    // A clean workflow using the sanctioned alternatives — zero DET011.
+    let src = wf(
+        "ctx.execute_activity_raw(\"a\", serde_json::json!(1), \"q\").await?;\n    let _ = ctx.race().activity_raw(\"b\", serde_json::json!(2), \"q\");",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "clean workflow must not be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_suppression_is_honored_and_reported() {
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {\n    // harvest-suppress: DET011 \"replay fixture proves this biased select is safe\"\n    let _ = futures::future::select(a, b).await;\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "suppressed DET011 must not produce a finding, got: {report:?}"
+    );
+    assert!(
+        report
+            .suppressions
+            .iter()
+            .any(|s| s.rule_id == "DET011" && !s.reason.is_empty()),
+        "DET011 suppression must be echoed into report.suppressions, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_activity_bodies_are_never_flagged() {
+    // AC6: select! and the futures combinators inside an #[activity] body are
+    // never flagged — activities may race freely.
+    let src = act(
+        "tokio::select! {\n        _ = std::future::ready(()) => {}\n    }\n    let _ = futures::future::select(a, b).await;",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET011"),
+        "activity bodies must never be flagged for DET011, got: {report:?}"
+    );
+}
+
+#[test]
+fn det011_finding_carries_metadata_and_names_race_alternative() {
+    let src = wf("let _ = futures::future::select(a, b).await;");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET011")
+        .expect("DET011 finding");
+    assert_eq!(finding.workflow_name.as_deref(), Some("test_wf"));
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(loc.file, "test.rs");
+    assert!(loc.line > 0);
+    assert!(!finding.message.is_empty());
+    assert!(
+        finding.alternative.contains("ctx.race()"),
+        "alternative must point at ctx.race(), got: {}",
+        finding.alternative
+    );
+}
+
+#[test]
+fn det011_self_scan_of_harvest_src_is_clean() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let report = autumn_harvest::det_check::check_dir(&dir).expect("src dir must be readable");
+    let det011: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET011")
+        .collect();
+    assert!(
+        det011.is_empty(),
+        "autumn-harvest/src must have zero DET011 findings, got: {det011:?}"
+    );
+}

@@ -1337,7 +1337,7 @@ enum ScheduleCommand {
         /// Only runs started before this RFC 3339 time or relative duration.
         #[arg(long)]
         until: Option<String>,
-        /// Maximum runs to return (default 100, max 1000).
+        /// Maximum runs to return (default 20, clamped 1-200).
         #[arg(long)]
         limit: Option<u32>,
         /// Opaque keyset cursor from a prior response's `next_cursor`.

@@ -19,6 +19,12 @@ async fn bypass_workflow(ctx: &WorkflowContext) -> Result<(), String> {
         _ = ctx.timer("t1", 60) => {}
         _ = ctx.wait_for_signal("approve") => {}
     }
+    // HVG010 combinator-function bypass proof (issue #799): the
+    // futures::future::select combinator is flagged by HVG010 exactly like the
+    // select! macro, but allow_nondeterministic_apis gates the whole visitor.
+    let fa = Box::pin(async {});
+    let fb = Box::pin(async {});
+    let _ = futures::future::select(fa, fb).await;
     // HVG011 bypass proof: a command-emitting HashMap iteration is allowed
     // under allow_nondeterministic_apis (the flag gates the whole visitor).
     let mut amounts: HashMap<String, u64> = HashMap::new();
@@ -80,6 +86,22 @@ async fn ordered_iteration_workflow(ctx: &WorkflowContext) -> Result<(), String>
         .map_err(|e| e.to_string())?;
     }
 
+    Ok(())
+}
+
+// HVG010 activity-body negative control (issue #799, AC6/AC7): the select!
+// macro AND the futures combinator functions inside an #[activity] body are
+// never flagged — activities may race freely (only the recorded result
+// matters, not the internal control flow). This fully-linted activity (no
+// allow_nondeterministic_apis) must compile clean.
+#[activity(start_to_close = "30s")]
+async fn activity_may_race_freely(_ctx: &ActivityContext) -> Result<(), String> {
+    let fa = Box::pin(async {});
+    let fb = Box::pin(async {});
+    let _ = futures::future::select(fa, fb).await;
+    let _ = tokio::select! {
+        () = std::future::ready(()) => {}
+    };
     Ok(())
 }
 

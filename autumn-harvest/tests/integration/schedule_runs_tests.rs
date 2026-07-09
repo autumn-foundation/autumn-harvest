@@ -405,6 +405,167 @@ async fn keyset_cursor_paginates_without_overlap() {
     }
 }
 
+/// Force an `error` value onto an already-seeded execution row.
+async fn set_error(conn: &mut AsyncPgConnection, id: Uuid, error: &str) {
+    use harvest_workflow_executions::dsl;
+    diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(id)))
+        .set(dsl::error.eq(error))
+        .execute(conn)
+        .await
+        .expect("set error");
+}
+
+#[tokio::test]
+async fn list_orders_by_logical_slot_and_returns_error() {
+    // issue #762: order by COALESCE(scheduled_for, started_at) DESC, not started_at,
+    // and surface the raw `error` column (the plugin gates it to terminal-failed).
+    let (mut conn, _c) = setup_db().await;
+    let sid = Uuid::new_v4();
+    let base = Utc::now() - Duration::hours(6);
+
+    // A: scheduled COMPLETED, slot = base+3h, started = base+3h.
+    let a = seed_run(
+        &mut conn,
+        sid,
+        "a",
+        Some(ORIGIN_SCHEDULED),
+        Some(base + Duration::hours(3)),
+        "COMPLETED",
+        base + Duration::hours(3),
+    )
+    .await;
+    // B: scheduled FAILED, slot = base+2h but started LATER (base+4h) than A — proves
+    // ordering keys off the slot, not the start time.
+    let b = seed_run(
+        &mut conn,
+        sid,
+        "b",
+        Some(ORIGIN_SCHEDULED),
+        Some(base + Duration::hours(2)),
+        "FAILED",
+        base + Duration::hours(4),
+    )
+    .await;
+    set_error(&mut conn, b, "billing failed: card declined\nstack line 2").await;
+    // C: manual FAILED, no slot, started base+2h30m → slot key = started_at.
+    let c = seed_run(
+        &mut conn,
+        sid,
+        "c",
+        Some(ORIGIN_MANUAL_TRIGGER),
+        None,
+        "FAILED",
+        base + Duration::minutes(150),
+    )
+    .await;
+    set_error(&mut conn, c, "manual boom").await;
+
+    let runs = list_schedule_runs(
+        &mut conn,
+        sid,
+        0,
+        &ScheduleRunQuery {
+            limit: 100,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list");
+
+    // Slot keys: A=base+3h, C=base+2h30m (its started_at), B=base+2h → A, C, B.
+    let order: Vec<Uuid> = runs.iter().map(|r| r.execution_id).collect();
+    assert_eq!(
+        order,
+        vec![a, c, b],
+        "ordered by logical slot, not started_at"
+    );
+
+    let b_row = runs.iter().find(|r| r.execution_id == b).unwrap();
+    assert_eq!(
+        b_row.error.as_deref(),
+        Some("billing failed: card declined\nstack line 2"),
+        "core returns the raw error verbatim"
+    );
+    let a_row = runs.iter().find(|r| r.execution_id == a).unwrap();
+    assert!(a_row.error.is_none(), "completed run has no error");
+
+    // The slot-key helper matches the COALESCE ordering used by the query.
+    assert_eq!(
+        c_row_sort_key(&runs, c),
+        base + Duration::minutes(150),
+        "manual run's sort key falls back to started_at"
+    );
+}
+
+fn c_row_sort_key(runs: &[autumn_harvest::ScheduleRunRow], id: Uuid) -> DateTime<Utc> {
+    runs.iter()
+        .find(|r| r.execution_id == id)
+        .unwrap()
+        .sort_key()
+}
+
+#[tokio::test]
+async fn keyset_cursor_uses_slot_key() {
+    // issue #762: pagination cursor keys off the logical slot, so a later page never
+    // overlaps even when start times disagree with slot order.
+    let (mut conn, _c) = setup_db().await;
+    let sid = Uuid::new_v4();
+    let base = Utc::now() - Duration::hours(12);
+
+    // Five runs whose slots strictly decrease but whose start times are shuffled.
+    let starts = [7, 3, 9, 1, 5];
+    for (i, s) in starts.iter().enumerate() {
+        let i = i64::try_from(i).unwrap();
+        seed_run(
+            &mut conn,
+            sid,
+            &format!("k{i}"),
+            Some(ORIGIN_SCHEDULED),
+            Some(base + Duration::hours(10 - i)), // slot decreasing
+            "COMPLETED",
+            base + Duration::hours(*s), // start shuffled
+        )
+        .await;
+    }
+
+    let page1 = list_schedule_runs(
+        &mut conn,
+        sid,
+        0,
+        &ScheduleRunQuery {
+            limit: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("page1");
+    assert_eq!(page1.len(), 3, "fetched limit+1");
+    let last_keep = &page1[1];
+    let cursor = Some((last_keep.sort_key(), last_keep.execution_id));
+
+    let page2 = list_schedule_runs(
+        &mut conn,
+        sid,
+        0,
+        &ScheduleRunQuery {
+            cursor,
+            limit: 100,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("page2");
+    for row in &page2 {
+        assert!(
+            (row.sort_key(), row.execution_id) < (last_keep.sort_key(), last_keep.execution_id),
+            "page2 row {:?} not strictly before cursor",
+            row.execution_id
+        );
+    }
+    // Union of page1[..2] and page2 covers all 5 with no overlap.
+    assert_eq!(page1.len() - 1 + page2.len(), 5);
+}
+
 #[tokio::test]
 async fn summary_counts_scheduled_origin_only() {
     let (mut conn, _c) = setup_db().await;

@@ -17,12 +17,35 @@
 //! | DET008 | Error    | Direct network / filesystem I/O                |
 //! | DET009 | Warning  | Bare tracing calls (log amplification)         |
 //! | DET010 | Error*   | `HashMap`/`HashSet` iteration order (issue #785) |
+//! | DET011 | Error    | `select!` / futures select combinators (issue #799) |
+//!
+//! DET011 is the det_check twin of guardrail HVG010 (SelectMacro, issue #600):
+//! `tokio::select!` / `futures::select!` / `select_biased!` and the
+//! `futures::future::{select, select_all, select_ok, try_select}` combinators
+//! (in both the fully-qualified `futures::future::…` and the short `future::…`
+//! forms) race ctx-managed awaitables non-deterministically (the winning branch
+//! differs between the live run and a replay). HVG010 is the compile-time /
+//! catalog id; det_check surfaces the same hazard as DET011 (DET010 was the
+//! prior det_check maximum).
 //!
 //! \* DET010 is command-aware: a flagged loop whose body schedules commands
 //! (`.execute_activity*`, `.spawn_child_workflow*`, `.execute_local_activity*`,
 //! `.timer(`, `.side_effect(`) is an Error; a command-free loop is a Warning.
 //! DET010 is the det_check twin of guardrail HVG011 (the issue proposed
 //! HVG010/DET010, but HVG010 was permanently assigned to SelectMacro/#600).
+//!
+//! # Heuristic pre-check vs. authoritative guardrail
+//!
+//! `det_check` is a best-effort **text** scanner: a fast, CLI-friendly
+//! pre-check that mirrors the compile-time guardrails so problems surface early
+//! (in review or CI) without waiting for a build. Being text-based, it can lag
+//! the guardrails on exotic syntax (turbofish, unusual spacing, multi-line
+//! calls). The **authoritative** determinism gate is the syn-based proc-macro
+//! guardrail that runs during compilation (e.g. HVG010 for DET011): it operates
+//! on the parsed AST, so it always hard-blocks these forms even where the text
+//! scanner would miss them. When the two disagree, trust the compile-time
+//! guardrail — it is the safety net, and `#[workflow(allow_nondeterministic_apis)]`
+//! (or a `// harvest-suppress:` comment for det_check) is the escape hatch.
 //!
 //! # Suppression
 //!
@@ -283,6 +306,81 @@ const RULES: &[Rule] = &[
                       each event is auto-tagged with workflow_id, execution_id, and workflow_type. \
                       See guardrail HVG009 in the catalog for the full rationale.",
     },
+    Rule {
+        id: "DET011",
+        severity: DetSeverity::Error,
+        patterns: &[
+            // Select MACROS — the trailing `!` makes these unambiguous macro
+            // invocations (no ident/method call contains it) and bounds the
+            // macro NAME on the right, so `select_biasedx!` and a `select!`
+            // match inside `select_biased!` are excluded. The candidate pattern
+            // only LOCATES the macro name; the accept/reject decision is made by
+            // the path-precise `matches_select_macro_pattern` (see
+            // `DET011_MACRO_PATTERNS`), which extracts the FULL qualified macro
+            // path (walking back over the contiguous path run, stripping an
+            // optional leading `::`) and matches it EXACTLY against
+            // `is_allowed_select_macro_path`. That precision is required so a
+            // qualified macro under an UNRELATED root is NOT flagged:
+            // `crate::ui::select! {}`, `my::select_biased! {}`,
+            // `foo::bar::select! {}` all resolve to paths outside the allowed
+            // set and are rejected — exactly as the compile-time HVG010
+            // guardrail's `visit_macro` rejects them (#980 Codex P2 — the
+            // earlier ident-boundary-only check false-positived on any `::`
+            // prefix). `::tokio::select!` normalizes to `tokio::select` and IS
+            // flagged; `sql_select!` / `my_select!` are absorbed into a
+            // non-matching path by the backward walk and stay unflagged. The
+            // allowed set mirrors `visit_macro` case-for-case: bare `select`,
+            // `select_biased`, `tokio::select`, `futures::select`,
+            // `futures::select_biased` (note `tokio::select_biased` is absent
+            // there too).
+            "select!",
+            "select_biased!",
+            // Combinator FUNCTIONS. These candidate patterns are the bare
+            // combinator NAME anchors (no trailing `(`); they cheaply locate a
+            // possible combinator call and the actual decision is made by the
+            // path-precise `matches_futures_combinator_pattern` (see
+            // `DET011_COMBINATOR_FN_PATTERNS`), which (a) confirms the name is a
+            // complete token, (b) requires a call `(` to follow — after an
+            // OPTIONAL turbofish `::<…>` and any surrounding whitespace, so a
+            // turbofished call `future::select::<_, _>(a, b)` is caught too
+            // (#980 Codex P2) — and (c) extracts the FULL qualified path ending
+            // at the call and matches it exactly against the same allowed-path
+            // set as the compile-time HVG010 guardrail's
+            // `is_select_combinator_path`. That precision is required so a
+            // qualified call by an UNRELATED helper of the same tail name is
+            // NOT flagged: `crate::future::select(`, `my_dsl::select_all(`,
+            // `bar::future::select_ok(`, and `foo::try_select(` all resolve to
+            // paths outside the allowed set and are rejected, exactly as the
+            // macro lint rejects them. The allowed set is: the
+            // `futures`-anchored qualified forms (`futures::future::{select,
+            // select_all, select_ok, try_select}`), their `future::…` short
+            // forms (the idiomatic `use futures::future;` spelling), and the
+            // genuinely BARE distinctive names `select_all`/`select_ok`/
+            // `try_select` (a bare free-fn call by any of these three is, in
+            // practice, always the futures combinator via
+            // `use futures::future::select_all;`). Bare `select` is
+            // deliberately NOT in the allowed set (`select` is a common
+            // free-fn / query-builder name), and a preceding `.` (method call,
+            // e.g. `q.select_all()`) is rejected — mirroring the AST macro
+            // visitor's structural exclusion of method calls.
+            "future::select",
+            "select_all",
+            "select_ok",
+            "try_select",
+        ],
+        message: "select! / futures select combinator inside a workflow function races ctx-managed \
+                  awaitables non-deterministically. tokio::select! polls its branches in a \
+                  randomized order by design, so the branch that wins can differ between the first \
+                  live run and a later replay, silently diverging the execution; the dropped loser \
+                  branches also do not durably cancel the underlying activity or timer.",
+        alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive \
+                      (issue #600): it records the winning branch durably and cancels the losers. \
+                      For a signal bounded by a deadline use ctx.receive_signal_timeout() / \
+                      ctx.wait_for_signal_timeout(); to fan out many activities in parallel and \
+                      collect their results in a deterministic order use ctx.execute_activity_fan_out*; \
+                      to block until a predicate holds use ctx.await_condition_timeout(). Inside an \
+                      #[activity] body, select! is fine — only the activity's recorded result matters.",
+    },
 ];
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -461,7 +559,14 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
 
         'rules: for rule in RULES {
             for &pattern in rule.patterns {
-                if !code_part.contains(pattern) {
+                let matched = if DET011_COMBINATOR_FN_PATTERNS.contains(&pattern) {
+                    matches_futures_combinator_pattern(&code_part, pattern)
+                } else if DET011_MACRO_PATTERNS.contains(&pattern) {
+                    matches_select_macro_pattern(&code_part, pattern)
+                } else {
+                    code_part.contains(pattern)
+                };
+                if !matched {
                     continue;
                 }
 
@@ -760,6 +865,221 @@ fn det010_emit_for_finding(
 
 const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// DET011 candidate patterns for the futures combinator FUNCTIONS. Each is the
+/// bare combinator NAME (no trailing `(`) — a cheap substring locator; the
+/// accept/reject decision is made by the path-precise
+/// [`matches_futures_combinator_pattern`], which confirms the name is a complete
+/// token, requires a call `(` (skipping an optional turbofish and whitespace),
+/// and extracts the full qualified path ending at the call to match it exactly
+/// against the allowed set. This keeps `det_check` in lock-step with the
+/// compile-time HVG010 guardrail's `is_select_combinator_path`, which matches
+/// whole paths exactly after `syn` has already stripped any turbofish
+/// (#980 Codex P2 review).
+const DET011_COMBINATOR_FN_PATTERNS: &[&str] =
+    &["future::select", "select_all", "select_ok", "try_select"];
+
+/// The exact set of paths that name a futures wait-first combinator FUNCTION.
+///
+/// This mirrors, case-for-case, `is_select_combinator_path` in the macro
+/// crate's `determinism_lint.rs`: the `futures`-anchored qualified forms, their
+/// `future::…` short forms, and the genuinely bare distinctive names
+/// `select_all`/`select_ok`/`try_select`. A qualified path with any OTHER root
+/// (`crate::future::select`, `my_dsl::select_all`, `bar::future::select_ok`,
+/// `foo::try_select`) is deliberately absent, and bare `select` is deliberately
+/// absent (too ambiguous a free-fn / query-builder name to hard-block).
+fn is_allowed_combinator_path(path: &str) -> bool {
+    matches!(
+        path,
+        "futures::future::select"
+            | "futures::future::select_all"
+            | "futures::future::select_ok"
+            | "futures::future::try_select"
+            | "future::select"
+            | "future::select_all"
+            | "future::select_ok"
+            | "future::try_select"
+            | "select_all"
+            | "select_ok"
+            | "try_select"
+    )
+}
+
+/// True if a candidate combinator `pattern` (a bare combinator NAME, e.g.
+/// `future::select` or `select_all`) occurs in `code` as a genuine futures
+/// combinator call. For each occurrence of `pattern` the check is:
+///
+/// 1. The name must be a complete token — the byte immediately after it must
+///    not be an identifier byte, so `future::select` inside `future::selected`
+///    / `future::select_all`, or `select_all` inside `select_all_flag`, is not
+///    a false hit (the longer name is caught by its own anchor).
+/// 2. A call `(` must follow once an OPTIONAL turbofish `::<…>` and any
+///    surrounding whitespace are skipped (see [`call_paren_follows`]). This is
+///    what makes `future::select::<_, _>(a, b)` and `select_all::<Vec<_>>(v)`
+///    match — the syn-based HVG010 macro lint strips such path arguments before
+///    matching, so `det_check` must tolerate them too (#980 Codex P2).
+/// 3. The full qualified path ending at the name is extracted by walking
+///    backward over the contiguous run of path bytes (identifier bytes and
+///    `:`), then matched exactly against [`is_allowed_combinator_path`] after a
+///    single optional leading `::` is stripped (so an absolute path like
+///    `::futures::future::select` matches, mirroring the macro lint's
+///    `path_to_string`, which ignores `leading_colon`). A path run immediately
+///    preceded by `.` is a method call and is rejected.
+///
+/// This is path-precise, so an unrelated helper of the same tail name under a
+/// different root (`crate::future::select`, `my_dsl::select_all`,
+/// `::my_dsl::select_all`) is never flagged — mirroring the macro lint's
+/// exact-path matching — with or without a leading `::` or a turbofish.
+fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
+    let bytes = code.as_bytes();
+    let name_len = pattern.len();
+    code.match_indices(pattern).any(|(pos, _)| {
+        // `name_end` is the byte index just past the last char of the name.
+        let name_end = pos + name_len;
+        // (1) The name must be a complete token, not a prefix of a longer one.
+        if name_end < bytes.len() && is_ident_byte(bytes[name_end]) {
+            return false;
+        }
+        // (2) A call `(` must follow (after an optional turbofish + whitespace).
+        if !call_paren_follows(bytes, name_end) {
+            return false;
+        }
+        // (3) Extract the full qualified path ending at the name (walking back
+        // over the contiguous path run and stripping an optional leading `::`),
+        // and match it exactly against the allowed set. A `.`-preceded run is a
+        // method call → `None` → rejected.
+        extract_qualified_path(code, pos, name_end).is_some_and(is_allowed_combinator_path)
+    })
+}
+
+/// Walk backward from `name_start` over the contiguous path run (identifier
+/// bytes and `:`) and return the full qualified path from the run start through
+/// `name_end`, with a single optional leading `::` stripped (so an absolute
+/// path like `::tokio::select` normalizes to `tokio::select`, mirroring the
+/// syn-based HVG010 macro lint's `path_to_string`, which ignores
+/// `leading_colon`). Returns `None` when the run is immediately preceded by a
+/// `.` — a method call, which is never a qualified path/macro invocation.
+///
+/// Shared by the DET011 combinator-FUNCTION matcher
+/// ([`matches_futures_combinator_pattern`]) and the DET011 select-MACRO matcher
+/// ([`matches_select_macro_pattern`]) so both extract the path identically. The
+/// caller supplies `name_start`/`name_end` — for a function the whole pattern
+/// (`future::select`) is the tail run; for a macro the `!` is excluded from
+/// `name_end` so only the macro PATH (`tokio::select`) is returned.
+fn extract_qualified_path(code: &str, name_start: usize, name_end: usize) -> Option<&str> {
+    let bytes = code.as_bytes();
+    let mut run_start = name_start;
+    while run_start > 0 {
+        let b = bytes[run_start - 1];
+        if is_ident_byte(b) || b == b':' {
+            run_start -= 1;
+        } else {
+            break;
+        }
+    }
+    // A `.` immediately before the path run is a method call — reject.
+    if run_start > 0 && bytes[run_start - 1] == b'.' {
+        return None;
+    }
+    let path = &code[run_start..name_end];
+    Some(path.strip_prefix("::").unwrap_or(path))
+}
+
+/// From byte index `after_name` (just past a combinator name token), returns
+/// `true` if a call `(` follows once an OPTIONAL turbofish `::<…>` and any
+/// surrounding whitespace are skipped. The turbofish's angle brackets are
+/// matched with a balanced-depth scan (their contents may contain nested `<>`,
+/// commas, paths, and `_`); the scan is bounded by `bytes.len()`, so it cannot
+/// run away, and an unbalanced group is rejected rather than treated as a call.
+///
+/// Recognized shapes (all → `true`):
+/// `name(`, `name (`, `name::<T>(`, `name::<_, _> (`, `name::<Vec<Box<T>>>(`.
+/// Anything else after the name (`.`, `::foo`, `,`, end of segment) → `false`.
+fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
+    let mut i = after_name;
+    // Optional whitespace before an (optional) turbofish.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Optional turbofish `::<…>`.
+    if i + 2 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' && bytes[i + 2] == b'<' {
+        i += 3; // skip `::<`, entering the angle-bracket group at depth 1.
+        let mut depth: u32 = 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return false; // unbalanced angle brackets — not a turbofish call.
+        }
+    }
+    // Optional whitespace after the turbofish (or the name).
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Require the call `(`.
+    i < bytes.len() && bytes[i] == b'('
+}
+
+/// DET011 candidate patterns for the select MACROS. Each carries a trailing
+/// `!` (so the macro NAME is a complete token bounded on the right by the bang,
+/// which keeps `select_biasedx!` and a `select` prefix inside `select_biased!`
+/// from matching); the accept/reject decision is made by the path-precise
+/// [`matches_select_macro_pattern`], which extracts the full qualified macro
+/// path and matches it EXACTLY against [`is_allowed_select_macro_path`]. This
+/// keeps `det_check` in lock-step with the compile-time HVG010 guardrail's
+/// `visit_macro`, which matches macro paths exactly (#799 / #980 Codex P2).
+const DET011_MACRO_PATTERNS: &[&str] = &["select!", "select_biased!"];
+
+/// The exact set of paths that name a select MACRO flagged by HVG010.
+///
+/// This mirrors, case-for-case, the allowed-path set in the macro crate's
+/// `determinism_lint.rs::visit_macro`: bare `select`/`select_biased`,
+/// `tokio::select`, `futures::select`, and `futures::select_biased`. Note that
+/// `tokio::select_biased` is deliberately ABSENT — it is not in `visit_macro`'s
+/// set either. A qualified path with any OTHER root (`crate::ui::select`,
+/// `my::select_biased`, `foo::bar::select`) is absent, so those are never
+/// flagged, exactly as the compile-time guardrail leaves them un-flagged
+/// (#980 Codex P2 — the qualified-macro-path false-positive fix).
+fn is_allowed_select_macro_path(path: &str) -> bool {
+    matches!(
+        path,
+        "select" | "select_biased" | "tokio::select" | "futures::select" | "futures::select_biased"
+    )
+}
+
+/// True if a select-macro `pattern` (`select!` or `select_biased!`, trailing
+/// `!` included) occurs in `code` as an invocation whose FULL qualified macro
+/// path is in the allowed set. For each occurrence the check is:
+///
+/// 1. The trailing `!` in `pattern` guarantees the macro name is a complete
+///    token on the right (`select_biasedx!` and a `select!` match inside
+///    `select_biased!` are excluded by `match_indices` itself).
+/// 2. The full qualified path ending at the macro name (the `!` excluded) is
+///    extracted by [`extract_qualified_path`] — walking backward over the
+///    contiguous path run and stripping an optional leading `::` — then matched
+///    exactly against [`is_allowed_select_macro_path`]. A `.`-preceded run
+///    (`None`) is rejected.
+///
+/// This is path-precise, so an unrelated macro of the same tail name under a
+/// different root (`crate::ui::select!`, `my::select_biased!`,
+/// `foo::bar::select!`) is never flagged — mirroring `visit_macro`'s
+/// exact-path matching — while `::tokio::select!` normalizes to `tokio::select`
+/// and IS flagged. `sql_select!` / `my_select!` are absorbed into a
+/// non-matching path (`sql_select` / `my_select`) by the backward walk and stay
+/// unflagged.
+fn matches_select_macro_pattern(code: &str, pattern: &str) -> bool {
+    // `pattern` ends with `!`; exclude it so only the macro PATH is extracted.
+    let name_end_offset = pattern.len() - 1;
+    code.match_indices(pattern).any(|(pos, _)| {
+        extract_qualified_path(code, pos, pos + name_end_offset)
+            .is_some_and(is_allowed_select_macro_path)
+    })
 }
 
 /// Byte positions of whole-word occurrences of `word` in `code`.
