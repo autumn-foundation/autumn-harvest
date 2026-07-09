@@ -2982,9 +2982,15 @@ async fn persist_workflow_failure(
                 // classification hint for the caller / completion-trigger, not a
                 // control input to the retry loop. `decoded.error_type` is `None`
                 // for a legacy `Err(String)` (and for an engine non-determinism
-                // string), so those fall back to the full-string match on the raw
-                // error, preserving legacy `non_retryable_errors` semantics.
-                if policy.is_non_retryable(decoded.error_type.as_deref(), &error) {
+                // string), so those fall back to the full-string match on the
+                // decoded HUMAN message (`decoded.message`) — never the raw
+                // `harvest_workflow_failure_v1` envelope JSON. Matching the raw
+                // envelope would mean a workflow returning `Err("fatal".into())`
+                // with `non_retryable_errors = ["fatal"]` never matches the
+                // envelope-wrapped string and keeps retrying (Codex P2). For a
+                // legacy `Err(String)` the decoded message equals the raw error,
+                // so legacy `non_retryable_errors` semantics are preserved.
+                if policy.is_non_retryable(decoded.error_type.as_deref(), &decoded.message) {
                     return None;
                 }
                 // Use the execution ID bytes as a deterministic seed so jitter is
