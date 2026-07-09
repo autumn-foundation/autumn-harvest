@@ -1840,6 +1840,72 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/dags/{dag_name}/runs/{run_exec_id}",
+      "category": "dag",
+      "read_only": true,
+      "description": "DAG run graph view (issue #690): the run's node topology annotated with per-node status/timing/attempts/error, reconstructed purely from the registered DagDefinition and recorded history. Admin-guarded, read-only. Unified DAGs only. No new event variant, no migration, no writes.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered (unified) DAG name."
+        },
+        {
+          "name": "run_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Execution id of the DAG run to inspect."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "run_exec_id",
+            "description": "The DAG run execution id."
+          },
+          {
+            "name": "dag_name",
+            "description": "The DAG name."
+          },
+          {
+            "name": "state",
+            "description": "The run's execution state (e.g. RUNNING, FAILED, COMPLETED)."
+          },
+          {
+            "name": "started_at",
+            "description": "When the run started."
+          },
+          {
+            "name": "finished_at",
+            "description": "When the run finished (omitted while still running)."
+          },
+          {
+            "name": "nodes",
+            "description": "Array of node entries: node_name, status (succeeded/failed/timed_out/cancelled/running/pending/skipped), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed."
+          }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The named DAG is a classic (non-unified) DAG with no DagDefinition topology to annotate."
+        },
+        {
+          "status": 404,
+          "description": "Unknown DAG name, or run_exec_id is not a run of that DAG."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/dags/{dag_name}/runs/{run_exec_id}/retry",
       "category": "dag",
