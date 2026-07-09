@@ -185,25 +185,38 @@ pub struct HealthSummaryReport {
 
 /// Classify the worker fleet from its deduped counts.
 ///
-/// The verdict keys on the workers that are *supposed to be running* —
-/// `supposed_running` (status `Active` or `Draining`) — never on `total`.
-/// `Stopped` rows are intentionally gone after a scale-down, so they never
-/// contribute to the verdict; keying the "no live workers" check on `total`
-/// would turn a clean scale-to-zero (only `Stopped` rows, no backlog) into a
-/// false `worker_no_active` critical (issue #679 review P2).
+/// Two independent sub-verdicts are combined with [`worst_status`], drawing a
+/// deliberate line between the workers that can *claim* new work and the
+/// workers that are merely *supposed to be running*:
 ///
-/// - `supposed_running == 0`: nothing is meant to be running. With a pending
-///   queue backlog this is `critical` (`worker_no_active`: work is queued with
-///   nothing to run it); with no backlog it is `healthy` — a clean
-///   scale-to-zero *or* a fresh install, nothing to run and nothing waiting.
-///   No division by zero.
-/// - `supposed_running > 0`: the unhealthy (stale) fraction over the
-///   supposed-running denominator drives the verdict against the degraded /
-///   critical thresholds. `unhealthy` counts only stale `Active`/`Draining`
-///   workers, so `Stopped` rows never inflate the fraction.
+/// - `active` = workers that can CLAIM new work = **Healthy AND status
+///   `Active`**. Draining workers refuse new tasks, and Stale or Stopped
+///   workers are not running, so none of them count as claimable capacity.
+/// - `supposed_running` = workers whose status is `Active` **or** `Draining`
+///   (regardless of health; `Stopped` excluded). A crashed-but-un-drained
+///   worker (status still `Active`, health `Stale`) is counted here, so a
+///   silently dead fleet is still visible to the fraction check.
+///
+/// 1. **Capacity check.** `active == 0 && queue_backlog > 0` ⇒ `critical`
+///    (`worker_no_active`): work is queued with nothing able to run it. This
+///    fires for an empty, an all-`Stopped`, an all-`Draining`, *and* an
+///    all-`Stale`-`Active` fleet whenever a backlog exists — because in every
+///    one of those cases no worker can claim the pending work (issue #679
+///    review P2: the earlier `supposed_running == 0` short-circuit let a
+///    drain window with a backlog read `healthy`).
+/// 2. **Health-fraction check.** Runs whenever `supposed_running > 0`,
+///    independent of the backlog, so a stale/crashed fleet is flagged even
+///    with nothing queued. `unhealthy / supposed_running` is compared against
+///    the degraded / critical thresholds; `unhealthy` counts only stale
+///    `Active`/`Draining` workers, so `Stopped` rows never inflate it. Skipped
+///    when `supposed_running == 0` (no division by zero) — a clean
+///    scale-to-zero or fresh install with no backlog therefore stays
+///    `healthy`.
 ///
 /// `total` (all deduped workers, `Stopped` included) drives only the response's
-/// headline `total` metric — never the verdict.
+/// headline `total` metric — never the verdict. A healthy, saturated fleet
+/// with a large backlog stays `healthy` on the workers axis: backlog is the
+/// queues subsystem's concern, not the workers'.
 #[must_use]
 pub fn classify_workers(
     active: usize,
@@ -213,8 +226,8 @@ pub fn classify_workers(
     queue_backlog: i64,
     thresholds: &StatusThresholds,
 ) -> (SubsystemStatus, Vec<String>) {
-    // Active workers are a subset of the supposed-running (Active+Draining) set;
-    // `total` (incl. Stopped) is the headline metric only, not part of the verdict.
+    // Claimable workers are a subset of the supposed-running (Active+Draining)
+    // set; `total` (incl. Stopped) is the headline metric only, not the verdict.
     debug_assert!(
         active <= supposed_running,
         "active ({active}) must not exceed supposed_running ({supposed_running})"
@@ -225,28 +238,29 @@ pub fn classify_workers(
     );
     let mut status = SubsystemStatus::Healthy;
     let mut codes = Vec::new();
-    if supposed_running == 0 {
-        // Nothing is supposed to be running. Critical only if work is queued
-        // with nothing to run it; otherwise a clean scale-to-zero / fresh
-        // install is healthy. Keyed on supposed_running, not total, so lingering
-        // Stopped heartbeat rows can't fabricate a false critical.
-        if queue_backlog > 0 {
-            status = SubsystemStatus::Critical;
-            codes.push(REASON_WORKER_NO_ACTIVE.to_string());
-        }
-        finalize_codes(&mut codes);
-        return (status, codes);
-    }
-    // Fraction over supposed-to-be-running workers only (Stopped excluded).
-    #[allow(clippy::cast_precision_loss)]
-    let fraction = unhealthy as f64 / supposed_running as f64;
-    if fraction >= thresholds.worker_critical_unhealthy_fraction {
+
+    // 1. Capacity: pending work with no worker able to claim it. Keyed on the
+    //    claimable count (`active`), so an all-Draining or all-Stale-Active
+    //    fleet with a backlog criticals — none of those workers can claim.
+    if active == 0 && queue_backlog > 0 {
         status = worst_status([status, SubsystemStatus::Critical]);
-        codes.push(REASON_WORKER_UNHEALTHY_FRACTION.to_string());
-    } else if fraction >= thresholds.worker_degraded_unhealthy_fraction {
-        status = worst_status([status, SubsystemStatus::Degraded]);
-        codes.push(REASON_WORKER_UNHEALTHY_FRACTION.to_string());
+        codes.push(REASON_WORKER_NO_ACTIVE.to_string());
     }
+
+    // 2. Health fraction over supposed-to-be-running workers (Stopped excluded).
+    //    Independent of the backlog, so a stale fleet is flagged even when idle.
+    if supposed_running > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let fraction = unhealthy as f64 / supposed_running as f64;
+        if fraction >= thresholds.worker_critical_unhealthy_fraction {
+            status = worst_status([status, SubsystemStatus::Critical]);
+            codes.push(REASON_WORKER_UNHEALTHY_FRACTION.to_string());
+        } else if fraction >= thresholds.worker_degraded_unhealthy_fraction {
+            status = worst_status([status, SubsystemStatus::Degraded]);
+            codes.push(REASON_WORKER_UNHEALTHY_FRACTION.to_string());
+        }
+    }
+
     finalize_codes(&mut codes);
     (status, codes)
 }
@@ -1071,9 +1085,10 @@ mod tests {
     #[test]
     fn classify_workers_zero_active_with_workers_is_critical() {
         // No active workers, but the sole supposed-running (Active/Draining)
-        // worker is stale ⇒ fraction 1/1 = 1.0 ≥ critical ⇒ critical. Under the
-        // supposed_running keying this surfaces as worker_unhealthy_fraction
-        // rather than worker_no_active (which now requires supposed_running==0).
+        // worker is stale ⇒ fraction 1/1 = 1.0 ≥ critical ⇒ critical. With no
+        // backlog the capacity check is skipped, so this surfaces as
+        // worker_unhealthy_fraction rather than worker_no_active (which now
+        // requires active == 0 AND a pending backlog).
         let (status, codes) = classify_workers(0, 1, 1, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
@@ -1140,6 +1155,66 @@ mod tests {
             "a scaled-down fleet of stale Stopped workers must not read critical"
         );
         assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn classify_workers_all_draining_with_backlog_is_critical() {
+        // THE #679 review P2 case: a deploy/drain window where every non-Stopped
+        // worker is Draining (0 claimable) and healthy, with pending work queued.
+        // Draining workers cannot claim new tasks, so nothing can run the
+        // backlog ⇒ critical worker_no_active — not a false healthy from the old
+        // `supposed_running > 0` short-circuit.
+        let (status, codes) = classify_workers(0, 3, 0, 3, 42, &thresholds());
+        assert_eq!(
+            status,
+            SubsystemStatus::Critical,
+            "an all-Draining fleet with a backlog cannot claim the work"
+        );
+        assert!(codes.contains(&"worker_no_active".to_string()));
+        assert!(!codes.contains(&"worker_unhealthy_fraction".to_string()));
+    }
+
+    #[test]
+    fn classify_workers_all_draining_no_backlog_is_healthy() {
+        // Same all-Draining fleet, but nothing is queued: an idle drain window is
+        // healthy — no work is waiting for a claimant.
+        let (status, codes) = classify_workers(0, 3, 0, 3, 0, &thresholds());
+        assert_eq!(status, SubsystemStatus::Healthy);
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn classify_workers_all_stale_active_no_backlog_is_critical_fraction() {
+        // A crashed, un-drained fleet: every worker's status is still Active but
+        // all are Stale, with no backlog. The capacity check is skipped (no work
+        // queued), but the health fraction (3/3 = 1.0 ≥ critical) still flags the
+        // dead fleet ⇒ critical worker_unhealthy_fraction. This is why the
+        // fraction check runs independently of the backlog.
+        let (status, codes) = classify_workers(0, 3, 3, 3, 0, &thresholds());
+        assert_eq!(status, SubsystemStatus::Critical);
+        assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
+        assert!(!codes.contains(&"worker_no_active".to_string()));
+    }
+
+    #[test]
+    fn classify_workers_healthy_saturated_fleet_with_huge_backlog_stays_healthy() {
+        // A fully healthy, saturated fleet (active > 0) with a large backlog is
+        // healthy on the WORKERS axis — a deep queue is the queues subsystem's
+        // concern, not a worker-fleet fault.
+        let (status, codes) = classify_workers(3, 6, 0, 6, 1_000_000, &thresholds());
+        assert_eq!(status, SubsystemStatus::Healthy);
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn classify_workers_degraded_fraction_with_active_claimant_present() {
+        // 1 claimable worker among 4 supposed-running, 1 stale ⇒ fraction
+        // 1/4 = 0.25 ≥ degraded 0.25. active > 0 so the capacity check is skipped;
+        // the run is degraded on the health fraction alone.
+        let (status, codes) = classify_workers(1, 4, 1, 4, 0, &thresholds());
+        assert_eq!(status, SubsystemStatus::Degraded);
+        assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
+        assert!(!codes.contains(&"worker_no_active".to_string()));
     }
 
     // ── classify_dead_letters ──────────────────────────────────────────────────
