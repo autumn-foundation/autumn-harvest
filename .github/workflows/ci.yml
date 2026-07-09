@@ -65,7 +65,9 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
           echo "Comparing ${base}...${head}"
-          changed="$(git diff --name-only "$base" "$head")"
+          # --no-renames disables rename detection so a code->docs move surfaces
+          # the deleted source path (setting code=true) instead of a docs-only add.
+          changed="$(git diff --name-only --no-renames "$base" "$head")"
           echo "Changed files:"
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any
