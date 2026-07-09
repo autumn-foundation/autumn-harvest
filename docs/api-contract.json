@@ -1893,15 +1893,15 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "The named DAG is a classic (non-unified) DAG with no DagDefinition topology to annotate."
+          "description": "The named DAG is a classic (non-unified) DAG with no DagDefinition topology to annotate, or run_exec_id is not a parseable execution id (JSON body: 'invalid execution id'). The unknown-DAG and classic-DAG checks run before the id parse, so an unparseable id is reached only for a valid unified DAG name."
         },
         {
           "status": 404,
           "description": "Unknown DAG name, or run_exec_id is not a run of that DAG."
         },
         {
-          "status": 500,
-          "description": "Database error."
+          "status": 503,
+          "description": "Database error (transient / service unavailable)."
         }
       ]
     },

@@ -18,6 +18,24 @@
 //! ([`crate::dag_retry`]). The `ActivityScheduled` event records that same
 //! activity name.
 //!
+//! ### v1 limitation: duplicate activity names
+//!
+//! This view assumes activity names are **unique** within a DAG. Because node
+//! identity is keyed purely by activity name (there is no per-task id in the
+//! recorded history), a DAG that reuses the same activity name across more than
+//! one task yields **ambiguous, duplicated** node entries: two [`DagRunNode`]s
+//! with the identical name, each carrying the same name-keyed status, timing,
+//! and error, and a combined `attempts` count. This is not supported.
+//!
+//! It is the same assumption the #366 retry resolver enforces — but that
+//! resolver *rejects* a duplicate-name DAG outright
+//! ([`DagRetryResolveError::AmbiguousNodes`](crate::dag_retry::DagRetryResolveError)
+//! → `400`). This read view deliberately does **not** reject: it is a
+//! best-effort, always-render-the-graph read path, and refusing to render a
+//! validly-running DAG would be worse operator UX than showing the (documented)
+//! ambiguous duplicates. `DagBuilder::build()` itself does not reject duplicate
+//! activity names, so such a DAG can be registered and run.
+//!
 //! ## Status classification (AC5 anchor)
 //!
 //! Base classification comes from [`crate::dag_retry::node_outcome`], the exact
@@ -124,22 +142,35 @@ pub struct DagRunGraphResponse {
 }
 
 /// Truncate an error message to its first line and at most [`ERROR_MAX_CHARS`]
-/// characters (char-boundary safe), appending `...` when truncated.
-fn first_line_truncated(error: &str) -> String {
+/// characters (char-boundary safe), appending `...` when truncated. Returns
+/// `None` when the first line is empty, so an empty error string is serialized
+/// as an omitted field rather than `Some("")`.
+fn first_line_truncated(error: &str) -> Option<String> {
     let first_line = error.lines().next().unwrap_or("");
+    if first_line.is_empty() {
+        return None;
+    }
     let mut chars = first_line.chars();
     let truncated: String = chars.by_ref().take(ERROR_MAX_CHARS).collect();
-    if chars.next().is_some() {
+    Some(if chars.next().is_some() {
         format!("{truncated}...")
     } else {
         truncated
-    }
+    })
 }
 
 /// Whether the execution state means the run is still live (a scheduled node
 /// with no terminal event is running, not cancelled).
+///
+/// Classified by **terminality**, not an explicit RUNNING allow-list: any
+/// non-terminal state is live. This deliberately includes `PAUSED` (a real
+/// non-terminal state, issue #383) — a scheduled-but-not-terminal node on a
+/// paused run is still in flight and reports `running`, not `cancelled`. It
+/// also future-proofs against any new non-terminal state. `SUSPENDED` is not a
+/// persisted execution state (the state CHECK constraint forbids it), so it is
+/// covered incidentally rather than named.
 fn is_live_state(exec_state: &str) -> bool {
-    matches!(exec_state, "RUNNING" | "SUSPENDED")
+    !autumn_harvest::erase::is_terminal_state(exec_state)
 }
 
 /// Find the index (and activity id) of the **latest** `ActivityScheduled` for
@@ -196,18 +227,28 @@ fn terminal_index(events: &[WorkflowEvent], activity_id: ActivityExecId) -> Opti
 }
 
 /// Extract the `(error_type, error)` pair from the terminal `ActivityFailed`
-/// for `activity_id`, first line truncated.
+/// for `activity_id`, first line truncated. The outer `Option` is `Some` when a
+/// terminal `ActivityFailed` exists for this attempt; the inner fields are each
+/// `None` when empty (an empty error string or empty error type serializes as an
+/// omitted field rather than `Some("")`).
 fn failure_detail(
     events: &[WorkflowEvent],
     activity_id: ActivityExecId,
-) -> Option<(String, String)> {
+) -> Option<(Option<String>, Option<String>)> {
     events.iter().rev().find_map(|event| match event {
         WorkflowEvent::ActivityFailed {
             activity_id: id,
             error,
             error_type,
             ..
-        } if *id == activity_id => Some((error_type.clone(), first_line_truncated(error))),
+        } if *id == activity_id => {
+            let etype = if error_type.is_empty() {
+                None
+            } else {
+                Some(error_type.clone())
+            };
+            Some((etype, first_line_truncated(error)))
+        }
         _ => None,
     })
 }
@@ -334,8 +375,8 @@ fn classify(
         if base == NodeOutcome::Failed
             && let Some((etype, emsg)) = failure_detail(events, activity_id)
         {
-            error_type = Some(etype);
-            error = Some(emsg);
+            error_type = etype;
+            error = emsg;
         }
     }
 
@@ -576,8 +617,39 @@ mod tests {
         let live = build_run_graph(&def, &events, "RUNNING");
         assert_eq!(node(&live, "b").status, DagNodeStatus::Running);
 
+        // PAUSED is a real non-terminal state (issue #383): a scheduled-no-terminal
+        // node is still in flight → running, not cancelled.
+        let paused = build_run_graph(&def, &events, "PAUSED");
+        assert_eq!(node(&paused, "b").status, DagNodeStatus::Running);
+
+        // A terminal state → cancelled.
         let dead = build_run_graph(&def, &events, "CANCELLED");
         assert_eq!(node(&dead, "b").status, DagNodeStatus::Cancelled);
+    }
+
+    #[test]
+    fn concurrent_fanout_scheduled_nodes_both_report_running() {
+        let def = fanout_dag();
+        // a completed; b and c both scheduled with no terminal event; run RUNNING.
+        let (ia, ib, ic) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), sched("b", ib)),
+            (ts(4), sched("c", ic)),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(node(&nodes, "a").status, DagNodeStatus::Succeeded);
+        // Two simultaneously in-flight fan-out branches both report running.
+        assert_eq!(node(&nodes, "b").status, DagNodeStatus::Running);
+        assert_eq!(node(&nodes, "c").status, DagNodeStatus::Running);
+        // The join node d was never reached.
+        assert_eq!(node(&nodes, "d").status, DagNodeStatus::Pending);
     }
 
     #[test]
@@ -682,11 +754,84 @@ mod tests {
 
     #[test]
     fn first_line_truncated_helper() {
-        assert_eq!(first_line_truncated("simple"), "simple");
-        assert_eq!(first_line_truncated("line1\nline2"), "line1");
+        assert_eq!(first_line_truncated("simple").as_deref(), Some("simple"));
+        assert_eq!(
+            first_line_truncated("line1\nline2").as_deref(),
+            Some("line1")
+        );
         let long = "y".repeat(300);
-        let out = first_line_truncated(&long);
+        let out = first_line_truncated(&long).expect("non-empty");
         assert_eq!(out.chars().count(), ERROR_MAX_CHARS + 3);
         assert!(out.ends_with("..."));
+        // An empty first line yields None (omitted, not Some("")).
+        assert_eq!(first_line_truncated(""), None);
+        assert_eq!(first_line_truncated("\nsecond line"), None);
+    }
+
+    #[test]
+    fn failed_node_with_empty_error_omits_error_field() {
+        let def = linear_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        // A failed activity whose error message is empty (and error_type empty).
+        let empty_fail = WorkflowEvent::ActivityFailed {
+            activity_id: ib,
+            error: String::new(),
+            attempt: 1,
+            error_type: String::new(),
+            non_retryable: false,
+            details: None,
+        };
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), sched("b", ib)),
+            (ts(4), empty_fail),
+        ];
+        let nodes = build_run_graph(&def, &events, "FAILED");
+        let b_node = node(&nodes, "b");
+        assert_eq!(b_node.status, DagNodeStatus::Failed);
+        // Empty error / error_type are omitted (None), not Some("").
+        assert!(b_node.error.is_none(), "empty error must be omitted");
+        assert!(
+            b_node.error_type.is_none(),
+            "empty error_type must be omitted"
+        );
+
+        // Serialized JSON must not carry the keys at all.
+        let value = serde_json::to_value(b_node).expect("serialize");
+        assert!(value.get("error").is_none(), "json: {value}");
+        assert!(value.get("error_type").is_none(), "json: {value}");
+    }
+
+    #[test]
+    fn duplicate_activity_names_produce_ambiguous_duplicated_nodes() {
+        // The node-name==activity-name contract assumes activity names are unique
+        // within a DAG. `DagBuilder::build()` does NOT reject duplicates (only the
+        // #366 retry resolver does, by rejecting the whole DAG). This read view
+        // neither guards nor rejects — it always shows the graph — so two tasks
+        // sharing an activity name yield two ambiguous, duplicated node entries
+        // with the same name-keyed status. This test pins that documented v1
+        // behavior so a future change is intentional.
+        let mut builder = DagBuilder::new();
+        let n1 = builder.activity(a);
+        // Same activity function `a` again → same activity_name "a".
+        let _n2 = builder.activity(a).upstream(&n1);
+        let def = builder.build().expect("dag with duplicate names builds");
+
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+
+        // Two node entries, both named "a".
+        let dupes: Vec<&DagRunNode> = nodes.iter().filter(|n| n.node_name == "a").collect();
+        assert_eq!(dupes.len(), 2, "both duplicated nodes are present");
+        // Both carry the same name-keyed status (ambiguous by construction).
+        assert_eq!(dupes[0].status, dupes[1].status);
+        assert_eq!(dupes[0].status, DagNodeStatus::Succeeded);
     }
 }

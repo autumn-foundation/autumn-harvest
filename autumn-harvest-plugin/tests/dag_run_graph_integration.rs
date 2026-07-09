@@ -352,6 +352,14 @@ fn failed(id: ActivityExecId) -> WorkflowEvent {
     }
 }
 
+/// A `dag_skip:{task_index}` marker (#482 data-dependent condition branch).
+fn skip_marker(task_index: usize, activity_name: &str) -> WorkflowEvent {
+    WorkflowEvent::MarkerRecorded {
+        name: format!("dag_skip:{task_index}"),
+        details: json!({ "task": activity_name, "reason": "condition_false" }),
+    }
+}
+
 /// Seed a workflow execution for `dag_name`, append `events` after the initial
 /// `WorkflowStarted`, then transition it to `state`.
 async fn seed_run(
@@ -623,4 +631,175 @@ async fn dag_run_graph_running_node_on_live_run() {
     // Scheduled-no-terminal on a live run → running (not cancelled).
     assert_eq!(node(&body, "step_b")["status"], json!("running"));
     assert!(body["finished_at"].is_null(), "live run has no finished_at");
+}
+
+// ── (g) PAUSED run: in-flight node reports running, not cancelled (FIX 1) ─────
+
+#[tokio::test]
+async fn dag_run_graph_paused_run_node_is_running_not_cancelled() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    // a completed; b scheduled but no terminal event; run PAUSED (issue #383).
+    let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+    let events = vec![sched("step_a", ia), completed(ia), sched("step_b", ib)];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-paused",
+        events,
+        "PAUSED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["state"], json!("PAUSED"));
+    // PAUSED is non-terminal → a scheduled-no-terminal node is running, not cancelled.
+    assert_eq!(node(&body, "step_b")["status"], json!("running"));
+}
+
+// ── (h) terminal run: in-flight node reports cancelled (FIX 7a) ──────────────
+
+#[tokio::test]
+async fn dag_run_graph_terminal_run_node_is_cancelled() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    // a completed; b scheduled but no terminal event; run CANCELLED.
+    let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+    let events = vec![
+        sched("step_a", ia),
+        completed(ia),
+        sched("step_b", ib),
+        WorkflowEvent::WorkflowCancelled {
+            reason: "operator cancel".to_string(),
+        },
+    ];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-cancel",
+        events,
+        "CANCELLED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["state"], json!("CANCELLED"));
+    // Scheduled-no-terminal on a terminal run → cancelled.
+    assert_eq!(node(&body, "step_b")["status"], json!("cancelled"));
+    // step_c was never reached.
+    assert_eq!(node(&body, "step_c")["status"], json!("pending"));
+}
+
+// ── (i) skip marker → skipped; downstream never-reached → pending (FIX 7b) ───
+
+#[tokio::test]
+async fn dag_run_graph_skipped_node_and_pending_downstream() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    // graph_linear_dag: step_a (idx 0) -> step_b (idx 1) -> step_c (idx 2).
+    // a succeeds; b is skipped by a data-dependent condition (dag_skip:1 marker,
+    // #482); c downstream of b is never reached.
+    let ia = ActivityExecId::new();
+    let events = vec![sched("step_a", ia), completed(ia), skip_marker(1, "step_b")];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-skip",
+        events,
+        "COMPLETED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(node(&body, "step_a")["status"], json!("succeeded"));
+    // Skipped by condition marker.
+    assert_eq!(node(&body, "step_b")["status"], json!("skipped"));
+    // Downstream of the skipped node, never reached → pending (not skipped).
+    assert_eq!(node(&body, "step_c")["status"], json!("pending"));
+    // A skipped node has no timing.
+    let b_node = node(&body, "step_b");
+    assert!(b_node.get("started_at").is_none() || b_node["started_at"].is_null());
+}
+
+// ── (j) retried node: attempts == 2 with latest-attempt status/timing (FIX 7c) ─
+
+#[tokio::test]
+async fn dag_run_graph_retried_node_reports_latest_attempt() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    // step_c scheduled twice: first attempt failed, second succeeded.
+    let (ia, ib, ic1, ic2) = (
+        ActivityExecId::new(),
+        ActivityExecId::new(),
+        ActivityExecId::new(),
+        ActivityExecId::new(),
+    );
+    let events = vec![
+        sched("step_a", ia),
+        completed(ia),
+        sched("step_b", ib),
+        completed(ib),
+        sched("step_c", ic1),
+        failed(ic1),
+        sched("step_c", ic2),
+        completed(ic2),
+    ];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-retry",
+        events,
+        "COMPLETED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let c_node = node(&body, "step_c");
+    // Both attempts counted.
+    assert_eq!(c_node["attempts"], json!(2));
+    // Status/timing describe the latest (successful) attempt.
+    assert_eq!(c_node["status"], json!("succeeded"));
+    assert!(!c_node["started_at"].is_null(), "latest attempt started_at");
+    assert!(
+        !c_node["finished_at"].is_null(),
+        "latest attempt finished_at"
+    );
+    // The latest attempt succeeded, so no error fields are carried.
+    assert!(c_node.get("error").is_none() || c_node["error"].is_null());
+    assert!(c_node.get("error_type").is_none() || c_node["error_type"].is_null());
+}
+
+// ── (k) malformed run_exec_id → 400 JSON (FIX 5) ─────────────────────────────
+
+#[tokio::test]
+async fn dag_run_graph_malformed_run_exec_id_is_bad_request_with_json_body() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // A valid unified DAG name reaches the id parse (the unknown-DAG and
+    // classic-DAG checks run first); a garbage run_exec_id is rejected 400.
+    let (status, body) = get_json(&app, "/dags/graph_linear_dag/runs/not-a-valid-uuid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    // A JSON error body, never a 500 / empty body.
+    assert!(
+        !body.is_null(),
+        "expected a JSON error body for a malformed run_exec_id, got null"
+    );
 }

@@ -3268,10 +3268,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             post(retry_dag_run),
         )
-        // DAG run graph view (issue #690): admin-guarded, read-only. The node
-        // topology + per-node status is reconstructed from the registered
-        // DagDefinition and recorded history, so it is admin-only like the
-        // other operator control-plane reads.
+        // DAG run graph view (issue #690): read-only, admin-guarded per AC1.
+        // Note the asymmetry with the sibling `/dags/*` read routes (e.g.
+        // GET /dags/{dag_name}/runs), which carry no `require_admin` layer and
+        // rely only on the embedder's optional `api_with_auth` boundary — a
+        // pre-existing posture left unchanged here. This route adds the admin
+        // layer because issue #690 AC1 explicitly mandates it.
         .route(
             "/dags/{dag_name}/runs/{run_exec_id}",
             get(get_dag_run_graph).route_layer(require_admin.clone()),
