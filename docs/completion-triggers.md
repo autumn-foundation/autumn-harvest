@@ -145,6 +145,26 @@ Triggers support projection mapping from the source workflow output payload:
 * **`Passthrough`**: Forwards the exact source workflow output payload to the target workflow's input.
 * **`Static(Value)`**: Provides a predefined, static JSON value as the target workflow's input.
 * **`Projection(String)`**: Projects a value out of the source output using dotted-path syntax (e.g. `results.summary.count`).
+* **`Outcome { projection: Option<String> }`** (issue #748): Assembles a structured **terminal-outcome envelope** from the source execution's *recorded* data — the terminal state, the source identity, the output (only on `COMPLETED`), and the error / cancel reason. This is the mapping to use for **failure-routed** triggers: a source that reached a non-`COMPLETED` terminal state has a `NULL` output, so `Passthrough`/`Projection` would deliver `null` and the target would start blind. The envelope is a pure read-side projection — **no new event variant, no migration**.
+
+  The full envelope (`projection = None`):
+  ```json
+  {
+    "terminal_state": "FAILED",
+    "source_exec_id": "0000abcd-…",
+    "source_workflow_id": "order-42",
+    "source_workflow_name": "fulfill_order",
+    "output": null,
+    "error": "payment declined: insufficient funds"
+  }
+  ```
+  Field semantics: `output` is non-null **only** on `COMPLETED`; `error` carries the failure message on `FAILED`/`TIMED_OUT` and the cancel reason on `CANCELLED` when one was recorded (naturally `null` on `COMPLETED`); `terminal_state` is the canonical string (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`TERMINATED`).
+
+  `projection = Some(path)` plucks one dotted field out of the envelope using the same mechanism `Projection` uses — e.g. `Outcome { projection: Some("error") }` delivers the bare error string as the target's input. JSON (management API):
+  ```json
+  {"type": "Outcome", "data": {"projection": "error"}}
+  ```
+  or, for the whole envelope, `{"type": "Outcome", "data": {"projection": null}}`.
 
 ---
 
@@ -336,6 +356,21 @@ such a gate would be unreliable rather than protective. This matches the rollout
 contract of every other additive behavioral column in Harvest (completion callbacks
 #605, soft SLA #487, debounce #499, schedule catchup #484): documented deploy ordering,
 not registration gating.
+
+### Rollout ordering — `Outcome` mappings need an upgraded fleet (issue #748)
+
+The same worker-vs-registration rollout rule that governs guards (above) applies to the
+`Outcome` input mapping. The envelope is assembled by whichever **worker binary** commits
+the source terminal transition, at the single inline mapping site. A **pre-#748 worker**
+that loads an `Outcome` mapping does not understand the variant: `serde` deserialization
+of `input_mapping` falls back to `InputMapping::Passthrough`, so the target receives the
+raw source output (`Null` for a failed source) instead of the envelope — the exact
+blind-start the feature exists to fix, silently.
+
+**Rule: upgrade the entire worker fleet before registering `Outcome` triggers.** As with
+guard-operator extensions, Harvest does not reject `Outcome` registrations based on
+observed fleet state (see the reasoning in the guard section above) — deploy ordering is
+the contract.
 
 ### Re-registering a trigger replaces the whole definition
 

@@ -3946,7 +3946,7 @@
           {
             "name": "input_mapping",
             "required": false,
-            "description": "Input projection mapping."
+            "description": "Input projection mapping. Adjacently tagged (type/data). One of: Passthrough, Static(value), Projection(dotted-path), or Outcome{projection} (issue #748) which assembles a terminal-outcome envelope {terminal_state, source_exec_id, source_workflow_id, source_workflow_name, output, error} from the recorded source execution — use for failure-routed triggers whose source has a null output; projection optionally plucks one dotted field (e.g. \"error\") from the envelope."
           },
           {
             "name": "queue_name",

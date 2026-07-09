@@ -949,6 +949,283 @@ async fn test_trigger_input_mapping_static_and_projection() {
     assert_eq!(target_exec_proj.input, json!(999));
 }
 
+/// Issue #748 success metric: a failure-routed target receives the source's
+/// terminal-outcome envelope (incl. the failure cause) WITHOUT any
+/// `GET /workflows/{id}` on the source. The `Outcome { projection: None }`
+/// mapping assembles the envelope purely from the recorded execution row.
+///
+/// AC5 (inline/outbox parity) holds here by construction: this is a same-shard
+/// fire, and the identical `target_input` value that lands in the target
+/// execution row is the same one that would populate a cross-shard outbox row
+/// / `DeferredTriggerStart` — the envelope is assembled once at the single
+/// inline mapping site and flows to both paths verbatim.
+#[tokio::test]
+async fn test_outcome_mapping_delivers_failure_cause_to_target() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Failed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Outcome", "data": {"projection": null}}
+        }),
+    )
+    .await;
+
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-outcome",
+            exec_id: source_exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Drive the source to FAILED with a recorded error and a NULL output
+    // (the exact blind-start scenario the feature fixes).
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("FAILED"),
+            harvest_workflow_executions::output.eq(None::<Value>),
+            harvest_workflow_executions::error.eq(Some("payment declined: insufficient funds")),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Failed, None)
+        .await
+        .unwrap();
+
+    let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    // The target's input IS the terminal-outcome envelope — the failure cause
+    // is present, output is null, and the terminal state is carried.
+    assert_eq!(target_exec.input["terminal_state"], json!("FAILED"));
+    assert_eq!(
+        target_exec.input["error"],
+        json!("payment declined: insufficient funds")
+    );
+    assert_eq!(target_exec.input["output"], Value::Null);
+    assert_eq!(
+        target_exec.input["source_workflow_name"],
+        json!("source_wf")
+    );
+    assert_eq!(
+        target_exec.input["source_workflow_id"],
+        json!("source-outcome")
+    );
+    assert_eq!(
+        target_exec.input["source_exec_id"],
+        json!(source_exec_id.to_string())
+    );
+}
+
+/// AC6: an `Outcome` mapping survives the HTTP create → list round trip
+/// intact (adjacently-tagged, `projection` preserved).
+#[tokio::test]
+async fn test_create_trigger_with_outcome_mapping_round_trips() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let trigger_id = uuid::Uuid::new_v4();
+    let (status, created) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Failed", "TimedOut"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Outcome", "data": {"projection": "error"}}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        created["input_mapping"],
+        json!({"type": "Outcome", "data": {"projection": "error"}})
+    );
+
+    let (status, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        list[0]["input_mapping"],
+        json!({"type": "Outcome", "data": {"projection": "error"}})
+    );
+}
+
+/// Issue #748 COMPLETED→output positive branch: a target routed off a
+/// successful source receives the terminal-outcome envelope carrying the
+/// source's recorded output (the `execution.output.as_ref()` arm, gated on
+/// `state == Completed`). This is the complement to
+/// `test_outcome_mapping_delivers_failure_cause_to_target`, which exercises
+/// only the FAILED → `None` output branch.
+#[tokio::test]
+async fn test_outcome_mapping_delivers_output_on_completed_source() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Outcome", "data": {"projection": null}}
+        }),
+    )
+    .await;
+
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-outcome-ok",
+            exec_id: source_exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Drive the source to COMPLETED with a known non-null recorded output and
+    // no error (the positive-branch scenario the envelope carries forward).
+    let source_output = json!({"invoice_total": 4200});
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(source_output.clone())),
+            harvest_workflow_executions::error.eq(None::<String>),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Completed, None)
+        .await
+        .unwrap();
+
+    let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    // The target's input IS the terminal-outcome envelope: the source output
+    // is carried verbatim, error is null, and the terminal state is COMPLETED.
+    assert_eq!(target_exec.input["output"], source_output);
+    assert_eq!(target_exec.input["error"], Value::Null);
+    assert_eq!(target_exec.input["terminal_state"], json!("COMPLETED"));
+    assert_eq!(
+        target_exec.input["source_workflow_name"],
+        json!("source_wf")
+    );
+    assert_eq!(
+        target_exec.input["source_workflow_id"],
+        json!("source-outcome-ok")
+    );
+    assert_eq!(
+        target_exec.input["source_exec_id"],
+        json!(source_exec_id.to_string())
+    );
+}
+
 #[tokio::test]
 async fn test_trigger_state_matching_and_deduplication() {
     let _lock = TEST_MUTEX
