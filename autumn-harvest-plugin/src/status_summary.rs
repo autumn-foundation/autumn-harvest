@@ -185,21 +185,25 @@ pub struct HealthSummaryReport {
 
 /// Classify the worker fleet from its deduped counts.
 ///
-/// An empty fleet (`total == 0`) is `healthy` when there is no work waiting —
-/// nothing is deployed to be unhealthy about. But an empty fleet **with a
-/// pending queue backlog** is `critical`: work is queued with nothing to run
-/// it (`queue_backlog > 0` ⇒ `worker_no_active`).
+/// The verdict keys on the workers that are *supposed to be running* —
+/// `supposed_running` (status `Active` or `Draining`) — never on `total`.
+/// `Stopped` rows are intentionally gone after a scale-down, so they never
+/// contribute to the verdict; keying the "no live workers" check on `total`
+/// would turn a clean scale-to-zero (only `Stopped` rows, no backlog) into a
+/// false `worker_no_active` critical (issue #679 review P2).
 ///
-/// With workers present, zero active is always `critical`; otherwise the
-/// unhealthy (stale) fraction drives the verdict. The fraction is computed over
-/// only the workers that are *supposed to be running* — `supposed_running`
-/// (status `Active` or `Draining`) is the denominator and `unhealthy` (stale
-/// workers among those) is the numerator. Intentionally `Stopped` workers are
-/// excluded from both: after a scale-down their heartbeat rows go stale, and
-/// counting them would inflate the fraction into a false `critical`.
+/// - `supposed_running == 0`: nothing is meant to be running. With a pending
+///   queue backlog this is `critical` (`worker_no_active`: work is queued with
+///   nothing to run it); with no backlog it is `healthy` — a clean
+///   scale-to-zero *or* a fresh install, nothing to run and nothing waiting.
+///   No division by zero.
+/// - `supposed_running > 0`: the unhealthy (stale) fraction over the
+///   supposed-running denominator drives the verdict against the degraded /
+///   critical thresholds. `unhealthy` counts only stale `Active`/`Draining`
+///   workers, so `Stopped` rows never inflate the fraction.
 ///
-/// `total` (all deduped workers, `Stopped` included) drives only the
-/// empty-fleet check and the response's headline `total` metric.
+/// `total` (all deduped workers, `Stopped` included) drives only the response's
+/// headline `total` metric — never the verdict.
 #[must_use]
 pub fn classify_workers(
     active: usize,
@@ -209,29 +213,33 @@ pub fn classify_workers(
     queue_backlog: i64,
     thresholds: &StatusThresholds,
 ) -> (SubsystemStatus, Vec<String>) {
+    // Active workers are a subset of the supposed-running (Active+Draining) set;
+    // `total` (incl. Stopped) is the headline metric only, not part of the verdict.
+    debug_assert!(
+        active <= supposed_running,
+        "active ({active}) must not exceed supposed_running ({supposed_running})"
+    );
+    debug_assert!(
+        supposed_running <= total,
+        "supposed_running ({supposed_running}) must not exceed total ({total})"
+    );
     let mut status = SubsystemStatus::Healthy;
     let mut codes = Vec::new();
-    if total == 0 {
-        // A genuinely idle fresh install (no workers, no backlog) is healthy;
-        // an empty fleet with work queued is critical (nothing to run it).
+    if supposed_running == 0 {
+        // Nothing is supposed to be running. Critical only if work is queued
+        // with nothing to run it; otherwise a clean scale-to-zero / fresh
+        // install is healthy. Keyed on supposed_running, not total, so lingering
+        // Stopped heartbeat rows can't fabricate a false critical.
         if queue_backlog > 0 {
             status = SubsystemStatus::Critical;
             codes.push(REASON_WORKER_NO_ACTIVE.to_string());
-            finalize_codes(&mut codes);
         }
+        finalize_codes(&mut codes);
         return (status, codes);
-    }
-    if active == 0 {
-        status = SubsystemStatus::Critical;
-        codes.push(REASON_WORKER_NO_ACTIVE.to_string());
     }
     // Fraction over supposed-to-be-running workers only (Stopped excluded).
     #[allow(clippy::cast_precision_loss)]
-    let fraction = if supposed_running == 0 {
-        0.0
-    } else {
-        unhealthy as f64 / supposed_running as f64
-    };
+    let fraction = unhealthy as f64 / supposed_running as f64;
     if fraction >= thresholds.worker_critical_unhealthy_fraction {
         status = worst_status([status, SubsystemStatus::Critical]);
         codes.push(REASON_WORKER_UNHEALTHY_FRACTION.to_string());
@@ -1062,8 +1070,36 @@ mod tests {
 
     #[test]
     fn classify_workers_zero_active_with_workers_is_critical() {
-        // active=0, total=3 ⇒ critical regardless of backlog.
+        // No active workers, but the sole supposed-running (Active/Draining)
+        // worker is stale ⇒ fraction 1/1 = 1.0 ≥ critical ⇒ critical. Under the
+        // supposed_running keying this surfaces as worker_unhealthy_fraction
+        // rather than worker_no_active (which now requires supposed_running==0).
         let (status, codes) = classify_workers(0, 1, 1, 3, 0, &thresholds());
+        assert_eq!(status, SubsystemStatus::Critical);
+        assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
+        assert!(!codes.contains(&"worker_no_active".to_string()));
+    }
+
+    #[test]
+    fn classify_workers_stopped_only_no_backlog_is_healthy() {
+        // Codex #679 review P2: after a clean scale-to-zero the fleet holds
+        // only Stopped rows (supposed_running == 0, total > 0) and no work is
+        // queued. This must read healthy, not a false worker_no_active critical.
+        let (status, codes) = classify_workers(0, 0, 0, 7, 0, &thresholds());
+        assert_eq!(
+            status,
+            SubsystemStatus::Healthy,
+            "an all-Stopped fleet with no backlog must not read critical"
+        );
+        assert!(!codes.contains(&"worker_no_active".to_string()));
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn classify_workers_stopped_only_with_backlog_is_critical() {
+        // Same all-Stopped fleet, but work is queued with nothing live to run
+        // it ⇒ critical via supposed_running==0 && backlog>0.
+        let (status, codes) = classify_workers(0, 0, 0, 7, 42, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_no_active".to_string()));
     }
