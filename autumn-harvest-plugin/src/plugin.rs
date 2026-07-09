@@ -331,7 +331,7 @@ impl HarvestPlugin {
     /// The defaults are **starter values, not universal SLOs**; tune DLQ depth,
     /// queue backlog, stalled-run, and worker-health thresholds per deployment.
     #[must_use]
-    pub fn with_status_thresholds(
+    pub const fn with_status_thresholds(
         mut self,
         thresholds: crate::status_summary::StatusThresholds,
     ) -> Self {

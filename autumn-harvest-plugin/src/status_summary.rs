@@ -185,29 +185,53 @@ pub struct HealthSummaryReport {
 
 /// Classify the worker fleet from its deduped counts.
 ///
-/// An empty fleet (`total == 0`) is `healthy` (nothing is deployed to be
-/// unhealthy about — the "no active workers" preflight/alert owns that case).
+/// An empty fleet (`total == 0`) is `healthy` when there is no work waiting —
+/// nothing is deployed to be unhealthy about. But an empty fleet **with a
+/// pending queue backlog** is `critical`: work is queued with nothing to run
+/// it (`queue_backlog > 0` ⇒ `worker_no_active`).
+///
 /// With workers present, zero active is always `critical`; otherwise the
-/// unhealthy (stale) fraction drives the verdict.
+/// unhealthy (stale) fraction drives the verdict. The fraction is computed over
+/// only the workers that are *supposed to be running* — `supposed_running`
+/// (status `Active` or `Draining`) is the denominator and `unhealthy` (stale
+/// workers among those) is the numerator. Intentionally `Stopped` workers are
+/// excluded from both: after a scale-down their heartbeat rows go stale, and
+/// counting them would inflate the fraction into a false `critical`.
+///
+/// `total` (all deduped workers, `Stopped` included) drives only the
+/// empty-fleet check and the response's headline `total` metric.
 #[must_use]
 pub fn classify_workers(
     active: usize,
-    _draining: usize,
+    supposed_running: usize,
     unhealthy: usize,
     total: usize,
+    queue_backlog: i64,
     thresholds: &StatusThresholds,
 ) -> (SubsystemStatus, Vec<String>) {
     let mut status = SubsystemStatus::Healthy;
     let mut codes = Vec::new();
     if total == 0 {
+        // A genuinely idle fresh install (no workers, no backlog) is healthy;
+        // an empty fleet with work queued is critical (nothing to run it).
+        if queue_backlog > 0 {
+            status = SubsystemStatus::Critical;
+            codes.push(REASON_WORKER_NO_ACTIVE.to_string());
+            finalize_codes(&mut codes);
+        }
         return (status, codes);
     }
     if active == 0 {
         status = SubsystemStatus::Critical;
         codes.push(REASON_WORKER_NO_ACTIVE.to_string());
     }
+    // Fraction over supposed-to-be-running workers only (Stopped excluded).
     #[allow(clippy::cast_precision_loss)]
-    let fraction = unhealthy as f64 / total as f64;
+    let fraction = if supposed_running == 0 {
+        0.0
+    } else {
+        unhealthy as f64 / supposed_running as f64
+    };
     if fraction >= thresholds.worker_critical_unhealthy_fraction {
         status = worst_status([status, SubsystemStatus::Critical]);
         codes.push(REASON_WORKER_UNHEALTHY_FRACTION.to_string());
@@ -332,9 +356,15 @@ pub struct StatusBundleMerge {
     pub workers_active: usize,
     /// Deduped workers whose status is draining.
     pub workers_draining: usize,
-    /// Deduped workers whose health is stale.
+    /// Deduped workers that are supposed to be running (status `Active` or
+    /// `Draining`, `Stopped` excluded) — the unhealthy-fraction denominator.
+    pub workers_supposed_running: usize,
+    /// Deduped workers whose health is stale AND that are supposed to be
+    /// running (status `Active` or `Draining`) — the unhealthy-fraction
+    /// numerator. Intentionally `Stopped` stale workers are excluded so a
+    /// scale-down cannot inflate the fraction into a false `critical`.
     pub workers_unhealthy: usize,
-    /// Total distinct (deduped) workers across shards.
+    /// Total distinct (deduped) workers across shards (`Stopped` included).
     pub workers_total: usize,
     /// Dead-letter total summed across shards.
     pub dlq_total: i64,
@@ -365,9 +395,13 @@ struct ShardBundle {
 }
 
 /// Merge per-shard bundle observations into the cross-shard numbers (pure).
+///
+/// Takes ownership so the merged collections can move each shard's owned
+/// `WorkerRow`s and queue-name `String`s in, rather than cloning them.
 #[must_use]
-fn merge_bundle(observations: &[ShardObservation<ShardBundle>]) -> StatusBundleMerge {
-    let (_inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(observations);
+fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundleMerge {
+    // Summarize errors first (borrows), before the consuming loop moves the rows.
+    let (_inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(&observations);
     let incomplete = !unavailable_shards.is_empty();
 
     let mut all_workers: Vec<WorkerRow> = Vec::new();
@@ -377,14 +411,14 @@ fn merge_bundle(observations: &[ShardObservation<ShardBundle>]) -> StatusBundleM
     let mut stalled_count = 0i64;
 
     for observation in observations {
-        for bundle in &observation.rows {
-            all_workers.extend(bundle.workers.iter().cloned());
+        for bundle in observation.rows {
+            all_workers.extend(bundle.workers);
             dlq_total += bundle.dlq_total;
             if let Some(age) = bundle.dlq_newest_age_secs {
                 dlq_newest = Some(dlq_newest.map_or(age, |cur| cur.min(age)));
             }
-            for (queue, count) in &bundle.by_queue {
-                *by_queue.entry(queue.clone()).or_default() += *count;
+            for (queue, count) in bundle.by_queue {
+                *by_queue.entry(queue).or_default() += count;
             }
             stalled_count += bundle.stalled_count;
         }
@@ -405,9 +439,17 @@ fn merge_bundle(observations: &[ShardObservation<ShardBundle>]) -> StatusBundleM
         .iter()
         .filter(|w| w.worker.status == WorkerStatus::Draining.as_str())
         .count();
+    // "Supposed to be running" = Active or Draining (Stopped excluded). A
+    // Stopped worker is intentionally gone, not unhealthy, so it is left out of
+    // the fraction's numerator and denominator entirely (issue #679 review).
+    let is_supposed_running = |w: &&WorkerRow| {
+        w.worker.status == WorkerStatus::Active.as_str()
+            || w.worker.status == WorkerStatus::Draining.as_str()
+    };
+    let workers_supposed_running = deduped.iter().filter(is_supposed_running).count();
     let workers_unhealthy = deduped
         .iter()
-        .filter(|w| w.health == WorkerHealth::Stale)
+        .filter(|w| w.health == WorkerHealth::Stale && is_supposed_running(w))
         .count();
 
     // Busiest queue; first-wins on ties (BTreeMap iterates sorted by key, so
@@ -424,6 +466,7 @@ fn merge_bundle(observations: &[ShardObservation<ShardBundle>]) -> StatusBundleM
     StatusBundleMerge {
         workers_active,
         workers_draining,
+        workers_supposed_running,
         workers_unhealthy,
         workers_total,
         dlq_total,
@@ -473,7 +516,10 @@ fn collect_unavailable_shards(
             let reason = row
                 .error_summary
                 .clone()
-                .or_else(|| row.reason_codes.iter().next().cloned())
+                // `.as_slice()` forces the slice inherent `first`; a bare
+                // `row.reason_codes.first()` resolves to the in-scope
+                // `diesel::RunQueryDsl::first` (a query method) instead.
+                .or_else(|| row.reason_codes.as_slice().first().cloned())
                 .unwrap_or_else(|| "shard unreachable".to_string());
             merged.entry(row.shard_id).or_insert(UnavailableShard {
                 shard_id: row.shard_id,
@@ -508,9 +554,10 @@ pub fn build_status_response(
     // workers
     let (workers_status, workers_codes) = classify_workers(
         bundle.workers_active,
-        bundle.workers_draining,
+        bundle.workers_supposed_running,
         bundle.workers_unhealthy,
         bundle.workers_total,
+        bundle.queue_max_backlog,
         thresholds,
     );
     let workers = make_subsystem(
@@ -634,7 +681,7 @@ async fn fan_out_bundle(
         .collect::<Vec<_>>();
     let observations = join_all(observations).await;
 
-    merge_bundle(&observations)
+    merge_bundle(observations)
 }
 
 async fn observe_bundle_shard(
@@ -743,18 +790,31 @@ struct CountRow {
 
 /// Bounded count of stalled *candidate* executions on this shard.
 ///
-/// Mirrors the candidate predicate of
-/// [`crate::api::load_stalled_workflows`] (active state + no `harvest_events`
-/// row newer than `minutes`) but stops counting at `cap` so the status
-/// endpoint never scans an unbounded backlog. This is a cheap approximation:
-/// unlike the full `GET /workflows?no_progress_minutes=N` drill-down, it does
-/// not apply the future-timer "correctly sleeping ≠ stalled" refinement, so it
-/// may slightly over-count. The drill-down link is authoritative.
+/// Mirrors the candidate predicate of [`crate::api::load_stalled_workflows`]
+/// (its default `include_sleeping = false` shape): an active-state execution
+/// (`RUNNING`/`SUSPENDED`) with no `harvest_events` row newer than `minutes`,
+/// **and** which is not "correctly sleeping" — i.e. it either has other pending
+/// work (a claimable task-queue row, a non-terminal child, or an unconsumed
+/// signal) or has no sole future-dated durable timer to be legitimately parked
+/// on / has an already-overdue timer. The future-timer exclusion predicate
+/// below is copied verbatim from `load_stalled_workflows` so the two agree: a
+/// workflow idling on a long `ctx.timer`/`receive_signal_timeout` is **not**
+/// counted as stalled. Counting stops at `cap` so the status endpoint never
+/// scans an unbounded backlog; the drill-down link remains authoritative.
+///
+/// Cost note: this is a `NOT EXISTS` anti-join per `RUNNING`/`SUSPENDED` row
+/// (backed by the `idx_harvest_events_exec_last` covering index), so its cost
+/// scales with the active-execution count. `GET /admin/status` is an on-demand
+/// triage surface, not a per-second dashboard poll.
 async fn count_stalled_candidates(
     conn: &mut AsyncPgConnection,
     minutes: i64,
     cap: i64,
 ) -> Result<i64, String> {
+    // The `AND (... future-timer exclusion ...)` block mirrors the
+    // `!include_sleeping` filter in `crate::api::load_stalled_workflows` exactly
+    // (only the correlation alias differs: `e.id` here vs. the qualified
+    // `harvest_workflow_executions.id` there). Keep the two in sync.
     let row: CountRow = diesel::sql_query(
         "SELECT COUNT(*)::BIGINT AS cnt FROM ( \
              SELECT 1 FROM harvest_workflow_executions e \
@@ -763,6 +823,35 @@ async fn count_stalled_candidates(
                  SELECT 1 FROM harvest_events ev \
                  WHERE ev.workflow_exec_id = e.id \
                  AND ev.timestamp >= NOW() - ($1 * INTERVAL '1 minute') \
+             ) \
+             AND ( \
+                 EXISTS ( \
+                     SELECT 1 FROM harvest_task_queue \
+                     WHERE workflow_exec_id = e.id \
+                     AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') \
+                 ) \
+              OR EXISTS ( \
+                     SELECT 1 FROM harvest_workflow_executions c \
+                     WHERE c.parent_id = e.id \
+                     AND c.state NOT IN ( \
+                         'COMPLETED','FAILED','CANCELLED', \
+                         'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' \
+                     ) \
+                 ) \
+              OR EXISTS ( \
+                     SELECT 1 FROM harvest_signals \
+                     WHERE workflow_exec_id = e.id AND consumed = false \
+                 ) \
+              OR NOT EXISTS ( \
+                     SELECT 1 FROM harvest_timers \
+                     WHERE workflow_exec_id = e.id \
+                     AND fired = false AND fires_at > NOW() \
+                 ) \
+              OR EXISTS ( \
+                     SELECT 1 FROM harvest_timers \
+                     WHERE workflow_exec_id = e.id \
+                     AND fired = false AND fires_at <= NOW() \
+                 ) \
              ) \
              LIMIT $2 \
          ) t",
@@ -852,6 +941,7 @@ mod tests {
         StatusBundleMerge {
             workers_active: 3,
             workers_draining: 0,
+            workers_supposed_running: 3,
             workers_unhealthy: 0,
             workers_total: 3,
             dlq_total: 0,
@@ -917,39 +1007,65 @@ mod tests {
     // ── classify_workers ───────────────────────────────────────────────────────
 
     #[test]
-    fn classify_workers_empty_fleet_is_healthy() {
-        let (status, codes) = classify_workers(0, 0, 0, 0, &thresholds());
+    fn classify_workers_empty_fleet_no_backlog_is_healthy() {
+        // No workers, no queued work ⇒ genuinely idle fresh install ⇒ healthy.
+        let (status, codes) = classify_workers(0, 0, 0, 0, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
         assert!(codes.is_empty());
     }
 
     #[test]
+    fn classify_workers_empty_fleet_with_backlog_is_critical() {
+        // FIX 2 (issue #679 review): no workers but work is queued ⇒ nothing to
+        // run it ⇒ critical.
+        let (status, codes) = classify_workers(0, 0, 0, 0, 42, &thresholds());
+        assert_eq!(status, SubsystemStatus::Critical);
+        assert!(codes.contains(&"worker_no_active".to_string()));
+    }
+
+    #[test]
     fn classify_workers_zero_active_with_workers_is_critical() {
-        let (status, codes) = classify_workers(0, 1, 2, 3, &thresholds());
+        // active=0, total=3 ⇒ critical regardless of backlog.
+        let (status, codes) = classify_workers(0, 1, 1, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_no_active".to_string()));
     }
 
     #[test]
     fn classify_workers_degraded_unhealthy_fraction() {
-        // 1 of 3 unhealthy = 0.33 ≥ degraded 0.25, < critical 0.5.
-        let (status, codes) = classify_workers(2, 0, 1, 3, &thresholds());
+        // 1 of 3 supposed-running unhealthy = 0.33 ≥ degraded 0.25, < critical 0.5.
+        let (status, codes) = classify_workers(2, 3, 1, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Degraded);
         assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
     }
 
     #[test]
     fn classify_workers_critical_unhealthy_fraction() {
-        // 2 of 3 unhealthy = 0.66 ≥ critical 0.5.
-        let (status, codes) = classify_workers(1, 0, 2, 3, &thresholds());
+        // 2 of 3 supposed-running unhealthy = 0.66 ≥ critical 0.5.
+        let (status, codes) = classify_workers(1, 3, 2, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
     }
 
     #[test]
     fn classify_workers_all_healthy() {
-        let (status, codes) = classify_workers(5, 0, 0, 5, &thresholds());
+        let (status, codes) = classify_workers(5, 5, 0, 5, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn classify_workers_stopped_stale_workers_excluded_from_fraction() {
+        // FIX 3 (issue #679 review): 3 Active-healthy + 7 Stopped-stale.
+        // The 7 Stopped rows are intentionally gone, not unhealthy, so they are
+        // excluded from the fraction: supposed_running = 3, unhealthy = 0.
+        // total = 10 (all deduped, for the headline metric only).
+        let (status, codes) = classify_workers(3, 3, 0, 10, 0, &thresholds());
+        assert_eq!(
+            status,
+            SubsystemStatus::Healthy,
+            "a scaled-down fleet of stale Stopped workers must not read critical"
+        );
         assert!(codes.is_empty());
     }
 

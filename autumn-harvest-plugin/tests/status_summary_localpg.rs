@@ -1,13 +1,26 @@
-//! Integration tests for `GET /admin/status` (issue #679).
+//! Local-Postgres end-to-end evidence for `GET /admin/status` (issue #679).
 //!
-//! Exercises the rolled-up health summary end-to-end: a healthy fleet reports
-//! `healthy` with five subsystems; seeded dead-letters drive the `dead_letters`
-//! subsystem (and the overall verdict) non-healthy with a drill-down link; the
-//! route is admin-gated; and a down shard degrades (never 500s) with the shard
-//! named in `unavailable_shards`.
+//! The primary coverage for this route lives in `status_summary_integration.rs`,
+//! which spins a real Postgres via testcontainers. In sandboxes that have a
+//! running Postgres but **no Docker daemon**, testcontainers can't start a
+//! container — so this file drives the identical app router (built with
+//! `harvest_api_router` over `HarvestApiState`) against an operator-supplied
+//! `DATABASE_URL` instead, exercising the real HTTP route through the axum stack
+//! (not just the pure classifiers). It mirrors the #597 M9 precedent of
+//! verifying routes end-to-end against a local Postgres by applying migrations
+//! directly.
 //!
-//! These tests require Docker/testcontainers and are compile-checked in
-//! sandboxes without a Docker daemon (matching the #543/#544/#601 precedent).
+//! **Opt-in / CI-safe**: the test is a no-op unless `DATABASE_URL` is set, so it
+//! never runs (and never fails) in CI without an explicitly provided database.
+//! Run it locally with e.g.:
+//!
+//! ```sh
+//! DATABASE_URL='postgres://harvest:harvest@localhost:5432/harvest_test' \
+//!   cargo test -p autumn-harvest-plugin --test status_summary_localpg -- --nocapture
+//! ```
+//!
+//! All phases run in one `#[tokio::test]` sequentially, resetting the schema
+//! between phases, so the result is deterministic regardless of `--test-threads`.
 
 use std::collections::BTreeMap;
 
@@ -25,11 +38,8 @@ use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use serde_json::Value;
-use testcontainers::ContainerAsync;
-use testcontainers::ImageExt;
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -176,51 +186,62 @@ const INIT_SQL: &str = concat!(
 
 type HarvestApiApp = axum::Router;
 
-async fn setup_single_shard() -> (String, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
-        .with_tag("16")
-        .start()
+/// Drop and recreate the `public` schema, then apply the full migration set —
+/// giving each phase a clean, deterministic slate on the shared local database.
+///
+/// Also creates and populates `__diesel_schema_migrations` from the on-disk
+/// migration directories so the shard-health readiness probe (which reads that
+/// table, `shard_health.rs`) sees a fully-migrated schema — exactly what a real
+/// `diesel migration run` deployment produces, and what raw `up.sql` application
+/// alone does not.
+async fn reset_and_migrate(url: &str) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
-        .expect("failed to start Postgres container");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, container)
+        .expect("connect for reset");
+    conn.batch_execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
+        .await
+        .expect("reset schema");
+    conn.batch_execute(INIT_SQL)
+        .await
+        .expect("apply migrations");
+    populate_migration_ledger(&mut conn).await;
 }
 
-async fn setup_two_shards() -> ((String, String), ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("16")
-        .start()
-        .await
-        .expect("failed to start Postgres container");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    let s0 = format!("harvest_shard_{}", Uuid::new_v4().simple());
-    let s1 = format!("harvest_shard_{}", Uuid::new_v4().simple());
+/// Record every migration's version in `__diesel_schema_migrations`, mirroring
+/// what `diesel migration run` does. Versions are the numeric prefix of each
+/// directory under `autumn-harvest/migrations`, resolved at compile time via
+/// `CARGO_MANIFEST_DIR` so it is independent of the test's runtime CWD.
+async fn populate_migration_ledger(conn: &mut AsyncPgConnection) {
+    let migrations_dir =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../autumn-harvest/migrations").to_string();
+    let mut versions: Vec<String> = std::fs::read_dir(&migrations_dir)
+        .expect("read migrations dir")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let prefix = name.split('_').next()?;
+            (prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_digit()))
+                .then(|| prefix.to_string())
+        })
+        .collect();
+    versions.sort();
+    versions.dedup();
 
-    let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS __diesel_schema_migrations ( \
+             version VARCHAR(50) PRIMARY KEY NOT NULL, \
+             run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .await
+    .expect("create migration ledger");
+    for version in &versions {
+        diesel::sql_query(
+            "INSERT INTO __diesel_schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind::<diesel::sql_types::Text, _>(version)
+        .execute(conn)
         .await
-        .expect("admin connect");
-    for db in [&s0, &s1] {
-        diesel::sql_query(format!("CREATE DATABASE {db}"))
-            .execute(&mut admin)
-            .await
-            .expect("create db");
+        .expect("insert migration version");
     }
-    let url0 = format!("postgres://postgres:postgres@{host}:{port}/{s0}");
-    let url1 = format!("postgres://postgres:postgres@{host}:{port}/{s1}");
-    for url in [&url0, &url1] {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
-            .await
-            .expect("shard connect");
-        diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, INIT_SQL)
-            .await
-            .expect("migrate shard");
-    }
-    ((url0, url1), container)
 }
 
 fn build_pool(url: &str) -> DbPool {
@@ -234,8 +255,6 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool")
 }
 
-/// Admin-gated router with the outer auth boundary declared, so `/admin/status`
-/// reaches the handler.
 fn build_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -243,15 +262,10 @@ fn build_app(storage: HarvestDbPool) -> HarvestApiApp {
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
-/// Router with NO auth boundary — used to prove the admin guard rejects.
 fn build_unauthenticated_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(storage);
     harvest_api_router(api_state).with_state(AppState::for_test())
-}
-
-fn single_app(url: &str) -> HarvestApiApp {
-    build_app(HarvestDbPool::from(build_pool(url)))
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -274,17 +288,17 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
-async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str) -> Uuid {
+async fn seed_running_execution(url: &str, shard: i32) -> Uuid {
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(shard));
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
         .expect("connect");
-    let wf_id = format!("{workflow_name}-{}", Uuid::new_v4().simple());
+    let wf_id = format!("onboarding-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
-        workflow_name,
+        workflow_name: "onboarding",
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
@@ -315,20 +329,19 @@ async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str)
         .values(&row)
         .execute(&mut conn)
         .await
-        .expect("insert");
+        .expect("insert running execution");
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
-        .set(dsl::state.eq(state))
+        .set(dsl::state.eq("RUNNING"))
         .execute(&mut conn)
         .await
-        .expect("force state");
+        .expect("force RUNNING");
     exec_id.as_uuid()
 }
 
 /// Insert a fresh (`NOW()`) `harvest_events` row for `exec_id` so the execution
-/// is not counted as stalled — the stalled predicate is: active state with no
-/// `harvest_events` row newer than the no-progress window. Without this, a
-/// seeded RUNNING execution with an empty history reads as stalled, so the
-/// healthy path would never actually be healthy against a real DB.
+/// is not counted as stalled (the stalled predicate is: active state with no
+/// `harvest_events` row newer than the no-progress window). This is the piece
+/// that distinguishes a *healthy, progressing* run from a stalled one.
 async fn seed_recent_event(url: &str, exec_id: Uuid) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -344,53 +357,23 @@ async fn seed_recent_event(url: &str, exec_id: Uuid) {
     .expect("seed recent event");
 }
 
-/// Record every migration's version in `__diesel_schema_migrations`, mirroring
-/// what `diesel migration run` does. The raw-`up.sql` `with_init_sql` path never
-/// populates this table, so the shard-health readiness probe (which reads it,
-/// `shard_health.rs`) would otherwise report `schema_unreadable` and degrade the
-/// shards subsystem — making the healthy path impossible.
-///
-/// Versions are the numeric prefix of each directory under
-/// `autumn-harvest/migrations`, resolved at compile time via `CARGO_MANIFEST_DIR`
-/// so it is independent of the test's runtime CWD (matches the local-PG helper).
-async fn populate_migration_ledger(url: &str) {
+/// Insert a future-dated, unfired durable timer for `exec_id` — a workflow that
+/// is legitimately parked on a long `ctx.timer`/`receive_signal_timeout` and is
+/// therefore "correctly sleeping", NOT stalled (issue #679 review, FIX 1).
+async fn seed_future_timer(url: &str, exec_id: Uuid) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
         .expect("connect");
-    let migrations_dir =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../autumn-harvest/migrations").to_string();
-    let mut versions: Vec<String> = std::fs::read_dir(&migrations_dir)
-        .expect("read migrations dir")
-        .filter_map(|entry| {
-            let name = entry.ok()?.file_name().into_string().ok()?;
-            let prefix = name.split('_').next()?;
-            (prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_digit()))
-                .then(|| prefix.to_string())
-        })
-        .collect();
-    versions.sort();
-    versions.dedup();
-
-    diesel_async::SimpleAsyncConnection::batch_execute(
-        &mut conn,
-        "CREATE TABLE IF NOT EXISTS __diesel_schema_migrations ( \
-             version VARCHAR(50) PRIMARY KEY NOT NULL, \
-             run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    diesel::sql_query(
+        "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+         VALUES (gen_random_uuid(), $1, 'sleep', NOW() + INTERVAL '1 hour', false)",
     )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
     .await
-    .expect("create migration ledger");
-    for version in &versions {
-        diesel::sql_query(
-            "INSERT INTO __diesel_schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING",
-        )
-        .bind::<diesel::sql_types::Text, _>(version)
-        .execute(&mut conn)
-        .await
-        .expect("insert migration version");
-    }
+    .expect("seed future timer");
 }
 
-/// Insert a recent dead-letter row on `url`.
 async fn seed_dead_letter(url: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -415,21 +398,28 @@ fn subsystem<'a>(body: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{name} subsystem present"))
 }
 
-// ── (a) healthy path ─────────────────────────────────────────────────────────
-
+/// Drives the real `GET /admin/status` route against a local Postgres for all
+/// four issue-#679 scenarios. No-op unless `DATABASE_URL` is set.
 #[tokio::test]
-async fn healthy_fleet_reports_healthy_with_five_subsystems() {
-    let (url, _c) = setup_single_shard().await;
-    // A fully-migrated schema (ledger populated) with an actively-progressing
-    // run (fresh event ⇒ not stalled) is the only genuinely healthy shape.
-    populate_migration_ledger(&url).await;
-    let exec = seed_execution(&url, 0, "onboarding", "RUNNING").await;
-    seed_recent_event(&url, exec).await;
-    let app = single_app(&url);
+#[allow(clippy::too_many_lines)]
+async fn admin_status_localpg_end_to_end() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("SKIP status_summary_localpg: DATABASE_URL not set");
+        return;
+    };
+    eprintln!("status_summary_localpg: using DATABASE_URL={url}");
 
+    // ── (a) healthy path: a migrated schema with an actively-progressing run ─
+    reset_and_migrate(&url).await;
+    let exec = seed_running_execution(&url, 0).await;
+    seed_recent_event(&url, exec).await; // fresh event ⇒ not stalled
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
     let (status, body) = get_json(&app, "/admin/status").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "healthy");
+    assert_eq!(status, StatusCode::OK, "healthy path returns 200");
+    assert_eq!(
+        body["status"], "healthy",
+        "a fully-migrated schema with a progressing run is healthy"
+    );
     let names: Vec<&str> = body["subsystems"]
         .as_array()
         .unwrap()
@@ -445,46 +435,48 @@ async fn healthy_fleet_reports_healthy_with_five_subsystems() {
     ] {
         assert!(names.contains(&expected), "{expected} subsystem present");
     }
-    assert!(body["as_of"].is_string());
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
-    // Every healthy subsystem has a null drill_down.
+    assert_eq!(names.len(), 5, "exactly five subsystems");
+    assert!(body["as_of"].is_string(), "as_of timestamp present");
+    assert!(
+        body["unavailable_shards"].as_array().unwrap().is_empty(),
+        "no unavailable shards on the healthy path"
+    );
     assert!(
         body["subsystems"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|s| s["drill_down"].is_null())
+            .all(|s| s["drill_down"].is_null()),
+        "every healthy subsystem has a null drill_down"
     );
-}
+    eprintln!(
+        "PASS (a) healthy: {}",
+        serde_json::to_string(&body).unwrap()
+    );
 
-// ── (b) dead-letters drive the verdict non-healthy ──────────────────────────
-
-#[tokio::test]
-async fn seeded_dead_letters_make_dead_letters_subsystem_non_healthy() {
-    let (url, _c) = setup_single_shard().await;
+    // ── (b) dead-letters drive the verdict non-healthy ──────────────────────
+    reset_and_migrate(&url).await;
     seed_dead_letter(&url).await;
-    let app = single_app(&url);
-
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
     let (status, body) = get_json(&app, "/admin/status").await;
     assert_eq!(status, StatusCode::OK);
-
     let dl = subsystem(&body, "dead_letters");
     assert_ne!(dl["status"], "healthy", "a dead-letter must not be healthy");
-    assert_eq!(dl["drill_down"], "/dead-letters/aggregate");
-    assert!(dl["total"].as_i64().unwrap() >= 1);
-    // A fresh dead-letter is an active failure ⇒ critical, which dominates the
-    // overall verdict.
-    assert_eq!(dl["status"], "critical");
-    assert_eq!(body["status"], "critical");
-}
+    assert_eq!(
+        dl["drill_down"], "/dead-letters/aggregate",
+        "drill-down link"
+    );
+    assert!(dl["total"].as_i64().unwrap() >= 1, "dead-letter counted");
+    assert_eq!(dl["status"], "critical", "a fresh dead-letter is critical");
+    assert_eq!(body["status"], "critical", "overall = worst subsystem");
+    eprintln!(
+        "PASS (b) dead_letters: overall={}, dead_letters={}",
+        body["status"], dl["status"]
+    );
 
-// ── (c) admin guard ──────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn admin_status_requires_admin() {
-    let (url, _c) = setup_single_shard().await;
+    // ── (c) admin guard rejects an unauthenticated request ──────────────────
+    reset_and_migrate(&url).await;
     let app = build_unauthenticated_app(HarvestDbPool::from(build_pool(&url)));
-
     let response = app
         .oneshot(
             Request::builder()
@@ -495,26 +487,23 @@ async fn admin_status_requires_admin() {
         )
         .await
         .expect("request");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-// ── (d) one shard down ⇒ degraded, not 500 ──────────────────────────────────
-
-#[tokio::test]
-async fn one_shard_down_degrades_and_names_the_shard() {
-    let ((url0, url1), _c) = setup_two_shards().await;
-    seed_execution(&url0, 0, "onboarding", "RUNNING").await;
-
-    // Point shard 1 at a database that does not exist so its pool fails.
-    let mut pools = BTreeMap::new();
-    pools.insert(ShardId::new(0), build_pool(&url0));
-    pools.insert(
-        ShardId::new(1),
-        build_pool(&url1.replace("harvest_shard_", "missing_db_")),
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "admin guard rejects an unauthenticated caller"
     );
+    eprintln!("PASS (c) admin guard: {} UNAUTHORIZED", response.status());
+
+    // ── (d) one shard down ⇒ degraded, not 500, shard named ─────────────────
+    reset_and_migrate(&url).await;
+    seed_running_execution(&url, 0).await;
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url));
+    // Point shard 1 at a database that does not exist so its pool fails.
+    let broken_url = format!("{url}_missing_db_does_not_exist");
+    pools.insert(ShardId::new(1), build_pool(&broken_url));
     let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
     let app = build_app(storage);
-
     let (status, body) = get_json(&app, "/admin/status").await;
     assert_eq!(status, StatusCode::OK, "a down shard must not 500");
     assert_ne!(
@@ -524,12 +513,47 @@ async fn one_shard_down_degrades_and_names_the_shard() {
     let unavailable = body["unavailable_shards"].as_array().unwrap();
     assert!(
         unavailable.iter().any(|u| u["shard_id"] == 1),
-        "the down shard is named in unavailable_shards"
+        "the down shard is named in unavailable_shards: {unavailable:?}"
     );
+    let down = unavailable
+        .iter()
+        .find(|u| u["shard_id"] == 1)
+        .expect("shard 1 entry");
     assert!(
-        !unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
-            .as_str()
-            .unwrap()
-            .is_empty()
+        !down["reason"].as_str().unwrap().is_empty(),
+        "the down shard carries a non-empty reason"
     );
+    eprintln!(
+        "PASS (d) shard down: overall={}, unavailable_shards={}",
+        body["status"],
+        serde_json::to_string(unavailable).unwrap()
+    );
+
+    // ── (e) a workflow correctly sleeping on a future timer is NOT stalled ───
+    // (issue #679 review, FIX 1) The exec has no recent event (so it passes the
+    // event-age stalled predicate) but its sole pending work is a future-dated
+    // timer, so the future-timer exclusion — copied verbatim from
+    // `load_stalled_workflows` — must keep it out of the stalled count.
+    reset_and_migrate(&url).await; // also populates the migration ledger
+    let sleeper = seed_running_execution(&url, 0).await;
+    seed_future_timer(&url, sleeper).await; // sole pending work is a future timer
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
+    let (status, body) = get_json(&app, "/admin/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let stalled = subsystem(&body, "stalled_workflows");
+    assert_eq!(
+        stalled["count"].as_i64().unwrap(),
+        0,
+        "a workflow sleeping on a future timer must not be counted as stalled: {stalled}"
+    );
+    assert_eq!(
+        stalled["status"], "healthy",
+        "stalled_workflows subsystem is healthy when the only 'stall' is a sleeper"
+    );
+    eprintln!(
+        "PASS (e) sleeper-not-stalled: stalled_count={}",
+        stalled["count"]
+    );
+
+    eprintln!("ALL PHASES PASSED against local Postgres");
 }
