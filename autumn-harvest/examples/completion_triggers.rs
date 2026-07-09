@@ -68,7 +68,7 @@
 use autumn_harvest::completion_trigger::{
     CompletionTrigger, InputMapping, TerminalState, project_json_path,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn main() {
     // The declarative edge: `etl_ingest` COMPLETED -> start `daily_report` with the
@@ -100,6 +100,24 @@ fn main() {
         InputMapping::Passthrough => source_output,
         InputMapping::Static(v) => v.clone(),
         InputMapping::Projection(path) => project_json_path(&source_output, path),
+        // Issue #748: the engine assembles a terminal-outcome envelope from the
+        // recorded execution row (state, source identity, output on COMPLETED,
+        // error/cancel reason otherwise). Here we illustrate the shape for this
+        // simulated COMPLETED source; `projection` plucks one field from it.
+        InputMapping::Outcome { projection } => {
+            let envelope = json!({
+                "terminal_state": "COMPLETED",
+                "source_exec_id": "0000abcd-0000-0000-0000-000000000001",
+                "source_workflow_id": "etl-ingest-1",
+                "source_workflow_name": "etl_ingest",
+                "output": source_output,
+                "error": Value::Null,
+            });
+            match projection {
+                Some(path) => project_json_path(&envelope, path),
+                None => envelope,
+            }
+        }
     };
     println!("\nProjected `daily_report` input: {target_input}");
     assert_eq!(
