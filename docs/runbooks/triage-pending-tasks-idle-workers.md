@@ -138,11 +138,27 @@ Common reason codes and their fixes:
   - Wait for in-flight tasks of that concurrency key to finish.
   - Or increase the concurrency cap for that key/workflow.
 
-#### `rate_limit_saturated`
+#### `rate_limit_exhausted`
 - **Meaning**: The tasks have a rate limit key, and the rate limit bucket for this key has fewer than 1.0 token.
 - **Fix**:
   - Wait for the rate-limit bucket to refill.
   - Or increase the rate limit refill rate or burst size.
+- **Note**: For an activity that *also* declares a circuit breaker, rate limiting is enforced at dispatch rather than at claim (issue #369), so a saturated bucket never surfaces as `rate_limit_exhausted` for it — you will see `circuit_open`/`circuit_half_open` instead.
+
+#### `circuit_open`
+- **Meaning**: The task's next activity is guarded by a circuit breaker that is currently **open** — repeated retryable failures (a downstream outage) tripped it, so dispatches fast-fail until the cooldown elapses. No worker will claim the task while the breaker is open.
+- **Fix**:
+  - Wait for the breaker's cooldown to elapse; it then admits a single probe dispatch and, if that succeeds, closes automatically.
+  - Inspect the breaker: `GET /admin/circuits/{activity_name}` (or `GET /admin/circuits` for the full list) to see `last_trip`, `rolling_failure_count`, and `time_until_probe_secs`.
+  - Once the downstream has recovered, force it closed to resume immediately: `POST /admin/circuits/{activity_name}/force-close`.
+  - **Caveat**: the explainer reads the breaker with a non-mutating snapshot, and the Open→HalfOpen transition is driven only by an admitted probe dispatch — so a breaker whose cooldown has already elapsed still reads `circuit_open` here until the next dispatch admits a probe.
+- **Scope**: `circuit_open`/`circuit_half_open` are surfaced only when the breaker is actually **open** or **half-open**. A CB activity whose breaker is **closed** but whose rate-limit token bucket is exhausted will *not* surface any claim-time impediment here: for a CB activity rate limiting is enforced at dispatch, not at claim (issue #369), so its stall is diagnosed via `GET /admin/circuits/{activity_name}` and the activity's rate-limit bucket — not this eligibility explainer.
+
+#### `circuit_half_open`
+- **Meaning**: The task's next activity breaker is **half-open** — the cooldown elapsed and a single probe dispatch is in flight to test whether the downstream has recovered. Tasks other than the probe remain blocked while the breaker decides. This is a normal, transient recovery state.
+- **Fix**:
+  - Usually no action: the probe resolves within one attempt and the breaker either closes (recovered) or re-opens (still failing).
+  - If it persists, the downstream is flapping — inspect `GET /admin/circuits/{activity_name}` and treat it as a `circuit_open` outage.
 
 ---
 
