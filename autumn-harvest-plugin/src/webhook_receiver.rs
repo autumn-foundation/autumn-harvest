@@ -45,7 +45,8 @@
 //! classification here re-checked by hand.
 
 use autumn_harvest::audit::{
-    self, OP_WEBHOOK_TRIGGER, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_WORKFLOW,
+    self, HEADER_IDEMPOTENCY_KEY, OP_WEBHOOK_TRIGGER, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_WORKFLOW,
 };
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::NewAuditRecord;
@@ -341,11 +342,29 @@ async fn handle_webhook(
 
     let dispatch_response = match target {
         WebhookTarget::Starts { workflow } => {
+            // Strip any upstream `Idempotency-Key` header before delegating.
+            // Issue #808 made `start_workflow` read this header as a
+            // *workflow-start* dedup key, but many webhook providers (Stripe
+            // et al.) send their OWN `Idempotency-Key` on deliveries -- that is
+            // the PROVIDER's key, not a Harvest start key. If it reached #808's
+            // key logic it would (a) collapse two DIFFERENT bindings/events that
+            // happen to reuse a provider key into one execution, and (b) trip
+            // #808's `idempotency_key` + throttle/debounce/batch mutual-exclusion
+            // `400`, breaking webhook starts for any throttled/debounced/batched
+            // target. Webhook starts already dedupe via the mapper's
+            // `workflow_id` (reuse policy on `(workflow_name, workflow_id)`), so
+            // removing the raw header restores that -- and only that -- dedup.
+            // `from_webhook` already sets the body `idempotency_key` to `None`;
+            // the header is the sole remaining source, so removing it fully
+            // disables #808 dedup for webhook-delegated starts. Use the same
+            // header-name constant the handler reads so the two can't drift.
+            let mut start_headers = headers.clone();
+            start_headers.remove(HEADER_IDEMPOTENCY_KEY);
             Box::pin(crate::api::start_workflow(
                 Extension(api_state.clone()),
                 axum::extract::Path(workflow.to_string()),
                 None,
-                headers.clone(),
+                start_headers,
                 Ok(Json(StartWorkflowRequest::from_webhook(
                     workflow_id.as_str().to_string(),
                     payload,
@@ -376,6 +395,13 @@ async fn handle_webhook(
             // defense-in-depth. A same-binding redelivery of the same event
             // still maps to the same key, so exactly-once dedup for the
             // common case is unchanged.
+            //
+            // Unlike the `Starts` path above, the raw upstream `Idempotency-Key`
+            // header cannot leak into #808 dedup here: `signal_with_start_workflow`
+            // reads its exactly-once key exclusively from the request BODY
+            // (`request.idempotency_key`), never the header, so the namespaced
+            // key below is authoritative regardless of any provider header. No
+            // header stripping is needed on this path.
             let namespaced_idempotency_key = ctx
                 .delivery_id
                 .as_deref()
