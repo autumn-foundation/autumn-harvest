@@ -76,6 +76,17 @@
 //! `busy_ms` and `wait_ms` are attributed per step by kind (see
 //! [`TimelineRollup`]). Their sum need **not** equal `total_wall_clock_ms` —
 //! suspension and orchestration gaps between steps are unattributed and expected.
+//!
+//! | kind | attribution |
+//! |---|---|
+//! | regular activity, split present (an `ActivityStarted` was recorded) | queue-wait → `wait_ms`, exec → `busy_ms` |
+//! | regular activity, split absent (never started: pending / schedule-to-start timeout / anomaly) | whole duration → `wait_ms` (pure queue-wait) |
+//! | external activity, `child_workflow`, `local_activity`, `side_effect` | whole duration → `busy_ms` (downstream work) |
+//! | timer, `signal_wait` | whole duration → `wait_ms` |
+//!
+//! A regular activity is discriminated from an external activity (both render as
+//! `activity` steps) by `attempt`: regular activities report `attempt = Some(..)`,
+//! external activities `attempt = None`.
 
 use std::collections::BTreeMap;
 
@@ -213,11 +224,12 @@ pub struct TimelineRollup {
     /// `clock_end - started_at` in ms, where `clock_end` is the terminal instant
     /// or "now" for a running execution.
     pub total_wall_clock_ms: i64,
-    /// Sum of per-step busy contributions (activity exec,
-    /// `local`/`child`/`side_effect` totals).
+    /// Sum of per-step busy contributions (started-activity exec split;
+    /// external-activity / `local` / `child` / `side_effect` totals).
     pub busy_ms: i64,
-    /// Sum of per-step wait contributions (activity queue wait, timer + signal
-    /// totals).
+    /// Sum of per-step wait contributions (started-activity queue-wait split;
+    /// the whole total of a regular activity that never started — pending or a
+    /// schedule-to-start timeout — plus timer + signal totals).
     pub wait_ms: i64,
     /// The single slowest step, or `None` when there are no steps.
     pub slowest_step: Option<SlowestStep>,
@@ -543,10 +555,28 @@ fn compute_rollup(
             .or_insert(0) += 1;
 
         match (step.step_kind, step.wait_ms, step.exec_ms) {
+            // Regular activity with a recorded start: split queue-wait + exec.
             (StepKind::Activity, Some(w), Some(e)) => {
                 wait_ms += w;
                 busy_ms += e;
             }
+            // Regular activity with NO recorded start = never claimed = the whole
+            // duration is pure queue-wait. A regular activity's split is present
+            // iff an `ActivityStarted` was recorded; its absence means the
+            // activity never demonstrably executed (Pending, or a
+            // schedule-to-start timeout that timed out while still queued). A
+            // completed activity always records an `ActivityStarted`, so it never
+            // hits this arm; a null-split terminal activity is therefore a
+            // schedule-to-start timeout or a defensive anomaly — "all queue-wait"
+            // is the correct/safe attribution for both.
+            //
+            // `attempt.is_some()` discriminates a REGULAR activity from an
+            // EXTERNAL activity (both are `StepKind::Activity`): external
+            // activities are mapped with `retrying = false` → `attempt = None`,
+            // so they fall through to the busy bucket below (downstream work,
+            // like `child_workflow`). Keep this coupling in sync if external
+            // activities ever start reporting an `attempt`.
+            (StepKind::Activity, None, None) if step.attempt.is_some() => wait_ms += step.total_ms,
             (StepKind::Timer | StepKind::SignalWait, _, _) => wait_ms += step.total_ms,
             _ => busy_ms += step.total_ms,
         }
@@ -901,9 +931,12 @@ mod tests {
         assert_eq!(act.wait_ms, None);
         assert_eq!(act.exec_ms, None);
         assert_eq!(act.outcome, StepOutcome::Completed);
-        // Rollup: no split → busy = total.
-        assert_eq!(tl.rollup.busy_ms, 90);
-        assert_eq!(tl.rollup.wait_ms, 0);
+        // Rollup: a regular activity (attempt Some) with no recorded start never
+        // demonstrably executed → its whole duration is queue-wait (#739). This
+        // completed-but-no-start shape is a defensive anomaly; "all queue-wait"
+        // is the correct/safe attribution for it too.
+        assert_eq!(tl.rollup.busy_ms, 0);
+        assert_eq!(tl.rollup.wait_ms, 90);
     }
 
     // ── Test 3: in-flight run → pending, measured to now ──
@@ -1792,5 +1825,183 @@ mod tests {
             "open step measures to completed_at(100), not now(900)"
         );
         assert_eq!(tl.rollup.total_wall_clock_ms, 100);
+    }
+
+    // ── #739 rollup attribution: null-split regular activity is queue-wait ──
+    //
+    // A regular activity's wait/exec split is present iff an `ActivityStarted`
+    // (claim/start) event was recorded. When it is absent the activity never
+    // demonstrably executed — it sat in the queue — so its whole duration is
+    // queue-wait and must land in `wait_ms`, not `busy_ms`. Misfiling it as busy
+    // reports an idle-queued run as active and points the operator at the wrong
+    // remediation (the whole point of the timeline read model).
+
+    #[test]
+    fn pending_unstarted_activity_attributes_to_wait_not_busy() {
+        // Running execution (completed_at = None): only ActivityScheduled, no
+        // ActivityStarted, no terminal → Pending, null split.
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "queued_forever".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+        ];
+        let tl = derive(&rows, None, 500);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::Pending);
+        assert_eq!(act.wait_ms, None, "no start → null split");
+        assert_eq!(act.exec_ms, None);
+        assert_eq!(act.total_ms, 490);
+        // The pure queue-wait duration is attributed to wait, not busy.
+        assert_eq!(tl.rollup.wait_ms, 490);
+        assert_eq!(tl.rollup.busy_ms, 0);
+    }
+
+    #[test]
+    fn schedule_to_start_timed_out_activity_attributes_to_wait() {
+        // ActivityScheduled then ActivityTimedOut with NO ActivityStarted: the
+        // activity timed out while still queued (schedule-to-start). Null split,
+        // outcome TimedOut, 100% queue-wait. This is the case the narrower
+        // "Pending-only" patch misses.
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "never_claimed".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+            row(
+                310,
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: a1,
+                    timeout_type: crate::error::TimeoutType::ScheduleToStart,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(310), 310);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::TimedOut);
+        assert_eq!(act.wait_ms, None, "no start → null split");
+        assert_eq!(act.exec_ms, None);
+        assert_eq!(act.total_ms, 300);
+        // Timed out while queued → all queue-wait.
+        assert_eq!(tl.rollup.wait_ms, 300);
+        assert_eq!(tl.rollup.busy_ms, 0);
+    }
+
+    #[test]
+    fn started_activity_split_unchanged() {
+        // Regression guard: a normal scheduled→started→completed activity still
+        // splits queue-wait + exec into the two buckets.
+        let a1 = ActivityExecId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "normal".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+            row(
+                30,
+                WorkflowEvent::ActivityStarted {
+                    activity_id: a1,
+                    worker_id: WorkerId::new("w"),
+                },
+            ),
+            row(
+                100,
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: a1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(100), 100);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.wait_ms, Some(20));
+        assert_eq!(act.exec_ms, Some(70));
+        // wait(queue) → wait_ms, exec → busy_ms.
+        assert_eq!(tl.rollup.wait_ms, 20);
+        assert_eq!(tl.rollup.busy_ms, 70);
+    }
+
+    #[test]
+    fn external_pending_activity_stays_in_busy() {
+        // An external activity (ActivityAwaitingExternal, attempt None) with no
+        // terminal is downstream work, treated as busy — like child_workflow.
+        // The null-split queue-wait rule applies ONLY to regular activities
+        // (attempt Some), so this fix does NOT reclassify external work.
+        let a1 = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: a1,
+                    token,
+                    name: "await_human".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                    schedule_to_close_secs: 86_400,
+                },
+            ),
+        ];
+        let tl = derive(&rows, None, 400);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::Pending);
+        assert_eq!(act.attempt, None, "external activity reports no attempt");
+        assert_eq!(act.wait_ms, None);
+        assert_eq!(act.total_ms, 390);
+        // External/awaiting work stays in busy, not reclassified to wait.
+        assert_eq!(tl.rollup.busy_ms, 390);
+        assert_eq!(tl.rollup.wait_ms, 0);
+    }
+
+    #[test]
+    fn child_workflow_stays_in_busy() {
+        // Regression guard: a child_workflow step's total stays in busy_ms — it
+        // is downstream work, unaffected by the null-split activity fix.
+        let c1 = ExecutionId::new();
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ChildWorkflowStarted {
+                    child_id: c1,
+                    workflow_name: "sub".into(),
+                    input: serde_json::Value::Null,
+                },
+            ),
+            row(
+                90,
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: c1,
+                    output: serde_json::Value::Null,
+                },
+            ),
+        ];
+        let tl = derive(&rows, Some(90), 90);
+        let ch = find(&tl.steps, StepKind::ChildWorkflow);
+        assert_eq!(ch.attempt, None);
+        assert_eq!(ch.total_ms, 80);
+        assert_eq!(tl.rollup.busy_ms, 80);
+        assert_eq!(tl.rollup.wait_ms, 0);
     }
 }
