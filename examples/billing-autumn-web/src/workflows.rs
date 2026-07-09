@@ -159,17 +159,17 @@ pub async fn billing_checkout(
         .unwrap_or_default();
     if !captured {
         saga.compensate_all().await?;
-        return Err(HarvestError::WorkflowFailed {
-            name: "billing_checkout".to_owned(),
-            reason: "payment capture was rejected".to_owned(),
-        });
+        return Err(HarvestError::workflow_failed_untyped(
+            "billing_checkout",
+            "payment capture was rejected",
+        ));
     }
     let Some(capture_id) = capture.get("capture_id").and_then(Value::as_str) else {
         saga.compensate_all().await?;
-        return Err(HarvestError::WorkflowFailed {
-            name: "billing_checkout".to_owned(),
-            reason: "payment_captured signal missing capture_id".to_owned(),
-        });
+        return Err(HarvestError::workflow_failed_untyped(
+            "billing_checkout",
+            "payment_captured signal missing capture_id",
+        ));
     };
     let capture_id = capture_id.to_owned();
 

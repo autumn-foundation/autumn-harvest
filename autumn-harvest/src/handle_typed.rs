@@ -179,9 +179,18 @@ impl<T> TypedWorkflowHandle<T> {
         // (falls back to untyped `None` fields), mirroring
         // `HandleInner::enrich_terminal_result` — it must not turn an otherwise
         // correct snapshot (state + human `error` message intact) into an `Err`.
+        //
+        // `result_snapshot` reports the original handle's execution row (it does
+        // NOT follow the #523 retry chain — unlike `result_raw`), so the typed
+        // failure is loaded from `self.inner`'s own `exec_id` to stay consistent
+        // with the snapshot's `state`/`error`.
         let (error_type, error_details, non_retryable) =
             if snap.state == WorkflowResultState::Failed {
-                if let Ok(Some(decoded)) = self.inner.terminal_typed_failure().await {
+                if let Ok(Some(decoded)) = self
+                    .inner
+                    .terminal_typed_failure(self.inner.exec_id())
+                    .await
+                {
                     (decoded.error_type, decoded.details, decoded.non_retryable)
                 } else {
                     (None, None, None)

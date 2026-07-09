@@ -392,10 +392,17 @@ pub struct WorkflowFailure {
     /// Advisory failure-classification hint read by the caller /
     /// completion-trigger (via [`HarvestError::is_workflow_non_retryable`]).
     ///
-    /// This is **not** a control input to the engine's workflow-level retry
+    /// This flag is **not** a control input to the engine's workflow-level retry
     /// (#523) loop — a typed workflow `non_retryable` is deliberately *not*
     /// consulted by the retry scheduler, per issue #767 scope. It is a hint for
     /// downstream classification only, never a gate on whether the run retries.
+    ///
+    /// To *halt* the retry loop for a specific failure class, list its
+    /// [`error_type`](Self::error_type) in the workflow's
+    /// [`RetryPolicy::non_retryable_errors`](crate::RetryPolicy::non_retryable_errors):
+    /// the scheduler matches that class list against the decoded `error_type`,
+    /// so the `error_type` (not this `non_retryable` flag) is the retry-control
+    /// knob for a typed workflow failure.
     ///
     /// [`HarvestError::is_workflow_non_retryable`]: crate::HarvestError::is_workflow_non_retryable
     pub non_retryable: bool,
@@ -425,7 +432,10 @@ impl WorkflowFailure {
     /// The flag is an **advisory classification hint** for the caller /
     /// completion-trigger, not a control input to the engine's workflow-level
     /// retry (#523) loop — the retry scheduler does not consult it (issue #767
-    /// scope). Setting it does not prevent the run from retrying.
+    /// scope). Setting it does not prevent the run from retrying. To halt the
+    /// retry loop for this failure's class, add its `error_type` to the
+    /// workflow's [`RetryPolicy::non_retryable_errors`](crate::RetryPolicy::non_retryable_errors)
+    /// instead — the scheduler matches that list against the decoded `error_type`.
     #[must_use]
     pub const fn non_retryable(mut self) -> Self {
         self.non_retryable = true;

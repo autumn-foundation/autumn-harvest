@@ -688,6 +688,9 @@ impl HarvestError {
     /// This is an **advisory** classification hint for the caller /
     /// completion-trigger — it is not a retry control input; the engine's
     /// workflow-level retry (#523) loop never consults it (issue #767 scope).
+    /// To gate the retry loop on a failure class, list its `error_type` in the
+    /// workflow's `RetryPolicy::non_retryable_errors` — the scheduler matches
+    /// that list against the decoded `error_type`, not against this flag.
     #[must_use]
     pub fn is_workflow_non_retryable(&self) -> bool {
         match self {

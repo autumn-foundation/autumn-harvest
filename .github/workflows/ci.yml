@@ -99,6 +99,9 @@ jobs:
       - name: Run Docker-backed typed workflow failure integration tests (issue #767)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests -- --test-threads=1
+      - name: Run Docker-backed typed workflow-failure retry-gate tests (issue #767 FIX B)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests::workflow_typed -- --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1

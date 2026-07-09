@@ -2972,13 +2972,19 @@ async fn persist_workflow_failure(
                 if attempt >= policy.max_attempts {
                     return None;
                 }
-                // NOTE: a typed workflow `non_retryable` (issue #767) is
-                // deliberately NOT consulted here — it is an advisory
+                // The retry policy's `non_retryable_errors` class list IS matched
+                // against the decoded workflow `error_type` (issue #767), so an
+                // operator can halt the #523 workflow-level retry loop for a
+                // specific typed failure class (e.g. `"ValidationRejected"`) the
+                // same way they can for a typed activity failure. The
+                // `WorkflowFailure.non_retryable` FLAG itself, however, stays
+                // advisory-only and is deliberately NOT consulted here — it is a
                 // classification hint for the caller / completion-trigger, not a
-                // control input to the #523 workflow-level retry loop.
-                // `failure_is_non_retryable` only honors the ACTIVITY envelope
-                // and the retry policy's `non_retryable_errors` list.
-                if failure_is_non_retryable(&error, Some(&policy)) {
+                // control input to the retry loop. `decoded.error_type` is `None`
+                // for a legacy `Err(String)` (and for an engine non-determinism
+                // string), so those fall back to the full-string match on the raw
+                // error, preserving legacy `non_retryable_errors` semantics.
+                if policy.is_non_retryable(decoded.error_type.as_deref(), &error) {
                     return None;
                 }
                 // Use the execution ID bytes as a deterministic seed so jitter is

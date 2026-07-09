@@ -230,9 +230,16 @@ impl WorkflowSimulator {
                     };
                 }
                 WorkflowOutcome::Failed { error, .. } => {
-                    history.push(WorkflowEvent::workflow_failed(error.clone()));
+                    // Decode the typed workflow-failure envelope (issue #767) so
+                    // the recorded `WorkflowFailed` event carries the typed
+                    // `error_type`/`details`/`non_retryable` fields and
+                    // `final_output` is the human message, mirroring the worker.
+                    // A legacy `Err(String)` decodes to all-`None` typed fields
+                    // with `message == error`, preserving legacy semantics.
+                    let decoded = crate::failure::decode_workflow_failure(&error);
+                    history.push(WorkflowEvent::workflow_failed_typed(&decoded));
                     return SimulatorResult {
-                        final_output: Err(error),
+                        final_output: Err(decoded.message),
                         history,
                     };
                 }
@@ -405,7 +412,15 @@ impl WorkflowSimulator {
                             });
                         }
                         Err(err) => {
-                            history.push(WorkflowEvent::child_workflow_failed(child_id, err));
+                            // Decode the typed child-failure envelope (issue #767)
+                            // for parity with the worker's child-terminal decode:
+                            // a mock returning a `WorkflowFailure` envelope yields
+                            // a typed `ChildWorkflowFailed` event, while a plain
+                            // `Err(String)` decodes to all-`None` typed fields.
+                            let decoded = crate::failure::decode_workflow_failure(&err);
+                            history.push(WorkflowEvent::child_workflow_failed_typed(
+                                child_id, &decoded,
+                            ));
                         }
                     }
                     advanced = true;
@@ -950,5 +965,133 @@ mod tests {
             2,
             "explicit override (max_attempts=2) must win over ActivityInfo default (5)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #767 (FIX C): the simulator decodes typed workflow-failure
+    // envelopes, mirroring the worker.
+    // -----------------------------------------------------------------
+
+    /// A workflow whose `Err` is a typed `WorkflowFailure` envelope — the exact
+    /// wire shape a `#[workflow] -> Result<_, WorkflowFailure>` produces.
+    fn typed_failing_workflow(
+        _ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        Box::pin(async move {
+            Err(
+                WorkflowFailure::new("ValidationRejected", "invoice failed schema check")
+                    .with_details(serde_json::json!({ "field": "amount" }))
+                    .into_workflow_error_payload(),
+            )
+        })
+    }
+
+    /// FIX C (issue #767): a typed `WorkflowFailure` returned by the workflow is
+    /// decoded — the recorded `WorkflowFailed` event carries the typed
+    /// `error_type`/`details`/`non_retryable` fields and `final_output` is the
+    /// human message, not the wire envelope JSON (mirroring the worker).
+    #[tokio::test]
+    async fn test_simulator_decodes_typed_workflow_failure() {
+        let sim = WorkflowSimulator::new(typed_failing_workflow);
+        let res = sim.run(serde_json::json!(null)).await;
+
+        let err = res.final_output.expect_err("workflow must fail");
+        assert_eq!(
+            err, "invoice failed schema check",
+            "final_output must be the human message, not the envelope JSON"
+        );
+        assert!(
+            !err.contains("harvest_workflow_failure_v1"),
+            "final_output must not leak the wire envelope: {err}"
+        );
+
+        let (error, error_type, details, non_retryable) = res
+            .history
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                WorkflowEvent::WorkflowFailed {
+                    error,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => Some((
+                    error.clone(),
+                    error_type.clone(),
+                    details.clone(),
+                    *non_retryable,
+                )),
+                _ => None,
+            })
+            .expect("history must record a WorkflowFailed event");
+        assert_eq!(error, "invoice failed schema check");
+        assert_eq!(error_type.as_deref(), Some("ValidationRejected"));
+        assert_eq!(details, Some(serde_json::json!({ "field": "amount" })));
+        assert_eq!(non_retryable, Some(false));
+    }
+
+    /// A parent that spawns a child which fails with a typed `WorkflowFailure`
+    /// envelope, then propagates the error.
+    fn parent_spawning_typed_failing_child(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            match ctx
+                .spawn_child_workflow_raw("bad_child", serde_json::json!(null))
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+    }
+
+    /// FIX C (issue #767): a child-workflow mock returning a typed
+    /// `WorkflowFailure` envelope yields a typed `ChildWorkflowFailed` event
+    /// (parity with the worker's child-terminal decode).
+    #[tokio::test]
+    async fn test_simulator_decodes_typed_child_workflow_failure() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let sim = WorkflowSimulator::new(parent_spawning_typed_failing_child).mock_child_workflow(
+            "bad_child",
+            |_val| {
+                Err(WorkflowFailure::new("ChildBad", "child failed validation")
+                    .with_details(serde_json::json!({ "x": 1 }))
+                    .into_workflow_error_payload())
+            },
+        );
+
+        let res = sim.run(serde_json::json!(null)).await;
+        assert!(
+            res.final_output.is_err(),
+            "parent must observe child failure"
+        );
+
+        let (error, error_type, details, non_retryable) = res
+            .history
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::ChildWorkflowFailed {
+                    error,
+                    error_type,
+                    details,
+                    non_retryable,
+                    ..
+                } => Some((
+                    error.clone(),
+                    error_type.clone(),
+                    details.clone(),
+                    *non_retryable,
+                )),
+                _ => None,
+            })
+            .expect("history must record a ChildWorkflowFailed event");
+        assert_eq!(error, "child failed validation");
+        assert_eq!(error_type.as_deref(), Some("ChildBad"));
+        assert_eq!(details, Some(serde_json::json!({ "x": 1 })));
+        assert_eq!(non_retryable, Some(false));
     }
 }

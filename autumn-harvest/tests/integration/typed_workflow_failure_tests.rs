@@ -311,6 +311,16 @@ mod db_handle_surface {
     }
 
     async fn insert_running_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
+        insert_running_execution_retry_of(conn, None).await
+    }
+
+    /// Insert a RUNNING execution, optionally linked to a predecessor via the
+    /// #523 workflow-level retry FK (`retry_of_exec_id`). A retry successor also
+    /// carries `workflow_attempt = 2`.
+    async fn insert_running_execution_retry_of(
+        conn: &mut AsyncPgConnection,
+        retry_of: Option<ExecutionId>,
+    ) -> ExecutionId {
         let exec_id = ExecutionId::new();
         diesel::insert_into(dsl::harvest_workflow_executions)
             .values(&NewWorkflowExecution {
@@ -336,9 +346,9 @@ mod db_handle_surface {
                 sla_deadline_at: None,
                 schedule_id: None,
                 scheduled_for: None,
-                workflow_attempt: 1,
+                workflow_attempt: if retry_of.is_some() { 2 } else { 1 },
                 workflow_retry_policy: None,
-                retry_of_exec_id: None,
+                retry_of_exec_id: retry_of.map(|e| e.as_uuid()),
                 origin: None,
                 completion_callbacks: None,
             })
@@ -443,5 +453,74 @@ mod db_handle_surface {
                 .expect_err("FAILED execution must return an Err from result()");
             assert_eq!(typed_err.workflow_error_type(), Some(cat));
         }
+    }
+
+    /// FIX A (issue #767): `result_raw` follows the workflow-level retry chain
+    /// (issue #523) via `load_effective_execution`, so for a retried workflow
+    /// whose *final* attempt failed with a DIFFERENT typed class than the first,
+    /// the caller must see the FINAL attempt's typed fields — enriched from the
+    /// *effective* execution, not the original handle id.
+    ///
+    /// Also pins the consistency contract: `result_snapshot` does NOT follow the
+    /// chain (it reports the original row), so its typed fields must stay keyed
+    /// to the original execution it reports.
+    #[tokio::test]
+    async fn result_raw_enriches_from_the_effective_retry_execution() {
+        let (db_url, _container) = setup().await;
+        let pool = build_pool(&db_url);
+        let mut conn = pool.get().await.unwrap();
+        let client = WorkflowHandleClient::single(pool.clone(), db_url.clone());
+
+        // The original attempt fails with one typed class...
+        let original = insert_running_execution_retry_of(&mut conn, None).await;
+        seal_typed_failure(
+            &mut conn,
+            original,
+            "OriginalClass",
+            "first attempt blew up",
+        )
+        .await;
+
+        // ...and its #523 retry successor fails with a DIFFERENT typed class.
+        let successor = insert_running_execution_retry_of(&mut conn, Some(original)).await;
+        seal_typed_failure(
+            &mut conn,
+            successor,
+            "FinalClass",
+            "final attempt also failed",
+        )
+        .await;
+
+        let handle = client.handle(original);
+
+        // result_raw follows the retry chain and enriches from the EFFECTIVE
+        // (final-attempt) execution — the FinalClass, never OriginalClass.
+        let err = handle
+            .result_raw()
+            .await
+            .expect_err("a fully-failed retry chain must return an Err");
+        assert!(matches!(err, HarvestError::WorkflowFailed { .. }));
+        assert_eq!(
+            err.workflow_error_type(),
+            Some("FinalClass"),
+            "result_raw must enrich from the effective (final-attempt) execution, \
+             not the original handle id"
+        );
+        assert_eq!(
+            err.workflow_details(),
+            Some(&serde_json::json!({ "cat": "FinalClass" }))
+        );
+
+        // result_snapshot does NOT follow the chain — it reports the original
+        // row, so its typed fields must stay consistent with THAT execution.
+        let typed = autumn_harvest::TypedWorkflowHandle::<Value>::new(handle.clone());
+        let snap = typed.result_snapshot().await.unwrap();
+        assert_eq!(snap.state, WorkflowResultState::Failed);
+        assert_eq!(
+            snap.error_type.as_deref(),
+            Some("OriginalClass"),
+            "result_snapshot reports the original row (no chain-follow), so its \
+             typed fields must match the original execution"
+        );
     }
 }
