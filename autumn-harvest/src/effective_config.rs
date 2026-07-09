@@ -401,6 +401,38 @@ pub struct PoolConfigView {
     pub shard_pool_count: usize,
 }
 
+/// Connection-budget sizing read off one resolved database pool.
+///
+/// This is the **DB-free** input to [`resolve_pool_view`]: the capture site
+/// reads the two numbers off a live pool (which needs a DB), then hands them to
+/// the pure precedence decision, which is testable without ever constructing a
+/// real pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSizing {
+    /// Maximum connections in the (default-shard) pool.
+    pub max_connections: usize,
+    /// Number of shard pools the pool spans.
+    pub shard_count: usize,
+}
+
+/// Resolve the reported [`PoolConfigView`], mirroring the pool-selection
+/// precedence in `HarvestRunner::start` (issue #695 review).
+///
+/// The runner gives a configured sharded pool
+/// (`WorkerConfig::with_sharded_pool`) precedence over the fallback
+/// single-shard pool derived from `harvest_pool`. The effective-config snapshot
+/// must therefore report the sizing of the pool the runtime *actually* uses:
+/// when a sharded pool is present its sizing wins, otherwise the fallback
+/// sizing is reported.
+#[must_use]
+pub fn resolve_pool_view(sharded_pool: Option<PoolSizing>, fallback: PoolSizing) -> PoolConfigView {
+    let chosen = sharded_pool.unwrap_or(fallback);
+    PoolConfigView {
+        worker_pool_max_connections: chosen.max_connections,
+        shard_pool_count: chosen.shard_count,
+    }
+}
+
 impl EffectiveConfigView {
     /// Assemble the full effective-config view from its resolved parts.
     ///
@@ -665,5 +697,36 @@ mod tests {
         }
         assert_eq!(json["pool"]["worker_pool_max_connections"], 10);
         assert_eq!(json["pool"]["shard_pool_count"], 1);
+    }
+
+    #[test]
+    fn resolve_pool_view_prefers_sharded_pool_sizing_when_present() {
+        // Mirrors the runner precedence: a configured sharded pool
+        // (WorkerConfig::with_sharded_pool) wins over the fallback pool, so the
+        // snapshot must report the sharded pool's sizing — not the fallback's.
+        let fallback = PoolSizing {
+            max_connections: 10,
+            shard_count: 1,
+        };
+        let sharded = PoolSizing {
+            max_connections: 42,
+            shard_count: 3,
+        };
+        let view = resolve_pool_view(Some(sharded), fallback);
+        assert_eq!(view.worker_pool_max_connections, 42);
+        assert_eq!(view.shard_pool_count, 3);
+    }
+
+    #[test]
+    fn resolve_pool_view_falls_back_when_no_sharded_pool() {
+        // No WorkerConfig::with_sharded_pool → the runtime uses the single-shard
+        // wrapper of harvest_pool, so the snapshot reports the fallback sizing.
+        let fallback = PoolSizing {
+            max_connections: 17,
+            shard_count: 1,
+        };
+        let view = resolve_pool_view(None, fallback);
+        assert_eq!(view.worker_pool_max_connections, 17);
+        assert_eq!(view.shard_pool_count, 1);
     }
 }

@@ -746,7 +746,7 @@ async fn start_harvest_runtime(
     // back to the WorkerConfig value for the history ceiling).
     {
         use autumn_harvest::effective_config::{
-            EffectiveConfigView, PayloadCapsView, PoolConfigView,
+            EffectiveConfigView, PayloadCapsView, PoolSizing, resolve_pool_view,
         };
         let (payload_offload_enabled, payload_offload_threshold_bytes) = built
             .payload_offloader()
@@ -767,14 +767,31 @@ async fn start_harvest_runtime(
             payload_offload_enabled,
             payload_offload_threshold_bytes,
         );
-        let pool_view = PoolConfigView {
-            worker_pool_max_connections: harvest_pool.status().max_size,
-            // Derived from the router's shard set rather than a hardcoded `1`, so
-            // it stays correct if multi-shard is ever enabled. On the plugin path
-            // this is always 1 in practice because multi-shard deployments are
-            // rejected further below.
-            shard_pool_count: router.readable_shards().len(),
+        // Mirror `HarvestRunner::start`'s pool-selection precedence: a
+        // `WorkerConfig::with_sharded_pool` (single-shard, valid on the plugin
+        // path) is used by the runtime *instead of* `harvest_pool`, so the
+        // snapshot must report that pool's sizing, not the fallback's (issue
+        // #695 review). The fallback shard count is derived from the router's
+        // shard set rather than a hardcoded `1`, so it stays correct if
+        // multi-shard is ever enabled. On the plugin path both counts are always
+        // 1 in practice because multi-shard deployments are rejected below.
+        let fallback_pool_sizing = PoolSizing {
+            max_connections: harvest_pool.status().max_size,
+            shard_count: router.readable_shards().len(),
         };
+        // `sharded_pool` is a `db`-only field; the plugin always depends on
+        // `autumn-harvest` with `db`, so it is always present here (mirroring the
+        // ungated access at the multi-shard preflight check below).
+        let sharded_pool_sizing =
+            built
+                .worker_config()
+                .sharded_pool
+                .as_ref()
+                .map(|sp| PoolSizing {
+                    max_connections: sp.pool_for(sp.default_shard()).status().max_size,
+                    shard_count: sp.iter_shards().count(),
+                });
+        let pool_view = resolve_pool_view(sharded_pool_sizing, fallback_pool_sizing);
         let poll_interval =
             autumn_harvest::worker::WorkerRuntimeConfig::from(built.worker_config().clone())
                 .poll_interval;
