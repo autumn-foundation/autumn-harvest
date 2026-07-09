@@ -107,13 +107,18 @@ pub struct DagRunNode {
     /// Static topology: the upstream node (activity) names this node depends on,
     /// so a UI renders the graph without a second registry lookup (AC3).
     pub depends_on: Vec<String>,
-    /// When the node's latest attempt was scheduled, if it was ever scheduled.
+    /// When the node's latest attempt actually started running (its latest
+    /// `ActivityStarted` timestamp), falling back to the schedule timestamp for
+    /// a scheduled-but-not-yet-claimed node. `None` for a never-scheduled node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     /// When the node's latest attempt reached a terminal event, if it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    /// Number of times the node's activity was scheduled (attempts).
+    /// Number of execution attempts of the node's latest attempt-chain — the
+    /// count of `ActivityStarted` events for its authoritative `activity_id`
+    /// (one per worker claim, so activity-level retries are counted). `0` for a
+    /// never-scheduled node.
     pub attempts: u32,
     /// Low-cardinality error-type name for a failed node.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,15 +194,36 @@ fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, Acti
     })
 }
 
-/// Count how many times `node` was scheduled (attempts).
-fn count_attempts(events: &[WorkflowEvent], node: &str) -> u32 {
-    let count = events
-        .iter()
-        .filter(
-            |event| matches!(event, WorkflowEvent::ActivityScheduled { name, .. } if name == node),
-        )
-        .count();
-    u32::try_from(count).unwrap_or(u32::MAX)
+/// Count the real execution attempts of the node's authoritative attempt-chain
+/// and return the index of the **latest** attempt's start.
+///
+/// An activity-level retry (a `RetryPolicy` firing within a single dispatch)
+/// **reuses the same task row and the same `activity_id`**: the engine keeps the
+/// original `ActivityScheduled` and appends a fresh `ActivityStarted` on every
+/// claim (`queue::requeue_for_retry` re-pends the row and appends no event; a
+/// retryable failure appends no `ActivityFailed` at all — only the final,
+/// retry-exhausting failure does). Counting `ActivityScheduled` would therefore
+/// report `attempts: 1` for a node the engine attempted N times, and anchor the
+/// timing to the original schedule instead of the latest attempt. The
+/// authoritative signal for "how many times a worker ran this" is the number of
+/// `ActivityStarted` events for the node's latest `activity_id` (the same
+/// `activity_id` [`node_outcome`] treats as authoritative).
+///
+/// Returns `(started_count, latest_started_index)` scoped to `activity_id`.
+fn started_attempts(events: &[WorkflowEvent], activity_id: ActivityExecId) -> (u32, Option<usize>) {
+    let mut count: u32 = 0;
+    let mut latest = None;
+    for (idx, event) in events.iter().enumerate() {
+        if let WorkflowEvent::ActivityStarted {
+            activity_id: id, ..
+        } = event
+            && *id == activity_id
+        {
+            count = count.saturating_add(1);
+            latest = Some(idx);
+        }
+    }
+    (count, latest)
 }
 
 /// Find the index of the terminal event (`ActivityCompleted`/`ActivityFailed`/
@@ -253,12 +279,58 @@ fn failure_detail(
     })
 }
 
-/// Whether a `dag_skip:{task_index}` marker was recorded for `task_index`.
-fn has_skip_marker(events: &[WorkflowEvent], task_index: usize) -> bool {
+/// Whether a `dag_skip:{task_index}` marker was recorded for `task_index`
+/// **and** its recorded fingerprint still identifies the current node.
+///
+/// A `dag_skip:{idx}` marker (#482) is keyed by the node's *position* in the
+/// DAG, but the marker's `details` also record the bound `task` (activity name)
+/// and `upstreams` (edges) at record time. If the DAG was reordered or a task
+/// renamed after this run recorded its markers, the marker at `task_index` would
+/// belong to a *different* node than the one now at that index — treating the
+/// bare marker name as authoritative would mislabel the wrong current node as
+/// `skipped`. Guard against that by requiring the recorded `details.task` to
+/// still match the current node's activity name, and the recorded
+/// `details.upstreams` fingerprint to still match its edges (old-format markers
+/// without an `upstreams` field pass through for backward compatibility). This
+/// mirrors the Vantage UI's condition-skip validation (`ui.rs`); a marker whose
+/// fingerprint no longer matches is ignored, so the node falls through to
+/// `pending` rather than being falsely reported as `skipped`.
+fn has_skip_marker(
+    events: &[WorkflowEvent],
+    task_index: usize,
+    activity_name: &str,
+    upstreams: &[usize],
+) -> bool {
     let marker_name = format!("dag_skip:{task_index}");
-    events.iter().any(
-        |event| matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if *name == marker_name),
-    )
+    events.iter().any(|event| {
+        let WorkflowEvent::MarkerRecorded { name, details } = event else {
+            return false;
+        };
+        if *name != marker_name {
+            return false;
+        }
+        // The recorded task name must still identify the current node at this
+        // index. A marker without a `task` field (never emitted by the current
+        // engine) is conservatively ignored, matching the UI.
+        let Some(recorded_task) = details.get("task").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if recorded_task != activity_name {
+            return false;
+        }
+        // Validate the upstream fingerprint when present; old-format markers
+        // without an `upstreams` field pass through for backward compat.
+        if let Some(arr) = details.get("upstreams").and_then(|v| v.as_array()) {
+            let recorded: Vec<usize> = arr
+                .iter()
+                .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .collect();
+            if recorded != upstreams {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 /// Build the annotated node topology for a DAG run.
@@ -286,13 +358,15 @@ pub fn build_run_graph(
             let node_name = task.activity_name.clone();
             let base = node_outcome(&events, &node_name);
 
-            // `classify` is the single source of truth for status, timing, and
-            // error: error fields are set only for a Failed base, and timing
-            // only for a node that was actually scheduled.
-            let (status, started_at, finished_at, error_type, error) = classify(
+            // `classify` is the single source of truth for status, timing,
+            // attempts, and error: all four describe the node's authoritative
+            // (latest-scheduled) attempt-chain, so they never disagree about
+            // which attempt they are reporting.
+            let (status, started_at, finished_at, error_type, error, attempts) = classify(
                 base,
                 task_index,
                 &node_name,
+                &task.upstreams,
                 &events,
                 timestamped_events,
                 exec_state,
@@ -310,7 +384,7 @@ pub fn build_run_graph(
                 depends_on,
                 started_at,
                 finished_at,
-                attempts: count_attempts(&events, &task.activity_name),
+                attempts,
                 error_type,
                 error,
             }
@@ -330,6 +404,7 @@ fn classify(
     base: NodeOutcome,
     task_index: usize,
     node_name: &str,
+    upstreams: &[usize],
     events: &[WorkflowEvent],
     timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
     exec_state: &str,
@@ -339,6 +414,7 @@ fn classify(
     Option<DateTime<Utc>>,
     Option<String>,
     Option<String>,
+    u32,
 ) {
     let status = match base {
         NodeOutcome::Succeeded => DagNodeStatus::Succeeded,
@@ -352,7 +428,7 @@ fn classify(
             }
         }
         NodeOutcome::NotAttempted => {
-            if has_skip_marker(events, task_index) {
+            if has_skip_marker(events, task_index, node_name, upstreams) {
                 DagNodeStatus::Skipped
             } else {
                 DagNodeStatus::Pending
@@ -360,16 +436,32 @@ fn classify(
         }
     };
 
-    // Timing + error describe the node's latest scheduled attempt, mirroring
-    // node_outcome's latest-attempt selection. A never-scheduled node
-    // (Pending/Skipped) has none.
+    // Timing, attempts, and error all describe the node's authoritative
+    // (latest-scheduled) attempt-chain, mirroring node_outcome's latest-attempt
+    // selection. A never-scheduled node (Pending/Skipped) has none, and reports
+    // `attempts: 0`.
     let mut started_at = None;
     let mut finished_at = None;
     let mut error_type = None;
     let mut error = None;
+    let mut attempts: u32 = 0;
 
     if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name) {
-        started_at = timestamped_events.get(sched_idx).map(|(ts, _)| *ts);
+        let (started_count, latest_started_idx) = started_attempts(events, activity_id);
+        // A scheduled node has made at least one attempt: the engine appends an
+        // `ActivityStarted` per claim, so `started_count` is the true attempt
+        // count for a claimed node. Floor to 1 so a scheduled-but-not-yet-claimed
+        // PENDING node (or an abbreviated history that omits `ActivityStarted`)
+        // still reports its single pending attempt rather than 0.
+        attempts = started_count.max(1);
+        // `started_at` is the LATEST attempt's actual start (its `ActivityStarted`
+        // timestamp), not the original schedule — so a node that backed off and
+        // retried is not made to look like it ran for the whole backoff window.
+        // Fall back to the schedule timestamp when no `ActivityStarted` exists
+        // (not yet claimed), so a running node still shows when it was scheduled.
+        started_at = latest_started_idx
+            .or(Some(sched_idx))
+            .and_then(|i| timestamped_events.get(i).map(|(ts, _)| *ts));
         finished_at = terminal_index(events, activity_id)
             .and_then(|i| timestamped_events.get(i).map(|(ts, _)| *ts));
         if base == NodeOutcome::Failed
@@ -380,14 +472,14 @@ fn classify(
         }
     }
 
-    (status, started_at, finished_at, error_type, error)
+    (status, started_at, finished_at, error_type, error, attempts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use autumn_harvest::dag::{DagBuilder, DagDefinition};
-    use autumn_harvest::types::ActivityExecId;
+    use autumn_harvest::types::{ActivityExecId, WorkerId};
     use chrono::{TimeZone, Utc};
     use serde_json::Value;
 
@@ -472,6 +564,15 @@ mod tests {
         }
     }
 
+    /// An `ActivityStarted` for `id` — the engine appends one per worker claim
+    /// (including each activity-level retry), reusing the original `activity_id`.
+    fn activity_started(id: ActivityExecId) -> WorkflowEvent {
+        WorkflowEvent::ActivityStarted {
+            activity_id: id,
+            worker_id: WorkerId::new("worker-1"),
+        }
+    }
+
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -486,6 +587,19 @@ mod tests {
         WorkflowEvent::MarkerRecorded {
             name: format!("dag_skip:{task_index}"),
             details: serde_json::json!({ "task": activity_name, "reason": "condition_false" }),
+        }
+    }
+
+    /// A `dag_skip` marker in the current engine's full format (task + upstream
+    /// fingerprint), for exercising the rename/reorder validation.
+    fn skip_marker_full(task_index: usize, task: &str, upstreams: &[usize]) -> WorkflowEvent {
+        WorkflowEvent::MarkerRecorded {
+            name: format!("dag_skip:{task_index}"),
+            details: serde_json::json!({
+                "task": task,
+                "reason": "condition_false",
+                "upstreams": upstreams,
+            }),
         }
     }
 
@@ -541,11 +655,19 @@ mod tests {
     }
 
     #[test]
-    fn attempts_counts_reschedules() {
+    fn attempts_counts_activity_started_not_scheduled() {
+        // Realistic engine output for an activity-level retry (issue #690
+        // review, Codex CLAIM A). The node is scheduled ONCE (one
+        // ActivityScheduled / activity_id); the engine appends a fresh
+        // ActivityStarted on each claim. `queue::requeue_for_retry` re-pends the
+        // same task row and appends no event, and a *retryable* failure appends
+        // NO ActivityFailed (only a retry-exhausting terminal failure does) — so
+        // a node the engine ran twice has ONE ActivityScheduled and TWO
+        // ActivityStarted. Counting ActivityScheduled (the pre-fix behavior)
+        // would report attempts: 1 and anchor started_at to the original
+        // schedule; this test would fail against that code.
         let def = linear_dag();
-        // c scheduled twice: first attempt failed, second succeeded.
-        let (ia, ib, ic1, ic2) = (
-            ActivityExecId::new(),
+        let (ia, ib, ic) = (
             ActivityExecId::new(),
             ActivityExecId::new(),
             ActivityExecId::new(),
@@ -553,21 +675,116 @@ mod tests {
         let events = vec![
             (ts(0), started()),
             (ts(1), sched("a", ia)),
-            (ts(2), completed(ia)),
-            (ts(3), sched("b", ib)),
-            (ts(4), completed(ib)),
-            (ts(5), sched("c", ic1)),
-            (ts(6), failed(ic1, "boom")),
-            (ts(7), sched("c", ic2)),
-            (ts(8), completed(ic2)),
+            (ts(2), activity_started(ia)),
+            (ts(3), completed(ia)),
+            (ts(4), sched("b", ib)),
+            (ts(5), activity_started(ib)),
+            (ts(6), completed(ib)),
+            (ts(7), sched("c", ic)),       // scheduled ONCE
+            (ts(8), activity_started(ic)), // claim 1
+            // attempt 1 fails retryably → requeue_for_retry (NO event appended)
+            (ts(9), activity_started(ic)), // claim 2 (the retry)
+            (ts(10), completed(ic)),
         ];
         let nodes = build_run_graph(&def, &events, "RUNNING");
         let c_node = node(&nodes, "c");
+        // Two execution attempts, counted from ActivityStarted (there is exactly
+        // ONE ActivityScheduled for the node).
         assert_eq!(c_node.attempts, 2);
         assert_eq!(c_node.status, DagNodeStatus::Succeeded);
-        // Timing describes the latest attempt (ic2).
+        // Timing describes the LATEST attempt's actual start (ts(9)), not the
+        // original schedule (ts(7)).
+        assert_eq!(c_node.started_at, Some(ts(9)));
+        assert_eq!(c_node.finished_at, Some(ts(10)));
+        // A single-run node reports 1 attempt.
+        assert_eq!(node(&nodes, "a").attempts, 1);
+    }
+
+    #[test]
+    fn attempts_counts_all_started_when_retries_exhaust() {
+        // A node that fails all its retries: ONE ActivityScheduled, N
+        // ActivityStarted, then a single terminal ActivityFailed (attempt == N).
+        let def = linear_dag();
+        let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), activity_started(ia)),
+            (ts(3), completed(ia)),
+            (ts(4), sched("c", ic)),           // scheduled ONCE
+            (ts(5), activity_started(ic)),     // claim 1
+            (ts(6), activity_started(ic)),     // claim 2
+            (ts(7), activity_started(ic)),     // claim 3
+            (ts(8), failed(ic, "still boom")), // terminal (attempt 3)
+        ];
+        let nodes = build_run_graph(&def, &events, "FAILED");
+        let c_node = node(&nodes, "c");
+        assert_eq!(c_node.attempts, 3);
+        assert_eq!(c_node.status, DagNodeStatus::Failed);
+        // Latest attempt's start (ts(7)) and its terminal event (ts(8)).
         assert_eq!(c_node.started_at, Some(ts(7)));
         assert_eq!(c_node.finished_at, Some(ts(8)));
+    }
+
+    #[test]
+    fn attempts_are_scoped_to_the_authoritative_latest_activity_id() {
+        // DAG-level re-dispatch (a #366 retry-from-node reset re-runs the node
+        // with a fresh activity_id). node_outcome treats the LATEST activity_id
+        // as authoritative; attempts/timing/error follow suit, so `attempts`
+        // reports the latest dispatch's execution count (here: 2 for ic2), not a
+        // cumulative total across the superseded first dispatch (ic1).
+        let def = linear_dag();
+        let (ia, ic1, ic2) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), activity_started(ia)),
+            (ts(3), completed(ia)),
+            // First dispatch (superseded by a reset): 1 attempt, failed.
+            (ts(4), sched("c", ic1)),
+            (ts(5), activity_started(ic1)),
+            (ts(6), failed(ic1, "boom")),
+            // Second dispatch (fresh activity_id): 2 attempts, succeeded.
+            (ts(7), sched("c", ic2)),
+            (ts(8), activity_started(ic2)),
+            (ts(9), activity_started(ic2)),
+            (ts(10), completed(ic2)),
+        ];
+        let nodes = build_run_graph(&def, &events, "COMPLETED");
+        let c_node = node(&nodes, "c");
+        // Scoped to the authoritative (latest) activity_id ic2 → 2, not 3.
+        assert_eq!(c_node.attempts, 2);
+        assert_eq!(c_node.status, DagNodeStatus::Succeeded);
+        assert_eq!(c_node.started_at, Some(ts(9)));
+        assert_eq!(c_node.finished_at, Some(ts(10)));
+    }
+
+    #[test]
+    fn scheduled_but_unclaimed_node_reports_one_attempt() {
+        // A node scheduled but not yet claimed (no ActivityStarted) still made
+        // one (pending) attempt; started_at falls back to the schedule time so a
+        // running node shows when it was scheduled.
+        let def = linear_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), activity_started(ia)),
+            (ts(3), completed(ia)),
+            (ts(4), sched("b", ib)), // scheduled, never claimed
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        let b_node = node(&nodes, "b");
+        assert_eq!(b_node.status, DagNodeStatus::Running);
+        assert_eq!(b_node.attempts, 1);
+        assert_eq!(b_node.started_at, Some(ts(4))); // falls back to schedule ts
+        assert!(b_node.finished_at.is_none());
+        // A never-scheduled node reports 0 attempts.
+        assert_eq!(node(&nodes, "c").attempts, 0);
     }
 
     #[test]
@@ -677,6 +894,63 @@ mod tests {
             (ts(2), completed(ia)),
         ];
         let nodes = build_run_graph(&def, &without_marker, "RUNNING");
+        assert_eq!(node(&nodes, "b").status, DagNodeStatus::Pending);
+    }
+
+    #[test]
+    fn skip_marker_with_mismatched_task_is_ignored() {
+        // Issue #690 review (Codex CLAIM B): a dag_skip:{idx} marker whose
+        // recorded details.task no longer identifies the current node at that
+        // index — because the DAG was reordered or a task renamed after this run
+        // recorded the marker — must NOT mislabel the current node as skipped.
+        // It falls through to pending. (The pre-fix has_skip_marker matched on
+        // the bare marker name alone and would report Skipped here.)
+        let def = conditional_dag(); // a(0) -> b(1)[cond] -> c(2)
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            // Marker at index 1 was recorded for a node named "was_renamed",
+            // not the "b" now occupying index 1.
+            (ts(3), skip_marker(1, "was_renamed")),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(node(&nodes, "b").status, DagNodeStatus::Pending);
+    }
+
+    #[test]
+    fn skip_marker_with_matching_task_and_upstreams_is_skipped() {
+        // A full-format marker (task + upstream fingerprint) that still matches
+        // the current node marks it skipped — the positive control for the
+        // validation added in the CLAIM B fix.
+        let def = conditional_dag(); // b(1) upstream is [0]
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), skip_marker_full(1, "b", &[0])),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(node(&nodes, "b").status, DagNodeStatus::Skipped);
+    }
+
+    #[test]
+    fn skip_marker_with_mismatched_upstreams_is_ignored() {
+        // A full-format marker whose recorded upstream fingerprint no longer
+        // matches the current node's edges (topology changed at the same index)
+        // is ignored, mirroring the Vantage UI's validation.
+        let def = conditional_dag(); // b(1) upstream is [0]
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            // Correct task name, but recorded upstreams [2] != current [0].
+            (ts(3), skip_marker_full(1, "b", &[2])),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
         assert_eq!(node(&nodes, "b").status, DagNodeStatus::Pending);
     }
 

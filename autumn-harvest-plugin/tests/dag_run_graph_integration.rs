@@ -21,7 +21,7 @@ use autumn_harvest::scheduler::{RegisteredDag, SchedulerMonitor, compile_dag_cat
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
-use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority, ShardId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority, ShardId, WorkerId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{
     OverlapPolicy, StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution,
@@ -338,6 +338,15 @@ fn completed(id: ActivityExecId) -> WorkflowEvent {
     WorkflowEvent::ActivityCompleted {
         activity_id: id,
         output: Value::Null,
+    }
+}
+
+/// An `ActivityStarted` — the engine appends one per worker claim (including
+/// each activity-level retry), reusing the original `activity_id`.
+fn activity_started(id: ActivityExecId) -> WorkflowEvent {
+    WorkflowEvent::ActivityStarted {
+        activity_id: id,
+        worker_id: WorkerId::new("worker-1"),
     }
 }
 
@@ -733,7 +742,7 @@ async fn dag_run_graph_skipped_node_and_pending_downstream() {
     assert!(b_node.get("started_at").is_none() || b_node["started_at"].is_null());
 }
 
-// ── (j) retried node: attempts == 2 with latest-attempt status/timing (FIX 7c) ─
+// ── (j) retried node: attempts counted from ActivityStarted (Codex CLAIM A) ──
 
 #[tokio::test]
 async fn dag_run_graph_retried_node_reports_latest_attempt() {
@@ -742,22 +751,31 @@ async fn dag_run_graph_retried_node_reports_latest_attempt() {
     let app = build_app(&pool);
     let mut conn = establish(&url).await;
 
-    // step_c scheduled twice: first attempt failed, second succeeded.
-    let (ia, ib, ic1, ic2) = (
-        ActivityExecId::new(),
+    // Realistic engine output for an activity-level retry: step_c is scheduled
+    // ONCE and the engine appends a fresh ActivityStarted on each claim. The
+    // first attempt fails *retryably* (which appends NO ActivityFailed —
+    // queue::requeue_for_retry re-pends the same task row and appends no event),
+    // then the second attempt (claim) succeeds. So the node has one
+    // ActivityScheduled and two ActivityStarted events, and `attempts` must be
+    // counted from ActivityStarted (the pre-fix code counted ActivityScheduled
+    // and would report attempts: 1 here).
+    let (ia, ib, ic) = (
         ActivityExecId::new(),
         ActivityExecId::new(),
         ActivityExecId::new(),
     );
     let events = vec![
         sched("step_a", ia),
+        activity_started(ia),
         completed(ia),
         sched("step_b", ib),
+        activity_started(ib),
         completed(ib),
-        sched("step_c", ic1),
-        failed(ic1),
-        sched("step_c", ic2),
-        completed(ic2),
+        sched("step_c", ic),  // scheduled ONCE
+        activity_started(ic), // claim 1
+        // attempt 1 fails retryably → requeue (no ActivityFailed appended)
+        activity_started(ic), // claim 2 (the retry)
+        completed(ic),
     ];
     let exec_id = seed_run(
         &mut conn,
@@ -771,8 +789,11 @@ async fn dag_run_graph_retried_node_reports_latest_attempt() {
     let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let c_node = node(&body, "step_c");
-    // Both attempts counted.
+    // Both execution attempts counted (from ActivityStarted, not the single
+    // ActivityScheduled).
     assert_eq!(c_node["attempts"], json!(2));
+    // A single-run node reports 1 attempt.
+    assert_eq!(node(&body, "step_a")["attempts"], json!(1));
     // Status/timing describe the latest (successful) attempt.
     assert_eq!(c_node["status"], json!("succeeded"));
     assert!(!c_node["started_at"].is_null(), "latest attempt started_at");
@@ -783,6 +804,42 @@ async fn dag_run_graph_retried_node_reports_latest_attempt() {
     // The latest attempt succeeded, so no error fields are carried.
     assert!(c_node.get("error").is_none() || c_node["error"].is_null());
     assert!(c_node.get("error_type").is_none() || c_node["error_type"].is_null());
+}
+
+// ── (l) skip marker with a stale task fingerprint is ignored (Codex CLAIM B) ──
+
+#[tokio::test]
+async fn dag_run_graph_skip_marker_with_mismatched_task_is_ignored() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    // graph_linear_dag: step_a (idx 0) -> step_b (idx 1) -> step_c (idx 2).
+    // A dag_skip:1 marker was recorded for a node named "was_renamed" (the DAG
+    // was reordered/renamed after this run), so it no longer identifies the
+    // "step_b" now at index 1 — the graph must NOT mislabel step_b as skipped.
+    let ia = ActivityExecId::new();
+    let events = vec![
+        sched("step_a", ia),
+        activity_started(ia),
+        completed(ia),
+        skip_marker(1, "was_renamed"),
+    ];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-skip-stale",
+        events,
+        "COMPLETED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The recorded task fingerprint no longer matches → the marker is ignored,
+    // and the never-scheduled node falls through to pending, not skipped.
+    assert_eq!(node(&body, "step_b")["status"], json!("pending"));
 }
 
 // ── (k) malformed run_exec_id → 400 JSON (FIX 5) ─────────────────────────────
