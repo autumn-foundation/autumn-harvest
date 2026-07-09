@@ -1427,7 +1427,10 @@ pub trait MetricsRecorder: Send + Sync {
     /// low-cardinality `workflow` registry key so operators can confirm
     /// per-type deletion. Emitted for real deletes only (never dry-run).
     /// `sum(harvest.retention.deleted)` over the label equals the aggregate
-    /// deleted count for the tick.
+    /// **workflow-history** deletion count for the tick, *excluding* orphaned
+    /// `harvest_completion_deliveries` reclaims (issue #921) — those rows have
+    /// no owning execution and therefore no workflow name to attribute — so it
+    /// may read below the tick's total `deleted_count`.
     fn record_retention_deleted(&self, workflow: &str, count: u64) {
         let _ = (workflow, count);
     }

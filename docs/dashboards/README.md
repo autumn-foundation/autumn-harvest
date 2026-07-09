@@ -151,9 +151,9 @@ the API result through your own probe with bounded labels) —
 | Variable | Type | Sourced from | Applied to |
 |---|---|---|---|
 | `$datasource` | datasource | your Prometheus datasources | every panel |
-| `$workflow` | query, multi + All | `label_values(harvest_workflow_started_total, workflow)` | series carrying a `workflow` label; series labelled `workflow_type` (history size, continue-as-new, payload metrics) use `workflow_type=~"$workflow"` |
+| `$workflow` | query, multi + All | `label_values(harvest_workflow_started_total, workflow)` | series carrying a `workflow` label, including `harvest_retention_deleted` (issue #737); series labelled `workflow_type` (history size, continue-as-new, payload metrics) use `workflow_type=~"$workflow"` |
 | `$queue` | query, multi + All | `label_values(harvest_queue_depth, queue)` | series carrying a `queue` label |
-| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** the three shard-labelled series: `harvest_dlq_entries`, `harvest_retention_deleted`, `harvest_shard_stranded_pending` |
+| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** the two shard-labelled series: `harvest_dlq_entries`, `harvest_shard_stranded_pending` |
 
 Variables are applied per-panel only where the series actually carries the
 label — applying `shard=~"$shard"` to an unlabelled series would silently

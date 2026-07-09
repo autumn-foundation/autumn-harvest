@@ -273,6 +273,14 @@ fn history_only(max_age: Option<Duration>) -> RetentionConfig {
 // AC3 + AC4 + AC8: a longer override survives the global age; a shorter
 // override is deleted at its own earlier age; the metric labels the deleted
 // type.
+//
+// The distinguishing AC4 case (a shorter override deleting a row that the
+// global would have KEPT) is exercised by the `short_wf`/`control_wf` rows
+// completed ~2 HOURS ago: 2h > the 1-hour override but < the 1-day global.
+// This makes the test falsifiable against a `max(override, global)` mutation
+// of `effective_max_age` — under that mutation `short_wf@2h` would resolve to
+// the 1-day global and survive, so the survivor assertion would fail.
+// Comfortable 2h-vs-1h/1day margins avoid `Utc::now()` boundary flakiness.
 #[tokio::test]
 async fn override_longer_survives_shorter_deleted() {
     let (url, _container) = setup_db().await;
@@ -281,14 +289,21 @@ async fn override_longer_survives_shorter_deleted() {
     scrub(&mut conn).await;
 
     let now = Utc::now();
-    // Both completed 2 days ago.
     let two_days_ago = now - chrono::Duration::days(2);
+    let two_hours_ago = now - chrono::Duration::hours(2);
     // "long_wf": override 30 days (longer than the 1-day global) -> survives.
     insert_completed(&mut conn, "long_wf", "l1", two_days_ago).await;
-    // "short_wf": override 1 hour (shorter than the 1-day global) -> deleted.
+    // "short_wf": override 1 hour (shorter than the 1-day global). Both the
+    // 2-days-ago and the 2-hours-ago rows exceed the 1h override -> deleted.
     insert_completed(&mut conn, "short_wf", "s1", two_days_ago).await;
-    // "default_wf": no override, uses the 1-day global -> deleted.
+    // AC4 crux: 2h exceeds the 1h override but is well under the 1-day global,
+    // so this row is deleted ONLY because the shorter override fires early.
+    insert_completed(&mut conn, "short_wf", "s2", two_hours_ago).await;
+    // "default_wf": no override, uses the 1-day global -> deleted (2d > 1d).
     insert_completed(&mut conn, "default_wf", "d1", two_days_ago).await;
+    // Same-age no-override control: 2h < 1-day global -> SURVIVES. Proves that
+    // without the override, a 2-hour-old row is not old enough to delete.
+    insert_completed(&mut conn, "control_wf", "c1", two_hours_ago).await;
 
     let config = history_only(Some(Duration::from_secs(86_400))) // global 1 day
         .with_workflow_override("long_wf", Duration::from_secs(30 * 86_400))
@@ -300,23 +315,28 @@ async fn override_longer_survives_shorter_deleted() {
     let survivors = surviving_names(&mut conn).await;
     assert_eq!(
         survivors,
-        vec!["long_wf".to_string()],
-        "only long_wf (30-day override) should survive the 1-day global cutoff"
+        vec!["control_wf".to_string(), "long_wf".to_string()],
+        "long_wf (30-day override) and control_wf (2h < 1-day global) survive; \
+         short_wf@2h is deleted only because its 1h override fires before the global"
     );
-    assert_eq!(result.deleted_count, 2, "short_wf + default_wf deleted");
+    assert_eq!(
+        result.deleted_count, 3,
+        "short_wf@2d + short_wf@2h + default_wf@2d deleted"
+    );
 
     // AC8: metric labeled per workflow, real deletes only.
     let mut deleted = metrics.deleted();
     deleted.sort();
     assert_eq!(
         deleted,
-        vec![("default_wf".to_string(), 1), ("short_wf".to_string(), 1)],
-        "per-type deletion metric must name exactly the deleted types"
+        vec![("default_wf".to_string(), 1), ("short_wf".to_string(), 2)],
+        "per-type deletion metric must name exactly the deleted types with counts"
     );
     // Per-type reporting on the tick result (AC7 reporting surface).
-    assert_eq!(result.deleted_by_workflow.get("short_wf"), Some(&1));
+    assert_eq!(result.deleted_by_workflow.get("short_wf"), Some(&2));
     assert_eq!(result.deleted_by_workflow.get("default_wf"), Some(&1));
     assert!(!result.deleted_by_workflow.contains_key("long_wf"));
+    assert!(!result.deleted_by_workflow.contains_key("control_wf"));
 }
 
 // AC7: dry_run reports per-type would-delete counts and deletes nothing.
@@ -430,4 +450,13 @@ async fn overrides_only_never_deletes_types_without_override() {
     );
     assert_eq!(result.deleted_count, 1);
     assert_eq!(metrics.deleted(), vec![("purge_me".to_string(), 1)]);
+    // Scalability optimization (issue #737): in overrides-only mode the SQL
+    // pre-filter is bounded to the overridden type(s), so the never-delete
+    // "keep_forever" row is never even SELECTed as a candidate. Only "purge_me"
+    // is scanned. Before the `workflow_name = ANY(...)` filter, candidate_count
+    // would be 2 (both rows loaded, one skipped).
+    assert_eq!(
+        result.candidate_count, 1,
+        "overrides-only pre-filter must not scan never-delete types"
+    );
 }

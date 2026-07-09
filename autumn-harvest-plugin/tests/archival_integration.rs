@@ -1,9 +1,25 @@
+// The registered `#[workflow]` fixture below has underscore-prefixed params
+// that the macro-generated dispatch shim uses, and no `.await` in its body —
+// matching the allow convention in the sibling workflow-defining test files
+// (mcp_tools_http_tests, webhook_receiver_http_tests).
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use autumn_harvest::prelude::{WorkflowContext, workflow};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{HistoryArchiver, RetentionConfig, WorkflowEvent};
+
+// Registered workflow matching the `workflow_name` used by
+// `insert_retention_fixture_execution`, so a per-type retention override on
+// "retention_fixture" passes the builder-time registration check (issue #737,
+// AC6). The handler body is never executed by these retention/archival tests.
+#[workflow]
+async fn retention_fixture(_ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+    Ok(())
+}
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::{HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig};
 use autumn_web::reexports::axum;
@@ -436,6 +452,131 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
         count, 1,
         "Workflow execution must NOT be deleted if archive hook fails"
     );
+
+    runner.stop().await;
+}
+
+/// Issue #737 (AC7, second clause): the #345 archival hook must still fire for
+/// every deleted row regardless of which retention policy selected it — in
+/// particular a row deleted because of a *per-workflow-type override* (not the
+/// global `max_age`). Global is 30 days; the `retention_fixture` type is
+/// overridden to 7 days; the seeded row completed 10 days ago. Without the
+/// override 10 days < 30-day global would keep it, so its deletion is
+/// attributable solely to the override — and the archiver must have been
+/// invoked with that row before it was deleted.
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn archival_hook_fires_for_override_deleted_row() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let should_fail = Arc::new(AtomicBool::new(false));
+    let archiver = TestArchiver {
+        calls: calls.clone(),
+        should_fail: should_fail.clone(),
+    };
+
+    let runner = HarvestRunner::start(
+        autumn_harvest::HarvestBuilder::new()
+            // "retention_fixture" must be registered for the override to pass
+            // build-time validation (issue #737, AC6).
+            .workflows(vec![retention_fixture_info()])
+            .retention(
+                RetentionConfig {
+                    // Global 30 days: on its own, a 10-day-old row survives.
+                    max_age_secs: Some(30 * 24 * 60 * 60),
+                    tick_interval_secs: 60 * 60,
+                    batch_size: 1000,
+                    dry_run: false,
+                    audit_retention_days: 90,
+                    schedule_decision_retention_days: 7,
+                    archival_timeout_secs: 30,
+                    ..Default::default()
+                }
+                // Per-type override 7 days: makes the 10-day-old row deletable.
+                .with_workflow_override(
+                    "retention_fixture",
+                    std::time::Duration::from_secs(7 * 24 * 60 * 60),
+                ),
+            )
+            .history_archiver(archiver)
+            .build(),
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
+                url: Some(database_url.clone()),
+            },
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
+            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
+            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+        },
+        HarvestRunnerResources::new(pool.clone()),
+    )
+    .await
+    .expect("runner with per-type retention override and archiver should start");
+
+    let override_exec = uuid::Uuid::new_v4();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for retention fixture");
+
+    // 10 days old: deletable under the 7-day override, but NOT under the
+    // 30-day global — so its deletion is attributable to the override alone.
+    insert_retention_fixture_execution(
+        &mut conn,
+        override_exec,
+        "override-archival",
+        "COMPLETED",
+        "NOW() - INTERVAL '10 days'",
+    )
+    .await;
+
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    api_state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
+
+    let (run_now_status, run_now_json) =
+        post_json(&app, "/admin/retention/run-now", json!({})).await;
+    assert_eq!(run_now_status, StatusCode::OK);
+    assert_eq!(run_now_json["ok"], true);
+
+    // The override-selected row is deleted.
+    let mut deleted = false;
+    for _ in 0..40 {
+        if count_execution_rows(&mut conn, override_exec).await == 0 {
+            deleted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        deleted,
+        "a row deletable only under a per-type override must be deleted by retention"
+    );
+
+    // AC7: the archival hook fired for that row before it was deleted.
+    {
+        let guard = calls.lock().unwrap();
+        assert_eq!(
+            guard.len(),
+            1,
+            "archiver must be invoked exactly once for the override-deleted row"
+        );
+        assert_eq!(
+            guard[0].execution_id,
+            autumn_harvest::types::ExecutionId::from_uuid(override_exec)
+        );
+        assert_eq!(
+            guard[0].workflow_name, "retention_fixture",
+            "archival hook must fire for the override-selected type"
+        );
+    }
 
     runner.stop().await;
 }

@@ -557,6 +557,24 @@ pub enum HarvestBuilderError {
         registered: Vec<String>,
     },
 
+    /// A per-workflow-type retention override (issue #737) names a workflow
+    /// type that is not registered on this builder — either an explicit
+    /// `#[workflow]` or an auto-registered DAG workflow. Caught at build time
+    /// so a typo'd override name is a clear error rather than a silently
+    /// ignored override. Mirrors [`Self::UnknownCompletionTriggerWorkflow`].
+    #[non_exhaustive]
+    #[error(
+        "retention override names unknown workflow type '{workflow_name}'; \
+         register it with .workflows(...) or remove the override. \
+         registered workflows: {registered:?}"
+    )]
+    UnknownRetentionOverrideWorkflow {
+        /// The unrecognised workflow name in the retention override.
+        workflow_name: String,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
+
     /// A completion trigger carries an output guard that fails
     /// [`crate::completion_trigger::TriggerCondition::validate`] — over the
     /// boundedness caps or with a malformed dotted path (issue #810). Never
@@ -1667,10 +1685,10 @@ fn validate_retention_overrides(
         .collect();
     for name in retention.workflow_overrides().keys() {
         if !registered.contains(name) {
-            return Err(HarvestBuilderError::InvalidRetention(format!(
-                "retention override names unknown workflow type '{name}'; \
-                 register it with .workflows(...) or remove the override"
-            )));
+            return Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow {
+                workflow_name: name.clone(),
+                registered,
+            });
         }
     }
     Ok(())
@@ -3787,8 +3805,12 @@ mod tests {
             .with_workflow_override("typo_wf", Duration::from_secs(60));
         let result = validate_retention_overrides(&cfg, &workflows, &dags);
         assert!(
-            matches!(result, Err(HarvestBuilderError::InvalidRetention(_))),
-            "Expected InvalidRetention for unknown override name, got: {result:?}"
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow { ref workflow_name, ref registered })
+                    if workflow_name == "typo_wf" && registered.contains(&"test".to_string())
+            ),
+            "Expected UnknownRetentionOverrideWorkflow naming the unknown type and listing registered, got: {result:?}"
         );
 
         // Known registered workflow name -> Ok
@@ -3818,8 +3840,12 @@ mod tests {
             .retention(cfg)
             .try_build();
         assert!(
-            matches!(result, Err(HarvestBuilderError::InvalidRetention(ref m)) if m.contains("nope")),
-            "Expected InvalidRetention naming the unknown type, got: {result:?}"
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow { ref workflow_name, .. })
+                    if workflow_name == "nope"
+            ),
+            "Expected UnknownRetentionOverrideWorkflow naming the unknown type, got: {result:?}"
         );
     }
 

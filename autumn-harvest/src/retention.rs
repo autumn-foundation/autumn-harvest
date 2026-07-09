@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel::prelude::*;
 #[cfg(feature = "db")]
-use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{Array, BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, RunQueryDsl};
 #[cfg(feature = "db")]
@@ -160,12 +160,12 @@ impl RetentionConfig {
 
     /// Bulk-register per-workflow-type retention overrides (issue #737).
     #[must_use]
-    pub fn with_workflow_overrides(
+    pub fn with_workflow_overrides<S: Into<String>>(
         mut self,
-        iter: impl IntoIterator<Item = (String, Duration)>,
+        iter: impl IntoIterator<Item = (S, Duration)>,
     ) -> Self {
         for (name, max_age) in iter {
-            self.overrides.insert(name, max_age.as_secs());
+            self.overrides.insert(name.into(), max_age.as_secs());
         }
         self
     }
@@ -716,6 +716,23 @@ async fn run_shard_tick(
     let mut remaining = config.batch_size;
     let mut has_failed = false;
 
+    // Overrides-only scalability guard (issue #737): when the global `max_age`
+    // is unset, ONLY the overridden workflow types are ever deletable — every
+    // other terminal row is a never-delete type that the loose-cutoff SQL
+    // pre-filter would otherwise re-select and re-skip on every tick, forever,
+    // as they accumulate. So in overrides-only mode we bound the pre-filter to
+    // `workflow_name = ANY(<override keys>)`. When the global `max_age` IS set,
+    // NO name filter is applied — fallback (un-overridden) types remain
+    // deletable under the global age. (The enclosing block only runs when
+    // `loosest_cutoff_age()` is `Some`, so overrides are non-empty whenever the
+    // global age is `None` here.)
+    let overrides_only = config.max_age().is_none();
+    let override_names: Vec<String> = if overrides_only {
+        config.workflow_overrides().keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
+
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
     let guard = RetentionLeaseGuard {
         pool: pool.clone(),
@@ -764,9 +781,17 @@ async fn run_shard_tick(
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
         let lease_id_inner = lease_id.clone();
+        let override_names_inner = override_names.clone();
         let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
             Box::pin(async move {
-                let rows = diesel::sql_query(
+                // Overrides-only mode adds `AND workflow_name = ANY($5)` so the
+                // pre-filter never re-scans never-delete types (issue #737).
+                let name_filter = if overrides_only {
+                    "AND workflow_name = ANY($5)"
+                } else {
+                    ""
+                };
+                let sql = format!(
                     "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
@@ -778,16 +803,26 @@ async fn run_shard_tick(
                            OR completed_at > $2
                            OR (completed_at = $2 AND id > $3)
                        )
+                       {name_filter}
                      ORDER BY completed_at ASC, id ASC
                      LIMIT $4
-                     FOR UPDATE SKIP LOCKED",
-                )
-                .bind::<Timestamptz, _>(loose_cutoff)
-                .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                .load::<CandidateExecution>(conn)
-                .await
+                     FOR UPDATE SKIP LOCKED"
+                );
+                // Bind order maps to $1..$N regardless of textual position, so
+                // $5 (the name array) is bound after $4 (the limit).
+                let query = diesel::sql_query(sql)
+                    .bind::<Timestamptz, _>(loose_cutoff)
+                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX));
+                let rows = if overrides_only {
+                    query
+                        .bind::<Array<Text>, _>(override_names_inner)
+                        .load::<CandidateExecution>(conn)
+                        .await
+                } else {
+                    query.load::<CandidateExecution>(conn).await
+                }
                 .map_err(database_error)?;
 
                 if !rows.is_empty() {
@@ -1479,6 +1514,17 @@ mod tests {
         // in range
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
             .with_workflow_override("wf", Duration::from_secs(7200));
+        assert!(config.validate().is_ok());
+
+        // exactly MIN_MAX_AGE (1s) -> Ok (inclusive lower bound; guards against
+        // an off-by-one flip of ..= to ..)
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(1));
+        assert!(config.validate().is_ok());
+
+        // exactly MAX_MAX_AGE (10 years) -> Ok (inclusive upper bound)
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(60 * 60 * 24 * 365 * 10));
         assert!(config.validate().is_ok());
 
         // empty overrides + valid global -> Ok
