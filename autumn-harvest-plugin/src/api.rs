@@ -14012,24 +14012,37 @@ async fn hydrate_ctx_for_query(
     );
 
     if terminal {
-        match classify_terminal_query(outcome, sealed) {
+        // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
+        // settled to a servable state while genuine recorded non-lifecycle
+        // history remains unmatched, the workflow code changed since the run
+        // executed — the reconstructed state is misleading. `has_non_lifecycle_unconsumed`
+        // excludes trailing terminal-lifecycle events, so a truthfully replayed
+        // completed / sealed-while-parked run still reports false and Serves.
+        // Computed after the drive advances the replay cursor; read-only.
+        let has_unconsumed_history = ctx.history_has_unconsumed_events();
+        match classify_terminal_query(outcome, sealed, has_unconsumed_history) {
             // Full drive to Poll::Ready, OR a run the engine sealed while its
             // function was parked mid-command (TIMED_OUT / CONTINUED_AS_NEW /
-            // mid-await CANCELLED / FAILED): serve the reconstructed state at
-            // the recorded terminal point.
+            // mid-await CANCELLED / FAILED), with all recorded non-lifecycle
+            // history faithfully consumed: serve the reconstructed state at the
+            // recorded terminal point.
             TerminalQueryDecision::Serve => Ok(ctx),
             TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
                     .unwrap_or(u64::MAX),
             })),
-            // The recorded history has no terminal seal at all — it was pruned by
-            // retention or released on reset. Never serve a partial/empty answer;
-            // surface a distinct 410.
+            // The recorded history has no terminal seal at all (pruned by
+            // retention / released on reset), or the drifted handler stopped
+            // short leaving recorded non-lifecycle history unconsumed (code
+            // drift). Never serve a partial/misleading answer; surface a
+            // distinct 410.
             TerminalQueryDecision::HistoryUnavailable => {
                 Err(map_error(HarvestError::HistoryUnavailable {
                     exec_id,
-                    reason: "pruned by retention or released".to_string(),
+                    reason: "pruned by retention, released, or replay diverged from \
+                             recorded history (workflow code changed)"
+                        .to_string(),
                 }))
             }
         }
