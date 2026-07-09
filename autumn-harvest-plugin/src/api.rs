@@ -29390,4 +29390,60 @@ mod tests {
         let malformed = serde_json::json!({"type": "Exists", "data": {"path": "a..b"}});
         assert!(decode_trigger_condition(Some(malformed)).is_err());
     }
+
+    #[test]
+    fn format_prometheus_metrics_formats_correctly() {
+        let signals = vec![
+            autumn_harvest::queue::QueueScalingSignal {
+                queue: "default".to_string(),
+                backlog: 10,
+                in_flight: 5,
+                scheduled: 2,
+                active_workers: 3,
+            },
+            autumn_harvest::queue::QueueScalingSignal {
+                queue: "emails_\"escaped\"_\\test".to_string(),
+                backlog: 100,
+                in_flight: 20,
+                scheduled: 50,
+                active_workers: 10,
+            },
+        ];
+
+        let out = super::format_prometheus_metrics(&signals);
+
+        // Assert backlog
+        assert!(out.contains("# HELP harvest_queue_backlog Count of pending tasks ready for execution (scheduled_at <= NOW)"));
+        assert!(out.contains("# TYPE harvest_queue_backlog gauge"));
+        assert!(out.contains("harvest_queue_backlog{queue=\"default\"} 10"));
+        assert!(
+            out.contains("harvest_queue_backlog{queue=\"emails_\\\"escaped\\\"_\\\\test\"} 100")
+        );
+
+        // Assert in_flight
+        assert!(out.contains("# HELP harvest_queue_in_flight Count of currently executing tasks"));
+        assert!(out.contains("# TYPE harvest_queue_in_flight gauge"));
+        assert!(out.contains("harvest_queue_in_flight{queue=\"default\"} 5"));
+        assert!(
+            out.contains("harvest_queue_in_flight{queue=\"emails_\\\"escaped\\\"_\\\\test\"} 20")
+        );
+
+        // Assert scheduled
+        assert!(out.contains(
+            "# HELP harvest_queue_scheduled Count of future-scheduled tasks (scheduled_at > NOW)"
+        ));
+        assert!(out.contains("# TYPE harvest_queue_scheduled gauge"));
+        assert!(out.contains("harvest_queue_scheduled{queue=\"default\"} 2"));
+        assert!(
+            out.contains("harvest_queue_scheduled{queue=\"emails_\\\"escaped\\\"_\\\\test\"} 50")
+        );
+
+        // Assert active_workers
+        assert!(out.contains("# HELP harvest_queue_active_workers Count of healthy, non-draining worker processes polling this queue"));
+        assert!(out.contains("# TYPE harvest_queue_active_workers gauge"));
+        assert!(out.contains("harvest_queue_active_workers{queue=\"default\"} 3"));
+        assert!(out.contains(
+            "harvest_queue_active_workers{queue=\"emails_\\\"escaped\\\"_\\\\test\"} 10"
+        ));
+    }
 }
