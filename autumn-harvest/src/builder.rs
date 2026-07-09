@@ -1421,6 +1421,7 @@ impl HarvestBuilder {
     /// when activities sharing a `concurrency_key` declare different
     /// `max_concurrent` values, or when a [`WorkflowSchedule`] references a
     /// workflow name not registered on this builder.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
         self.retention
             .validate()

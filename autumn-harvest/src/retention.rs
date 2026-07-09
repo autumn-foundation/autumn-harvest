@@ -1247,9 +1247,11 @@ async fn routine_skip_candidate(
         outcome.next_cursor = Some(candidate_cursor);
     }
 
-    let mut active_guard = active_ids.lock().expect("lease guard lock poisoned");
-    if let Some(pos) = active_guard.iter().position(|&x| x == candidate_id) {
-        active_guard.swap_remove(pos);
+    {
+        let mut active_guard = active_ids.lock().expect("lease guard lock poisoned");
+        if let Some(pos) = active_guard.iter().position(|&x| x == candidate_id) {
+            active_guard.swap_remove(pos);
+        }
     }
     Ok(())
 }
@@ -1404,9 +1406,9 @@ mod tests {
         );
 
         // no global, override present -> override for that type, None for others
-        let mut config = RetentionConfig::default();
-        config.max_age_secs = None;
-        let config = config.with_workflow_override("only_wf", Duration::from_secs(500));
+        // (Default already leaves max_age_secs = None.)
+        let config =
+            RetentionConfig::default().with_workflow_override("only_wf", Duration::from_secs(500));
         assert_eq!(
             config.effective_max_age("only_wf"),
             Some(Duration::from_secs(500))
@@ -1431,9 +1433,7 @@ mod tests {
         assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(600)));
 
         // no global, overrides only -> min override
-        let mut config = RetentionConfig::default();
-        config.max_age_secs = None;
-        let config = config
+        let config = RetentionConfig::default()
             .with_workflow_override("a", Duration::from_secs(900))
             .with_workflow_override("b", Duration::from_secs(300));
         assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(300)));
@@ -1459,9 +1459,8 @@ mod tests {
         assert!(config.history_retention_active());
 
         // only overrides set
-        let mut config = RetentionConfig::default();
-        config.max_age_secs = None;
-        let config = config.with_workflow_override("wf", Duration::from_secs(60));
+        let config =
+            RetentionConfig::default().with_workflow_override("wf", Duration::from_secs(60));
         assert!(config.history_retention_active());
     }
 

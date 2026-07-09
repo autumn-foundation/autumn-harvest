@@ -262,13 +262,12 @@ async fn run_one_tick(
 /// A config with only workflow-history retention active (audit/schedule purges
 /// off) so the tick's observable effect is deterministic.
 fn history_only(max_age: Option<Duration>) -> RetentionConfig {
-    let mut cfg = RetentionConfig {
+    RetentionConfig {
+        max_age_secs: max_age.map(|d| d.as_secs()),
         audit_retention_days: 0,
         schedule_decision_retention_days: 0,
         ..RetentionConfig::default()
-    };
-    cfg.max_age_secs = max_age.map(|d| d.as_secs());
-    cfg
+    }
 }
 
 // AC3 + AC4 + AC8: a longer override survives the global age; a shorter
@@ -317,7 +316,7 @@ async fn override_longer_survives_shorter_deleted() {
     // Per-type reporting on the tick result (AC7 reporting surface).
     assert_eq!(result.deleted_by_workflow.get("short_wf"), Some(&1));
     assert_eq!(result.deleted_by_workflow.get("default_wf"), Some(&1));
-    assert!(result.deleted_by_workflow.get("long_wf").is_none());
+    assert!(!result.deleted_by_workflow.contains_key("long_wf"));
 }
 
 // AC7: dry_run reports per-type would-delete counts and deletes nothing.
