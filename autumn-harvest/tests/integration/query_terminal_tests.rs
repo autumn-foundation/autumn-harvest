@@ -309,7 +309,7 @@ fn truncated_history_with_no_seal_classifies_as_history_unavailable() {
     let outcome = drive_query_replay(&ctx, progress_workflow, input, QUERY_BUDGET);
     assert_eq!(outcome, QueryReplayOutcome::Suspended);
     assert_eq!(
-        classify_terminal_query(outcome, sealed),
+        classify_terminal_query(outcome, sealed, ctx.history_has_unconsumed_events()),
         TerminalQueryDecision::HistoryUnavailable,
         "Suspended + no terminal seal → 410 (pruned/released)"
     );
@@ -332,9 +332,10 @@ fn continued_as_new_sealed_history_serves_partial_state_not_gone() {
         "continue_as_new parks forever → Suspended, not ReachedTerminal"
     );
     assert_eq!(
-        classify_terminal_query(outcome, sealed),
+        classify_terminal_query(outcome, sealed, ctx.history_has_unconsumed_events()),
         TerminalQueryDecision::Serve,
-        "Suspended + terminal seal (CONTINUED_AS_NEW) → serve (200)"
+        "Suspended + terminal seal (CONTINUED_AS_NEW), only the lifecycle seal \
+         unconsumed → serve (200)"
     );
 
     let result = ctx
@@ -364,9 +365,10 @@ fn cancelled_sealed_mid_activity_serves_partial_state() {
     let outcome = drive_query_replay(&ctx, progress_workflow, input, QUERY_BUDGET);
     assert_eq!(outcome, QueryReplayOutcome::Suspended);
     assert_eq!(
-        classify_terminal_query(outcome, sealed),
+        classify_terminal_query(outcome, sealed, ctx.history_has_unconsumed_events()),
         TerminalQueryDecision::Serve,
-        "Suspended + terminal seal (CANCELLED) → serve (200)"
+        "Suspended + terminal seal (CANCELLED), only the lifecycle seal \
+         unconsumed → serve (200)"
     );
     assert_eq!(
         ctx.execute_query("progress").expect("progress registered"),
@@ -392,9 +394,10 @@ fn timed_out_sealed_mid_activity_serves_partial_state() {
     let outcome = drive_query_replay(&ctx, progress_workflow, input, QUERY_BUDGET);
     assert_eq!(outcome, QueryReplayOutcome::Suspended);
     assert_eq!(
-        classify_terminal_query(outcome, sealed),
+        classify_terminal_query(outcome, sealed, ctx.history_has_unconsumed_events()),
         TerminalQueryDecision::Serve,
-        "Suspended + terminal seal (TIMED_OUT) → serve (200)"
+        "Suspended + terminal seal (TIMED_OUT), only the lifecycle seal \
+         unconsumed → serve (200)"
     );
     assert_eq!(
         ctx.execute_query("progress").expect("progress registered"),
@@ -455,6 +458,75 @@ fn running_partial_history_still_serves_query_without_error() {
         result,
         json!(2),
         "running path serves partial internal state"
+    );
+}
+
+#[test]
+fn code_drift_reaching_terminal_early_with_unconsumed_history_is_gone() {
+    // Codex P2 (PR #986 follow-up): the recorded history was produced by code
+    // that ran THREE activities, but the handler driving replay now completes
+    // after only ONE (a code change / drift since the run executed). The drive
+    // reaches Poll::Ready (ReachedTerminal) while two recorded activity pairs
+    // remain unconsumed — the reconstructed state does NOT correspond to what
+    // actually happened, so the terminal-query classifier must return
+    // HistoryUnavailable (→ 410), never a misleading partial answer.
+    let (exec_id, _recorded_input, events) = complete_history(&["a", "b", "c"], false);
+    let sealed = history_reached_terminal_seal(&events);
+    assert!(
+        !sealed,
+        "a plain completed-pair history carries no terminal seal"
+    );
+    let ctx = build_ctx(exec_id, events);
+
+    // Drive with a SHORTER input: the drifted handler processes only one item,
+    // matching the first recorded activity pair and then completing early.
+    let drift_input = workflow_input(&["a"], false);
+    let outcome = drive_query_replay(&ctx, progress_workflow, drift_input, QUERY_BUDGET);
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::ReachedTerminal,
+        "the drifted handler completes early (Poll::Ready) after one activity"
+    );
+    let has_unconsumed = ctx.history_has_unconsumed_events();
+    assert!(
+        has_unconsumed,
+        "two recorded activity pairs were never consumed by the drifted handler"
+    );
+    assert_eq!(
+        classify_terminal_query(outcome, sealed, has_unconsumed),
+        TerminalQueryDecision::HistoryUnavailable,
+        "ReachedTerminal + genuine unconsumed non-lifecycle history → 410 (code drift)"
+    );
+}
+
+#[test]
+fn completed_history_fully_consumed_still_serves() {
+    // AC2 non-regression: a faithfully-replayed completed run drives to
+    // Poll::Ready with NO unconsumed non-lifecycle history — the trailing
+    // WorkflowCompleted seal is excluded by has_non_lifecycle_unconsumed — so the
+    // drift gate does not fire and the query still Serves (200). This is the
+    // "trailing-lifecycle exclusion is why a truthfully-replayed sealed run still
+    // Serves" property the drift gate must not break.
+    let (exec_id, input, mut events) = complete_history(&["a", "b", "c"], false);
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: json!({ "processed": 3 }),
+    });
+    let sealed = history_reached_terminal_seal(&events);
+    assert!(sealed, "a WorkflowCompleted history is sealed");
+    let ctx = build_ctx(exec_id, events);
+
+    let outcome = drive_query_replay(&ctx, progress_workflow, input, QUERY_BUDGET);
+    assert_eq!(outcome, QueryReplayOutcome::ReachedTerminal);
+    let has_unconsumed = ctx.history_has_unconsumed_events();
+    assert!(
+        !has_unconsumed,
+        "a faithful full replay leaves only the trailing terminal seal, which is \
+         excluded — so no genuine unconsumed history remains"
+    );
+    assert_eq!(
+        classify_terminal_query(outcome, sealed, has_unconsumed),
+        TerminalQueryDecision::Serve,
+        "ReachedTerminal + only trailing lifecycle events → still Serve (AC2 non-regression)"
     );
 }
 

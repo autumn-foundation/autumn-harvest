@@ -229,39 +229,68 @@ pub fn history_reached_terminal_seal(events: &[WorkflowEvent]) -> bool {
         .any(WorkflowEvent::is_terminal_lifecycle)
 }
 
-/// Classify how to answer a query on a **terminal** execution (issue #612),
-/// given the replay `outcome` and whether the recorded history reached its
-/// terminal seal (see [`history_reached_terminal_seal`]).
+/// Classify how to answer a query on a **terminal** execution (issue #612).
 ///
-/// - [`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal) → always
-///   [`Serve`](TerminalQueryDecision::Serve): the handler drove all the way to
-///   `Poll::Ready`, so the context holds the workflow's fully reconstructed
-///   final state.
+/// Takes the replay `outcome`, whether the recorded history reached its terminal
+/// seal (see [`history_reached_terminal_seal`]), and whether — after the drive —
+/// the context still holds **unconsumed non-lifecycle history** (see
+/// [`WorkflowContext::history_has_unconsumed_events`]).
+///
+/// `has_unconsumed_history` is the drift guard (Codex P2, PR #986 follow-up).
+/// If the driven handler settled to a servable state (`ReachedTerminal`, or a
+/// `Suspended` run the engine sealed while parked) while genuine recorded
+/// non-lifecycle history remains unmatched, the handler diverged from the
+/// recorded history — the workflow code changed since the run executed — and the
+/// reconstructed state does **not** correspond to what actually happened.
+/// Serving it would be misleading, so gate every `Serve` on this check and
+/// return [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable)
+/// (410) instead. The check comes from
+/// [`HistoryMatcher::has_non_lifecycle_unconsumed`](crate::replay::HistoryMatcher::has_non_lifecycle_unconsumed),
+/// which **excludes trailing terminal-lifecycle events** — so a truthfully
+/// replayed completed / sealed-while-parked run (whose only unconsumed tail is
+/// the terminal seal) reports `false` and still Serves. That exclusion is
+/// exactly why the sealed-mid-flight shapes below are not regressed.
+///
+/// - [`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal): the handler drove
+///   all the way to `Poll::Ready`, so the context holds the workflow's fully
+///   reconstructed final state → [`Serve`](TerminalQueryDecision::Serve) (200),
+///   **unless** `has_unconsumed_history` (code drift) →
+///   [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable) (410).
 /// - [`TimedOut`](QueryReplayOutcome::TimedOut) →
 ///   [`TimedOut`](TerminalQueryDecision::TimedOut) (408): a spinning replay.
 /// - [`Suspended`](QueryReplayOutcome::Suspended):
-///     - if the history reached a terminal seal, the engine sealed the run while
-///       its function was parked mid-command — the canonical shapes are
-///       `CONTINUED_AS_NEW` (`continue_as_new` parks forever), `TIMED_OUT`
-///       (incomplete trailing command + `WorkflowExecutionTimedOut`), and a
-///       mid-await external/hard `CANCELLED`/`FAILED`. This is exactly the
-///       running-path behaviour applied to a run the engine sealed while parked,
-///       so serve the reconstructed partial state at the recorded terminal
-///       point ([`Serve`](TerminalQueryDecision::Serve), 200).
-///     - otherwise the history has no terminal lifecycle event at all → it is
-///       genuinely truncated (pruned by retention / released on reset / empty),
-///       so return [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable)
-///       (410) rather than a misleading partial/empty answer.
+///     - if the history reached a terminal seal **and** no non-lifecycle history
+///       remains unconsumed, the engine sealed the run while its function was
+///       parked mid-command — the canonical shapes are `CONTINUED_AS_NEW`
+///       (`continue_as_new` parks forever), `TIMED_OUT` (incomplete trailing
+///       command + `WorkflowExecutionTimedOut`), and a mid-await external/hard
+///       `CANCELLED`/`FAILED`. This is exactly the running-path behaviour applied
+///       to a run the engine sealed while parked, so serve the reconstructed
+///       partial state at the recorded terminal point
+///       ([`Serve`](TerminalQueryDecision::Serve), 200).
+///     - otherwise the history has no terminal lifecycle event at all (genuinely
+///       truncated: pruned by retention / released on reset / empty), or the
+///       drifted handler stopped short on a sealed run leaving recorded
+///       non-lifecycle history unconsumed → return
+///       [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable) (410)
+///       rather than a misleading partial/empty answer.
 #[must_use]
 pub const fn classify_terminal_query(
     outcome: QueryReplayOutcome,
     history_reached_terminal_seal: bool,
+    has_unconsumed_history: bool,
 ) -> TerminalQueryDecision {
     match outcome {
-        QueryReplayOutcome::ReachedTerminal => TerminalQueryDecision::Serve,
+        QueryReplayOutcome::ReachedTerminal => {
+            if has_unconsumed_history {
+                TerminalQueryDecision::HistoryUnavailable
+            } else {
+                TerminalQueryDecision::Serve
+            }
+        }
         QueryReplayOutcome::TimedOut => TerminalQueryDecision::TimedOut,
         QueryReplayOutcome::Suspended => {
-            if history_reached_terminal_seal {
+            if history_reached_terminal_seal && !has_unconsumed_history {
                 TerminalQueryDecision::Serve
             } else {
                 TerminalQueryDecision::HistoryUnavailable
