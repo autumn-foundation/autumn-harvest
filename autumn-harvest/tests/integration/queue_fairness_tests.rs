@@ -156,6 +156,8 @@ async fn insert_execution_for_queue(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = autumn_harvest::models::NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "fairness_test",
         workflow_id: &format!("fairness-{queue_name}-{suffix}"),

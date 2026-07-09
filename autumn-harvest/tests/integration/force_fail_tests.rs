@@ -148,6 +148,8 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
     let exec_id = ExecutionId::new();
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "test_wf",
             workflow_id: &format!("wf-ff-{}", Uuid::new_v4()),

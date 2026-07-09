@@ -305,6 +305,8 @@ async fn seed_execution(
         .expect("connect");
     let wf_id = format!("{workflow_name}-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id: &wf_id,

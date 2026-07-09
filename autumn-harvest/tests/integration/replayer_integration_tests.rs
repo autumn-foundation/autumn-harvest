@@ -145,6 +145,8 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 /// Insert a minimal workflow execution row so `replay_from_db` can look up the name.
 async fn insert_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name: &str) {
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: name,
         workflow_id: "test-wf",

@@ -582,6 +582,8 @@ async fn load_child_executions_from_url(
 async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_test_workflow",
         workflow_id: "e2e-wf-001",
@@ -4231,6 +4233,8 @@ async fn insert_named_workflow_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_sticky_test",
         workflow_id,
@@ -7898,6 +7902,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     let started_at = Utc::now();
     let deadline_at = started_at + execution_timeout;
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "signal_blocked_wf",
         workflow_id: "signal-blocked-timeout-001",

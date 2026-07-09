@@ -291,6 +291,8 @@ async fn seed_run(
         .expect("connect");
     let wf_id = format!("nightly-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "nightly_etl",
         workflow_id: &wf_id,

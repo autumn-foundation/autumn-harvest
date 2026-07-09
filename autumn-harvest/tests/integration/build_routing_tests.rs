@@ -731,6 +731,8 @@ mod db_tests {
     ) {
         diesel::insert_into(harvest_workflow_executions::table)
             .values(NewWorkflowExecution {
+                continued_from_exec_id: None,
+                first_exec_id: None,
                 id: exec_id,
                 workflow_name: "test_wf",
                 workflow_id: &exec_id.to_string(),

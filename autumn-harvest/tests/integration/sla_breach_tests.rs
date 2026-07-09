@@ -164,6 +164,8 @@ async fn insert_execution(
     let sla = sla_deadline_at.map(|_| ChronoDuration::hours(2));
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "slow_workflow",
             workflow_id: &format!("wf-sla-{}", Uuid::new_v4()),

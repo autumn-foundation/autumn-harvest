@@ -674,6 +674,8 @@ async fn workflow_and_activity_metrics_are_recorded() {
     let workflow_input = serde_json::json!({"msg": "hello metrics"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "metrics_test_workflow",
         workflow_id: &format!("metrics-test-{}", Uuid::new_v4()),
@@ -904,6 +906,8 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "continue_metric_workflow",
             workflow_id: &workflow_id,
@@ -1043,6 +1047,8 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "history_cap_violator",
             workflow_id: &workflow_id,
@@ -1195,6 +1201,8 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "history_cap_violator",
             workflow_id: &workflow_id,
@@ -1346,6 +1354,8 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
 
         diesel::insert_into(harvest_workflow_executions::table)
             .values(NewWorkflowExecution {
+                continued_from_exec_id: None,
+                first_exec_id: None,
                 id: exec_id.as_uuid(),
                 workflow_name: "suspended_command_reaches_history_cap",
                 workflow_id: &workflow_id,
@@ -1576,6 +1586,8 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "local_activity_retry_reaches_history_cap",
             workflow_id: &workflow_id,
@@ -1762,6 +1774,8 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "detached_cascade_reaches_history_cap",
             workflow_id: &workflow_id,
@@ -1958,6 +1972,8 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: parent_exec_id.as_uuid(),
             workflow_name: "parent_with_history_capped_child",
             workflow_id: &workflow_id,
@@ -2285,6 +2301,8 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
     let workflow_input = serde_json::json!({"msg": "non-det"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "non_deterministic_test_workflow",
         workflow_id: &format!("non-det-{}", Uuid::new_v4()),
@@ -2505,6 +2523,8 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
     let workflow_input = serde_json::json!({"msg": "sts test"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "sts_test_workflow",
         workflow_id: &format!("sts-{}", Uuid::new_v4()),
@@ -2662,6 +2682,8 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     let workflow_input = serde_json::json!({"msg": "age test"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "age_test_workflow",
         workflow_id: &format!("age-{}", Uuid::new_v4()),
@@ -2776,6 +2798,8 @@ async fn oldest_pending_age_excludes_paused_executions() {
     let workflow_input = serde_json::json!({"msg": "paused age test"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "paused_age_test_workflow",
         workflow_id: &format!("paused-age-{}", Uuid::new_v4()),
@@ -2880,6 +2904,8 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
     let workflow_input = serde_json::json!({"msg": "rate limit age test"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "rl_age_test_workflow",
         workflow_id: &format!("rl-age-{}", Uuid::new_v4()),
@@ -3018,6 +3044,8 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
     let workflow_input = serde_json::json!({"msg": "concurrency cap age test"});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "cap_age_test_workflow",
         workflow_id: &format!("cap-age-{}", Uuid::new_v4()),
@@ -3132,6 +3160,8 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
     let workflow_input = serde_json::json!({});
 
     let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "unfinished_updates_test_workflow",
         workflow_id: &format!("unfinished-updates-{}", Uuid::new_v4()),

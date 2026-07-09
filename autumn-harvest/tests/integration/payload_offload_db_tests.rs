@@ -177,6 +177,8 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 async fn insert_execution(conn: &mut AsyncPgConnection, name: &str) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: name,
         workflow_id: &Uuid::new_v4().to_string(),

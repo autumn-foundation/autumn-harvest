@@ -158,6 +158,13 @@ pub struct WorkflowExecution {
     /// of `{url, filter}` objects. `None` = no per-execution targets; the
     /// effective set is still the union with any builder-wide defaults.
     pub completion_callbacks: Option<serde_json::Value>,
+    /// Predecessor execution in a continue-as-new chain (issue #701). `None` for
+    /// the first run in a chain and for all non-continued runs.
+    pub continued_from_exec_id: Option<Uuid>,
+    /// The first (origin) execution of this continue-as-new chain (issue #701).
+    /// Set on every successor to the chain head. `None` for the origin run and
+    /// all non-continued runs.
+    pub first_exec_id: Option<Uuid>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -207,6 +214,12 @@ pub struct NewWorkflowExecution<'a> {
     pub origin: Option<&'a str>,
     /// Per-execution completion-callback targets (issue #605). `None` = none configured.
     pub completion_callbacks: Option<serde_json::Value>,
+    /// Predecessor execution in a continue-as-new chain (issue #701). `None`
+    /// except when inserting a continue-as-new successor.
+    pub continued_from_exec_id: Option<Uuid>,
+    /// First (origin) execution of this continue-as-new chain (issue #701).
+    /// `None` except when inserting a continue-as-new successor.
+    pub first_exec_id: Option<Uuid>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
