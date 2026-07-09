@@ -2952,6 +2952,13 @@ async fn persist_workflow_failure(
     priority: crate::types::Priority,
 ) -> HarvestResult<(bool, (ExecutionId, Option<String>))> {
     let error = error.to_string();
+    // Decode the typed failure envelope once (issue #767). A legacy `Err(String)`
+    // — and an engine non-determinism string (`nd_details.is_some()`) — decodes to
+    // all-None typed fields with `message == error`, preserving legacy semantics.
+    // `decoded.message` is the HUMAN message and is what the `execution.error` TEXT
+    // column and the task reason must carry (never the envelope JSON, AC4); the
+    // `WorkflowFailed` event carries the full typed fields.
+    let decoded = crate::failure::decode_workflow_failure(&error);
 
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
     let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
@@ -3010,21 +3017,26 @@ async fn persist_workflow_failure(
             bool,
             Vec<(ExecutionId, String)>,
         ), HarvestError, _>(|conn| {
-            let error = error.clone();
+            let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
             async move {
-                // TODO(#767 Wave 2): decode typed failure here
                 store::append_events(
                     conn,
                     exec_id,
-                    &[WorkflowEvent::workflow_failed(error.clone())],
+                    &[WorkflowEvent::workflow_failed_typed(&decoded)],
                     next_event_id,
                 )
                 .await?;
-                update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
-                    .await?;
-                queue::fail_task(conn, task_id, &error).await?;
+                update_workflow_execution_failed(
+                    conn,
+                    exec_id,
+                    worker_id,
+                    &decoded.message,
+                    nd_details,
+                )
+                .await?;
+                queue::fail_task(conn, task_id, &decoded.message).await?;
                 let mut deferred: Vec<crate::completion_trigger::DeferredTriggerStart> = Vec::new();
                 let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
 
@@ -4758,8 +4770,12 @@ async fn wake_parent_for_child_failure(
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
-    // TODO(#767 Wave 2): decode typed failure here
-    let event = WorkflowEvent::child_workflow_failed(child_exec_id, error.to_string());
+    // Decode the typed failure envelope (issue #767) so the parent's
+    // `ChildWorkflowFailed` event carries the child's `error_type`/`details`/
+    // `non_retryable`. The two seal-path callers pass engine reason strings,
+    // which decode to all-None typed fields (legacy behaviour preserved).
+    let decoded = crate::failure::decode_workflow_failure(error);
+    let event = WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded);
     store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
@@ -4827,17 +4843,23 @@ async fn persist_child_workflow_failure(
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
-    // TODO(#767 Wave 2): decode typed failure here
-    let workflow_failure = WorkflowEvent::workflow_failed(error.to_string());
+    // Decode the child's typed failure envelope once (issue #767). The child's own
+    // `WorkflowFailed` event carries the full typed fields; its `execution.error`
+    // TEXT column and task reason carry the human `decoded.message` (never the
+    // envelope JSON, AC4). The ORIGINAL raw `error` is forwarded to the parent so
+    // the parent's `ChildWorkflowFailed` can recover the same typed fields.
+    let decoded = crate::failure::decode_workflow_failure(error);
+    let workflow_failure = WorkflowEvent::workflow_failed_typed(&decoded);
 
     let (deferred, closed_children) = conn
         .transaction::<_, HarvestError, _>(|conn| {
-            let error = error.to_string();
+            let raw_error = error.to_string();
+            let message = decoded.message.clone();
             async move {
                 store::append_events(conn, exec_id, &[workflow_failure], next_event_id).await?;
-                update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
+                update_workflow_execution_failed(conn, exec_id, worker_id, &message, nd_details)
                     .await?;
-                queue::fail_task(conn, task_id, &error).await?;
+                queue::fail_task(conn, task_id, &message).await?;
                 let (mut deferred, closed_children) =
                     apply_parent_close_cascade(conn, exec_id).await?;
                 let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
@@ -4848,7 +4870,7 @@ async fn persist_child_workflow_failure(
                 )
                 .await?;
                 deferred.extend(triggers);
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &error).await?;
+                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error).await?;
                 Ok((deferred, closed_children))
             }
             .scope_boxed()

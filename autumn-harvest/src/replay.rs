@@ -41,6 +41,10 @@ pub enum HistoryMatch {
         /// Optional structured details recorded with a typed failure (e.g.
         /// `retry_after_secs` / `forced` for `CircuitOpen`). `None` otherwise.
         details: Option<Value>,
+        /// Non-retryable flag recorded with a typed failure (issue #767). `true`
+        /// only for a genuine typed `ActivityFailed`/`ChildWorkflowFailed` that
+        /// marked itself permanent; `false` for legacy / untyped failures.
+        non_retryable: bool,
     },
     /// History contains a timeout for this command.
     TimedOut {
@@ -821,6 +825,7 @@ impl HistoryMatcher {
                     attempt,
                     error_type,
                     details,
+                    non_retryable,
                     ..
                 } if *id == activity_id => {
                     let result = HistoryMatch::Failed {
@@ -828,6 +833,7 @@ impl HistoryMatcher {
                         attempt: *attempt,
                         error_type: error_type.clone(),
                         details: details.clone(),
+                        non_retryable: *non_retryable,
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -1050,6 +1056,7 @@ impl HistoryMatcher {
                         attempt: *attempt,
                         error_type: "Error".to_string(),
                         details: None,
+                        non_retryable: false,
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -1780,6 +1787,7 @@ impl HistoryMatcher {
                         attempt: 1,
                         error_type: "Error".to_string(),
                         details: None,
+                        non_retryable: false,
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -3293,17 +3301,27 @@ impl HistoryMatcher {
                 WorkflowEvent::ChildWorkflowFailed {
                     child_id: id,
                     error,
-                    ..
+                    error_type,
+                    details,
+                    non_retryable,
                 } if *id == child_id => {
+                    // Carry the child's typed failure fields (issue #767) through
+                    // to the parent's `HistoryMatch::Failed`. A legacy / untyped
+                    // child failure decodes to the `"Error"` sentinel with no
+                    // details and `non_retryable = false`.
                     let error = error.clone();
+                    let error_type = error_type.clone().unwrap_or_else(|| "Error".to_string());
+                    let details = details.clone();
+                    let non_retryable = non_retryable.unwrap_or(false);
                     self.consumed_out_of_order_events.insert(scan_cursor);
                     self.cursor = start_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Failed {
                         error,
                         attempt: 1,
-                        error_type: "Error".to_string(),
-                        details: None,
+                        error_type,
+                        details,
+                        non_retryable,
                     };
                 }
                 _ => scan_cursor += 1,
@@ -4207,6 +4225,7 @@ impl HistoryMatcher {
                         attempt: 1,
                         error_type: "Error".to_string(),
                         details: None,
+                        non_retryable: false,
                     };
                 }
                 _ => {}
@@ -4338,6 +4357,7 @@ mod tests {
                 attempt: 3,
                 error_type: "Error".into(),
                 details: None,
+                non_retryable: false,
             }
         );
     }
@@ -5046,6 +5066,42 @@ mod tests {
                 attempt: 1,
                 error_type: "Error".into(),
                 details: None,
+                non_retryable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_replays_typed_child_workflow_failure() {
+        // A child that failed with a typed `WorkflowFailure` surfaces its
+        // error_type / details / non_retryable through `HistoryMatch::Failed`
+        // (issue #767).
+        let child_id = crate::types::ExecutionId::new();
+        let decoded = crate::failure::DecodedWorkflowFailure {
+            message: "card declined".into(),
+            error_type: Some("ValidationRejected".into()),
+            details: Some(serde_json::json!({ "code": 402 })),
+            non_retryable: Some(true),
+        };
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "charge_card".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::child_workflow_failed_typed(child_id, &decoded),
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("charge_card", &Value::Null);
+        assert_eq!(
+            result,
+            HistoryMatch::Failed {
+                error: "card declined".into(),
+                attempt: 1,
+                error_type: "ValidationRejected".into(),
+                details: Some(serde_json::json!({ "code": 402 })),
+                non_retryable: true,
             }
         );
     }
@@ -6504,6 +6560,7 @@ mod tests {
                 attempt: 1,
                 error_type: "Error".into(),
                 details: None,
+                non_retryable: false,
             }
         );
     }

@@ -3529,6 +3529,9 @@ impl WorkflowContext {
                 attempt,
                 error_type,
                 details,
+                // Activity failures do not carry the workflow-level non_retryable
+                // flag on this path; it is consumed only by child-workflow matches.
+                non_retryable: _,
             } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
@@ -3674,6 +3677,9 @@ impl WorkflowContext {
                 attempt,
                 error_type,
                 details,
+                // Activity failures do not carry the workflow-level non_retryable
+                // flag on this path; it is consumed only by child-workflow matches.
+                non_retryable: _,
             } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
@@ -4001,15 +4007,20 @@ impl WorkflowContext {
             HistoryMatch::Matched { output } => Ok(output),
             HistoryMatch::Failed {
                 error,
-                attempt,
+                attempt: _,
                 error_type,
                 details,
-            } => Err(HarvestError::ActivityFailed {
+                non_retryable,
+            } => Err(HarvestError::WorkflowFailed {
+                // Keep the `child-workflow:` name prefix for log disambiguation.
                 name: format!("child-workflow:{workflow_name}"),
-                attempt,
-                error_type,
+                reason: error,
+                // `"Error"` is the untyped sentinel; convert it back to `None` so
+                // the parent's typed error surface reflects a legacy child failure
+                // as untyped rather than a synthetic `"Error"` class (issue #767).
+                error_type: (error_type != "Error").then(|| error_type.clone()),
                 details,
-                source: error.into(),
+                non_retryable: Some(non_retryable),
             }),
             HistoryMatch::TimedOut { .. }
             | HistoryMatch::ActivityInProgress { .. }
@@ -4062,9 +4073,11 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(
+                    // Live child failure: decode the typed envelope so the parent
+                    // observes a typed `HarvestError::WorkflowFailed` (issue #767),
+                    // consistent with the replay path above.
+                    Ok(Err(error)) => Err(HarvestError::workflow_failed(
                         format!("child-workflow:{workflow_name}"),
-                        1,
                         &error,
                     )),
                     Err(_) => Err(HarvestError::Cancelled(format!(
@@ -4102,9 +4115,11 @@ impl WorkflowContext {
 
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(
+                    // Live child failure: decode the typed envelope so the parent
+                    // observes a typed `HarvestError::WorkflowFailed` (issue #767),
+                    // consistent with the replay path above.
+                    Ok(Err(error)) => Err(HarvestError::workflow_failed(
                         format!("child-workflow:{workflow_name}"),
-                        1,
                         &error,
                     )),
                     Err(_) => Err(HarvestError::Cancelled(format!(
@@ -5543,9 +5558,10 @@ impl WorkflowContext {
     /// - [`HarvestError::NonDeterministic`] if `children.len()` differs
     ///   from the count recorded in history.
     /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
-    /// - [`HarvestError::ActivityFailed`] (child failures surface with a
-    ///   `child-workflow:{name}` activity name) on the first failure in the
-    ///   group.
+    /// - [`HarvestError::WorkflowFailed`] (child failures surface as a typed
+    ///   workflow failure with a `child-workflow:{name}` name, carrying the
+    ///   child's `error_type`/`details`/`non_retryable`, issue #767) on the
+    ///   first failure in the group.
     ///
     /// # Panics
     ///
@@ -5852,6 +5868,7 @@ impl WorkflowContext {
                             attempt,
                             error_type,
                             details,
+                            non_retryable: _,
                         } => resolved.push((
                             index,
                             Err(HarvestError::ActivityFailed {
@@ -5913,17 +5930,19 @@ impl WorkflowContext {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Failed {
                             error,
-                            attempt,
+                            attempt: _,
                             error_type,
                             details,
+                            non_retryable,
                         } => resolved.push((
                             index,
-                            Err(HarvestError::ActivityFailed {
+                            Err(HarvestError::WorkflowFailed {
                                 name: format!("child-workflow:{workflow_name}"),
-                                attempt,
-                                error_type,
+                                reason: error,
+                                error_type: (error_type != "Error")
+                                    .then(|| error_type.clone()),
                                 details,
-                                source: error.into(),
+                                non_retryable: Some(non_retryable),
                             }),
                         )),
                         HistoryMatch::Diverged {
@@ -6104,9 +6123,10 @@ impl WorkflowContext {
                     Err(HarvestError::activity_failed(name, 1, &error))
                 }
                 RaceBranchKind::ChildWorkflow { workflow_name, .. } => {
-                    Err(HarvestError::activity_failed(
+                    // Live child failure in a race: surface the typed
+                    // `HarvestError::WorkflowFailed` (issue #767).
+                    Err(HarvestError::workflow_failed(
                         format!("child-workflow:{workflow_name}"),
-                        1,
                         &error,
                     ))
                 }
@@ -6504,6 +6524,9 @@ impl WorkflowContext {
                 attempt,
                 error_type,
                 details,
+                // Activity failures do not carry the workflow-level non_retryable
+                // flag on this path; it is consumed only by child-workflow matches.
+                non_retryable: _,
             } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
@@ -10777,6 +10800,84 @@ mod tests {
 
         assert_eq!(result, output);
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_replays_typed_child_workflow_failure_as_workflow_failed() {
+        // A parent replaying a child that failed with a typed `WorkflowFailure`
+        // observes `HarvestError::WorkflowFailed` carrying the child's
+        // error_type / details / non_retryable — not a stringly-typed
+        // `ActivityFailed` (issue #767).
+        let child_id = ExecutionId::new();
+        let decoded = crate::failure::DecodedWorkflowFailure {
+            message: "card declined".into(),
+            error_type: Some("ValidationRejected".into()),
+            details: Some(serde_json::json!({ "code": 402 })),
+            non_retryable: Some(true),
+        };
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "charge_card".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::child_workflow_failed_typed(child_id, &decoded),
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .spawn_child_workflow_raw("charge_card", Value::Null)
+            .await
+            .expect_err("child failure should surface as an Err");
+
+        assert!(
+            matches!(err, HarvestError::WorkflowFailed { .. }),
+            "expected WorkflowFailed, got {err:?}"
+        );
+        assert_eq!(err.workflow_error_type(), Some("ValidationRejected"));
+        assert_eq!(err.workflow_details(), Some(&serde_json::json!({ "code": 402 })));
+        assert!(err.is_workflow_non_retryable());
+    }
+
+    #[tokio::test]
+    async fn context_replays_legacy_child_workflow_failure_untyped() {
+        // A pre-#767 (untyped) child failure surfaces as `WorkflowFailed` with a
+        // `None` error_type — proving the `"Error"` sentinel is converted back to
+        // untyped rather than leaking a synthetic class.
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "charge_card".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::child_workflow_failed(child_id, "boom"),
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .spawn_child_workflow_raw("charge_card", Value::Null)
+            .await
+            .expect_err("child failure should surface as an Err");
+
+        assert!(matches!(err, HarvestError::WorkflowFailed { .. }));
+        assert_eq!(err.workflow_error_type(), None);
+        assert!(err.workflow_details().is_none());
+        assert!(!err.is_workflow_non_retryable());
     }
 
     #[tokio::test]
