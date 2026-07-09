@@ -12,6 +12,143 @@ metric-backed rule below — each alert maps to a named panel (the mapping
 table lives in `docs/dashboards/README.md`), and each mapped panel's
 description links back to its section in this runbook.
 
+## First 60 seconds — one-call incident triage
+
+When an alert fires or a page lands, hit **one** endpoint first:
+
+```bash
+curl -s https://your-app/api/harvest/admin/status | jq
+```
+
+`GET /api/harvest/admin/status` (issue #679) is the single incident-triage
+entry point. It rolls up five subsystems — workers, shards, dead-letters,
+queues, and stalled workflows — into **one** JSON document with a single
+cluster verdict (`healthy` / `degraded` / `critical`) and, per subsystem, a
+verdict, machine-readable `reason_codes`, and a `drill_down` pointer to the
+endpoint that investigates it. Read this first instead of correlating
+`/workers/health`, `/admin/shards/health`, `/dead-letters/aggregate`, and
+`/workflows?no_progress_minutes=N` by hand: it tells you the overall verdict
+and the single worst subsystem in one request, then points you straight at
+where to look next.
+
+### Example response
+
+```json
+{
+  "status": "degraded",
+  "as_of": "2026-07-09T14:32:05Z",
+  "subsystems": [
+    {
+      "name": "workers",
+      "status": "healthy",
+      "reason_codes": [],
+      "drill_down": null,
+      "active": 4,
+      "draining": 0,
+      "unhealthy": 0,
+      "total": 4
+    },
+    {
+      "name": "shards",
+      "status": "healthy",
+      "reason_codes": [],
+      "drill_down": null,
+      "ready": 2,
+      "degraded": 0,
+      "unavailable": 0
+    },
+    {
+      "name": "dead_letters",
+      "status": "degraded",
+      "reason_codes": ["dlq_backlog"],
+      "drill_down": "/dead-letters/aggregate",
+      "total": 7,
+      "newest_entry_age_secs": 5400
+    },
+    {
+      "name": "queues",
+      "status": "healthy",
+      "reason_codes": [],
+      "drill_down": null,
+      "max_backlog": 12,
+      "max_backlog_queue": "default"
+    },
+    {
+      "name": "stalled_workflows",
+      "status": "healthy",
+      "reason_codes": [],
+      "drill_down": null,
+      "count": 0
+    }
+  ],
+  "unavailable_shards": []
+}
+```
+
+Each subsystem block carries its verdict, its `reason_codes`, its headline
+numbers (flattened into the block), and a `drill_down` path — which is
+populated **only when the subsystem is not `healthy`** and is `null`
+otherwise. The `drill_down` paths are relative to the management-API mount
+(e.g. `/api/harvest`).
+
+### Subsystem → drill-down
+
+| Subsystem | Headline metrics | `drill_down` when non-`healthy` |
+|---|---|---|
+| `workers` | `active` / `draining` / `unhealthy` / `total` | `/workers/health` |
+| `shards` | `ready` / `degraded` / `unavailable` | `/admin/shards/health` |
+| `dead_letters` | `total` / `newest_entry_age_secs` | `/dead-letters/aggregate` |
+| `queues` | `max_backlog` / `max_backlog_queue` | `/admin/shards/health` |
+| `stalled_workflows` | `count` | `/workflows?no_progress_minutes=N` (N = `stalled_no_progress_minutes`, default 60) |
+
+### How the verdict is computed
+
+The top-level `status` is the **worst of** the five subsystem verdicts —
+`critical` dominates `degraded` dominates `healthy`. It never fails wholesale:
+an **unreachable shard degrades the affected subsystems** (each non-shard
+subsystem that could not read complete data drops to at least `degraded` and
+carries the `shard_unreachable` reason code; the `shards` subsystem reflects it
+through its own readiness) and the shard is **named in `unavailable_shards`**
+rather than returning a `500`. So a partial answer is always honest, never a
+silent success and never an error page.
+
+Once you have the verdict, follow the worst subsystem's `drill_down` into the
+matching per-domain endpoint — those map directly onto the alert sections
+below (e.g. `dead_letters` → `harvest_dlq_growth`, `queues` /
+`stalled_workflows` → `harvest_queue_schedule_to_start_high`, `workers` →
+`harvest_no_active_workers` / `harvest_worker_saturation`, `shards` →
+`harvest_shard_unready`).
+
+### Configurable thresholds
+
+The verdict boundaries are **starter defaults, not universal SLOs** — every
+deployment tolerates a different DLQ depth, queue backlog, and stalled-run
+count. Override them per environment with
+`HarvestPlugin::with_status_thresholds(StatusThresholds { .. })`.
+
+| Field | Starter default | Effect |
+|---|---|---|
+| `dlq_degraded_total` | `1` | DLQ total at/above ⇒ `degraded` (any dead letter is worth a look) |
+| `dlq_critical_total` | `100` | DLQ total at/above ⇒ `critical` |
+| `dlq_critical_recent_secs` | `300` | A dead letter newer than this ⇒ `critical` (active failure) |
+| `queue_degraded_backlog` | `1000` | Busiest-queue claimable backlog at/above ⇒ `degraded` |
+| `queue_critical_backlog` | `10000` | Busiest-queue claimable backlog at/above ⇒ `critical` |
+| `stalled_no_progress_minutes` | `60` | No-progress window for the stalled count and drill-down link |
+| `stalled_degraded_count` | `1` | Stalled-execution count at/above ⇒ `degraded` |
+| `stalled_critical_count` | `50` | Stalled-execution count at/above ⇒ `critical` |
+| `worker_degraded_unhealthy_fraction` | `0.25` | Unhealthy (stale) worker fraction at/above ⇒ `degraded` |
+| `worker_critical_unhealthy_fraction` | `0.5` | Unhealthy fraction at/above ⇒ `critical` (zero active with any registered is always `critical`) |
+
+### Where this fits among the health surfaces
+
+- **`/admin/status` is the PULL triage surface** — one call, on demand, when you
+  are already responding to an incident.
+- The **static alert pack** (`docs/alerts/starter-pack-v0.1.0.json`, the rest of
+  this runbook) owns **PUSH alerting** — it tells you *when* to look.
+- **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
+- **`/api/harvest/admin/preflight`** is **startup validation** — is this
+  deployment safe to promote — run at deploy time, not during an incident.
+
 ## harvest_preflight_failed
 
 ### Triage steps
