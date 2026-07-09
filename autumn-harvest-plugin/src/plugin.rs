@@ -769,9 +769,11 @@ async fn start_harvest_runtime(
         );
         let pool_view = PoolConfigView {
             worker_pool_max_connections: harvest_pool.status().max_size,
-            // The plugin always resolves a single-shard `DbPool`; multi-shard
-            // deployments are rejected further below.
-            shard_pool_count: 1,
+            // Derived from the router's shard set rather than a hardcoded `1`, so
+            // it stays correct if multi-shard is ever enabled. On the plugin path
+            // this is always 1 in practice because multi-shard deployments are
+            // rejected further below.
+            shard_pool_count: router.readable_shards().len(),
         };
         let poll_interval =
             autumn_harvest::worker::WorkerRuntimeConfig::from(built.worker_config().clone())

@@ -143,6 +143,12 @@ pub struct WorkerConfigView {
     /// Capability labels for hardware/regional routing (sorted for stable output).
     pub labels: BTreeMap<String, String>,
     /// `WorkerConfig`-level hard history-event ceiling (`null` = unbounded).
+    ///
+    /// This is the **raw `WorkerConfig` knob**. The *resolved* effective ceiling
+    /// (builder value falling back to this one) is surfaced separately as
+    /// [`PayloadCapsView::max_workflow_history_events`]; both are reported so an
+    /// operator can distinguish the worker-level default from the value actually
+    /// enforced.
     pub max_workflow_history_events: Option<u64>,
     /// Default debounce max-wait cap, milliseconds.
     pub default_debounce_max_wait_ms: u64,
@@ -273,6 +279,11 @@ pub struct PayloadCapsView {
     /// Server-side workflow retry-attempt ceiling (`null` = unbounded).
     pub max_workflow_attempts: Option<u32>,
     /// Server-side hard history-event ceiling (`null` = unbounded).
+    ///
+    /// This is the **resolved effective ceiling** — the builder value falling
+    /// back to the raw `WorkerConfig` knob, which is also reported separately as
+    /// [`WorkerConfigView::max_workflow_history_events`]. Both appear
+    /// deliberately (raw knob vs. enforced ceiling), not by mistake.
     pub max_workflow_history_events: Option<u64>,
     /// `GET /admin/usage` window ceiling, milliseconds.
     pub usage_window_ceiling_ms: u64,
@@ -373,9 +384,18 @@ pub struct FeatureFlagsView {
 }
 
 /// Resolved database pool sizing.
+///
+/// The plugin resolves a **single** database pool, so
+/// [`worker_pool_max_connections`](PoolConfigView::worker_pool_max_connections)
+/// is the effective *total* connection budget for the deployment — there is no
+/// separate `max_total_connections` field because there is no second pool to
+/// aggregate. [`shard_pool_count`](PoolConfigView::shard_pool_count) is derived
+/// from the resolved shard topology (always `1` on the plugin path, which
+/// rejects multi-shard deployments).
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PoolConfigView {
-    /// Maximum connections in the worker/default-shard pool.
+    /// Maximum connections in the worker/default-shard pool. In the single-pool
+    /// model this is also the effective total connection budget.
     pub worker_pool_max_connections: usize,
     /// Number of shard pools resolved.
     pub shard_pool_count: usize,
