@@ -14,7 +14,10 @@ use crate::handle::{WorkflowHandle, WorkflowResultState};
 use crate::types::ExecutionId;
 
 /// Compact type-safe workflow result payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived: `error_details` is a
+/// [`serde_json::Value`], which is only `PartialEq` (issue #767).
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypedWorkflowResult<T> {
     /// Current compact state.
     pub state: WorkflowResultState,
@@ -24,6 +27,18 @@ pub struct TypedWorkflowResult<T> {
     pub error: Option<String>,
     /// Timestamp when the execution entered a terminal state.
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Stable error-type class from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    ///
+    /// `Some` only for a failure state produced by a typed workflow failure;
+    /// `None` for success states and legacy/untyped failures.
+    pub error_type: Option<String>,
+    /// Structured details from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    pub error_details: Option<serde_json::Value>,
+    /// Non-retryable flag from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    pub non_retryable: Option<bool>,
 }
 
 /// Type-safe awaitable handle for one workflow execution.
@@ -156,11 +171,29 @@ impl<T> TypedWorkflowHandle<T> {
             Some(val) => Some(serde_json::from_value(val).map_err(HarvestError::Serialization)?),
             None => None,
         };
+        // Only a `Failed` state emits a `WorkflowFailed` event carrying typed
+        // fields (issue #767); the extra history load is skipped for every other
+        // state (`Cancelled`/`TimedOut`/`Terminated` never carry a typed
+        // `WorkflowFailure`).
+        let (error_type, error_details, non_retryable) =
+            if snap.state == WorkflowResultState::Failed {
+                match self.inner.terminal_typed_failure().await? {
+                    Some(decoded) => {
+                        (decoded.error_type, decoded.details, decoded.non_retryable)
+                    }
+                    None => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            };
         Ok(TypedWorkflowResult {
             state: snap.state,
             output,
             error: snap.error,
             completed_at: snap.completed_at,
+            error_type,
+            error_details,
+            non_retryable,
         })
     }
 }

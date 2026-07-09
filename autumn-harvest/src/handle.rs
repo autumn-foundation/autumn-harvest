@@ -663,7 +663,7 @@ impl WorkflowHandle {
     pub async fn result_raw(&self) -> HarvestResult<Value> {
         let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
-            return result;
+            return self.enrich_terminal_result(result).await;
         }
 
         let mut listener = self.connect_listener().await?;
@@ -671,7 +671,7 @@ impl WorkflowHandle {
         loop {
             let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
-                return result;
+                return self.enrich_terminal_result(result).await;
             }
 
             match listener.wait_for_notification().await? {
@@ -698,7 +698,7 @@ impl WorkflowHandle {
         })?;
         let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
-            return result;
+            return self.enrich_terminal_result(result).await;
         }
         if Instant::now() >= deadline {
             return Err(wait_timeout_error(&execution));
@@ -709,7 +709,7 @@ impl WorkflowHandle {
         loop {
             let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
-                return result;
+                return self.enrich_terminal_result(result).await;
             }
 
             let now = Instant::now();
@@ -722,7 +722,7 @@ impl WorkflowHandle {
                 WorkflowEventWaitOutcome::TimedOut => {
                     let execution = self.load_effective_execution().await?;
                     if let Some(result) = terminal_raw_result(&execution) {
-                        return result;
+                        return self.enrich_terminal_result(result).await;
                     }
                     return Err(wait_timeout_error(&execution));
                 }
@@ -730,6 +730,104 @@ impl WorkflowHandle {
                     listener = self.connect_listener().await?;
                 }
             }
+        }
+    }
+
+    /// Load the typed fields of this execution's terminal `WorkflowFailed` event
+    /// (issue #767).
+    ///
+    /// Returns `Some(DecodedWorkflowFailure)` when a `WorkflowFailed` event
+    /// exists in history (carrying its `error_type`/`details`/`non_retryable`, all
+    /// `None` for a legacy untyped failure), or `None` when the execution has no
+    /// `WorkflowFailed` event. Callers should invoke this only on the `FAILED`
+    /// branch, since it performs an extra history load.
+    ///
+    /// # Errors
+    ///
+    /// Returns database or history-load errors.
+    pub(crate) async fn terminal_typed_failure(
+        &self,
+    ) -> HarvestResult<Option<crate::failure::DecodedWorkflowFailure>> {
+        let shard = self.shard();
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let history = crate::store::load_history_with_codecs(
+            &mut conn,
+            self.exec_id,
+            &self.client.inner.payload_codecs,
+        )
+        .await?;
+        drop(conn);
+
+        Ok(history.events.iter().rev().find_map(|event| match event {
+            crate::event::WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => Some(crate::failure::DecodedWorkflowFailure {
+                message: error.clone(),
+                error_type: error_type.clone(),
+                details: details.clone(),
+                non_retryable: *non_retryable,
+            }),
+            _ => None,
+        }))
+    }
+
+    /// Enrich a terminal `result_raw` outcome with the typed failure fields.
+    ///
+    /// For a `FAILED` execution (`Err(HarvestError::WorkflowFailed { .. })`) this
+    /// performs one extra history load to recover the typed
+    /// `error_type`/`details`/`non_retryable` (issue #767). The `reason` stays the
+    /// human message from `execution.error`. Every other outcome is passed through
+    /// untouched (no extra DB round-trip).
+    async fn enrich_terminal_result(&self, result: HarvestResult<Value>) -> HarvestResult<Value> {
+        let Err(HarvestError::WorkflowFailed {
+            name,
+            reason,
+            error_type,
+            details,
+            non_retryable,
+        }) = result
+        else {
+            return result;
+        };
+        // Only reload history when the message-only branch produced an untyped
+        // failure (the common terminal path); if typed fields are already present
+        // there is nothing to recover.
+        if error_type.is_some() || details.is_some() || non_retryable.is_some() {
+            return Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type,
+                details,
+                non_retryable,
+            });
+        }
+        match self.terminal_typed_failure().await {
+            Ok(Some(decoded)) => Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type: decoded.error_type,
+                details: decoded.details,
+                non_retryable: decoded.non_retryable,
+            }),
+            // No WorkflowFailed event or a history-load error: fall back to the
+            // untyped result rather than masking the terminal failure.
+            _ => Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            }),
         }
     }
 
@@ -994,7 +1092,9 @@ fn terminal_raw_result(execution: &WorkflowExecution) -> Option<HarvestResult<Va
         "COMPLETED" | "CONTINUED_AS_NEW" => {
             Some(Ok(execution.output.clone().unwrap_or(Value::Null)))
         }
-        // TODO(#767 Wave 2): typed
+        // Message-only here (no history access); `enrich_terminal_result`
+        // augments this with the typed fields from the terminal `WorkflowFailed`
+        // event on the `FAILED` branch (issue #767).
         "FAILED" => Some(Err(HarvestError::workflow_failed_untyped(
             execution.workflow_name.clone(),
             execution
