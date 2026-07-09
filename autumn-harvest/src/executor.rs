@@ -172,10 +172,40 @@ pub fn drive_query_replay(
         }
         flag.0.store(false, Ordering::Release);
         match handler_fut.as_mut().poll(&mut poll_cx) {
-            Poll::Ready(_) => return QueryReplayOutcome::ReachedTerminal,
+            Poll::Ready(_) => {
+                // Issue #612 (Codex P2, PR #993): mirror the executor's
+                // completion-time signal-handler flush (see the `run_workflow`
+                // family, which flushes right before its own
+                // `history_has_unconsumed_events()` check) before returning. A
+                // push-based signal handler (issue #546) whose target
+                // `SignalReceived` became claimable but was never picked up by a
+                // real cursor-advancing call this cycle — e.g. a workflow that
+                // registers a handler and then completes with no further
+                // activity/timer/signal wait — leaves that event stashed. The
+                // caller's `history_has_unconsumed_events()` drift check
+                // (`hydrate_ctx_for_query`) runs *after* this returns, so without
+                // the flush a truthfully replayed run would be misclassified as
+                // 410. The flush also completes state reconstruction by invoking
+                // the handler, so the served query reflects the processed signal.
+                // A no-op when no handlers are registered (the common case).
+                ctx.flush_pending_signal_handlers();
+                return QueryReplayOutcome::ReachedTerminal;
+            }
             Poll::Pending => {
                 if !flag.0.load(Ordering::Acquire) {
                     // Not woken → genuine suspension on a workflow command.
+                    // Flush for the same reason: on a run the engine sealed while
+                    // parked (CONTINUED_AS_NEW / TIMED_OUT / mid-await cancel), the
+                    // drift-guarded `Suspended` arm of `classify_terminal_query`
+                    // serves only when no non-lifecycle history remains
+                    // unconsumed, so a push-handler signal recorded before the
+                    // park point must be claimed here too. The flush is
+                    // cursor-bound and push-handler-only (`claim_pending_signal`
+                    // drains only up to the suspension blocker and respects race
+                    // reservations), so it never consumes a signal a genuine
+                    // pull-based `wait_for_signal` or an open signal-or-deadline
+                    // race is still waiting on.
+                    ctx.flush_pending_signal_handlers();
                     return QueryReplayOutcome::Suspended;
                 }
                 // Woken immediately (e.g. yield_now) — keep driving.
