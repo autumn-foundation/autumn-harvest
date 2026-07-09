@@ -271,6 +271,52 @@ mod db_impl {
         Ok(row)
     }
 
+    /// Outcome of a single upsert-and-classify pass, *without* any reclaim.
+    ///
+    /// The [`reserve_start_idempotency`] entry point runs this once, and — only
+    /// on [`ReserveClassification::Dangling`] — performs a guarded delete and
+    /// runs it exactly once more to re-classify.
+    enum ReserveClassification {
+        /// The upsert wrote our new id (fresh insert or window-expired reclaim).
+        Reserved,
+        /// A live claim within the window points at an existing execution.
+        Duplicate(ExistingRun),
+        /// A claim row exists but points at an execution that no longer exists.
+        Dangling,
+    }
+
+    /// Run the reserve upsert once and classify the result, performing **no**
+    /// reclaim. Robust to both Postgres interpretations of a `WHERE`-false
+    /// `DO UPDATE` (`RETURNING` may yield the pre-existing row or nothing).
+    async fn try_reserve_once(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        key: &str,
+        new_exec_id: ExecutionId,
+        shard_id: i32,
+        window_secs: f64,
+    ) -> HarvestResult<ReserveClassification> {
+        let returned =
+            run_reserve_upsert(conn, workflow_name, key, new_exec_id, shard_id, window_secs)
+                .await?;
+
+        // Fresh insert OR a window-expired reclaim: the upsert wrote our new id.
+        if returned == Some(new_exec_id.as_uuid()) {
+            return Ok(ReserveClassification::Reserved);
+        }
+
+        // Either the conflict guard was false and RETURNING gave the old id
+        // (`Some(other)`), or it gave nothing (`None`). In both cases a claim
+        // exists within the window — resolve it by loading the pointed-at
+        // execution through the join. A live execution → Duplicate; a dangling
+        // pointer (execution retention-deleted) → Dangling.
+        let existing = load_claimed_execution(conn, workflow_name, key).await?;
+        Ok(existing.map_or(
+            ReserveClassification::Dangling,
+            ReserveClassification::Duplicate,
+        ))
+    }
+
     /// Reserve a start idempotency claim for `(workflow_name, key)`.
     ///
     /// Returns [`StartIdempotencyReservation::Reserved`] when this request should
@@ -294,60 +340,68 @@ mod db_impl {
         shard_id: i32,
         window_secs: f64,
     ) -> HarvestResult<StartIdempotencyReservation> {
-        let returned =
-            run_reserve_upsert(conn, workflow_name, key, new_exec_id, shard_id, window_secs)
-                .await?;
+        match try_reserve_once(conn, workflow_name, key, new_exec_id, shard_id, window_secs).await?
+        {
+            ReserveClassification::Reserved => Ok(StartIdempotencyReservation::Reserved),
+            ReserveClassification::Duplicate(existing) => {
+                Ok(StartIdempotencyReservation::Duplicate {
+                    exec_id: ExecutionId::from_uuid(existing.id),
+                    workflow_id: existing.workflow_id,
+                    state: existing.state,
+                })
+            }
+            ReserveClassification::Dangling => {
+                // Defensive reclaim path: the claim row exists but points at an
+                // execution that no longer exists (a dangling pointer — only
+                // reachable if the idempotency window exceeds execution retention
+                // and the sweep hasn't run yet). Delete the stale claim, but ONLY
+                // if it still points at a non-existent execution: the `NOT EXISTS`
+                // guard makes this safe against a concurrent same-key request that
+                // repointed the claim to a real new run between our classifying
+                // JOIN above and this delete — that request's valid claim is
+                // preserved, so we never delete a live claim and never produce a
+                // duplicate execution. Binds `workflow_name`/`key` as parameters.
+                diesel::sql_query(
+                    "DELETE FROM harvest_start_idempotency \
+                     WHERE workflow_name = $1 AND idempotency_key = $2 \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM harvest_workflow_executions we \
+                           WHERE we.id = harvest_start_idempotency.workflow_exec_id \
+                       )",
+                )
+                .bind::<diesel::sql_types::Text, _>(workflow_name)
+                .bind::<diesel::sql_types::Text, _>(key)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        // Fresh insert OR a window-expired reclaim: the upsert wrote our new id.
-        if returned == Some(new_exec_id.as_uuid()) {
-            return Ok(StartIdempotencyReservation::Reserved);
-        }
-
-        // Either the conflict guard was false and RETURNING gave the old id
-        // (`Some(other)`), or it gave nothing (`None`). In both cases a live
-        // claim exists within the window — resolve it by loading the pointed-at
-        // execution through the join.
-        if let Some(existing) = load_claimed_execution(conn, workflow_name, key).await? {
-            return Ok(StartIdempotencyReservation::Duplicate {
-                exec_id: ExecutionId::from_uuid(existing.id),
-                workflow_id: existing.workflow_id,
-                state: existing.state,
-            });
-        }
-
-        // Defensive reclaim path: the claim row exists but points at an
-        // execution that no longer exists (a dangling pointer — only reachable
-        // if the retention window exceeds execution retention and the sweep
-        // hasn't run yet). Delete the stale claim and re-run the upsert, which
-        // now inserts our fresh row cleanly, so a start can proceed rather than
-        // wedging on a claim for a run that will never be observable.
-        diesel::sql_query(
-            "DELETE FROM harvest_start_idempotency \
-             WHERE workflow_name = $1 AND idempotency_key = $2",
-        )
-        .bind::<diesel::sql_types::Text, _>(workflow_name)
-        .bind::<diesel::sql_types::Text, _>(key)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-
-        let reclaimed =
-            run_reserve_upsert(conn, workflow_name, key, new_exec_id, shard_id, window_secs)
-                .await?;
-        if reclaimed == Some(new_exec_id.as_uuid()) {
-            Ok(StartIdempotencyReservation::Reserved)
-        } else if let Some(existing) = load_claimed_execution(conn, workflow_name, key).await? {
-            // A concurrent racer re-claimed between our delete and re-insert;
-            // honour their claim.
-            Ok(StartIdempotencyReservation::Duplicate {
-                exec_id: ExecutionId::from_uuid(existing.id),
-                workflow_id: existing.workflow_id,
-                state: existing.state,
-            })
-        } else {
-            // Still dangling after a re-claim race with nothing to observe;
-            // treat our own reservation as authoritative rather than looping.
-            Ok(StartIdempotencyReservation::Reserved)
+                // Re-classify ONCE after the guarded delete. Because the delete is
+                // guarded, it may have removed 0 rows (a concurrent request already
+                // repointed the claim to a valid run), so we must NOT assume
+                // Reserved — re-run the classify and honour whatever now owns the
+                // key.
+                match try_reserve_once(conn, workflow_name, key, new_exec_id, shard_id, window_secs)
+                    .await?
+                {
+                    // Stale row removed (or expired) — our insert won.
+                    ReserveClassification::Reserved => Ok(StartIdempotencyReservation::Reserved),
+                    // A concurrent valid claim now owns the key — dedup to it.
+                    ReserveClassification::Duplicate(existing) => {
+                        Ok(StartIdempotencyReservation::Duplicate {
+                            exec_id: ExecutionId::from_uuid(existing.id),
+                            workflow_id: existing.workflow_id,
+                            state: existing.state,
+                        })
+                    }
+                    // Practically unreachable (the guarded delete + upsert leaves
+                    // either our row or a concurrent valid claim). Surface it
+                    // rather than guessing a reservation that could duplicate.
+                    ReserveClassification::Dangling => Err(database_error(
+                        "start idempotency claim still dangling after guarded reclaim; \
+                         refusing to reserve to avoid a duplicate execution",
+                    )),
+                }
+            }
         }
     }
 
