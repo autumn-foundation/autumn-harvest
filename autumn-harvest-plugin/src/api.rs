@@ -8209,6 +8209,96 @@ pub(crate) async fn start_workflow(
             .pick_for_new_workflow(&workflow_name, &workflow_id)
     };
 
+    // issue #808 (Codex P2): a *committed* keyed replay short-circuits to the
+    // `200` no-op BEFORE any fresh-start-only rejection: the
+    // throttle/debounce/batch mutual-exclusion `400` below, the input-schema
+    // (#373) / completion-callback SSRF (#605) / delay-`start_at` validations,
+    // and the admission gate (#377). Those rules govern *fresh* work; a retry
+    // of an already-successful keyed start creates no new work, so tightening
+    // any of them between the original delivery and a retry must not reject the
+    // retry. In particular, if the workflow gained a throttle/debounce/batch
+    // policy *after* the original keyed start succeeded, an at-least-once retry
+    // must still return the existing execution as a `200` no-op — never the
+    // mutual-exclusion `400` — because the retry creates no deferred start. This
+    // probe therefore runs before the debounce/batch/throttle applicability is
+    // even computed; those apply only to a genuine fresh keyed start (a probe
+    // miss). We probe the keyed claim read-only on the same key-derived `shard`
+    // the
+    // reserve below uses (so we observe the claim the original delivery wrote),
+    // and a hit returns the original execution verbatim — standard
+    // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
+    // detection (out of scope for #808). A miss falls through to the full
+    // fresh-start path unchanged, whose reserve+start transaction's `ON CONFLICT`
+    // upsert (with a row lock) remains the *authoritative* dedup for the
+    // concurrent-first-delivery race: two simultaneous first deliveries both miss
+    // this probe (nothing committed yet), both proceed, and the reserve
+    // serializes them → one creates, one dedups. This early probe is an
+    // additional fast-path for COMMITTED replays only, never a replacement for
+    // the reserve.
+    if let Some(ref key) = idempotency_key
+        && let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut probe_conn) = acquire_conn(pool.pool_for(shard)).await
+    {
+        let window_secs = api_state.start_idempotency_window().as_secs_f64();
+        if let Ok(Some(claim_exec_id)) =
+            autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
+                &mut probe_conn,
+                &workflow_name,
+                key,
+                window_secs,
+            )
+            .await
+        {
+            // `lookup_live_start_idempotency_claim` JOINs to the execution row, so
+            // a `Some` claim implies the row existed at lookup time. Re-read its
+            // identity for the no-op response; if it vanished (retention-deleted in
+            // the gap) or the read errors, fall through to the fresh-start path,
+            // which re-reserves / reclaims as needed.
+            if let Ok(Some((dup_workflow_id, dup_state))) = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
+                .select((
+                    harvest_workflow_executions::workflow_id,
+                    harvest_workflow_executions::state,
+                ))
+                .first::<(String, String)>(&mut probe_conn)
+                .await
+                .optional()
+            {
+                // Best-effort dedup audit (intentional asymmetry with the
+                // fresh-start arm's 503-on-audit-failure): the original start was
+                // already audited when it created the run, so a failed audit here
+                // is a no-op read and never fails the reply.
+                let exec_id_str = claim_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut probe_conn, &ar).await;
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(StartWorkflowResponse {
+                        execution_id: claim_exec_id.to_string(),
+                        workflow_name: workflow_name.clone(),
+                        workflow_id: dup_workflow_id,
+                        state: dup_state,
+                        started_fresh: Some(false),
+                        deduplicated: Some(true),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
     // starts so a gate on that shard can't reject a request whose work would be
@@ -8311,7 +8401,12 @@ pub(crate) async fn start_workflow(
     // issue #808: a request-scoped idempotency key requires a synchronous, single
     // execution id to converge on. Throttle / debounce / batch all defer the
     // start and return no exec id up front, so "converge on the same exec id" has
-    // no coherent meaning combined with them — reject the combination.
+    // no coherent meaning combined with them — reject the combination. This only
+    // reaches a *genuine fresh* keyed start: the committed-replay probe above
+    // already short-circuited an at-least-once retry of an earlier keyed start to
+    // a `200` no-op before this check, so a workflow that gained a throttle/
+    // debounce/batch policy after an original keyed start still returns the
+    // existing execution rather than a `400` on retry.
     if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -8320,88 +8415,6 @@ pub(crate) async fn start_workflow(
             })),
         )
             .into_response();
-    }
-
-    // issue #808 (Codex P2): a *committed* keyed replay short-circuits to the
-    // `200` no-op BEFORE any fresh-start-only validation (input schema #373,
-    // completion-callback SSRF #605, delay/start_at) and BEFORE the admission
-    // gate #377. Those rules govern *fresh* work; a retry of an
-    // already-successful keyed start creates no new work, so tightening any of
-    // them between the original delivery and a retry must not reject the retry.
-    // We probe the keyed claim read-only on the same key-derived `shard` the
-    // reserve below uses (so we observe the claim the original delivery wrote),
-    // and a hit returns the original execution verbatim — standard
-    // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
-    // detection (out of scope for #808). A miss falls through to the full
-    // fresh-start path unchanged, whose reserve+start transaction's `ON CONFLICT`
-    // upsert (with a row lock) remains the *authoritative* dedup for the
-    // concurrent-first-delivery race: two simultaneous first deliveries both miss
-    // this probe (nothing committed yet), both proceed, and the reserve
-    // serializes them → one creates, one dedups. This early probe is an
-    // additional fast-path for COMMITTED replays only, never a replacement for
-    // the reserve.
-    if let Some(ref key) = idempotency_key
-        && let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut probe_conn) = acquire_conn(pool.pool_for(shard)).await
-    {
-        let window_secs = api_state.start_idempotency_window().as_secs_f64();
-        if let Ok(Some(claim_exec_id)) =
-            autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
-                &mut probe_conn,
-                &workflow_name,
-                key,
-                window_secs,
-            )
-            .await
-        {
-            // `lookup_live_start_idempotency_claim` JOINs to the execution row, so
-            // a `Some` claim implies the row existed at lookup time. Re-read its
-            // identity for the no-op response; if it vanished (retention-deleted in
-            // the gap) or the read errors, fall through to the fresh-start path,
-            // which re-reserves / reclaims as needed.
-            if let Ok(Some((dup_workflow_id, dup_state))) = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
-                .select((
-                    harvest_workflow_executions::workflow_id,
-                    harvest_workflow_executions::state,
-                ))
-                .first::<(String, String)>(&mut probe_conn)
-                .await
-                .optional()
-            {
-                // Best-effort dedup audit (intentional asymmetry with the
-                // fresh-start arm's 503-on-audit-failure): the original start was
-                // already audited when it created the run, so a failed audit here
-                // is a no-op read and never fails the reply.
-                let exec_id_str = claim_exec_id.to_string();
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_WORKFLOW_START,
-                    target_type: TARGET_WORKFLOW,
-                    target_id: Some(exec_id_str.as_str()),
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: Some(key.as_str()),
-                    status: STATUS_SUCCEEDED,
-                    error_summary: None,
-                    shard_id: Some(shard.as_i32()),
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut probe_conn, &ar).await;
-                return (
-                    axum::http::StatusCode::OK,
-                    Json(StartWorkflowResponse {
-                        execution_id: claim_exec_id.to_string(),
-                        workflow_name: workflow_name.clone(),
-                        workflow_id: dup_workflow_id,
-                        state: dup_state,
-                        started_fresh: Some(false),
-                        deduplicated: Some(true),
-                    }),
-                )
-                    .into_response();
-            }
-        }
     }
 
     // issue #377: check admission gates before touching the DB.

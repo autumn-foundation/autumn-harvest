@@ -153,6 +153,24 @@ delivery's retries routes them to different shards, so the second would not see
 the first's claim. Pick one shape per delivery. In a single-shard deployment this
 is moot (everything is on one shard).
 
+### Known limitation — shard drain within the retention window
+
+Keyed dedup routes via the **same rendezvous hash + writable-subset redirect**
+as `(workflow_name, workflow_id)` uniqueness (`pick_for_idempotency_key` reuses
+the identical logic as `pick_for_new_workflow`). Because of that, it is **not
+guaranteed across a writable → read-only shard transition** within a key's
+retention window: a key that first claimed a run on a shard which is *later*
+removed from the writable set (drained to read-only, but still readable) will,
+on a same-key retry, rehash to a *different* writable shard, probe/reserve a
+different shard-local `harvest_start_idempotency` row, and can create a **second**
+execution. This is the same drain limitation `(name, workflow_id)` uniqueness
+already has (a drained-shard uniqueness key can likewise be re-created on a
+different writable shard), and issue #808 deliberately scopes keyed dedup to be
+shard-local, exactly as that uniqueness is — so the two share identical behavior.
+The guarantee holds while the **writable set is stable**; do not drain a writable
+shard to read-only while keyed starts targeting it are still within their
+retention window.
+
 See the [start route in the management-API contract](../api-contract.json) for
 the full request/response schema.
 

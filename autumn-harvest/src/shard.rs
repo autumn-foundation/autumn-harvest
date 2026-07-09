@@ -158,6 +158,18 @@ impl ShardRouter {
     /// The same writable-subset redirect as [`Self::pick_for_new_workflow`]
     /// applies (a keyed start still creates a brand-new workflow, so it must
     /// land on a writable shard).
+    ///
+    /// KNOWN LIMITATION (Codex #808 P2): because this reuses `pick_writable`
+    /// verbatim, keyed dedup inherits the *exact* shard-drain behavior of
+    /// `(workflow_name, workflow_id)` uniqueness. If a key first claims a run on
+    /// shard 0 and shard 0 is later removed from the writable set (drained to
+    /// read-only) while still readable, a same-key retry rehashes via the
+    /// writable-subset redirect to a *different* writable shard, probes/reserves
+    /// a different shard-local `harvest_start_idempotency` row, and can create a
+    /// second execution within the retention window. Issue #808 scopes dedup to
+    /// be shard-local, exactly as `(name, workflow_id)` uniqueness already is —
+    /// so this matches (and is bounded by) that existing guarantee. See the
+    /// "Known limitation" note in `docs/getting-started/06-idempotency.md`.
     #[must_use]
     pub fn pick_for_idempotency_key(&self, workflow_name: &str, idempotency_key: &str) -> ShardId {
         self.pick_writable(workflow_name, idempotency_key)

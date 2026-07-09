@@ -308,7 +308,11 @@ async fn post_start(
 ) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method("POST")
-        .uri(format!("/api/harvest/workflows/{wf}/start"))
+        // `harvest_api_router` mounts routes at the root (`/workflows/...`), not
+        // under `/api/harvest` (the plugin nests that prefix outside this router);
+        // sibling integration tests (e.g. `workflow_result_integration`,
+        // `erase_payloads_integration`) hit the root path for the same reason.
+        .uri(format!("/workflows/{wf}/start"))
         .header("content-type", "application/json")
         .header("x-harvest-admin", "true");
     if let Some(k) = idem_header {
@@ -982,4 +986,83 @@ async fn keyed_replay_bypasses_callback_validation() {
 
     let mut conn = raw_connect(&url).await;
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FINDING 1 (Codex P2): the committed-replay dedup probe runs BEFORE the
+/// throttle/debounce/batch mutual-exclusion `400`. So a keyed start that
+/// succeeded while the workflow had NO throttle policy must, on an
+/// at-least-once retry made AFTER the workflow gained one, still return the
+/// existing execution as a `200` no-op — never the mutual-exclusion `400`
+/// (the retry creates no deferred start). A FRESH keyed start against the
+/// throttled workflow (a probe miss) still `400`s.
+#[tokio::test]
+async fn keyed_replay_against_a_throttled_workflow_dedups() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+
+    // 1. Original delivery: the workflow has NO throttle policy yet, so a keyed
+    //    start goes through the normal reserve+start path and writes the
+    //    `harvest_start_idempotency` claim + execution row (the real path,
+    //    simulating a delivery made before the policy existed).
+    let plain_app = build_app(&pool, vec![plain_info("sync_tenant")]);
+    let (s1, b1) = post_start(
+        &plain_app,
+        "sync_tenant",
+        json!({"input": {"tenant_id": "acme"}}),
+        Some("delivery-42"),
+    )
+    .await;
+    assert_eq!(
+        s1,
+        StatusCode::CREATED,
+        "original keyed start creates: {b1}"
+    );
+    assert_eq!(b1["started_fresh"], json!(true));
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    // 2. The workflow is LATER configured with a throttle policy. A same-key
+    //    retry against the now-throttled app (same pool/DB) must dedup to the
+    //    original run with `200`, NOT be rejected `400` by the mutual-exclusion.
+    let throttled_app = build_app(&pool, vec![throttled_info("sync_tenant")]);
+    let (s2, b2) = post_start(
+        &throttled_app,
+        "sync_tenant",
+        json!({"input": {"tenant_id": "acme"}}),
+        Some("delivery-42"),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "a committed keyed replay must dedup, not hit the throttle mutual-exclusion 400: {b2}"
+    );
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
+
+    // 3. A FRESH keyed start (a probe miss — new key) against the throttled
+    //    workflow still returns `400`: the mutual-exclusion applies to genuine
+    //    fresh keyed starts.
+    let (s3, b3) = post_start(
+        &throttled_app,
+        "sync_tenant",
+        json!({"input": {"tenant_id": "acme"}}),
+        Some("delivery-99"),
+    )
+    .await;
+    assert_eq!(
+        s3,
+        StatusCode::BAD_REQUEST,
+        "a fresh keyed start against a throttled workflow is still rejected: {b3}"
+    );
+    assert!(
+        b3["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("idempotency_key"),
+        "error names the conflict: {b3}"
+    );
+
+    // Exactly one execution overall (the retry deduped; the fresh 400 created nothing).
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "sync_tenant").await, 1);
 }
