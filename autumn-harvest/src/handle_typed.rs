@@ -14,6 +14,24 @@ use crate::handle::{WorkflowHandle, WorkflowResultState};
 use crate::types::ExecutionId;
 
 /// Compact type-safe workflow result payload.
+///
+/// This struct holds the final resting state of a completed or failed workflow.
+/// It wraps the raw execution result, providing access to the terminal state,
+/// strongly-typed output payload, error message, and completion timestamp.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_harvest::handle::WorkflowResultState;
+/// use autumn_harvest::handle_typed::TypedWorkflowResult;
+///
+/// let result: TypedWorkflowResult<i32> = TypedWorkflowResult {
+///     state: WorkflowResultState::Completed,
+///     output: Some(42),
+///     error: None,
+///     completed_at: Some(chrono::Utc::now()),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedWorkflowResult<T> {
     /// Current compact state.
@@ -27,6 +45,22 @@ pub struct TypedWorkflowResult<T> {
 }
 
 /// Type-safe awaitable handle for one workflow execution.
+///
+/// A `TypedWorkflowHandle` serves as a client-side proxy to an executing workflow.
+/// It wraps the untyped [`WorkflowHandle`] and carries a PhantomData marker for the
+/// expected success return type `T`. It enables type-safe polling for results
+/// and interacting with the workflow via signals or cancellation requests.
+///
+/// # Examples
+///
+/// ```compile_fail
+/// use autumn_harvest::handle_typed::TypedWorkflowHandle;
+///
+/// // Handles are typically returned by typed stubs or the worker registry.
+/// // They represent an active execution waiting to be resolved.
+/// let handle: TypedWorkflowHandle<String> = my_workflow_stub.start(input).await?;
+/// let result = handle.result().await?;
+/// ```
 #[derive(Debug, Clone)]
 pub struct TypedWorkflowHandle<T> {
     inner: WorkflowHandle,
@@ -37,7 +71,7 @@ unsafe impl<T> Send for TypedWorkflowHandle<T> {}
 unsafe impl<T> Sync for TypedWorkflowHandle<T> {}
 
 impl<T> TypedWorkflowHandle<T> {
-    /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
+    /// Wrap an untyped [[`WorkflowHandle`]] with type parameter `T` representing
     /// the expected success return type.
     #[must_use]
     pub const fn new(inner: WorkflowHandle) -> Self {
@@ -53,7 +87,7 @@ impl<T> TypedWorkflowHandle<T> {
         self.inner.exec_id()
     }
 
-    /// Access the underlying untyped [`WorkflowHandle`].
+    /// Access the underlying untyped [[`WorkflowHandle`]].
     #[must_use]
     pub const fn inner(&self) -> &WorkflowHandle {
         &self.inner
@@ -150,6 +184,27 @@ impl<T> TypedWorkflowHandle<T> {
 }
 
 /// Optional configurations when starting a typed workflow.
+///
+/// This struct enables callers to override default start parameters (like the
+/// execution ID, queue name, and timeout) when initiating a type-safe workflow.
+/// It provides a builder-like structure for fine-grained control over execution.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_harvest::handle_typed::TypedStartOptions;
+/// use autumn_harvest::types::ExecutionId;
+/// use uuid::Uuid;
+/// use std::time::Duration;
+///
+/// let options = TypedStartOptions {
+///     exec_id: Some(ExecutionId(Uuid::new_v4())),
+///     parent_id: None,
+///     queue_name: Some("high-priority".to_string()),
+///     execution_timeout: Some(Duration::from_secs(3600)),
+///     memo: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct TypedStartOptions {
     /// Explicitly override the `ExecutionId` for this run.

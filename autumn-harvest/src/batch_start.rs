@@ -34,6 +34,19 @@ pub const BATCH_START_BODY_HARD_LIMIT: u64 = 100 * 1024 * 1024;
 /// application startup. The defaults are operator-friendly values that keep a
 /// single management-API call from monopolising the connection pool or saturating
 /// Postgres WAL bandwidth.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_harvest::batch_start::BatchStartConfig;
+///
+/// let config = BatchStartConfig {
+///     max_items_per_batch: 500,
+///     max_total_bytes: 5 * 1024 * 1024, // 5 MiB
+/// };
+///
+/// assert_eq!(config.max_items_per_batch, 500);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchStartConfig {
     /// Maximum number of items in a single batch-start request.
@@ -59,6 +72,29 @@ impl Default for BatchStartConfig {
 // ── Per-item request ──────────────────────────────────────────────────────────
 
 /// One workflow to start, supplied inside a `POST /workflows/batch_start` body.
+///
+/// Defines the structure of a single item in a batch start request.
+/// It must specify the `workflow_name` to execute and optionally can define
+/// the logical `workflow_id`, `input`, and `search_attributes`. If `idempotency_key`
+/// is supplied, subsequent batch-starts with the same key for the same workflow
+/// will be deduplicated.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_harvest::batch_start::BatchStartItem;
+/// use serde_json::json;
+///
+/// let item = BatchStartItem {
+///     workflow_name: "onboarding".to_string(),
+///     workflow_id: Some("user-123".to_string()),
+///     input: Some(json!({ "user_id": 123 })),
+///     search_attributes: None,
+///     idempotency_key: None,
+///     context_headers: None,
+///     priority: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BatchStartItem {
     /// Registered workflow type name (e.g. `"onboarding"`).
@@ -100,6 +136,24 @@ pub struct BatchStartItem {
 // ── Per-item result ───────────────────────────────────────────────────────────
 
 /// Outcome for a single item in a best-effort (`atomic = false`) batch-start response.
+///
+/// Contains the resolved status (Started, Rejected, Deferred) of a single workflow
+/// submission. If started, the `execution_id` will be present. If rejected,
+/// the `error` field will explain the reason (e.g., unknown workflow type).
+///
+/// # Examples
+///
+/// ```
+/// use autumn_harvest::batch_start::{BatchStartItemResult, BatchStartItemStatus};
+///
+/// let result = BatchStartItemResult {
+///     index: 0,
+///     workflow_id: Some("user-123".to_string()),
+///     status: BatchStartItemStatus::Started,
+///     execution_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+///     error: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchStartItemResult {
     /// Zero-based index of this item in the original request.
