@@ -159,16 +159,23 @@ impl MetricsRecorder for RecordingMetrics {
 
     fn record_retention_tick(
         &self,
-        shard: u16,
+        _shard: u16,
         _candidate_count: u64,
-        deleted_count: u64,
+        _deleted_count: u64,
         _duration_secs: f64,
     ) {
+        // Issue #737: the retention deletion counter is now owned by
+        // `record_retention_deleted` (labeled by workflow type). The tick
+        // observability point emits nothing for the catalogue counter, so the
+        // coverage guard exercises the real emission path below, not this one.
+    }
+
+    fn record_retention_deleted(&self, workflow: &str, count: u64) {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_RETENTION_DELETED,
             labels: vec![
-                ("shard", shard.to_string()),
-                ("deleted", deleted_count.to_string()),
+                ("workflow", workflow.to_string()),
+                ("count", count.to_string()),
             ],
         });
     }
@@ -234,6 +241,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_schedule_skipped("workflow", "nightly", "paused");
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 100, 50, 0.01);
+    rec.record_retention_deleted("my_workflow", 50);
     rec.record_workflow_task_timeout("my_workflow", "default");
     rec.record_task_dispatched("default");
 

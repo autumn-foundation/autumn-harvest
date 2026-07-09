@@ -94,6 +94,9 @@ required-features = ["schema"]
 [[example]]
 name = "business_metrics"
 
+[[example]]
+name = "sleep_until_renewal_reminder"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }

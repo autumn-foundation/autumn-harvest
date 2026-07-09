@@ -99,6 +99,14 @@ curl -X POST http://localhost:8080/hooks/stripe \
 # {"status":"idempotent_replay","workflow_exec_id":"...","workflow_id":"stripe-evt_123"}
 ```
 
+A `starts` webhook dedupes solely on the mapping function's deterministic
+`workflow_id` (via the reuse policy on `(workflow_name, workflow_id)`); any
+upstream provider `Idempotency-Key` header on the delivery is deliberately
+**not** used as an issue-#808 workflow-start idempotency key (it is the
+provider's key, not a Harvest start key), so it can neither collapse two
+distinct events that reuse a provider key nor trip the start-throttle/debounce/
+batch mutual-exclusion `400`.
+
 ## Signaling a running workflow instead of starting one
 
 Stripe's `invoice.payment_succeeded` often needs to reach an *already

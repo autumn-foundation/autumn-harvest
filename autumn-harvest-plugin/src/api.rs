@@ -14,6 +14,7 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -352,6 +353,11 @@ pub struct HarvestApiState {
     /// Default **off**: responses are byte-for-byte identical to a build
     /// without the feature.
     decode_payloads_on_read: Arc<Mutex<bool>>,
+    /// Retention window for request-scoped start idempotency keys (issue #808),
+    /// mirrored from `BuiltHarvest::start_idempotency_window` at startup so the
+    /// HTTP start route dedups a repeated `idempotency_key` within this window.
+    /// Defaults to 24h.
+    start_idempotency_window: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -395,6 +401,9 @@ impl Default for HarvestApiState {
                 autumn_harvest::payload_codec::PayloadCodecs::default(),
             )),
             decode_payloads_on_read: Arc::new(Mutex::new(false)),
+            start_idempotency_window: Arc::new(Mutex::new(
+                autumn_harvest::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+            )),
         }
     }
 }
@@ -725,6 +734,32 @@ impl HarvestApiState {
             .default_debounce_max_wait
             .lock()
             .expect("harvest api state lock poisoned") = max_wait;
+    }
+
+    /// Returns the retention window for request-scoped start idempotency keys
+    /// (issue #808). Defaults to 24h.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
+    pub fn start_idempotency_window(&self) -> std::time::Duration {
+        *self
+            .start_idempotency_window
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the start-idempotency retention window (issue #808).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_start_idempotency_window(&self, window: std::time::Duration) {
+        *self
+            .start_idempotency_window
+            .lock()
+            .expect("harvest api state lock poisoned") = window;
     }
 
     /// Returns the ceiling on the `[from, to]` window accepted by
@@ -1753,6 +1788,16 @@ pub(crate) struct StartWorkflowResponse {
     workflow_name: String,
     workflow_id: String,
     state: String,
+    /// `true` when this request created the execution, `false` when it
+    /// deduplicated onto an earlier same-`idempotency_key` start (issue #808).
+    /// Populated only on the idempotency-key path; omitted (byte-identical to a
+    /// pre-#808 response) otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_fresh: Option<bool>,
+    /// `true` when this request was a no-op that returned an existing execution
+    /// via a matching `idempotency_key` (issue #808). Omitted on the no-key path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deduplicated: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2056,6 +2101,15 @@ pub(crate) struct StartWorkflowRequest {
     context_headers: Option<std::collections::HashMap<String, String>>,
     /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
     priority: Option<autumn_harvest::types::Priority>,
+    /// Request-scoped idempotency key (issue #808). Two starts carrying the same
+    /// key (within the configured retention window, default 24h) converge on
+    /// exactly one execution — the second returns the same `execution_id` as a
+    /// no-op (`200`), with no second `WorkflowStarted` event. Dedup scope is
+    /// `(workflow_name, idempotency_key)`, independent of `workflow_id`. The
+    /// `Idempotency-Key` request header takes precedence over this field.
+    /// Mutually exclusive with a throttle / debounce / batch policy.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 impl StartWorkflowRequest {
@@ -2085,6 +2139,7 @@ impl StartWorkflowRequest {
             completion_callbacks: None,
             context_headers: None,
             priority: None,
+            idempotency_key: None,
         }
     }
 
@@ -2123,6 +2178,7 @@ impl StartWorkflowRequest {
             completion_callbacks: None,
             context_headers: None,
             priority: None,
+            idempotency_key: None,
         }
     }
 }
@@ -3268,6 +3324,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             post(retry_dag_run),
         )
+        // DAG run graph view (issue #690): read-only, admin-guarded per AC1.
+        // Note the asymmetry with the sibling `/dags/*` read routes (e.g.
+        // GET /dags/{dag_name}/runs), which carry no `require_admin` layer and
+        // rely only on the embedder's optional `api_with_auth` boundary — a
+        // pre-existing posture left unchanged here. This route adds the admin
+        // layer because issue #690 AC1 explicitly mandates it.
+        .route(
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            get(get_dag_run_graph).route_layer(require_admin.clone()),
+        )
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
         .route(
@@ -3833,6 +3899,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags"),
         ("GET", "/dags/{dag_name}/runs"),
+        ("GET", "/dags/{dag_name}/runs/{run_exec_id}"),
         ("POST", "/dags/{dag_name}/runs/{run_exec_id}/retry"),
         ("POST", "/dags/{dag_name}/trigger"),
         ("PATCH", "/dags/{dag_name}"),
@@ -3969,6 +4036,7 @@ pub const fn management_api_request_fields()
                 "batch_max_size",
                 "batch_max_wait",
                 "completion_callbacks",
+                "idempotency_key",
             ]),
         ),
         (
@@ -4384,6 +4452,8 @@ pub const fn management_api_response_fields()
             // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
             // A debounced workflow (issue #499) instead returns 202 Accepted with the
             // debounce fields below (no execution_id exists until the scanner fires).
+            // With an idempotency_key (issue #808) the response also carries the
+            // started_fresh/deduplicated flags (200 on a dedup replay).
             Some(&[
                 "execution_id",
                 "workflow_name",
@@ -4397,6 +4467,8 @@ pub const fn management_api_response_fields()
                 "flushed",
                 "batch_key",
                 "max_size",
+                "started_fresh",
+                "deduplicated",
             ]),
         ),
         (
@@ -4574,6 +4646,18 @@ pub const fn management_api_response_fields()
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags", None),                 // Vec<DagSummary>
         ("GET", "/dags/{dag_name}/runs", None), // Vec<WorkflowExecution>
+        (
+            "GET",
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            Some(&[
+                "run_exec_id",
+                "dag_name",
+                "state",
+                "started_at",
+                "finished_at",
+                "nodes",
+            ]),
+        ),
         (
             "POST",
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
@@ -8211,15 +8295,274 @@ fn workflow_resolving_throttle(
     )
 }
 
+/// Maximum accepted length (in bytes, after trimming) for a request-scoped
+/// `idempotency_key` (issue #808).
+///
+/// The key is half of the composite PRIMARY KEY `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency`; an oversized key would
+/// exceed Postgres's ~2704-byte btree index tuple limit and error at INSERT,
+/// leaking a `500` on client-controlled input. Cap it conservatively so
+/// `workflow_name` + key stays well under that limit and a too-long key is a
+/// clean `400` at the API boundary instead.
+const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
+
+/// Shared trim + empty-`400` + length-cap validation for a request-scoped
+/// `idempotency_key` (issue #808), used by both the `Idempotency-Key` header
+/// and the body-field source so the two never diverge. `Ok(None)` = no key;
+/// `Ok(Some(k))` = a valid trimmed key; `Err(resp)` = a `400` for an empty or
+/// over-long key.
+#[allow(clippy::result_large_err)]
+fn validate_start_idempotency_key(
+    raw: Option<String>,
+) -> Result<Option<String>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    match raw {
+        Some(s) if s.trim().is_empty() => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "idempotency_key must not be empty" })),
+        )
+            .into_response()),
+        Some(s) => {
+            let trimmed = s.trim();
+            // Cap the key length: it is half of the composite PK on
+            // harvest_start_idempotency, so an oversized key would overflow the
+            // btree tuple limit and 500 at INSERT on client-controlled input.
+            // Reject it cleanly at the boundary instead.
+            if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN})"
+                        )
+                    })),
+                )
+                    .into_response());
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Extract the `Idempotency-Key` HEADER value (issue #808), applying the same
+/// trim/empty/length-cap rules as the body field via
+/// [`validate_start_idempotency_key`]. `Err` is a `400` (invalid UTF-8, empty,
+/// or over-long); `Ok(None)` = header absent. Independent of the request body,
+/// so it is usable even when the JSON body failed to deserialize.
+#[allow(clippy::result_large_err)]
+fn extract_start_idempotency_header_key(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let raw = match headers.get(HEADER_IDEMPOTENCY_KEY) {
+        Some(hv) => match hv.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Idempotency-Key header must be valid UTF-8"
+                    })),
+                )
+                    .into_response());
+            }
+        },
+        None => None,
+    };
+    validate_start_idempotency_key(raw)
+}
+
+/// Read-only committed-replay dedup probe (issue #808). On `shard`, look up a
+/// live idempotency claim for `(workflow_name, key)`; on a hit, load the claimed
+/// execution and return a `200` no-op response (writing a best-effort dedup
+/// audit row). Returns `None` on a miss, a vanished row (retention-deleted in
+/// the gap), or any read error — the caller then falls through to the
+/// fresh-start path (or, for a malformed body, the extractor rejection).
+///
+/// Standard idempotency-key semantics: on a hit the original execution is
+/// returned verbatim, the retry's body is irrelevant, and there is no
+/// body-mismatch detection (out of scope for #808).
+#[allow(clippy::too_many_arguments)]
+async fn probe_committed_start_replay(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    key: &str,
+    shard: ShardId,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    route: &'static str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let pool = api_state.storage_pool().ok()?;
+    let mut probe_conn = acquire_conn(pool.pool_for(shard)).await.ok()?;
+    let window_secs = api_state.start_idempotency_window().as_secs_f64();
+    let claim_exec_id = autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
+        &mut probe_conn,
+        workflow_name,
+        key,
+        window_secs,
+    )
+    .await
+    .ok()??;
+    // `lookup_live_start_idempotency_claim` JOINs to the execution row, so a
+    // `Some` claim implies the row existed at lookup time. Re-read its identity
+    // for the no-op response; if it vanished or the read errors, return `None`
+    // so the caller re-reserves / reclaims as needed.
+    let (dup_workflow_id, dup_state) = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
+        .select((
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+        ))
+        .first::<(String, String)>(&mut probe_conn)
+        .await
+        .optional()
+        .ok()??;
+    // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
+    // 503-on-audit-failure): the original start was already audited when it
+    // created the run, so a failed audit here is a no-op read and never fails
+    // the reply.
+    let exec_id_str = claim_exec_id.to_string();
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_START,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id,
+        idempotency_key: Some(key),
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(shard.as_i32()),
+        source,
+    };
+    let _ = audit::insert_audit(&mut probe_conn, &ar).await;
+    Some(
+        (
+            axum::http::StatusCode::OK,
+            Json(StartWorkflowResponse {
+                execution_id: claim_exec_id.to_string(),
+                workflow_name: workflow_name.to_string(),
+                workflow_id: dup_workflow_id,
+                state: dup_state,
+                started_fresh: Some(false),
+                deduplicated: Some(true),
+            }),
+        )
+            .into_response(),
+    )
+}
+
+/// Handle a `start_workflow` request whose JSON body failed to deserialize
+/// (issue #808, Codex P2). axum rejects a malformed `Json<T>` body before the
+/// handler runs, but a retry that carries its exactly-once key in the
+/// `Idempotency-Key` HEADER (body irrelevant on a committed-key hit) must still
+/// return the advertised `200` no-op rather than the extractor's `400`/`422`.
+///
+/// If a valid header key is present we probe the committed claim routed by the
+/// KEY — the body is unparsed so `workflow_id` is unknown, and the
+/// `workflow_id`-aware routing rule cannot be applied here (see the residual
+/// documented at the call site). On a hit we return the `200` no-op; on a miss
+/// (or no header key / an over-long or invalid-UTF-8 header key surfaced as its
+/// own `400`) we return the exact axum rejection, so the malformed-body wire
+/// response is byte-for-byte what axum produces today (AC1: the no-key path is
+/// unchanged).
+///
+/// This fallback recognizes only the HEADER key. A key supplied solely in the
+/// body `idempotency_key` field cannot be recovered from an undeserializable
+/// body (`JsonRejection` carries no raw bytes), so by design a body-field key
+/// requires a structurally-valid body to be recognized on retry — use the
+/// `Idempotency-Key` header for body-independent replay recognition. See the
+/// no-header-key arm below and docs/getting-started/06-idempotency.md.
+async fn handle_malformed_start_body(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    headers: &axum::http::HeaderMap,
+    rejection: JsonRejection,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let header_key = match extract_start_idempotency_header_key(headers) {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
+    let Some(key) = header_key else {
+        // No header key → the exact axum rejection (AC1: byte-for-byte no-key
+        // malformed-body behavior).
+        //
+        // NOTE (issue #808, Codex P2): this fallback probes the HEADER key ONLY.
+        // A key supplied solely in the body `idempotency_key` field is NOT
+        // recovered here: `JsonRejection` does not carry the raw request bytes,
+        // so an otherwise-undeserializable body cannot be parsed to read that
+        // field without abandoning the clean `Result<Json, JsonRejection>`
+        // extractor for raw-byte parsing plus manually replicating axum's exact
+        // per-variant rejection responses (preserving the AC1 byte-for-byte
+        // no-key wire behavior). By design, a body-field key therefore requires a
+        // structurally-valid (deserializable) body to be recognized on retry;
+        // the `Idempotency-Key` header is the body-independent mechanism. See
+        // docs/getting-started/06-idempotency.md.
+        return rejection.into_response();
+    };
+    let Ok(runtime) = api_state.runtime() else {
+        // Runtime not installed → surface the body error unchanged; we cannot
+        // route without the router.
+        return rejection.into_response();
+    };
+    // NOTE (issue #808, Codex P2 residual): route the probe by the KEY only —
+    // the body is unparsed so `workflow_id` is unknown, so the explicit-
+    // `workflow_id` → route-by-`workflow_id` rule (see the shard resolution at
+    // the main call site) cannot be applied here. A committed replay whose
+    // ORIGINAL delivery supplied an explicit `workflow_id` (and was therefore
+    // routed to, and claimed on, the `workflow_id`-derived shard) is not found
+    // by this key-routed fallback and still returns the extractor rejection.
+    // This is safe (never a false dedup, never a duplicate run) and narrow: the
+    // common header-key usage omits `workflow_id` (auto-generated), which routes
+    // by the key and IS found. A well-behaved client sends a consistent valid
+    // body on retries.
+    let shard = runtime.router.pick_for_idempotency_key(workflow_name, &key);
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+    if let Some(resp) = probe_committed_start_replay(
+        api_state,
+        workflow_name,
+        &key,
+        shard,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        route,
+    )
+    .await
+    {
+        return resp;
+    }
+    rejection.into_response()
+}
+
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<StartWorkflowRequest>,
+    body: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
+    // body no longer short-circuits with axum's `400`/`422` before the handler
+    // runs. A retry that carries its exactly-once key in the `Idempotency-Key`
+    // HEADER (its body being irrelevant on a committed-key hit) is routed to the
+    // committed-replay probe; otherwise the exact axum rejection is returned so
+    // the no-key malformed-body wire response is unchanged (AC1).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return handle_malformed_start_body(&api_state, &workflow_name, &headers, rejection)
+                .await;
+        }
+    };
 
     if matches!(
         request.reuse_policy.as_deref(),
@@ -8285,6 +8628,172 @@ pub(crate) async fn start_workflow(
         .into_response();
     }
 
+    // Request-scoped idempotency key (issue #808). The `Idempotency-Key` request
+    // header wins over the body `idempotency_key` field. A present-but-empty (or
+    // whitespace-only) key is a client error surfaced as `400`, never silently
+    // downgraded to a non-idempotent start. Header and body share one validation
+    // path (`validate_start_idempotency_key`), so the two never diverge — the
+    // same helpers back the malformed-body probe above.
+    let idempotency_key: Option<String> = match extract_start_idempotency_header_key(&headers) {
+        Err(resp) => return resp,
+        // Header wins when present and valid.
+        Ok(Some(k)) => Some(k),
+        // Header absent → fall back to the body field, same validation.
+        Ok(None) => match validate_start_idempotency_key(request.idempotency_key.clone()) {
+            Err(resp) => return resp,
+            Ok(k) => k,
+        },
+    };
+
+    let explicit_workflow_id = request.workflow_id.is_some();
+    let mut workflow_id = request
+        .workflow_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let queue_name = request
+        .queue
+        .or_else(|| runtime.queues.as_slice().first().cloned())
+        .unwrap_or_else(|| "default".to_string());
+    let input = request.input.unwrap_or(Value::Null);
+
+    // Compute target shard early so the gate check can filter by shard-scoped gates.
+    //
+    // issue #808: a request-scoped `idempotency_key` routes by the KEY
+    // (rendezvous over `(workflow_name, idempotency_key)`) — but ONLY when the
+    // `workflow_id` was auto-generated (omitted). In that case there is no
+    // stable business identity to preserve, and the per-request `workflow_id`
+    // varies per retry, so routing by `workflow_id` would scatter same-key
+    // retries across shards in a multi-shard deployment (a separate
+    // `harvest_start_idempotency` claim row per shard, hence a separate
+    // execution per shard), defeating dedup — routing by the key is what
+    // co-locates them.
+    //
+    // When the caller supplies an EXPLICIT `workflow_id`, route by
+    // `workflow_id` instead (the pre-#808 behavior). An explicit `workflow_id`
+    // is a stable business identity: routing by it *also* co-locates same-key
+    // retries (the `workflow_id` is constant across them) AND keeps the start
+    // on the shard that owns `(workflow_name, workflow_id)`, which the
+    // reuse-policy matrix and the shard-local `(name, workflow_id)` uniqueness
+    // invariant depend on. Routing a keyed-and-explicit start by the key would
+    // land it on the key-derived shard, where `start_or_load_workflow_execution`
+    // cannot see an existing `(name, workflow_id)` run living on the
+    // `workflow_id`-derived shard — silently breaking `RejectDuplicate` /
+    // `AllowDuplicate` and the uniqueness invariant. This branch is the
+    // resolution of the P1↔P2 routing tension (see docs/getting-started/
+    // 06-idempotency.md): always-route-by-key reintroduces the P1 duplicate-run
+    // for explicit-`workflow_id` starts, and always-route-by-`workflow_id`
+    // breaks the P2/AC3 auto-gen dedup case — the two cannot coexist under
+    // #808's shard-local, no-cross-shard-probe scope. Consistency caveat: for
+    // keyed dedup to converge, a client must supply a consistent `workflow_id`
+    // (same value, or consistently omitted) across retries of the same delivery
+    // — a retry that changes its explicit `workflow_id` is not a retry of the
+    // same delivery and can route to a different shard. The no-key path is
+    // byte-for-byte unchanged.
+    let shard = if let Some(ref key) = idempotency_key
+        && !explicit_workflow_id
+    {
+        runtime.router.pick_for_idempotency_key(&workflow_name, key)
+    } else {
+        runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+    };
+
+    // issue #808 (Codex P2): when a keyed start OMITS `workflow_id`, the server
+    // auto-generates it AND (per the routing rule above) routes the start by the
+    // KEY onto `shard`. But a random auto-generated `workflow_id` hashes via
+    // `pick_for_new_workflow` to a potentially DIFFERENT shard than `shard` (the
+    // key-shard). If a later request then uses the RETURNED `workflow_id`
+    // explicitly — a client echoing the response's `workflow_id`, or a fresh
+    // no-key `RejectDuplicate` start on that id — it routes via
+    // `pick_for_new_workflow` to the `workflow_id`-shard, cannot see the
+    // execution (which lives on the key-shard), and creates a SECOND active run
+    // with the same `workflow_id`, breaking the shard-local `(workflow_name,
+    // workflow_id)` uniqueness invariant. Mint the auto-generated `workflow_id`
+    // by bounded rejection sampling so it hashes to the key-shard, making its
+    // later explicit reuse route consistently to the shard the execution lives
+    // on. Both `pick_for_new_workflow` and `pick_for_idempotency_key` apply the
+    // writable-subset redirect, so `shard` is comparable. Single-shard (default)
+    // converges on the first candidate (`pick_for_new_workflow` returns the one
+    // shard); multi-shard converges in ~N expected iterations (cheap seahash) —
+    // the cap is a safety backstop only. Explicit client-chosen `workflow_id`s
+    // (routed by `workflow_id`, subject to the documented consistency caveat) and
+    // the no-key path are UNCHANGED.
+    if idempotency_key.is_some() && !explicit_workflow_id {
+        const MINT_CAP: u32 = 10_000;
+        let mut attempts = 0u32;
+        while runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+            != shard
+        {
+            attempts += 1;
+            if attempts > MINT_CAP {
+                tracing::warn!(
+                    workflow_name = %workflow_name,
+                    shard = ?shard,
+                    "could not mint a workflow_id on the idempotency-key shard after {attempts} attempts; using last candidate"
+                );
+                break;
+            }
+            workflow_id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
+    // precede ALL fresh-start-only rejections (reuse-policy parse,
+    // throttle/debounce/batch mutual-exclusion, input-schema #373,
+    // completion-callback SSRF #605, delay/`start_at`, admission gate #377) so a
+    // retry of an already-successful key always returns the `200` no-op
+    // regardless of a now-invalid replay body or a policy tightened after the
+    // original delivery. Those rules govern *fresh* work; a retry of an
+    // already-successful keyed start creates no new work, so tightening any of
+    // them — or sending a now-invalid `reuse_policy` string, or the workflow
+    // gaining a throttle/debounce/batch policy — between the original delivery
+    // and a retry must not reject the retry. The probe therefore runs before
+    // `parse_reuse_policy` and before the debounce/batch/throttle applicability
+    // is even computed; those apply only to a genuine fresh keyed start (a probe
+    // miss). Only genuine prerequisites run above it: key validation, the
+    // registry/DAG 404/400 existence check, and workflow_id + shard resolution
+    // (needed to know which shard to probe). The `terminate_if_running` admin
+    // gate at the very top of the handler is an authorization boundary (not a
+    // fresh-start validation) and deliberately stays ahead of the probe — a
+    // non-admin must never be able to invoke that capability, and a legitimate
+    // idempotent retry comes from the same authorized caller anyway.
+    //
+    // We probe the keyed claim read-only on the same key-derived `shard` the
+    // reserve below uses (so we observe the claim the original delivery wrote),
+    // and a hit returns the original execution verbatim — standard
+    // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
+    // detection (out of scope for #808). A miss falls through to the full
+    // fresh-start path unchanged, whose reserve+start transaction's `ON CONFLICT`
+    // upsert (with a row lock) remains the *authoritative* dedup for the
+    // concurrent-first-delivery race: two simultaneous first deliveries both miss
+    // this probe (nothing committed yet), both proceed, and the reserve
+    // serializes them → one creates, one dedups. This early probe is an
+    // additional fast-path for COMMITTED replays only, never a replacement for
+    // the reserve.
+    if let Some(ref key) = idempotency_key
+        && let Some(resp) = probe_committed_start_replay(
+            &api_state,
+            &workflow_name,
+            key,
+            shard,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            route,
+        )
+        .await
+    {
+        return resp;
+    }
+
+    // Fresh-start-only validation: parse the reuse policy. Runs AFTER the
+    // committed-replay probe above (issue #808, Codex P2) so a retry of an
+    // already-successful keyed start with a now-invalid `reuse_policy` string
+    // returns the `200` no-op rather than a `400` — the retry's body is
+    // irrelevant on a dedup hit. The parsed `reuse_policy` is only consumed by
+    // the reserve+start path further down.
     let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -8309,20 +8818,6 @@ pub(crate) async fn start_workflow(
             return e.into_response();
         }
     };
-    let explicit_workflow_id = request.workflow_id.is_some();
-    let workflow_id = request
-        .workflow_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let queue_name = request
-        .queue
-        .or_else(|| runtime.queues.as_slice().first().cloned())
-        .unwrap_or_else(|| "default".to_string());
-    let input = request.input.unwrap_or(Value::Null);
-
-    // Compute target shard early so the gate check can filter by shard-scoped gates.
-    let shard = runtime
-        .router
-        .pick_for_new_workflow(&workflow_name, &workflow_id);
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
@@ -8423,6 +8918,25 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
+    // issue #808: a request-scoped idempotency key requires a synchronous, single
+    // execution id to converge on. Throttle / debounce / batch all defer the
+    // start and return no exec id up front, so "converge on the same exec id" has
+    // no coherent meaning combined with them — reject the combination. This only
+    // reaches a *genuine fresh* keyed start: the committed-replay probe above
+    // already short-circuited an at-least-once retry of an earlier keyed start to
+    // a `200` no-op before this check, so a workflow that gained a throttle/
+    // debounce/batch policy after an original keyed start still returns the
+    // existing execution rather than a `400` on retry.
+    if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "idempotency_key cannot be combined with throttle/debounce/batch start"
+            })),
+        )
+            .into_response();
+    }
+
     // issue #377: check admission gates before touching the DB.
     if !is_debounced_start && !has_batch_policy {
         let wf_owner = runtime
@@ -8448,6 +8962,14 @@ pub(crate) async fn start_workflow(
             // so the gate must not block that case either. Checked only when
             // this workflow actually resolves a throttle policy, to avoid an
             // extra round-trip for the common non-throttled case.
+            //
+            // issue #808 (Codex P2): a *keyed* replay is handled earlier — a
+            // committed keyed claim short-circuits to the `200` no-op before this
+            // gate is even consulted (see the probe above the gate). So by the
+            // time control reaches here with an idempotency key set, it is a
+            // genuinely fresh keyed start with no live claim, which must pass
+            // through the gate normally. This bypass therefore only covers the
+            // explicit-`workflow_id` idempotent-retry case.
             let is_idempotent_retry = if explicit_workflow_id {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
@@ -9681,6 +10203,233 @@ pub(crate) async fn start_workflow(
         }
     }
 
+    // issue #808: request-scoped idempotency. The reserve + start run in a single
+    // transaction (reserve short-circuits the reuse-policy matrix entirely); a
+    // same-key retry converges on the same execution as a `200` no-op. This is
+    // mutually exclusive with throttle/debounce/batch (rejected above), so
+    // `throttle_reserved` is always `None` here and no token refund is needed.
+    if let Some(ref key) = idempotency_key {
+        // Validate execution_timeout_secs BEFORE building params: the range
+        // guard inside the debounce/batch blocks is skipped for keyed starts
+        // (they are mutually exclusive), and `chrono::Duration::seconds` panics
+        // on an out-of-range i64. Mirror the existing 400 guard so an untrusted
+        // value is a clean bad request, never a 500. (issue #808)
+        if let Some(secs) = request.execution_timeout_secs
+            && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: Some(key.as_str()),
+                status: STATUS_FAILED,
+                error_summary: Some("invalid execution_timeout_secs"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("execution_timeout_secs ({secs}) is out of range or negative")
+                })),
+            )
+                .into_response();
+        }
+        let window_secs = api_state.start_idempotency_window().as_secs_f64();
+        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
+            &mut conn,
+            StartWorkflowParams {
+                workflow_name: &workflow_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: request
+                    .execution_timeout_secs
+                    .map(chrono::Duration::seconds)
+                    .or_else(|| {
+                        info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
+                    }),
+                memo: request.memo.clone(),
+                search_attrs: request.search_attrs.clone(),
+                reuse_policy,
+                trace_context: trace_ctx,
+                max_execution_timeout_ceiling: api_state
+                    .max_workflow_execution_timeout()
+                    .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+                concurrency_key,
+                concurrency_limit,
+                priority: request.priority.unwrap_or_default(),
+                max_workflow_input_bytes: effective_wf_cap,
+                start_at: request.start_at,
+                delay,
+                max_workflow_start_delay: max_delay_chrono,
+                owner,
+                runbook_url,
+                severity,
+                context_headers: request.context_headers.clone(),
+                sla: effective_sla,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                origin: None,
+                completion_callbacks,
+            },
+            key,
+            window_secs,
+            Some(runtime.registry.telemetry().metrics.as_ref()),
+        )
+        .await;
+
+        return match idem {
+            Ok(autumn_harvest::IdempotentStartOutcome::Started(start)) => {
+                let exec_id_str = start.exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(error = %audit_err, "audit insert failed for workflow.start");
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+                (
+                    if start.created {
+                        axum::http::StatusCode::CREATED
+                    } else {
+                        axum::http::StatusCode::OK
+                    },
+                    // Three honest states on this Started arm (issue #808):
+                    //  - fresh key, fresh run: created=true  → started_fresh:true,  deduplicated:false
+                    //  - fresh key, attached to an existing workflow_id run under
+                    //    the reuse policy (e.g. AllowDuplicate): created=false
+                    //                                          → started_fresh:false, deduplicated:false
+                    //  - same key hit is handled by the Deduplicated arm below
+                    //                                          → started_fresh:false, deduplicated:true
+                    // `deduplicated` is false here because no *idempotency-key*
+                    // dedup occurred (this request won the claim); `started_fresh`
+                    // reflects whether a new WorkflowStarted event was written.
+                    Json(StartWorkflowResponse {
+                        execution_id: start.exec_id.to_string(),
+                        workflow_name: start.workflow_name,
+                        workflow_id: start.workflow_id,
+                        state: start.state,
+                        started_fresh: Some(start.created),
+                        deduplicated: Some(false),
+                    }),
+                )
+                    .into_response()
+            }
+            Ok(autumn_harvest::IdempotentStartOutcome::Deduplicated {
+                exec_id: dup_exec_id,
+                workflow_id: dup_workflow_id,
+                state: dup_state,
+            }) => {
+                // A dedup replay is a successful, idempotent start — audit it as
+                // workflow.start succeeded pointing at the original execution.
+                let exec_id_str = dup_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                // Intentional asymmetry with the Started arm (which returns 503
+                // on audit-insert failure): a dedup replay is a no-op read — the
+                // original start was already audited when it created the run — so
+                // a failed audit here is best-effort and never fails the reply.
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    axum::http::StatusCode::OK,
+                    Json(StartWorkflowResponse {
+                        execution_id: dup_exec_id.to_string(),
+                        workflow_name: workflow_name.clone(),
+                        workflow_id: dup_workflow_id,
+                        state: dup_state,
+                        started_fresh: Some(false),
+                        deduplicated: Some(true),
+                    }),
+                )
+                    .into_response()
+            }
+            Err(HarvestError::AlreadyExists {
+                existing_exec_id,
+                existing_state,
+            }) => {
+                let exec_id_str = existing_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some("workflow already exists"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                // Best-effort audit on the failure paths (intentional asymmetry
+                // with the Started arm's 503-on-audit-failure): the reserve
+                // rolled back, so there is no persisted start to keep consistent.
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(AlreadyExistsResponse {
+                        existing_execution_id: existing_exec_id.to_string(),
+                        existing_state,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: None,
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                map_error(e).into_response()
+            }
+        };
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
@@ -9827,6 +10576,10 @@ pub(crate) async fn start_workflow(
                     workflow_name: start.workflow_name,
                     workflow_id: start.workflow_id,
                     state: start.state,
+                    // No-key path: omit the #808 flags so the response is
+                    // byte-for-byte identical to a pre-#808 build.
+                    started_fresh: None,
+                    deduplicated: None,
                 }),
             )
                 .into_response()
@@ -13989,24 +14742,37 @@ async fn hydrate_ctx_for_query(
     );
 
     if terminal {
-        match classify_terminal_query(outcome, sealed) {
+        // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
+        // settled to a servable state while genuine recorded non-lifecycle
+        // history remains unmatched, the workflow code changed since the run
+        // executed — the reconstructed state is misleading. `has_non_lifecycle_unconsumed`
+        // excludes trailing terminal-lifecycle events, so a truthfully replayed
+        // completed / sealed-while-parked run still reports false and Serves.
+        // Computed after the drive advances the replay cursor; read-only.
+        let has_unconsumed_history = ctx.history_has_unconsumed_events();
+        match classify_terminal_query(outcome, sealed, has_unconsumed_history) {
             // Full drive to Poll::Ready, OR a run the engine sealed while its
             // function was parked mid-command (TIMED_OUT / CONTINUED_AS_NEW /
-            // mid-await CANCELLED / FAILED): serve the reconstructed state at
-            // the recorded terminal point.
+            // mid-await CANCELLED / FAILED), with all recorded non-lifecycle
+            // history faithfully consumed: serve the reconstructed state at the
+            // recorded terminal point.
             TerminalQueryDecision::Serve => Ok(ctx),
             TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
                     .unwrap_or(u64::MAX),
             })),
-            // The recorded history has no terminal seal at all — it was pruned by
-            // retention or released on reset. Never serve a partial/empty answer;
-            // surface a distinct 410.
+            // The recorded history has no terminal seal at all (pruned by
+            // retention / released on reset), or the drifted handler stopped
+            // short leaving recorded non-lifecycle history unconsumed (code
+            // drift). Never serve a partial/misleading answer; surface a
+            // distinct 410.
             TerminalQueryDecision::HistoryUnavailable => {
                 Err(map_error(HarvestError::HistoryUnavailable {
                     exec_id,
-                    reason: "pruned by retention or released".to_string(),
+                    reason: "pruned by retention, released, or replay diverged from \
+                             recorded history (workflow code changed)"
+                        .to_string(),
                 }))
             }
         }
@@ -14246,6 +15012,92 @@ async fn list_dag_runs(
     Ok(Json(runs))
 }
 
+/// `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (issue #690).
+///
+/// Read-only: reconstructs a unified DAG run's node topology annotated with
+/// per-node status/timing/attempts/error, purely from the registered
+/// [`DagDefinition`](autumn_harvest::dag::DagDefinition) plus the run's recorded
+/// history. No new event variant, no migration, no writes to `harvest_dag_runs`.
+///
+/// * `404` — unknown `dag_name`, or a `run_exec_id` that is not a run of that DAG.
+/// * `400` (JSON body) — a classic (non-unified) DAG has no `DagDefinition`
+///   topology to annotate.
+///
+/// Cross-shard correct (AC8): reads from the owning shard via
+/// [`db_conn_for_execution`] ([`ExecutionId::shard`](autumn_harvest::types::ExecutionId)
+/// routing), no cross-shard fan-out.
+async fn get_dag_run_graph(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Resolve the DAG by name; reject classic (non-unified) DAGs (AC6).
+    let Some(dag) = runtime.dags().get(&dag_name).cloned() else {
+        return AutumnError::not_found_msg(format!("DAG '{dag_name}' is not registered"))
+            .into_response();
+    };
+    if !dag.is_unified {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "DAG '{dag_name}' is a classic (non-unified) DAG with no DagDefinition \
+                     topology to annotate; the run graph view is only supported for unified DAGs."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    let exec_id = match parse_execution_id(&run_exec_id) {
+        Ok(eid) => eid,
+        Err(e) => return e.into_response(),
+    };
+
+    // AC8: route to the owning shard via ExecutionId::shard().
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load the run and verify it belongs to this DAG (AC6: 404 otherwise).
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => return map_error(e).into_response(),
+    };
+    if execution.workflow_name != dag_name {
+        return AutumnError::not_found_msg(format!(
+            "execution {exec_id} is not a run of DAG '{dag_name}'"
+        ))
+        .into_response();
+    }
+
+    // Timestamped history for per-node started_at/finished_at (issue #690).
+    let ts_events = match store::load_history_with_timestamps(&mut conn, exec_id).await {
+        Ok(evts) => evts,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let nodes = crate::dag_graph::build_run_graph(&dag.definition, &ts_events, &execution.state);
+
+    let response = crate::dag_graph::DagRunGraphResponse {
+        run_exec_id: exec_id.to_string(),
+        dag_name,
+        state: execution.state,
+        started_at: execution.started_at,
+        finished_at: execution.completed_at,
+        nodes,
+    };
+
+    (axum::http::StatusCode::OK, Json(response)).into_response()
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn trigger_dag_run(
     Extension(api_state): Extension<HarvestApiState>,
@@ -14406,6 +15258,8 @@ pub(crate) async fn trigger_dag_run_inner(
                     workflow_name: started.workflow_name,
                     workflow_id: started.workflow_id,
                     state: started.state,
+                    started_fresh: None,
+                    deduplicated: None,
                 }),
             ))
         }
