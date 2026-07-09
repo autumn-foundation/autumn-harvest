@@ -61,6 +61,7 @@ mod payload_offload_replay_tests;
 mod poison_pill_tests;
 mod priority_tests;
 mod query_deadlock;
+mod query_terminal_tests;
 mod query_tests;
 mod queue_fairness_tests;
 mod redrive_tests;

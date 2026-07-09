@@ -7,6 +7,7 @@ pub mod api;
 /// auto-wired by [`crate::plugin::HarvestPlugin`].
 pub mod callback_deliverer;
 pub mod config;
+pub mod dag_graph;
 pub mod dag_retry;
 pub mod outbox;
 pub mod plugin;

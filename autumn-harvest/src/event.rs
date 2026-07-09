@@ -1488,6 +1488,100 @@ mod tests {
         assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
     }
 
+    // ── is_terminal_lifecycle exhaustive coverage (issue #612 seal check) ─────
+
+    #[test]
+    fn every_terminal_seal_variant_is_terminal_lifecycle() {
+        let exec = ExecutionId::new();
+        let terminal: Vec<WorkflowEvent> = vec![
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowFailed {
+                error: "boom".into(),
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator".into(),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: exec,
+                input: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowResetTerminated {
+                reset_to_exec_id: exec,
+                reason: "reset".into(),
+                operator_id: "op".into(),
+            },
+            WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: Utc::now(),
+                timed_out_at: Utc::now(),
+            },
+            // Trailing bookkeeping events appended after the terminal seal.
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: exec,
+                policy: crate::types::ParentClosePolicy::RequestCancel,
+                action: "request_cancel".into(),
+            },
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: exec,
+                attempt: 2,
+                fire_at: Utc::now(),
+            },
+        ];
+        for event in &terminal {
+            assert!(
+                event.is_terminal_lifecycle(),
+                "{} must be a terminal lifecycle event",
+                event.type_name()
+            );
+        }
+    }
+
+    #[test]
+    fn non_terminal_events_are_not_terminal_lifecycle() {
+        let id = ActivityExecId::new();
+        let non_terminal: Vec<WorkflowEvent> = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id,
+                name: "a".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id,
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            // Redrive reopens a previously-failed run — must NOT count as a seal.
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: Utc::now(),
+                dead_letter_id: Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        for event in &non_terminal {
+            assert!(
+                !event.is_terminal_lifecycle(),
+                "{} must NOT be a terminal lifecycle event",
+                event.type_name()
+            );
+        }
+    }
+
     // ── Pause/Resume tests (issue #383) ───────────────────────────────────────
 
     #[test]
