@@ -3193,6 +3193,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
+        .route("/workflows/{id}/run-chain", get(get_run_chain))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -3802,6 +3803,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
+        ("GET", "/workflows/{id}/run-chain"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -4377,6 +4379,11 @@ pub const fn management_api_response_fields()
                 "steps",
                 "rollup",
             ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/run-chain",
+            Some(&["head_unknown", "workflow_id", "runs"]),
         ),
         (
             "POST",
@@ -7580,6 +7587,162 @@ async fn get_workflow_timeline(
     );
 
     Ok(Json(timeline))
+}
+
+/// Upper bound on the number of legacy `WorkflowContinuedAsNew` event hops the
+/// run-chain gather will walk forward (issue #701). Bounds the best-effort
+/// legacy path so a corrupt or unusually long chain can never spin.
+const MAX_RUN_CHAIN_HOPS: usize = 128;
+
+/// Map a loaded `WorkflowExecution` row into the minimal `RunChainRow` the pure
+/// [`autumn_harvest::run_chain::assemble_run_chain`] assembler consumes.
+fn run_row_from_execution(execution: &WorkflowExecution) -> autumn_harvest::run_chain::RunChainRow {
+    autumn_harvest::run_chain::RunChainRow {
+        exec_id: execution.id,
+        run_id: execution.run_id,
+        workflow_id: execution.workflow_id.clone(),
+        state: execution.state.clone(),
+        started_at: execution.started_at,
+        completed_at: execution.completed_at,
+        continued_from_exec_id: execution.continued_from_exec_id,
+        first_exec_id: execution.first_exec_id,
+    }
+}
+
+/// Read the successor execution id from a `WorkflowContinuedAsNew` event in
+/// `exec_id`'s recorded history, reusing the caller's already-held connection.
+///
+/// Deliberately does NOT call [`load_continue_as_new_successor`] (which acquires
+/// its own pool connection): the run-chain gather holds a connection across the
+/// whole walk, so a nested acquire would self-deadlock at pool size 1 (the
+/// issue #601 F4 precedent). Codec-untransformed load — only the typed
+/// `new_exec_id` field is read, never a payload — so an encrypted history's
+/// codec envelopes ride along as opaque values and cannot fail the walk.
+async fn continue_as_new_successor_on_conn(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<ExecutionId>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    Ok(history.events.into_iter().find_map(|event| {
+        if let WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } = event {
+            Some(new_exec_id)
+        } else {
+            None
+        }
+    }))
+}
+
+/// Load every execution in the continue-as-new chain whose origin is
+/// `head_exec_id`, shard-locally (issue #701).
+///
+/// Primary path (post-feature rows): one indexed query selects the origin
+/// (`id = head`) plus every successor (`first_exec_id = head`) — this is
+/// complete for any chain written after the feature landed, and for a
+/// standalone never-continued run it returns just that one row.
+///
+/// Legacy forward-fallback (AC5): rows written before issue #701 carry no
+/// back-links, so a `CONTINUED_AS_NEW` run that no gathered row continues from
+/// is walked forward through its `WorkflowContinuedAsNew` events to pick up the
+/// legacy successors. Each `CONTINUED_AS_NEW` frontier run is walked at most
+/// once (tracked in `walked`), so the walk is linear in chain length and
+/// bounded overall by [`MAX_RUN_CHAIN_HOPS`]; a post-feature chain never enters
+/// the walk (every `CONTINUED_AS_NEW` run already has an in-set back-linked
+/// successor). A mid-chain missing successor is swallowed — the chain is served
+/// best-effort, never a 500.
+async fn gather_run_chain_rows(
+    conn: &mut AsyncPgConnection,
+    head_exec_id: ExecutionId,
+) -> HarvestResult<Vec<autumn_harvest::run_chain::RunChainRow>> {
+    let head_uuid = head_exec_id.as_uuid();
+    let executions: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(
+            harvest_workflow_executions::id
+                .eq(head_uuid)
+                .or(harvest_workflow_executions::first_exec_id.eq(Some(head_uuid))),
+        )
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    let mut rows: std::collections::BTreeMap<uuid::Uuid, autumn_harvest::run_chain::RunChainRow> =
+        executions
+            .into_iter()
+            .map(|e| (e.id, run_row_from_execution(&e)))
+            .collect();
+
+    // Legacy forward-walk. Only a CONTINUED_AS_NEW run with no in-set back-linked
+    // successor is a frontier candidate, and each is walked at most once.
+    let mut walked: std::collections::BTreeSet<uuid::Uuid> = std::collections::BTreeSet::new();
+    for _ in 0..MAX_RUN_CHAIN_HOPS {
+        let next_from = rows
+            .values()
+            .find(|r| {
+                r.state == "CONTINUED_AS_NEW"
+                    && !walked.contains(&r.exec_id)
+                    && !rows
+                        .values()
+                        .any(|other| other.continued_from_exec_id == Some(r.exec_id))
+            })
+            .map(|r| r.exec_id);
+        let Some(from_uuid) = next_from else { break };
+        walked.insert(from_uuid);
+
+        let successor =
+            continue_as_new_successor_on_conn(conn, ExecutionId::from_uuid(from_uuid)).await?;
+        let Some(successor_id) = successor else {
+            continue;
+        };
+        if rows.contains_key(&successor_id.as_uuid()) {
+            continue;
+        }
+        match load_execution(conn, successor_id).await {
+            Ok(execution) => {
+                rows.insert(execution.id, run_row_from_execution(&execution));
+            }
+            // A retention-pruned or otherwise missing mid-chain successor is a
+            // best-effort gap, not an error.
+            Err(HarvestError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(rows.into_values().collect())
+}
+
+/// `GET /workflows/{id}/run-chain` (issue #701): reconstruct the ordered
+/// continue-as-new run chain that `id` belongs to, from any one member. The
+/// whole chain lives on one shard (a successor inherits the predecessor's
+/// shard), so this is a single shard-local gather — never a cross-shard
+/// fan-out. Read-only: no events are appended and no state is mutated.
+async fn get_run_chain(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<autumn_harvest::run_chain::RunChainResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    let queried = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // The chain head is the origin: a successor carries it in `first_exec_id`;
+    // the origin (and any standalone run) is its own head.
+    let head_exec_id = ExecutionId::from_uuid(queried.first_exec_id.unwrap_or(queried.id));
+
+    let rows = gather_run_chain_rows(&mut conn, head_exec_id)
+        .await
+        .map_err(map_error)?;
+
+    let response = autumn_harvest::run_chain::assemble_run_chain(rows, head_exec_id.as_uuid());
+    Ok(Json(response))
 }
 
 #[allow(clippy::too_many_lines)]

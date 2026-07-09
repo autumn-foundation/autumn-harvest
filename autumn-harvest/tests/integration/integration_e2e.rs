@@ -154,7 +154,8 @@ const INIT_SQL: &str = concat!(
     // issue #606: harvest_sessions table + session_id column on
     // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
     // harvest_workers.
-    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql")
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!("../../migrations/20260709000000_harvest_workflow_continue_chain/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -233,7 +234,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n",
     // issue #605: the modern start path's full-row insert touches
     // completion_callbacks even for a workflow with no configured callback.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n",
+    // issue #701: the modern start path's full-row insert touches the
+    // continue-as-new chain back-links even for a fresh (never-continued) run.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS continued_from_exec_id UUID NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS first_exec_id UUID NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

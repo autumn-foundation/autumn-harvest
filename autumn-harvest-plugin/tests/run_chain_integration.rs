@@ -1,19 +1,26 @@
-//! Integration tests for `GET /api/harvest/workflows/{id}/result` (issue #527).
+//! Integration tests for `GET /api/harvest/workflows/{id}/run-chain` (issue #701).
 //!
 //! Tests run against a real Postgres instance (testcontainers) and exercise:
-//!   (a) 404 for an unknown execution id.
-//!   (b) 200 with correct terminal state for a COMPLETED execution.
-//!   (c) 204 No Content + Retry-After for a RUNNING execution (no wait).
-//!   (d) `ContinuedAsNew` → follows the successor chain to the final output (AC5).
+//!   (1) 404 for an unknown execution id.
+//!   (2) 400 for a malformed execution id.
+//!   (3) A fully post-feature 4-run continue-as-new chain resolves to the same
+//!       ordered chain from the head, a middle run, and the tail.
+//!   (4) A standalone never-continued run resolves to a single-entry chain.
+//!   (5) A pure legacy chain (rows lack the back-link columns, linked only by
+//!       `WorkflowContinuedAsNew` events) resolves best-effort with
+//!       `head_unknown = true` and no 500.
+//!
+//! The pure ordering / `head_unknown` math is unit-tested in
+//! `autumn-harvest/src/run_chain.rs`; these tests verify the HTTP wiring plus
+//! the DB gather (indexed back-link query + legacy forward-walk).
 
-#![allow(clippy::too_many_lines)]
+#![allow(clippy::too_many_lines, clippy::similar_names)]
 
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
 use autumn_harvest::shard::ShardRouter;
-use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{
@@ -27,7 +34,7 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -154,7 +161,6 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql"),
     "\n",
-    // issue #534: origin column + per-schedule run-history index.
     include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
@@ -202,7 +208,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         Arc::new(HandlerRegistry::new(vec![], vec![])),
         Arc::new(DagCatalog::default()),
         Arc::new(Vec::new()),
-        Some("result-test".to_string()),
+        Some("run-chain-test".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
@@ -225,32 +231,37 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
         .await
         .expect("GET request");
     let status = response.status();
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let mut json = if bytes.is_empty() {
+    let json = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()))
     };
-    if let Some(ra) = retry_after {
-        json["__retry_after"] = Value::String(ra);
-    }
     (status, json)
 }
 
-async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
+/// Seed one execution row in a chosen state, then overwrite its lifecycle
+/// timestamps and the continue-as-new back-link columns directly. Each run is
+/// started under a distinct `workflow_id` so `start_or_load_workflow_execution`
+/// never trips the active-run uniqueness index; the run-chain gather resolves by
+/// `id`/`first_exec_id`, not `workflow_id`, so distinct ids are fine.
+async fn seed_run(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    state: &str,
+    started_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    continued_from: Option<ExecutionId>,
+    first: Option<ExecutionId>,
+) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
-            workflow_name: "result-wf",
+            workflow_name: "run-chain-wf",
             workflow_id,
             exec_id,
             input: json!({"n": 1}),
@@ -286,288 +297,278 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
     )
     .await
     .expect("seed workflow");
+
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::started_at.eq(started_at),
+            harvest_workflow_executions::completed_at.eq(completed_at),
+            harvest_workflow_executions::continued_from_exec_id
+                .eq(continued_from.map(|e| e.as_uuid())),
+            harvest_workflow_executions::first_exec_id.eq(first.map(|e| e.as_uuid())),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
     exec_id
 }
 
-async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, output: Value) {
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set((
-            harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-            harvest_workflow_executions::output.eq(Some(output)),
-        ))
-        .execute(conn)
-        .await
-        .unwrap();
-}
-
-async fn mark_continued_as_new(
+/// Append a `WorkflowContinuedAsNew` event to `exec_id`'s history pointing at
+/// `successor` — the only forward link a pre-feature (legacy) chain carries.
+async fn insert_continue_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    new_id: ExecutionId,
+    event_id: i32,
+    successor: ExecutionId,
 ) {
-    // Append the ContinuedAsNew event to history.
-    let history = store::load_history(conn, exec_id).await.unwrap();
-    let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
-        new_exec_id: new_id,
+    let event = WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id: successor,
         input: json!({"n": 2}),
-    }];
-    store::append_events(conn, exec_id, &events, history.next_event_id)
-        .await
-        .expect("append ContinuedAsNew event");
-
-    // Seal the predecessor row.
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set((
-            harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+    };
+    let data = serde_json::to_value(&event).expect("event serializes");
+    let event_type = data
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("adjacently-tagged event carries a 'type'")
+        .to_string();
+    diesel::insert_into(harvest_events::table)
+        .values((
+            harvest_events::workflow_exec_id.eq(exec_id.as_uuid()),
+            harvest_events::event_id.eq(event_id),
+            harvest_events::event_type.eq(event_type),
+            harvest_events::event_data.eq(data),
+            harvest_events::timestamp.eq(Utc::now()),
         ))
         .execute(conn)
         .await
         .unwrap();
-
-    // Verify the event was appended.
-    let count: i64 = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .count()
-        .get_result(conn)
-        .await
-        .unwrap();
-    // >= 2: WorkflowStarted is always present; ContinuedAsNew must be the second row.
-    assert!(count >= 2, "ContinuedAsNew event must have been appended");
 }
 
-/// (a) Unknown execution id → 404.
+fn run_ids(body: &Value) -> Vec<String> {
+    body["runs"]
+        .as_array()
+        .expect("runs is an array")
+        .iter()
+        .map(|r| r["exec_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// (1) Unknown execution id → 404.
 #[tokio::test]
-async fn result_unknown_id_returns_404() {
+async fn run_chain_unknown_id_returns_404() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
     let unknown = ExecutionId::new_for_shard(ShardId::new(0));
-    let (status, _body) = get_json(&app, &format!("/workflows/{unknown}/result")).await;
+    let (status, _body) = get_json(&app, &format!("/workflows/{unknown}/run-chain")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// (b) A COMPLETED execution → 200 OK with state=completed and its output.
+/// (2) Malformed execution id → 400.
 #[tokio::test]
-async fn result_completed_returns_200_with_output() {
+async fn run_chain_malformed_id_returns_400() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
-    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let exec_id = seed_running(&mut conn, "completed-wf").await;
-    mark_completed(&mut conn, exec_id, json!({"answer": 42})).await;
-
-    let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/result")).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["state"], "completed");
-    assert_eq!(body["output"]["answer"], 42);
+    let (status, _body) = get_json(&app, "/workflows/not-a-uuid/run-chain").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// (c) A RUNNING execution with no wait → 204 No Content + Retry-After.
+/// (3) A fully post-feature 4-run chain (3 `CONTINUED_AS_NEW` + 1 `RUNNING` tail,
+/// each successor carrying `continued_from_exec_id` + `first_exec_id`) resolves
+/// to the SAME ordered chain from the head, a middle run, and the tail.
 #[tokio::test]
-async fn result_running_no_wait_returns_204() {
+async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let exec_id = seed_running(&mut conn, "still-running").await;
-
-    let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/result")).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "body: {body}");
-    assert_eq!(
-        body["__retry_after"].as_str(),
-        Some("1"),
-        "Retry-After header must be present"
-    );
-}
-
-/// (d) AC5: `ContinuedAsNew` predecessor → follows the chain to the successor's
-/// COMPLETED output, not the `ContinuedAsNew` sentinel.
-#[tokio::test]
-async fn result_follows_continue_as_new_to_final_output() {
-    let (url, _container) = setup_database().await;
-    let pool = build_pool(&url);
-    let app = build_app(&pool);
-    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
-
-    // Seed the predecessor as CONTINUED_AS_NEW → successor COMPLETED.
-    let predecessor_id = seed_running(&mut conn, "can-predecessor").await;
-    let successor_id = seed_running(&mut conn, "can-successor").await;
-
-    mark_continued_as_new(&mut conn, predecessor_id, successor_id).await;
-    mark_completed(&mut conn, successor_id, json!({"final": "result"})).await;
-
-    // Querying the predecessor must resolve through the chain to the successor's output.
-    let (status, body) = get_json(&app, &format!("/workflows/{predecessor_id}/result")).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(
-        body["state"], "completed",
-        "must return the successor's completed state, not continued_as_new"
-    );
-    assert_eq!(
-        body["output"]["final"], "result",
-        "must return the successor's output"
-    );
-}
-
-#[tokio::test]
-async fn test_get_update_result_orphaned() {
-    use autumn_harvest::types::UpdateId;
-    let (url, _container) = setup_database().await;
-    let pool = build_pool(&url);
-    let app = build_app(&pool);
-    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
-
-    let exec_id = seed_running(&mut conn, "orphaned-wf").await;
-    let update_id = UpdateId::new();
-
-    // 1. Append UpdateAdmitted to history
-    let history = store::load_history(&mut conn, exec_id).await.unwrap();
-    let events = vec![WorkflowEvent::UpdateAdmitted {
-        update_id,
-        name: "test_update".to_string(),
-        input: Value::Null,
-        timestamp: Utc::now(),
-    }];
-    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
-        .await
-        .expect("append admitted update event");
-
-    // 2. Querying result while running should return 202 Accepted
-    let (status, body) = get_json(
-        &app,
-        &format!("/workflows/{exec_id}/update/{update_id}/result"),
+    let t0 = Utc::now() - Duration::seconds(400);
+    // run0 = origin; run1, run2 = middle; run3 = live tail.
+    let run0 = seed_run(
+        &mut conn,
+        "chain-run-0",
+        "CONTINUED_AS_NEW",
+        t0,
+        Some(t0 + Duration::seconds(10)),
+        None,
+        None,
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(body["update_id"], update_id.to_string());
-
-    // 3. Mark the workflow COMPLETED (unresolved update becomes orphaned)
-    mark_completed(&mut conn, exec_id, Value::Null).await;
-    // Append WorkflowCompleted event to history to make get_terminal_workflow_state find it
-    let history = store::load_history(&mut conn, exec_id).await.unwrap();
-    let completed_event = vec![WorkflowEvent::WorkflowCompleted {
-        output: Value::Null,
-    }];
-    store::append_events(&mut conn, exec_id, &completed_event, history.next_event_id)
-        .await
-        .expect("append completed event");
-
-    // 4. Querying result now should return 409 Conflict with update_orphaned
-    let (status, body) = get_json(
-        &app,
-        &format!("/workflows/{exec_id}/update/{update_id}/result"),
+    let run1 = seed_run(
+        &mut conn,
+        "chain-run-1",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(100),
+        Some(t0 + Duration::seconds(110)),
+        Some(run0),
+        Some(run0),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["update_id"], update_id.to_string());
-    assert_eq!(body["error_type"], "update_orphaned");
-    assert_eq!(body["workflow_state"], "COMPLETED");
+    let run2 = seed_run(
+        &mut conn,
+        "chain-run-2",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(200),
+        Some(t0 + Duration::seconds(210)),
+        Some(run1),
+        Some(run0),
+    )
+    .await;
+    let run3 = seed_run(
+        &mut conn,
+        "chain-run-3",
+        "RUNNING",
+        t0 + Duration::seconds(300),
+        None,
+        Some(run2),
+        Some(run0),
+    )
+    .await;
+
+    // Realistic forward links in history (the gather must not need them for a
+    // post-feature chain, but they should be a harmless no-op for the walk).
+    insert_continue_event(&mut conn, run0, 100, run1).await;
+    insert_continue_event(&mut conn, run1, 100, run2).await;
+    insert_continue_event(&mut conn, run2, 100, run3).await;
+
+    let expected = vec![
+        run0.to_string(),
+        run1.to_string(),
+        run2.to_string(),
+        run3.to_string(),
+    ];
+
+    for (label, member) in [("head", run0), ("middle", run1), ("tail", run3)] {
+        let (status, body) = get_json(&app, &format!("/workflows/{member}/run-chain")).await;
+        assert_eq!(status, StatusCode::OK, "resolving from {label}");
+        assert_eq!(
+            body["head_unknown"], false,
+            "post-feature chain head is confirmed ({label})"
+        );
+        assert_eq!(run_ids(&body), expected, "same ordered chain from {label}");
+
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 4);
+        for (i, run) in runs.iter().enumerate() {
+            assert_eq!(run["sequence"], i as u64, "sequence {i} ({label})");
+        }
+        assert_eq!(runs[0]["outcome"], "continued_as_new");
+        assert_eq!(runs[3]["outcome"], "running");
+        assert_eq!(
+            runs[0]["continued_to_exec_id"].as_str(),
+            Some(run1.to_string().as_str()),
+            "run0 forward link ({label})"
+        );
+        assert_eq!(
+            runs[2]["continued_to_exec_id"].as_str(),
+            Some(run3.to_string().as_str()),
+            "run2 forward link ({label})"
+        );
+        assert!(
+            runs[3]["continued_to_exec_id"].is_null(),
+            "tail has no forward link ({label})"
+        );
+    }
 }
 
+/// (4) A standalone never-continued run → single-entry chain, head known.
 #[tokio::test]
-async fn test_poll_update_result_orphaned() {
-    use autumn_harvest::types::UpdateId;
-    use autumn_harvest_plugin::api::poll_update_result;
-    let (url, _container) = setup_database().await;
-    let pool = build_pool(&url);
-    let harvest_pool = HarvestDbPool::from(pool);
-    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
-
-    let exec_id = seed_running(&mut conn, "orphaned-poll-wf").await;
-    let update_id = UpdateId::new();
-
-    // Append UpdateAdmitted to history
-    let history = store::load_history(&mut conn, exec_id).await.unwrap();
-    let events = vec![WorkflowEvent::UpdateAdmitted {
-        update_id,
-        name: "test_update".to_string(),
-        input: Value::Null,
-        timestamp: Utc::now(),
-    }];
-    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
-        .await
-        .expect("append admitted update event");
-
-    // Mark completed + append WorkflowCompleted event
-    mark_completed(&mut conn, exec_id, Value::Null).await;
-    let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
-    let completed_event = vec![WorkflowEvent::WorkflowCompleted {
-        output: Value::Null,
-    }];
-    store::append_events(&mut conn, exec_id, &completed_event, history2.next_event_id)
-        .await
-        .expect("append completed event");
-
-    // Poll the result — it should immediately resolve with 409 Conflict
-    let response = poll_update_result(&harvest_pool, exec_id, update_id, 1).await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["update_id"], update_id.to_string());
-    assert_eq!(body["error_type"], "update_orphaned");
-    assert_eq!(body["workflow_state"], "COMPLETED");
-}
-
-#[tokio::test]
-async fn test_get_update_result_orphaned_timed_out() {
-    use autumn_harvest::types::UpdateId;
+async fn run_chain_standalone_run_is_single_entry() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let exec_id = seed_running(&mut conn, "orphaned-timeout-wf").await;
-    let update_id = UpdateId::new();
-
-    // 1. Append UpdateAdmitted to history
-    let history = store::load_history(&mut conn, exec_id).await.unwrap();
-    let events = vec![WorkflowEvent::UpdateAdmitted {
-        update_id,
-        name: "test_update".to_string(),
-        input: Value::Null,
-        timestamp: Utc::now(),
-    }];
-    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
-        .await
-        .expect("append admitted update event");
-
-    // 2. Set DB execution state to TIMED_OUT and append WorkflowFailed to history (simulates enforce_workflow_timeout)
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set((
-            harvest_workflow_executions::state.eq("TIMED_OUT"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-            harvest_workflow_executions::error.eq(Some(
-                "timeout: workflow exceeded execution timeout".to_string(),
-            )),
-        ))
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
-    let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
-    let fail_event = vec![WorkflowEvent::WorkflowFailed {
-        error: "timeout: workflow exceeded execution timeout".to_string(),
-    }];
-    store::append_events(&mut conn, exec_id, &fail_event, history2.next_event_id)
-        .await
-        .expect("append WorkflowFailed event");
-
-    // 3. Querying result should return 409 Conflict with workflow_state: "TIMED_OUT"
-    let (status, body) = get_json(
-        &app,
-        &format!("/workflows/{exec_id}/update/{update_id}/result"),
+    let t0 = Utc::now() - Duration::seconds(30);
+    let run = seed_run(
+        &mut conn,
+        "standalone",
+        "COMPLETED",
+        t0,
+        Some(t0 + Duration::seconds(5)),
+        None,
+        None,
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["update_id"], update_id.to_string());
-    assert_eq!(body["error_type"], "update_orphaned");
-    assert_eq!(body["workflow_state"], "TIMED_OUT");
+
+    let (status, body) = get_json(&app, &format!("/workflows/{run}/run-chain")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["head_unknown"], false);
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["sequence"], 0);
+    assert_eq!(runs[0]["outcome"], "completed");
+    assert!(runs[0]["continued_to_exec_id"].is_null());
+}
+
+/// (5) A pure legacy chain: rows carry NO back-links (both columns NULL) and are
+/// linked only by `WorkflowContinuedAsNew` events; the head is `CONTINUED_AS_NEW`.
+/// The gather forward-walks the events and the assembler flags `head_unknown`.
+#[tokio::test]
+async fn run_chain_legacy_chain_flags_head_unknown() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let t0 = Utc::now() - Duration::seconds(300);
+    // Legacy rows: continued_from + first_exec_id are both NULL.
+    let run0 = seed_run(
+        &mut conn,
+        "legacy-run-0",
+        "CONTINUED_AS_NEW",
+        t0,
+        Some(t0 + Duration::seconds(10)),
+        None,
+        None,
+    )
+    .await;
+    let run1 = seed_run(
+        &mut conn,
+        "legacy-run-1",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(100),
+        Some(t0 + Duration::seconds(110)),
+        None,
+        None,
+    )
+    .await;
+    let run2 = seed_run(
+        &mut conn,
+        "legacy-run-2",
+        "RUNNING",
+        t0 + Duration::seconds(200),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // The only forward links a legacy chain has.
+    insert_continue_event(&mut conn, run0, 100, run1).await;
+    insert_continue_event(&mut conn, run1, 100, run2).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{run0}/run-chain")).await;
+    assert_eq!(status, StatusCode::OK, "legacy chain must not 500");
+    assert_eq!(
+        body["head_unknown"], true,
+        "legacy chain cannot confirm its origin"
+    );
+    assert_eq!(
+        run_ids(&body),
+        vec![run0.to_string(), run1.to_string(), run2.to_string()],
+        "legacy chain ordered by started_at via forward-walk"
+    );
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(
+        runs[0]["continued_to_exec_id"].as_str(),
+        Some(run1.to_string().as_str())
+    );
+    assert!(runs[2]["continued_to_exec_id"].is_null());
+    assert_eq!(runs[2]["outcome"], "running");
 }

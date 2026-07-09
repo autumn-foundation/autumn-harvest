@@ -782,6 +782,15 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Reconstruct the ordered continue-as-new run chain a workflow execution
+    /// belongs to, resolvable from any member (origin, middle, or tail).
+    RunChain {
+        /// Workflow execution ID of any member of the chain.
+        execution_id: String,
+        /// Emit raw JSON instead of the default table.
+        #[arg(long)]
+        json: bool,
+    },
     /// List child workflow executions for a parent execution.
     Children {
         /// Parent workflow execution ID.
@@ -2170,6 +2179,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
+    if run_chain_wants_table(cli) {
+        return Ok(format_run_chain_table(value));
+    }
     if handoff_wants_table(cli) {
         return Ok(format_handoff_table(value));
     }
@@ -2199,6 +2211,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     }
 
     let output = if workflow_children_wants_raw_json(cli)
+        || run_chain_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
@@ -3196,6 +3209,24 @@ const fn workflow_children_wants_raw_json(cli: &Cli) -> bool {
     )
 }
 
+fn run_chain_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::RunChain { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn run_chain_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::RunChain { json: true, .. }
+        }
+    )
+}
+
 fn handoff_wants_table(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -3385,6 +3416,72 @@ fn format_workflow_children_table(value: &Value) -> String {
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
         rendered.push_str(cursor);
+    }
+    rendered
+}
+
+fn format_run_chain_table(value: &Value) -> String {
+    let Some(runs) = value.get("runs").and_then(Value::as_array) else {
+        return "No run chain found.".to_string();
+    };
+    if runs.is_empty() {
+        return "No run chain found.".to_string();
+    }
+
+    let mut rows = Vec::with_capacity(runs.len() + 1);
+    rows.push(vec![
+        "SEQ".to_string(),
+        "EXEC ID".to_string(),
+        "RUN ID".to_string(),
+        "STATE".to_string(),
+        "OUTCOME".to_string(),
+        "STARTED".to_string(),
+        "COMPLETED".to_string(),
+        "CONTINUED TO".to_string(),
+    ]);
+    for run in runs {
+        rows.push(vec![
+            cell_number(run.get("sequence")),
+            cell_str(run.get("exec_id")),
+            cell_str(run.get("run_id")),
+            cell_str(run.get("state")),
+            cell_str(run.get("outcome")),
+            cell_str(run.get("started_at")),
+            cell_optional_str(run.get("completed_at")),
+            cell_optional_str(run.get("continued_to_exec_id")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if let Some(workflow_id) = value.get("workflow_id").and_then(Value::as_str) {
+        rendered = format!("workflow_id: {workflow_id}\n{rendered}");
+    }
+    if value
+        .get("head_unknown")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        rendered.push_str(
+            "\nnote: head_unknown — the chain participates in continue-as-new but its \
+             true origin could not be proven (legacy rows lacking back-links); the first \
+             run shown is a best-effort head.",
+        );
     }
     rendered
 }
@@ -3697,6 +3794,13 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         ))),
         WorkflowCommand::Timeline { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/timeline",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::RunChain {
+            execution_id,
+            json: _,
+        } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/run-chain",
             path_segment(execution_id)
         ))),
         WorkflowCommand::Children {

@@ -155,6 +155,9 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260709000000_harvest_workflow_continue_chain/up.sql"
+    ),
 );
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
