@@ -295,9 +295,7 @@ async fn seed_failed_with_dlq(
         conn,
         exec_id,
         "FAILED",
-        WorkflowEvent::WorkflowFailed {
-            error: error.to_string(),
-        },
+        WorkflowEvent::workflow_failed(error.to_string()),
     )
     .await;
     let dlq_id = insert_dlq(conn, exec_id, queue, error).await;

@@ -233,10 +233,7 @@ const fn child_completed(child_id: ExecutionId, output: Value) -> WorkflowEvent 
 }
 
 fn child_failed(child_id: ExecutionId, error: &str) -> WorkflowEvent {
-    WorkflowEvent::ChildWorkflowFailed {
-        child_id,
-        error: error.to_string(),
-    }
+    WorkflowEvent::child_workflow_failed(child_id, error.to_string())
 }
 
 // ---------------------------------------------------------------------------

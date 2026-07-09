@@ -444,6 +444,36 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
     Ok(result)
 }
 
+/// Whether the workflow's `Result<_, E>` error type `E` names `WorkflowFailure`
+/// (issue #767). Mirrors `activity.rs::activity_returns_activity_failure`.
+fn workflow_returns_workflow_failure(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let syn::Type::Path(type_path) = &**ty else {
+        return false;
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return false;
+    };
+    if last.ident != "Result" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return false;
+    };
+    // Second generic argument is the error type.
+    let Some(syn::GenericArgument::Type(syn::Type::Path(err_path))) = args.args.iter().nth(1)
+    else {
+        return false;
+    };
+    err_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "WorkflowFailure")
+}
+
 // ---------------------------------------------------------------------------
 // Main macro
 // ---------------------------------------------------------------------------
@@ -546,10 +576,24 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // If the workflow returns `Result<_, WorkflowFailure>`, route the error
+    // through `WorkflowFailure`'s `IntoWorkflowErrorString` impl so the engine
+    // can recover the typed `error_type` / `details` / `non_retryable` from the
+    // wire envelope. Otherwise the legacy `.to_string()` path is used, keeping
+    // every `Result<_, String>` (or other `ToString` error) workflow unchanged.
+    let returns_workflow_failure = workflow_returns_workflow_failure(&input_fn.sig.output);
+    let encode_err = if returns_workflow_failure {
+        quote! {
+            |e| ::autumn_harvest::failure::IntoWorkflowErrorString::into_workflow_error_payload(e)
+        }
+    } else {
+        quote! { |e| e.to_string() }
+    };
+
     let dispatch = if param_names.is_empty() {
         quote! {
             let result = #fn_name(ctx).await;
-            result.map_err(|e| e.to_string())
+            result.map_err(#encode_err)
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v)
                         .map_err(|e| e.to_string())
@@ -561,7 +605,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let #name = ::autumn_harvest::serde_json::from_value(input)
                 .map_err(|e| e.to_string())?;
             let result = #fn_name(ctx, #name).await;
-            result.map_err(|e| e.to_string())
+            result.map_err(#encode_err)
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v)
                         .map_err(|e| e.to_string())
@@ -578,7 +622,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| e.to_string())?;
             )*
             let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(|e| e.to_string())
+            result.map_err(#encode_err)
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v)
                         .map_err(|e| e.to_string())

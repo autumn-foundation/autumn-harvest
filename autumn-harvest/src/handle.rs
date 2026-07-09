@@ -926,10 +926,10 @@ impl WorkflowHandle {
         }
 
         if let Some(Err(reason)) = replay_result {
-            return Err(HarvestError::WorkflowFailed {
-                name: self.exec_id.to_string(),
+            return Err(HarvestError::workflow_failed_untyped(
+                self.exec_id.to_string(),
                 reason,
-            });
+            ));
         }
 
         ctx.execute_query_with_args(query_name, args)
@@ -966,12 +966,9 @@ impl WorkflowHandle {
                 .await?;
                 match crate::replay::HistoryMatcher::new(h.events).match_update(update_id) {
                     crate::replay::HistoryMatch::Matched { output } => Some(Ok(output)),
-                    crate::replay::HistoryMatch::Failed { error, .. } => {
-                        Some(Err(HarvestError::WorkflowFailed {
-                            name: self.exec_id.to_string(),
-                            reason: error,
-                        }))
-                    }
+                    crate::replay::HistoryMatch::Failed { error, .. } => Some(Err(
+                        HarvestError::workflow_failed_untyped(self.exec_id.to_string(), error),
+                    )),
                     _ => None,
                 }
             };
@@ -997,13 +994,14 @@ fn terminal_raw_result(execution: &WorkflowExecution) -> Option<HarvestResult<Va
         "COMPLETED" | "CONTINUED_AS_NEW" => {
             Some(Ok(execution.output.clone().unwrap_or(Value::Null)))
         }
-        "FAILED" => Some(Err(HarvestError::WorkflowFailed {
-            name: execution.workflow_name.clone(),
-            reason: execution
+        // TODO(#767 Wave 2): typed
+        "FAILED" => Some(Err(HarvestError::workflow_failed_untyped(
+            execution.workflow_name.clone(),
+            execution
                 .error
                 .clone()
                 .unwrap_or_else(|| "workflow failed".to_string()),
-        })),
+        ))),
         "CANCELLED" => Some(Err(HarvestError::Cancelled(
             execution
                 .error

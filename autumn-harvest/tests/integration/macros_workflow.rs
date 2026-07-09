@@ -150,3 +150,45 @@ fn workflow_mcp_composes_with_other_attributes() {
     assert!(info.mcp);
     assert_eq!(info.description, Some("an MCP-exposed workflow"));
 }
+
+// ── typed workflow failures (issue #767) ──────────────────────────────────────
+
+#[workflow]
+async fn wf_typed_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), WorkflowFailure> {
+    Err(WorkflowFailure::new("ValidationRejected", "bad").non_retryable())
+}
+
+#[workflow]
+async fn wf_string_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), String> {
+    Err("boom".into())
+}
+
+#[test]
+fn workflow_typed_failure_encodes_wire_envelope() {
+    let info = __autumn_workflow_info_wf_typed_fail();
+    let ctx = WorkflowContext::new_test();
+    let result = futures::executor::block_on((info.handler)(
+        &ctx,
+        autumn_harvest::serde_json::Value::Null,
+    ));
+    let payload = result.expect_err("workflow returned Err");
+    let decoded = autumn_harvest::failure::decode_workflow_failure(&payload);
+    assert_eq!(decoded.error_type, Some("ValidationRejected".to_string()));
+    assert_eq!(decoded.non_retryable, Some(true));
+    assert_eq!(decoded.message, "bad");
+}
+
+#[test]
+fn workflow_string_failure_stays_untyped() {
+    let info = __autumn_workflow_info_wf_string_fail();
+    let ctx = WorkflowContext::new_test();
+    let result = futures::executor::block_on((info.handler)(
+        &ctx,
+        autumn_harvest::serde_json::Value::Null,
+    ));
+    let payload = result.expect_err("workflow returned Err");
+    assert_eq!(payload, "boom");
+    let decoded = autumn_harvest::failure::decode_workflow_failure(&payload);
+    assert!(decoded.error_type.is_none());
+    assert_eq!(decoded.message, "boom");
+}

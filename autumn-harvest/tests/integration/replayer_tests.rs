@@ -2345,9 +2345,7 @@ async fn replayer_diverges_at_marker_not_at_a_phantom_child_for_payload_cap_fail
             last_error: None,
             scheduled_time: None,
         },
-        WorkflowEvent::WorkflowFailed {
-            error: "payload too large: child input exceeds cap".into(),
-        },
+        WorkflowEvent::workflow_failed("payload too large: child input exceeds cap"),
     ];
     let report = WorkflowReplayer::new()
         .register_fn(
@@ -2412,9 +2410,7 @@ async fn known_limitation_early_config_dependent_failure_does_not_replay_cleanly
             last_error: None,
             scheduled_time: None,
         },
-        WorkflowEvent::WorkflowFailed {
-            error: "payload too large".into(),
-        },
+        WorkflowEvent::workflow_failed("payload too large"),
     ];
     let report = WorkflowReplayer::new()
         .register_fn(

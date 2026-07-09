@@ -14275,9 +14275,7 @@ mod tests {
             // A further recorded event past the timeout -- proves this
             // history has already progressed beyond the point where the
             // timeout was first discovered.
-            WorkflowEvent::WorkflowFailed {
-                error: "session acquisition timed out".to_string(),
-            },
+            WorkflowEvent::workflow_failed("session acquisition timed out".to_string()),
         ];
         let recorder = std::sync::Arc::new(SessionAcquisitionCounter::default());
         let ctx =

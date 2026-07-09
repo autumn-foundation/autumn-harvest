@@ -3014,12 +3014,11 @@ async fn persist_workflow_failure(
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
             async move {
+                // TODO(#767 Wave 2): decode typed failure here
                 store::append_events(
                     conn,
                     exec_id,
-                    &[WorkflowEvent::WorkflowFailed {
-                        error: error.clone(),
-                    }],
+                    &[WorkflowEvent::workflow_failed(error.clone())],
                     next_event_id,
                 )
                 .await?;
@@ -4759,10 +4758,8 @@ async fn wake_parent_for_child_failure(
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
-    let event = WorkflowEvent::ChildWorkflowFailed {
-        child_id: child_exec_id,
-        error: error.to_string(),
-    };
+    // TODO(#767 Wave 2): decode typed failure here
+    let event = WorkflowEvent::child_workflow_failed(child_exec_id, error.to_string());
     store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
@@ -4830,9 +4827,8 @@ async fn persist_child_workflow_failure(
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
-    let workflow_failure = WorkflowEvent::WorkflowFailed {
-        error: error.to_string(),
-    };
+    // TODO(#767 Wave 2): decode typed failure here
+    let workflow_failure = WorkflowEvent::workflow_failed(error.to_string());
 
     let (deferred, closed_children) = conn
         .transaction::<_, HarvestError, _>(|conn| {
@@ -7616,9 +7612,7 @@ async fn move_workflow_to_dlq_for_history_cap(
                 store::append_events(
                     conn,
                     exec_id,
-                    &[WorkflowEvent::WorkflowFailed {
-                        error: reason.clone(),
-                    }],
+                    &[WorkflowEvent::workflow_failed(reason.clone())],
                     next_event_id,
                 )
                 .await?;
@@ -11944,9 +11938,7 @@ pub async fn quarantine_workflow_task_timeout(
                             crate::store::append_events(
                                 conn,
                                 exec_id,
-                                &[WorkflowEvent::WorkflowFailed {
-                                    error: error_msg.clone(),
-                                }],
+                                &[WorkflowEvent::workflow_failed(error_msg.clone())],
                                 history.next_event_id,
                             )
                             .await?;

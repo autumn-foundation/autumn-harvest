@@ -97,7 +97,7 @@ impl TestHarnessGenerator {
                 WorkflowEvent::WorkflowCompleted { output } => {
                     final_result = Some(Ok(output.clone()));
                 }
-                WorkflowEvent::WorkflowFailed { error } => {
+                WorkflowEvent::WorkflowFailed { error, .. } => {
                     final_result = Some(Err(error.clone()));
                 }
                 _ => {}
@@ -240,9 +240,7 @@ mod tests {
                 non_retryable: false,
                 details: None,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "workflow failed: charge_card failed".into(),
-            },
+            WorkflowEvent::workflow_failed("workflow failed: charge_card failed"),
         ];
 
         let generator = TestHarnessGenerator::new();

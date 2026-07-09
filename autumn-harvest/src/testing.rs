@@ -2712,9 +2712,7 @@ impl WorkflowTestEnv {
                 Ok(output)
             }
             WorkflowOutcome::Failed { error, .. } => {
-                history.push(WorkflowEvent::WorkflowFailed {
-                    error: error.clone(),
-                });
+                history.push(WorkflowEvent::workflow_failed(error.clone()));
                 Err(error)
             }
             WorkflowOutcome::ContinuedAsNew { input } => {
@@ -2965,8 +2963,7 @@ impl WorkflowTestEnv {
                             .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
                     }
                     Err(error) => {
-                        deferred_events
-                            .push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
+                        deferred_events.push(WorkflowEvent::child_workflow_failed(child_id, error));
                     }
                 }
                 Ok(true)
@@ -3071,10 +3068,10 @@ impl WorkflowTestEnv {
                     });
                 }
                 for child_id in children {
-                    deferred_events.push(WorkflowEvent::ChildWorkflowFailed {
+                    deferred_events.push(WorkflowEvent::child_workflow_failed(
                         child_id,
-                        error: "lost race to a sibling branch".to_string(),
-                    });
+                        "lost race to a sibling branch".to_string(),
+                    ));
                 }
                 Ok(true)
             }

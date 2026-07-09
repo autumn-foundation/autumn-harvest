@@ -1689,7 +1689,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(matches!(
         history.events.last(),
-        Some(WorkflowEvent::WorkflowFailed { error }) if error.contains("workflow exploded")
+        Some(WorkflowEvent::WorkflowFailed { error, .. }) if error.contains("workflow exploded")
     ));
 
     let task = load_task_from_url(&database_url, task_id).await;
@@ -2114,7 +2114,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(matches!(
         history.events.last(),
-        Some(WorkflowEvent::WorkflowFailed { error })
+        Some(WorkflowEvent::WorkflowFailed { error, .. })
             if error.contains("no pending scheduled activity")
     ));
 }
@@ -2657,9 +2657,9 @@ async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
         .events
         .iter()
         .find_map(|event| match event {
-            WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
-                Some((*child_id, error.clone()))
-            }
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id, error, ..
+            } => Some((*child_id, error.clone())),
             _ => None,
         })
         .expect("parent history should include ChildWorkflowFailed");
@@ -8659,10 +8659,10 @@ fn saga_metrics_workflow<'a>(
         // Step 3 fails outright — rollback_after unwinds both compensations.
         saga.step(
             || async {
-                Err::<serde_json::Value, _>(HarvestError::WorkflowFailed {
-                    name: "e2e_test_workflow".into(),
-                    reason: "tour sold out".into(),
-                })
+                Err::<serde_json::Value, _>(HarvestError::workflow_failed_untyped(
+                    "e2e_test_workflow",
+                    "tour sold out",
+                ))
             },
             |_: serde_json::Value| async { Ok::<_, HarvestError>(()) },
         )

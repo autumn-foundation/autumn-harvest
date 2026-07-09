@@ -3293,6 +3293,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ChildWorkflowFailed {
                     child_id: id,
                     error,
+                    ..
                 } if *id == child_id => {
                     let error = error.clone();
                     self.consumed_out_of_order_events.insert(scan_cursor);
@@ -5033,10 +5034,7 @@ mod tests {
                 workflow_name: "process_order".into(),
                 input: Value::Null,
             },
-            WorkflowEvent::ChildWorkflowFailed {
-                child_id,
-                error: "child failed".into(),
-            },
+            WorkflowEvent::child_workflow_failed(child_id, "child failed"),
         ];
 
         let mut matcher = HistoryMatcher::new(events);
@@ -6309,9 +6307,7 @@ mod tests {
                 details: None,
                 non_retryable: false,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "downstream down".into(),
-            },
+            WorkflowEvent::workflow_failed("downstream down"),
             WorkflowEvent::WorkflowRedriven {
                 redriven_at: chrono::Utc::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
@@ -6347,9 +6343,7 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "boom".into(),
-            },
+            WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::WorkflowRedriven {
                 redriven_at: chrono::Utc::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
@@ -6377,9 +6371,7 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "boom".into(),
-            },
+            WorkflowEvent::workflow_failed("boom"),
         ];
         let matcher = HistoryMatcher::new(events);
         assert!(
@@ -6402,9 +6394,7 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "boom".into(),
-            },
+            WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::WorkflowRedriven {
                 redriven_at: chrono::Utc::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),

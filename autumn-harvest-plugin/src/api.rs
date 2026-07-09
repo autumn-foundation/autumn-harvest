@@ -24029,8 +24029,7 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         }
         | HarvestError::Cancelled(message)
         | HarvestError::WorkflowFailed {
-            name: _,
-            reason: message,
+            reason: message, ..
         } => AutumnError::bad_request_msg(message),
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)

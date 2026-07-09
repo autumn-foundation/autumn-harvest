@@ -230,9 +230,7 @@ impl WorkflowSimulator {
                     };
                 }
                 WorkflowOutcome::Failed { error, .. } => {
-                    history.push(WorkflowEvent::WorkflowFailed {
-                        error: error.clone(),
-                    });
+                    history.push(WorkflowEvent::workflow_failed(error.clone()));
                     return SimulatorResult {
                         final_output: Err(error),
                         history,
@@ -407,10 +405,7 @@ impl WorkflowSimulator {
                             });
                         }
                         Err(err) => {
-                            history.push(WorkflowEvent::ChildWorkflowFailed {
-                                child_id,
-                                error: err,
-                            });
+                            history.push(WorkflowEvent::child_workflow_failed(child_id, err));
                         }
                     }
                     advanced = true;
@@ -456,10 +451,10 @@ impl WorkflowSimulator {
                         });
                     }
                     for child_id in children {
-                        history.push(WorkflowEvent::ChildWorkflowFailed {
+                        history.push(WorkflowEvent::child_workflow_failed(
                             child_id,
-                            error: "lost race to a sibling branch".to_string(),
-                        });
+                            "lost race to a sibling branch".to_string(),
+                        ));
                     }
                     advanced = true;
                 }

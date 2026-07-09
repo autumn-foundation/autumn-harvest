@@ -349,6 +349,190 @@ pub(crate) fn classify_activity_error(
 }
 
 // ---------------------------------------------------------------------------
+// Typed workflow failures (issue #767)
+// ---------------------------------------------------------------------------
+
+/// Typed failure carrier for workflow handlers.
+///
+/// Mirrors [`ActivityFailure`] onto the workflow surface: a workflow author
+/// can return `Err(WorkflowFailure::new("ValidationRejected", "…"))` to signal
+/// a stable, low-cardinality error-type name (and optional structured details)
+/// that operators and result-awaiting callers can classify without parsing the
+/// human-readable message.
+///
+/// ## Backward compatibility
+///
+/// `From<String>` / `From<&str>` produce a `WorkflowFailure` with
+/// `error_type = "Error"`, so every workflow that today returns `Err(String)`
+/// continues to compile and behave identically. Untyped failures decode back
+/// to `error_type = None` (see [`decode_workflow_failure`]).
+///
+/// ## Builder note
+///
+/// Unlike [`ActivityFailure::non_retryable`] (a constructor taking a type and
+/// message), [`WorkflowFailure::non_retryable`] is a **builder** that flips the
+/// flag on an existing value and returns `self`, so it chains after
+/// [`WorkflowFailure::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowFailure {
+    /// A stable, low-cardinality error-type name used for classification and
+    /// policy matching (e.g. `"ValidationRejected"`, `"BudgetExceeded"`).
+    pub error_type: String,
+    /// Human-readable description of the failure.
+    pub message: String,
+    /// Optional structured details serialised alongside the failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    /// When `true` the failure is marked as permanent for downstream
+    /// classification (e.g. workflow-level retry policies).
+    pub non_retryable: bool,
+}
+
+impl WorkflowFailure {
+    /// Construct a retryable workflow failure carrying a stable error-type name.
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_type: error_type.into(),
+            message: message.into(),
+            details: None,
+            non_retryable: false,
+        }
+    }
+
+    /// Attach optional structured details to this failure.
+    #[must_use]
+    pub fn with_details(mut self, value: serde_json::Value) -> Self {
+        self.details = Some(value);
+        self
+    }
+
+    /// Mark this failure as non-retryable (builder — flips the flag, returns
+    /// `self`). Chains after [`WorkflowFailure::new`].
+    #[must_use]
+    pub const fn non_retryable(mut self) -> Self {
+        self.non_retryable = true;
+        self
+    }
+}
+
+impl std::fmt::Display for WorkflowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.error_type, self.message)
+    }
+}
+
+impl From<String> for WorkflowFailure {
+    fn from(message: String) -> Self {
+        Self::new("Error", message)
+    }
+}
+
+impl From<&str> for WorkflowFailure {
+    fn from(message: &str) -> Self {
+        Self::new("Error", message)
+    }
+}
+
+/// Trait that lets the macro-generated workflow dispatch shim serialise both
+/// `String` and `WorkflowFailure` errors into the engine's wire format without
+/// runtime type-checking.
+///
+/// `String` passes through unchanged (legacy path).
+/// `WorkflowFailure` is serialised to a `harvest_workflow_failure_v1` JSON
+/// envelope so the engine can recover `error_type`, `details`, and
+/// `non_retryable` when writing the `WorkflowFailed` event.
+pub trait IntoWorkflowErrorString {
+    /// Convert this error into the string payload carried on the engine's
+    /// internal `Result<serde_json::Value, String>` boundary.
+    fn into_workflow_error_payload(self) -> String;
+}
+
+impl IntoWorkflowErrorString for String {
+    fn into_workflow_error_payload(self) -> String {
+        self
+    }
+}
+
+impl IntoWorkflowErrorString for WorkflowFailure {
+    fn into_workflow_error_payload(self) -> String {
+        // WorkflowFailure has no maps with non-string keys, so to_string never
+        // fails — but if it ever does, fall back to the Display string rather
+        // than panicking on the worker hot path.
+        let fallback = self.to_string();
+        serde_json::to_string(&WorkflowWirePayload::WorkflowFailureV1(self)).unwrap_or(fallback)
+    }
+}
+
+/// Wire-format envelope for `WorkflowFailure` payloads.
+///
+/// The explicit `harvest_workflow_failure_v1` discriminator prevents collision
+/// with legacy workflows that happen to return JSON-shaped error strings. Only
+/// payloads emitted by [`IntoWorkflowErrorString`] are routed through the typed
+/// path; every other string stays on the legacy untyped fallback.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WorkflowWirePayload {
+    #[serde(rename = "harvest_workflow_failure_v1")]
+    WorkflowFailureV1(WorkflowFailure),
+}
+
+/// Decoded view of a workflow failure payload.
+///
+/// The `Option` fields are the load-bearing back-compat signal: a genuine
+/// `harvest_workflow_failure_v1` envelope decodes to `Some(..)` typed fields,
+/// while any legacy plain string (including JSON that happens to share
+/// `WorkflowFailure`'s shape) decodes to `None` for every typed field so the
+/// engine records no synthetic `error_type` for pre-#767 failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedWorkflowFailure {
+    /// Human-readable failure message (always present).
+    pub message: String,
+    /// Stable error-type name — `Some` only for genuine typed envelopes.
+    pub error_type: Option<String>,
+    /// Structured details — `Some` only for genuine typed envelopes.
+    pub details: Option<serde_json::Value>,
+    /// Non-retryable flag — `Some` only for genuine typed envelopes.
+    pub non_retryable: Option<bool>,
+}
+
+/// Decode a workflow failure payload string.
+///
+/// A well-formed `harvest_workflow_failure_v1` envelope decodes to its typed
+/// fields; every other string decodes to `message = payload`, with all typed
+/// fields `None` (the untyped back-compat path).
+#[must_use]
+pub fn decode_workflow_failure(payload: &str) -> DecodedWorkflowFailure {
+    if let Ok(WorkflowWirePayload::WorkflowFailureV1(failure)) =
+        serde_json::from_str::<WorkflowWirePayload>(payload)
+    {
+        DecodedWorkflowFailure {
+            message: failure.message,
+            error_type: Some(failure.error_type),
+            details: failure.details,
+            non_retryable: Some(failure.non_retryable),
+        }
+    } else {
+        DecodedWorkflowFailure {
+            message: payload.to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+}
+
+/// Returns `Some(WorkflowFailure)` only for genuine typed-wire-format payloads.
+///
+/// Returns `None` for legacy plain-string payloads (no
+/// `harvest_workflow_failure_v1` envelope).
+#[must_use]
+pub fn parse_workflow_typed_payload(payload: &str) -> Option<WorkflowFailure> {
+    match serde_json::from_str::<WorkflowWirePayload>(payload) {
+        Ok(WorkflowWirePayload::WorkflowFailureV1(failure)) => Some(failure),
+        Err(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (red phase: written before implementation compiles)
 // ---------------------------------------------------------------------------
 
@@ -655,5 +839,71 @@ mod tests {
         let payload = ActivityFailure::operator_force_failed(None).into_error_payload();
         assert!(failure_is_non_retryable(&payload, Some(&policy)));
         assert!(failure_is_non_retryable(&payload, None));
+    }
+
+    // ── typed workflow failures (issue #767) ──────────────────────────────
+
+    #[test]
+    fn workflow_failure_new_defaults_retryable() {
+        let f = WorkflowFailure::new("ValidationRejected", "bad input");
+        assert_eq!(f.error_type, "ValidationRejected");
+        assert_eq!(f.message, "bad input");
+        assert!(!f.non_retryable);
+        assert!(f.details.is_none());
+    }
+
+    #[test]
+    fn workflow_failure_builder_chain() {
+        let f = WorkflowFailure::new("BudgetExceeded", "over cap")
+            .with_details(serde_json::json!({"limit": 100}))
+            .non_retryable();
+        assert_eq!(f.error_type, "BudgetExceeded");
+        assert!(f.non_retryable);
+        assert_eq!(f.details, Some(serde_json::json!({"limit": 100})));
+    }
+
+    #[test]
+    fn workflow_failure_envelope_round_trips() {
+        let original = WorkflowFailure::new("PermanentValidation", "bad data")
+            .with_details(serde_json::json!({"field": "amount"}))
+            .non_retryable();
+        let payload = original.clone().into_workflow_error_payload();
+        assert!(payload.contains("harvest_workflow_failure_v1"));
+        let decoded = decode_workflow_failure(&payload);
+        assert_eq!(decoded.message, "bad data");
+        assert_eq!(decoded.error_type, Some("PermanentValidation".to_string()));
+        assert_eq!(decoded.non_retryable, Some(true));
+        assert_eq!(
+            decoded.details,
+            Some(serde_json::json!({"field": "amount"}))
+        );
+        assert_eq!(parse_workflow_typed_payload(&payload), Some(original));
+    }
+
+    #[test]
+    fn decode_plain_string_yields_all_none() {
+        let decoded = decode_workflow_failure("boom");
+        assert_eq!(decoded.message, "boom");
+        assert!(decoded.error_type.is_none());
+        assert!(decoded.details.is_none());
+        assert!(decoded.non_retryable.is_none());
+        // Look-alike JSON stays untyped too (no discriminator).
+        let look_alike = r#"{"error_type":"X","message":"y","non_retryable":true}"#;
+        let decoded = decode_workflow_failure(look_alike);
+        assert_eq!(decoded.message, look_alike);
+        assert!(decoded.error_type.is_none());
+        assert!(parse_workflow_typed_payload(look_alike).is_none());
+    }
+
+    #[test]
+    fn workflow_failure_display() {
+        let f = WorkflowFailure::new("ValidationRejected", "bad value");
+        assert_eq!(f.to_string(), "ValidationRejected: bad value");
+    }
+
+    #[test]
+    fn into_workflow_error_payload_for_string_is_passthrough() {
+        let s = "simple error".to_string();
+        assert_eq!(s.into_workflow_error_payload(), "simple error");
     }
 }

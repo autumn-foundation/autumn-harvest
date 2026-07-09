@@ -98,9 +98,38 @@ pub enum WorkflowEvent {
         output: serde_json::Value,
     },
     /// The workflow panicked or returned a non-recoverable error.
+    ///
+    /// ## Backward-compatibility note (issue #767)
+    ///
+    /// `error_type`, `details`, and `non_retryable` were added after the
+    /// initial release. Old events stored without these fields deserialise
+    /// cleanly via `#[serde(default)]` to `None`. Unlike `ActivityFailed`,
+    /// `error_type` is `Option<String>` (not defaulted to `"Error"`) so a
+    /// pre-#767 untyped failure is distinguishable from a typed one. The
+    /// append-only invariant is preserved — no variants removed, no renames.
     WorkflowFailed {
-        /// String representation of the failure.
+        /// Human-readable string representation of the failure.
         error: String,
+        /// Low-cardinality error-type name from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for events stored before issue #767 or for failures returned
+        /// via the legacy `Err(String)` path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        /// Optional structured details preserved from
+        /// [`WorkflowFailure::with_details`](crate::failure::WorkflowFailure::with_details).
+        ///
+        /// `None` for untyped or pre-#767 failures. Omitted from the serialised
+        /// form when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        /// Non-retryable flag from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for untyped or pre-#767 failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        non_retryable: Option<bool>,
     },
     /// The workflow was intentionally cancelled (e.g., via API or parent workflow).
     WorkflowCancelled {
@@ -225,11 +254,35 @@ pub enum WorkflowEvent {
         output: serde_json::Value,
     },
     /// The spawned sub-workflow encountered a fatal error.
+    ///
+    /// ## Backward-compatibility note (issue #767)
+    ///
+    /// `error_type`, `details`, and `non_retryable` were added after the
+    /// initial release and deserialise to `None` for pre-#767 events. See
+    /// [`WorkflowFailed`](Self::WorkflowFailed) for the full rationale.
     ChildWorkflowFailed {
         /// The ID of the spawned execution.
         child_id: ExecutionId,
-        /// The reason the child failed.
+        /// The reason the child failed (human-readable message).
         error: String,
+        /// Low-cardinality error-type name from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for pre-#767 or untyped child failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        /// Optional structured details from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for pre-#767 or untyped child failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        /// Non-retryable flag from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for pre-#767 or untyped child failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        non_retryable: Option<bool>,
     },
 
     // ── Markers ───────────────────────────────────────────────────
@@ -666,6 +719,59 @@ impl WorkflowEvent {
         }
     }
 
+    /// Construct an untyped [`WorkflowEvent::WorkflowFailed`] (issue #767): the
+    /// typed fields default to `None`, preserving pre-#767 legacy semantics.
+    #[must_use]
+    pub fn workflow_failed(error: impl Into<String>) -> Self {
+        Self::WorkflowFailed {
+            error: error.into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+
+    /// Construct a typed [`WorkflowEvent::WorkflowFailed`] from a decoded
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) payload (issue #767).
+    #[must_use]
+    pub fn workflow_failed_typed(decoded: &crate::failure::DecodedWorkflowFailure) -> Self {
+        Self::WorkflowFailed {
+            error: decoded.message.clone(),
+            error_type: decoded.error_type.clone(),
+            details: decoded.details.clone(),
+            non_retryable: decoded.non_retryable,
+        }
+    }
+
+    /// Construct an untyped [`WorkflowEvent::ChildWorkflowFailed`] (issue #767):
+    /// the typed fields default to `None`, preserving pre-#767 legacy semantics.
+    #[must_use]
+    pub fn child_workflow_failed(child_id: ExecutionId, error: impl Into<String>) -> Self {
+        Self::ChildWorkflowFailed {
+            child_id,
+            error: error.into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+
+    /// Construct a typed [`WorkflowEvent::ChildWorkflowFailed`] from a decoded
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) payload (issue #767).
+    #[must_use]
+    pub fn child_workflow_failed_typed(
+        child_id: ExecutionId,
+        decoded: &crate::failure::DecodedWorkflowFailure,
+    ) -> Self {
+        Self::ChildWorkflowFailed {
+            child_id,
+            error: decoded.message.clone(),
+            error_type: decoded.error_type.clone(),
+            details: decoded.details.clone(),
+            non_retryable: decoded.non_retryable,
+        }
+    }
+
     /// Stable string identifier for this event variant, stored in
     /// `harvest_events.event_type`.
     #[must_use]
@@ -749,6 +855,86 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    // ── WorkflowFailed / ChildWorkflowFailed typed-failure tests (issue #767) ─
+
+    #[test]
+    fn workflow_failed_pre_767_json_deserializes_with_none() {
+        let old_json = r#"{"type":"WorkflowFailed","data":{"error":"boom"}}"#;
+        let back: WorkflowEvent = serde_json::from_str(old_json).unwrap();
+        match back {
+            WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(error, "boom");
+                assert!(error_type.is_none());
+                assert!(details.is_none());
+                assert!(non_retryable.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn child_workflow_failed_pre_767_json_deserializes_with_none() {
+        let old_json = r#"{"type":"ChildWorkflowFailed","data":{"child_id":"00000000-0000-0000-0000-000000000001","error":"boom"}}"#;
+        let back: WorkflowEvent = serde_json::from_str(old_json).unwrap();
+        match back {
+            WorkflowEvent::ChildWorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error, "boom");
+                assert!(error_type.is_none());
+                assert!(details.is_none());
+                assert!(non_retryable.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn workflow_failed_typed_round_trips() {
+        use crate::failure::IntoWorkflowErrorString;
+        let decoded = crate::failure::decode_workflow_failure(
+            &crate::failure::WorkflowFailure::new("ValidationRejected", "bad")
+                .with_details(serde_json::json!({"field": "x"}))
+                .non_retryable()
+                .into_workflow_error_payload(),
+        );
+        let event = WorkflowEvent::workflow_failed_typed(&decoded);
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(error, "bad");
+                assert_eq!(error_type, Some("ValidationRejected".to_string()));
+                assert_eq!(details, Some(serde_json::json!({"field": "x"})));
+                assert_eq!(non_retryable, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn workflow_failed_none_fields_omitted_from_json() {
+        let event = WorkflowEvent::workflow_failed("x");
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("error_type"));
+        assert!(!json.contains("details"));
+        assert!(!json.contains("non_retryable"));
+    }
 
     // ── ActivityFailed typed-failure tests (issue #227) ──────────────────────
 
@@ -996,7 +1182,7 @@ mod tests {
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
             },
-            WorkflowEvent::WorkflowFailed { error: "x".into() },
+            WorkflowEvent::workflow_failed("x"),
             WorkflowEvent::WorkflowCancelled { reason: "x".into() },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -1048,10 +1234,7 @@ mod tests {
                 child_id: ExecutionId::new(),
                 output: serde_json::Value::Null,
             },
-            WorkflowEvent::ChildWorkflowFailed {
-                child_id: ExecutionId::new(),
-                error: "x".into(),
-            },
+            WorkflowEvent::child_workflow_failed(ExecutionId::new(), "x"),
             WorkflowEvent::MarkerRecorded {
                 name: "m".into(),
                 details: serde_json::Value::Null,
