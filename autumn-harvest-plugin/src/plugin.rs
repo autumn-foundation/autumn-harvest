@@ -116,6 +116,9 @@ pub struct HarvestPlugin {
     /// Deployment-level opt-in for operator read-path payload decoding
     /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
     decode_payloads_on_read: bool,
+    /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
+    /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
+    status_thresholds: crate::status_summary::StatusThresholds,
     /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
@@ -144,6 +147,7 @@ impl HarvestPlugin {
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
             decode_payloads_on_read: false,
+            status_thresholds: crate::status_summary::StatusThresholds::default(),
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
             #[cfg(feature = "metrics")]
@@ -321,6 +325,20 @@ impl HarvestPlugin {
         self
     }
 
+    /// Override the thresholds for the rolled-up `GET /admin/status` verdict
+    /// (issue #679).
+    ///
+    /// The defaults are **starter values, not universal SLOs**; tune DLQ depth,
+    /// queue backlog, stalled-run, and worker-health thresholds per deployment.
+    #[must_use]
+    pub fn with_status_thresholds(
+        mut self,
+        thresholds: crate::status_summary::StatusThresholds,
+    ) -> Self {
+        self.status_thresholds = thresholds;
+        self
+    }
+
     /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
     /// (issue #344).
     ///
@@ -408,6 +426,7 @@ impl Plugin for HarvestPlugin {
             mcp_tools_enabled,
             mcp_tools_prefix,
             decode_payloads_on_read,
+            status_thresholds,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
             #[cfg(feature = "metrics")]
@@ -523,6 +542,8 @@ impl Plugin for HarvestPlugin {
         // gate. Must run before `builder` is moved into the runtime slot.
         api_state.set_payload_codecs(builder.payload_codecs().clone());
         api_state.set_decode_payloads_on_read(decode_payloads_on_read);
+        // Issue #679: mirror the rolled-up status thresholds into the API state.
+        api_state.set_status_thresholds(status_thresholds);
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
@@ -1348,6 +1369,24 @@ mod tests {
         assert!(
             plugin.decode_payloads_on_read,
             "HarvestPlugin::decode_payloads_on_read() must set the opt-in flag"
+        );
+    }
+
+    /// Issue #679: the rolled-up status thresholds default to the starter
+    /// values and are overridable via the builder.
+    #[test]
+    fn status_thresholds_default_and_override_on_builder() {
+        let plugin = HarvestPlugin::new();
+        assert_eq!(plugin.status_thresholds.dlq_critical_total, 100);
+
+        let custom = crate::status_summary::StatusThresholds {
+            dlq_critical_total: 7,
+            ..crate::status_summary::StatusThresholds::default()
+        };
+        let plugin = plugin.with_status_thresholds(custom);
+        assert_eq!(
+            plugin.status_thresholds.dlq_critical_total, 7,
+            "HarvestPlugin::with_status_thresholds() must override the thresholds"
         );
     }
 

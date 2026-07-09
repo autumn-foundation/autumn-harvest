@@ -3405,6 +3405,30 @@
     },
     {
       "method": "GET",
+      "path": "/admin/status",
+      "category": "admin",
+      "read_only": true,
+      "description": "Rolled-up management health summary (issue #679): composes five existing read models (workers, shards, dead-letters, queues, stalled workflows) into one JSON document with a single worst-of verdict (healthy/degraded/critical). Composes, never duplicates, per-domain check semantics. Each subsystem carries headline numbers, bounded reason_codes, and a drill_down management-API path (present only when non-healthy). An unreachable shard degrades the affected subsystems and is named in unavailable_shards rather than failing the call wholesale. Thresholds are starter defaults, not universal SLOs.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "subsystems",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Database or shard connectivity error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/version-gates/usage",
       "category": "admin",
       "read_only": true,

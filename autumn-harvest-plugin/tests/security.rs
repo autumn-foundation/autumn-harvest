@@ -398,6 +398,15 @@ async fn eris_unauthenticated_list_dead_letters_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_admin_status_is_blocked() {
+    // Issue #679: the rolled-up health summary is admin-gated; the built-in
+    // guard rejects before the handler runs, so no DB is needed here.
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/admin/status")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_replay_dead_letter_is_blocked() {
     let app = unauthenticated_app();
     let res = app
