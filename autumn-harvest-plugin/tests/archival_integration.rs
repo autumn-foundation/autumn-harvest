@@ -326,6 +326,7 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .history_archiver(archiver)
             .build(),
@@ -470,6 +471,7 @@ async fn archival_hook_times_out_and_preserves_execution() {
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 1, // 1 second timeout
+                ..Default::default()
             })
             .history_archiver(SlowArchiver)
             .build(),
@@ -555,6 +557,7 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .build(),
         &HarvestRuntimeConfig {
@@ -758,6 +761,7 @@ async fn retention_reclaims_an_orphaned_delivered_completion_delivery() {
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .build(),
         &HarvestRuntimeConfig {

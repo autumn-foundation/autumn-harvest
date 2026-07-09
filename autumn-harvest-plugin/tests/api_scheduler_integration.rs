@@ -3762,6 +3762,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .build(),
         &HarvestRuntimeConfig {
