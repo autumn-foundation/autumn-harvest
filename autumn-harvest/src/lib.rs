@@ -71,7 +71,7 @@ pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
 pub mod dag_linter;
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
@@ -147,6 +147,8 @@ pub mod test_generator;
 pub mod testing;
 /// Workflow-start throttle — pace admissions, defer the excess (issue #607).
 pub mod throttle;
+#[cfg(any(test, feature = "testing"))]
+pub mod trace_export;
 pub mod types;
 pub mod update;
 /// Read-only per-tenant/per-workflow usage aggregation (issue #596).
@@ -243,7 +245,7 @@ pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,
 };
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
@@ -355,6 +357,8 @@ pub use testing::{
 pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use trace_export::export_chrome_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
     ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, TimerId, UpdateId, WorkerId,
