@@ -1152,6 +1152,26 @@ fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whole seconds from `now` until `deadline`, for `sleep_until`.
+///
+/// - A past-or-equal deadline clamps to `0` (never wraps into a multi-year
+///   sleep) — the durable timer then fires on the next poll.
+/// - A sub-second remainder is rounded **up** to the next whole second, so the
+///   wait never resolves *before* the deadline (harvest timers have whole-second
+///   granularity).
+/// - An astronomically distant deadline saturates to `u64::MAX`; the worker's
+///   `chrono_duration_from_secs` then surfaces it as a `Config` error at persist,
+///   exactly like an overflowing `ctx.timer` duration.
+pub(crate) fn remaining_secs_until(deadline: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
+    let delta_ms = deadline.signed_duration_since(now).num_milliseconds();
+    if delta_ms <= 0 {
+        return 0;
+    }
+    let secs = delta_ms / 1000;
+    let round_up = i64::from(delta_ms % 1000 != 0);
+    u64::try_from(secs + round_up).unwrap_or(u64::MAX)
+}
+
 /// Options for [`WorkflowContext::create_session`] (issue #606).
 ///
 /// # Example
@@ -3867,6 +3887,57 @@ impl WorkflowContext {
                 })
             }
         }
+    }
+
+    /// Durably wait until an absolute instant, then resolve.
+    ///
+    /// This is the absolute-deadline companion to [`WorkflowContext::timer`] (a
+    /// relative, whole-second wait). It is the blessed, replay-safe form of the
+    /// hand-rolled `ctx.timer(id, (deadline - ctx.system_now()).num_seconds() as u64)`
+    /// pattern, with both foot-guns closed inside the engine:
+    ///
+    /// - **Replay-determinism:** the current wall clock is captured once via the
+    ///   deterministic [`WorkflowContext::system_now`] (frozen into history as a
+    ///   `SideEffectRecorded` event, an existing variant — no new event variant, no
+    ///   migration). Every replay recomputes the identical remaining duration from
+    ///   that frozen instant, so the wait resolves at the same instant on every
+    ///   worker regardless of the replaying worker's wall clock. Reaching for
+    ///   `chrono::Utc::now()` here instead would silently break replay (guardrail
+    ///   HVG001); `sleep_until` removes that path entirely.
+    /// - **Past deadline:** a `deadline` at or before the captured "now" clamps the
+    ///   remaining duration to zero and fires on the next poll — never a wrapped
+    ///   multi-year sleep.
+    ///
+    /// **Sub-second precision:** deadlines are honored to the engine's whole-second
+    /// timer granularity; a sub-second remainder is rounded **up**, so the wait
+    /// never resolves before `deadline`.
+    ///
+    /// The timer lowers onto the existing `TimerStarted`/`TimerFired` events and the
+    /// existing suspension/`match_timer` path — a `sleep_until` timer is byte-identical
+    /// to a `ctx.timer` timer of the same computed duration. Like `ctx.timer`, exactly
+    /// one timer suspends per call and it cannot share a suspension batch with
+    /// activity/child-workflow/signal commands.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if the timer at this history position
+    ///   does not match (a non-deterministic author-supplied `deadline` surfaces as
+    ///   ordinary timer non-determinism, not a panic).
+    /// - [`HarvestError::Cancelled`] if the oneshot sender was dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Send a renewal reminder 24h before an absolute expiry instant:
+    /// ctx.sleep_until("renewal-reminder", expiry - chrono::Duration::hours(24)).await?;
+    /// ```
+    pub async fn sleep_until(&self, timer_id: &str, deadline: DateTime<Utc>) -> HarvestResult<()> {
+        let now = self.system_now();
+        let remaining_secs = remaining_secs_until(deadline, now);
+        self.timer(timer_id, remaining_secs).await
     }
 
     /// Spawn a child workflow and await its terminal result.
@@ -9883,6 +9954,149 @@ mod tests {
         assert_eq!(t.timestamp_millis(), frozen_millis);
         // No command emitted on replay.
         assert!(ctx.drain_commands().is_empty());
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    // ── sleep_until (issue #749) ──────────────────────────────────────────
+
+    #[test]
+    fn remaining_secs_until_truth_table() {
+        let base = 1_700_000_000_000_i64;
+        let now = DateTime::from_timestamp_millis(base).unwrap();
+        let at = |delta_ms: i64| DateTime::from_timestamp_millis(base + delta_ms).unwrap();
+
+        // Future: exactly one hour out.
+        assert_eq!(remaining_secs_until(at(3_600_000), now), 3600);
+        // Exact-now clamps to zero.
+        assert_eq!(remaining_secs_until(now, now), 0);
+        // Past clamps to zero (never wraps into a multi-year sleep).
+        assert_eq!(remaining_secs_until(at(-10_000), now), 0);
+        // Sub-second remainders round UP so the wait never resolves early.
+        assert_eq!(remaining_secs_until(at(1_500), now), 2);
+        assert_eq!(remaining_secs_until(at(1), now), 1);
+        assert_eq!(remaining_secs_until(at(999), now), 1);
+        // Exactly whole seconds do not round up.
+        assert_eq!(remaining_secs_until(at(2_000), now), 2);
+        // Large future.
+        assert_eq!(
+            remaining_secs_until(at(400 * 86_400 * 1000), now),
+            400 * 86_400
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_until_live_emits_side_effect_then_timer() {
+        let ctx = WorkflowContext::new_test();
+        // Base the deadline on a fresh wall-clock read so it is ~1h ahead of
+        // the internal `system_now()` capture regardless of `ctx.now()`.
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+
+        let fut = ctx.sleep_until("wake", deadline);
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "live sleep_until must suspend on the durable timer"
+        );
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            cmds.len(),
+            2,
+            "expected RecordSideEffect(Now) + StartTimer, got {cmds:?}"
+        );
+        assert!(
+            matches!(
+                &cmds[0],
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::Now,
+                    name: None,
+                    ..
+                }
+            ),
+            "first command must capture the wall clock deterministically, got {cmds:?}"
+        );
+        let WorkflowCommand::StartTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = &cmds[1]
+        else {
+            panic!("second command must be StartTimer, got {cmds:?}");
+        };
+        assert_eq!(timer_id.as_str(), "wake");
+        assert!(
+            (3599..=3600).contains(duration_secs),
+            "expected ~3600s remaining, got {duration_secs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_until_past_deadline_starts_zero_duration_timer() {
+        let ctx = WorkflowContext::new_test();
+        let deadline = Utc::now() - chrono::Duration::days(365);
+
+        let fut = ctx.sleep_until("wake", deadline);
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending());
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer as second command, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs, 0,
+            "a past deadline must clamp to a zero-duration timer (fires next poll)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_until_replays_recorded_timer_without_new_commands() {
+        // Frozen `system_now()` capture and a deadline exactly one hour after
+        // it, so the recorded timer duration is a consistent 3600s.
+        let frozen_millis = 1_700_000_000_000_i64;
+        let deadline_millis = frozen_millis + 3_600_000;
+        let d = remaining_secs_until(
+            DateTime::from_timestamp_millis(deadline_millis).unwrap(),
+            DateTime::from_timestamp_millis(frozen_millis).unwrap(),
+        );
+        assert_eq!(d, 3600, "fixture math must be internally consistent");
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: None,
+                value: serde_json::json!(frozen_millis),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("wake"),
+                duration_secs: d,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("wake"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let deadline = DateTime::from_timestamp_millis(deadline_millis).unwrap();
+        let result = ctx.sleep_until("wake", deadline).await;
+        assert!(
+            result.is_ok(),
+            "recorded sleep_until must replay cleanly: {result:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new commands"
+        );
         assert!(ctx.take_deferred_nd_error().is_none());
     }
 

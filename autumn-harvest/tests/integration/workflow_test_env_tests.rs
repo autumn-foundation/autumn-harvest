@@ -1331,6 +1331,87 @@ async fn test_timer_advances_virtual_clock() {
     );
 }
 
+// ── issue #749: sleep_until absolute-deadline durable timer ────────────────────
+
+/// Sleeps until a fixed future instant; reports the virtual-clock delta so the
+/// test can check internal consistency against the recorded timer duration.
+fn sleep_until_future_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let t0 = ctx.now().timestamp();
+        // A fixed instant firmly in the future (year 2035).
+        let deadline = chrono::DateTime::from_timestamp(2_051_222_400, 0).unwrap();
+        ctx.sleep_until("wake", deadline)
+            .await
+            .map_err(|e| e.to_string())?;
+        let t1 = ctx.now().timestamp();
+        Ok(json!({ "delta": t1 - t0 }))
+    })
+}
+
+/// Sleeps until an instant firmly in the past — must fire immediately.
+fn sleep_until_past_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // 2000-01-01T00:00:00Z — firmly in the past.
+        let deadline = chrono::DateTime::from_timestamp(946_684_800, 0).unwrap();
+        ctx.sleep_until("wake", deadline)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("fired"))
+    })
+}
+
+#[tokio::test]
+async fn sleep_until_resolves_in_test_env_without_real_sleep() {
+    let outcome = WorkflowTestEnv::new()
+        .run(sleep_until_future_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    // The recorded durable-timer duration and the virtual-clock delta must
+    // agree (robust to `system_now()` returning real wall time in tests).
+    let timer_secs = outcome
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::TimerStarted { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        })
+        .expect("a TimerStarted event must be recorded");
+    let delta = outcome.result.unwrap()["delta"].as_u64().unwrap();
+    assert_eq!(
+        delta, timer_secs,
+        "virtual clock must advance by exactly the recorded timer duration"
+    );
+    assert!(timer_secs > 0, "a future deadline must be a positive wait");
+}
+
+#[tokio::test]
+async fn sleep_until_past_deadline_fires_immediately() {
+    let outcome = WorkflowTestEnv::new()
+        .run(sleep_until_past_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("fired")));
+
+    let timer_secs = outcome
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::TimerStarted { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        })
+        .expect("a TimerStarted event must be recorded even for a past deadline");
+    assert_eq!(
+        timer_secs, 0,
+        "a past deadline must record a zero-duration timer (AC3)"
+    );
+}
+
 fn two_timers_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
