@@ -1425,6 +1425,11 @@ impl HarvestBuilder {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+        validate_retention_overrides(
+            &self.retention,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
 
         if self.worker_config.worker_heartbeat_interval.is_zero() {
             return Err(HarvestBuilderError::InvalidWorkerConfig(
@@ -1636,6 +1641,35 @@ fn validate_completion_triggers(
                 trigger_id: trigger.id,
                 message,
             });
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every per-workflow-type retention override (issue #737)
+/// names a registered workflow type — either an explicitly registered
+/// `#[workflow]` or an auto-registered DAG workflow. Catches typos at build
+/// time rather than silently ignoring the override. Mirrors
+/// [`validate_completion_triggers`].
+fn validate_retention_overrides(
+    retention: &crate::retention::RetentionConfig,
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    if retention.workflow_overrides().is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows
+        .iter()
+        .map(|w| w.name.to_string())
+        .chain(auto_registered_dag_workflows.iter().cloned())
+        .collect();
+    for name in retention.workflow_overrides().keys() {
+        if !registered.contains(name) {
+            return Err(HarvestBuilderError::InvalidRetention(format!(
+                "retention override names unknown workflow type '{name}'; \
+                 register it with .workflows(...) or remove the override"
+            )));
         }
     }
     Ok(())
@@ -3736,6 +3770,55 @@ mod tests {
                 }) if workflow_name == "unknown_target" && role == "target"
             ),
             "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_retention_overrides_registration() {
+        use crate::retention::RetentionConfig;
+        use std::time::Duration;
+
+        let workflows = vec![fake_workflow_info()]; // registered name: "test"
+        let dags = vec!["my_dag".to_string()];
+
+        // Unknown override name -> Err
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("typo_wf", Duration::from_secs(60));
+        let result = validate_retention_overrides(&cfg, &workflows, &dags);
+        assert!(
+            matches!(result, Err(HarvestBuilderError::InvalidRetention(_))),
+            "Expected InvalidRetention for unknown override name, got: {result:?}"
+        );
+
+        // Known registered workflow name -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("test", Duration::from_secs(60));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+
+        // Known auto-registered DAG workflow name -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("my_dag", Duration::from_secs(60));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+
+        // Empty overrides -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+    }
+
+    #[test]
+    fn harvest_builder_rejects_unknown_retention_override() {
+        use crate::retention::RetentionConfig;
+        use std::time::Duration;
+
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("nope", Duration::from_secs(60));
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .retention(cfg)
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::InvalidRetention(ref m)) if m.contains("nope")),
+            "Expected InvalidRetention naming the unknown type, got: {result:?}"
         );
     }
 

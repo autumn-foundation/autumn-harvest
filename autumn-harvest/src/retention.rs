@@ -327,6 +327,13 @@ pub struct RetentionTickResult {
     pub duration_ms: u128,
     /// The last error encountered during the tick, if any.
     pub last_error: Option<String>,
+    /// Per-workflow-type deletion counts for this tick (issue #737).
+    ///
+    /// In dry-run mode these are the counts the janitor *would* delete under
+    /// each type's resolved retention age. In a real run they are the counts
+    /// actually deleted. Surfaced via `GET /admin/retention` for per-type
+    /// reporting.
+    pub deleted_by_workflow: BTreeMap<String, u64>,
 }
 
 /// The current overall status of the retention subsystem.
@@ -440,10 +447,16 @@ impl RetentionRuntime {
                     }
                 }
 
-                // Workflow-history retention: only when max_age is configured.
-                if let Some(max_age) = config.max_age() {
-                    let cutoff =
-                        Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
+                // Workflow-history retention: runs when the global max_age OR
+                // any per-workflow-type override is configured (issue #737).
+                if let Some(loosest_age) = config.loosest_cutoff_age() {
+                    // Compute `now` once so every shard's per-candidate
+                    // resolution uses a single consistent clock; `loose_cutoff`
+                    // is the smallest-effective-age SQL pre-filter (a superset
+                    // of every deletable row across all types).
+                    let now = Utc::now();
+                    let loose_cutoff =
+                        now - chrono::Duration::from_std(loosest_age).unwrap_or_default();
                     let tick_futures = pools.iter_shards().map(|(shard, pool)| {
                         let pool = pool.clone();
                         let config = config.clone();
@@ -456,7 +469,8 @@ impl RetentionRuntime {
                             let tick = run_shard_tick(
                                 pool,
                                 shard,
-                                cutoff,
+                                now,
+                                loose_cutoff,
                                 &config,
                                 archiver,
                                 cursor,
@@ -481,6 +495,7 @@ impl RetentionRuntime {
                                 result.candidate_count = ok.candidate_count;
                                 result.deleted_count = ok.deleted_count;
                                 result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
+                                result.deleted_by_workflow = ok.deleted_by_workflow.clone();
                                 tracing::info!(
                                     shard = %shard,
                                     candidates = ok.candidate_count,
@@ -497,6 +512,16 @@ impl RetentionRuntime {
                                     ok.deleted_count as u64,
                                     result.duration_ms as f64 / 1000.0,
                                 );
+                                // Per-workflow-type deletion counter (issue
+                                // #737, AC8). Real deletes only — the metric
+                                // confirms ACTUAL deletion (it reads 0 for a
+                                // long-retained type until its own age), so a
+                                // dry-run's would-delete counts are excluded.
+                                if !config.dry_run {
+                                    for (name, count) in &ok.deleted_by_workflow {
+                                        metrics.record_retention_deleted(name, *count);
+                                    }
+                                }
                             }
                             Err(error) => {
                                 result.last_error = Some(error.to_string());
@@ -590,6 +615,9 @@ struct ShardTickOutcome {
     deleted_count: usize,
     oldest_age_secs_skipped: Option<u64>,
     next_cursor: Option<RetentionScanCursor>,
+    /// Per-workflow-type deletion counts (real deletes and dry-run
+    /// would-deletes). Issue #737.
+    deleted_by_workflow: BTreeMap<String, u64>,
 }
 
 #[cfg(feature = "db")]
@@ -664,7 +692,8 @@ impl Drop for RetentionLeaseGuard {
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
-    cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+    loose_cutoff: DateTime<Utc>,
     config: &RetentionConfig,
     archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
@@ -746,7 +775,7 @@ async fn run_shard_tick(
                      LIMIT $4
                      FOR UPDATE SKIP LOCKED",
                 )
-                .bind::<Timestamptz, _>(cutoff)
+                .bind::<Timestamptz, _>(loose_cutoff)
                 .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
                 .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                 .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
@@ -813,8 +842,34 @@ async fn run_shard_tick(
                 .await
                 .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-            if should_skip_candidate(&mut conn, &candidate, cutoff).await? {
-                let age = Utc::now()
+            // --- Per-candidate retention decision (issue #737) ------------
+            // This is the single seam where a candidate's fate is decided.
+            // Resolve the effective max-age for THIS workflow type (override
+            // or global fallback), then gate on it before any archive/delete.
+            // Future policies (#747 legal hold, #752 tiered summary) hook in
+            // here.
+            let Some(age) = config.effective_max_age(&candidate.workflow_name) else {
+                // Neither an override nor a global max-age applies to this
+                // type: never delete it. Routine skip.
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            };
+            let resolved_cutoff =
+                now - chrono::Duration::from_std(age).unwrap_or_else(|_| chrono::Duration::zero());
+            if completed_at >= resolved_cutoff {
+                // The loosest-cutoff SQL pre-filter is a superset; this type is
+                // not old enough under its own effective age. Routine skip, and
+                // record its age for tuning observability (as the existing
+                // should_skip branch does for not-yet-collectable candidates).
+                let skipped_age = now
                     .signed_duration_since(completed_at)
                     .num_seconds()
                     .max(0)
@@ -822,31 +877,44 @@ async fn run_shard_tick(
                 outcome.oldest_age_secs_skipped = Some(
                     outcome
                         .oldest_age_secs_skipped
-                        .map_or(age, |existing| existing.max(age)),
+                        .map_or(skipped_age, |existing| existing.max(skipped_age)),
                 );
-
-                // Release its lease immediately so it can be picked up on subsequent ticks
-                diesel::update(
-                    harvest_workflow_executions::table
-                        .filter(harvest_workflow_executions::id.eq(candidate.id)),
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
                 )
-                .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
-                .execute(&mut conn)
-                .await
-                .map_err(database_error)?;
+                .await?;
+                continue;
+            }
 
-                // Advance cursor for routine skips
-                if !has_failed {
-                    outcome.next_cursor = Some(candidate_cursor);
-                }
-
-                {
-                    let mut active_guard =
-                        guard.active_ids.lock().expect("lease guard lock poisoned");
-                    if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
-                        active_guard.swap_remove(pos);
-                    }
-                }
+            // NOTE: pass the per-type `resolved_cutoff` (not the loose cutoff)
+            // to should_skip_candidate — its continue-as-new chain-link check
+            // compares `completed_at >= $cutoff` and must see this type's own
+            // cutoff to be correct.
+            if should_skip_candidate(&mut conn, &candidate, resolved_cutoff).await? {
+                let skipped_age = now
+                    .signed_duration_since(completed_at)
+                    .num_seconds()
+                    .max(0)
+                    .cast_unsigned();
+                outcome.oldest_age_secs_skipped = Some(
+                    outcome
+                        .oldest_age_secs_skipped
+                        .map_or(skipped_age, |existing| existing.max(skipped_age)),
+                );
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
                 continue;
             }
 
@@ -956,6 +1024,11 @@ async fn run_shard_tick(
 
             if config.dry_run {
                 outcome.deleted_count += 1;
+                // Per-type would-delete count (issue #737, AC7).
+                *outcome
+                    .deleted_by_workflow
+                    .entry(candidate.workflow_name.clone())
+                    .or_insert(0) += 1;
                 if !has_failed {
                     outcome.next_cursor = Some(candidate_cursor);
                 }
@@ -992,6 +1065,11 @@ async fn run_shard_tick(
                 break;
             }
             outcome.deleted_count += 1;
+            // Per-type real-delete count (issue #737, AC7/AC8).
+            *outcome
+                .deleted_by_workflow
+                .entry(candidate.workflow_name.clone())
+                .or_insert(0) += 1;
 
             // After the execution row (and its refs) are durably gone, delete any
             // blob no longer referenced by a surviving execution. A blob still
@@ -1130,6 +1208,44 @@ async fn delete_candidate_execution(
         })
     })
     .await
+}
+
+/// Common bookkeeping for a "routine skip" of a retention candidate (issue
+/// #737): release the candidate's retention lease so a later tick can revisit
+/// it, advance the scan cursor when the tick has not already failed, and drop
+/// the id from the lease guard's active set. Used by every non-deleting,
+/// non-failing per-candidate decision (never-delete type, not-old-enough for
+/// its type, and the pre-existing dependency-based `should_skip_candidate`).
+/// It must NOT freeze the cursor and must NOT set `has_failed`.
+#[cfg(feature = "db")]
+async fn routine_skip_candidate(
+    conn: &mut diesel_async::AsyncPgConnection,
+    candidate_id: uuid::Uuid,
+    candidate_cursor: RetentionScanCursor,
+    has_failed: bool,
+    outcome: &mut ShardTickOutcome,
+    active_ids: &Arc<Mutex<Vec<uuid::Uuid>>>,
+) -> HarvestResult<()> {
+    // Release its lease immediately so it can be picked up on subsequent ticks.
+    diesel::update(
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq(candidate_id)),
+    )
+    .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+
+    // Advance cursor for routine skips.
+    if !has_failed {
+        outcome.next_cursor = Some(candidate_cursor);
+    }
+
+    let mut active_guard = active_ids.lock().expect("lease guard lock poisoned");
+    if let Some(pos) = active_guard.iter().position(|&x| x == candidate_id) {
+        active_guard.swap_remove(pos);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "db")]
