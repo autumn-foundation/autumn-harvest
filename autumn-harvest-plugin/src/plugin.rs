@@ -792,9 +792,13 @@ async fn start_harvest_runtime(
                     shard_count: sp.iter_shards().count(),
                 });
         let pool_view = resolve_pool_view(sharded_pool_sizing, fallback_pool_sizing);
-        let poll_interval =
-            autumn_harvest::worker::WorkerRuntimeConfig::from(built.worker_config().clone())
-                .poll_interval;
+        // Read the poll interval from the side-effect-free constant rather than
+        // constructing a `WorkerRuntimeConfig`, whose `From<WorkerConfig>`
+        // conversion prematurely locks the write-once
+        // `GLOBAL_DEFAULT_WORKFLOW_QUEUE` (issue #695 review). This capture runs
+        // before the fallible preflight/`HarvestRunner::start`, so a read-only
+        // introspection snapshot must not mutate that global.
+        let poll_interval = autumn_harvest::worker::DEFAULT_WORKER_POLL_INTERVAL;
         api_state.set_effective_config(EffectiveConfigView::capture(
             built.worker_config(),
             caps,

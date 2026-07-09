@@ -526,6 +526,25 @@ mod tests {
         assert_eq!(json["poll_interval_ms"], 500);
     }
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn poll_interval_ms_matches_the_side_effect_free_constant() {
+        // The effective-config snapshot sources `poll_interval` from
+        // `worker::DEFAULT_WORKER_POLL_INTERVAL` (a side-effect-free constant)
+        // rather than constructing a `WorkerRuntimeConfig` (whose conversion
+        // locks the write-once `GLOBAL_DEFAULT_WORKFLOW_QUEUE`, issue #695).
+        // This test pins that the surfaced value equals that single source of
+        // truth, so the value cannot drift from the runtime's own default.
+        let expected_ms =
+            u64::try_from(crate::worker::DEFAULT_WORKER_POLL_INTERVAL.as_millis()).unwrap();
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            crate::worker::DEFAULT_WORKER_POLL_INTERVAL,
+        );
+        assert_eq!(view.poll_interval_ms, expected_ms);
+        assert_eq!(expected_ms, 500);
+    }
+
     #[test]
     fn unbounded_ceilings_serialize_as_explicit_null_with_key_present() {
         // These ceilings are `None` in the default config; assert they surface
