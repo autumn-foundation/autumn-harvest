@@ -67,7 +67,10 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::erase;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
-use autumn_harvest::executor::{QueryReplayOutcome, drive_query_replay};
+use autumn_harvest::executor::{
+    TerminalQueryDecision, classify_terminal_query, drive_query_replay,
+    history_reached_terminal_seal,
+};
 use autumn_harvest::external_task;
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
@@ -13637,12 +13640,29 @@ async fn hydrate_ctx_for_query(
         .map_err(map_error)?;
 
     // Terminal executions are now queryable for post-mortem state inspection
-    // (issue #612): the workflow function is driven to completion (full history
-    // drained) and the query is served against its final reconstructed state.
+    // (issue #612): the workflow function is driven through replay and the query
+    // is served against its reconstructed state — the final state for a run that
+    // returned cooperatively, or the partial state at the recorded terminal point
+    // for a run the engine sealed while its function was parked mid-command
+    // (TIMED_OUT / CONTINUED_AS_NEW / mid-await CANCELLED/FAILED). See the
+    // classify_terminal_query call below.
     // Running/suspended executions keep the pre-#612 behaviour byte-for-byte:
     // the drive stops at the first genuine suspension and the query reads the
     // current partial state.
     let terminal = is_terminal_state(&execution.state);
+
+    // A PII-erased terminal execution (issue #495) replays structurally but over
+    // `{"_harvest_erased": true}` payloads, which would compute a misleading
+    // answer. `erase_workflow_payloads` always tombstones the row's own `input`
+    // column, so this O(1) check is authoritative and far cheaper than
+    // re-scanning the full event history on every terminal query (#612). This
+    // takes precedence over the terminal-seal check below.
+    if terminal && erase::execution_input_is_erased(&execution.input) {
+        return Err(map_error(HarvestError::HistoryUnavailable {
+            exec_id,
+            reason: "payloads erased".to_string(),
+        }));
+    }
 
     let workflow = runtime
         .registry
@@ -13663,15 +13683,14 @@ async fn hydrate_ctx_for_query(
     // DB operations for the entire duration of the workflow replay.
     drop(conn);
 
-    // A PII-erased terminal history (issue #495) replays structurally but over
-    // `{"_harvest_erased": true}` payloads, which would compute a misleading
-    // answer. Reject it explicitly (410) rather than serve tombstoned state.
-    if terminal && erase::history_events_contain_tombstone(&history.events) {
-        return Err(map_error(HarvestError::HistoryUnavailable {
-            exec_id,
-            reason: "payloads erased".to_string(),
-        }));
-    }
+    // Whether the recorded history reached a terminal seal (issue #612). A run
+    // the engine seals while its function is parked mid-command (TIMED_OUT,
+    // CONTINUED_AS_NEW, mid-await CANCELLED/FAILED) replays to a suspension, not
+    // Poll::Ready — but its history DOES carry the terminal lifecycle event, so
+    // this distinguishes a legitimately sealed run (serve the partial state) from
+    // a genuinely truncated one (pruned/released → 410). Computed before the
+    // history is moved into the context below.
+    let sealed = terminal && history_reached_terminal_seal(&history.events);
 
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -13706,20 +13725,26 @@ async fn hydrate_ctx_for_query(
     );
 
     if terminal {
-        match outcome {
-            QueryReplayOutcome::ReachedTerminal => Ok(ctx),
-            QueryReplayOutcome::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
+        match classify_terminal_query(outcome, sealed) {
+            // Full drive to Poll::Ready, OR a run the engine sealed while its
+            // function was parked mid-command (TIMED_OUT / CONTINUED_AS_NEW /
+            // mid-await CANCELLED / FAILED): serve the reconstructed state at
+            // the recorded terminal point.
+            TerminalQueryDecision::Serve => Ok(ctx),
+            TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
                     .unwrap_or(u64::MAX),
             })),
-            // The recorded history is insufficient to reach the workflow's
-            // final state — pruned by retention or released on reset. Never
-            // serve a partial/empty answer; surface a distinct 410.
-            QueryReplayOutcome::Suspended => Err(map_error(HarvestError::HistoryUnavailable {
-                exec_id,
-                reason: "pruned by retention or history released".to_string(),
-            })),
+            // The recorded history has no terminal seal at all — it was pruned by
+            // retention or released on reset. Never serve a partial/empty answer;
+            // surface a distinct 410.
+            TerminalQueryDecision::HistoryUnavailable => {
+                Err(map_error(HarvestError::HistoryUnavailable {
+                    exec_id,
+                    reason: "pruned by retention or released".to_string(),
+                }))
+            }
         }
     } else {
         // Running/suspended: serve whatever state the drive reconstructed,

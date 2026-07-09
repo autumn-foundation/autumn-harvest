@@ -237,12 +237,70 @@ fn spin_workflow<'a>(
     })
 }
 
+/// Like [`progress_workflow`] but calls `ctx.continue_as_new(...)` after
+/// processing every item — which parks the function forever. A `CONTINUED_AS_NEW`
+/// run therefore replays to a `Suspended` outcome (not `Poll::Ready`), yet its
+/// history carries the terminal seal, so its query must still serve 200.
+fn continue_as_new_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let processed = Arc::new(std::sync::Mutex::new(0u64));
+        let state = processed.clone();
+        ctx.register_query_handler::<Value, u64, _>("progress", move |_req: &Value| {
+            Ok(*state.lock().expect("counter lock"))
+        });
+
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            ctx.execute_activity_raw("process_item", item.clone(), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            *processed.lock().expect("counter lock") += 1;
+        }
+
+        ctx.continue_as_new(json!({ "carry": *processed.lock().expect("counter lock") }))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
         mcp: false,
         name: "progress_wf",
         module: "tests",
         handler: progress_workflow,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
+fn continue_as_new_info() -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name: "continue_as_new_wf",
+        module: "tests",
+        handler: continue_as_new_workflow,
         execution_timeout: None,
         sla: None,
         concurrency: None,
@@ -321,7 +379,7 @@ fn build_app_with_query_timeout(pool: &DbPool, query_timeout: Duration) -> Harve
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(
-            vec![progress_info(), spin_info()],
+            vec![progress_info(), continue_as_new_info(), spin_info()],
             vec![],
         )),
         Arc::new(DagCatalog::default()),
@@ -395,6 +453,17 @@ async fn seed_execution(
 ) -> ExecutionId {
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
+
+    // `erase_workflow_payloads` tombstones BOTH the event payloads AND the
+    // execution row's own `input` column — the terminal-query erasure check is
+    // now the O(1) row check, so a realistic erased fixture must tombstone the
+    // row input too (issue #612 review).
+    let row_input = if erased {
+        erase::erasure_tombstone()
+    } else {
+        input.clone()
+    };
+
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, input, queue_name, state) \
@@ -403,7 +472,7 @@ async fn seed_execution(
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Text, _>(workflow_name)
     .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
-    .bind::<diesel::sql_types::Jsonb, _>(input)
+    .bind::<diesel::sql_types::Jsonb, _>(row_input)
     .bind::<diesel::sql_types::Text, _>(state)
     .execute(&mut conn)
     .await
@@ -421,6 +490,49 @@ async fn seed_execution(
         .await
         .expect("seed history");
     exec_id
+}
+
+/// A history the engine sealed while a workflow was parked mid-activity: full
+/// pairs for `completed`, then a bare `ActivityScheduled` for `pending` (no
+/// completion), then the `seal` terminal event. Driving `progress_workflow` with
+/// `items = completed ++ [pending]` reconstructs a partial count of
+/// `completed.len()` before parking on the incomplete activity.
+fn sealed_mid_activity_history(
+    completed: &[&str],
+    pending: &str,
+    seal: WorkflowEvent,
+) -> (Value, Vec<WorkflowEvent>) {
+    let mut items: Vec<&str> = completed.to_vec();
+    items.push(pending);
+    let input = json!({ "items": items, "should_fail": false });
+    let mut events = vec![WorkflowEvent::WorkflowStarted {
+        input: input.clone(),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+    for item in completed {
+        let id = ActivityExecId::new();
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "process_item".into(),
+            input: json!(item),
+            queue: "default".into(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: Value::Null,
+        });
+    }
+    events.push(WorkflowEvent::ActivityScheduled {
+        activity_id: ActivityExecId::new(),
+        name: "process_item".into(),
+        input: json!(pending),
+        queue: "default".into(),
+    });
+    events.push(seal);
+    (input, events)
 }
 
 /// Full `progress_wf` history for `items`: `WorkflowStarted` + one
@@ -524,21 +636,124 @@ async fn ac2_failed_cancelled_timed_out_answer_200_with_internal_state() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // FAILED: workflow returns Err after processing both items — query still
-    // reports the internal count (2), never the error string.
+    // FAILED (cooperative return): the workflow returns Err after processing both
+    // items — a full history that drives to Poll::Ready. Query reports the
+    // internal count (2), never the error string.
     let (input, events) = progress_history(&["x", "y"], true);
     let failed = seed_execution(&pool, "progress_wf", "FAILED", input, events, false).await;
     let (status, body) = get(&app, &format!("/workflows/{failed}/query/progress")).await;
     assert_eq!(status, StatusCode::OK, "FAILED query: {body:?}");
     assert_eq!(body, json!(2));
 
-    for state in ["CANCELLED", "TIMED_OUT"] {
-        let (input, events) = progress_history(&["a", "b"], false);
+    // CANCELLED / TIMED_OUT: the engine seals these while the function is parked
+    // on an in-flight activity, so the history ends with a trailing incomplete
+    // ActivityScheduled + a terminal lifecycle event and the drive replays to a
+    // *suspension*, not Poll::Ready. It must still serve 200 with the partial
+    // internal state reconstructed at the recorded terminal point (count = 1,
+    // one activity completed before the seal).
+    for (state, seal) in [
+        (
+            "CANCELLED",
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator cancelled mid-flight".into(),
+            },
+        ),
+        (
+            "TIMED_OUT",
+            WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: Utc::now(),
+                timed_out_at: Utc::now(),
+            },
+        ),
+    ] {
+        let (input, events) = sealed_mid_activity_history(&["a"], "b", seal);
         let exec_id = seed_execution(&pool, "progress_wf", state, input, events, false).await;
         let (status, body) = get(&app, &format!("/workflows/{exec_id}/query/progress")).await;
         assert_eq!(status, StatusCode::OK, "{state} query: {body:?}");
-        assert_eq!(body, json!(2), "{state} reports final internal state");
+        assert_eq!(
+            body,
+            json!(1),
+            "{state} (sealed while parked mid-activity) reports partial internal state"
+        );
     }
+}
+
+#[tokio::test]
+async fn ac2_continued_as_new_answers_200_with_internal_state() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // CONTINUED_AS_NEW: continue_as_new parks the function forever, so the run
+    // replays to a *suspension*, not Poll::Ready — yet its history ends with the
+    // WorkflowContinuedAsNew terminal seal, so the query must serve 200 with the
+    // count reached at the continue_as_new point (2).
+    let (input, mut events) = progress_history(&["a", "b"], false);
+    events.push(WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id: ExecutionId::new(),
+        input: json!({ "carry": 2 }),
+    });
+    let exec_id = seed_execution(
+        &pool,
+        "continue_as_new_wf",
+        "CONTINUED_AS_NEW",
+        input,
+        events,
+        false,
+    )
+    .await;
+
+    let (status, body) = get(&app, &format!("/workflows/{exec_id}/query/progress")).await;
+    assert_eq!(status, StatusCode::OK, "CONTINUED_AS_NEW query: {body:?}");
+    assert_eq!(
+        body,
+        json!(2),
+        "CONTINUED_AS_NEW reports the count reached at the continue_as_new point"
+    );
+}
+
+#[tokio::test]
+async fn running_partial_history_serves_query_with_partial_state() {
+    // FIX #612 review: guard the running-workflow path within this feature's own
+    // file. A RUNNING execution with a partial history (parks at a suspension, no
+    // terminal seal) must serve 200 with the partial state — NEVER 410. The
+    // terminal-seal classifier only applies to terminal executions; a RUNNING run
+    // is served regardless of the drive outcome.
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Two of three items completed, third never scheduled → drive suspends.
+    let input = json!({ "items": ["a", "b", "c"], "should_fail": false });
+    let mut events = vec![WorkflowEvent::WorkflowStarted {
+        input: input.clone(),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+    for item in ["a", "b"] {
+        let id = ActivityExecId::new();
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "process_item".into(),
+            input: json!(item),
+            queue: "default".into(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: Value::Null,
+        });
+    }
+    let exec_id = seed_execution(&pool, "progress_wf", "RUNNING", input, events, false).await;
+
+    let (status, body) = get(&app, &format!("/workflows/{exec_id}/query/progress")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a RUNNING partial-history query must serve 200, not 410: {body:?}"
+    );
+    assert_eq!(body, json!(2), "running path serves current partial state");
 }
 
 #[tokio::test]
