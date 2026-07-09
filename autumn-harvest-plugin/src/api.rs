@@ -65,7 +65,12 @@ use autumn_harvest::calendar::{
 use autumn_harvest::completion_trigger::{InputMapping, TerminalState, TriggerCondition};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
+use autumn_harvest::erase;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::executor::{
+    TerminalQueryDecision, classify_terminal_query, drive_query_replay,
+    history_reached_terminal_seal,
+};
 use autumn_harvest::external_task;
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
@@ -1290,6 +1295,114 @@ impl From<WorkflowExecution> for StalledWorkflowRow {
     }
 }
 
+/// The most recent recorded failure for a pending activity (issue #773).
+///
+/// **Availability differs by activity kind, because retryable failures are not
+/// event-sourced (AC2-vs-AC5 reconciliation):**
+///
+/// - **Regular (task-queue) activities** are the primary #773 target: a
+///   backing-off activity has NOT yet emitted an `ActivityFailed` event (that
+///   is appended only on a *terminal* failure — retry exhausted / non-retryable
+///   — which then drops out of the pending list). A *retryable* failure instead
+///   writes its message into the `harvest_task_queue.error` column and re-queues
+///   the row as `PENDING`. So `last_failure` for a regular activity is sourced
+///   from that task-row `error` column: `error` carries the message, `attempt`
+///   the task-row attempt counter, `error_type` defaults to `"Error"`,
+///   `non_retryable` to `false` (a backing-off task is retryable by
+///   definition), and `failed_at`/`details` are absent (the task row has no
+///   failure timestamp and no structured detail). No migration is added to
+///   event-source these (AC5), so the reduced set is deliberate.
+/// - **Local activities** (and any event-sourced failure) DO record a
+///   `LocalActivityFailed` event per attempt, so the full typed set is present,
+///   including `failed_at` (the event timestamp).
+///
+/// Surfaced on `PendingActivity` / `PendingLocalActivity` so an operator
+/// triaging a backing-off activity sees *why* it is retrying without a second
+/// round-trip. Omitted entirely when the activity has never failed (AC3), so a
+/// healthy-run stack response stays byte-identical to pre-#773 builds.
+#[derive(Debug, Clone, Serialize)]
+struct LastFailure {
+    /// Low-cardinality error-type name. Defaults to `"Error"` for the
+    /// task-row-sourced regular-activity path and for local activities (the
+    /// `LocalActivityFailed` event carries no typed error-type).
+    error_type: String,
+    /// Human-readable failure message. Always present.
+    error: String,
+    /// Attempt number of this (the latest) recorded failure; consistent with
+    /// the sibling `next_retry_at` countdown (AC4).
+    attempt: i32,
+    /// `true` when the worker skipped retry and routed straight to DLQ. Always
+    /// `false` for the regular-activity task-row path (a backing-off task is
+    /// retryable by definition) and for local activities.
+    non_retryable: bool,
+    /// When the failure was recorded. Populated from the
+    /// `harvest_events.timestamp` of the originating `LocalActivityFailed`
+    /// event; `None` (and omitted from the serialized form) for the regular
+    /// task-row path, which has no failure timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional structured failure details (`ActivityFailure::with_details`).
+    /// Always `None` today from both sources — the regular task-row path has no
+    /// structured detail and `LocalActivityFailed` carries none — but the field
+    /// is retained for forward-compat. Omitted from the serialized form when
+    /// absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
+}
+
+/// Build a map of `activity_id` → most-recent [`LastFailure`] from a slice of
+/// decoded `(event_id, event, timestamp)` triples (issue #773). Only
+/// `LocalActivityFailed` events contribute; the entry with the highest
+/// `event_id` wins per activity (AC4), independent of iteration order. Pure and
+/// DB-free so it is unit-testable without a database.
+///
+/// This is the **local-activity** failure source only. Regular (task-queue)
+/// activities are handled inline from the `harvest_task_queue.error` column at
+/// the join site, because a *retryable* regular failure appends no
+/// `ActivityFailed` event (it re-queues the row with the message in the `error`
+/// column) — so an event-sourced map would miss exactly the backing-off
+/// activities #773 targets.
+///
+/// `LocalActivityFailed` carries only `activity_id` / `error` / `attempt`, so
+/// its `error_type` defaults to `"Error"`, `non_retryable` to `false`, and
+/// `details` to `None`; `failed_at` is the event timestamp.
+fn latest_failures_by_activity(
+    events: &[(i64, WorkflowEvent, chrono::DateTime<chrono::Utc>)],
+) -> std::collections::HashMap<uuid::Uuid, LastFailure> {
+    let mut map: std::collections::HashMap<uuid::Uuid, (i64, LastFailure)> =
+        std::collections::HashMap::new();
+    for (event_id, event, ts) in events {
+        let WorkflowEvent::LocalActivityFailed {
+            activity_id,
+            error,
+            attempt,
+        } = event
+        else {
+            continue;
+        };
+        let activity_uuid = activity_id.as_uuid();
+        let failure = LastFailure {
+            error_type: "Error".to_string(),
+            error: error.clone(),
+            attempt: i32::try_from(*attempt).unwrap_or(i32::MAX),
+            non_retryable: false,
+            failed_at: Some(*ts),
+            details: None,
+        };
+        map.entry(activity_uuid)
+            .and_modify(|(existing_id, existing)| {
+                if *event_id >= *existing_id {
+                    *existing_id = *event_id;
+                    *existing = failure.clone();
+                }
+            })
+            .or_insert((*event_id, failure));
+    }
+    map.into_iter()
+        .map(|(k, (_id, failure))| (k, failure))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PendingActivity {
     activity_exec_id: String,
@@ -1358,6 +1471,11 @@ struct PendingActivity {
     schedule_to_start_deadline: Option<chrono::DateTime<chrono::Utc>>,
     start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
     heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// The most recent recorded failure for this activity (issue #773),
+    /// derived from the latest `ActivityFailed` event. Omitted when the
+    /// activity has never failed (AC3). `None` for external-handoff rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failure: Option<LastFailure>,
 }
 
 /// A `std::io::Write` sink that counts bytes and discards them. Used to measure
@@ -1521,6 +1639,11 @@ struct PendingLocalActivity {
     next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
     start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
     heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// The most recent recorded failure for this local activity (issue #773),
+    /// derived from the latest `LocalActivityFailed` event. Omitted when the
+    /// activity has never failed (AC3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failure: Option<LastFailure>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3069,6 +3192,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
+        .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -3143,6 +3267,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             post(retry_dag_run),
+        )
+        // DAG run graph view (issue #690): read-only, admin-guarded per AC1.
+        // Note the asymmetry with the sibling `/dags/*` read routes (e.g.
+        // GET /dags/{dag_name}/runs), which carry no `require_admin` layer and
+        // rely only on the embedder's optional `api_with_auth` boundary — a
+        // pre-existing posture left unchanged here. This route adds the admin
+        // layer because issue #690 AC1 explicitly mandates it.
+        .route(
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            get(get_dag_run_graph).route_layer(require_admin.clone()),
         )
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
@@ -3677,6 +3811,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/history/export"),
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
+        ("GET", "/workflows/{id}/timeline"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -3708,6 +3843,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags"),
         ("GET", "/dags/{dag_name}/runs"),
+        ("GET", "/dags/{dag_name}/runs/{run_exec_id}"),
         ("POST", "/dags/{dag_name}/runs/{run_exec_id}/retry"),
         ("POST", "/dags/{dag_name}/trigger"),
         ("PATCH", "/dags/{dag_name}"),
@@ -4242,6 +4378,18 @@ pub const fn management_api_response_fields()
             ]),
         ),
         (
+            "GET",
+            "/workflows/{id}/timeline",
+            Some(&[
+                "exec_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "steps",
+                "rollup",
+            ]),
+        ),
+        (
             "POST",
             "/workflows/{workflow_name}/start",
             // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
@@ -4437,6 +4585,18 @@ pub const fn management_api_response_fields()
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags", None),                 // Vec<DagSummary>
         ("GET", "/dags/{dag_name}/runs", None), // Vec<WorkflowExecution>
+        (
+            "GET",
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            Some(&[
+                "run_exec_id",
+                "dag_name",
+                "state",
+                "started_at",
+                "finished_at",
+                "nodes",
+            ]),
+        ),
         (
             "POST",
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
@@ -7395,6 +7555,56 @@ fn unavailable_shards_summary(shards: &[UnavailableShard]) -> String {
         .join(", ")
 }
 
+/// `GET /workflows/{id}/timeline` — reconstruct a single execution's timeline.
+///
+/// Purely read-only (issue #739): projects the recorded `harvest_events` history
+/// into ordered per-step durations (queue-wait vs execution split, slowest step,
+/// busy/wait rollup) via [`autumn_harvest::derive_timeline`]. No new events are
+/// appended and no state is recomputed. Shard routing is O(1) from the
+/// `ExecutionId`; an unknown execution (including a classic DAG run, which is not
+/// on the standard execution path) returns a clear 404.
+///
+/// The timeline surfaces only durations, names, ids, and outcomes — never any
+/// `input`/`output`/`payload`/`error`/`value` field — so read-path payload
+/// decoding (issue #608) is a no-op here and is deliberately skipped (no
+/// `read_path_decoder`, no `audit_decoded_read`).
+async fn get_workflow_timeline(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<autumn_harvest::Timeline>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    let rows = autumn_harvest::store::load_timestamped_history(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+
+    let now = chrono::Utc::now();
+    let timeline = autumn_harvest::derive_timeline(
+        &rows,
+        execution.started_at,
+        now,
+        execution.completed_at,
+        exec_id.to_string(),
+        execution.workflow_id.clone(),
+        execution.workflow_name.clone(),
+        execution.state.clone(),
+    );
+
+    Ok(Json(timeline))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn get_workflow_stack(
     Extension(api_state): Extension<HarvestApiState>,
@@ -7455,6 +7665,38 @@ async fn get_workflow_stack(
         .await
         .map_err(database_error)?;
 
+    // Most-recent LOCAL-activity failure per activity (issue #773). One
+    // read-only query over the `LocalActivityFailed` events for this execution —
+    // regular (task-queue) activities are handled inline from the task-row
+    // `error` column below, because a retryable regular failure appends no
+    // `ActivityFailed` event (it re-queues with the message in `error`). Keyed
+    // by the event's `activity_id`, which equals the `LocalActivityScheduled`
+    // /`LocalActivityFailed` id-space. Restricting the query to
+    // `LocalActivityFailed` also keeps the #608 read-path decode scoped to the
+    // failures actually surfaced on the local panel.
+    let failures_by_activity = {
+        let failure_events = harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+            .filter(harvest_events::event_type.eq("LocalActivityFailed"))
+            .order(harvest_events::event_id.asc())
+            .select((
+                harvest_events::event_id,
+                harvest_events::event_data,
+                harvest_events::timestamp,
+            ))
+            .load::<(i32, serde_json::Value, chrono::DateTime<chrono::Utc>)>(&mut conn)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .filter_map(|(event_id, data, ts)| {
+                serde_json::from_value::<WorkflowEvent>(data)
+                    .ok()
+                    .map(|event| (i64::from(event_id), event, ts))
+            })
+            .collect::<Vec<_>>();
+        latest_failures_by_activity(&failure_events)
+    };
+
     let rate_limit_keys: Vec<String> = tasks
         .iter()
         .filter(|t| t.state == "PENDING")
@@ -7505,6 +7747,11 @@ async fn get_workflow_stack(
     // response are judged against a consistent instant (Finding 7 / #516).
     let now = chrono::Utc::now();
     // Accumulated across every decoded field on this response (issue #608).
+    // The surfaced #773 `last_failure` errors are decoded inline at each join
+    // site below (regular: from the task-row `error`; local: from the failure
+    // map, restricted to the surfaced local activities), so a ciphertext error
+    // is rewritten exactly for the rows actually returned and every decode is
+    // folded into this outcome for the best-effort audit row.
     let mut decode_outcome = LossyDecodeOutcome::default();
     let pending_activities = tasks
         .into_iter()
@@ -7586,6 +7833,27 @@ async fn get_workflow_stack(
                     (payload, Some(truncated), bytes)
                 });
             let input_omitted_for_budget = input_truncated.map(|_| false);
+            // Regular (task-queue) activity last_failure (issue #773): sourced
+            // from the task-row `error` column, which `requeue_for_retry` sets
+            // on every RETRYABLE (backing-off) failure — the primary #773 case,
+            // which appends no `ActivityFailed` event. When the row has no
+            // recorded error (never failed / external-handoff synthetic), it is
+            // omitted (AC3). Decoded inline (issue #608) when the decoder is
+            // active, folding into `decode_outcome` for the audit row.
+            let last_failure = t.error.map(|raw| {
+                let mut error = raw;
+                if let Some(codecs) = decoder.as_ref() {
+                    decode_outcome = decode_outcome.merged(decode_error_field(codecs, &mut error));
+                }
+                LastFailure {
+                    error_type: "Error".to_string(),
+                    error,
+                    attempt: t.attempt,
+                    non_retryable: false,
+                    failed_at: None,
+                    details: None,
+                }
+            });
             PendingActivity {
                 activity_exec_id: t.id.to_string(),
                 activity_name: t.activity_name.unwrap_or_default(),
@@ -7611,6 +7879,7 @@ async fn get_workflow_stack(
                     .last_heartbeat_at
                     .zip(t.heartbeat_timeout)
                     .map(|(h, d)| h + d),
+                last_failure,
             }
         })
         .collect::<Vec<_>>();
@@ -7652,6 +7921,10 @@ async fn get_workflow_stack(
             schedule_to_start_deadline: None,
             start_to_close_deadline: Some(task.deadline_at),
             heartbeat_deadline: None,
+            // External-handoff rows are a different id-space (the handoff PK is
+            // surfaced as activity_exec_id) and carry no ActivityFailed events
+            // keyed by a task-queue activity_id, so no failure joins here (#773).
+            last_failure: None,
         })
         .collect::<Vec<_>>();
     let pending_external_handoffs = external_handoff_rows
@@ -7704,6 +7977,24 @@ async fn get_workflow_stack(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_string();
+                        // The local-activity id-space is the `activity_id`
+                        // string on the event, which is what
+                        // `LocalActivityFailed.activity_id` (and hence the
+                        // failure map key) also carries — parse it to look up
+                        // the most-recent failure (issue #773). Decode the
+                        // error inline (issue #608) so the read-path decode is
+                        // scoped to the SURFACED local activities only (P3), and
+                        // fold it into `decode_outcome` for the audit row.
+                        let last_failure = uuid::Uuid::parse_str(&activity_exec_id)
+                            .ok()
+                            .and_then(|aid| failures_by_activity.get(&aid).cloned())
+                            .map(|mut failure| {
+                                if let Some(codecs) = decoder.as_ref() {
+                                    decode_outcome = decode_outcome
+                                        .merged(decode_error_field(codecs, &mut failure.error));
+                                }
+                                failure
+                            });
                         acc.insert(
                             activity_exec_id.clone(),
                             PendingLocalActivity {
@@ -7717,6 +8008,7 @@ async fn get_workflow_stack(
                                 next_retry_at: None,
                                 start_to_close_deadline: None,
                                 heartbeat_deadline: None,
+                                last_failure,
                             },
                         );
                     }
@@ -13621,29 +13913,12 @@ pub(crate) async fn signal_workflow(
     ))
 }
 
-/// Waker that records whether `wake()` was called synchronously during a poll.
-///
-/// Used by [`hydrate_ctx_for_query`] to distinguish genuine command-based
-/// suspension (waker never fired) from ordinary async yields like
-/// `tokio::task::yield_now()` (waker fires immediately, signalling the caller
-/// to re-poll).
-struct WokenFlag(std::sync::atomic::AtomicBool);
-
-impl futures::task::ArcWake for WokenFlag {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        std::sync::atomic::AtomicBool::store(
-            &arc_self.0,
-            true,
-            std::sync::atomic::Ordering::Release,
-        );
-    }
-}
-
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
+    query_label: &str,
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
@@ -13651,9 +13926,29 @@ async fn hydrate_ctx_for_query(
         .await
         .map_err(map_error)?;
 
-    // Queries are only meaningful on running workflows.
-    if is_terminal_state(&execution.state) {
-        return Err(map_error(HarvestError::WorkflowNotRunning(exec_id)));
+    // Terminal executions are now queryable for post-mortem state inspection
+    // (issue #612): the workflow function is driven through replay and the query
+    // is served against its reconstructed state — the final state for a run that
+    // returned cooperatively, or the partial state at the recorded terminal point
+    // for a run the engine sealed while its function was parked mid-command
+    // (TIMED_OUT / CONTINUED_AS_NEW / mid-await CANCELLED/FAILED). See the
+    // classify_terminal_query call below.
+    // Running/suspended executions keep the pre-#612 behaviour byte-for-byte:
+    // the drive stops at the first genuine suspension and the query reads the
+    // current partial state.
+    let terminal = is_terminal_state(&execution.state);
+
+    // A PII-erased terminal execution (issue #495) replays structurally but over
+    // `{"_harvest_erased": true}` payloads, which would compute a misleading
+    // answer. `erase_workflow_payloads` always tombstones the row's own `input`
+    // column, so this O(1) check is authoritative and far cheaper than
+    // re-scanning the full event history on every terminal query (#612). This
+    // takes precedence over the terminal-seal check below.
+    if terminal && erase::execution_input_is_erased(&execution.input) {
+        return Err(map_error(HarvestError::HistoryUnavailable {
+            exec_id,
+            reason: "payloads erased".to_string(),
+        }));
     }
 
     let workflow = runtime
@@ -13675,6 +13970,15 @@ async fn hydrate_ctx_for_query(
     // DB operations for the entire duration of the workflow replay.
     drop(conn);
 
+    // Whether the recorded history reached a terminal seal (issue #612). A run
+    // the engine seals while its function is parked mid-command (TIMED_OUT,
+    // CONTINUED_AS_NEW, mid-await CANCELLED/FAILED) replays to a suspension, not
+    // Poll::Ready — but its history DOES carry the terminal lifecycle event, so
+    // this distinguishes a legitimately sealed run (serve the partial state) from
+    // a genuinely truncated one (pruned/released → 410). Computed before the
+    // history is moved into the context below.
+    let sealed = terminal && history_reached_terminal_seal(&history.events);
+
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history.events,
@@ -13694,44 +13998,47 @@ async fn hydrate_ctx_for_query(
         ctx.register_declarative_query_handler(h);
     }
 
-    // Drive the workflow future until it genuinely suspends on a workflow
-    // command (activity, signal wait, timer). Recorded events resolve via
-    // pre-sent oneshot channels so the entire history replays synchronously.
-    // Some workflows interleave ordinary async yields (e.g. yield_now) before
-    // registering query handlers; the WokenFlag waker detects those and keeps
-    // us polling. A wall-clock deadline (query_timeout) prevents spinning on a
-    // misbehaving workflow.
-    let deadline = std::time::Instant::now() + api_state.query_timeout();
-    let flag = Arc::new(WokenFlag(std::sync::atomic::AtomicBool::new(false)));
-    {
-        let waker = futures::task::waker_ref(&flag);
-        let mut poll_cx = std::task::Context::from_waker(&waker);
-        let handler_fut = (workflow.handler)(&ctx, execution.input.clone());
-        tokio::pin!(handler_fut);
-        loop {
-            std::sync::atomic::AtomicBool::store(
-                &flag.0,
-                false,
-                std::sync::atomic::Ordering::Release,
-            );
-            match handler_fut.as_mut().poll(&mut poll_cx) {
-                std::task::Poll::Ready(_) => break,
-                std::task::Poll::Pending => {
-                    let was_woken = std::sync::atomic::AtomicBool::load(
-                        &flag.0,
-                        std::sync::atomic::Ordering::Acquire,
-                    );
-                    if !was_woken || std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    // Waker was signalled immediately — the future yielded but
-                    // wants to be re-polled (e.g. yield_now). Keep driving.
-                }
+    // Drive the workflow future in replay, bounded by `query_timeout`. The
+    // shared driver stops at either `Poll::Ready` (full history drained), a
+    // genuine workflow-command suspension, or the deadline. Recorded events
+    // resolve via pre-sent oneshot channels so the entire history replays
+    // synchronously; this is read-only and appends no events / performs no
+    // writes (issue #612 AC4).
+    let outcome = drive_query_replay(
+        &ctx,
+        workflow.handler,
+        execution.input.clone(),
+        api_state.query_timeout(),
+    );
+
+    if terminal {
+        match classify_terminal_query(outcome, sealed) {
+            // Full drive to Poll::Ready, OR a run the engine sealed while its
+            // function was parked mid-command (TIMED_OUT / CONTINUED_AS_NEW /
+            // mid-await CANCELLED / FAILED): serve the reconstructed state at
+            // the recorded terminal point.
+            TerminalQueryDecision::Serve => Ok(ctx),
+            TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
+                query_name: query_label.to_string(),
+                timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
+                    .unwrap_or(u64::MAX),
+            })),
+            // The recorded history has no terminal seal at all — it was pruned by
+            // retention or released on reset. Never serve a partial/empty answer;
+            // surface a distinct 410.
+            TerminalQueryDecision::HistoryUnavailable => {
+                Err(map_error(HarvestError::HistoryUnavailable {
+                    exec_id,
+                    reason: "pruned by retention or released".to_string(),
+                }))
             }
         }
+    } else {
+        // Running/suspended: serve whatever state the drive reconstructed,
+        // exactly as before #612 — the drive naturally stops at the first
+        // suspension (or the deadline) for a partial, still-growing history.
+        Ok(ctx)
     }
-
-    Ok(ctx)
 }
 
 /// `GET /workflows/{id}/query/{query_name}` — query with no args (backward compat).
@@ -13740,7 +14047,7 @@ async fn query_workflow(
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, &query_name).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
 
     let harvest_result = ctx.execute_query(&query_name);
@@ -13782,7 +14089,7 @@ async fn query_workflow_post(
     body: Bytes,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, &query_name).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
     let args: Value = if body.is_empty() {
         Value::Null
@@ -13818,7 +14125,7 @@ async fn list_workflow_queries(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, "history replay").await?;
     let mut names = ctx.list_query_names();
     names.sort(); // deterministic order for UI
     Ok(Json(names))
@@ -13960,6 +14267,92 @@ async fn list_dag_runs(
         .map_err(database_error)
         .map_err(map_error)?;
     Ok(Json(runs))
+}
+
+/// `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (issue #690).
+///
+/// Read-only: reconstructs a unified DAG run's node topology annotated with
+/// per-node status/timing/attempts/error, purely from the registered
+/// [`DagDefinition`](autumn_harvest::dag::DagDefinition) plus the run's recorded
+/// history. No new event variant, no migration, no writes to `harvest_dag_runs`.
+///
+/// * `404` — unknown `dag_name`, or a `run_exec_id` that is not a run of that DAG.
+/// * `400` (JSON body) — a classic (non-unified) DAG has no `DagDefinition`
+///   topology to annotate.
+///
+/// Cross-shard correct (AC8): reads from the owning shard via
+/// [`db_conn_for_execution`] ([`ExecutionId::shard`](autumn_harvest::types::ExecutionId)
+/// routing), no cross-shard fan-out.
+async fn get_dag_run_graph(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Resolve the DAG by name; reject classic (non-unified) DAGs (AC6).
+    let Some(dag) = runtime.dags().get(&dag_name).cloned() else {
+        return AutumnError::not_found_msg(format!("DAG '{dag_name}' is not registered"))
+            .into_response();
+    };
+    if !dag.is_unified {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "DAG '{dag_name}' is a classic (non-unified) DAG with no DagDefinition \
+                     topology to annotate; the run graph view is only supported for unified DAGs."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    let exec_id = match parse_execution_id(&run_exec_id) {
+        Ok(eid) => eid,
+        Err(e) => return e.into_response(),
+    };
+
+    // AC8: route to the owning shard via ExecutionId::shard().
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load the run and verify it belongs to this DAG (AC6: 404 otherwise).
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => return map_error(e).into_response(),
+    };
+    if execution.workflow_name != dag_name {
+        return AutumnError::not_found_msg(format!(
+            "execution {exec_id} is not a run of DAG '{dag_name}'"
+        ))
+        .into_response();
+    }
+
+    // Timestamped history for per-node started_at/finished_at (issue #690).
+    let ts_events = match store::load_history_with_timestamps(&mut conn, exec_id).await {
+        Ok(evts) => evts,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let nodes = crate::dag_graph::build_run_graph(&dag.definition, &ts_events, &execution.state);
+
+    let response = crate::dag_graph::DagRunGraphResponse {
+        run_exec_id: exec_id.to_string(),
+        dag_name,
+        state: execution.state,
+        started_at: execution.started_at,
+        finished_at: execution.completed_at,
+        nodes,
+    };
+
+    (axum::http::StatusCode::OK, Json(response)).into_response()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -22878,6 +23271,13 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             "query '{query_name}' timed out after {timeout_ms}ms"
         ))
         .with_status(axum::http::StatusCode::REQUEST_TIMEOUT),
+        // The execution row is present but its history is unqueryable (pruned by
+        // retention, released on reset, or payloads erased) — distinct from a
+        // fully-deleted row (404). Issue #612.
+        HarvestError::HistoryUnavailable { reason, .. } => {
+            AutumnError::bad_request_msg(format!("history unavailable: {reason}"))
+                .with_status(axum::http::StatusCode::GONE)
+        }
         HarvestError::Config(message)
         | HarvestError::NonDeterministic {
             reason: message, ..
@@ -27146,6 +27546,7 @@ mod tests {
             schedule_to_start_deadline: None,
             start_to_close_deadline: None,
             heartbeat_deadline: None,
+            last_failure: None,
         }
     }
 
@@ -30006,6 +30407,265 @@ mod tests {
                 && on_json.contains("\"input_bytes\":16"),
             "decode-active PendingActivity JSON must carry the input-budget \
              companion fields: {on_json}"
+        );
+    }
+
+    // ── #773: last_failure on PendingActivity / PendingLocalActivity ──────────
+
+    #[test]
+    fn latest_failures_by_activity_keeps_latest_per_activity() {
+        use autumn_harvest::types::ActivityExecId;
+        let act_a = ActivityExecId::new();
+        let act_b = ActivityExecId::new();
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(5);
+        let t2 = t0 + chrono::Duration::seconds(9);
+
+        // Only `LocalActivityFailed` events feed the map now — regular activity
+        // failures are sourced from the task-row `error` column at the join
+        // site (a retryable regular failure appends no event).
+        let events = vec![
+            (
+                10_i64,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: act_a,
+                    error: "attempt 2 failed".to_string(),
+                    attempt: 2,
+                },
+                t0,
+            ),
+            (
+                20_i64,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: act_a,
+                    error: "attempt 3 failed".to_string(),
+                    attempt: 3,
+                },
+                t1,
+            ),
+            (
+                30_i64,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: act_b,
+                    error: "local boom".to_string(),
+                    attempt: 1,
+                },
+                t2,
+            ),
+        ];
+
+        let map = latest_failures_by_activity(&events);
+        assert_eq!(map.len(), 2, "one entry per distinct activity_id");
+
+        // AC4: the LATEST recorded failure (highest event_id) wins for act_a.
+        let a = map.get(&act_a.as_uuid()).expect("act_a present");
+        assert_eq!(a.attempt, 3);
+        assert_eq!(a.error, "attempt 3 failed");
+        // LocalActivityFailed defaults: error_type="Error", non_retryable=false,
+        // details=None (the event carries none of those fields); failed_at is
+        // the event timestamp.
+        assert_eq!(a.error_type, "Error");
+        assert!(!a.non_retryable);
+        assert_eq!(a.failed_at, Some(t1));
+        assert!(a.details.is_none());
+
+        let b = map.get(&act_b.as_uuid()).expect("act_b present");
+        assert_eq!(b.attempt, 1);
+        assert_eq!(b.error, "local boom");
+        assert_eq!(b.error_type, "Error");
+        assert!(!b.non_retryable);
+        assert_eq!(b.failed_at, Some(t2));
+        assert!(b.details.is_none());
+    }
+
+    #[test]
+    fn latest_failures_by_activity_ignores_out_of_order_lower_event_ids() {
+        use autumn_harvest::types::ActivityExecId;
+        let act = ActivityExecId::new();
+        let t0 = chrono::Utc::now();
+        // Deliberately present the higher event_id first, then a lower one, to
+        // prove the map keys off the highest event_id, not iteration order.
+        let events = vec![
+            (
+                99_i64,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: act,
+                    error: "latest".to_string(),
+                    attempt: 4,
+                },
+                t0,
+            ),
+            (
+                5_i64,
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: act,
+                    error: "stale".to_string(),
+                    attempt: 1,
+                },
+                t0,
+            ),
+        ];
+        let map = latest_failures_by_activity(&events);
+        assert_eq!(map.get(&act.as_uuid()).unwrap().attempt, 4);
+        assert_eq!(map.get(&act.as_uuid()).unwrap().error, "latest");
+    }
+
+    #[test]
+    fn latest_failures_by_activity_ignores_non_local_failed_events() {
+        use autumn_harvest::types::ActivityExecId;
+        let act = ActivityExecId::new();
+        let t0 = chrono::Utc::now();
+        // A regular ActivityFailed event must NOT feed the local map: the
+        // regular path is task-row-sourced (a retryable regular failure appends
+        // no event at all, so an event-sourced map would miss it — the P1 bug).
+        let events = vec![(
+            10_i64,
+            WorkflowEvent::ActivityFailed {
+                activity_id: act,
+                error: "terminal regular failure".to_string(),
+                attempt: 3,
+                error_type: "DownstreamError".to_string(),
+                non_retryable: true,
+                details: Some(serde_json::json!({"status": 503})),
+            },
+            t0,
+        )];
+        let map = latest_failures_by_activity(&events);
+        assert!(
+            map.is_empty(),
+            "ActivityFailed events must not contribute to the local failure map"
+        );
+    }
+
+    #[test]
+    fn pending_activity_last_failure_field_is_omitted_when_none() {
+        // AC3: a never-failed pending activity omits `last_failure` entirely so
+        // the healthy-run response is byte-identical to pre-#773 builds.
+        let off = pending_with_checkpoint(None);
+        assert!(off.last_failure.is_none(), "fixture sanity");
+        let off_json = serde_json::to_string(&off).expect("serialize");
+        assert!(
+            !off_json.contains("last_failure"),
+            "flag-off PendingActivity JSON must omit the last_failure key: {off_json}"
+        );
+
+        // Regular (task-row) path shape: failed_at=None and details=None, so
+        // BOTH are omitted; the remaining AC2 keys are present.
+        let on = PendingActivity {
+            last_failure: Some(LastFailure {
+                error_type: "Error".to_string(),
+                error: "connection refused".to_string(),
+                attempt: 3,
+                non_retryable: false,
+                failed_at: None,
+                details: None,
+            }),
+            ..off
+        };
+        let on_json = serde_json::to_string(&on).expect("serialize");
+        assert!(
+            on_json.contains("\"last_failure\""),
+            "populated PendingActivity JSON must carry last_failure: {on_json}"
+        );
+        for key in ["error_type", "\"error\"", "attempt", "non_retryable"] {
+            assert!(
+                on_json.contains(key),
+                "last_failure must carry `{key}`: {on_json}"
+            );
+        }
+        // failed_at=None (the regular task-row path) omits the key, mirroring
+        // the details omission below.
+        assert!(
+            !on_json.contains("failed_at"),
+            "last_failure with failed_at=None must omit the failed_at key: {on_json}"
+        );
+        // Quote-anchor the key so this doesn't spuriously match the unrelated
+        // `heartbeat_details` field on PendingActivity — we're asserting the
+        // `last_failure` object itself carries no `"details"` key.
+        assert!(
+            !on_json.contains("\"details\""),
+            "last_failure with details=None must omit the details key: {on_json}"
+        );
+
+        // Event-sourced (local) path shape: failed_at=Some is present.
+        let on_failed_at = PendingActivity {
+            last_failure: Some(LastFailure {
+                error_type: "Error".to_string(),
+                error: "local boom".to_string(),
+                attempt: 2,
+                non_retryable: false,
+                failed_at: Some(chrono::Utc::now()),
+                details: None,
+            }),
+            ..pending_with_checkpoint(None)
+        };
+        let failed_at_json = serde_json::to_string(&on_failed_at).expect("serialize");
+        assert!(
+            failed_at_json.contains("failed_at"),
+            "last_failure with failed_at=Some must carry the failed_at key: {failed_at_json}"
+        );
+
+        // With details=Some, the details key is present.
+        let on_details = PendingActivity {
+            last_failure: Some(LastFailure {
+                error_type: "DownstreamError".to_string(),
+                error: "503".to_string(),
+                attempt: 2,
+                non_retryable: true,
+                failed_at: Some(chrono::Utc::now()),
+                details: Some(serde_json::json!({"status": 503})),
+            }),
+            ..pending_with_checkpoint(None)
+        };
+        let details_json = serde_json::to_string(&on_details).expect("serialize");
+        assert!(
+            details_json.contains("\"details\":{\"status\":503}"),
+            "last_failure with details=Some must carry the details value: {details_json}"
+        );
+    }
+
+    #[test]
+    fn pending_local_activity_last_failure_field_is_omitted_when_none() {
+        let base = PendingLocalActivity {
+            activity_exec_id: "la".to_string(),
+            activity_name: "checksum".to_string(),
+            scheduled_at: chrono::Utc::now(),
+            attempt: 1,
+            max_attempts: 3,
+            task_status: "PENDING".to_string(),
+            last_heartbeat_at: None,
+            next_retry_at: None,
+            start_to_close_deadline: None,
+            heartbeat_deadline: None,
+            last_failure: None,
+        };
+        let off_json = serde_json::to_string(&base).expect("serialize");
+        assert!(
+            !off_json.contains("last_failure"),
+            "flag-off PendingLocalActivity JSON must omit last_failure: {off_json}"
+        );
+
+        let on = PendingLocalActivity {
+            attempt: 2,
+            last_failure: Some(LastFailure {
+                error_type: "Error".to_string(),
+                error: "local boom".to_string(),
+                attempt: 2,
+                non_retryable: false,
+                failed_at: Some(chrono::Utc::now()),
+                details: None,
+            }),
+            ..base
+        };
+        let on_json = serde_json::to_string(&on).expect("serialize");
+        assert!(
+            on_json.contains("\"last_failure\"") && on_json.contains("local boom"),
+            "populated PendingLocalActivity JSON must carry last_failure: {on_json}"
+        );
+        // Event-sourced local path carries failed_at.
+        assert!(
+            on_json.contains("failed_at"),
+            "local last_failure must carry failed_at: {on_json}"
         );
     }
 

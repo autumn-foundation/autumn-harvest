@@ -125,6 +125,30 @@ pub fn is_terminal_state(state: &str) -> bool {
     )
 }
 
+/// Returns `true` if a workflow execution row's payload has been PII-erased
+/// (issue #495), from an O(1) check of its already-loaded `input` column.
+///
+/// A PII-erased terminal history still replays *structurally* (event types,
+/// order, and IDs are untouched), so a post-mortem query (issue #612) would
+/// drive it to completion and then compute against `{"_harvest_erased": true}`
+/// payloads — a subtly wrong answer. Callers serving queries on terminal
+/// executions use this to reject such histories explicitly rather than return
+/// misleading state.
+///
+/// This is authoritative and O(1): [`erase_workflow_payloads`] **always**
+/// tombstones the execution row's own `input` column (it is the very first
+/// column set in the row-scrub `UPDATE`), so testing `input` alone is
+/// sufficient and far cheaper than re-serialising and tree-walking the entire
+/// event history on every terminal query (the 10k-events-under-200ms budget).
+///
+/// `_harvest_erased` is a **reserved payload key**: a workflow whose real input
+/// is literally `{"_harvest_erased": true}` would be indistinguishable from an
+/// erased row here, so authors must not use that key as a top-level input shape.
+#[must_use]
+pub fn execution_input_is_erased(input: &Value) -> bool {
+    is_tombstone(input)
+}
+
 // ── Outcome types ─────────────────────────────────────────────────────────────
 
 /// A child execution that was skipped because it is not yet terminal.
@@ -600,6 +624,28 @@ mod tests {
         ));
         assert!(!is_tombstone(&json!("string")));
         assert!(!is_tombstone(&json!(null)));
+    }
+
+    // ── execution_input_is_erased (issue #612 O(1) row check) ─────────────────
+
+    #[test]
+    fn detects_erased_execution_row_input() {
+        // Production tombstones the row's `input` column to exactly this shape.
+        assert!(execution_input_is_erased(&erasure_tombstone()));
+    }
+
+    #[test]
+    fn does_not_flag_a_clean_execution_row_input() {
+        assert!(!execution_input_is_erased(
+            &json!({ "user_id": 42, "email": "alice@example.com" })
+        ));
+        assert!(!execution_input_is_erased(&json!(null)));
+        assert!(!execution_input_is_erased(&json!("plain string input")));
+        // A nested-but-not-top-level tombstone is NOT an erased row: the row
+        // check keys off the top-level column value only.
+        assert!(!execution_input_is_erased(
+            &json!({ "nested": { "_harvest_erased": true } })
+        ));
     }
 
     // ── EraseOutcome serde ────────────────────────────────────────────────────

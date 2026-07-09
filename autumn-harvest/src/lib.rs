@@ -147,6 +147,8 @@ pub mod test_generator;
 pub mod testing;
 /// Workflow-start throttle — pace admissions, defer the excess (issue #607).
 pub mod throttle;
+/// Per-execution timeline read model (issue #739).
+pub mod timeline;
 #[cfg(any(test, feature = "testing"))]
 pub mod trace_export;
 pub mod types;
@@ -358,6 +360,10 @@ pub use testing::{
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
+};
+pub use timeline::{
+    SlowestStep, StepKind, StepOutcome, Timeline, TimelineEventRow, TimelineRollup, TimelineStep,
+    derive_timeline,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use trace_export::export_chrome_trace;

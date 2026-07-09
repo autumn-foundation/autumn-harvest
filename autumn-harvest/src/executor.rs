@@ -80,6 +80,196 @@ pub struct WorkflowExecuteSpanMeta {
     pub build_id: Option<String>,
 }
 
+/// Classification of a bounded, read-only query-replay drive (issue #612).
+///
+/// A query drives the workflow handler purely in replay against recorded
+/// history — emitting no commands and appending no events — to reconstruct the
+/// context state its registered query handlers read. This enum reports where
+/// that drive stopped so the caller can decide how to respond:
+///
+/// - [`ReachedTerminal`](Self::ReachedTerminal): the handler ran to `Poll::Ready`
+///   (`Ok` **or** `Err`), i.e. the full history was drained and the context now
+///   reflects the workflow's final reconstructed state.
+/// - [`Suspended`](Self::Suspended): the handler blocked on a workflow command
+///   (activity/timer/signal) before reaching `Poll::Ready`, i.e. the recorded
+///   history is insufficient to reconstruct the final state (pruned/released).
+/// - [`TimedOut`](Self::TimedOut): the drive exceeded the supplied deadline
+///   before reaching `Poll::Ready` (a workflow spinning on replay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryReplayOutcome {
+    /// The handler reached `Poll::Ready`; the context holds final state.
+    ReachedTerminal,
+    /// The handler suspended before completing; history is insufficient.
+    Suspended,
+    /// The drive exceeded the supplied deadline.
+    TimedOut,
+}
+
+/// Waker used by [`drive_query_replay`] to detect immediate re-wakes (e.g. a
+/// workflow that calls `tokio::task::yield_now()` — the waker fires synchronously,
+/// signalling the driver to re-poll rather than treat the `Pending` as a genuine
+/// workflow-command suspension).
+struct QueryReplayWaker(std::sync::atomic::AtomicBool);
+
+impl futures::task::ArcWake for QueryReplayWaker {
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Drive a workflow handler future purely in replay, bounded by `timeout`, and
+/// classify where it stopped (issue #612).
+///
+/// This is **read-only**: it never persists anything. The provided `ctx` must
+/// already be a replay context (built via
+/// [`WorkflowContext::for_replay_with_state_and_history_policy`]) with its query
+/// handlers registered; recorded events resolve synchronously via pre-sent
+/// oneshot channels, so the whole history replays without I/O. The returned
+/// [`QueryReplayOutcome`] tells the caller whether the context now reflects the
+/// workflow's final state ([`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal)),
+/// stopped at a genuine suspension with insufficient history
+/// ([`Suspended`](QueryReplayOutcome::Suspended)), or blew the deadline
+/// ([`TimedOut`](QueryReplayOutcome::TimedOut)).
+///
+/// The `Ok`/`Err` return value of the workflow function is intentionally
+/// ignored — a `FAILED` run still reconstructs its final internal state, which
+/// is exactly what a post-mortem query wants to read.
+#[must_use]
+pub fn drive_query_replay(
+    ctx: &WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    timeout: Duration,
+) -> QueryReplayOutcome {
+    use std::future::Future;
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let flag = std::sync::Arc::new(QueryReplayWaker(std::sync::atomic::AtomicBool::new(false)));
+    let waker = futures::task::waker_ref(&flag);
+    let mut poll_cx = std::task::Context::from_waker(&waker);
+    let handler_fut = handler(ctx, input);
+    tokio::pin!(handler_fut);
+
+    // `checked_add` guards against a pathologically large `timeout` overflowing
+    // `Instant` (which would panic on `+`). `None` means "no representable
+    // deadline" → never time out (skip the deadline check entirely below).
+    let deadline = std::time::Instant::now().checked_add(timeout);
+    loop {
+        // Check the deadline BEFORE polling so an already-elapsed (or zero)
+        // deadline classifies deterministically as TimedOut without a hang.
+        // This ordering is intentional and load-bearing: the pure test
+        // `past_deadline_classifies_as_timed_out_deterministically` passes
+        // `Duration::ZERO` and expects `TimedOut`, so switching to poll-first
+        // would break the deterministic-timeout semantics. (The running-path
+        // parity nit — a zero-timeout running query would classify as TimedOut
+        // rather than serve partial state — is intentionally not addressed: the
+        // default `query_timeout` is 5s, so this is unreachable in practice.)
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            return QueryReplayOutcome::TimedOut;
+        }
+        flag.0.store(false, Ordering::Release);
+        match handler_fut.as_mut().poll(&mut poll_cx) {
+            Poll::Ready(_) => return QueryReplayOutcome::ReachedTerminal,
+            Poll::Pending => {
+                if !flag.0.load(Ordering::Acquire) {
+                    // Not woken → genuine suspension on a workflow command.
+                    return QueryReplayOutcome::Suspended;
+                }
+                // Woken immediately (e.g. yield_now) — keep driving.
+            }
+        }
+    }
+}
+
+/// How a query on a *terminal* execution should be answered after driving its
+/// history through [`drive_query_replay`] (issue #612).
+///
+/// This is the pure classification the plugin's `hydrate_ctx_for_query` maps to
+/// HTTP status codes: [`Serve`](Self::Serve) → 200, [`TimedOut`](Self::TimedOut)
+/// → 408, [`HistoryUnavailable`](Self::HistoryUnavailable) → 410.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalQueryDecision {
+    /// Serve the query against the reconstructed context (HTTP 200).
+    Serve,
+    /// The replay exceeded the deadline (HTTP 408).
+    TimedOut,
+    /// The recorded history cannot be replayed to its terminal seal — it was
+    /// pruned by retention or released on reset (HTTP 410).
+    HistoryUnavailable,
+}
+
+/// Returns `true` when the recorded history reached its **terminal seal** (issue
+/// #612).
+///
+/// A terminal seal is any terminal lifecycle event (`WorkflowCompleted`/
+/// `WorkflowFailed`/`WorkflowCancelled`/`WorkflowContinuedAsNew`/
+/// `WorkflowResetTerminated`/`WorkflowExecutionTimedOut`, plus the trailing
+/// bookkeeping events [`is_terminal_lifecycle`](WorkflowEvent::is_terminal_lifecycle)
+/// also classifies) present in the log.
+///
+/// The append-only event log always seals with the terminal event, so it sits
+/// at or near the tail; the scan runs **from the end** so a sealed history
+/// short-circuits in O(1) while tolerating any trailing bookkeeping events
+/// (`ChildWorkflowCascadeApplied`, `WorkflowRetryScheduled`) that follow the
+/// seal — those are themselves classified as terminal-lifecycle, so
+/// last-event-only would also work, but `rev().any()` is robust to any future
+/// non-terminal trailing bookkeeping without an O(N) full scan on the common
+/// sealed case.
+///
+/// Only meaningful for executions whose DB row is already in a terminal state;
+/// callers gate this behind that check.
+#[must_use]
+pub fn history_reached_terminal_seal(events: &[WorkflowEvent]) -> bool {
+    events
+        .iter()
+        .rev()
+        .any(WorkflowEvent::is_terminal_lifecycle)
+}
+
+/// Classify how to answer a query on a **terminal** execution (issue #612),
+/// given the replay `outcome` and whether the recorded history reached its
+/// terminal seal (see [`history_reached_terminal_seal`]).
+///
+/// - [`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal) → always
+///   [`Serve`](TerminalQueryDecision::Serve): the handler drove all the way to
+///   `Poll::Ready`, so the context holds the workflow's fully reconstructed
+///   final state.
+/// - [`TimedOut`](QueryReplayOutcome::TimedOut) →
+///   [`TimedOut`](TerminalQueryDecision::TimedOut) (408): a spinning replay.
+/// - [`Suspended`](QueryReplayOutcome::Suspended):
+///     - if the history reached a terminal seal, the engine sealed the run while
+///       its function was parked mid-command — the canonical shapes are
+///       `CONTINUED_AS_NEW` (`continue_as_new` parks forever), `TIMED_OUT`
+///       (incomplete trailing command + `WorkflowExecutionTimedOut`), and a
+///       mid-await external/hard `CANCELLED`/`FAILED`. This is exactly the
+///       running-path behaviour applied to a run the engine sealed while parked,
+///       so serve the reconstructed partial state at the recorded terminal
+///       point ([`Serve`](TerminalQueryDecision::Serve), 200).
+///     - otherwise the history has no terminal lifecycle event at all → it is
+///       genuinely truncated (pruned by retention / released on reset / empty),
+///       so return [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable)
+///       (410) rather than a misleading partial/empty answer.
+#[must_use]
+pub const fn classify_terminal_query(
+    outcome: QueryReplayOutcome,
+    history_reached_terminal_seal: bool,
+) -> TerminalQueryDecision {
+    match outcome {
+        QueryReplayOutcome::ReachedTerminal => TerminalQueryDecision::Serve,
+        QueryReplayOutcome::TimedOut => TerminalQueryDecision::TimedOut,
+        QueryReplayOutcome::Suspended => {
+            if history_reached_terminal_seal {
+                TerminalQueryDecision::Serve
+            } else {
+                TerminalQueryDecision::HistoryUnavailable
+            }
+        }
+    }
+}
+
 /// Run a workflow function through replay and live execution.
 ///
 /// Builds a [`WorkflowContext`] from the provided event history, invokes the

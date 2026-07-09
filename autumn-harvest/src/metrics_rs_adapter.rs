@@ -365,15 +365,24 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_retention_tick(
         &self,
         shard: u16,
-        _candidate_count: u64,
+        candidate_count: u64,
         deleted_count: u64,
-        _duration_secs: f64,
+        duration_secs: f64,
     ) {
+        // The `harvest.retention.deleted` counter is now owned by
+        // `record_retention_deleted`, which carries a per-workflow-type label
+        // (issue #737). Emitting it here too would double-count. Candidate
+        // count and duration have no metric today; kept as a no-op so the
+        // per-shard tick observability point remains available.
+        let _ = (shard, candidate_count, deleted_count, duration_secs);
+    }
+
+    fn record_retention_deleted(&self, workflow: &str, count: u64) {
         counter!(
             METRIC_RETENTION_DELETED,
-            METRIC_LABEL_SHARD => shard.to_string(),
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
         )
-        .increment(deleted_count);
+        .increment(count);
     }
 
     fn record_payload_offloaded(&self, field: &str, store_id: &str, byte_len: u64) {
@@ -847,6 +856,7 @@ mod tests {
         rec.record_schedule_skipped("workflow", "nightly", "paused");
         rec.record_schedule_decision_write_failed();
         rec.record_retention_tick(0, 100, 50, 0.01);
+        rec.record_retention_deleted("wf", 50);
         rec.record_concurrency_key_in_flight("cap", 3);
         rec.record_concurrency_key_deferred("cap", 1);
         rec.record_workflow_cache_hit("wf", "q");
@@ -879,6 +889,15 @@ mod tests {
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
+    }
+
+    #[test]
+    fn record_retention_deleted_does_not_panic() {
+        // Per-workflow-type retention deletion counter bridge (issue #737).
+        // Must not panic with no global recorder installed.
+        let rec = MetricsRsRecorder;
+        rec.record_retention_deleted("onboarding", 5);
+        rec.record_retention_deleted("nightly_report", 0);
     }
 
     #[test]
