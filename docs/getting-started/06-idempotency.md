@@ -75,6 +75,146 @@ exactly. Full contract and curl examples:
 [signals chapter](04-signals.md#idempotent-standalone-signals-over-http-issue-521)
 and the [signal-delivery section of the management-API reference](../management-api.md#signal-delivery-post-workflowsidsignalsignal_name).
 
+## Idempotent workflow start — `idempotency_key` vs `workflow_id` (issue #808)
+
+The same at-least-once problem hits the **start** path: a webhook or event
+source that retries `POST /workflows/{name}/start` would launch a redundant
+execution on every redelivery. Two knobs deduplicate a start, and they answer
+**different questions**:
+
+| | `workflow_id` (business identity) | `idempotency_key` (delivery identity) |
+|---|---|---|
+| Answers | "Is this the *same logical run*?" | "Is this the *same request*?" |
+| Dedup scope | `(workflow_name, workflow_id)` via the `reuse_policy` matrix | `(workflow_name, idempotency_key)`, **independent of `workflow_id`** |
+| Works when `workflow_id` is auto-generated per request | No (each request is a new id) | **Yes** — that's the point |
+| On a duplicate | Depends on `reuse_policy` (may `409`, attach, or start fresh) | Always a `200` no-op returning the **same** `execution_id` |
+
+`idempotency_key` is checked **first** and short-circuits the `reuse_policy`
+matrix entirely. Supply it out-of-band via the `Idempotency-Key` request header
+(preferred — the raw body stays your workflow input) or the body
+`idempotency_key` field; the header wins when both are present.
+
+To have a replay recognized when the retry body may not deserialize (for
+example a field was tightened between deliveries), supply the key in the
+`Idempotency-Key` **header** — the header is honored independently of body
+validity. A key supplied only in the body `idempotency_key` field requires the
+request body to be structurally valid (deserializable) to be recognized on
+retry, since the body must be parsed to read it. This mirrors the standard
+reason idempotency keys are delivered via a header.
+
+```bash
+# First delivery — creates the run (201, started_fresh: true).
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Idempotency-Key: webhook-evt-abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": 42}}'
+
+# Retry (same key) — no-op returning the SAME execution_id
+# (200, deduplicated: true, no second WorkflowStarted, no second task).
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Idempotency-Key: webhook-evt-abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": 42}}'
+```
+
+Semantics:
+
+- **Exactly one execution** even under N simultaneous same-key starts
+  (concurrency-safe by a composite-PK upsert).
+- **Retention window** (default 24h, `HarvestBuilder::start_idempotency_window`):
+  after it elapses the key is reusable and starts a fresh run.
+- **Byte-identical when unused** — a start with no key omits the
+  `started_fresh`/`deduplicated` response fields entirely.
+- **A committed keyed replay short-circuits to the `200` no-op _before_
+  fresh-start-only validations** — input-schema validation (#373),
+  completion-callback SSRF validation (#605), and the delay/`start_at` checks —
+  **and before the admission gate** (#377). Tightening any of those rules (or
+  raising a gate during an incident) between the original delivery and a retry
+  never rejects a retry of already-done work; the retry returns the original
+  execution regardless of its own body. A genuinely fresh keyed start (no live
+  claim) still runs every validation and the gate normally.
+- **A committed keyed replay survives a malformed body when the key is in the
+  `Idempotency-Key` header.** Because the body is irrelevant on a key hit, a
+  retry whose JSON body no longer deserializes (a client- or server-side shape
+  change after the original delivery) still returns the `200` no-op rather than
+  the JSON extractor's `400`/`422`. **Residual:** with a malformed body the
+  `workflow_id` is unknown, so this fallback can only probe the claim by
+  **key-routing**; a committed replay whose *original* delivery supplied an
+  explicit `workflow_id` (and was therefore routed to — and claimed on — the
+  `workflow_id`-derived shard) is not found by the key-routed fallback and still
+  returns the extractor rejection. This is safe (never a false dedup, never a
+  duplicate run) and narrow: the common header-key usage omits `workflow_id`
+  (auto-generated), which routes by the key and *is* found. A malformed body with
+  **no** key returns the exact extractor rejection unchanged. A well-behaved
+  client sends a consistent, valid body on retries.
+- **Empty key → `400`**; **combining a key with a throttle/debounce/batch
+  policy → `400`** (those defer the start and expose no synchronous
+  `execution_id` to converge on).
+- Shard-local, and it introduces **no new event** — the dedup happens before
+  `WorkflowStarted` is ever appended, so replay is unaffected.
+
+### Consistency caveat in multi-shard deployments
+
+The claim row and its execution are **shard-local**, so a keyed start's shard is
+chosen deterministically from either the key or the `workflow_id`:
+
+- **`workflow_id` omitted** (auto-generated): the start routes by the **key**
+  `(workflow_name, idempotency_key)`. Same-key retries co-locate on one shard and
+  dedup — routing by the per-request `workflow_id` would scatter them. The server
+  also **mints** the auto-generated `workflow_id` onto that same key-shard (by
+  bounded rejection sampling), so a later request that reuses the *returned*
+  `workflow_id` explicitly (a client echo, or a `reject_duplicate` start on that
+  id) routes via `(workflow_name, workflow_id)` back to the shard the execution
+  lives on and sees it — preserving the shard-local `(workflow_name, workflow_id)`
+  uniqueness invariant.
+- **`workflow_id` supplied** (explicit business identity): the start routes by
+  `(workflow_name, workflow_id)`, exactly as a non-keyed start does. This keeps
+  the run on the shard that owns `(name, workflow_id)`, so the `reuse_policy`
+  matrix and the `(name, workflow_id)` uniqueness invariant still apply — a keyed
+  `reject_duplicate` start still `409`s against an existing run, and never
+  silently creates a second run on a different shard. Same-`workflow_id` retries
+  still co-locate (the `workflow_id` is constant) and dedup on the key.
+
+For keyed dedup to converge in a multi-shard deployment, a client must supply a
+**consistent `workflow_id`** — the *same* explicit value, or consistently
+*omit* it and let the server auto-generate — **across all retries of the same
+delivery**. A retry that carries a *different* explicit `workflow_id` is not a
+retry of the same logical delivery: it changes the business identity, can route
+to a different shard-local claim table, and may create a second run. This is
+inherent to shard-local dedup coexisting with the `(workflow_name, workflow_id)`
+reuse matrix — keyed starts with an explicit `workflow_id` route by
+`workflow_id` (so the `reuse_policy` matrix still sees an existing run on that
+identity's shard), and keyed starts with an omitted/auto-generated `workflow_id`
+route by the key. Routing *all* keyed starts by the key instead would break the
+reuse matrix for explicit-`workflow_id` starts whose existing run lives on the
+`workflow_id` shard (the matrix could no longer see it, silently creating a
+duplicate). The two placements cannot both be satisfied when the key and the
+`workflow_id` hash to different shards, and #808 scopes dedup as shard-local with
+no cross-shard probe — so the requirement is on the client: pick one
+`workflow_id` shape *and value* per delivery. In a single-shard deployment this
+is all moot (everything is on one shard).
+
+### Known limitation — shard drain within the retention window
+
+Keyed dedup routes via the **same rendezvous hash + writable-subset redirect**
+as `(workflow_name, workflow_id)` uniqueness (`pick_for_idempotency_key` reuses
+the identical logic as `pick_for_new_workflow`). Because of that, it is **not
+guaranteed across a writable → read-only shard transition** within a key's
+retention window: a key that first claimed a run on a shard which is *later*
+removed from the writable set (drained to read-only, but still readable) will,
+on a same-key retry, rehash to a *different* writable shard, probe/reserve a
+different shard-local `harvest_start_idempotency` row, and can create a **second**
+execution. This is the same drain limitation `(name, workflow_id)` uniqueness
+already has (a drained-shard uniqueness key can likewise be re-created on a
+different writable shard), and issue #808 deliberately scopes keyed dedup to be
+shard-local, exactly as that uniqueness is — so the two share identical behavior.
+The guarantee holds while the **writable set is stable**; do not drain a writable
+shard to read-only while keyed starts targeting it are still within their
+retention window.
+
+See the [start route in the management-API contract](../api-contract.json) for
+the full request/response schema.
+
 ---
 
 [← Child workflows](05-child-workflows.md) · [Index](README.md) · [Next: Reliability knobs →](07-reliability-knobs.md)

@@ -2361,6 +2361,15 @@ pub async fn enforce_timeouts_once(
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
     count += crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs).await?;
+    // Sweep expired request-scoped start-idempotency claims (issue #808). Best
+    // effort table growth control; the reserve upsert overwrites an expired row
+    // in place regardless, so correctness does not depend on this running.
+    count += crate::start_idempotency::sweep_expired_start_idempotency(
+        conn,
+        sharded_pool,
+        shard_assignments,
+    )
+    .await?;
     Ok(count)
 }
 

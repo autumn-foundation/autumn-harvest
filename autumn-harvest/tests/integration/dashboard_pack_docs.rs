@@ -239,7 +239,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_schedule_decision_write_failed", &[]),
     ("harvest_completion_trigger_fires", &["trigger", "outcome"]),
     ("harvest_completion_trigger_skipped", &["trigger", "reason"]),
-    ("harvest_retention_deleted", &["shard"]),
+    ("harvest_retention_deleted", &["workflow"]),
     ("harvest_query_duration", &["query_name", "status"]),
     ("harvest_task_quarantined", &["queue", "reason"]),
     ("harvest_concurrency_in_flight", &["key"]),

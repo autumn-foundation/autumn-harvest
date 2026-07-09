@@ -629,12 +629,17 @@
             "name": "completion_callbacks",
             "required": false,
             "description": "Per-execution completion-callback targets (issue #605): a JSON array of {url, filter} objects. Each target's URL is validated against the operator-configured SSRF host allowlist before admission; a non-allowlisted target rejects the start with 422."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. A committed keyed replay short-circuits to the 200 no-op before fresh-start-only validations (input-schema #373, completion-callback SSRF #605, delay/start_at) and before the admission gate #377, returning the original execution regardless of the retry's body; a genuinely fresh keyed start (no live claim) still runs every validation and the gate. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."
           }
         ]
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -647,13 +652,15 @@
           "batched",
           "flushed",
           "batch_key",
-          "max_size"
+          "max_size",
+          "started_fresh",
+          "deduplicated"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, or when input exceeds the workflow input cap."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, or when idempotency_key is combined with a throttle/debounce/batch policy (issue #808)."
         },
         {
           "status": 409,
@@ -661,7 +668,7 @@
         },
         {
           "status": 503,
-          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts)."
+          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
         },
         {
           "status": 500,
@@ -5947,7 +5954,8 @@
           "summary",
           "shards",
           "shard_errors"
-        ]
+        ],
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker — a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
         {
@@ -5989,7 +5997,8 @@
           "eligible_workers",
           "ineligible_workers",
           "summary"
-        ]
+        ],
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker — a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
         {

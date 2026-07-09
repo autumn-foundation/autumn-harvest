@@ -805,6 +805,140 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     Ok(result)
 }
 
+/// Outcome of [`start_or_load_workflow_execution_idempotent`] (issue #808).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotentStartOutcome {
+    /// This request reserved the `idempotency_key` and performed the start.
+    Started(StartedWorkflowExecution),
+    /// An earlier same-`idempotency_key` start already created the execution;
+    /// this request was a no-op returning that existing run.
+    Deduplicated {
+        /// The already-created execution's id.
+        exec_id: ExecutionId,
+        /// The already-created execution's `workflow_id`.
+        workflow_id: String,
+        /// The already-created execution's current state string.
+        state: String,
+    },
+}
+
+/// Start a workflow with request-scoped idempotency (issue #808).
+///
+/// Reserves a `(workflow_name, idempotency_key)` claim and performs the start in
+/// a **single transaction** so the two are atomic: if the start fails (a
+/// reuse-policy conflict, a validation error, ...) the reservation rolls back so
+/// a retry can start fresh. When the same key was already claimed by an earlier
+/// start whose execution still exists, this is a no-op returning that run
+/// ([`IdempotentStartOutcome::Deduplicated`]) — no second `WorkflowStarted`
+/// event, no second enqueued task.
+///
+/// The idempotency dedupe **precedes and short-circuits** the reuse-policy
+/// matrix keyed on `workflow_id`: a duplicate key never even reaches
+/// `start_or_load_workflow_execution_collect`. When the key is *fresh*, the
+/// normal reuse-policy semantics apply unchanged.
+///
+/// Deferred trigger starts, unfinished-handler checks, and cancellation metrics
+/// produced by an admitted start are dispatched after the transaction commits,
+/// mirroring [`start_or_load_workflow_execution_with_metrics`].
+///
+/// `window_secs` is the retention window in seconds (see
+/// [`crate::start_idempotency`]).
+///
+/// # Errors
+/// - [`HarvestError::AlreadyExists`] when the underlying reuse policy rejects.
+/// - Propagates database / queue / event-store failures (rolling the reservation
+///   back).
+pub async fn start_or_load_workflow_execution_idempotent(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    idempotency_key: &str,
+    window_secs: f64,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<IdempotentStartOutcome> {
+    let new_exec_id = request.exec_id;
+    let shard_id = request.shard_id();
+
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
+        .transaction::<(
+            IdempotentStartOutcome,
+            Vec<DeferredTriggerStart>,
+            Vec<(ExecutionId, String)>,
+            Vec<(String, String)>,
+        ), HarvestError, _>(|conn| {
+            let request = request;
+            async move {
+                match crate::start_idempotency::reserve_start_idempotency(
+                    conn,
+                    request.workflow_name,
+                    idempotency_key,
+                    new_exec_id,
+                    shard_id,
+                    window_secs,
+                )
+                .await?
+                {
+                    crate::start_idempotency::StartIdempotencyReservation::Duplicate {
+                        exec_id,
+                        workflow_id,
+                        state,
+                    } => Ok((
+                        IdempotentStartOutcome::Deduplicated {
+                            exec_id,
+                            workflow_id,
+                            state,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )),
+                    crate::start_idempotency::StartIdempotencyReservation::Reserved => {
+                        let workflow_name = request.workflow_name;
+                        let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
+                            conn, request, true, false, metrics,
+                        )
+                        .await?;
+                        // The reserve wrote the claim pointing at `new_exec_id`.
+                        // If the reuse policy resolved this fresh-key start to an
+                        // *existing* run (e.g. AllowDuplicate attaching to a prior
+                        // workflow_id collision), `new_exec_id` was never inserted
+                        // — repoint the claim at the real run so a subsequent
+                        // same-key request deduplicates cleanly instead of hitting
+                        // the defensive reclaim path and re-running the start.
+                        if started.exec_id != new_exec_id {
+                            crate::start_idempotency::repoint_start_idempotency_claim(
+                                conn,
+                                workflow_name,
+                                idempotency_key,
+                                started.exec_id,
+                            )
+                            .await?;
+                        }
+                        Ok((IdempotentStartOutcome::Started(started), ds, dc, cm))
+                    }
+                }
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    for start in deferred_starts {
+        start.spawn();
+    }
+    for check in deferred_checks {
+        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
+    }
+    if let Some(m) = metrics {
+        for (wf_name, q_name) in cancel_metrics {
+            m.record_workflow_terminal(
+                &wf_name,
+                &q_name,
+                crate::telemetry::WorkflowStatus::Cancelled,
+            );
+        }
+    }
+    Ok(outcome)
+}
+
 /// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
 /// index slot) then insert `new_row` as a fresh execution with its own
 /// `WorkflowStarted` event and task queue entry.
