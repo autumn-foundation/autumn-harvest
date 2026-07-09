@@ -248,6 +248,15 @@ fn workflow_stack_is_covered() {
 }
 
 #[test]
+fn workflow_timeline_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "timeline",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
 fn workflow_children_is_covered() {
     assert_covered(&[
         "workflow",

@@ -274,6 +274,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
+    ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
     (
         "GET /workflows/{id}/query/{query_name}",
         RouteClass::ReadOnly,
@@ -521,6 +522,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/{id}",
     "GET /workflows/{id}/children",
     "GET /workflows/{id}/stack",
+    "GET /workflows/{id}/timeline",
     "GET /workflows/{id}/query/{query_name}",
     "POST /workflows/{id}/query/{query_name}",
     "GET /workflows/{id}/queries",
@@ -585,6 +587,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
     ("GET /workflows/{id}/stack", None),
+    ("GET /workflows/{id}/timeline", None),
     (
         "POST /workflows/{workflow_name}/start",
         Some(OP_WORKFLOW_START),

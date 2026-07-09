@@ -499,6 +499,48 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/workflows/{id}/timeline",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Reconstruct a single execution's timeline (per-step durations, busy-vs-wait split, slowest step) purely from recorded history; no new events are appended and no state is recomputed. Surfaces only durations, names, ids, and outcomes — never any input/output/payload/error/value field — so read-path payload decoding (issue #608) is a no-op and is skipped. Classic DAG runs are not on the execution path and return 404.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "exec_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "steps",
+          "rollup"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
       "method": "POST",
       "path": "/workflows/{workflow_name}/start",
       "category": "workflow",

@@ -184,6 +184,23 @@ fn workflow_list_and_query_use_get_requests() {
         "/workflows/00000000-0000-0000-0000-000000000001/stack"
     );
     assert_eq!(stack_request.body, None);
+
+    let timeline = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "timeline",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow timeline args should parse");
+    let timeline_request = timeline
+        .api_request()
+        .expect("timeline request should build");
+    assert_eq!(timeline_request.method, ApiMethod::Get);
+    assert_eq!(
+        timeline_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/timeline"
+    );
+    assert_eq!(timeline_request.body, None);
 }
 
 #[test]

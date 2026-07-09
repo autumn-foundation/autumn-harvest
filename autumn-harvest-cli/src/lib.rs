@@ -776,6 +776,12 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Reconstruct a workflow execution's timeline (per-step durations, wait vs
+    /// exec split, slowest step) from recorded history.
+    Timeline {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
     /// List child workflow executions for a parent execution.
     Children {
         /// Parent workflow execution ID.
@@ -3687,6 +3693,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         ))),
         WorkflowCommand::Stack { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/stack",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Timeline { execution_id } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/timeline",
             path_segment(execution_id)
         ))),
         WorkflowCommand::Children {
