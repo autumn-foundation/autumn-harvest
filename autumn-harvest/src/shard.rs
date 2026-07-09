@@ -115,6 +115,23 @@ impl ShardRouter {
         self.default_shard
     }
 
+    /// Rendezvous-pick a *writable* shard for a brand new workflow, keyed on
+    /// two arbitrary string tokens.
+    ///
+    /// The initial pick is taken over the full readable set (so the hash is
+    /// stable while the writable set is widened/narrowed) and, when it lands
+    /// outside the writable subset, re-hashed among the writable shards.
+    fn pick_writable(&self, primary: &str, secondary: &str) -> ShardId {
+        let initial = rendezvous_pick(&self.readable_shards, primary, secondary);
+        if self.writable_shards.contains(&initial) {
+            return initial;
+        }
+        if self.writable_shards.is_empty() {
+            return self.default_shard;
+        }
+        rendezvous_pick(&self.writable_shards, primary, secondary)
+    }
+
     /// Pick a shard for a brand new workflow using rendezvous hashing.
     ///
     /// The input is `(workflow_name, workflow_id)` which uniquely identifies
@@ -123,14 +140,27 @@ impl ShardRouter {
     /// retries idempotent.
     #[must_use]
     pub fn pick_for_new_workflow(&self, workflow_name: &str, workflow_id: &str) -> ShardId {
-        let initial = rendezvous_pick(&self.readable_shards, workflow_name, workflow_id);
-        if self.writable_shards.contains(&initial) {
-            return initial;
-        }
-        if self.writable_shards.is_empty() {
-            return self.default_shard;
-        }
-        rendezvous_pick(&self.writable_shards, workflow_name, workflow_id)
+        self.pick_writable(workflow_name, workflow_id)
+    }
+
+    /// Pick a shard for a new workflow started via a request-scoped
+    /// `idempotency_key` (issue #808).
+    ///
+    /// Unlike [`Self::pick_for_new_workflow`], which routes by `(workflow_name,
+    /// workflow_id)`, this routes by `(workflow_name, idempotency_key)` so two
+    /// same-key retries — whose `workflow_id` may be independently
+    /// auto-generated per request — deterministically co-locate on the *same*
+    /// shard, hit the same `harvest_start_idempotency` claim row, and
+    /// deduplicate. Routing by `workflow_id` would scatter same-key retries
+    /// across shards in a multi-shard deployment (one claim row per shard →
+    /// one execution per shard), defeating dedup.
+    ///
+    /// The same writable-subset redirect as [`Self::pick_for_new_workflow`]
+    /// applies (a keyed start still creates a brand-new workflow, so it must
+    /// land on a writable shard).
+    #[must_use]
+    pub fn pick_for_idempotency_key(&self, workflow_name: &str, idempotency_key: &str) -> ShardId {
+        self.pick_writable(workflow_name, idempotency_key)
     }
 
     /// Resolve the shard for an arbitrary `ExecutionId`.
@@ -447,5 +477,61 @@ mod tests {
         let a = router.pick_for_dag("daily_etl");
         let b = router.pick_for_dag("daily_etl");
         assert_eq!(a, b);
+    }
+
+    // ── issue #808: key-based idempotency routing ────────────────────────────
+
+    #[test]
+    fn pick_for_idempotency_key_is_deterministic_for_same_name_and_key() {
+        let router = router_with(&[0, 1, 2, 3]);
+        // The same (name, key) always resolves to the same shard so two
+        // same-key retries co-locate and dedup — independent of workflow_id.
+        let a = router.pick_for_idempotency_key("order_flow", "delivery-42");
+        let b = router.pick_for_idempotency_key("order_flow", "delivery-42");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pick_for_idempotency_key_ignores_workflow_id_entirely() {
+        // Routing must depend only on (name, key), never on workflow_id: a
+        // same-key retry whose workflow_id was auto-generated per request must
+        // still land on the same shard. The method takes no workflow_id, so
+        // this is guaranteed by construction — assert two independent calls
+        // (as two separate requests would make) agree.
+        let router = router_with(&[0, 1, 2, 3, 4]);
+        let first = router.pick_for_idempotency_key("wf", "same-key");
+        let second = router.pick_for_idempotency_key("wf", "same-key");
+        assert_eq!(
+            first, second,
+            "same key must co-locate regardless of per-request workflow_id"
+        );
+    }
+
+    #[test]
+    fn distinct_keys_can_map_to_distinct_shards() {
+        let router = router_with(&[0, 1, 2, 3]);
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..200 {
+            seen.insert(router.pick_for_idempotency_key("wf", &format!("key-{i}")));
+        }
+        assert!(
+            seen.len() > 1,
+            "distinct keys must spread across shards: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_pick_honours_writable_subset() {
+        // A keyed start still creates a brand-new workflow, so it must land on
+        // a writable shard even when the key hashes to a read-only shard.
+        let readable = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+        let writable = vec![ShardId::new(1)];
+        let router = ShardRouter::new(readable, writable, ShardId::new(0));
+        for i in 0..20 {
+            assert_eq!(
+                router.pick_for_idempotency_key("wf", &format!("k-{i}")),
+                ShardId::new(1)
+            );
+        }
     }
 }

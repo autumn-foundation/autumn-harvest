@@ -892,10 +892,27 @@ pub async fn start_or_load_workflow_execution_idempotent(
                         Vec::new(),
                     )),
                     crate::start_idempotency::StartIdempotencyReservation::Reserved => {
+                        let workflow_name = request.workflow_name;
                         let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
                             conn, request, true, false, metrics,
                         )
                         .await?;
+                        // The reserve wrote the claim pointing at `new_exec_id`.
+                        // If the reuse policy resolved this fresh-key start to an
+                        // *existing* run (e.g. AllowDuplicate attaching to a prior
+                        // workflow_id collision), `new_exec_id` was never inserted
+                        // — repoint the claim at the real run so a subsequent
+                        // same-key request deduplicates cleanly instead of hitting
+                        // the defensive reclaim path and re-running the start.
+                        if started.exec_id != new_exec_id {
+                            crate::start_idempotency::repoint_start_idempotency_claim(
+                                conn,
+                                workflow_name,
+                                idempotency_key,
+                                started.exec_id,
+                            )
+                            .await?;
+                        }
                         Ok((IdempotentStartOutcome::Started(started), ds, dc, cm))
                     }
                 }

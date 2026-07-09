@@ -8002,6 +8002,17 @@ fn workflow_resolving_throttle(
     )
 }
 
+/// Maximum accepted length (in bytes, after trimming) for a request-scoped
+/// `idempotency_key` (issue #808).
+///
+/// The key is half of the composite PRIMARY KEY `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency`; an oversized key would
+/// exceed Postgres's ~2704-byte btree index tuple limit and error at INSERT,
+/// leaking a `500` on client-controlled input. Cap it conservatively so
+/// `workflow_name` + key stays well under that limit and a too-long key is a
+/// clean `400` at the API boundary instead.
+const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
+
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -8105,7 +8116,7 @@ pub(crate) async fn start_workflow(
     // whitespace-only) key is a client error surfaced as `400`, never silently
     // downgraded to a non-idempotent start.
     let idempotency_key: Option<String> = {
-        let raw = if let Some(hv) = headers.get("idempotency-key") {
+        let raw = if let Some(hv) = headers.get(HEADER_IDEMPOTENCY_KEY) {
             match hv.to_str() {
                 Ok(s) => Some(s.to_string()),
                 Err(_) => {
@@ -8129,7 +8140,25 @@ pub(crate) async fn start_workflow(
                 )
                     .into_response();
             }
-            Some(s) => Some(s.trim().to_string()),
+            Some(s) => {
+                let trimmed = s.trim();
+                // Cap the key length: it is half of the composite PK on
+                // harvest_start_idempotency, so an oversized key would overflow
+                // the btree tuple limit and 500 at INSERT on client-controlled
+                // input. Reject it cleanly at the boundary instead.
+                if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN})"
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+                Some(trimmed.to_string())
+            }
             None => None,
         }
     };
@@ -8145,9 +8174,23 @@ pub(crate) async fn start_workflow(
     let input = request.input.unwrap_or(Value::Null);
 
     // Compute target shard early so the gate check can filter by shard-scoped gates.
-    let shard = runtime
-        .router
-        .pick_for_new_workflow(&workflow_name, &workflow_id);
+    //
+    // issue #808: a request-scoped `idempotency_key` must route by the KEY
+    // (rendezvous over `(workflow_name, idempotency_key)`), NOT by the
+    // per-request `workflow_id` (which is auto-generated when omitted). Routing
+    // a keyed start by `workflow_id` would scatter same-key retries across
+    // shards in a multi-shard deployment — a separate `harvest_start_idempotency`
+    // claim row per shard, hence a separate execution per shard — defeating the
+    // dedup guarantee. The claim row, its execution, and the per-shard expiry
+    // sweep therefore all use this same key-derived shard. The no-key path is
+    // byte-for-byte unchanged (routes by `workflow_id`).
+    let shard = if let Some(ref key) = idempotency_key {
+        runtime.router.pick_for_idempotency_key(&workflow_name, key)
+    } else {
+        runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+    };
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
@@ -9526,6 +9569,36 @@ pub(crate) async fn start_workflow(
     // mutually exclusive with throttle/debounce/batch (rejected above), so
     // `throttle_reserved` is always `None` here and no token refund is needed.
     if let Some(ref key) = idempotency_key {
+        // Validate execution_timeout_secs BEFORE building params: the range
+        // guard inside the debounce/batch blocks is skipped for keyed starts
+        // (they are mutually exclusive), and `chrono::Duration::seconds` panics
+        // on an out-of-range i64. Mirror the existing 400 guard so an untrusted
+        // value is a clean bad request, never a 500. (issue #808)
+        if let Some(secs) = request.execution_timeout_secs
+            && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: Some(key.as_str()),
+                status: STATUS_FAILED,
+                error_summary: Some("invalid execution_timeout_secs"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("execution_timeout_secs ({secs}) is out of range or negative")
+                })),
+            )
+                .into_response();
+        }
         let window_secs = api_state.start_idempotency_window().as_secs_f64();
         let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
             &mut conn,
@@ -9605,6 +9678,16 @@ pub(crate) async fn start_workflow(
                     } else {
                         axum::http::StatusCode::OK
                     },
+                    // Three honest states on this Started arm (issue #808):
+                    //  - fresh key, fresh run: created=true  → started_fresh:true,  deduplicated:false
+                    //  - fresh key, attached to an existing workflow_id run under
+                    //    the reuse policy (e.g. AllowDuplicate): created=false
+                    //                                          → started_fresh:false, deduplicated:false
+                    //  - same key hit is handled by the Deduplicated arm below
+                    //                                          → started_fresh:false, deduplicated:true
+                    // `deduplicated` is false here because no *idempotency-key*
+                    // dedup occurred (this request won the claim); `started_fresh`
+                    // reflects whether a new WorkflowStarted event was written.
                     Json(StartWorkflowResponse {
                         execution_id: start.exec_id.to_string(),
                         workflow_name: start.workflow_name,
@@ -9637,6 +9720,10 @@ pub(crate) async fn start_workflow(
                     shard_id: Some(shard.as_i32()),
                     source: &source,
                 };
+                // Intentional asymmetry with the Started arm (which returns 503
+                // on audit-insert failure): a dedup replay is a no-op read — the
+                // original start was already audited when it created the run — so
+                // a failed audit here is best-effort and never fails the reply.
                 let _ = audit::insert_audit(&mut conn, &ar).await;
                 (
                     axum::http::StatusCode::OK,
@@ -9669,6 +9756,9 @@ pub(crate) async fn start_workflow(
                     shard_id: Some(shard.as_i32()),
                     source: &source,
                 };
+                // Best-effort audit on the failure paths (intentional asymmetry
+                // with the Started arm's 503-on-audit-failure): the reserve
+                // rolled back, so there is no persisted start to keep consistent.
                 let _ = audit::insert_audit(&mut conn, &ar).await;
                 (
                     axum::http::StatusCode::CONFLICT,

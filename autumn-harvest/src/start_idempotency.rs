@@ -18,6 +18,14 @@
 //! short-circuits the reuse-policy matrix entirely. When a start is *not*
 //! deduplicated (fresh key), the normal reuse-policy semantics apply unchanged.
 //!
+//! Because the dedupe is `workflow_id`-independent, a keyed start must **route
+//! by the key**, not by `workflow_id`. The HTTP handler picks the shard via
+//! [`crate::shard::ShardRouter::pick_for_idempotency_key`] (rendezvous over
+//! `(workflow_name, idempotency_key)`), so two same-key retries — whose
+//! `workflow_id` may be auto-generated per request — deterministically
+//! co-locate on one shard and hit the same claim row. The claim row, its
+//! execution, and the per-shard expiry sweep all share that key-derived shard.
+//!
 //! # Concurrency
 //!
 //! Safety comes from the `(workflow_name, idempotency_key)` primary key and a
@@ -343,6 +351,42 @@ mod db_impl {
         }
     }
 
+    /// Repoint an existing claim at the execution the start actually resolved to.
+    ///
+    /// The reserve upsert writes the claim pointing at the *reserved*
+    /// `new_exec_id`, but when the fresh-key start's `workflow_id` collides with
+    /// a prior run and the reuse policy **returns that existing run** (e.g.
+    /// `AllowDuplicate`), `start_or_load_workflow_execution_collect` returns the
+    /// existing execution's id rather than `new_exec_id` — so `new_exec_id` is
+    /// never inserted and the claim would dangle. Repointing it at the real run
+    /// (`resolved_exec_id`) means the next same-key request's join resolves to a
+    /// live execution and deduplicates cleanly, instead of hitting the defensive
+    /// reclaim path and re-running the whole start every time.
+    ///
+    /// Runs inside the caller's reserve+start transaction.
+    ///
+    /// # Errors
+    /// Propagates database failures.
+    pub async fn repoint_start_idempotency_claim(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        key: &str,
+        resolved_exec_id: ExecutionId,
+    ) -> HarvestResult<()> {
+        diesel::sql_query(
+            "UPDATE harvest_start_idempotency \
+             SET workflow_exec_id = $3 \
+             WHERE workflow_name = $1 AND idempotency_key = $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(workflow_name)
+        .bind::<diesel::sql_types::Text, _>(key)
+        .bind::<diesel::sql_types::Uuid, _>(resolved_exec_id.as_uuid())
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
     /// Delete idempotency claims older than the retention window on one shard.
     ///
     /// Bounded to `batch_limit` rows per call via a `ctid` subselect so a large
@@ -448,5 +492,6 @@ mod db_impl {
 
 #[cfg(feature = "db")]
 pub use db_impl::{
-    purge_expired_start_idempotency, reserve_start_idempotency, sweep_expired_start_idempotency,
+    purge_expired_start_idempotency, repoint_start_idempotency_claim, reserve_start_idempotency,
+    sweep_expired_start_idempotency,
 };

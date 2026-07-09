@@ -21,8 +21,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::throttle::ThrottlePolicy;
+use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{WorkflowInfo, context::WorkflowContext};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -516,4 +517,157 @@ async fn concurrent_same_key_starts_create_one_execution() {
 
     let mut conn = raw_connect(&url).await;
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FIX 3 (issue #808 review): an oversized key is a clean 400 at the boundary —
+/// never a 500 from overflowing the composite-PK btree tuple limit at INSERT.
+#[tokio::test]
+async fn over_length_key_is_rejected_with_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    let long_key = "x".repeat(600); // > MAX_START_IDEMPOTENCY_KEY_LEN (512)
+    let (s, b) = post_start(&app, "order_flow", json!({"input": {}}), Some(&long_key)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"].as_str().unwrap_or_default().contains("too long"),
+        "error names the length cap: {b}"
+    );
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(
+        execution_count(&mut conn, "order_flow").await,
+        0,
+        "no execution created on a rejected over-length key"
+    );
+}
+
+/// FIX 4 (issue #808 review): an out-of-range `execution_timeout_secs` on the
+/// keyed path is a 400, not a panic/500 (the debounce/batch range guard is
+/// skipped for keyed starts).
+#[tokio::test]
+async fn keyed_start_with_out_of_range_timeout_is_rejected_with_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    let body = json!({
+        "input": {},
+        "execution_timeout_secs": i64::MAX,
+    });
+    let (s, b) = post_start(&app, "order_flow", body, Some("dk-timeout")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "expected 400, not a panic: {b}");
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("execution_timeout_secs"),
+        "error names the field: {b}"
+    );
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 0);
+}
+
+/// FIX 7 (issue #808 review): a same-key hit returns the cached outcome
+/// regardless of `reuse_policy` — a second same-key start with `reject_duplicate`
+/// is a 200 dedup (same execution_id), NOT a 409.
+#[tokio::test]
+async fn same_key_hit_short_circuits_reject_duplicate() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    let (s1, b1) = post_start(&app, "order_flow", json!({"input": {}}), Some("K")).await;
+    assert_eq!(s1, StatusCode::CREATED, "{b1}");
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    // Same key, reject_duplicate reuse policy: the idempotency dedup precedes
+    // the reuse-policy matrix, so this is a 200 dedup, not a 409.
+    let body = json!({"input": {}, "reuse_policy": "reject_duplicate"});
+    let (s2, b2) = post_start(&app, "order_flow", body, Some("K")).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "same-key hit must not 409 under reject_duplicate: {b2}"
+    );
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FIX 1 (issue #808 review): in a MULTI-shard deployment, two same-key starts
+/// with auto-generated (omitted) workflow_ids converge on exactly ONE execution
+/// — because the shard is derived from the KEY, not the per-request workflow_id.
+/// Pre-fix (workflow_id routing) they could land on different shards → two
+/// distinct claim rows → two executions.
+#[tokio::test]
+async fn multi_shard_same_key_converges_on_one_execution() {
+    let (url0, _c0) = setup_database().await;
+    let (url1, _c1) = setup_database().await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+
+    // Two logical shards backed by two SEPARATE physical databases.
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(ShardId::new(0), pool0);
+    map.insert(ShardId::new(1), pool1);
+    let sharded = ShardedDbPool::from_map(map, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded));
+    let registry = HandlerRegistry::new(vec![plain_info("order_flow")], vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("idem-multishard".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router,
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    // Two same-key starts, each with an OMITTED workflow_id (auto-generated).
+    let (s1, b1) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {"n": 1}}),
+        Some("delivery-9"),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "first: {b1}");
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    let (s2, b2) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {"n": 1}}),
+        Some("delivery-9"),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "second must dedup: {b2}");
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(
+        b2["execution_id"].as_str().unwrap(),
+        exec1,
+        "both requests converge on the same execution across shards"
+    );
+
+    // Exactly one execution total across BOTH physical databases.
+    let mut c0 = raw_connect(&url0).await;
+    let mut c1 = raw_connect(&url1).await;
+    let total =
+        execution_count(&mut c0, "order_flow").await + execution_count(&mut c1, "order_flow").await;
+    assert_eq!(total, 1, "exactly one execution across both shards");
 }

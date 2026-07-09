@@ -34,7 +34,8 @@ use autumn_harvest::execution::{
     IdempotentStartOutcome, start_or_load_workflow_execution_idempotent,
 };
 use autumn_harvest::start_idempotency::{
-    DEFAULT_START_IDEMPOTENCY_WINDOW, StartIdempotencyReservation, reserve_start_idempotency,
+    DEFAULT_START_IDEMPOTENCY_WINDOW, StartIdempotencyReservation, purge_expired_start_idempotency,
+    reserve_start_idempotency,
 };
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use diesel_async::AsyncPgConnection;
@@ -259,6 +260,26 @@ async fn idem_claim_count(conn: &mut AsyncPgConnection, wf: &str, key: &str) -> 
     .await
     .expect("claim count")
     .n
+}
+
+/// Read the exec id a claim currently points at (panics if the row is absent).
+async fn claim_pointer(conn: &mut AsyncPgConnection, wf: &str, key: &str) -> Uuid {
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct R {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        workflow_exec_id: Uuid,
+    }
+    diesel::sql_query(
+        "SELECT workflow_exec_id FROM harvest_start_idempotency \
+         WHERE workflow_name = $1 AND idempotency_key = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .get_result::<R>(conn)
+    .await
+    .expect("claim pointer")
+    .workflow_exec_id
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -555,4 +576,225 @@ async fn dangling_claim_is_reclaimed() {
         .workflow_exec_id
     };
     assert_eq!(pointed, e2.as_uuid());
+}
+
+/// FIX 2 (issue #808 review): a fresh key whose `workflow_id` collides with a
+/// pre-existing run under `AllowDuplicate` returns the EXISTING execution
+/// (started_fresh:false, deduplicated:false), and the claim is REPOINTED at the
+/// real run so a subsequent same-key request deduplicates cleanly — no claim
+/// churn, no re-running the start.
+#[tokio::test]
+async fn fresh_key_attaching_to_existing_run_repoints_claim() {
+    let (mut conn, _c) = setup_db().await;
+    let wf = "attach_flow";
+    let shared_wid = "wid-shared";
+
+    // Pre-create a RUNNING run under `shared_wid` (via a distinct seed key).
+    let seed_exec = ExecutionId::new_for_shard(ShardId::new(0));
+    let seeded = start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(
+            wf,
+            shared_wid,
+            seed_exec,
+            WorkflowIdReusePolicy::AllowDuplicate,
+        ),
+        "seed-key",
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("seed run");
+    let existing_exec = match seeded {
+        IdempotentStartOutcome::Started(s) => {
+            assert!(s.created);
+            s.exec_id
+        }
+        IdempotentStartOutcome::Deduplicated { .. } => panic!("seed must create"),
+    };
+
+    // Fresh idempotency key, SAME workflow_id, AllowDuplicate → the reserve wins
+    // the claim but start_or_load returns the EXISTING run (created=false).
+    let fresh_exec = ExecutionId::new_for_shard(ShardId::new(0));
+    let out = start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(
+            wf,
+            shared_wid,
+            fresh_exec,
+            WorkflowIdReusePolicy::AllowDuplicate,
+        ),
+        "fresh-key",
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("attach start");
+    match out {
+        IdempotentStartOutcome::Started(s) => {
+            assert!(
+                !s.created,
+                "attaching to a prior run must not create a new one"
+            );
+            assert_eq!(
+                s.exec_id, existing_exec,
+                "returns the existing execution, not the reserved exec id"
+            );
+        }
+        IdempotentStartOutcome::Deduplicated { .. } => {
+            panic!("a FRESH key must not report an idempotency-key dedup")
+        }
+    }
+
+    // The claim must have been REPOINTED at the real (existing) run — not left
+    // dangling at the never-inserted reserved `fresh_exec`.
+    assert_eq!(
+        claim_pointer(&mut conn, wf, "fresh-key").await,
+        existing_exec.as_uuid(),
+        "claim repointed at the resolved execution"
+    );
+
+    // A SECOND same-key request now deduplicates cleanly onto the existing run
+    // with NO churn: exactly one claim row, still pointing at the existing exec.
+    let retry_exec = ExecutionId::new_for_shard(ShardId::new(0));
+    let second = start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(
+            wf,
+            shared_wid,
+            retry_exec,
+            WorkflowIdReusePolicy::AllowDuplicate,
+        ),
+        "fresh-key",
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("retry");
+    match second {
+        IdempotentStartOutcome::Deduplicated { exec_id, .. } => {
+            assert_eq!(exec_id, existing_exec, "dedups onto the real run");
+        }
+        IdempotentStartOutcome::Started(_) => panic!("same-key retry must dedup"),
+    }
+    assert_eq!(
+        idem_claim_count(&mut conn, wf, "fresh-key").await,
+        1,
+        "exactly one claim row — no churn"
+    );
+    assert_eq!(
+        claim_pointer(&mut conn, wf, "fresh-key").await,
+        existing_exec.as_uuid(),
+        "still pointing at the existing execution after the dedup retry"
+    );
+}
+
+/// FIX 7 (issue #808 review): a same-key HIT short-circuits the reuse-policy
+/// matrix entirely — a second start carrying the same key with `RejectDuplicate`
+/// returns the cached run as a dedup no-op, NOT an `AlreadyExists` conflict.
+#[tokio::test]
+async fn dedup_hit_short_circuits_reject_duplicate() {
+    let (mut conn, _c) = setup_db().await;
+    let wf = "reject_short_circuit";
+    let key = "k-reject";
+
+    let e1 = ExecutionId::new_for_shard(ShardId::new(0));
+    let first = start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(wf, "wid-a", e1, WorkflowIdReusePolicy::AllowDuplicate),
+        key,
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("first");
+    let created = match first {
+        IdempotentStartOutcome::Started(s) => s.exec_id,
+        IdempotentStartOutcome::Deduplicated { .. } => panic!("first must create"),
+    };
+
+    // Same key, but RejectDuplicate — the idempotency dedup precedes the matrix,
+    // so this is a 200-shaped dedup, NOT a reject/AlreadyExists.
+    let e2 = ExecutionId::new_for_shard(ShardId::new(0));
+    let second = start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(wf, "wid-b", e2, WorkflowIdReusePolicy::RejectDuplicate),
+        key,
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("same-key RejectDuplicate must not error");
+    match second {
+        IdempotentStartOutcome::Deduplicated { exec_id, .. } => {
+            assert_eq!(
+                exec_id, created,
+                "returns the cached run regardless of reuse policy"
+            );
+        }
+        IdempotentStartOutcome::Started(_) => panic!("same-key must dedup"),
+    }
+    assert_eq!(exec_count(&mut conn, wf).await, 1);
+}
+
+/// FIX 5 (issue #808 review): the expiry sweep deletes ONLY rows older than the
+/// retention window — a fresh claim survives.
+#[tokio::test]
+async fn purge_deletes_only_expired_rows() {
+    let (mut conn, _c) = setup_db().await;
+    use diesel_async::RunQueryDsl;
+    let wf = "sweep_flow";
+
+    // One fresh claim.
+    let e_fresh = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(
+            wf,
+            "wid-fresh",
+            e_fresh,
+            WorkflowIdReusePolicy::AllowDuplicate,
+        ),
+        "fresh",
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("fresh claim");
+
+    // One expired claim.
+    let e_old = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params(wf, "wid-old", e_old, WorkflowIdReusePolicy::AllowDuplicate),
+        "expired",
+        window_secs(),
+        None,
+    )
+    .await
+    .expect("expired claim");
+    diesel::sql_query(
+        "UPDATE harvest_start_idempotency SET created_at = now() - INTERVAL '2 days' \
+         WHERE workflow_name = $1 AND idempotency_key = 'expired'",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .execute(&mut conn)
+    .await
+    .expect("backdate expired");
+
+    // Sweep shard 0 with the default 24h window.
+    let deleted = purge_expired_start_idempotency(&mut conn, 0, window_secs(), 1000)
+        .await
+        .expect("purge");
+    assert_eq!(deleted, 1, "exactly the expired row is deleted");
+    assert_eq!(
+        idem_claim_count(&mut conn, wf, "fresh").await,
+        1,
+        "the fresh claim survives"
+    );
+    assert_eq!(
+        idem_claim_count(&mut conn, wf, "expired").await,
+        0,
+        "the expired claim is gone"
+    );
 }
