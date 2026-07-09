@@ -3268,6 +3268,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             post(retry_dag_run),
         )
+        // DAG run graph view (issue #690): read-only, admin-guarded per AC1.
+        // Note the asymmetry with the sibling `/dags/*` read routes (e.g.
+        // GET /dags/{dag_name}/runs), which carry no `require_admin` layer and
+        // rely only on the embedder's optional `api_with_auth` boundary — a
+        // pre-existing posture left unchanged here. This route adds the admin
+        // layer because issue #690 AC1 explicitly mandates it.
+        .route(
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            get(get_dag_run_graph).route_layer(require_admin.clone()),
+        )
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
         .route(
@@ -3833,6 +3843,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags"),
         ("GET", "/dags/{dag_name}/runs"),
+        ("GET", "/dags/{dag_name}/runs/{run_exec_id}"),
         ("POST", "/dags/{dag_name}/runs/{run_exec_id}/retry"),
         ("POST", "/dags/{dag_name}/trigger"),
         ("PATCH", "/dags/{dag_name}"),
@@ -4574,6 +4585,18 @@ pub const fn management_api_response_fields()
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags", None),                 // Vec<DagSummary>
         ("GET", "/dags/{dag_name}/runs", None), // Vec<WorkflowExecution>
+        (
+            "GET",
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            Some(&[
+                "run_exec_id",
+                "dag_name",
+                "state",
+                "started_at",
+                "finished_at",
+                "nodes",
+            ]),
+        ),
         (
             "POST",
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
@@ -14244,6 +14267,92 @@ async fn list_dag_runs(
         .map_err(database_error)
         .map_err(map_error)?;
     Ok(Json(runs))
+}
+
+/// `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (issue #690).
+///
+/// Read-only: reconstructs a unified DAG run's node topology annotated with
+/// per-node status/timing/attempts/error, purely from the registered
+/// [`DagDefinition`](autumn_harvest::dag::DagDefinition) plus the run's recorded
+/// history. No new event variant, no migration, no writes to `harvest_dag_runs`.
+///
+/// * `404` — unknown `dag_name`, or a `run_exec_id` that is not a run of that DAG.
+/// * `400` (JSON body) — a classic (non-unified) DAG has no `DagDefinition`
+///   topology to annotate.
+///
+/// Cross-shard correct (AC8): reads from the owning shard via
+/// [`db_conn_for_execution`] ([`ExecutionId::shard`](autumn_harvest::types::ExecutionId)
+/// routing), no cross-shard fan-out.
+async fn get_dag_run_graph(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Resolve the DAG by name; reject classic (non-unified) DAGs (AC6).
+    let Some(dag) = runtime.dags().get(&dag_name).cloned() else {
+        return AutumnError::not_found_msg(format!("DAG '{dag_name}' is not registered"))
+            .into_response();
+    };
+    if !dag.is_unified {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "DAG '{dag_name}' is a classic (non-unified) DAG with no DagDefinition \
+                     topology to annotate; the run graph view is only supported for unified DAGs."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    let exec_id = match parse_execution_id(&run_exec_id) {
+        Ok(eid) => eid,
+        Err(e) => return e.into_response(),
+    };
+
+    // AC8: route to the owning shard via ExecutionId::shard().
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load the run and verify it belongs to this DAG (AC6: 404 otherwise).
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => return map_error(e).into_response(),
+    };
+    if execution.workflow_name != dag_name {
+        return AutumnError::not_found_msg(format!(
+            "execution {exec_id} is not a run of DAG '{dag_name}'"
+        ))
+        .into_response();
+    }
+
+    // Timestamped history for per-node started_at/finished_at (issue #690).
+    let ts_events = match store::load_history_with_timestamps(&mut conn, exec_id).await {
+        Ok(evts) => evts,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let nodes = crate::dag_graph::build_run_graph(&dag.definition, &ts_events, &execution.state);
+
+    let response = crate::dag_graph::DagRunGraphResponse {
+        run_exec_id: exec_id.to_string(),
+        dag_name,
+        state: execution.state,
+        started_at: execution.started_at,
+        finished_at: execution.completed_at,
+        nodes,
+    };
+
+    (axum::http::StatusCode::OK, Json(response)).into_response()
 }
 
 #[allow(clippy::too_many_lines)]

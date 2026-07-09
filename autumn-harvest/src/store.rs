@@ -735,6 +735,55 @@ pub async fn load_timestamped_history(
         .collect()
 }
 
+/// Load a workflow's full event history paired with each event's
+/// `harvest_events.timestamp` (issue #690).
+///
+/// [`WorkflowEvent`] variants carry no timestamp and [`load_history`] discards
+/// the per-row `timestamp` column, but read views such as the DAG run graph
+/// need per-node `started_at`/`finished_at` timing. This helper loads the
+/// [`HarvestEvent`](crate::models::HarvestEvent) rows in `event_id` order and
+/// zips each row's `timestamp` with its deserialized event.
+///
+/// Payloads are deserialized directly (no codec transform), matching
+/// [`load_history_undecoded`]: on an identity-codec deployment this is
+/// byte-identical to [`load_history`]. The DAG graph classification reads
+/// non-payload fields (activity name, error type) plus the error string, and
+/// the `dag_skip:{idx}` marker's `details` fingerprint — a payload field that
+/// is an opaque codec/offload envelope on a non-identity-codec deployment. The
+/// classifier (`dag_graph::has_skip_marker`, issue #690 review) tolerates that
+/// opacity by falling back to the always-clear marker name/index, so this raw
+/// (non-decoding) load is correct for the graph view in every deployment.
+///
+/// **Never use this for replay or any engine execution path** — replay must see
+/// codec-decoded plaintext and uses the codec-aware loaders.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on connection or query
+/// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
+/// value can't be deserialized into [`WorkflowEvent`].
+pub async fn load_history_with_timestamps(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)>> {
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let event = serde_json::from_value::<WorkflowEvent>(row.event_data)
+                .map_err(crate::error::HarvestError::from)?;
+            Ok((row.timestamp, event))
+        })
+        .collect()
+}
+
 /// Load history, inflating any offloaded payload fields from the configured
 /// [`PayloadOffloader`](crate::payload_store::PayloadOffloader) (issue #524).
 ///

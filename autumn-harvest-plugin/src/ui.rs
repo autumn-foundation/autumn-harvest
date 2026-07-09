@@ -723,13 +723,25 @@ async fn dag_detail_ui(
                 let data = e.event_data.get("data")?;
                 let name = data["name"].as_str()?;
                 let idx = parse_dag_skip_marker_index(name)?;
+                let current_task = dag.definition.tasks().get(idx)?;
                 // Guard against task rename/reorder across deploys: only mark
                 // the node as condition-skipped when the recorded activity name
                 // still matches the task at that index in the current definition.
                 // MarkerRecorded serializes as {"type":…,"data":{"name":…,"details":{…}}},
                 // so the task field lives under data.details.task.
-                let recorded_task = data.get("details").and_then(|d| d["task"].as_str())?;
-                let current_task = dag.definition.tasks().get(idx)?;
+                //
+                // `details` is a payload field, so on a non-identity PayloadCodec
+                // (or large-payload offload) deployment it is stored as an opaque
+                // envelope and `details.task` is not readable here — this read
+                // path does not codec-decode. When the fingerprint is unreadable,
+                // fall back to the (always-clear) marker name/index so a
+                // condition-skipped node is still shown skipped rather than
+                // pending, mirroring `dag_graph::has_skip_marker` (issue #690
+                // review). Reorder-safety is not available in that opaque case.
+                let Some(recorded_task) = data.get("details").and_then(|d| d["task"].as_str())
+                else {
+                    return Some(idx);
+                };
                 if recorded_task != current_task.activity_name.as_str() {
                     return None;
                 }
