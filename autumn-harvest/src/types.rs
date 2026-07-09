@@ -1295,4 +1295,60 @@ mod tests {
     fn session_id_invalid_str_fails_to_parse() {
         assert!("not-a-valid-uuid".parse::<SessionId>().is_err());
     }
+
+    #[test]
+    fn priority_round_trips_through_string_and_display() {
+        for priority in [
+            Priority::Low,
+            Priority::Normal,
+            Priority::High,
+            Priority::Critical,
+        ] {
+            let s = priority.to_string();
+            let parsed: Priority = s.parse().expect("valid priority string should parse");
+            assert_eq!(parsed, priority);
+        }
+    }
+
+    #[test]
+    fn priority_rejects_unknown_string() {
+        let err = "highest"
+            .parse::<Priority>()
+            .expect_err("unknown priority should fail");
+        assert!(err.contains("unknown priority"));
+    }
+
+    #[test]
+    fn priority_maps_to_and_from_i32() {
+        assert_eq!(Priority::Low.as_i32(), -1);
+        assert_eq!(Priority::Normal.as_i32(), 0);
+        assert_eq!(Priority::High.as_i32(), 1);
+        assert_eq!(Priority::Critical.as_i32(), 2);
+
+        assert_eq!(Priority::from_i32(-1), Some(Priority::Low));
+        assert_eq!(Priority::from_i32(0), Some(Priority::Normal));
+        assert_eq!(Priority::from_i32(1), Some(Priority::High));
+        assert_eq!(Priority::from_i32(2), Some(Priority::Critical));
+
+        assert_eq!(Priority::from_i32(3), None);
+        assert_eq!(Priority::from_i32(-2), None);
+    }
+
+    #[test]
+    fn priority_round_trips_serde() {
+        let cases = vec![
+            (Priority::Low, "\"low\""),
+            (Priority::Normal, "\"normal\""),
+            (Priority::High, "\"high\""),
+            (Priority::Critical, "\"critical\""),
+        ];
+
+        for (priority, expected_json) in cases {
+            let json = serde_json::to_string(&priority).unwrap();
+            assert_eq!(json, expected_json);
+
+            let deserialized: Priority = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, priority);
+        }
+    }
 }

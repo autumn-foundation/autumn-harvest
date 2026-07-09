@@ -285,7 +285,13 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(4)
+        // Sized at 8 for comfortable headroom under the concurrent-request money
+        // test. Since the Codex F4 fix, a single-shard backfill reuses the per-slot
+        // exec conn for budget accounting and holds exactly one connection at a time
+        // (proven pool-size-1 safe by
+        // `backfill_single_shard_pool_size_one_does_not_deadlock`), so 8 is generous
+        // rather than a floor.
+        .max_size(8)
         .build()
         .expect("failed to build test pool")
 }
@@ -5006,6 +5012,591 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         count_workflow_executions_by_name_from_url(&database_url, dag_name).await,
         0,
         "unregistered DAG schedule backfill must not start a workflow execution"
+    );
+}
+
+// ── Backfill max_runs atomic reservation (issue #688) ─────────────────────────
+
+/// Register a pure workflow-only (`dag_name` = NULL) hourly-cron schedule with a
+/// given `max_runs` budget and stand up an app whose runtime knows the workflow,
+/// so backfill dispatches actually create executions. Returns the app plus the
+/// freshly-loaded schedule row (`runs_started` = 0 on insert).
+async fn setup_workflow_backfill_app(
+    database_url: &str,
+    pool: DbPool,
+    name: &'static str,
+    max_runs: Option<u32>,
+) -> (HarvestApiApp, HarvestSchedule) {
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input: Value::Null,
+        catchup: false,
+        // Keep max_active_runs high so it never gates the small backfill windows
+        // below — the test isolates the max_runs budget path.
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs,
+        catchup_policy: None,
+        retry_policy: None,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+            .await
+            .expect("failed to connect for workflow schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("workflow schedule should register");
+    }
+    let schedule = load_workflow_only_schedule_from_url_optional(database_url, name)
+        .await
+        .expect("workflow-only schedule row should exist");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    (app, schedule)
+}
+
+/// Like `setup_workflow_backfill_app`, but the registered `WorkflowInfo` carries
+/// a `throttle` policy (so `workflow_resolving_throttle` returns `Some` and the
+/// backfill loop enters the throttle block, where the oversized-input check —
+/// and its `release_backfill_budget_slot` release path — lives) and the schedule
+/// input can be sized to overflow the workflow-input cap (issue #688 release
+/// test). The throttle policy has no key (`key_expr = None`), so every slot
+/// resolves the same empty key.
+async fn setup_throttled_workflow_backfill_app(
+    database_url: &str,
+    pool: DbPool,
+    name: &'static str,
+    max_runs: Option<u32>,
+    input: Value,
+) -> (HarvestApiApp, HarvestSchedule) {
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input,
+        catchup: false,
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs,
+        catchup_policy: None,
+        retry_policy: None,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+            .await
+            .expect("failed to connect for workflow schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("workflow schedule should register");
+    }
+    let schedule = load_workflow_only_schedule_from_url_optional(database_url, name)
+        .await
+        .expect("workflow-only schedule row should exist");
+
+    let mut info = workflow_info_named(name);
+    // A tiny per-workflow cap documents intent, but the effective cap is
+    // max(per, registry-global), so it never *lowers* the cap below the
+    // registry's 2 MiB default. The test's input is instead sized past that
+    // default, forcing the oversized-input path without mutating the
+    // process-global GLOBAL_MAX_WORKFLOW_INPUT_BYTES (which would race parallel
+    // tests in this binary).
+    info.max_input_bytes = Some(1);
+    info.throttle = Some(
+        autumn_harvest::throttle::ThrottlePolicy::from_rate_str("100/m", None, None, None)
+            .expect("valid throttle policy"),
+    );
+
+    let registry = Arc::new(HandlerRegistry::new(vec![info], vec![]));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    (app, schedule)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_one() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_race_one_slot_wf";
+    // Exactly one max_runs slot remains (max_runs = 1, runs_started = 0).
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(1)).await;
+
+    // A 3-hour hourly window → 4 candidate slots, more than the single remaining
+    // slot, so two concurrent requests both have work to dispatch.
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let uri = format!("/admin/schedules/{}/backfill", schedule.id);
+    let body = json!({ "from": from, "to": to });
+
+    // Fire both requests genuinely concurrently on a multi-thread runtime (two
+    // spawned tasks, not cooperatively-scheduled `tokio::join!` futures on one
+    // thread) so the atomic reservation is exercised under real thread-level
+    // parallelism — a stale-snapshot gate would let BOTH dispatch here.
+    let (app_a, app_b) = (app.clone(), app.clone());
+    let (uri_a, uri_b) = (uri.clone(), uri.clone());
+    let (body_a, body_b) = (body.clone(), body.clone());
+    let handle_a = tokio::spawn(async move { post_json(&app_a, uri_a, body_a).await });
+    let handle_b = tokio::spawn(async move { post_json(&app_b, uri_b, body_b).await });
+    let (status_a, json_a) = handle_a.await.expect("backfill request A must not panic");
+    let (status_b, json_b) = handle_b.await.expect("backfill request B must not panic");
+    assert_eq!(status_a, StatusCode::OK, "req A body: {json_a}");
+    assert_eq!(status_b, StatusCode::OK, "req B body: {json_b}");
+
+    let dispatched_a = json_a["dispatched"].as_u64().unwrap();
+    let dispatched_b = json_b["dispatched"].as_u64().unwrap();
+    assert_eq!(
+        dispatched_a + dispatched_b,
+        1,
+        "exactly one slot must be dispatched across two concurrent requests \
+         (A={dispatched_a}, B={dispatched_b}); atomic reservation must not over-run max_runs"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 1,
+        "runs_started must equal max_runs after the single dispatch"
+    );
+    assert!(
+        reloaded.exhausted_at.is_some(),
+        "schedule must transition to exhausted once the last slot is consumed"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        1,
+        "exactly one execution row must exist for the schedule"
+    );
+}
+
+/// F4 regression (issue #688 review, Codex): with a web DB pool of size 1
+/// (single-shard), a non-dry-run backfill must NOT self-deadlock. Before the fix
+/// the route held a dedicated schedule-shard connection across the dispatch loop
+/// while each slot also checked out a per-slot exec conn — two concurrent
+/// connections against a size-1 pool wedge forever (the route waits on a
+/// connection it already holds). The fix reuses the per-slot exec conn for budget
+/// accounting when the schedule and exec shards share a pool, so the route holds
+/// exactly one connection at a time again (restoring pre-#688 pool-size-1 safety).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
+    let (database_url, _container) = setup_test_database_url().await;
+    // Deliberately size the pool at 1: exercising the exact F4 self-deadlock
+    // condition (pool.rs only forbids size 0, so 1 is a valid production config).
+    let pool = {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url.as_str());
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("failed to build size-1 test pool")
+    };
+    let name = "backfill_pool_size_one_wf";
+    // Unlimited budget so every planned slot actually dispatches, exercising the
+    // reserve + transition budget path on the single shared connection.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-05-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let uri = format!("/admin/schedules/{}/backfill", schedule.id);
+    let body = json!({ "from": from, "to": to });
+
+    // If the route self-deadlocks on the size-1 pool this times out (a clear
+    // failure) rather than hanging the whole test binary indefinitely.
+    let (status, json) = tokio::time::timeout(Duration::from_secs(20), post_json(&app, uri, body))
+        .await
+        .expect("backfill on a size-1 pool must return, not self-deadlock");
+
+    assert_eq!(status, StatusCode::OK, "backfill body: {json}");
+    assert!(
+        json["dispatched"].as_u64().unwrap() >= 1,
+        "at least one slot should dispatch, body: {json}"
+    );
+}
+
+/// Deterministic reserve-then-RELEASE proof (issue #688): every slot reserves a
+/// `max_runs` budget slot, enters the throttle block, hits the oversized-input
+/// guard, and releases the reservation. No slot ever dispatches, and the
+/// schedule's `runs_started` must return to exactly its pre-backfill value —
+/// proving `release_backfill_budget_slot` returns every reserved slot.
+#[tokio::test]
+async fn backfill_release_on_oversized_input_leaves_budget_intact() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_release_oversized_wf";
+    // A schedule input that serializes past the registry's default 2 MiB
+    // workflow-input cap, so the throttle block's oversized-input guard trips
+    // for every slot. (The effective cap is max(per-workflow, registry-global);
+    // rather than lower the process-global cap — which would race parallel tests
+    // — the input is sized past the default.)
+    let big = "x".repeat(2 * 1024 * 1024 + 1024);
+    let input = json!({ "blob": big });
+    // Budget of 5 with a 2-slot window: budget is never exhausted, so any
+    // net change in runs_started can only come from a leaked reservation.
+    let (app, schedule) =
+        setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
+
+    // A 1-hour hourly window → 2 candidate slots (10:00, 11:00).
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let window_size = body["total"].as_u64().unwrap();
+    assert_eq!(window_size, 2, "1-hour hourly window has 2 slots");
+    assert_eq!(
+        body["dispatched"],
+        serde_json::json!(0),
+        "no slot may dispatch — every one overflows the input cap"
+    );
+    assert_eq!(
+        body["skipped_reasons"]["oversized_input"],
+        serde_json::json!(window_size),
+        "every slot must be skipped for oversized_input"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 0,
+        "runs_started must return to its pre-backfill value — every reserved \
+         slot was released, none leaked"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "a schedule whose budget was never actually consumed must not be exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        0,
+        "no execution rows may be created when every slot is skipped"
+    );
+}
+
+#[tokio::test]
+async fn backfill_over_window_dispatches_only_remaining_budget() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_over_window_wf";
+    // Two slots of budget, a four-slot window.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(2)).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(4), "window has 4 slots");
+    assert_eq!(body["dispatched"], serde_json::json!(2));
+    assert_eq!(
+        body["skipped_reasons"]["max_runs_exhausted"],
+        serde_json::json!(2),
+        "the two out-of-budget slots must be reported as max_runs_exhausted"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(reloaded.runs_started, 2);
+    assert!(reloaded.exhausted_at.is_some());
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        2,
+    );
+}
+
+#[tokio::test]
+async fn backfill_unlimited_schedule_increments_runs_started() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_unlimited_wf";
+    // Unlimited budget (max_runs = None) — every slot dispatches, runs_started
+    // still increments for observability, exhausted_at stays NULL.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(3), "window has 3 slots");
+    assert_eq!(body["dispatched"], serde_json::json!(3));
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 3,
+        "runs_started must increase by the number dispatched even when unlimited"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "an unlimited schedule must never transition to exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        3,
+    );
+}
+
+/// A row with `max_runs = 0` in the column must be treated as UNLIMITED by the
+/// atomic reservation guard (issue #688 review, Codex F1) — matching
+/// `backfill_budget_reached`, the up-front exhaustion check, and the dry-run
+/// projection, all of which read non-positive `max_runs` as "no cap". The
+/// builder normalizes `0 → None`, so this writes `0` to the column DIRECTLY via
+/// diesel to simulate a pre-existing / hand-written row. Without the
+/// `max_runs <= 0` clause in the reservation predicate, `0 < 0` is false and the
+/// backfill would wrongly skip every slot as `max_runs_exhausted`.
+///
+/// NOTE: the release-clears-exhaustion path (F2b) is a concurrent-only scenario
+/// not deterministically reproducible in a single-request test: within one
+/// request, once a slot transitions the row to exhausted, subsequent
+/// reservations fail the `exhausted_at IS NULL` guard and set `budget_hit`, so no
+/// release-after-transition occurs intra-request. F2b is covered by the
+/// `clear_stale_max_runs_exhaustion_generates_the_guarded_clear_update` shape
+/// test plus code reasoning, matching the no-Docker precedent.
+#[tokio::test]
+async fn backfill_max_runs_zero_is_treated_as_unlimited() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_max_runs_zero_wf";
+    // Register unlimited (builder normalizes 0 → None), then force the column to
+    // literal 0 to exercise the reservation guard's non-positive handling.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect to force max_runs = 0");
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(harvest_schedules::max_runs.eq(Some(0_i32)))
+            .execute(&mut conn)
+            .await
+            .expect("forcing max_runs = 0 must succeed");
+    }
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(3), "window has 3 slots");
+    assert_eq!(
+        body["dispatched"],
+        serde_json::json!(3),
+        "max_runs = 0 must be treated as unlimited — every slot dispatches"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 3,
+        "runs_started must increase by the number dispatched (max_runs = 0 = unlimited)"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "a max_runs = 0 (unlimited) schedule must never transition to exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        3,
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "backfill_dag_over_window";
+    // A unified DAG schedule row (dag_name set) with a two-slot budget over a
+    // four-slot window — exercises the DAG loop's atomic reservation path.
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Cron("0 * * * *".to_string())),
+            catchup: false,
+            max_active_runs: 1000,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+        }])
+        .expect("unified DAG should compile"),
+    );
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: Some(2),
+        catchup_policy: None,
+        retry_policy: None,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for DAG schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("DAG schedule should register");
+    }
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(4), "window has 4 slots");
+    assert_eq!(body["dispatched"], serde_json::json!(2));
+    assert_eq!(
+        body["skipped_reasons"]["max_runs_exhausted"],
+        serde_json::json!(2),
+    );
+
+    let reloaded = load_schedule_from_url(&database_url, dag_name).await;
+    assert_eq!(reloaded.runs_started, 2);
+    assert!(reloaded.exhausted_at.is_some());
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, dag_name).await,
+        2,
     );
 }
 

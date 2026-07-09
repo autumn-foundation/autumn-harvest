@@ -17,9 +17,6 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
 
     // 1. Initialize TestDb and run pending migrations
     let db = TestDb::shared().await;
-    unsafe {
-        std::env::set_var("AUTUMN_DATABASE__URL", db.url());
-    }
     autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
     autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
@@ -47,7 +44,24 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
 
     // 3. Build the TestApp, mounting both OutboundWebhookPlugin and HarvestPlugin
     // with the "webhooks" feature enabled (which autowires the webhook workflow/activity)
+    let config = autumn_web::config::AutumnConfig {
+        profile: Some("test".into()),
+        security: autumn_web::security::SecurityConfig {
+            csrf: autumn_web::security::CsrfConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        database: autumn_web::config::DatabaseConfig {
+            url: Some(db.url().to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
     let mut app_builder = TestApp::new()
+        .config(config)
         .plugin(webhook_plugin)
         .plugin(
             HarvestPlugin::new()

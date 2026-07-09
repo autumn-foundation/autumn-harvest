@@ -646,6 +646,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_skip_policy_next_exceeds_365_days_returns_none() {
+        let start_date = date("2026-01-01");
+        let mut exc = Vec::new();
+        // Exclude start_date and the next 365 days
+        for i in 0..=365 {
+            exc.push(start_date + chrono::Duration::days(i));
+        }
+
+        assert_eq!(
+            apply_skip_policy(start_date, SkipPolicy::RunNextBusinessDay, &exc, false),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_prev_exceeds_365_days_returns_none() {
+        let start_date = date("2026-12-31");
+        let mut exc = Vec::new();
+        // Exclude start_date and the previous 365 days
+        for i in 0..=365 {
+            exc.push(start_date - chrono::Duration::days(i));
+        }
+
+        assert_eq!(
+            apply_skip_policy(start_date, SkipPolicy::RunPrevBusinessDay, &exc, false),
+            None
+        );
+    }
+
     // ── preview_schedule_firings ──────────────────────────────────────────────
 
     #[cfg(feature = "db")]

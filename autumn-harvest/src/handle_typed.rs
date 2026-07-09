@@ -27,14 +27,30 @@ pub struct TypedWorkflowResult<T> {
 }
 
 /// Type-safe awaitable handle for one workflow execution.
-#[derive(Debug, Clone)]
 pub struct TypedWorkflowHandle<T> {
     inner: WorkflowHandle,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
-unsafe impl<T> Send for TypedWorkflowHandle<T> {}
-unsafe impl<T> Sync for TypedWorkflowHandle<T> {}
+// Manual `Debug` impl so `TypedWorkflowHandle<T>` is formattable regardless of
+// whether `T` implements `Debug`. `T` is a phantom type parameter (the handle
+// holds no `T`), so the derived impl's implicit `T: Debug` bound is spurious.
+impl<T> std::fmt::Debug for TypedWorkflowHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedWorkflowHandle")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<T> Clone for TypedWorkflowHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
 
 impl<T> TypedWorkflowHandle<T> {
     /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
