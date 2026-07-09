@@ -657,9 +657,26 @@ pub async fn build_status_report(
     thresholds: &StatusThresholds,
 ) -> HealthSummaryReport {
     let as_of = Utc::now();
+    // Activity names with a circuit-breaker policy skip the rate-limit gate at
+    // claim, so the per-shard claimable-backlog scan must exempt them from its
+    // rate-limit filter to match `claim_task` (and the shard-health coverage
+    // gate, which resolves the same set — see `shard_health.rs`). Resolved once
+    // here: the tracked-names set is per-runtime (in-process/global), not
+    // per-shard. Empty when no runtime is installed (early boot) or no breakers
+    // are configured — the safe under-count-free fallback.
+    let circuit_breaker_activities: Vec<String> = api_state
+        .runtime()
+        .ok()
+        .map(|r| {
+            r.registry()
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec()
+        })
+        .unwrap_or_default();
     let (shard_report, bundle) = tokio::join!(
         build_shard_health_report(api_state, None),
-        fan_out_bundle(api_state, thresholds),
+        fan_out_bundle(api_state, thresholds, &circuit_breaker_activities),
     );
     build_status_response(as_of, &shard_report, &bundle, thresholds)
 }
@@ -667,6 +684,7 @@ pub async fn build_status_report(
 async fn fan_out_bundle(
     api_state: &HarvestApiState,
     thresholds: &StatusThresholds,
+    circuit_breaker_activities: &[String],
 ) -> StatusBundleMerge {
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected = shard_fanout::expected_shards(api_state, &pools);
@@ -676,7 +694,13 @@ async fn fan_out_bundle(
         .iter()
         .map(|shard_id| {
             let pool = pools.get(shard_id).cloned();
-            observe_bundle_shard(*shard_id, pool, stale_threshold, thresholds)
+            observe_bundle_shard(
+                *shard_id,
+                pool,
+                stale_threshold,
+                thresholds,
+                circuit_breaker_activities,
+            )
         })
         .collect::<Vec<_>>();
     let observations = join_all(observations).await;
@@ -689,6 +713,7 @@ async fn observe_bundle_shard(
     pool: Option<DbPool>,
     stale_threshold: std::time::Duration,
     thresholds: &StatusThresholds,
+    circuit_breaker_activities: &[String],
 ) -> ShardObservation<ShardBundle> {
     let Some(pool) = pool else {
         return ShardObservation {
@@ -706,7 +731,14 @@ async fn observe_bundle_shard(
             )),
         };
     };
-    match gather_bundle(&mut conn, stale_threshold, thresholds).await {
+    match gather_bundle(
+        &mut conn,
+        stale_threshold,
+        thresholds,
+        circuit_breaker_activities,
+    )
+    .await
+    {
         Ok(bundle) => ShardObservation {
             shard_id,
             rows: vec![bundle],
@@ -724,6 +756,7 @@ async fn gather_bundle(
     conn: &mut AsyncPgConnection,
     stale_threshold: std::time::Duration,
     thresholds: &StatusThresholds,
+    circuit_breaker_activities: &[String],
 ) -> Result<ShardBundle, String> {
     let worker_filters = WorkerFilters {
         limit: i64::MAX,
@@ -739,10 +772,14 @@ async fn gather_bundle(
     let dlq_newest_age_secs = dlq_newest_age_secs(conn).await?;
 
     // Reuse the same claimable-demand core helper the shard-health coverage
-    // gate uses; empty circuit-breaker list keeps this a plain backlog read.
-    let demands = autumn_harvest::queue::claimable_pending_demand_by_queue(conn, &[])
-        .await
-        .map_err(|e| e.to_string())?;
+    // gate uses. Pass the circuit-breaker-tracked activity names so their rows
+    // are counted as claimable even when the rate-limit bucket is empty (they
+    // skip the rate-limit gate at claim), matching `claim_task` and the
+    // shard-health scan — otherwise this under-counts real claimable backlog.
+    let demands =
+        autumn_harvest::queue::claimable_pending_demand_by_queue(conn, circuit_breaker_activities)
+            .await
+            .map_err(|e| e.to_string())?;
     let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
     for demand in &demands {
         *by_queue.entry(demand.queue_name.clone()).or_default() += demand.count;

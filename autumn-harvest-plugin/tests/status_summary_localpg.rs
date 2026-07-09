@@ -21,6 +21,21 @@
 //!
 //! All phases run in one `#[tokio::test]` sequentially, resetting the schema
 //! between phases, so the result is deterministic regardless of `--test-threads`.
+//!
+//! **Circuit-breaker-tracked backlog (PR #988 review, issue #679):** the
+//! per-shard queue-backlog scan now threads the runtime's circuit-breaker
+//! tracked-activity names into `claimable_pending_demand_by_queue` (so a
+//! breaker-tracked activity's rows count as claimable even with an empty
+//! rate-limit bucket — matching `claim_task` and the shard-health coverage
+//! gate). That non-empty-names path is intentionally **not** exercised here: this
+//! harness builds `HarvestApiState` with `install_storage_pool` only and never
+//! calls `install(runtime)`, so `api_state.runtime()` is `Err` and the resolved
+//! tracked-names set is always empty (the safe under-count-free fallback the plumbing
+//! degrades to at early boot). The non-empty branch is the byte-identical mirror
+//! of `shard_health.rs`'s already-tested coverage-gate call, so its correctness
+//! is covered there and by the core-crate tests for
+//! `queue::claimable_pending_demand_by_queue`; the compiler verifies the
+//! parameter threading.
 
 use std::collections::BTreeMap;
 
