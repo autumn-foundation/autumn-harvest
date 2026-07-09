@@ -362,6 +362,23 @@ pub enum HarvestError {
         timeout_ms: u64,
     },
 
+    /// The execution row exists and is terminal, but its recorded history can
+    /// no longer be replayed to reconstruct final state for a post-mortem query
+    /// (issue #612). This happens when the history was pruned by retention,
+    /// released on reset (`TERMINATED`), or had its payloads erased (issue #495).
+    ///
+    /// This is **distinct** from [`NotFound`][Self::NotFound] (row gone → 404):
+    /// here the row is present but its history is unqueryable, so returning a
+    /// partial/empty/erased answer would be misleading. Surfaces as `410 Gone`
+    /// at the management API layer.
+    #[error("history unavailable: {reason} ({exec_id})")]
+    HistoryUnavailable {
+        /// The execution whose history cannot be queried.
+        exec_id: ExecutionId,
+        /// Human-readable reason (e.g. "pruned by retention", "payloads erased").
+        reason: String,
+    },
+
     /// A payload exceeded the configured size cap at a write boundary.
     ///
     /// Returned synchronously at the moment the oversized payload is detected
