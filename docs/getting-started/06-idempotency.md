@@ -117,6 +117,14 @@ Semantics:
   after it elapses the key is reusable and starts a fresh run.
 - **Byte-identical when unused** — a start with no key omits the
   `started_fresh`/`deduplicated` response fields entirely.
+- **A committed keyed replay short-circuits to the `200` no-op _before_
+  fresh-start-only validations** — input-schema validation (#373),
+  completion-callback SSRF validation (#605), and the delay/`start_at` checks —
+  **and before the admission gate** (#377). Tightening any of those rules (or
+  raising a gate during an incident) between the original delivery and a retry
+  never rejects a retry of already-done work; the retry returns the original
+  execution regardless of its own body. A genuinely fresh keyed start (no live
+  claim) still runs every validation and the gate normally.
 - **Empty key → `400`**; **combining a key with a throttle/debounce/batch
   policy → `400`** (those defer the start and expose no synchronous
   `execution_id` to converge on).

@@ -262,6 +262,23 @@ fn throttled_info(name: &'static str) -> WorkflowInfo {
     info
 }
 
+/// A published input schema requiring an object with an `email` field.
+fn require_email_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "email": { "type": "string" } },
+        "required": ["email"]
+    })
+}
+
+/// A workflow that publishes the `require_email_schema` input schema (issue #373),
+/// so `POST /start` validates `input` against it on a *fresh* start.
+fn schema_info(name: &'static str) -> WorkflowInfo {
+    let mut info = plain_info(name);
+    info.input_schema = Some(require_email_schema);
+    info
+}
+
 fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -849,6 +866,116 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
         s2,
         StatusCode::OK,
         "a keyed replay must bypass the raised gate: {b2}"
+    );
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FINDING (Codex P2, issue #808): a committed keyed replay short-circuits to the
+/// 200 no-op BEFORE fresh-start-only input-schema validation (#373). The first
+/// start passes the schema; a same-key retry with a body that WOULD now fail the
+/// schema is not re-validated — it returns the original execution as a 200 dedup,
+/// never a 400.
+#[tokio::test]
+async fn keyed_replay_bypasses_input_schema_validation() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![schema_info("order_flow")]);
+
+    // Sanity: a fresh start (different key) with an invalid body IS rejected —
+    // proving the schema path is live in this harness.
+    let (s_bad, b_bad) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {}}),
+        Some("fresh-invalid"),
+    )
+    .await;
+    assert_eq!(
+        s_bad,
+        StatusCode::BAD_REQUEST,
+        "a fresh keyed start with a schema-invalid body must be rejected: {b_bad}"
+    );
+
+    // 1. First start with key "K" and a schema-VALID body → 201.
+    let (s1, b1) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {"email": "a@b.com"}}),
+        Some("K"),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "{b1}");
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    // 2. Same-key retry with a body that WOULD fail the schema (no email) → must
+    // short-circuit to the 200 no-op, NOT 400.
+    let (s2, b2) = post_start(&app, "order_flow", json!({"input": {}}), Some("K")).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "a keyed replay must bypass fresh-start-only schema validation: {b2}"
+    );
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FINDING (Codex P2, issue #808): a committed keyed replay short-circuits BEFORE
+/// completion-callback SSRF validation (#605). The first start has no callback; a
+/// same-key retry carrying a callback target that WOULD be rejected by the SSRF
+/// policy is not re-validated — it returns the original execution as a 200 dedup,
+/// never a 422.
+#[tokio::test]
+async fn keyed_replay_bypasses_callback_validation() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    // A well-formed but non-allowlisted https callback target: the default SSRF
+    // policy (HTTPS-only + allowlist-required) rejects it.
+    let bad_callback =
+        json!([{ "url": "https://evil.example.com/hook", "filter": {"type": "CompletedOnly"} }]);
+
+    // Sanity: a fresh start (different key) carrying the bad callback IS rejected
+    // (the SSRF-rejection path returns 422 Unprocessable Entity) — proving the
+    // callback-validation path is live in this harness.
+    let (s_bad, b_bad) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {}, "completion_callbacks": bad_callback}),
+        Some("fresh-cb"),
+    )
+    .await;
+    assert_eq!(
+        s_bad,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a fresh keyed start with a rejected callback must be rejected: {b_bad}"
+    );
+
+    // 1. First start with key "C" and NO callback → 201.
+    let (s1, b1) = post_start(&app, "order_flow", json!({"input": {}}), Some("C")).await;
+    assert_eq!(s1, StatusCode::CREATED, "{b1}");
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    // 2. Same-key retry carrying the bad callback → must short-circuit to the
+    // 200 no-op, NOT 400.
+    let (s2, b2) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {}, "completion_callbacks": bad_callback}),
+        Some("C"),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "a keyed replay must bypass fresh-start-only callback validation: {b2}"
     );
     assert_eq!(b2["deduplicated"], json!(true));
     assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);

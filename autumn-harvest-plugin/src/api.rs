@@ -8322,6 +8322,88 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
+    // issue #808 (Codex P2): a *committed* keyed replay short-circuits to the
+    // `200` no-op BEFORE any fresh-start-only validation (input schema #373,
+    // completion-callback SSRF #605, delay/start_at) and BEFORE the admission
+    // gate #377. Those rules govern *fresh* work; a retry of an
+    // already-successful keyed start creates no new work, so tightening any of
+    // them between the original delivery and a retry must not reject the retry.
+    // We probe the keyed claim read-only on the same key-derived `shard` the
+    // reserve below uses (so we observe the claim the original delivery wrote),
+    // and a hit returns the original execution verbatim — standard
+    // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
+    // detection (out of scope for #808). A miss falls through to the full
+    // fresh-start path unchanged, whose reserve+start transaction's `ON CONFLICT`
+    // upsert (with a row lock) remains the *authoritative* dedup for the
+    // concurrent-first-delivery race: two simultaneous first deliveries both miss
+    // this probe (nothing committed yet), both proceed, and the reserve
+    // serializes them → one creates, one dedups. This early probe is an
+    // additional fast-path for COMMITTED replays only, never a replacement for
+    // the reserve.
+    if let Some(ref key) = idempotency_key
+        && let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut probe_conn) = acquire_conn(pool.pool_for(shard)).await
+    {
+        let window_secs = api_state.start_idempotency_window().as_secs_f64();
+        if let Ok(Some(claim_exec_id)) =
+            autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
+                &mut probe_conn,
+                &workflow_name,
+                key,
+                window_secs,
+            )
+            .await
+        {
+            // `lookup_live_start_idempotency_claim` JOINs to the execution row, so
+            // a `Some` claim implies the row existed at lookup time. Re-read its
+            // identity for the no-op response; if it vanished (retention-deleted in
+            // the gap) or the read errors, fall through to the fresh-start path,
+            // which re-reserves / reclaims as needed.
+            if let Ok(Some((dup_workflow_id, dup_state))) = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
+                .select((
+                    harvest_workflow_executions::workflow_id,
+                    harvest_workflow_executions::state,
+                ))
+                .first::<(String, String)>(&mut probe_conn)
+                .await
+                .optional()
+            {
+                // Best-effort dedup audit (intentional asymmetry with the
+                // fresh-start arm's 503-on-audit-failure): the original start was
+                // already audited when it created the run, so a failed audit here
+                // is a no-op read and never fails the reply.
+                let exec_id_str = claim_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut probe_conn, &ar).await;
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(StartWorkflowResponse {
+                        execution_id: claim_exec_id.to_string(),
+                        workflow_name: workflow_name.clone(),
+                        workflow_id: dup_workflow_id,
+                        state: dup_state,
+                        started_fresh: Some(false),
+                        deduplicated: Some(true),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // issue #377: check admission gates before touching the DB.
     if !is_debounced_start && !has_batch_policy {
         let wf_owner = runtime
@@ -8348,67 +8430,41 @@ pub(crate) async fn start_workflow(
             // this workflow actually resolves a throttle policy, to avoid an
             // extra round-trip for the common non-throttled case.
             //
-            // issue #808: a keyed replay of an already-successful start is also
-            // not fresh admission — the idempotency reserve path would resolve
-            // it to a `200` no-op returning the existing execution. Without this
-            // probe, raising a gate during an incident would reject retries of
-            // *already-done* work exactly when at-least-once retry storms matter
-            // most. The `(workflow_name, workflow_id)` execution check above
-            // misses this because the common keyed case auto-generates a fresh
-            // `workflow_id` per retry, so we probe the keyed claim on the same
-            // key-derived `shard` selected above. A genuinely fresh keyed start
-            // finds no live claim and still passes through the gate normally.
-            let is_idempotent_retry = if explicit_workflow_id || idempotency_key.is_some() {
+            // issue #808 (Codex P2): a *keyed* replay is handled earlier — a
+            // committed keyed claim short-circuits to the `200` no-op before this
+            // gate is even consulted (see the probe above the gate). So by the
+            // time control reaches here with an idempotency key set, it is a
+            // genuinely fresh keyed start with no live claim, which must pass
+            // through the gate normally. This bypass therefore only covers the
+            // explicit-`workflow_id` idempotent-retry case.
+            let is_idempotent_retry = if explicit_workflow_id {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
                         Ok(mut pre_conn) => {
-                            let keyed_replay = if let Some(ref key) = idempotency_key {
-                                let window_secs =
-                                    api_state.start_idempotency_window().as_secs_f64();
-                                autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
-                                    &mut pre_conn,
-                                    &workflow_name,
-                                    key,
-                                    window_secs,
+                            let has_execution = harvest_workflow_executions::table
+                                .filter(
+                                    harvest_workflow_executions::workflow_name.eq(&workflow_name),
                                 )
+                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                                .filter(
+                                    harvest_workflow_executions::state
+                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                )
+                                .select(harvest_workflow_executions::id)
+                                .first::<uuid::Uuid>(&mut pre_conn)
                                 .await
+                                .optional()
                                 .unwrap_or(None)
-                                .is_some()
-                            } else {
-                                false
-                            };
-                            let explicit_wid_retry = explicit_workflow_id
-                                && {
-                                    let has_execution = harvest_workflow_executions::table
-                                        .filter(
-                                            harvest_workflow_executions::workflow_name
-                                                .eq(&workflow_name),
-                                        )
-                                        .filter(
-                                            harvest_workflow_executions::workflow_id
-                                                .eq(&workflow_id),
-                                        )
-                                        .filter(
-                                            harvest_workflow_executions::state
-                                                .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                                        )
-                                        .select(harvest_workflow_executions::id)
-                                        .first::<uuid::Uuid>(&mut pre_conn)
-                                        .await
-                                        .optional()
-                                        .unwrap_or(None)
-                                        .is_some();
-                                    has_execution
-                                    || (throttle_applies
-                                        && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
-                                            &mut pre_conn,
-                                            &workflow_name,
-                                            &workflow_id,
-                                        )
-                                        .await
-                                        .unwrap_or(false))
-                                };
-                            keyed_replay || explicit_wid_retry
+                                .is_some();
+                            has_execution
+                                || (throttle_applies
+                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                                        &mut pre_conn,
+                                        &workflow_name,
+                                        &workflow_id,
+                                    )
+                                    .await
+                                    .unwrap_or(false))
                         }
                         Err(_) => false,
                     },
