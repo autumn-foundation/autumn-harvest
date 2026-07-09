@@ -2972,6 +2972,12 @@ async fn persist_workflow_failure(
                 if attempt >= policy.max_attempts {
                     return None;
                 }
+                // NOTE: a typed workflow `non_retryable` (issue #767) is
+                // deliberately NOT consulted here — it is an advisory
+                // classification hint for the caller / completion-trigger, not a
+                // control input to the #523 workflow-level retry loop.
+                // `failure_is_non_retryable` only honors the ACTIVITY envelope
+                // and the retry policy's `non_retryable_errors` list.
                 if failure_is_non_retryable(&error, Some(&policy)) {
                     return None;
                 }

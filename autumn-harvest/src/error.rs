@@ -152,9 +152,11 @@ pub enum HarvestError {
         /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
         /// untyped failures.
         details: Option<serde_json::Value>,
-        /// Non-retryable flag from a typed
+        /// Advisory non-retryable classification hint from a typed
         /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
-        /// untyped failures.
+        /// untyped failures. This is a hint for the caller / completion-trigger,
+        /// **not** a control input to the engine's workflow-level retry (#523)
+        /// loop (issue #767 scope).
         non_retryable: Option<bool>,
     },
 
@@ -682,6 +684,10 @@ impl HarvestError {
     /// `true` if this is a [`WorkflowFailed`](HarvestError::WorkflowFailed)
     /// carrying a typed non-retryable [`WorkflowFailure`](crate::failure::WorkflowFailure).
     /// `false` for untyped failures or other variants.
+    ///
+    /// This is an **advisory** classification hint for the caller /
+    /// completion-trigger — it is not a retry control input; the engine's
+    /// workflow-level retry (#523) loop never consults it (issue #767 scope).
     #[must_use]
     pub fn is_workflow_non_retryable(&self) -> bool {
         match self {

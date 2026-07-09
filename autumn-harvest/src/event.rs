@@ -124,10 +124,13 @@ pub enum WorkflowEvent {
         /// form when `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
-        /// Non-retryable flag from a typed
+        /// Advisory non-retryable classification hint from a typed
         /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
         ///
-        /// `None` for untyped or pre-#767 failures.
+        /// `None` for untyped or pre-#767 failures. This is a downstream
+        /// classification hint (caller / completion-trigger), **not** a control
+        /// input to the engine's workflow-level retry (#523) loop (issue #767
+        /// scope).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         non_retryable: Option<bool>,
     },
@@ -277,10 +280,13 @@ pub enum WorkflowEvent {
         /// `None` for pre-#767 or untyped child failures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
-        /// Non-retryable flag from a typed
+        /// Advisory non-retryable classification hint from a typed
         /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
         ///
-        /// `None` for pre-#767 or untyped child failures.
+        /// `None` for pre-#767 or untyped child failures. This is a downstream
+        /// classification hint (caller / completion-trigger), **not** a control
+        /// input to the engine's workflow-level retry (#523) loop (issue #767
+        /// scope).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         non_retryable: Option<bool>,
     },

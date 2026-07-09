@@ -435,6 +435,13 @@ mod db_handle_surface {
             assert_eq!(snap.error_type.as_deref(), Some(cat));
             assert_eq!(snap.non_retryable, Some(true));
             assert_eq!(snap.error_details, Some(serde_json::json!({ "cat": cat })));
+
+            // Typed `result()` Err-arm also surfaces the typed class (D1).
+            let typed_err = typed
+                .result()
+                .await
+                .expect_err("FAILED execution must return an Err from result()");
+            assert_eq!(typed_err.workflow_error_type(), Some(cat));
         }
     }
 }

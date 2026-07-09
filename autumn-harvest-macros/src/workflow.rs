@@ -446,6 +446,12 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
 
 /// Whether the workflow's `Result<_, E>` error type `E` names `WorkflowFailure`
 /// (issue #767). Mirrors `activity.rs::activity_returns_activity_failure`.
+///
+/// Detection is by the error type's **last path segment ident** (`== "WorkflowFailure"`,
+/// with or without a `failure::` / `autumn_harvest::failure::` prefix), mirroring
+/// `activity_returns_activity_failure`. A `use` alias or a rename of the type is
+/// therefore not detected and falls back to the `.to_string()` path — a documented
+/// limitation, consistent with the activity precedent.
 fn workflow_returns_workflow_failure(output: &syn::ReturnType) -> bool {
     let syn::ReturnType::Type(_, ty) = output else {
         return false;

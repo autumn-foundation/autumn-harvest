@@ -175,12 +175,16 @@ impl<T> TypedWorkflowHandle<T> {
         // Only a `Failed` state emits a `WorkflowFailed` event carrying typed
         // fields (issue #767); the extra history load is skipped for every other
         // state (`Cancelled`/`TimedOut`/`Terminated` never carry a typed
-        // `WorkflowFailure`).
+        // `WorkflowFailure`). A transient history-load failure is *swallowed*
+        // (falls back to untyped `None` fields), mirroring
+        // `HandleInner::enrich_terminal_result` — it must not turn an otherwise
+        // correct snapshot (state + human `error` message intact) into an `Err`.
         let (error_type, error_details, non_retryable) =
             if snap.state == WorkflowResultState::Failed {
-                match self.inner.terminal_typed_failure().await? {
-                    Some(decoded) => (decoded.error_type, decoded.details, decoded.non_retryable),
-                    None => (None, None, None),
+                if let Ok(Some(decoded)) = self.inner.terminal_typed_failure().await {
+                    (decoded.error_type, decoded.details, decoded.non_retryable)
+                } else {
+                    (None, None, None)
                 }
             } else {
                 (None, None, None)

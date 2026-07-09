@@ -4011,17 +4011,27 @@ impl WorkflowContext {
                 error_type,
                 details,
                 non_retryable,
-            } => Err(HarvestError::WorkflowFailed {
-                // Keep the `child-workflow:` name prefix for log disambiguation.
-                name: format!("child-workflow:{workflow_name}"),
-                reason: error,
-                // `"Error"` is the untyped sentinel; convert it back to `None` so
-                // the parent's typed error surface reflects a legacy child failure
-                // as untyped rather than a synthetic `"Error"` class (issue #767).
-                error_type: (error_type != "Error").then(|| error_type.clone()),
-                details,
-                non_retryable: Some(non_retryable),
-            }),
+            } => {
+                // A pure-untyped legacy child failure (`error_type == "Error"`
+                // sentinel, no details, not non-retryable) must surface
+                // identically to a direct untyped failure — all typed fields
+                // `None`. Any typed signal (a real class, details, or the
+                // non-retryable flag — incl. the degenerate
+                // `WorkflowFailure::new("Error", ..).non_retryable()`) preserves
+                // the typed surface. Mirrors the live child path below (#767).
+                let was_typed = error_type != "Error" || details.is_some() || non_retryable;
+                Err(HarvestError::WorkflowFailed {
+                    // Keep the `child-workflow:` name prefix for log disambiguation.
+                    name: format!("child-workflow:{workflow_name}"),
+                    reason: error,
+                    // `"Error"` is the untyped sentinel; convert it back to `None`
+                    // so the parent's typed error surface reflects a legacy child
+                    // failure as untyped rather than a synthetic `"Error"` class.
+                    error_type: (error_type != "Error").then_some(error_type),
+                    details,
+                    non_retryable: was_typed.then_some(non_retryable),
+                })
+            }
             HistoryMatch::TimedOut { .. }
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
@@ -5939,16 +5949,24 @@ impl WorkflowContext {
                             error_type,
                             details,
                             non_retryable,
-                        } => resolved.push((
-                            index,
-                            Err(HarvestError::WorkflowFailed {
-                                name: format!("child-workflow:{workflow_name}"),
-                                reason: error,
-                                error_type: (error_type != "Error").then(|| error_type.clone()),
-                                details,
-                                non_retryable: Some(non_retryable),
-                            }),
-                        )),
+                        } => {
+                            // Legacy untyped child → all typed fields `None`
+                            // (identical to a direct untyped failure); any typed
+                            // signal preserves the typed surface. Mirrors the
+                            // single-child replay path (#767).
+                            let was_typed =
+                                error_type != "Error" || details.is_some() || non_retryable;
+                            resolved.push((
+                                index,
+                                Err(HarvestError::WorkflowFailed {
+                                    name: format!("child-workflow:{workflow_name}"),
+                                    reason: error,
+                                    error_type: (error_type != "Error").then_some(error_type),
+                                    details,
+                                    non_retryable: was_typed.then_some(non_retryable),
+                                }),
+                            ));
+                        }
                         HistoryMatch::Diverged {
                             expected,
                             actual,
@@ -10881,10 +10899,72 @@ mod tests {
             .await
             .expect_err("child failure should surface as an Err");
 
-        assert!(matches!(err, HarvestError::WorkflowFailed { .. }));
-        assert_eq!(err.workflow_error_type(), None);
-        assert!(err.workflow_details().is_none());
         assert!(!err.is_workflow_non_retryable());
+        // A legacy untyped child must produce `non_retryable: None` (not
+        // `Some(false)`) so it is byte-identical to a direct untyped failure.
+        match err {
+            HarvestError::WorkflowFailed {
+                error_type,
+                details,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error_type, None);
+                assert!(details.is_none());
+                assert_eq!(non_retryable, None);
+            }
+            other => panic!("expected WorkflowFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_replays_typed_non_retryable_child_preserves_flag() {
+        // A typed non-retryable child failure surfaces `non_retryable == Some(true)`
+        // on the underlying field — even for the degenerate `"Error"` class, whose
+        // `error_type` still collapses to `None` (issue #767).
+        let child_id = ExecutionId::new();
+        let decoded = crate::failure::DecodedWorkflowFailure {
+            message: "permanent".into(),
+            // `"Error"` class collapses to None on decode, but the
+            // non-retryable flag keeps the failure "typed".
+            error_type: None,
+            details: None,
+            non_retryable: Some(true),
+        };
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "charge_card".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::child_workflow_failed_typed(child_id, &decoded),
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .spawn_child_workflow_raw("charge_card", Value::Null)
+            .await
+            .expect_err("child failure should surface as an Err");
+
+        assert!(err.is_workflow_non_retryable());
+        match err {
+            HarvestError::WorkflowFailed {
+                error_type,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error_type, None);
+                assert_eq!(non_retryable, Some(true));
+            }
+            other => panic!("expected WorkflowFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

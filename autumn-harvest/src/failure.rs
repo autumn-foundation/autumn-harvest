@@ -367,6 +367,12 @@ pub(crate) fn classify_activity_error(
 /// continues to compile and behave identically. Untyped failures decode back
 /// to `error_type = None` (see [`decode_workflow_failure`]).
 ///
+/// `"Error"` is the **reserved untyped sentinel** and must not be used as a
+/// typed `error_type` class: a genuine envelope whose class is literally
+/// `"Error"` collapses back to `error_type = None` on decode (mirroring the
+/// activity `"Error"` legacy convention). Its other fields (`details`,
+/// `non_retryable`) are still preserved.
+///
 /// ## Builder note
 ///
 /// Unlike [`ActivityFailure::non_retryable`] (a constructor taking a type and
@@ -383,8 +389,15 @@ pub struct WorkflowFailure {
     /// Optional structured details serialised alongside the failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
-    /// When `true` the failure is marked as permanent for downstream
-    /// classification (e.g. workflow-level retry policies).
+    /// Advisory failure-classification hint read by the caller /
+    /// completion-trigger (via [`HarvestError::is_workflow_non_retryable`]).
+    ///
+    /// This is **not** a control input to the engine's workflow-level retry
+    /// (#523) loop — a typed workflow `non_retryable` is deliberately *not*
+    /// consulted by the retry scheduler, per issue #767 scope. It is a hint for
+    /// downstream classification only, never a gate on whether the run retries.
+    ///
+    /// [`HarvestError::is_workflow_non_retryable`]: crate::HarvestError::is_workflow_non_retryable
     pub non_retryable: bool,
 }
 
@@ -408,6 +421,11 @@ impl WorkflowFailure {
 
     /// Mark this failure as non-retryable (builder — flips the flag, returns
     /// `self`). Chains after [`WorkflowFailure::new`].
+    ///
+    /// The flag is an **advisory classification hint** for the caller /
+    /// completion-trigger, not a control input to the engine's workflow-level
+    /// retry (#523) loop — the retry scheduler does not consult it (issue #767
+    /// scope). Setting it does not prevent the run from retrying.
     #[must_use]
     pub const fn non_retryable(mut self) -> Self {
         self.non_retryable = true;
@@ -499,6 +517,13 @@ pub struct DecodedWorkflowFailure {
 /// A well-formed `harvest_workflow_failure_v1` envelope decodes to its typed
 /// fields; every other string decodes to `message = payload`, with all typed
 /// fields `None` (the untyped back-compat path).
+///
+/// The string `"Error"` is the reserved untyped sentinel (mirroring the
+/// activity `"Error"` legacy convention): a genuine envelope whose
+/// `error_type` is literally `"Error"` collapses `error_type` to `None` so it
+/// classifies identically to a legacy untyped failure. The other typed fields
+/// (`message`, `details`, `non_retryable`) are preserved independently — only
+/// `error_type` is affected by the sentinel collapse.
 #[must_use]
 pub fn decode_workflow_failure(payload: &str) -> DecodedWorkflowFailure {
     if let Ok(WorkflowWirePayload::WorkflowFailureV1(failure)) =
@@ -506,7 +531,11 @@ pub fn decode_workflow_failure(payload: &str) -> DecodedWorkflowFailure {
     {
         DecodedWorkflowFailure {
             message: failure.message,
-            error_type: Some(failure.error_type),
+            // `"Error"` is the reserved untyped sentinel: collapse it to `None`
+            // so a genuine typed failure whose class is literally `"Error"`
+            // classifies the same live, on replay, and when stored. Preserve the
+            // other typed fields independently.
+            error_type: (failure.error_type != "Error").then_some(failure.error_type),
             details: failure.details,
             non_retryable: Some(failure.non_retryable),
         }
@@ -893,6 +922,22 @@ mod tests {
         assert_eq!(decoded.message, look_alike);
         assert!(decoded.error_type.is_none());
         assert!(parse_workflow_typed_payload(look_alike).is_none());
+    }
+
+    #[test]
+    fn decode_error_sentinel_class_yields_none_error_type() {
+        // A genuine typed envelope whose class is literally the reserved
+        // `"Error"` sentinel collapses `error_type` to `None`, but preserves
+        // `non_retryable` and `details` independently.
+        let payload = WorkflowFailure::new("Error", "x")
+            .non_retryable()
+            .with_details(serde_json::json!({"a": 1}))
+            .into_workflow_error_payload();
+        let decoded = decode_workflow_failure(&payload);
+        assert_eq!(decoded.message, "x");
+        assert_eq!(decoded.error_type, None);
+        assert_eq!(decoded.non_retryable, Some(true));
+        assert_eq!(decoded.details, Some(serde_json::json!({"a": 1})));
     }
 
     #[test]

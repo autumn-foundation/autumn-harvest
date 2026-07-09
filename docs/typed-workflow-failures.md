@@ -67,6 +67,20 @@ Because the branch is a pure function of the recorded typed `ChildWorkflowFailed
 event, **replay always takes the same branch** — reword the child's message and
 the parent's decision is byte-identical.
 
+## Behavior change (upgrading from before #767)
+
+A failed **child** workflow now surfaces to the parent as
+`HarvestError::WorkflowFailed` (typed). **Before #767 it surfaced as
+`HarvestError::ActivityFailed { name: "child-workflow:{name}", .. }`.** The
+`child-workflow:{name}` name prefix is preserved, so log/observability matching
+on the name is unaffected.
+
+Downstream parent code that previously matched on `HarvestError::ActivityFailed`
+for a child result — or called `.activity_error_type()` / `.activity_details()` /
+`.is_circuit_open()` on it — must switch to the `HarvestError::WorkflowFailed`
+variant and the `workflow_error_type()` / `workflow_details()` /
+`is_workflow_non_retryable()` accessors shown above.
+
 ## Embedder surface: `TypedWorkflowHandle`
 
 A caller awaiting a workflow directly (not from inside another workflow) gets the
