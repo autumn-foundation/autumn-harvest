@@ -615,20 +615,20 @@ async fn seed_typed_task(
     let mut conn = pool.get().await.expect("task seeding connection");
     let id = uuid::Uuid::new_v4();
 
-    let rate_limit_key_clause =
-        rate_limit_key.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
-    let activity_name_clause =
-        activity_name.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
-
     diesel::sql_query(format!(
         "INSERT INTO harvest_task_queue (
             id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
             rate_limit_key, activity_name
          ) VALUES (
-            '{id}', '{queue_name}', '{task_type}', '{{}}'::jsonb, 'PENDING', 0, 1, {scheduled_at_clause},
-            {rate_limit_key_clause}, {activity_name_clause}
+            $1, $2, $3, '{{}}'::jsonb, 'PENDING', 0, 1, {scheduled_at_clause},
+            $4, $5
          )"
     ))
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .bind::<diesel::sql_types::Text, _>(task_type)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(rate_limit_key)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(activity_name)
     .execute(&mut conn)
     .await
     .expect("failed to insert typed test task");
