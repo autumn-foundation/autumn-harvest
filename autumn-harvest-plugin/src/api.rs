@@ -26423,6 +26423,58 @@ pub struct TaskEligibilityResponse {
     pub summary: EligibilitySummary,
 }
 
+/// Compute the reason codes that depend only on the task and shared runtime
+/// state — not on any particular worker (issue #611).
+///
+/// These are the impediments that block *every* worker equally: a saturated
+/// per-key concurrency cap, an exhausted rate-limit bucket, and an OPEN /
+/// HALF-OPEN circuit breaker on the task's next activity. The worker-specific
+/// reasons (`build_incompatible`, `sticky_owned_by_other_worker`,
+/// `unsatisfied_requirement:*`) are computed separately by the caller and
+/// appended alongside these, preserving the existing multi-reason behaviour
+/// (AC5).
+///
+/// Rate-limit suppression (issue #369): an activity that carries a circuit
+/// breaker (`has_cb`) enforces rate limiting at dispatch, not at claim, so a
+/// stale `rate_limit_exhausted` reason is never surfaced for it — its
+/// impediment is the circuit reason instead.
+fn task_intrinsic_impediment_reasons(
+    activity_name: Option<&str>,
+    rate_limit_key: Option<&str>,
+    has_cb: bool,
+    saturated_rate_limits: &std::collections::HashSet<String>,
+    concurrency_saturated: bool,
+    cb_phase: &std::collections::HashMap<String, &'static str>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    if concurrency_saturated {
+        reasons.push("concurrency_saturated".to_string());
+    }
+
+    // Rate limiting for CB activities is enforced at dispatch, not at claim
+    // (issue #369), so a saturated bucket never surfaces here for them — the
+    // circuit reason below is the accurate impediment.
+    if !has_cb
+        && let Some(rlk) = rate_limit_key
+        && saturated_rate_limits.contains(rlk)
+    {
+        reasons.push("rate_limit_exhausted".to_string());
+    }
+
+    // An OPEN or HALF-OPEN breaker on the task's next activity blocks the claim;
+    // a CLOSED (or absent) breaker contributes nothing.
+    if let Some(name) = activity_name {
+        match cb_phase.get(name).copied() {
+            Some("open") => reasons.push("circuit_open".to_string()),
+            Some("half_open") => reasons.push("circuit_half_open".to_string()),
+            _ => {}
+        }
+    }
+
+    reasons
+}
+
 #[allow(
     clippy::collapsible_if,
     clippy::cast_precision_loss,
@@ -26610,6 +26662,26 @@ async fn evaluate_eligibility_for_shard(
         })
         .unwrap_or_default();
 
+    // Observable circuit-breaker phase per tracked activity (issue #611).
+    // `list()` prunes each breaker's rolling failure window and reads its phase;
+    // it never transitions phase (Open→HalfOpen is driven exclusively by
+    // dispatch), so an open breaker reads "open" through the cooldown until a
+    // probe is admitted — safe to consult read-only from this diagnostic
+    // endpoint (`list()`/`snapshot` only, never `on_dispatch`/`on_result`/
+    // `force_*`).
+    let cb_phase: HashMap<String, &'static str> = api_state
+        .runtime()
+        .ok()
+        .map(|r| {
+            r.registry()
+                .circuit_breakers()
+                .list(std::time::Instant::now())
+                .into_iter()
+                .map(|snap| (snap.activity_name, snap.state))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut rate_limit_keys = Vec::new();
     for t in tasks.iter().filter(|t| t.state == "PENDING") {
         if let Some(ref rlk) = t.rate_limit_key {
@@ -26759,25 +26831,32 @@ async fn evaluate_eligibility_for_shard(
                     }
                 }
 
-                if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
-                    let running = running_map
-                        .get(&(key.clone(), t.task_type.clone()))
-                        .copied()
-                        .unwrap_or(0);
-                    if running >= i64::from(cap) {
-                        reasons.push("concurrency_saturated".to_string());
-                    }
-                }
-
-                if let Some(ref rlk) = t.rate_limit_key {
-                    let has_cb = t
-                        .activity_name
-                        .as_ref()
-                        .is_some_and(|act_name| cb_activities.contains(act_name));
-                    if !has_cb && saturated_rate_limits.contains(rlk) {
-                        reasons.push("rate_limit_saturated".to_string());
-                    }
-                }
+                // Task-intrinsic impediments (issue #611): per-key concurrency
+                // saturation, rate-limit exhaustion, and circuit-breaker phase.
+                // These block every worker equally; they are computed once per
+                // task and appended alongside the worker-specific reasons above.
+                let concurrency_saturated =
+                    if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
+                        let running = running_map
+                            .get(&(key.clone(), t.task_type.clone()))
+                            .copied()
+                            .unwrap_or(0);
+                        running >= i64::from(cap)
+                    } else {
+                        false
+                    };
+                let has_cb = t
+                    .activity_name
+                    .as_ref()
+                    .is_some_and(|act_name| cb_activities.contains(act_name));
+                reasons.extend(task_intrinsic_impediment_reasons(
+                    t.activity_name.as_deref(),
+                    t.rate_limit_key.as_deref(),
+                    has_cb,
+                    &saturated_rate_limits,
+                    concurrency_saturated,
+                    &cb_phase,
+                ));
 
                 let parsed_reqs = if t.task_type == "activity" {
                     t.required_capabilities.as_ref().map_or_else(
@@ -27115,6 +27194,175 @@ async fn get_task_eligibility(
     Err(AutumnError::not_found_msg(format!(
         "task {task_id} not found"
     )))
+}
+
+#[cfg(test)]
+mod eligibility_reason_tests {
+    use super::task_intrinsic_impediment_reasons;
+    use std::collections::{HashMap, HashSet};
+
+    fn saturated(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    fn phases(pairs: &[(&str, &'static str)]) -> HashMap<String, &'static str> {
+        pairs.iter().map(|(n, s)| ((*n).to_string(), *s)).collect()
+    }
+
+    // AC1: a task deferred solely because its rate-limit bucket is exhausted
+    // reports `rate_limit_exhausted` — never `concurrency_saturated`.
+    #[test]
+    fn rate_limit_only_reports_rate_limit_exhausted() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("send_email"),
+            Some("rl-key"),
+            false,
+            &saturated(&["rl-key"]),
+            false,
+            &HashMap::new(),
+        );
+        assert_eq!(reasons, vec!["rate_limit_exhausted".to_string()]);
+    }
+
+    // AC2: a genuinely concurrency-capped task reports `concurrency_saturated`
+    // and nothing else.
+    #[test]
+    fn concurrency_only_reports_concurrency_saturated() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("do_work"),
+            None,
+            false,
+            &HashSet::new(),
+            true,
+            &HashMap::new(),
+        );
+        assert_eq!(reasons, vec!["concurrency_saturated".to_string()]);
+    }
+
+    // AC3: a task whose next activity is gated by an OPEN breaker reports
+    // `circuit_open` (never an empty/unknown impediment set for that cause).
+    #[test]
+    fn open_circuit_reports_circuit_open() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            false,
+            &phases(&[("charge_card", "open")]),
+        );
+        assert!(
+            reasons.contains(&"circuit_open".to_string()),
+            "expected circuit_open, got {reasons:?}"
+        );
+    }
+
+    // AC4: a HALF-OPEN breaker (task is not the probe) reports
+    // `circuit_half_open`.
+    #[test]
+    fn half_open_circuit_reports_circuit_half_open() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            false,
+            &phases(&[("charge_card", "half_open")]),
+        );
+        assert!(
+            reasons.contains(&"circuit_half_open".to_string()),
+            "expected circuit_half_open, got {reasons:?}"
+        );
+    }
+
+    // AC4: a CLOSED breaker contributes no reason.
+    #[test]
+    fn closed_circuit_contributes_no_reason() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            false,
+            &phases(&[("charge_card", "closed")]),
+        );
+        assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
+
+    // #369 suppression preserved: a CB activity with a saturated bucket reports
+    // `circuit_open` and never a stale `rate_limit_exhausted`.
+    #[test]
+    fn cb_activity_suppresses_rate_limit_and_reports_circuit() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            Some("rl-key"),
+            true,
+            &saturated(&["rl-key"]),
+            false,
+            &phases(&[("charge_card", "open")]),
+        );
+        assert!(
+            reasons.contains(&"circuit_open".to_string()),
+            "expected circuit_open, got {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&"rate_limit_exhausted".to_string()),
+            "rate-limit reason must be suppressed for a CB activity, got {reasons:?}"
+        );
+    }
+
+    // AC5: multiple impediments list all applicable reason codes.
+    #[test]
+    fn concurrency_and_circuit_report_both() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            true,
+            &phases(&[("charge_card", "open")]),
+        );
+        assert!(
+            reasons.contains(&"concurrency_saturated".to_string()),
+            "expected concurrency_saturated, got {reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"circuit_open".to_string()),
+            "expected circuit_open, got {reasons:?}"
+        );
+    }
+
+    // A non-saturated rate limit and no other impediment yields no reasons.
+    #[test]
+    fn no_impediment_yields_no_reasons() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("send_email"),
+            Some("rl-key"),
+            false,
+            &HashSet::new(),
+            false,
+            &HashMap::new(),
+        );
+        assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
+
+    // Documented #369 boundary: a CB activity whose breaker is CLOSED but whose
+    // rate-limit bucket is exhausted surfaces NO claim-time impediment — rate
+    // limiting for a CB activity is enforced at dispatch, not claim, so its
+    // stall is dispatch-side (visible via `GET /admin/circuits/{activity}` + the
+    // token bucket), never through this claim-time eligibility explainer.
+    #[test]
+    fn cb_activity_closed_breaker_with_exhausted_bucket_reports_nothing() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("a"),
+            Some("k"),
+            true,
+            &saturated(&["k"]),
+            false,
+            &phases(&[("a", "closed")]),
+        );
+        assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
 }
 
 #[cfg(test)]
