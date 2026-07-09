@@ -280,6 +280,25 @@ fn timer_first_workflow<'a>(
     })
 }
 
+/// Workflow that sleeps until an absolute deadline (issue #749). The deadline
+/// is carried in the input as epoch-millis so the fixture is fully
+/// deterministic; `sleep_until` internally captures `system_now()`
+/// (`SideEffectRecorded`) then starts a whole-second timer.
+fn sleep_until_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let deadline_millis = input["deadline_millis"].as_i64().unwrap_or(0);
+        let deadline = chrono::DateTime::from_timestamp_millis(deadline_millis)
+            .ok_or_else(|| "bad deadline".to_string())?;
+        ctx.sleep_until("wake", deadline)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
 /// Workflow that derives a timer duration from deterministic retry-jitter math.
 fn jitter_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -432,6 +451,7 @@ fn build_replayer() -> WorkflowReplayer {
         )
         .register_fn("patched_workflow_sandwich", patched_workflow_sandwich)
         .register_fn("timer_first_workflow", timer_first_workflow)
+        .register_fn("sleep_until_workflow", sleep_until_workflow)
         .register_fn("jitter_timer_workflow", jitter_timer_workflow)
         .register_fn("current_details_workflow", current_details_workflow)
         .register_fn("session_pipeline_workflow", session_pipeline_workflow)
@@ -782,6 +802,184 @@ async fn replay_jitter_timer_is_exact_and_deterministic() {
             }
         ),
         "timer duration mismatch must be detected as TimerMismatch, got: {bad}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// sleep_until — absolute-deadline durable timer (issue #749)
+// ---------------------------------------------------------------------------
+
+/// Build a consistent recorded history for `sleep_until_workflow`: a frozen
+/// `system_now()` capture plus a whole-second timer whose duration equals
+/// `remaining_secs_until(deadline, frozen_now)` computed inline from the same
+/// values, so the fixture is internally consistent by construction.
+fn sleep_until_history(
+    frozen_millis: i64,
+    deadline_millis: i64,
+) -> (Value, Vec<WorkflowEvent>, u64) {
+    // Mirror of `context::remaining_secs_until` (crate-private): clamp past to
+    // zero, round sub-second remainders up to whole seconds.
+    let delta_ms = deadline_millis - frozen_millis;
+    let duration_secs: u64 = if delta_ms <= 0 {
+        0
+    } else {
+        let secs = delta_ms / 1000;
+        let round_up = i64::from(delta_ms % 1000 != 0);
+        u64::try_from(secs + round_up).unwrap_or(u64::MAX)
+    };
+    let input = serde_json::json!({ "deadline_millis": deadline_millis });
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(frozen_millis),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("wake"),
+            duration_secs,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("wake"),
+        },
+    ];
+    (input, events, duration_secs)
+}
+
+/// The falsifiable bar for issue #749: `sleep_until` histories replay
+/// deterministically across N = 1000 runs with zero divergences. Each iteration
+/// builds a *distinct* fixture — the frozen `system_now()` instant and the
+/// deadline offset both vary with `i`, including deliberate sub-second jitter
+/// that exercises the round-up path — so this is 1000 varied cases, not one
+/// fixture cloned 1000 times.
+#[tokio::test]
+async fn sleep_until_replays_deterministically() {
+    let base_frozen = 1_600_000_000_000_i64;
+    let replayer = build_replayer();
+    for i in 0..1000_i64 {
+        // Vary the frozen capture and the remaining offset deterministically;
+        // the `* 250ms` term walks the sub-second remainder through the round-up
+        // boundary (0, 250, 500, 750, 1000ms, ...).
+        let frozen_millis = base_frozen + i * 37_000;
+        let deadline_millis = frozen_millis + 3_600_000 + i * 250;
+        let (_input, events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
+        if i == 0 {
+            assert_eq!(duration_secs, 3600, "i=0 fixture math must be consistent");
+        }
+
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "sleep_until_workflow",
+                ExecutionId::new(),
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "replay pass {i} must succeed with zero divergences, got: {report}"
+        );
+    }
+}
+
+/// A recorded past-deadline `sleep_until` (duration clamped to 0) still replays
+/// cleanly — AC3 through the replayer.
+#[tokio::test]
+async fn sleep_until_past_deadline_replays_deterministically() {
+    let frozen_millis = 1_700_000_000_000_i64;
+    let deadline_millis = frozen_millis - 60_000; // one minute BEFORE the frozen now
+    let (_input, events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
+    assert_eq!(duration_secs, 0, "past deadline must clamp to zero");
+
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "sleep_until_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "past-deadline sleep_until must replay cleanly, got: {report}"
+    );
+}
+
+/// A mutated timer *duration* in an otherwise-valid `sleep_until` history
+/// surfaces as ordinary timer non-determinism — NOT a panic, NOT
+/// `ReplaySucceeded`. (Renamed from `..._reorder_...`: this mutates the recorded
+/// duration, not event order.)
+#[tokio::test]
+async fn sleep_until_duration_mismatch_surfaces_as_timer_nondeterminism() {
+    let frozen_millis = 1_700_000_000_000_i64;
+    let deadline_millis = frozen_millis + 3_600_000;
+    let (_input, mut events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
+
+    // Mutate the recorded timer so the replayed duration diverges.
+    if let WorkflowEvent::TimerStarted {
+        duration_secs: d, ..
+    } = &mut events[2]
+    {
+        *d = duration_secs.saturating_add(1);
+    } else {
+        panic!("event[2] must be TimerStarted");
+    }
+
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "sleep_until_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::TimerMismatch,
+                ..
+            }
+        ),
+        "a mutated sleep_until timer must be detected as TimerMismatch, got: {report}"
+    );
+}
+
+/// A genuine *structural* divergence: the frozen `SideEffectRecorded { Now }`
+/// event is dropped from history (as if a code change removed the `system_now()`
+/// capture that `sleep_until` performs), so on replay the first history-consulting
+/// call diverges. Must surface as a classified non-determinism — NOT a panic,
+/// NOT `ReplaySucceeded`.
+#[tokio::test]
+async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
+    let frozen_millis = 1_700_000_000_000_i64;
+    let deadline_millis = frozen_millis + 3_600_000;
+    let (_input, events, _duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
+
+    // Drop the SideEffectRecorded(Now) capture (events[1]), leaving
+    // [WorkflowStarted, TimerStarted, TimerFired].
+    let mut structural = events;
+    structural.remove(1);
+
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "sleep_until_workflow",
+            ExecutionId::new(),
+            structural,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::SideEffectDrift,
+                ..
+            }
+        ),
+        "dropping the frozen system_now() capture must surface as SideEffectDrift, got: {report}"
     );
 }
 
