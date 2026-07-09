@@ -125,6 +125,20 @@ Semantics:
   never rejects a retry of already-done work; the retry returns the original
   execution regardless of its own body. A genuinely fresh keyed start (no live
   claim) still runs every validation and the gate normally.
+- **A committed keyed replay survives a malformed body when the key is in the
+  `Idempotency-Key` header.** Because the body is irrelevant on a key hit, a
+  retry whose JSON body no longer deserializes (a client- or server-side shape
+  change after the original delivery) still returns the `200` no-op rather than
+  the JSON extractor's `400`/`422`. **Residual:** with a malformed body the
+  `workflow_id` is unknown, so this fallback can only probe the claim by
+  **key-routing**; a committed replay whose *original* delivery supplied an
+  explicit `workflow_id` (and was therefore routed to — and claimed on — the
+  `workflow_id`-derived shard) is not found by the key-routed fallback and still
+  returns the extractor rejection. This is safe (never a false dedup, never a
+  duplicate run) and narrow: the common header-key usage omits `workflow_id`
+  (auto-generated), which routes by the key and *is* found. A malformed body with
+  **no** key returns the exact extractor rejection unchanged. A well-behaved
+  client sends a consistent, valid body on retries.
 - **Empty key → `400`**; **combining a key with a throttle/debounce/batch
   policy → `400`** (those defer the start and expose no synchronous
   `execution_id` to converge on).

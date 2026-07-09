@@ -335,6 +335,40 @@ async fn post_start(
     (status, json)
 }
 
+/// Like [`post_start`] but sends an arbitrary raw request body (which may be
+/// malformed/undeserializable JSON), so tests can exercise the JSON-extractor
+/// rejection path (issue #808, Codex P2).
+async fn post_start_raw_body(
+    app: &HarvestApiApp,
+    wf: &str,
+    raw_body: &str,
+    idem_header: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/workflows/{wf}/start"))
+        .header("content-type", "application/json")
+        .header("x-harvest-admin", "true");
+    if let Some(k) = idem_header {
+        builder = builder.header("Idempotency-Key", k);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(raw_body.to_string())).unwrap())
+        .await
+        .expect("POST request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, json)
+}
+
 async fn raw_connect(url: &str) -> diesel_async::AsyncPgConnection {
     diesel_async::AsyncPgConnection::establish(url)
         .await
@@ -1065,4 +1099,93 @@ async fn keyed_replay_against_a_throttled_workflow_dedups() {
     // Exactly one execution overall (the retry deduped; the fresh 400 created nothing).
     let mut conn = raw_connect(&url).await;
     assert_eq!(execution_count(&mut conn, "sync_tenant").await, 1);
+}
+
+/// A malformed/undeserializable JSON body that is undeserializable at the axum
+/// extractor level. Kept in one place so the three malformed-body tests below
+/// exercise the identical wire input (`execution_timeout_secs` wrong-typed →
+/// `JsonDataError`).
+const MALFORMED_START_BODY: &str =
+    r#"{"input": {"n": 1}, "execution_timeout_secs": "not-a-number"}"#;
+
+/// issue #808 (Codex P2): a retry that carries its exactly-once key in the
+/// `Idempotency-Key` HEADER, but whose JSON body is now malformed, must still
+/// return the advertised `200` no-op for a committed claim — the body is
+/// irrelevant on a key hit, so the JSON-extractor rejection must not win.
+#[tokio::test]
+async fn header_key_replay_survives_a_malformed_body() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    // Original delivery: valid body, auto-generated workflow_id (routes by key).
+    let (s1, b1) = post_start(&app, "order_flow", json!({"input": {"n": 1}}), Some("mk-1")).await;
+    assert_eq!(s1, StatusCode::CREATED, "first: {b1}");
+    assert_eq!(b1["started_fresh"], json!(true));
+    let exec1 = b1["execution_id"].as_str().unwrap().to_string();
+
+    // Retry: SAME header key, MALFORMED body → 200 no-op, same execution_id,
+    // NOT the extractor's 400/422.
+    let (s2, b2) =
+        post_start_raw_body(&app, "order_flow", MALFORMED_START_BODY, Some("mk-1")).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "committed header-key replay must dedup despite a malformed body: {b2}"
+    );
+    assert_eq!(b2["deduplicated"], json!(true));
+    assert_eq!(b2["started_fresh"], json!(false));
+    assert_eq!(
+        b2["execution_id"].as_str().unwrap(),
+        exec1,
+        "dedup returns the original execution_id"
+    );
+
+    // Exactly one execution — the malformed-body retry created nothing new.
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// AC1: a malformed body with NO idempotency key returns the exact JSON-extractor
+/// rejection (a client error, never a `200`) — byte-for-byte the no-key behavior,
+/// unchanged by the #808 header-probe fix. A header-key malformed body with no
+/// committed claim (a probe miss) returns the IDENTICAL rejection, proving the
+/// fallback never fabricates a start.
+#[tokio::test]
+async fn malformed_body_returns_the_extractor_rejection_when_not_a_committed_replay() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("order_flow")]);
+
+    // No key: the exact axum rejection (client error, never 200).
+    let (s_nokey, _b_nokey) =
+        post_start_raw_body(&app, "order_flow", MALFORMED_START_BODY, None).await;
+    assert!(
+        s_nokey.is_client_error(),
+        "no-key malformed body returns a client error, got {s_nokey}"
+    );
+    assert_ne!(s_nokey, StatusCode::OK, "never a 200 no-op without a claim");
+
+    // Header key present but no committed claim (probe miss) → identical
+    // rejection (the fallback falls through to `rejection.into_response()`).
+    let (s_miss, _b_miss) = post_start_raw_body(
+        &app,
+        "order_flow",
+        MALFORMED_START_BODY,
+        Some("never-started-key"),
+    )
+    .await;
+    assert!(
+        s_miss.is_client_error(),
+        "header-key malformed body with no claim returns a client error, got {s_miss}"
+    );
+    assert_ne!(s_miss, StatusCode::OK, "a probe miss never returns 200");
+    assert_eq!(
+        s_miss, s_nokey,
+        "AC1: the probe-miss rejection is byte-identical to the no-key rejection"
+    );
+
+    // Nothing was started by either malformed request.
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "order_flow").await, 0);
 }

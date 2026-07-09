@@ -14,6 +14,7 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -8013,15 +8014,244 @@ fn workflow_resolving_throttle(
 /// clean `400` at the API boundary instead.
 const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 
+/// Shared trim + empty-`400` + length-cap validation for a request-scoped
+/// `idempotency_key` (issue #808), used by both the `Idempotency-Key` header
+/// and the body-field source so the two never diverge. `Ok(None)` = no key;
+/// `Ok(Some(k))` = a valid trimmed key; `Err(resp)` = a `400` for an empty or
+/// over-long key.
+#[allow(clippy::result_large_err)]
+fn validate_start_idempotency_key(
+    raw: Option<String>,
+) -> Result<Option<String>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    match raw {
+        Some(s) if s.trim().is_empty() => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "idempotency_key must not be empty" })),
+        )
+            .into_response()),
+        Some(s) => {
+            let trimmed = s.trim();
+            // Cap the key length: it is half of the composite PK on
+            // harvest_start_idempotency, so an oversized key would overflow the
+            // btree tuple limit and 500 at INSERT on client-controlled input.
+            // Reject it cleanly at the boundary instead.
+            if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN})"
+                        )
+                    })),
+                )
+                    .into_response());
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Extract the `Idempotency-Key` HEADER value (issue #808), applying the same
+/// trim/empty/length-cap rules as the body field via
+/// [`validate_start_idempotency_key`]. `Err` is a `400` (invalid UTF-8, empty,
+/// or over-long); `Ok(None)` = header absent. Independent of the request body,
+/// so it is usable even when the JSON body failed to deserialize.
+#[allow(clippy::result_large_err)]
+fn extract_start_idempotency_header_key(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let raw = match headers.get(HEADER_IDEMPOTENCY_KEY) {
+        Some(hv) => match hv.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Idempotency-Key header must be valid UTF-8"
+                    })),
+                )
+                    .into_response());
+            }
+        },
+        None => None,
+    };
+    validate_start_idempotency_key(raw)
+}
+
+/// Read-only committed-replay dedup probe (issue #808). On `shard`, look up a
+/// live idempotency claim for `(workflow_name, key)`; on a hit, load the claimed
+/// execution and return a `200` no-op response (writing a best-effort dedup
+/// audit row). Returns `None` on a miss, a vanished row (retention-deleted in
+/// the gap), or any read error — the caller then falls through to the
+/// fresh-start path (or, for a malformed body, the extractor rejection).
+///
+/// Standard idempotency-key semantics: on a hit the original execution is
+/// returned verbatim, the retry's body is irrelevant, and there is no
+/// body-mismatch detection (out of scope for #808).
+#[allow(clippy::too_many_arguments)]
+async fn probe_committed_start_replay(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    key: &str,
+    shard: ShardId,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    route: &'static str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let pool = api_state.storage_pool().ok()?;
+    let mut probe_conn = acquire_conn(pool.pool_for(shard)).await.ok()?;
+    let window_secs = api_state.start_idempotency_window().as_secs_f64();
+    let claim_exec_id = autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
+        &mut probe_conn,
+        workflow_name,
+        key,
+        window_secs,
+    )
+    .await
+    .ok()??;
+    // `lookup_live_start_idempotency_claim` JOINs to the execution row, so a
+    // `Some` claim implies the row existed at lookup time. Re-read its identity
+    // for the no-op response; if it vanished or the read errors, return `None`
+    // so the caller re-reserves / reclaims as needed.
+    let (dup_workflow_id, dup_state) = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
+        .select((
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+        ))
+        .first::<(String, String)>(&mut probe_conn)
+        .await
+        .optional()
+        .ok()??;
+    // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
+    // 503-on-audit-failure): the original start was already audited when it
+    // created the run, so a failed audit here is a no-op read and never fails
+    // the reply.
+    let exec_id_str = claim_exec_id.to_string();
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_START,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id,
+        idempotency_key: Some(key),
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(shard.as_i32()),
+        source,
+    };
+    let _ = audit::insert_audit(&mut probe_conn, &ar).await;
+    Some(
+        (
+            axum::http::StatusCode::OK,
+            Json(StartWorkflowResponse {
+                execution_id: claim_exec_id.to_string(),
+                workflow_name: workflow_name.to_string(),
+                workflow_id: dup_workflow_id,
+                state: dup_state,
+                started_fresh: Some(false),
+                deduplicated: Some(true),
+            }),
+        )
+            .into_response(),
+    )
+}
+
+/// Handle a `start_workflow` request whose JSON body failed to deserialize
+/// (issue #808, Codex P2). axum rejects a malformed `Json<T>` body before the
+/// handler runs, but a retry that carries its exactly-once key in the
+/// `Idempotency-Key` HEADER (body irrelevant on a committed-key hit) must still
+/// return the advertised `200` no-op rather than the extractor's `400`/`422`.
+///
+/// If a valid header key is present we probe the committed claim routed by the
+/// KEY — the body is unparsed so `workflow_id` is unknown, and the
+/// `workflow_id`-aware routing rule cannot be applied here (see the residual
+/// documented at the call site). On a hit we return the `200` no-op; on a miss
+/// (or no header key / an over-long or invalid-UTF-8 header key surfaced as its
+/// own `400`) we return the exact axum rejection, so the malformed-body wire
+/// response is byte-for-byte what axum produces today (AC1: the no-key path is
+/// unchanged).
+async fn handle_malformed_start_body(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    headers: &axum::http::HeaderMap,
+    rejection: JsonRejection,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let header_key = match extract_start_idempotency_header_key(headers) {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
+    let Some(key) = header_key else {
+        // No header key → the exact axum rejection (AC1: byte-for-byte no-key
+        // malformed-body behavior).
+        return rejection.into_response();
+    };
+    let Ok(runtime) = api_state.runtime() else {
+        // Runtime not installed → surface the body error unchanged; we cannot
+        // route without the router.
+        return rejection.into_response();
+    };
+    // NOTE (issue #808, Codex P2 residual): route the probe by the KEY only —
+    // the body is unparsed so `workflow_id` is unknown, so the explicit-
+    // `workflow_id` → route-by-`workflow_id` rule (see the shard resolution at
+    // the main call site) cannot be applied here. A committed replay whose
+    // ORIGINAL delivery supplied an explicit `workflow_id` (and was therefore
+    // routed to, and claimed on, the `workflow_id`-derived shard) is not found
+    // by this key-routed fallback and still returns the extractor rejection.
+    // This is safe (never a false dedup, never a duplicate run) and narrow: the
+    // common header-key usage omits `workflow_id` (auto-generated), which routes
+    // by the key and IS found. A well-behaved client sends a consistent valid
+    // body on retries.
+    let shard = runtime.router.pick_for_idempotency_key(workflow_name, &key);
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+    if let Some(resp) = probe_committed_start_replay(
+        api_state,
+        workflow_name,
+        &key,
+        shard,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        route,
+    )
+    .await
+    {
+        return resp;
+    }
+    rejection.into_response()
+}
+
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<StartWorkflowRequest>,
+    body: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
+    // body no longer short-circuits with axum's `400`/`422` before the handler
+    // runs. A retry that carries its exactly-once key in the `Idempotency-Key`
+    // HEADER (its body being irrelevant on a committed-key hit) is routed to the
+    // committed-replay probe; otherwise the exact axum rejection is returned so
+    // the no-key malformed-body wire response is unchanged (AC1).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return handle_malformed_start_body(&api_state, &workflow_name, &headers, rejection)
+                .await;
+        }
+    };
 
     if matches!(
         request.reuse_policy.as_deref(),
@@ -8090,53 +8320,18 @@ pub(crate) async fn start_workflow(
     // Request-scoped idempotency key (issue #808). The `Idempotency-Key` request
     // header wins over the body `idempotency_key` field. A present-but-empty (or
     // whitespace-only) key is a client error surfaced as `400`, never silently
-    // downgraded to a non-idempotent start.
-    let idempotency_key: Option<String> = {
-        let raw = if let Some(hv) = headers.get(HEADER_IDEMPOTENCY_KEY) {
-            match hv.to_str() {
-                Ok(s) => Some(s.to_string()),
-                Err(_) => {
-                    return (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "Idempotency-Key header must be valid UTF-8"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            request.idempotency_key.clone()
-        };
-        match raw {
-            Some(s) if s.trim().is_empty() => {
-                return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "idempotency_key must not be empty" })),
-                )
-                    .into_response();
-            }
-            Some(s) => {
-                let trimmed = s.trim();
-                // Cap the key length: it is half of the composite PK on
-                // harvest_start_idempotency, so an oversized key would overflow
-                // the btree tuple limit and 500 at INSERT on client-controlled
-                // input. Reject it cleanly at the boundary instead.
-                if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
-                    return (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": format!(
-                                "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN})"
-                            )
-                        })),
-                    )
-                        .into_response();
-                }
-                Some(trimmed.to_string())
-            }
-            None => None,
-        }
+    // downgraded to a non-idempotent start. Header and body share one validation
+    // path (`validate_start_idempotency_key`), so the two never diverge — the
+    // same helpers back the malformed-body probe above.
+    let idempotency_key: Option<String> = match extract_start_idempotency_header_key(&headers) {
+        Err(resp) => return resp,
+        // Header wins when present and valid.
+        Ok(Some(k)) => Some(k),
+        // Header absent → fall back to the body field, same validation.
+        Ok(None) => match validate_start_idempotency_key(request.idempotency_key.clone()) {
+            Err(resp) => return resp,
+            Ok(k) => k,
+        },
     };
 
     let explicit_workflow_id = request.workflow_id.is_some();
@@ -8226,67 +8421,19 @@ pub(crate) async fn start_workflow(
     // additional fast-path for COMMITTED replays only, never a replacement for
     // the reserve.
     if let Some(ref key) = idempotency_key
-        && let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut probe_conn) = acquire_conn(pool.pool_for(shard)).await
+        && let Some(resp) = probe_committed_start_replay(
+            &api_state,
+            &workflow_name,
+            key,
+            shard,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            route,
+        )
+        .await
     {
-        let window_secs = api_state.start_idempotency_window().as_secs_f64();
-        if let Ok(Some(claim_exec_id)) =
-            autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
-                &mut probe_conn,
-                &workflow_name,
-                key,
-                window_secs,
-            )
-            .await
-        {
-            // `lookup_live_start_idempotency_claim` JOINs to the execution row, so
-            // a `Some` claim implies the row existed at lookup time. Re-read its
-            // identity for the no-op response; if it vanished (retention-deleted in
-            // the gap) or the read errors, fall through to the fresh-start path,
-            // which re-reserves / reclaims as needed.
-            if let Ok(Some((dup_workflow_id, dup_state))) = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
-                .select((
-                    harvest_workflow_executions::workflow_id,
-                    harvest_workflow_executions::state,
-                ))
-                .first::<(String, String)>(&mut probe_conn)
-                .await
-                .optional()
-            {
-                // Best-effort dedup audit (intentional asymmetry with the
-                // fresh-start arm's 503-on-audit-failure): the original start was
-                // already audited when it created the run, so a failed audit here
-                // is a no-op read and never fails the reply.
-                let exec_id_str = claim_exec_id.to_string();
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_WORKFLOW_START,
-                    target_type: TARGET_WORKFLOW,
-                    target_id: Some(exec_id_str.as_str()),
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: Some(key.as_str()),
-                    status: STATUS_SUCCEEDED,
-                    error_summary: None,
-                    shard_id: Some(shard.as_i32()),
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut probe_conn, &ar).await;
-                return (
-                    axum::http::StatusCode::OK,
-                    Json(StartWorkflowResponse {
-                        execution_id: claim_exec_id.to_string(),
-                        workflow_name: workflow_name.clone(),
-                        workflow_id: dup_workflow_id,
-                        state: dup_state,
-                        started_fresh: Some(false),
-                        deduplicated: Some(true),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+        return resp;
     }
 
     // Fresh-start-only validation: parse the reuse policy. Runs AFTER the

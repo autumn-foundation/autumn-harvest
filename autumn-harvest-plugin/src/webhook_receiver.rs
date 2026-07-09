@@ -346,11 +346,11 @@ async fn handle_webhook(
                 axum::extract::Path(workflow.to_string()),
                 None,
                 headers.clone(),
-                Json(StartWorkflowRequest::from_webhook(
+                Ok(Json(StartWorkflowRequest::from_webhook(
                     workflow_id.as_str().to_string(),
                     payload,
                     queue.map(str::to_string),
-                )),
+                ))),
             ))
             .await
         }
