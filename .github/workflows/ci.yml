@@ -1,9 +1,27 @@
+# Changelog: CI cost controls — reduce GitHub Actions minutes on iterative draft
+# work. Three standard controls (this repo has no docs/changelog.d/ newsfragment
+# convention on the base branch, so this changelog note lives here as a comment):
+#   1. concurrency.cancel-in-progress — a new push cancels the superseded in-progress
+#      run instead of queueing (already present below).
+#   2. Draft-PR skip — expensive jobs are guarded with
+#      `github.event_name != 'pull_request' || github.event.pull_request.draft == false`
+#      so intermediate draft-PR pushes don't run CI. The team iterates on DRAFT PRs
+#      and flips to "Ready for review" when final, so CI runs once per PR at the end
+#      plus any post-ready fixes. Push events (e.g. to trunk-dev) always run.
+#   3. Docs-only skip — the `changes` guard job gates the build/test jobs so a change
+#      touching only docs/** or **/*.md doesn't run the compile/test matrix. A job
+#      skipped via `if:` still reports success to branch protection, so this is safe
+#      for required status checks (unlike paths-ignore, which reports nothing).
 name: CI
 
 on:
   push:
     branches: [trunk, trunk-dev]
   pull_request:
+    # ready_for_review is required so flipping a draft to "Ready for review"
+    # triggers a fresh run; the GitHub default [opened, synchronize, reopened]
+    # does not include it. The other three keep normal PR pushes triggering.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [trunk, trunk-dev]
 
 concurrency:
@@ -15,9 +33,59 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Detects whether any non-docs file changed, so the build/test jobs below can
+  # skip on docs-only PRs/pushes. Plain `git diff` — no third-party action.
+  changes:
+    name: Detect non-docs changes
+    runs-on: ubuntu-latest
+    # Draft-skip (see header): don't even compute changes on draft-PR pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        name: Check whether any non-docs file changed
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            base="$PUSH_BEFORE"; head="${{ github.sha }}"
+          fi
+          # Fall back to the previous commit if base is empty/all-zeros/unknown
+          # (e.g. a brand-new branch push).
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          echo "Comparing ${base}...${head}"
+          changed="$(git diff --name-only "$base" "$head")"
+          echo "Changed files:"
+          echo "$changed"
+          # Docs-only = every changed path matches docs/** or **/*.md. If any
+          # other path is present, we have code changes and must run the matrix.
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # Draft-skip: the team iterates on DRAFT PRs (many pushes) and flips to
+    # "Ready for review" when final, so CI runs once per PR at the end plus any
+    # post-ready fixes. Push events (e.g. trunk-dev) always run via the
+    # `github.event_name != 'pull_request'` clause. Lint intentionally runs on
+    # docs-only changes (it's a single cheap job); the expensive build/test jobs
+    # below additionally gate on the `changes` guard.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,7 +109,13 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
-    needs: lint
+    needs: [lint, changes]
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard. A job
+    # skipped by this `if:` reports success to branch protection, so gating a
+    # required check this way is safe.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -124,6 +198,11 @@ jobs:
 
   quickstart:
     name: Quickstart example builds
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -134,6 +213,11 @@ jobs:
 
   msrv:
     name: MSRV (1.88.0)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
