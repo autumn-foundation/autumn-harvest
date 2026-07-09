@@ -138,6 +138,8 @@ pub mod signal_handler;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
+/// Request-scoped idempotency keys for plain workflow starts (issue #808).
+pub mod start_idempotency;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]
@@ -262,17 +264,18 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
-    CancelledWorkflowExecution, ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER, ORIGIN_SCHEDULED,
-    PausedWorkflowExecution, ResumedWorkflowExecution, ScheduleRunQuery, ScheduleRunRow,
-    ScheduleRunStateCount, SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
-    StartedWorkflowExecution, UpdateWithStartOutcome, UpdateWithStartParams,
+    CancelledWorkflowExecution, IdempotentStartOutcome, ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER,
+    ORIGIN_SCHEDULED, PausedWorkflowExecution, ResumedWorkflowExecution, ScheduleRunQuery,
+    ScheduleRunRow, ScheduleRunStateCount, SignalWithStartOutcome, SignalWithStartParams,
+    StartWorkflowParams, StartedWorkflowExecution, UpdateWithStartOutcome, UpdateWithStartParams,
     WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, WorkflowTypeNonTerminalCount,
     auto_resume_expired_pauses, cancel_workflow_execution, count_workflow_executions_grouped,
     list_schedule_runs, non_terminal_counts_by_workflow_name, pause_workflow_execution,
     resume_workflow_execution, schedule_run_state_summary, signal_with_start_workflow_execution,
     signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
-    start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
-    update_with_start_workflow_execution, update_with_start_workflow_execution_with_metrics,
+    start_or_load_workflow_execution_idempotent, start_or_load_workflow_execution_with_metrics,
+    terminate_workflow_execution, update_with_start_workflow_execution,
+    update_with_start_workflow_execution_with_metrics,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{

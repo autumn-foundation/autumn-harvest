@@ -129,6 +129,11 @@ pub struct HarvestBuilder {
     /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
     /// optional custom deliverer.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    /// Retention window for request-scoped start idempotency keys (issue #808).
+    /// A repeated `idempotency_key` within this window deduplicates onto the same
+    /// execution; after it elapses the key is reusable. `None` uses
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
+    start_idempotency_window: Option<Duration>,
 }
 
 impl Default for HarvestBuilder {
@@ -166,6 +171,7 @@ impl Default for HarvestBuilder {
             usage_max_groups: None,
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
+            start_idempotency_window: None,
         }
     }
 }
@@ -278,6 +284,10 @@ pub struct BuiltHarvest {
     /// custom one — the plugin substitutes its default `reqwest`-based
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    /// Retention window for request-scoped start idempotency keys (issue #808).
+    /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
+    /// (24h) when unset on the builder.
+    pub start_idempotency_window: Duration,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -785,6 +795,19 @@ impl BuiltHarvest {
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
         );
+        // issue #808 review (Codex P2): the start-idempotency expiry sweep
+        // (`enforce_timeouts_once` -> `sweep_expired_start_idempotency`) reads
+        // its retention window from a process-global static, mirroring the
+        // callback-config pattern above. `Plugin::build` installs it, but a
+        // standalone `HarvestRunner` worker process funnels through this method
+        // (via `into_worker_parts_with_extra_state`) without ever calling
+        // `Plugin::build` — so in a split web/worker deployment the worker's
+        // sweep would otherwise use the DEFAULT 24h window while the web app's
+        // reserve honors a custom `start_idempotency_window`, deleting a claim
+        // the reserve still considers live and letting a same-key retry create
+        // a second execution. Install the configured window here too so every
+        // worker (plugin-embedded or standalone) sweeps on the same window.
+        crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
                 self.workflows,
@@ -822,10 +845,14 @@ impl BuiltHarvest {
         Vec<WorkflowSchedule>,
         WorkerConfig,
     ) {
-        // See the identical call in `into_worker_parts` above.
+        // See the identical calls in `into_worker_parts` above. This is the
+        // method the standalone `HarvestRunner` worker actually funnels through
+        // (runner.rs), so installing the configured start-idempotency sweep
+        // window here is what closes the split web/worker dedup gap.
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
         );
+        crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
@@ -1283,6 +1310,28 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the retention window for request-scoped start idempotency keys
+    /// (issue #808).
+    ///
+    /// A repeated `idempotency_key` on `POST /workflows/{name}/start` within this
+    /// window deduplicates onto the same execution (returning it as a no-op);
+    /// once the window elapses, the same key is reusable. Defaults to
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
+    #[must_use]
+    pub const fn start_idempotency_window(mut self, window: Duration) -> Self {
+        self.start_idempotency_window = Some(window);
+        self
+    }
+
+    /// The configured start-idempotency retention window, or `None` if unset
+    /// (the default 24h applies at build time).
+    ///
+    /// Read-only pre-build accessor (issue #695).
+    #[must_use]
+    pub const fn start_idempotency_window_config(&self) -> Option<Duration> {
+        self.start_idempotency_window
+    }
+
     /// Override the ceiling on the `[from, to]` window accepted by
     /// `GET /admin/usage` (issue #596).
     ///
@@ -1550,6 +1599,9 @@ impl HarvestBuilder {
             usage_window_ceiling,
             usage_max_groups,
             completion_callback_config: self.completion_callback_config,
+            start_idempotency_window: self
+                .start_idempotency_window
+                .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
         })
     }
 }
@@ -2935,6 +2987,52 @@ mod tests {
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
+    }
+
+    /// The core worker build path (`into_worker_parts`) — which the standalone
+    /// `HarvestRunner` worker funnels through via
+    /// `into_worker_parts_with_extra_state` — must install the configured
+    /// start-idempotency retention window into the process-global sweep static
+    /// (issue #808, Codex P2). Without this, a split web/worker deployment
+    /// running the sweep in a standalone runner would use the DEFAULT 24h window
+    /// while the web app's reserve honors a custom window, deleting a claim the
+    /// reserve still considers live and letting a same-key retry double-start.
+    #[cfg(feature = "db")]
+    #[test]
+    fn into_worker_parts_installs_configured_start_idempotency_purge_window() {
+        // Serialize against the sibling `purge_window_precision_and_clamping`
+        // test, which mutates the same process-global static.
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Start from a known baseline distinct from the custom value below.
+        crate::start_idempotency::set_purge_window_secs(
+            crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+        );
+
+        // A custom window distinct from the 24h default and the sibling test's
+        // values (7200s / 1.5s) so a stale/default read fails loudly.
+        let custom = Duration::from_secs(3 * 24 * 3600);
+        let built = HarvestBuilder::new()
+            .start_idempotency_window(custom)
+            .build();
+        assert_eq!(built.start_idempotency_window, custom);
+
+        let (_registry, _dags, _ws, _wc) = built.into_worker_parts();
+
+        assert!(
+            (crate::start_idempotency::purge_window_secs() - custom.as_secs_f64()).abs() < 1e-9,
+            "into_worker_parts must install the configured start-idempotency \
+             sweep window (expected {}s, got {}s)",
+            custom.as_secs_f64(),
+            crate::start_idempotency::purge_window_secs(),
+        );
+
+        // Restore the default so ordering-independent test runs don't leak state.
+        crate::start_idempotency::set_purge_window_secs(
+            crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+        );
     }
 
     #[test]

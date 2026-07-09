@@ -97,6 +97,8 @@ mod signal_tests;
 mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slot_tuner_tests;
+#[cfg(feature = "db")]
+mod start_idempotency_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]

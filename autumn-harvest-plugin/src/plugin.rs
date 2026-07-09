@@ -686,6 +686,13 @@ async fn start_harvest_runtime(
     api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
     // Propagate the server-side workflow retry attempt ceiling (issue #523).
     api_state.set_max_workflow_attempts(built.max_workflow_attempts);
+    // Propagate the request-scoped start-idempotency retention window (issue
+    // #808): the HTTP start route reads it to dedup a repeated idempotency_key,
+    // and the background expiry sweep reads the same value from a process-global
+    // static (mirroring GLOBAL_CALLBACK_CONFIG) so it needs no extra param
+    // threaded through enforce_timeouts_once.
+    api_state.set_start_idempotency_window(built.start_idempotency_window);
+    autumn_harvest::start_idempotency::set_purge_window_secs(built.start_idempotency_window);
     // Propagate the GET /admin/usage window ceiling (issue #596).
     api_state.set_usage_window_ceiling(built.usage_window_ceiling);
     // Propagate the GET /admin/usage group-count cap (issue #596).
