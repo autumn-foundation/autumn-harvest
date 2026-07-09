@@ -94,6 +94,14 @@ matrix entirely. Supply it out-of-band via the `Idempotency-Key` request header
 (preferred — the raw body stays your workflow input) or the body
 `idempotency_key` field; the header wins when both are present.
 
+To have a replay recognized when the retry body may not deserialize (for
+example a field was tightened between deliveries), supply the key in the
+`Idempotency-Key` **header** — the header is honored independently of body
+validity. A key supplied only in the body `idempotency_key` field requires the
+request body to be structurally valid (deserializable) to be recognized on
+retry, since the body must be parsed to read it. This mirrors the standard
+reason idempotency keys are delivered via a header.
+
 ```bash
 # First delivery — creates the run (201, started_fresh: true).
 curl -X POST /api/harvest/workflows/onboarding/start \

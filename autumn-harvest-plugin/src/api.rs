@@ -8177,6 +8177,13 @@ async fn probe_committed_start_replay(
 /// own `400`) we return the exact axum rejection, so the malformed-body wire
 /// response is byte-for-byte what axum produces today (AC1: the no-key path is
 /// unchanged).
+///
+/// This fallback recognizes only the HEADER key. A key supplied solely in the
+/// body `idempotency_key` field cannot be recovered from an undeserializable
+/// body (`JsonRejection` carries no raw bytes), so by design a body-field key
+/// requires a structurally-valid body to be recognized on retry — use the
+/// `Idempotency-Key` header for body-independent replay recognition. See the
+/// no-header-key arm below and docs/getting-started/06-idempotency.md.
 async fn handle_malformed_start_body(
     api_state: &HarvestApiState,
     workflow_name: &str,
@@ -8191,6 +8198,18 @@ async fn handle_malformed_start_body(
     let Some(key) = header_key else {
         // No header key → the exact axum rejection (AC1: byte-for-byte no-key
         // malformed-body behavior).
+        //
+        // NOTE (issue #808, Codex P2): this fallback probes the HEADER key ONLY.
+        // A key supplied solely in the body `idempotency_key` field is NOT
+        // recovered here: `JsonRejection` does not carry the raw request bytes,
+        // so an otherwise-undeserializable body cannot be parsed to read that
+        // field without abandoning the clean `Result<Json, JsonRejection>`
+        // extractor for raw-byte parsing plus manually replicating axum's exact
+        // per-variant rejection responses (preserving the AC1 byte-for-byte
+        // no-key wire behavior). By design, a body-field key therefore requires a
+        // structurally-valid (deserializable) body to be recognized on retry;
+        // the `Idempotency-Key` header is the body-independent mechanism. See
+        // docs/getting-started/06-idempotency.md.
         return rejection.into_response();
     };
     let Ok(runtime) = api_state.runtime() else {
