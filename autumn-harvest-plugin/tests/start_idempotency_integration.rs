@@ -23,7 +23,7 @@ use std::sync::Arc;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::throttle::ThrottlePolicy;
-use autumn_harvest::types::ShardId;
+use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{WorkflowInfo, context::WorkflowContext};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -837,6 +837,147 @@ async fn explicit_workflow_id_keyed_retry_dedups() {
 
     let mut conn = raw_connect(&url).await;
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+}
+
+/// FINDING (Codex P2, issue #808): when a keyed start OMITS `workflow_id`, the
+/// server auto-generates it AND routes by the key. The auto-generated
+/// `workflow_id` must be MINTED onto the key-shard so that its later explicit
+/// reuse routes (via `pick_for_new_workflow`) to the same shard the execution
+/// lives on. Here we assert that the RETURNED `workflow_id` hashes to the SAME
+/// shard as the RETURNED `execution_id`'s encoded shard — i.e. the minting
+/// worked.
+#[tokio::test]
+async fn auto_generated_workflow_id_belongs_to_the_key_shard() {
+    let (url0, _c0) = setup_database().await;
+    let (url1, _c1) = setup_database().await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(ShardId::new(0), pool0);
+    map.insert(ShardId::new(1), pool1);
+    let sharded = ShardedDbPool::from_map(map, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    let router_check = router.clone();
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded));
+    let registry = HandlerRegistry::new(vec![plain_info("order_flow")], vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("idem-mint-wid".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router,
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    // Keyed start OMITTING workflow_id (auto-generated + minted onto the key shard).
+    let (s1, b1) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {"n": 1}}),
+        Some("mint-delivery"),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "first: {b1}");
+
+    let returned_wid = b1["workflow_id"].as_str().unwrap();
+    let returned_exec = b1["execution_id"].as_str().unwrap();
+    let exec_shard = returned_exec.parse::<ExecutionId>().unwrap().shard();
+
+    // The minted workflow_id must route to the SAME shard the execution lives on.
+    assert_eq!(
+        router_check.pick_for_new_workflow("order_flow", returned_wid),
+        exec_shard,
+        "auto-generated workflow_id must be minted onto the key-routed shard so \
+         its later explicit reuse routes to where the execution lives"
+    );
+}
+
+/// FINDING (Codex P2, issue #808): because the auto-generated `workflow_id` is
+/// minted onto the key-shard, a later request that reuses that RETURNED
+/// `workflow_id` explicitly (with `reject_duplicate`, no key) routes to the same
+/// shard, SEES the existing execution, and 409s — preserving the shard-local
+/// `(workflow_name, workflow_id)` uniqueness invariant. Pre-fix, the random
+/// auto-generated `workflow_id` could hash to a different shard, so the explicit
+/// reuse would miss the run and create a second execution with the same id.
+#[tokio::test]
+async fn explicit_reuse_of_a_keyed_auto_workflow_id_is_seen_uniqueness_preserved() {
+    let (url0, _c0) = setup_database().await;
+    let (url1, _c1) = setup_database().await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(ShardId::new(0), pool0);
+    map.insert(ShardId::new(1), pool1);
+    let sharded = ShardedDbPool::from_map(map, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded));
+    let registry = HandlerRegistry::new(vec![plain_info("order_flow")], vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("idem-mint-reuse".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router,
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    // Keyed start OMITTING workflow_id → minted onto the key shard.
+    let (s1, b1) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {"n": 1}}),
+        Some("reuse-delivery"),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "first: {b1}");
+    let returned_wid = b1["workflow_id"].as_str().unwrap().to_string();
+
+    // Explicit reuse of the RETURNED workflow_id, reject_duplicate, NO key.
+    // Routes by workflow_id → the key shard → sees the run → 409.
+    let (s2, b2) = post_start(
+        &app,
+        "order_flow",
+        json!({"input": {"n": 2}, "workflow_id": returned_wid, "reuse_policy": "reject_duplicate"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::CONFLICT,
+        "explicit reuse of a minted keyed workflow_id must see the run and 409: {b2}"
+    );
+
+    // Exactly one execution total across both shards for that workflow_id.
+    let mut c0 = raw_connect(&url0).await;
+    let mut c1 = raw_connect(&url1).await;
+    let total =
+        execution_count(&mut c0, "order_flow").await + execution_count(&mut c1, "order_flow").await;
+    assert_eq!(
+        total, 1,
+        "no duplicate run created for the minted workflow_id"
+    );
 }
 
 /// FINDING 2 (Codex P2, issue #808): a keyed replay of an already-successful

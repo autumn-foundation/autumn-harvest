@@ -8335,7 +8335,7 @@ pub(crate) async fn start_workflow(
     };
 
     let explicit_workflow_id = request.workflow_id.is_some();
-    let workflow_id = request
+    let mut workflow_id = request
         .workflow_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let queue_name = request
@@ -8386,6 +8386,47 @@ pub(crate) async fn start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, &workflow_id)
     };
+
+    // issue #808 (Codex P2): when a keyed start OMITS `workflow_id`, the server
+    // auto-generates it AND (per the routing rule above) routes the start by the
+    // KEY onto `shard`. But a random auto-generated `workflow_id` hashes via
+    // `pick_for_new_workflow` to a potentially DIFFERENT shard than `shard` (the
+    // key-shard). If a later request then uses the RETURNED `workflow_id`
+    // explicitly — a client echoing the response's `workflow_id`, or a fresh
+    // no-key `RejectDuplicate` start on that id — it routes via
+    // `pick_for_new_workflow` to the `workflow_id`-shard, cannot see the
+    // execution (which lives on the key-shard), and creates a SECOND active run
+    // with the same `workflow_id`, breaking the shard-local `(workflow_name,
+    // workflow_id)` uniqueness invariant. Mint the auto-generated `workflow_id`
+    // by bounded rejection sampling so it hashes to the key-shard, making its
+    // later explicit reuse route consistently to the shard the execution lives
+    // on. Both `pick_for_new_workflow` and `pick_for_idempotency_key` apply the
+    // writable-subset redirect, so `shard` is comparable. Single-shard (default)
+    // converges on the first candidate (`pick_for_new_workflow` returns the one
+    // shard); multi-shard converges in ~N expected iterations (cheap seahash) —
+    // the cap is a safety backstop only. Explicit client-chosen `workflow_id`s
+    // (routed by `workflow_id`, subject to the documented consistency caveat) and
+    // the no-key path are UNCHANGED.
+    if idempotency_key.is_some() && !explicit_workflow_id {
+        const MINT_CAP: u32 = 10_000;
+        let mut attempts = 0u32;
+        while runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+            != shard
+        {
+            attempts += 1;
+            if attempts > MINT_CAP {
+                tracing::warn!(
+                    workflow_name = %workflow_name,
+                    shard = ?shard,
+                    "could not mint a workflow_id on the idempotency-key shard after {attempts} attempts; using last candidate"
+                );
+                break;
+            }
+            workflow_id = uuid::Uuid::new_v4().to_string();
+        }
+    }
 
     // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
     // precede ALL fresh-start-only rejections (reuse-policy parse,

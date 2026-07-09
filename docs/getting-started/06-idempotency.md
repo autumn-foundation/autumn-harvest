@@ -152,7 +152,13 @@ chosen deterministically from either the key or the `workflow_id`:
 
 - **`workflow_id` omitted** (auto-generated): the start routes by the **key**
   `(workflow_name, idempotency_key)`. Same-key retries co-locate on one shard and
-  dedup — routing by the per-request `workflow_id` would scatter them.
+  dedup — routing by the per-request `workflow_id` would scatter them. The server
+  also **mints** the auto-generated `workflow_id` onto that same key-shard (by
+  bounded rejection sampling), so a later request that reuses the *returned*
+  `workflow_id` explicitly (a client echo, or a `reject_duplicate` start on that
+  id) routes via `(workflow_name, workflow_id)` back to the shard the execution
+  lives on and sees it — preserving the shard-local `(workflow_name, workflow_id)`
+  uniqueness invariant.
 - **`workflow_id` supplied** (explicit business identity): the start routes by
   `(workflow_name, workflow_id)`, exactly as a non-keyed start does. This keeps
   the run on the shard that owns `(name, workflow_id)`, so the `reuse_policy`
