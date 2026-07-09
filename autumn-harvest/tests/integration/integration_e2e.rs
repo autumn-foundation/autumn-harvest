@@ -2778,7 +2778,9 @@ async fn worker_parent_branches_on_typed_child_failure_across_categories() {
             "category {category}: parent must observe the typed error_type"
         );
         assert_eq!(
-            output.get("non_retryable").and_then(serde_json::Value::as_bool),
+            output
+                .get("non_retryable")
+                .and_then(serde_json::Value::as_bool),
             Some(true),
             "category {category}: parent must observe the non_retryable flag"
         );
@@ -2815,7 +2817,11 @@ async fn worker_parent_branches_on_typed_child_failure_across_categories() {
             _ => None,
         });
         let (et, nr, details) = typed.expect("child history has a WorkflowFailed event");
-        assert_eq!(et.as_deref(), Some(category), "child WorkflowFailed error_type");
+        assert_eq!(
+            et.as_deref(),
+            Some(category),
+            "child WorkflowFailed error_type"
+        );
         assert_eq!(nr, Some(true), "child WorkflowFailed non_retryable");
         assert_eq!(details, Some(serde_json::json!({ "source": "child" })));
 
@@ -2826,7 +2832,9 @@ async fn worker_parent_branches_on_typed_child_failure_across_categories() {
             _ => None,
         });
         assert_eq!(
-            child_failed_type.expect("parent has ChildWorkflowFailed").as_deref(),
+            child_failed_type
+                .expect("parent has ChildWorkflowFailed")
+                .as_deref(),
             Some(category),
             "parent's ChildWorkflowFailed must carry the typed error_type"
         );

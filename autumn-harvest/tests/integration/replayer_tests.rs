@@ -395,10 +395,12 @@ fn self_typed_failure_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        Err(WorkflowFailure::new("BudgetExceeded", "monthly spend cap reached")
-            .with_details(serde_json::json!({ "cap_usd": 5000 }))
-            .non_retryable()
-            .into_workflow_error_payload())
+        Err(
+            WorkflowFailure::new("BudgetExceeded", "monthly spend cap reached")
+                .with_details(serde_json::json!({ "cap_usd": 5000 }))
+                .non_retryable()
+                .into_workflow_error_payload(),
+        )
     })
 }
 

@@ -20,9 +20,7 @@
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::failure::{
-    IntoWorkflowErrorString, WorkflowFailure, decode_workflow_failure,
-};
+use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure, decode_workflow_failure};
 use autumn_harvest::types::ExecutionId;
 use chrono::Utc;
 use serde_json::Value;
@@ -182,11 +180,11 @@ mod db_handle_surface {
     use diesel::prelude::*;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use serde_json::Value;
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use serde_json::Value;
     use uuid::Uuid;
 
     const INIT_SQL: &str = concat!(
@@ -353,7 +351,12 @@ mod db_handle_surface {
     /// Simulate exactly what `worker::persist_workflow_failure` now does
     /// (issue #767): append a typed `WorkflowFailed` event, and stamp the
     /// **human message** (not the wire envelope) into the `error` column.
-    async fn seal_typed_failure(conn: &mut AsyncPgConnection, exec_id: ExecutionId, cat: &str, msg: &str) {
+    async fn seal_typed_failure(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        cat: &str,
+        msg: &str,
+    ) {
         let payload = WorkflowFailure::new(cat, msg)
             .with_details(serde_json::json!({ "cat": cat }))
             .non_retryable()
@@ -419,7 +422,11 @@ mod db_handle_surface {
                 .await
                 .unwrap();
             assert_eq!(stored_error.as_deref(), Some(msg));
-            assert!(!stored_error.unwrap().contains("harvest_workflow_failure_v1"));
+            assert!(
+                !stored_error
+                    .unwrap()
+                    .contains("harvest_workflow_failure_v1")
+            );
 
             // Typed snapshot (D3): the three typed fields are populated.
             let typed = autumn_harvest::TypedWorkflowHandle::<Value>::new(handle.clone());

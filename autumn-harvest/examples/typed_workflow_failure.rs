@@ -124,7 +124,9 @@ fn main() {
     let _wfs = workflows![checkout, charge_card];
     println!("typed_workflow_failure example compiled successfully");
     println!();
-    println!("A child fails with WorkflowFailure::new(\"ValidationRejected\", ...).non_retryable();");
+    println!(
+        "A child fails with WorkflowFailure::new(\"ValidationRejected\", ...).non_retryable();"
+    );
     println!("the parent branches on err.workflow_error_type() instead of scraping the message.");
 }
 
@@ -167,12 +169,8 @@ mod tests {
     #[tokio::test]
     async fn parent_routes_on_typed_error_type_across_categories() {
         assert_eq!(
-            run_checkout_with_typed_child_failure(
-                "ValidationRejected",
-                "issuer declined",
-                true
-            )
-            .await,
+            run_checkout_with_typed_child_failure("ValidationRejected", "issuer declined", true)
+                .await,
             "compensate:refund_and_notify_customer|non_retryable=true"
         );
         assert_eq!(

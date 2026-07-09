@@ -5650,14 +5650,19 @@ impl WorkflowContext {
             .map(|(workflow_name, input)| async move {
                 match self.spawn_child_workflow_raw(&workflow_name, input).await {
                     Ok(v) => Ok(Ok(v)),
-                    // Mirrors the activity fan-out sibling's `ActivityFailed | Timeout`
-                    // classification for defensive symmetry. `spawn_child_workflow_raw`
-                    // cannot currently produce `Timeout` (its `HistoryMatch::TimedOut`
-                    // arm is `unreachable!()`), but matching it here means a future
-                    // child-level timeout path degrades to a per-slot failure instead
-                    // of silently reverting to aborting the whole collect-all batch.
+                    // A failed child surfaces as a typed `WorkflowFailed` (issue #767);
+                    // it is the collect-all per-slot failure to capture rather than
+                    // abort the whole batch on. `ActivityFailed | Timeout` are matched
+                    // for defensive symmetry with the activity fan-out sibling:
+                    // `spawn_child_workflow_raw` cannot currently produce `Timeout`
+                    // (its `HistoryMatch::TimedOut` arm is `unreachable!()`), but
+                    // matching them here means a future child-level timeout path
+                    // degrades to a per-slot failure instead of silently reverting to
+                    // aborting the whole collect-all batch.
                     Err(
-                        e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                        e @ (HarvestError::WorkflowFailed { .. }
+                        | HarvestError::ActivityFailed { .. }
+                        | HarvestError::Timeout { .. }),
                     ) => Ok(Err(e.to_string())),
                     Err(e) => Err(e),
                 }
@@ -5939,8 +5944,7 @@ impl WorkflowContext {
                             Err(HarvestError::WorkflowFailed {
                                 name: format!("child-workflow:{workflow_name}"),
                                 reason: error,
-                                error_type: (error_type != "Error")
-                                    .then(|| error_type.clone()),
+                                error_type: (error_type != "Error").then(|| error_type.clone()),
                                 details,
                                 non_retryable: Some(non_retryable),
                             }),
@@ -10842,7 +10846,10 @@ mod tests {
             "expected WorkflowFailed, got {err:?}"
         );
         assert_eq!(err.workflow_error_type(), Some("ValidationRejected"));
-        assert_eq!(err.workflow_details(), Some(&serde_json::json!({ "code": 402 })));
+        assert_eq!(
+            err.workflow_details(),
+            Some(&serde_json::json!({ "code": 402 }))
+        );
         assert!(err.is_workflow_non_retryable());
     }
 

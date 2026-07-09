@@ -18,6 +18,7 @@ use crate::types::ExecutionId;
 /// `Eq` is intentionally not derived: `error_details` is a
 /// [`serde_json::Value`], which is only `PartialEq` (issue #767).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
 pub struct TypedWorkflowResult<T> {
     /// Current compact state.
     pub state: WorkflowResultState,
@@ -178,9 +179,7 @@ impl<T> TypedWorkflowHandle<T> {
         let (error_type, error_details, non_retryable) =
             if snap.state == WorkflowResultState::Failed {
                 match self.inner.terminal_typed_failure().await? {
-                    Some(decoded) => {
-                        (decoded.error_type, decoded.details, decoded.non_retryable)
-                    }
+                    Some(decoded) => (decoded.error_type, decoded.details, decoded.non_retryable),
                     None => (None, None, None),
                 }
             } else {

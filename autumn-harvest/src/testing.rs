@@ -2970,8 +2970,9 @@ impl WorkflowTestEnv {
                         // `wake_parent_for_child_failure`. A plain string decodes
                         // to all-None typed fields (unchanged legacy behaviour).
                         let decoded = crate::failure::decode_workflow_failure(&error);
-                        deferred_events
-                            .push(WorkflowEvent::child_workflow_failed_typed(child_id, &decoded));
+                        deferred_events.push(WorkflowEvent::child_workflow_failed_typed(
+                            child_id, &decoded,
+                        ));
                     }
                 }
                 Ok(true)
