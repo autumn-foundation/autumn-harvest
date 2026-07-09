@@ -361,8 +361,16 @@ async fn run_chain_unknown_id_returns_404() {
     let app = build_app(&pool);
 
     let unknown = ExecutionId::new_for_shard(ShardId::new(0));
-    let (status, _body) = get_json(&app, &format!("/workflows/{unknown}/run-chain")).await;
+    let (status, body) = get_json(&app, &format!("/workflows/{unknown}/run-chain")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // A structured problem-details error body, not an empty 404.
+    let detail = body["detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("404 must carry a JSON problem-details body, got: {body}"));
+    assert!(
+        detail.contains("not found"),
+        "404 detail should name the missing execution, got: {detail}"
+    );
 }
 
 /// (2) Malformed execution id → 400.
@@ -372,8 +380,13 @@ async fn run_chain_malformed_id_returns_400() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    let (status, _body) = get_json(&app, "/workflows/not-a-uuid/run-chain").await;
+    let (status, body) = get_json(&app, "/workflows/not-a-uuid/run-chain").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A structured problem-details error body, not an empty 400.
+    assert!(
+        body["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "400 must carry a non-empty JSON problem-details body, got: {body}"
+    );
 }
 
 /// (3) A fully post-feature 4-run chain (3 `CONTINUED_AS_NEW` + 1 `RUNNING` tail,
@@ -571,4 +584,77 @@ async fn run_chain_legacy_chain_flags_head_unknown() {
     );
     assert!(runs[2]["continued_to_exec_id"].is_null());
     assert_eq!(runs[2]["outcome"], "running");
+}
+
+/// (6) A pure legacy chain queried from a MIDDLE run. The gather can only walk
+/// FORWARD via `WorkflowContinuedAsNew` events (legacy rows have no back-links to
+/// reach the origin), so it resolves the runs from the middle onward and flags
+/// `head_unknown = true` — documented graceful degradation, never a 500.
+#[tokio::test]
+async fn run_chain_legacy_middle_run_flags_head_unknown() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let t0 = Utc::now() - Duration::seconds(300);
+    // Legacy rows: continued_from + first_exec_id are both NULL.
+    let run0 = seed_run(
+        &mut conn,
+        "legacy-mid-run-0",
+        "CONTINUED_AS_NEW",
+        t0,
+        Some(t0 + Duration::seconds(10)),
+        None,
+        None,
+    )
+    .await;
+    let run1 = seed_run(
+        &mut conn,
+        "legacy-mid-run-1",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(100),
+        Some(t0 + Duration::seconds(110)),
+        None,
+        None,
+    )
+    .await;
+    let run2 = seed_run(
+        &mut conn,
+        "legacy-mid-run-2",
+        "RUNNING",
+        t0 + Duration::seconds(200),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // Forward links: run0 -> run1 -> run2.
+    insert_continue_event(&mut conn, run0, 100, run1).await;
+    insert_continue_event(&mut conn, run1, 100, run2).await;
+
+    // Query from the MIDDLE run (run1).
+    let (status, body) = get_json(&app, &format!("/workflows/{run1}/run-chain")).await;
+    assert_eq!(status, StatusCode::OK, "legacy middle query must not 500");
+    assert_eq!(
+        body["head_unknown"], true,
+        "a legacy chain resolved from the middle cannot confirm its origin"
+    );
+    // Forward-only from the queried middle run: run0 (the origin) is unreachable
+    // because legacy rows carry no back-link to walk up to it.
+    assert_eq!(
+        run_ids(&body),
+        vec![run1.to_string(), run2.to_string()],
+        "runs resolvable forward from the middle run"
+    );
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["sequence"], 0);
+    assert_eq!(
+        runs[0]["continued_to_exec_id"].as_str(),
+        Some(run2.to_string().as_str())
+    );
+    assert!(runs[1]["continued_to_exec_id"].is_null());
+    assert_eq!(runs[1]["outcome"], "running");
 }

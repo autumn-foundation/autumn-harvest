@@ -182,7 +182,11 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     let mut current = start;
     for _ in 0..=n {
         // Prefer the explicit forward link: an unvisited row whose predecessor
-        // is `current`.
+        // is `current`. A valid continue-as-new chain has an injective
+        // `continued_from` (reset forks and workflow retries set it to `None`, not
+        // a duplicate predecessor), so the first match is the only match; a stray
+        // corrupt-fork duplicate is still recovered by the defensive time-order
+        // pass below.
         let current_exec_id = rows[current].exec_id;
         let next = rows
             .iter()
@@ -198,6 +202,10 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
 
         // Legacy fallback: current is a CONTINUED_AS_NEW run with no stored
         // forward link but unvisited rows remain — append them in time order.
+        // This graceful-degradation path orders a mixed legacy->post-feature
+        // suffix by timestamp; it is correct under monotonic continue-as-new
+        // timing (successive runs are seconds/minutes apart) and only
+        // mis-orderable under clock skew between the runs.
         if rows[current].state == "CONTINUED_AS_NEW" {
             let mut last_appended = None;
             for &idx in &by_time {
@@ -252,7 +260,20 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     let head_participates_in_can = rows.len() > 1 || head_row.state == "CONTINUED_AS_NEW";
     let head_lacks_backlink =
         head_row.continued_from_exec_id.is_none() && head_row.first_exec_id.is_none();
-    let head_unknown = head_lacks_backlink && head_participates_in_can && !confirmed_origin;
+    // Retention-pruned origin: an operator querying a surviving successor gets
+    // that successor as the resolved head, but its own `continued_from_exec_id`
+    // names a predecessor absent from the gathered set — proof it is NOT the
+    // true origin. Flag the head as unknown so we never present a mid-chain run
+    // as a confirmed origin. A genuine origin (post-feature, legacy, standalone,
+    // or the mixed-chain boundary run) always has `continued_from_exec_id == None`
+    // at the resolved head, and a normal from-the-middle query gathers the real
+    // origin (its `first_exec_id`) so `ordered[0]`'s predecessor is `None` — this
+    // term is false for all of those.
+    let head_predecessor_missing = head_row
+        .continued_from_exec_id
+        .is_some_and(|pred| !rows.iter().any(|r| r.exec_id == pred));
+    let head_unknown = (head_lacks_backlink && head_participates_in_can && !confirmed_origin)
+        || head_predecessor_missing;
 
     let workflow_id = Some(head_row.workflow_id.clone());
 
@@ -401,7 +422,50 @@ mod tests {
             vec![origin.to_string(), mid.to_string(), tail.to_string()]
         );
         assert_eq!(from_mid, from_tail);
-        assert!(!from_mid.head_unknown);
+        // Guards against a head_predecessor_missing false positive: a from-middle
+        // query still gathers the real origin, whose predecessor is None.
+        assert!(
+            !from_mid.head_unknown,
+            "a complete post-feature chain queried from the middle keeps head_unknown=false"
+        );
+    }
+
+    #[test]
+    fn head_unknown_true_when_resolved_head_declares_a_missing_predecessor() {
+        // Retention-pruned origin: the true origin row is gone, so a query from a
+        // surviving successor resolves the earliest survivor (mid) as head — but
+        // mid.continued_from_exec_id names the pruned origin, which is not in the
+        // gathered set. head_unknown must flag it.
+        let origin = Uuid::new_v4(); // pruned: never inserted into `rows`
+        let mid = Uuid::new_v4();
+        let tail = Uuid::new_v4();
+        let rows = vec![
+            row(mid, "CONTINUED_AS_NEW", 100, Some(origin), Some(origin)),
+            row(tail, "RUNNING", 200, Some(mid), Some(origin)),
+        ];
+        // head_exec_id = origin (from the survivor's first_exec_id), absent here.
+        let resp = assemble_run_chain(rows, origin);
+
+        assert!(
+            resp.head_unknown,
+            "resolved head points back at a predecessor missing from the gathered set"
+        );
+        let ids: Vec<String> = resp.runs.iter().map(|r| r.exec_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![mid.to_string(), tail.to_string()],
+            "mid is the earliest survivor and starts the chain"
+        );
+        assert_eq!(resp.runs[0].sequence, 0);
+        assert_eq!(resp.runs[1].sequence, 1);
+        assert_eq!(
+            resp.runs[0].continued_to_exec_id.as_deref(),
+            Some(tail.to_string().as_str())
+        );
+        assert_eq!(
+            resp.runs[1].continued_to_exec_id, None,
+            "tail has no forward link"
+        );
     }
 
     #[test]
