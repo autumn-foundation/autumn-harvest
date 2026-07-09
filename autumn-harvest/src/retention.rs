@@ -153,7 +153,8 @@ impl RetentionConfig {
         workflow_name: impl Into<String>,
         max_age: Duration,
     ) -> Self {
-        self.overrides.insert(workflow_name.into(), max_age.as_secs());
+        self.overrides
+            .insert(workflow_name.into(), max_age.as_secs());
         self
     }
 
@@ -1234,8 +1235,7 @@ async fn routine_skip_candidate(
 ) -> HarvestResult<()> {
     // Release its lease immediately so it can be picked up on subsequent ticks.
     diesel::update(
-        harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::id.eq(candidate_id)),
+        harvest_workflow_executions::table.filter(harvest_workflow_executions::id.eq(candidate_id)),
     )
     .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
     .execute(conn)
@@ -1422,10 +1422,7 @@ mod tests {
     fn test_loosest_cutoff_age() {
         // global only
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
-        assert_eq!(
-            config.loosest_cutoff_age(),
-            Some(Duration::from_secs(3600))
-        );
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(3600)));
 
         // global + overrides -> min of all
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))

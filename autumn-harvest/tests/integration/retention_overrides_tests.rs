@@ -371,8 +371,20 @@ async fn no_overrides_behaves_like_global_only() {
     scrub(&mut conn).await;
 
     let now = Utc::now();
-    insert_completed(&mut conn, "compat_old", "o1", now - chrono::Duration::days(2)).await;
-    insert_completed(&mut conn, "compat_young", "y1", now - chrono::Duration::minutes(5)).await;
+    insert_completed(
+        &mut conn,
+        "compat_old",
+        "o1",
+        now - chrono::Duration::days(2),
+    )
+    .await;
+    insert_completed(
+        &mut conn,
+        "compat_young",
+        "y1",
+        now - chrono::Duration::minutes(5),
+    )
+    .await;
 
     // Global 1-day, no overrides.
     let config = history_only(Some(Duration::from_secs(86_400)));

@@ -164,7 +164,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use autumn_harvest::retention::RetentionConfig;
 
-let retention_config = RetentionConfig::with_max_age(Duration::from_secs(7 * 24 * 60 * 60)) // Prune workflows older than 7 days
+let retention_config = RetentionConfig::with_max_age(Duration::from_secs(7 * 24 * 60 * 60)) // Global default: prune workflows older than 7 days
+    // Per-workflow-type overrides (issue #737): a type without an override
+    // falls back to the global default; a type with neither is never deleted.
+    .with_workflow_override("compliance_report", Duration::from_secs(365 * 24 * 60 * 60)) // keep 1 year
+    .with_workflow_override("ephemeral_ping", Duration::from_secs(60 * 60)) // keep 1 hour
     .with_audit_retention_days(90)
     .with_schedule_decision_retention_days(7);
 
@@ -185,7 +189,7 @@ let harvest = autumn_harvest::HarvestBuilder::new()
 ### Telemetry
 
 Pruning telemetry is emitted dynamically:
-* `harvest.retention.deleted` counter tracks the number of workflow histories successfully purged from the database after a successful archival invocation.
+* `harvest.retention.deleted` counter tracks the number of workflow histories successfully purged from the database, **labeled by workflow type** (issue #737) so per-type retention overrides are confirmable (a long-retained type reads `0` until its own age is reached). Emitted for real deletions only — `dry_run` reports per-type would-delete counts on `GET /admin/retention` without emitting the counter.
 * Shard-level statistics are also observable in your metrics agent (gauges for processing duration and candidate scan sizes).
 
 ### Log Diagnosis
