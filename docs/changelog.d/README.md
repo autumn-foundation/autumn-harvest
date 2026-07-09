@@ -34,3 +34,14 @@ and test evidence.>
 ```
 
 Keep the heading style consistent with the existing phase entries so collation is a straight copy-paste.
+
+## Rebase policy (parallel waves)
+
+Same spirit as the fragments above — minimise churn across concurrent PRs. **Do not proactively rebase or force-push a PR branch every time `trunk-dev` moves.** Every push re-triggers the Codex auto-review and restarts the review tail, which is noisy for reviewers.
+
+Rebase / update a branch only when:
+
+1. GitHub actually reports the branch as **conflicted**, or
+2. **Immediately before** the branch is merged.
+
+If the branch is merge-clean, leave it alone even if it's behind trunk. Cosmetic force-pushes are the enemy.
