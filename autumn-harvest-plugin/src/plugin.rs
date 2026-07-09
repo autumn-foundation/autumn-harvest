@@ -738,6 +738,53 @@ async fn start_harvest_runtime(
         built.set_audit_retention_days(days);
     }
 
+    // Capture the resolved effective runtime configuration (issue #695) so
+    // `GET /admin/config` can serve a secret-free introspection snapshot. This
+    // must run before `harvest_pool` and `router` are moved into
+    // `HarvestRunnerResources` below. Payload/history ceilings mirror the same
+    // resolution used for the API-state scalars above (the builder value falls
+    // back to the WorkerConfig value for the history ceiling).
+    {
+        use autumn_harvest::effective_config::{
+            EffectiveConfigView, PayloadCapsView, PoolConfigView,
+        };
+        let (payload_offload_enabled, payload_offload_threshold_bytes) = built
+            .payload_offloader()
+            .map_or((false, 0), |o| (true, o.threshold()));
+        let caps = PayloadCapsView::new(
+            built.max_activity_input_bytes,
+            built.max_activity_result_bytes,
+            built.max_signal_payload_bytes,
+            built.max_workflow_input_bytes,
+            built.max_current_details_bytes,
+            built.max_workflow_execution_timeout,
+            built.max_workflow_attempts,
+            built
+                .max_workflow_history_events
+                .or_else(|| built.worker_config().max_workflow_history_events),
+            built.usage_window_ceiling,
+            built.usage_max_groups,
+            payload_offload_enabled,
+            payload_offload_threshold_bytes,
+        );
+        let pool_view = PoolConfigView {
+            worker_pool_max_connections: harvest_pool.status().max_size,
+            // The plugin always resolves a single-shard `DbPool`; multi-shard
+            // deployments are rejected further below.
+            shard_pool_count: 1,
+        };
+        let poll_interval =
+            autumn_harvest::worker::WorkerRuntimeConfig::from(built.worker_config().clone())
+                .poll_interval;
+        api_state.set_effective_config(EffectiveConfigView::capture(
+            built.worker_config(),
+            caps,
+            &router,
+            pool_view,
+            poll_interval,
+        ));
+    }
+
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)

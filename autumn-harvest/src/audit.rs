@@ -311,6 +311,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/preflight", RouteClass::ReadOnly),
     ("GET /admin/shards/health", RouteClass::ReadOnly),
     ("GET /admin/status", RouteClass::ReadOnly),
+    // Effective runtime-config introspection (issue #695): read-only, secret-free.
+    ("GET /admin/config", RouteClass::ReadOnly),
     ("GET /admin/version-gates/usage", RouteClass::ReadOnly),
     (
         "GET /admin/version-gates/retirement-check",
@@ -548,6 +550,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/preflight",
     "GET /admin/shards/health",
     "GET /admin/status",
+    "GET /admin/config",
     "GET /admin/version-gates/usage",
     "GET /admin/version-gates/retirement-check",
     "GET /admin/retention",
@@ -647,6 +650,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
     ("GET /admin/status", None),
+    ("GET /admin/config", None),
     ("GET /admin/version-gates/usage", None),
     ("GET /admin/version-gates/retirement-check", None),
     ("GET /admin/retention", None),

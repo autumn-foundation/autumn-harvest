@@ -361,6 +361,11 @@ pub struct HarvestApiState {
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Starter defaults; overridable per deployment via the plugin builder.
     status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
+    /// Snapshot of the resolved effective runtime configuration (issue #695),
+    /// captured once at startup and served (secret-free) from
+    /// `GET /admin/config`. `None` until the runtime starts — the handler
+    /// fails closed in that boot window.
+    effective_config: Arc<Mutex<Option<autumn_harvest::effective_config::EffectiveConfigView>>>,
 }
 
 impl Default for HarvestApiState {
@@ -410,6 +415,7 @@ impl Default for HarvestApiState {
             status_thresholds: Arc::new(Mutex::new(
                 crate::status_summary::StatusThresholds::default(),
             )),
+            effective_config: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -630,6 +636,42 @@ impl HarvestApiState {
             .decode_payloads_on_read
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    /// Install the resolved effective-config snapshot (issue #695).
+    ///
+    /// Call this during startup from the plugin, once the [`WorkerConfig`],
+    /// shard router, payload caps, and pool sizing are all resolved, so
+    /// `GET /admin/config` can serve the secret-free view. Until it is set the
+    /// handler fails closed with the standard "runtime not started" error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_effective_config(
+        &self,
+        view: autumn_harvest::effective_config::EffectiveConfigView,
+    ) {
+        *self
+            .effective_config
+            .lock()
+            .expect("harvest api state lock poisoned") = Some(view);
+    }
+
+    /// Snapshot of the resolved effective runtime configuration (issue #695),
+    /// or `None` if the runtime has not started yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn effective_config(
+        &self,
+    ) -> Option<autumn_harvest::effective_config::EffectiveConfigView> {
+        self.effective_config
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
     }
 
     /// Set the hard ceiling on per-execution event count (issue #493).
@@ -3406,6 +3448,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(admin_status).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/config",
+            get(effective_config).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/version-gates/usage",
             get(version_usage).route_layer(require_admin.clone()),
         )
@@ -3971,6 +4017,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
         ("GET", "/admin/status"),
+        ("GET", "/admin/config"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -4849,6 +4896,17 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/admin/config",
+            Some(&[
+                "worker",
+                "payload_caps",
+                "shard_topology",
+                "features",
+                "pool",
+            ]),
+        ),
+        (
+            "GET",
             "/admin/version-gates/usage",
             Some(&["status", "observed_at", "filters", "items", "shards"]),
         ),
@@ -5316,6 +5374,27 @@ async fn admin_status(
 ) -> Json<crate::status_summary::HealthSummaryReport> {
     let thresholds = api_state.status_thresholds();
     Json(crate::status_summary::build_status_report(&api_state, &thresholds).await)
+}
+
+/// `GET /admin/config` — return the resolved effective runtime configuration,
+/// secret-free (issue #695).
+///
+/// Read-only, admin-gated. Serves the [`EffectiveConfigView`] captured once at
+/// startup. Secret-bearing configuration (notification URLs, sharded pool
+/// handle) is surfaced only as presence booleans/counts — never a value — so a
+/// connection string can never appear in the response. Fails closed with the
+/// standard "runtime not started" error if the snapshot is not yet installed.
+///
+/// [`EffectiveConfigView`]: autumn_harvest::effective_config::EffectiveConfigView
+async fn effective_config(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<autumn_harvest::effective_config::EffectiveConfigView>, AutumnError> {
+    let view = api_state.effective_config().ok_or_else(|| {
+        map_error(HarvestError::Config(
+            "harvest runtime is not started".to_string(),
+        ))
+    })?;
+    Ok(Json(view))
 }
 
 async fn version_usage(
