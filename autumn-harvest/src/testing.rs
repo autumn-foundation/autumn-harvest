@@ -2963,7 +2963,15 @@ impl WorkflowTestEnv {
                             .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
                     }
                     Err(error) => {
-                        deferred_events.push(WorkflowEvent::child_workflow_failed(child_id, error));
+                        // Decode the child mock's error so a typed
+                        // `WorkflowFailure` envelope surfaces the child's
+                        // `error_type`/`details`/`non_retryable` to the parent
+                        // (issue #767), mirroring the worker's
+                        // `wake_parent_for_child_failure`. A plain string decodes
+                        // to all-None typed fields (unchanged legacy behaviour).
+                        let decoded = crate::failure::decode_workflow_failure(&error);
+                        deferred_events
+                            .push(WorkflowEvent::child_workflow_failed_typed(child_id, &decoded));
                     }
                 }
                 Ok(true)

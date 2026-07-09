@@ -83,6 +83,8 @@ jobs:
         run: cargo test -p autumn-harvest-cli
       - name: Run business_metrics example tests (issue #758)
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
+      - name: Run typed_workflow_failure example tests (issue #767)
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Compile plugin integration tests
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --no-run
       - name: Run Docker-backed integration tests
