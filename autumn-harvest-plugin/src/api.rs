@@ -3074,6 +3074,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
+        .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -3682,6 +3683,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/history/export"),
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
+        ("GET", "/workflows/{id}/timeline"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -4244,6 +4246,18 @@ pub const fn management_api_response_fields()
                 "pending_child_workflows",
                 "checkpoints_truncated_for_budget",
                 "last_event_id",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/timeline",
+            Some(&[
+                "exec_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "steps",
+                "rollup",
             ]),
         ),
         (
@@ -7398,6 +7412,56 @@ fn unavailable_shards_summary(shards: &[UnavailableShard]) -> String {
         .map(|shard| format!("{} ({})", shard.shard_id, shard.reason))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `GET /workflows/{id}/timeline` — reconstruct a single execution's timeline.
+///
+/// Purely read-only (issue #739): projects the recorded `harvest_events` history
+/// into ordered per-step durations (queue-wait vs execution split, slowest step,
+/// busy/wait rollup) via [`autumn_harvest::derive_timeline`]. No new events are
+/// appended and no state is recomputed. Shard routing is O(1) from the
+/// `ExecutionId`; an unknown execution (including a classic DAG run, which is not
+/// on the standard execution path) returns a clear 404.
+///
+/// The timeline surfaces only durations, names, ids, and outcomes — never any
+/// `input`/`output`/`payload`/`error`/`value` field — so read-path payload
+/// decoding (issue #608) is a no-op here and is deliberately skipped (no
+/// `read_path_decoder`, no `audit_decoded_read`).
+async fn get_workflow_timeline(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<autumn_harvest::Timeline>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    let rows = autumn_harvest::store::load_timestamped_history(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+
+    let now = chrono::Utc::now();
+    let timeline = autumn_harvest::derive_timeline(
+        &rows,
+        execution.started_at,
+        now,
+        execution.completed_at,
+        exec_id.to_string(),
+        execution.workflow_id.clone(),
+        execution.workflow_name.clone(),
+        execution.state.clone(),
+    );
+
+    Ok(Json(timeline))
 }
 
 #[allow(clippy::too_many_lines)]

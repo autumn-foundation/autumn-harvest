@@ -681,6 +681,60 @@ pub async fn load_history_undecoded(
     })
 }
 
+/// Load every event of an execution paired with its `harvest_events` row
+/// timestamp, ordered by `event_id ASC` (issue #739).
+///
+/// This is the read-only input loader for the per-execution timeline read model
+/// ([`crate::timeline::derive_timeline`]). Each row's `event_data` is decoded
+/// directly with `serde_json::from_value` — **no** payload codec is applied
+/// (mirroring [`load_history_undecoded`]): the timeline reads only structural
+/// fields (ids, names, `attempt`, durations), which payload codecs never
+/// encrypt, so a foreign codec envelope riding along inside a payload field is
+/// harmless and must not make the strict identity-only [`load_history`] path
+/// hard-error `UnknownPayloadCodec`.
+///
+/// **Known limitation — unbounded load.** No pagination or `LIMIT`: the *entire*
+/// event history is loaded (consistent with replay's full load), even though
+/// this is an HTTP-triggerable read surface. A hard cap is deliberately **not**
+/// imposed, because a silently-truncated history would make the timeline rollup
+/// (busy/wait attribution, slowest step) wrong rather than merely incomplete.
+/// Bounding the history size is instead the workflow author's responsibility via
+/// continue-as-new discipline (the ≤500-event target); a run that ignores that
+/// discipline and accumulates a very large history will make this loader (and the
+/// timeline derivation) proportionally expensive. **Never use this for replay or
+/// any engine execution path**; it is a read-surface loader only.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on connection or query
+/// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
+/// value can't be deserialized into [`WorkflowEvent`].
+#[cfg(feature = "db")]
+pub async fn load_timestamped_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<crate::timeline::TimelineEventRow>> {
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    rows.into_iter()
+        .map(|row| {
+            serde_json::from_value::<WorkflowEvent>(row.event_data)
+                .map(|event| crate::timeline::TimelineEventRow {
+                    timestamp: row.timestamp,
+                    event,
+                })
+                .map_err(crate::error::HarvestError::from)
+        })
+        .collect()
+}
+
 /// Load history, inflating any offloaded payload fields from the configured
 /// [`PayloadOffloader`](crate::payload_store::PayloadOffloader) (issue #524).
 ///
