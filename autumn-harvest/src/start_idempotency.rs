@@ -176,6 +176,14 @@ pub const fn window_to_secs_f64(window: Duration) -> f64 {
     window.as_secs_f64()
 }
 
+/// Serializes tests that mutate and read back the process-global
+/// [`PURGE_WINDOW_SECS_BITS`] static so they don't race each other in the shared
+/// lib-test binary (issue #808, Codex P2). Any test that calls
+/// `set_purge_window_secs` and then asserts on `purge_window_secs()` — here or in
+/// `builder.rs` — must hold this lock for the set→read span.
+#[cfg(test)]
+pub(crate) static PURGE_WINDOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
@@ -208,6 +216,9 @@ mod pure_tests {
 
     #[test]
     fn purge_window_precision_and_clamping() {
+        let _guard = PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Sub-second precision (issue #808, Codex P2): the sweep window must be
         // >= the reserve window (`Duration::as_secs_f64()`) so the sweep never
         // deletes a claim the reserve still considers live. A truncating u64
