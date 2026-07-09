@@ -2893,7 +2893,7 @@
         {
           "id": 63,
           "type": "timeseries",
-          "title": "Retention deletions by shard",
+          "title": "Retention deletions by workflow type",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -2929,8 +2929,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (shard) (rate(harvest_retention_deleted_total{shard=~\"$shard\"}[$__rate_interval]))",
-              "legendFormat": "shard {{shard}}",
+              "expr": "sum by (workflow) (rate(harvest_retention_deleted_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

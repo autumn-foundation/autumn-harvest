@@ -557,6 +557,24 @@ pub enum HarvestBuilderError {
         registered: Vec<String>,
     },
 
+    /// A per-workflow-type retention override (issue #737) names a workflow
+    /// type that is not registered on this builder — either an explicit
+    /// `#[workflow]` or an auto-registered DAG workflow. Caught at build time
+    /// so a typo'd override name is a clear error rather than a silently
+    /// ignored override. Mirrors [`Self::UnknownCompletionTriggerWorkflow`].
+    #[non_exhaustive]
+    #[error(
+        "retention override names unknown workflow type '{workflow_name}'; \
+         register it with .workflows(...) or remove the override. \
+         registered workflows: {registered:?}"
+    )]
+    UnknownRetentionOverrideWorkflow {
+        /// The unrecognised workflow name in the retention override.
+        workflow_name: String,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
+
     /// A completion trigger carries an output guard that fails
     /// [`crate::completion_trigger::TriggerCondition::validate`] — over the
     /// boundedness caps or with a malformed dotted path (issue #810). Never
@@ -1099,7 +1117,7 @@ impl HarvestBuilder {
 
     /// Configure retention janitor behavior for completed workflow history.
     #[must_use]
-    pub const fn retention(mut self, retention: RetentionConfig) -> Self {
+    pub fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
         self
     }
@@ -1421,10 +1439,16 @@ impl HarvestBuilder {
     /// when activities sharing a `concurrency_key` declare different
     /// `max_concurrent` values, or when a [`WorkflowSchedule`] references a
     /// workflow name not registered on this builder.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+        validate_retention_overrides(
+            &self.retention,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
 
         if self.worker_config.worker_heartbeat_interval.is_zero() {
             return Err(HarvestBuilderError::InvalidWorkerConfig(
@@ -1635,6 +1659,35 @@ fn validate_completion_triggers(
             return Err(HarvestBuilderError::InvalidCompletionTriggerCondition {
                 trigger_id: trigger.id,
                 message,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every per-workflow-type retention override (issue #737)
+/// names a registered workflow type — either an explicitly registered
+/// `#[workflow]` or an auto-registered DAG workflow. Catches typos at build
+/// time rather than silently ignoring the override. Mirrors
+/// [`validate_completion_triggers`].
+fn validate_retention_overrides(
+    retention: &crate::retention::RetentionConfig,
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    if retention.workflow_overrides().is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows
+        .iter()
+        .map(|w| w.name.to_string())
+        .chain(auto_registered_dag_workflows.iter().cloned())
+        .collect();
+    for name in retention.workflow_overrides().keys() {
+        if !registered.contains(name) {
+            return Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow {
+                workflow_name: name.clone(),
+                registered,
             });
         }
     }
@@ -3736,6 +3789,63 @@ mod tests {
                 }) if workflow_name == "unknown_target" && role == "target"
             ),
             "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_retention_overrides_registration() {
+        use crate::retention::RetentionConfig;
+        use std::time::Duration;
+
+        let workflows = vec![fake_workflow_info()]; // registered name: "test"
+        let dags = vec!["my_dag".to_string()];
+
+        // Unknown override name -> Err
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("typo_wf", Duration::from_secs(60));
+        let result = validate_retention_overrides(&cfg, &workflows, &dags);
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow { ref workflow_name, ref registered })
+                    if workflow_name == "typo_wf" && registered.contains(&"test".to_string())
+            ),
+            "Expected UnknownRetentionOverrideWorkflow naming the unknown type and listing registered, got: {result:?}"
+        );
+
+        // Known registered workflow name -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("test", Duration::from_secs(60));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+
+        // Known auto-registered DAG workflow name -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("my_dag", Duration::from_secs(60));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+
+        // Empty overrides -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+    }
+
+    #[test]
+    fn harvest_builder_rejects_unknown_retention_override() {
+        use crate::retention::RetentionConfig;
+        use std::time::Duration;
+
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("nope", Duration::from_secs(60));
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .retention(cfg)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow { ref workflow_name, .. })
+                    if workflow_name == "nope"
+            ),
+            "Expected UnknownRetentionOverrideWorkflow naming the unknown type, got: {result:?}"
         );
     }
 

@@ -249,7 +249,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_DLQ_ENTRIES`       | `harvest.dlq.entries`         | Gauge        | `shard` (≤ 256)                               |                       |
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |
-| `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `shard` (≤ 256)                               |                       |
+| `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`)        |                       |
 | `METRIC_WORKFLOW_PAUSED`   | `harvest.workflow.paused`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`      |
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |

@@ -200,6 +200,15 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
+    // issue #607 / #688: workflow-start throttle table + its index follow-ups.
+    include_str!("../../autumn-harvest/migrations/20260706000001_harvest_start_throttle/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260707000000_harvest_start_throttle_bucket_deferred_idx/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260708000000_harvest_start_throttle_workflow_id_idx/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -3762,6 +3771,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .build(),
         &HarvestRuntimeConfig {
