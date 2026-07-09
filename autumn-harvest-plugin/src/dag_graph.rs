@@ -36,6 +36,29 @@
 //! ambiguous duplicates. `DagBuilder::build()` itself does not reject duplicate
 //! activity names, so such a DAG can be registered and run.
 //!
+//! ### v1 limitation: mapped (fan-out) tasks
+//!
+//! A mapped task (`DagBuilder::map_activity`) is a single `DagTask`, but at
+//! runtime the unified DAG handler dispatches one activity instance per
+//! input-array element, **all sharing the task's activity name** with distinct
+//! `activity_id`s (no `fan_out:` marker is recorded — the handler hand-rolls the
+//! fan-out via `execute_activity_raw_with_opts`). Because node identity is keyed
+//! purely by activity name and both this view and [`crate::dag_retry::node_outcome`]
+//! select the **latest-scheduled** `ActivityScheduled` for the name, the whole
+//! mapped node collapses to that single instance's outcome. If an earlier mapped
+//! element fails or times out while a later element succeeds, the node is
+//! reported with the later element's status/attempts/error rather than an
+//! aggregate — a `FAILED` run can show the mapped node as `succeeded` or
+//! `cancelled`.
+//!
+//! This is **intentionally identical** to the #366 retry resolver, which
+//! collapses mapped tasks the same way ([`node_outcome`](crate::dag_retry::node_outcome)
+//! has no `map_upstream` awareness). Keeping the two consistent is the point
+//! (AC5): aggregating here would make the graph disagree with the retry
+//! endpoint — an operator could see a mapped node reported `failed` yet have the
+//! retry endpoint reject it as succeeded. A map-aware aggregate outcome is
+//! deferred to a #366 change that updates `node_outcome` and this view together.
+//!
 //! ## Status classification (AC5 anchor)
 //!
 //! Base classification comes from [`crate::dag_retry::node_outcome`], the exact
@@ -1107,5 +1130,51 @@ mod tests {
         // Both carry the same name-keyed status (ambiguous by construction).
         assert_eq!(dupes[0].status, dupes[1].status);
         assert_eq!(dupes[0].status, DagNodeStatus::Succeeded);
+    }
+
+    #[test]
+    fn mapped_task_collapses_to_latest_scheduled_instance() {
+        // A mapped (fan-out) task is a single DagTask, but the unified DAG
+        // handler dispatches one activity instance per input-array element, all
+        // sharing the task's activity name with distinct activity_ids and NO
+        // `fan_out:` marker. Because node identity is keyed purely by activity
+        // name and `latest_scheduled` (this view) and `node_outcome` (the #366
+        // retry resolver) both select the LATEST-scheduled instance for the
+        // name, the whole mapped node collapses to that single instance's
+        // outcome (issue #690 review, Codex CLAIM C).
+        //
+        // This test PINS that documented v1 collapse — it is NOT asserting the
+        // "ideal" map-aware aggregate. On a FAILED run where an EARLIER mapped
+        // element failed but the LATER element succeeded, the node is reported
+        // `succeeded` (the latest-scheduled element B), not `failed`. Diverging
+        // from this would break AC5 consistency with the #366 retry endpoint.
+        //
+        // The mapped node is a single task; the collapse is purely name-keyed,
+        // so a plain single-node DAG faithfully models it.
+        let mut builder = DagBuilder::new();
+        let _na = builder.activity(a);
+        let def = builder.build().expect("single-node dag builds");
+
+        let (id_a, id_b) = (ActivityExecId::new(), ActivityExecId::new());
+        // Two same-name "a" instances (a mapped fan-out): earlier element A
+        // fails, later element B succeeds; distinct timestamps so B is latest.
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", id_a)),
+            (ts(2), activity_started(id_a)),
+            (ts(3), sched("a", id_b)),
+            (ts(4), activity_started(id_b)),
+            (ts(5), failed(id_a, "element A failed")),
+            (ts(6), completed(id_b)),
+        ];
+        let nodes = build_run_graph(&def, &events, "FAILED");
+
+        // The collapse reports the LATEST-scheduled instance (B → completed).
+        assert_eq!(node(&nodes, "a").status, DagNodeStatus::Succeeded);
+
+        // AC5: this exactly matches the #366 retry resolver for the same
+        // history — both collapse to the latest-scheduled instance's outcome.
+        let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
+        assert_eq!(node_outcome(&plain, "a"), NodeOutcome::Succeeded);
     }
 }
