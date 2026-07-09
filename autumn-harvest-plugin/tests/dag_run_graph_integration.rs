@@ -369,6 +369,25 @@ fn skip_marker(task_index: usize, activity_name: &str) -> WorkflowEvent {
     }
 }
 
+/// A `dag_skip:{task_index}` marker whose `details` is an opaque codec envelope,
+/// exactly as it is persisted on a deployment with a non-identity `PayloadCodec`
+/// (`details` is a payload field, wrapped by `transform_event_data` on write).
+/// The default identity codec stores this verbatim, so seeding it reproduces a
+/// codec-deployment's on-disk state without configuring a real codec. The read
+/// path does not decode, so the recorded task/upstream fingerprint is opaque
+/// here — classification must fall back to the marker name/index (issue #690
+/// review, Codex CLAIM D).
+fn skip_marker_codec_envelope(task_index: usize) -> WorkflowEvent {
+    WorkflowEvent::MarkerRecorded {
+        name: format!("dag_skip:{task_index}"),
+        details: json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "reverse",
+            "data": "b3BhcXVl",
+        }),
+    }
+}
+
 /// Seed a workflow execution for `dag_name`, append `events` after the initial
 /// `WorkflowStarted`, then transition it to `state`.
 async fn seed_run(
@@ -740,6 +759,42 @@ async fn dag_run_graph_skipped_node_and_pending_downstream() {
     // A skipped node has no timing.
     let b_node = node(&body, "step_b");
     assert!(b_node.get("started_at").is_none() || b_node["started_at"].is_null());
+}
+
+#[tokio::test]
+async fn dag_run_graph_skip_marker_with_opaque_codec_details_is_still_skipped() {
+    // Issue #690 review (Codex CLAIM D): on a non-identity-codec deployment the
+    // dag_skip marker's `details` is stored as an opaque envelope, so its
+    // recorded task/upstream fingerprint is unreadable at this (non-decoding)
+    // read path. The condition-skipped node must still be reported `skipped`
+    // (falling back to the always-clear marker name/index), not `pending`.
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    // graph_linear_dag: step_a (0) -> step_b (1) -> step_c (2).
+    let ia = ActivityExecId::new();
+    let events = vec![
+        sched("step_a", ia),
+        completed(ia),
+        skip_marker_codec_envelope(1),
+    ];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-skip-codec",
+        events,
+        "COMPLETED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(node(&body, "step_a")["status"], json!("succeeded"));
+    // Skipped despite the opaque codec-envelope details.
+    assert_eq!(node(&body, "step_b")["status"], json!("skipped"));
+    assert_eq!(node(&body, "step_c")["status"], json!("pending"));
 }
 
 // ── (j) retried node: attempts counted from ActivityStarted (Codex CLAIM A) ──

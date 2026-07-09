@@ -303,7 +303,8 @@ fn failure_detail(
 }
 
 /// Whether a `dag_skip:{task_index}` marker was recorded for `task_index`
-/// **and** its recorded fingerprint still identifies the current node.
+/// (and, when its recorded fingerprint is readable, whether that fingerprint
+/// still identifies the current node).
 ///
 /// A `dag_skip:{idx}` marker (#482) is keyed by the node's *position* in the
 /// DAG, but the marker's `details` also record the bound `task` (activity name)
@@ -318,6 +319,20 @@ fn failure_detail(
 /// mirrors the Vantage UI's condition-skip validation (`ui.rs`); a marker whose
 /// fingerprint no longer matches is ignored, so the node falls through to
 /// `pending` rather than being falsely reported as `skipped`.
+///
+/// **Codec/offload deployments (issue #690 review, Codex CLAIM D).** `details`
+/// is a payload field (`PAYLOAD_FIELD_KEYS`), so on a deployment with a
+/// non-identity [`PayloadCodec`](autumn_harvest::payload_codec::PayloadCodec) —
+/// or, in principle, large-payload offload — it is stored as an opaque envelope
+/// (`_harvest_codec_envelope` / `_harvest_offload_envelope`). This read path
+/// deliberately does **not** codec-decode (matching the Vantage UI's `dag_skip`
+/// detection and [`crate::store::load_history_with_timestamps`]), so the
+/// recorded fingerprint is not visible. When `details.task` is unreadable the
+/// fingerprint validation cannot run, so we fall back to matching by the marker
+/// **name/index** alone — which is never a payload field and is always in the
+/// clear — and report the node `skipped`. Reorder-safety is not available in
+/// that opaque case (accepted: this equals the pre-#690 behavior, and skip
+/// detection itself stays correct in every deployment).
 fn has_skip_marker(
     events: &[WorkflowEvent],
     task_index: usize,
@@ -332,12 +347,15 @@ fn has_skip_marker(
         if *name != marker_name {
             return false;
         }
-        // The recorded task name must still identify the current node at this
-        // index. A marker without a `task` field (never emitted by the current
-        // engine) is conservatively ignored, matching the UI.
+        // When the recorded fingerprint is unreadable — an opaque codec/offload
+        // envelope, or an erasure tombstone — validation cannot run, so honor
+        // the skip by the (always-clear) marker name/index alone. See the doc
+        // comment (issue #690 review, Codex CLAIM D).
         let Some(recorded_task) = details.get("task").and_then(|v| v.as_str()) else {
-            return false;
+            return true;
         };
+        // The recorded task name must still identify the current node at this
+        // index (reorder/rename safety).
         if recorded_task != activity_name {
             return false;
         }
@@ -622,6 +640,23 @@ mod tests {
                 "task": task,
                 "reason": "condition_false",
                 "upstreams": upstreams,
+            }),
+        }
+    }
+
+    /// A `dag_skip` marker whose `details` has been replaced by a codec envelope,
+    /// exactly as `PayloadCodecs::transform_event_data` does on write when a
+    /// non-identity `PayloadCodec` is configured (`details` is a payload field).
+    /// The recorded task/upstream fingerprint is opaque here — the read path does
+    /// not codec-decode — so classification must fall back to the (always
+    /// in-the-clear) marker name/index (issue #690 review, Codex CLAIM D).
+    fn skip_marker_codec_envelope(task_index: usize) -> WorkflowEvent {
+        WorkflowEvent::MarkerRecorded {
+            name: format!("dag_skip:{task_index}"),
+            details: serde_json::json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "reverse",
+                "data": "b3BhcXVl",
             }),
         }
     }
@@ -975,6 +1010,31 @@ mod tests {
         ];
         let nodes = build_run_graph(&def, &events, "RUNNING");
         assert_eq!(node(&nodes, "b").status, DagNodeStatus::Pending);
+    }
+
+    #[test]
+    fn skip_marker_with_opaque_codec_envelope_details_is_still_skipped() {
+        // Issue #690 review (Codex CLAIM D): on a deployment with a non-identity
+        // PayloadCodec, a `dag_skip:{idx}` marker's `details` is stored as an
+        // opaque codec envelope (`details` is a payload field), so the recorded
+        // task/upstream fingerprint is not readable at this read path. The node
+        // must still be reported `skipped` (falling back to the in-the-clear
+        // marker name/index) rather than `pending` — the marker name is never a
+        // payload field. Before the fix, the unreadable `details.task` made
+        // has_skip_marker return false and the node was wrongly reported pending.
+        let def = conditional_dag(); // a(0) -> b(1)[cond] -> c(2)
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), skip_marker_codec_envelope(1)),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(node(&nodes, "b").status, DagNodeStatus::Skipped);
+        assert_eq!(node(&nodes, "c").status, DagNodeStatus::Pending);
+        // A skipped node still has no timing.
+        assert!(node(&nodes, "b").started_at.is_none());
     }
 
     // ── depends_on topology ─────────────────────────────────────────────────

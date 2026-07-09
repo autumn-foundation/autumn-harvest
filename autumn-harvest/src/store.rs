@@ -746,8 +746,13 @@ pub async fn load_timestamped_history(
 ///
 /// Payloads are deserialized directly (no codec transform), matching
 /// [`load_history_undecoded`]: on an identity-codec deployment this is
-/// byte-identical to [`load_history`], and the DAG graph classification only
-/// reads non-payload fields (activity name, error type) plus the error string.
+/// byte-identical to [`load_history`]. The DAG graph classification reads
+/// non-payload fields (activity name, error type) plus the error string, and
+/// the `dag_skip:{idx}` marker's `details` fingerprint — a payload field that
+/// is an opaque codec/offload envelope on a non-identity-codec deployment. The
+/// classifier (`dag_graph::has_skip_marker`, issue #690 review) tolerates that
+/// opacity by falling back to the always-clear marker name/index, so this raw
+/// (non-decoding) load is correct for the graph view in every deployment.
 ///
 /// **Never use this for replay or any engine execution path** — replay must see
 /// codec-decoded plaintext and uses the codec-aware loaders.
