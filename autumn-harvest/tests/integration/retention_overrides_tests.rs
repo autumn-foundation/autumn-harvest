@@ -460,3 +460,102 @@ async fn overrides_only_never_deletes_types_without_override() {
         "overrides-only pre-filter must not scan never-delete types"
     );
 }
+
+// Mixed-policy fairness (issue #737, PR #990 review): a global default plus a
+// LONGER per-workflow override — the canonical compliance config (short default,
+// long financial-record retention). The long-retained type's rows are OLDER
+// (smaller `completed_at`), so under the old single-loose-cutoff SELECT
+// (`ORDER BY completed_at ASC`) they were returned FIRST, claimed into the
+// batch, and skipped as not-yet-eligible — consuming the batch budget and
+// starving/delaying deletion of newer already-expired rows of the shorter
+// policy. The fix pushes each row's exact per-type cutoff into the predicate, so
+// only genuinely-eligible rows are ever selected.
+//
+// Falsifiable against the old behavior: with `batch_size = 2` and a 3-row
+// not-yet-eligible `archive_wf` backlog that is OLDER than the one eligible
+// `global_wf` row, the old code would load 2 archive_wf rows (oldest first),
+// skip both, exhaust `remaining`, and never reach `global_wf` — deleting nothing
+// and reporting `candidate_count = 2`. The fix selects only the eligible row.
+#[tokio::test]
+async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    // A backlog of `archive_wf` rows, all OLDER than the eligible global_wf row
+    // but NONE eligible under the 365-day override. These would sort FIRST under
+    // `ORDER BY completed_at ASC` and consume the batch under the old behavior.
+    insert_completed(
+        &mut conn,
+        "archive_wf",
+        "a60",
+        now - chrono::Duration::days(60),
+    )
+    .await;
+    insert_completed(
+        &mut conn,
+        "archive_wf",
+        "a45",
+        now - chrono::Duration::days(45),
+    )
+    .await;
+    insert_completed(
+        &mut conn,
+        "archive_wf",
+        "a30",
+        now - chrono::Duration::days(30),
+    )
+    .await;
+    // One eligible short-policy row: 2 days > the 1-day global default.
+    insert_completed(
+        &mut conn,
+        "global_wf",
+        "g1",
+        now - chrono::Duration::days(2),
+    )
+    .await;
+
+    // Global 1 day; archive_wf retained 365 days. Small batch so the backlog
+    // would exhaust it before reaching global_wf under the old loose cutoff.
+    let mut config = history_only(Some(Duration::from_secs(86_400)))
+        .with_workflow_override("archive_wf", Duration::from_secs(365 * 86_400));
+    config.batch_size = 2;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    // The eligible short-policy row is deleted; the entire not-yet-eligible
+    // backlog survives — it never starved the eligible deletion.
+    let mut survivors = surviving_names(&mut conn).await;
+    survivors.sort();
+    assert_eq!(
+        survivors,
+        vec![
+            "archive_wf".to_string(),
+            "archive_wf".to_string(),
+            "archive_wf".to_string(),
+        ],
+        "every not-yet-eligible archive_wf row survives; only the eligible \
+         global_wf row is deleted despite the small batch"
+    );
+    assert_eq!(
+        result.deleted_count, 1,
+        "exactly the eligible global_wf row"
+    );
+
+    // Only the eligible row is ever SELECTed — the not-yet-eligible backlog is
+    // filtered out in SQL and never consumes candidate/batch budget. Under the
+    // old loose-cutoff behavior this would have been 2 (both oldest archive_wf
+    // rows loaded and skipped).
+    assert_eq!(
+        result.candidate_count, 1,
+        "per-type SQL cutoff must not select not-yet-eligible rows"
+    );
+
+    // Per-type reporting and metric name exactly the deleted type.
+    assert_eq!(result.deleted_by_workflow.get("global_wf"), Some(&1));
+    assert!(!result.deleted_by_workflow.contains_key("archive_wf"));
+    assert_eq!(metrics.deleted(), vec![("global_wf".to_string(), 1)]);
+}

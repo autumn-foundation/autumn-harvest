@@ -466,16 +466,22 @@ impl RetentionRuntime {
                 // cutoff that would make `loose_cutoff == now` and over-select
                 // nearly every completed row. The audit/schedule purges below
                 // still run.
-                if let Some(loose_chrono) = config
+                if config
                     .loosest_cutoff_age()
                     .and_then(|age| chrono::Duration::from_std(age).ok())
+                    .is_some()
                 {
-                    // Compute `now` once so every shard's per-candidate
-                    // resolution uses a single consistent clock; `loose_cutoff`
-                    // is the smallest-effective-age SQL pre-filter (a superset
-                    // of every deletable row across all types).
+                    // Phase-active gate (issue #737): the `and_then(from_std)`
+                    // above is the fail-safe guard from commit 34ddb62 — if the
+                    // loosest configured age is unrepresentable as a
+                    // `chrono::Duration` (unreachable for validated ages) we skip
+                    // the whole workflow-history phase this tick rather than
+                    // over-selecting. Compute `now` once so every shard's SQL
+                    // predicate and per-candidate resolution use one consistent
+                    // clock. The exact per-type cutoffs are pushed into the SELECT
+                    // inside `run_shard_tick` (PR #990 review) — there is no
+                    // single "loose cutoff" SQL bind any more.
                     let now = Utc::now();
-                    let loose_cutoff = now - loose_chrono;
                     let tick_futures = pools.iter_shards().map(|(shard, pool)| {
                         let pool = pool.clone();
                         let config = config.clone();
@@ -489,7 +495,6 @@ impl RetentionRuntime {
                                 pool,
                                 shard,
                                 now,
-                                loose_cutoff,
                                 &config,
                                 archiver,
                                 cursor,
@@ -712,7 +717,6 @@ async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
     now: DateTime<Utc>,
-    loose_cutoff: DateTime<Utc>,
     config: &RetentionConfig,
     archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
@@ -728,22 +732,39 @@ async fn run_shard_tick(
     let mut remaining = config.batch_size;
     let mut has_failed = false;
 
-    // Overrides-only scalability guard (issue #737): when the global `max_age`
-    // is unset, ONLY the overridden workflow types are ever deletable — every
-    // other terminal row is a never-delete type that the loose-cutoff SQL
-    // pre-filter would otherwise re-select and re-skip on every tick, forever,
-    // as they accumulate. So in overrides-only mode we bound the pre-filter to
-    // `workflow_name = ANY(<override keys>)`. When the global `max_age` IS set,
-    // NO name filter is applied — fallback (un-overridden) types remain
-    // deletable under the global age. (The enclosing block only runs when
-    // `loosest_cutoff_age()` is `Some`, so overrides are non-empty whenever the
-    // global age is `None` here.)
-    let overrides_only = config.max_age().is_none();
-    let override_names: Vec<String> = if overrides_only {
-        config.workflow_overrides().keys().cloned().collect()
-    } else {
-        Vec::new()
-    };
+    // Per-type effective cutoff pushed into the candidate SELECT (issue #737,
+    // PR #990 review). Instead of a single loose cutoff (`now - min(all ages)`)
+    // followed by a Rust per-candidate skip — which selects, claims, and re-skips
+    // a long-retained type's not-yet-eligible rows every tick, consuming batch
+    // budget and starving newer already-expired rows of a shorter policy — we
+    // build one (name, cutoff) pair per override and let the SQL COALESCE resolve
+    // each row's own effective cutoff. Only genuinely-eligible rows are ever
+    // selected, so mixed-policy deployments never starve.
+    //
+    // `override_cut_names[i]` ↔ `override_cuts[i]` are kept in lockstep (unnest
+    // requires equal-length arrays). A non-overridden type falls through COALESCE
+    // to `global_fallback` (the global `max_age` cutoff) or, when no global age is
+    // set, to `'-infinity'` — meaning it is never selected.
+    let mut override_cut_names: Vec<String> = Vec::new();
+    let mut override_cuts: Vec<DateTime<Utc>> = Vec::new();
+    for (name, secs) in config.workflow_overrides() {
+        // Fail safe: an unrepresentable override age (unreachable for validated
+        // ages, bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range) is omitted so
+        // its rows are never selected under a too-aggressive cutoff. With a global
+        // `max_age` set they then fall back to it; without one they fall back to
+        // `'-infinity'` (never selected). Retaining is the correct failure mode.
+        if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
+            override_cut_names.push(name.clone());
+            override_cuts.push(now - delta);
+        }
+    }
+    // The global fallback cutoff for un-overridden types. `None` means "no global
+    // age" (or an unrepresentable one — same fail-safe): the SQL uses an
+    // `'-infinity'` literal so those types are never selected.
+    let global_fallback: Option<DateTime<Utc>> = config
+        .max_age()
+        .and_then(|age| chrono::Duration::from_std(age).ok())
+        .map(|delta| now - delta);
 
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
     let guard = RetentionLeaseGuard {
@@ -793,47 +814,84 @@ async fn run_shard_tick(
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
         let lease_id_inner = lease_id.clone();
-        let override_names_inner = override_names.clone();
+        let names_inner = override_cut_names.clone();
+        let cuts_inner = override_cuts.clone();
         let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
             Box::pin(async move {
-                // Overrides-only mode adds `AND workflow_name = ANY($5)` so the
-                // pre-filter never re-scans never-delete types (issue #737).
-                let name_filter = if overrides_only {
-                    "AND workflow_name = ANY($5)"
-                } else {
-                    ""
-                };
-                let sql = format!(
+                // Push each row's exact per-type effective cutoff into the
+                // predicate (issue #737, PR #990 review): the correlated
+                // `unnest` subquery resolves the override cutoff for this row's
+                // workflow_name, falling through COALESCE to the global cutoff
+                // ($3) or, when there is no global age, to `'-infinity'` — so a
+                // non-overridden never-delete type is never selected. Only
+                // genuinely-eligible rows are returned, so a long-retained
+                // type's not-yet-eligible backlog can neither consume the batch
+                // budget nor starve newer expired rows of a shorter policy.
+                //
+                // Two query-string variants keep the bind numbering unambiguous:
+                // with a global age the fallback is bound as $3; without one it
+                // is the `'-infinity'` literal and the cursor/limit binds shift
+                // down by one.
+                let sql = if global_fallback.is_some() {
                     "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
-                       AND completed_at < $1
                        AND sticky_worker_id IS NULL
+                       AND completed_at < COALESCE(
+                           (SELECT ov.cut
+                              FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                             WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                           $3)
                        AND (
-                           $2 IS NULL
-                           OR completed_at > $2
-                           OR (completed_at = $2 AND id > $3)
+                           $4 IS NULL
+                           OR completed_at > $4
+                           OR (completed_at = $4 AND id > $5)
                        )
-                       {name_filter}
                      ORDER BY completed_at ASC, id ASC
-                     LIMIT $4
+                     LIMIT $6
                      FOR UPDATE SKIP LOCKED"
-                );
-                // Bind order maps to $1..$N regardless of textual position, so
-                // $5 (the name array) is bound after $4 (the limit).
+                } else {
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
+                     FROM harvest_workflow_executions
+                     WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                       AND completed_at IS NOT NULL
+                       AND sticky_worker_id IS NULL
+                       AND completed_at < COALESCE(
+                           (SELECT ov.cut
+                              FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                             WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                           '-infinity'::timestamptz)
+                       AND (
+                           $3 IS NULL
+                           OR completed_at > $3
+                           OR (completed_at = $3 AND id > $4)
+                       )
+                     ORDER BY completed_at ASC, id ASC
+                     LIMIT $5
+                     FOR UPDATE SKIP LOCKED"
+                };
+                // Bind order maps to $1..$N regardless of textual position. The
+                // override arrays ($1/$2) are always bound; $3 is the global
+                // fallback only in the global-age variant.
                 let query = diesel::sql_query(sql)
-                    .bind::<Timestamptz, _>(loose_cutoff)
-                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX));
-                let rows = if overrides_only {
+                    .bind::<Array<Text>, _>(names_inner)
+                    .bind::<Array<Timestamptz>, _>(cuts_inner);
+                let rows = if let Some(fallback) = global_fallback {
                     query
-                        .bind::<Array<Text>, _>(override_names_inner)
+                        .bind::<Timestamptz, _>(fallback)
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
                         .load::<CandidateExecution>(conn)
                         .await
                 } else {
-                    query.load::<CandidateExecution>(conn).await
+                    query
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
                 }
                 .map_err(database_error)?;
 
@@ -902,6 +960,14 @@ async fn run_shard_tick(
             // or global fallback), then gate on it before any archive/delete.
             // Future policies (#747 legal hold, #752 tiered summary) hook in
             // here.
+            //
+            // NB (PR #990 review): the candidate SELECT now pushes each row's
+            // exact per-type cutoff into SQL, so the two skip branches below
+            // (`effective_max_age == None` and `completed_at >= resolved_cutoff`)
+            // are effectively unreachable — no not-yet-eligible or never-delete
+            // row is ever selected. They are kept as cheap defense-in-depth. The
+            // `should_skip_candidate` chain-link check below still needs the
+            // RESOLVED per-type cutoff, which is derived here.
             let Some(age) = config.effective_max_age(&candidate.workflow_name) else {
                 // Neither an override nor a global max-age applies to this
                 // type: never delete it. Routine skip.
