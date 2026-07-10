@@ -290,6 +290,88 @@ fn workflow_list_supports_repeated_and_comma_states() {
 }
 
 #[test]
+fn workflow_summaries_maps_to_get_request() {
+    let cli = Cli::try_parse_from(["harvest", "workflow", "summaries"])
+        .expect("summaries args should parse");
+    let request = cli.api_request().expect("summaries request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/workflows/summaries");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_summaries_filters_map_to_query_string() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "summaries",
+        "--workflow-name",
+        "onboarding",
+        "--workflow-id",
+        "acme-1",
+        "--state",
+        "COMPLETED,FAILED",
+        "--completed-after",
+        "2026-01-01T00:00:00Z",
+        "--completed-before",
+        "2026-12-31T23:59:59Z",
+        "--search-attr",
+        "tenant=acme",
+        "--limit",
+        "100",
+        "--cursor",
+        "2026-05-04T12:00:00Z|00000000-0000-0000-0000-000000000099",
+    ])
+    .expect("filtered summaries args should parse");
+    let request = cli.api_request().expect("summaries request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows/summaries?workflow_name=onboarding&workflow_id=acme-1\
+         &state=COMPLETED,FAILED&completed_after=2026-01-01T00:00:00Z\
+         &completed_before=2026-12-31T23:59:59Z&search_attr=tenant:acme&limit=100\
+         &cursor=2026-05-04T12:00:00Z%7C00000000-0000-0000-0000-000000000099"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_summaries_order_maps_to_query_string() {
+    let cli = Cli::try_parse_from(["harvest", "workflow", "summaries", "--order", "asc"])
+        .expect("summaries --order args should parse");
+    let request = cli.api_request().expect("summaries request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/workflows/summaries?order=asc");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_summaries_reject_invalid_order() {
+    // Restricted at clap parse time to asc|desc.
+    let parsed = Cli::try_parse_from(["harvest", "workflow", "summaries", "--order", "sideways"]);
+    assert!(parsed.is_err(), "invalid --order value must be rejected");
+}
+
+#[test]
+fn workflow_summaries_reject_search_attr_without_equals() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "summaries",
+        "--search-attr",
+        "tenant",
+    ])
+    .expect("summaries args should parse");
+    assert!(
+        cli.api_request().is_err(),
+        "malformed --search-attr should error before building the request"
+    );
+}
+
+#[test]
 fn workflow_children_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",

@@ -14,9 +14,10 @@ use crate::schema::{
     harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
     harvest_completion_deliveries, harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
-    harvest_events, harvest_external_tasks, harvest_payload_refs, harvest_rate_limit_buckets,
-    harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_workers, harvest_workflow_executions,
+    harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_payload_refs,
+    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,
+    harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -1261,4 +1262,62 @@ pub struct SessionBrokenUpdate {
 pub struct SessionCompletedUpdate {
     pub state: String,
     pub completed_at: DateTime<Utc>,
+}
+
+// ── Execution summary (issue #752) ──────────────────────────────────────────────
+
+/// A compact summary of a terminal execution demoted by the retention janitor
+/// (issue #752), read from `harvest_execution_summaries`.
+#[derive(
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[diesel(table_name = harvest_execution_summaries)]
+#[diesel(primary_key(execution_id))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ExecutionSummary {
+    pub execution_id: Uuid,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: Option<i64>,
+    pub shard_id: i32,
+    pub search_attrs: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    /// Parent execution UUID for a child-workflow summary, else `None`
+    /// (issue #752). Links a demoted child to its parent for the #495 PII-erase
+    /// cascade.
+    pub parent_id: Option<Uuid>,
+    pub summarized_at: DateTime<Utc>,
+}
+
+/// Insert struct for a newly written execution summary (issue #752).
+///
+/// `summarized_at` is omitted so Postgres fills its `DEFAULT NOW()`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_execution_summaries)]
+pub struct NewExecutionSummary {
+    pub execution_id: Uuid,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: Option<i64>,
+    pub shard_id: i32,
+    pub search_attrs: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    /// Parent execution UUID when demoting a child workflow, else `None`
+    /// (issue #752).
+    pub parent_id: Option<Uuid>,
 }

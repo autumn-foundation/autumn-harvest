@@ -207,6 +207,91 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/summaries",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List tiered/summary-retention execution summaries (issue #752): compact, queryable rows the retention janitor demotes a hard-deleted terminal execution into instead of losing it entirely. Admin-guarded (summaries may carry retained/redacted payloads). Cross-shard fan-out with the same keyset-cursor pagination contract as GET /workflows (issue #498), ordered by (completed_at DESC, execution_id DESC). Each item carries summarized:true and history_available:false so it is unambiguously distinguishable from a live execution. An unreachable shard fails the call (matching GET /workflows).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by registered workflow name (exact match)."
+        },
+        {
+          "name": "workflow_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by workflow ID (exact match)."
+        },
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Comma-separated or repeated terminal states (e.g. COMPLETED,FAILED)."
+        },
+        {
+          "name": "completed_after",
+          "in": "query",
+          "required": false,
+          "description": "Filter to summaries whose completed_at is on or after this RFC 3339 timestamp."
+        },
+        {
+          "name": "completed_before",
+          "in": "query",
+          "required": false,
+          "description": "Filter to summaries whose completed_at is on or before this RFC 3339 timestamp."
+        },
+        {
+          "name": "search_attr",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Search-attribute containment filter in key:value form (JSONB @> exact-match). May be repeated; ANDed."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results to return (default 50, max 500). page_size is accepted as an alias."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Sort direction: 'desc' (default, newest-first) or 'asc'. Any other value returns 400. Threaded through both the ordering and the keyset cursor comparison, matching GET /workflows (issue #498)."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "description": "JSON object {\"summaries\": [...], \"next_cursor\": <string|null>}. Each summary carries execution_id, workflow_name, workflow_id, state, started_at, completed_at, duration_ms, shard_id, search_attrs, result, error, summarized_at, plus summarized:true and history_available:false."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid parameter value (unknown state, malformed timestamp, malformed search_attr, malformed cursor, or non-numeric limit)."
+        },
+        {
+          "status": 401,
+          "description": "Admin authorization required."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}",
       "category": "workflow",
       "read_only": true,

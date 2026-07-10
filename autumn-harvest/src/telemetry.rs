@@ -277,6 +277,14 @@ pub const METRIC_SCHEDULE_DECISION_WRITE_FAILED: &str = "harvest.schedule.decisi
 /// Counter: number of rows deleted by the retention janitor in one tick.
 pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 
+/// Counter: number of execution summaries garbage-collected by the summary
+/// retention GC pass (issue #752).
+///
+/// A distinct member of the retention metric family from
+/// `harvest.retention.deleted` (history rows), so operators can separate the
+/// two tiers. Labeled by the low-cardinality `workflow` registry key.
+pub const METRIC_SUMMARY_DELETED: &str = "harvest.retention.summary_deleted";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -1435,6 +1443,18 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow, count);
     }
 
+    /// Number of execution summaries the summary-retention GC pass deleted for
+    /// a specific workflow type in one tick (issue #752).
+    ///
+    /// Maps to the counter [`METRIC_SUMMARY_DELETED`], labeled with the
+    /// low-cardinality `workflow` registry key. A distinct member of the
+    /// retention metric family from [`Self::record_retention_deleted`] (which
+    /// counts history-row deletions), so operators can observe the two tiers
+    /// independently. Emitted for real deletes only (never dry-run).
+    fn record_summary_deleted(&self, workflow: &str, count: u64) {
+        let _ = (workflow, count);
+    }
+
     /// Current number of RUNNING tasks for a concurrency group key.
     ///
     /// Emitted by the concurrency sampler on every sample interval. The value
@@ -2199,6 +2219,7 @@ mod tests {
             "harvest.schedule.decision_write_failed"
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+        assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
         assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
         assert_eq!(
@@ -2723,6 +2744,7 @@ mod tests {
         rec.record_schedule_skipped("workflow", "daily_digest", "paused");
         rec.record_retention_tick(0, 100, 50, 0.02);
         rec.record_retention_deleted("onboarding", 50);
+        rec.record_summary_deleted("onboarding", 50);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_schedule_to_start("default", 1.5);

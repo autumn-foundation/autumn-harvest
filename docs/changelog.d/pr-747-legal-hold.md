@@ -15,7 +15,7 @@ erase attempt on a held execution returns `409` naming the active hold.
 
 - Additive nullable columns only (`legal_hold_set_at` / `legal_hold_until` /
   `legal_hold_reason` / `legal_hold_actor`) on `harvest_workflow_executions`
-  (migration `20260709000000_harvest_legal_hold`), plus a partial discovery
+  (migration `20260709000001_harvest_legal_hold`), plus a partial discovery
   index. **No new `WorkflowEvent` variant, no replay impact, shard-local.**
 - Active-hold predicate is single-sourced in `legal_hold_active(set_at, until,
   now)` (re-exported from the crate root), shared by the retention gate, the
