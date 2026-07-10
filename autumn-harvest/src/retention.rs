@@ -201,7 +201,7 @@ pub fn omitted_marker(reason: &str, bytes: Option<usize>) -> serde_json::Value {
 /// capture disabled passes `None`, so the column stays NULL).
 #[must_use]
 pub fn cap_result_payload(
-    output: Option<&serde_json::Value>,
+    output: Option<serde_json::Value>,
     cap: usize,
 ) -> Option<serde_json::Value> {
     let output = output?;
@@ -212,20 +212,21 @@ pub fn cap_result_payload(
     // never offloadable). A future nested-envelope offload change MUST recurse
     // this check, or a summary could store a value referencing a blob that
     // #524's GC later reclaims, leaving a dangling summary→blob reference.
-    if crate::payload_store::extract_offload_ref(output).is_some() {
+    if crate::payload_store::extract_offload_ref(&output).is_some() {
         return Some(omitted_marker("offloaded", None));
     }
     // Fail SAFE on a (near-impossible) serialize failure of an already-parsed
     // JSONB value: emit an omitted marker rather than storing an unmeasured
     // payload verbatim, consistent with the oversized-payload path below.
-    let len = match serde_json::to_vec(output) {
+    let len = match serde_json::to_vec(&output) {
         Ok(bytes) => bytes.len(),
         Err(_) => return Some(omitted_marker("too_large", None)),
     };
     if len > cap {
         return Some(omitted_marker("too_large", Some(len)));
     }
-    Some(output.clone())
+    // Common case: under cap — move the owned value into the return, no clone.
+    Some(output)
 }
 
 /// Compute the `error` column value for a summary from a run's `error` text
@@ -1828,7 +1829,7 @@ async fn delete_candidate_execution(
                     // disabled leaves result/error NULL.
                     let (result, error_out) = if policy.capture_payload {
                         (
-                            cap_result_payload(output.as_ref(), policy.max_payload_bytes),
+                            cap_result_payload(output, policy.max_payload_bytes),
                             cap_error_text(error.as_deref(), policy.max_payload_bytes),
                         )
                     } else {
@@ -2894,13 +2895,13 @@ mod tests {
 
         // small inline -> stored verbatim
         let small = serde_json::json!({"ok": true, "n": 1});
-        assert_eq!(cap_result_payload(Some(&small), 4096), Some(small.clone()));
+        assert_eq!(cap_result_payload(Some(small.clone()), 4096), Some(small));
 
         // over-cap -> too_large marker carrying the observed byte length
         let big_str = "x".repeat(100);
         let big = serde_json::json!({"blob": big_str});
         let len = serde_json::to_vec(&big).unwrap().len();
-        let capped = cap_result_payload(Some(&big), 32).expect("some");
+        let capped = cap_result_payload(Some(big), 32).expect("some");
         assert_eq!(capped[OMITTED_MARKER_KEY], true);
         assert_eq!(capped["reason"], "too_large");
         assert_eq!(capped["bytes"], len);
@@ -2917,7 +2918,7 @@ mod tests {
             "len": 2_000_000,
             "checksum": "deadbeef",
         });
-        let capped = cap_result_payload(Some(&envelope), 4096).expect("some");
+        let capped = cap_result_payload(Some(envelope), 4096).expect("some");
         assert_eq!(capped[OMITTED_MARKER_KEY], true);
         assert_eq!(capped["reason"], "offloaded");
         assert!(
