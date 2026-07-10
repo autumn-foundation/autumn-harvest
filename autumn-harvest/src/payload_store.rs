@@ -576,4 +576,73 @@ mod tests {
             serde_json::json!("o".repeat(1_000))
         );
     }
+
+    #[test]
+    fn is_offload_envelope_recognizes_envelope() {
+        let valid = serde_json::json!({
+            OFFLOAD_ENVELOPE_KEY: 1,
+            "store_id": "s3",
+            "key": "123",
+            "len": 100,
+            "checksum": "abc"
+        });
+        assert!(is_offload_envelope(&valid));
+
+        let invalid_val = serde_json::json!({
+            OFFLOAD_ENVELOPE_KEY: 2,
+        });
+        assert!(!is_offload_envelope(&invalid_val));
+
+        let missing_key = serde_json::json!({
+            "store_id": "s3"
+        });
+        assert!(!is_offload_envelope(&missing_key));
+
+        let not_object = serde_json::json!("string");
+        assert!(!is_offload_envelope(&not_object));
+    }
+
+    #[test]
+    fn parse_offload_envelope_extracts_correctly() {
+        let valid = serde_json::json!({
+            OFFLOAD_ENVELOPE_KEY: 1,
+            "store_id": "s3",
+            "key": "123",
+            "len": 100,
+            "checksum": "abc"
+        });
+        let env = parse_offload_envelope(&valid).unwrap();
+        assert_eq!(env.store_id, "s3");
+        assert_eq!(env.key, "123");
+        assert_eq!(env.len, 100);
+        assert_eq!(env.checksum, "abc");
+
+        let missing_store = serde_json::json!({
+            OFFLOAD_ENVELOPE_KEY: 1,
+            "key": "123",
+            "len": 100,
+            "checksum": "abc"
+        });
+        assert!(parse_offload_envelope(&missing_store).is_none());
+
+        let invalid_type = serde_json::json!({
+            OFFLOAD_ENVELOPE_KEY: 1,
+            "store_id": 123,
+            "key": "123",
+            "len": 100,
+            "checksum": "abc"
+        });
+        assert!(parse_offload_envelope(&invalid_type).is_none());
+    }
+
+    #[test]
+    fn build_offload_envelope_constructs_valid_json() {
+        let env = build_offload_envelope("gcs", "xyz", 42, "def");
+        assert!(is_offload_envelope(&env));
+        let parsed = parse_offload_envelope(&env).unwrap();
+        assert_eq!(parsed.store_id, "gcs");
+        assert_eq!(parsed.key, "xyz");
+        assert_eq!(parsed.len, 42);
+        assert_eq!(parsed.checksum, "def");
+    }
 }
