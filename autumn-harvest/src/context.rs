@@ -10620,6 +10620,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn await_fire_then_same_cycle_reset_emits_the_stale_arm_cancelling_batch() {
+        // Round 11 (issue #768): an `await_fire()` polled BEFORE a sibling
+        // `reset()` in the same task cycle emits the batch
+        // `[ArmTimer(for_await:true, old), CancelTimer, ArmTimer(for_await:false,
+        // new)]`. The reset's later same-id cancel must supersede the earlier
+        // await arm so the worker's planner arms NO stale firing row — otherwise
+        // the live run fires off the old await duration while a replay of the
+        // recorded history (whose `TimerCancelled` precedes the fresh
+        // `TimerStarted`) resolves `Cancelled` (a live-vs-replay divergence). The
+        // planner's handling of this exact batch is asserted in worker.rs
+        // (`plan_timer_lifecycle_pure_excludes_an_await_arm_cancelled_by_a_later_reset`
+        // → `armed_indices` empty → wake now); the replay side (recorded
+        // `TimerCancelled` before any `TimerFired` → `Cancelled`) is covered by
+        // `await_fire_returns_cancelled_when_history_has_timercancelled_before_fire`.
+        // Here we prove the real API sequence produces exactly that batch.
+        let ctx = WorkflowContext::new_test();
+        let mut handle = ctx.start_timer("idle", 300);
+        let _ = ctx.drain_commands(); // drain the initial fresh arm
+        // Poll await_fire once so it re-arms (for_await:true) and parks.
+        let awaited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle.await_fire()).await;
+        assert!(awaited.is_err(), "await_fire must park (suspend) when live");
+        // The sibling branch then resets the timer to a new duration.
+        handle.reset(600).expect("reset is infallible");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 3, "await re-arm + cancel + fresh arm: {cmds:?}");
+        assert!(
+            matches!(&cmds[0], WorkflowCommand::ArmTimer { for_await: true, timer_id, .. } if timer_id.as_str() == "idle"),
+            "cmds[0] must be the await re-arm (for_await:true): {cmds:?}"
+        );
+        assert!(
+            matches!(&cmds[1], WorkflowCommand::CancelTimer { timer_id } if timer_id.as_str() == "idle"),
+            "cmds[1] must be the reset's cancel: {cmds:?}"
+        );
+        assert!(
+            matches!(&cmds[2], WorkflowCommand::ArmTimer { for_await: false, timer_id, .. } if timer_id.as_str() == "idle"),
+            "cmds[2] must be the reset's fresh arm (for_await:false): {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn await_fire_clears_armed_state_so_reused_id_records_fresh_arm() {
         // Codex P2 round 6 (issue #768): consuming a fire must CLEAR the Armed
         // logical state so a LOOP that reuses the same id (arm; await→Fired; arm

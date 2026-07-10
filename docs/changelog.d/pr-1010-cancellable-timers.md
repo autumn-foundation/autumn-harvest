@@ -239,3 +239,35 @@ non-blocking — safe (the fork re-arms via `await_fire` replay and
 `remove_pending_timers` deletes the source row), but a subtlety worth a maintainer
 review. Left as a documented known limitation pending the decision between the
 field and a doc-only note.
+
+## Post-review hardening round 11 (Codex 1× P2)
+
+`plan_timer_lifecycle` (worker.rs) now contributes a firing row for a
+`for_await: true` (await) arm only when, at its own position, **no same-id
+`CancelTimer` follows it in the batch** (forward, round 11) **and** the timer is
+not sitting cancelled-without-reset before it (backward, round 9) — a
+`for_await: false` (fresh start/reset) arm never contributes a firing row on its
+own. This replaces round 10's end-of-batch-liveness rule
+(`cancelled_and_not_reestablished`), which decided contribution from the id's
+*final* liveness across the whole batch. That was wrong for an `await_fire()`
+polled BEFORE a sibling `reset()` in the same workflow task: the batch is
+`[ArmTimer(X, for_await:true, old), CancelTimer(X), ArmTimer(X, for_await:false,
+new)]`, and because the fresh arm re-establishes X at end-of-batch, the round-10
+rule KEPT the old await arm and armed a firing row off the **stale await
+duration** — so the live run waited/fired on that row while a replay of the
+recorded history (whose `TimerCancelled(X)` precedes the fresh
+`TimerStarted(X, new)`) resolved the same `await_fire()` to `Cancelled`, a
+live-vs-replay divergence. Under the round-11 rule the later same-id cancel
+supersedes the await arm regardless of any later fresh arm, so `armed_indices` is
+empty → the parked task wakes now → live and replay both resolve `Cancelled`. The
+backward (round-9) half is retained so `[CancelTimer(X), ArmTimer(X, true)]`
+(cancel-then-await with no reset) still wakes now while
+`[CancelTimer(X), ArmTimer(X, false), ArmTimer(X, true)]` (reset-then-await) still
+arms in the same transaction. Tests (TDD red→green): new pure planner test
+`plan_timer_lifecycle_pure_excludes_an_await_arm_cancelled_by_a_later_reset`
+(worker.rs — confirmed RED under the round-10 rule: `armed == [0]`; GREEN under
+round 11: empty), the round-8/9/10 pure tests kept green, and a new context test
+`await_fire_then_same_cycle_reset_emits_the_stale_arm_cancelling_batch` (context.rs)
+proving the real `await_fire()`-then-`reset()` API sequence emits exactly that
+`[Arm(true), Cancel, Arm(false)]` batch; the replay-resolves-`Cancelled` side is
+already covered by `await_fire_returns_cancelled_when_history_has_timercancelled_before_fire`.
