@@ -61,8 +61,12 @@ async fn fulfillment(ctx: &WorkflowContext, order: Order) -> HarvestResult<Strin
 
     for item in order.items {
         ctx.execute_activity_raw("pick_item", serde_json::json!(item), "default").await?;
-        // Each item renews the SLA window — reset cancels the old arming and
-        // starts a fresh one, so there is never an orphaned timer left to fire late.
+        // Each item pushes the SLA deadline forward — reset cancels the old
+        // arming and starts a fresh one, so there is never an orphaned timer
+        // left to fire late. NOTE: this does NOT interrupt a long-running
+        // `pick_item`; an armed timer is never observed mid-activity. The
+        // deadline is only *checked* when the workflow reaches `await_fire()`
+        // below.
         sla.reset(3600)?;
     }
 
@@ -88,6 +92,23 @@ async fn fulfillment(ctx: &WorkflowContext, order: Order) -> HarvestResult<Strin
   (two events) with **zero orphaned firings**.
 - **`await_fire()`** suspends until the timer fires (`TimerOutcome::Fired`) or
   is cancelled (`TimerOutcome::Cancelled`).
+
+**An armed timer is observed only at the next `await_fire()` / wake — never
+mid-activity.** `start_timer`/`reset`/`cancel` are non-suspending bookkeeping:
+they record the arming and return. The engine does not preempt a running
+activity, child workflow, or signal wait when an armed timer's deadline passes;
+the fire is only surfaced the next time the workflow *suspends and wakes on that
+timer* via `await_fire()`. In the loop above, the SLA breach is therefore
+detected after the loop, at `await_fire()` — not the instant `fires_at` elapses
+mid-`pick_item`.
+
+> **Footgun.** If you arm a cancellable timer and then suspend on a *different*
+> await — a signal (`wait_for_signal`) or an activity — **without** an
+> `await_fire()`, the timer's fire is not observed until that other suspension
+> wakes for its own reason. An armed timer alone will *not* wake a workflow that
+> is parked on a signal. To bound a signal wait with a deadline, use
+> [`ctx.receive_signal_timeout`](04-signals.md) (below), which arms the deadline
+> and the signal wait together as one race.
 
 **Fire-vs-cancel is decided by recorded-history order, not the wall clock.** If a
 timer genuinely races its own cancellation, whichever of `TimerFired` /

@@ -352,6 +352,33 @@ fn cancellable_timer_then_activity_workflow<'a>(
     })
 }
 
+/// Cancellable timer reset loop that ALSO captures a `new_uuid()` side effect in
+/// the SAME cycle as the initial arm and each reset (issue #768, FINDING 1). This
+/// drives the arm/reset + side-effect same-cycle interleaving path — the exact
+/// ordering the pre-fix worker got wrong — across a reset-heavy history.
+fn cancellable_reset_with_uuid_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let reset_count = input["reset_count"].as_u64().unwrap_or(0);
+        let cancel_at_end = input["cancel_at_end"].as_bool().unwrap_or(false);
+        let mut handle = ctx.start_timer("idle", 300);
+        let _sid = ctx.new_uuid(); // side effect in the same cycle as the arm
+        for _ in 0..reset_count {
+            handle.reset(300).map_err(|e| e.to_string())?;
+            let _u = ctx.new_uuid(); // side effect in the same cycle as the reset
+        }
+        if cancel_at_end {
+            handle.cancel().map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("cancelled_by_workflow"))
+        } else {
+            let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(format!("{outcome:?}")))
+        }
+    })
+}
+
 /// Same as `cancellable_timer_workflow` but arms a differently-named timer —
 /// used to prove a renamed timer id surfaces as `TimerMismatch` (issue #768).
 fn cancellable_timer_renamed_workflow<'a>(
@@ -360,6 +387,25 @@ fn cancellable_timer_renamed_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let handle = ctx.start_timer("renamed", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Arms a cancellable timer, then captures a `new_uuid()` side effect in the
+/// SAME cycle, then awaits the fire (issue #768, FINDING 1). The live worker
+/// emits `[ArmTimer(idle), RecordSideEffect(Uuid)]`; the recorded history MUST
+/// interleave `TimerStarted` at the `ArmTimer` position (before
+/// `SideEffectRecorded`), or `match_timer_arm`'s positional check diverges on
+/// resume. This fixture replays the CORRECT emission-order history — the one the
+/// fixed worker produces.
+fn cancellable_timer_then_side_effect_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let _sid = ctx.new_uuid();
         let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!(format!("{outcome:?}")))
     })
@@ -662,6 +708,14 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn(
             "cancellable_timer_renamed_workflow",
             cancellable_timer_renamed_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_then_side_effect_workflow",
+            cancellable_timer_then_side_effect_workflow,
+        )
+        .register_fn(
+            "cancellable_reset_with_uuid_workflow",
+            cancellable_reset_with_uuid_workflow,
         )
 }
 
@@ -1348,37 +1402,105 @@ fn cancellable_reset_history(reset_count: u64, cancel_at_end: bool) -> Vec<Workf
     events
 }
 
+/// A distinct `SideEffectRecorded { Uuid }` event seeded from `seed` so every
+/// fixture's history is byte-distinct (a hyphenated UUID string deserialises
+/// back to `uuid::Uuid` on replay).
+fn uuid_side_effect(seed: u64) -> WorkflowEvent {
+    WorkflowEvent::SideEffectRecorded {
+        kind: autumn_harvest::SideEffectKind::Uuid,
+        name: None,
+        value: serde_json::json!(format!("018f0000-0000-7000-8000-{seed:012x}")),
+    }
+}
+
+/// History recorded by `cancellable_reset_with_uuid_workflow`: an initial arm +
+/// its same-cycle side effect, then three events per reset (cancel + fresh arm +
+/// same-cycle side effect — the FINDING-1 interleaving), then a terminal
+/// fire-or-cancel. Bounded and O(K) with zero orphaned firings. `seed` makes the
+/// interleaved side-effect values distinct so the whole fixture is unique.
+fn cancellable_reset_uuid_history(
+    reset_count: u64,
+    cancel_at_end: bool,
+    seed: u64,
+) -> Vec<WorkflowEvent> {
+    let input = serde_json::json!({
+        "reset_count": reset_count,
+        "cancel_at_end": cancel_at_end,
+    });
+    let mut events = vec![
+        wf_started_with_input(input),
+        cancellable_ts(),
+        uuid_side_effect(seed * 1000),
+    ];
+    for i in 0..reset_count {
+        events.push(cancellable_tc());
+        events.push(cancellable_ts());
+        events.push(uuid_side_effect(seed * 1000 + i + 1));
+    }
+    events.push(if cancel_at_end {
+        cancellable_tc()
+    } else {
+        cancellable_tf()
+    });
+    events
+}
+
 /// The falsifiable success-metric bar for issue #768: reset-heavy cancellable
-/// timer histories replay deterministically across N = 1000 DISTINCT fixtures
-/// (reset cadence and terminal outcome both vary with `i`), each with zero
-/// divergences, and the history stays bounded at exactly 2 events per reset.
+/// timer histories replay deterministically across N = 1000 GENUINELY DISTINCT
+/// fixtures, each with zero divergences and a bounded, O(K), zero-orphaned-firing
+/// history. Reset cadence spans a wide prime range and terminal outcome varies;
+/// every third fixture also interleaves a `new_uuid()` side effect in the SAME
+/// cycle as the initial arm and each reset — exercising the FINDING-1
+/// timer-lifecycle-event-in-emission-position ordering path (a distinct per-`i`
+/// seed makes those fixtures byte-unique). The plain fixtures pin the exact
+/// 2-events/reset bound; the interleaved fixtures pin the 3-events/reset bound.
 #[tokio::test]
 async fn reset_1000_times_replays_with_bounded_history() {
     let replayer = build_replayer();
     for i in 0..1000_u64 {
-        let reset_count = i % 20;
-        let cancel_at_end = i % 2 == 0;
-        let events = cancellable_reset_history(reset_count, cancel_at_end);
+        // Wide, prime-modulus spread so shapes are not just ~40 repeats.
+        let reset_count = i % 97;
+        let cancel_at_end = (i / 97) % 2 == 0;
+        let with_side_effect = i % 3 == 0;
 
-        // Bounded history: WorkflowStarted + initial arm + 2 events/reset + 1
-        // terminal = 2*reset_count + 3, i.e. exactly two events per reset.
-        assert_eq!(
-            events.len() as u64,
-            2 * reset_count + 3,
-            "history must be bounded at 2 events per reset (i={i})"
+        let (workflow_name, events) = if with_side_effect {
+            let events = cancellable_reset_uuid_history(reset_count, cancel_at_end, i);
+            // Bounded: WorkflowStarted + arm + initial side-effect + 3/reset + terminal.
+            assert_eq!(
+                events.len() as u64,
+                3 * reset_count + 4,
+                "uuid-interleaved history must be bounded at 3 events per reset (i={i})"
+            );
+            ("cancellable_reset_with_uuid_workflow", events)
+        } else {
+            let events = cancellable_reset_history(reset_count, cancel_at_end);
+            // Bounded: WorkflowStarted + initial arm + 2 events/reset + terminal.
+            assert_eq!(
+                events.len() as u64,
+                2 * reset_count + 3,
+                "plain reset history must be bounded at 2 events per reset (i={i})"
+            );
+            ("cancellable_timer_reset_workflow", events)
+        };
+
+        // Zero orphaned firings: at most one terminal TimerFired ever.
+        let fired = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+            .count();
+        assert!(
+            fired <= 1,
+            "a reset history must never orphan a TimerFired (i={i}, fired={fired})"
         );
 
         let report = replayer
-            .replay_from_snapshot(make_snapshot(
-                "cancellable_timer_reset_workflow",
-                ExecutionId::new(),
-                events,
-            ))
+            .replay_from_snapshot(make_snapshot(workflow_name, ExecutionId::new(), events))
             .await;
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),
-            "reset replay pass {i} (resets={reset_count}, cancel={cancel_at_end}) must \
-             succeed with zero divergences, got: {report}"
+            "reset replay pass {i} ({workflow_name}, resets={reset_count}, \
+             cancel={cancel_at_end}, side_effect={with_side_effect}) must succeed with \
+             zero divergences, got: {report}"
         );
     }
 }
@@ -1443,6 +1565,71 @@ async fn renamed_timer_surfaces_as_timer_mismatch() {
             }
         ),
         "a renamed timer id must classify as TimerMismatch, got: {report}"
+    );
+}
+
+/// FINDING 1: a `start_timer` followed same-cycle by a `new_uuid()` side effect
+/// records history in emission order `[TimerStarted(idle), SideEffectRecorded]`.
+/// This is the history the FIXED worker produces (timer-lifecycle events
+/// interleaved at their command position, not appended at the end of the batch).
+/// It must replay cleanly.
+#[tokio::test]
+async fn timer_arm_then_side_effect_correct_order_replays_succeeded() {
+    let uuid_value = serde_json::json!("018f0000-0000-7000-8000-000000000000");
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Uuid,
+            name: None,
+            value: uuid_value,
+        },
+        cancellable_tf(),
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_then_side_effect_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "emission-order history (TimerStarted before SideEffectRecorded) must \
+         replay cleanly, got: {report}"
+    );
+}
+
+/// FINDING 1 (bug proof): the PRE-FIX worker appended timer-lifecycle events at
+/// the END of the batch, recording `[SideEffectRecorded, TimerStarted]`. That
+/// wrong-order history nd-blocks the run on first resume — `match_timer_arm` is
+/// positional, `drain_early_signals` does not skip `SideEffectRecorded`, so the
+/// cursor lands on `SideEffectRecorded` and the timer arm diverges. This test
+/// pins that the buggy ordering is genuinely non-replayable.
+#[tokio::test]
+async fn timer_arm_then_side_effect_wrong_order_diverges() {
+    let uuid_value = serde_json::json!("018f0000-0000-7000-8000-000000000000");
+    let events = vec![
+        wf_started(),
+        // Wrong order: side effect recorded before the timer arm.
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Uuid,
+            name: None,
+            value: uuid_value,
+        },
+        cancellable_ts(),
+        cancellable_tf(),
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_then_side_effect_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "the pre-fix end-of-batch timer ordering must be non-replayable, got: {report}"
     );
 }
 

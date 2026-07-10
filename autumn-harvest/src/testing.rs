@@ -3126,8 +3126,11 @@ impl WorkflowTestEnv {
             }
 
             // Cancellable/renewable durable timer arm (issue #768). Mirrors the
-            // real worker's `apply_timer_lifecycle`: record TimerStarted and
-            // defer a TimerFired so the timer resolves on the next iteration
+            // real worker's `plan_timer_lifecycle` + emission-position
+            // interleaving: record TimerStarted at this command's position (the
+            // harness already applies each command in emission order, matching the
+            // fixed worker) and defer a TimerFired so the timer resolves on the
+            // next iteration
             // (no real sleep). Idempotent — a re-arm of an already-active timer
             // (e.g. `await_fire`'s re-arm in the same cycle as `start_timer`)
             // records nothing.
