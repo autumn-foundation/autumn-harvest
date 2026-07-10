@@ -226,6 +226,7 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),

@@ -551,6 +551,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -774,6 +775,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -935,6 +937,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -1091,6 +1094,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),

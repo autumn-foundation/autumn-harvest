@@ -1227,6 +1227,7 @@ fn outcome_to_report(
         WorkflowOutcome::Failed {
             error,
             non_deterministic_details,
+            ..
         } => try_parse_non_determinism(
             &error,
             exec_id,

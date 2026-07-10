@@ -65,6 +65,30 @@ pub const ERROR_TYPE_SESSION_BROKEN: &str = "SessionBroken";
 /// misleading in the response.
 pub const ERROR_TYPE_OPERATOR_FORCE_FAILED: &str = "OperatorForceFailed";
 
+/// Stable error-type name for a **contained handler panic** (issue #782).
+///
+/// Synthesised by the engine when an `#[activity]` or `#[workflow]` handler
+/// future panics (unwinds) instead of returning a clean `Err`. The panic is
+/// caught at the dispatch boundary and re-routed into the normal failure path
+/// carrying this error type:
+///
+/// - An **activity** handler panic becomes a *retryable* [`ActivityFailure`]
+///   (same path as `Err(String)`) — it honours the activity's retry policy and,
+///   if retries exhaust, dead-letters as ordinary retry-exhaustion (never a
+///   poison-pill quarantine).
+/// - A **workflow** handler panic becomes a [`WorkflowFailure`], re-dispatched
+///   with capped backoff up to `WorkerConfig::workflow_panic_max_attempts`
+///   before failing the run terminally.
+///
+/// This error type is **engine-reserved** (like [`ERROR_TYPE_CIRCUIT_OPEN`],
+/// [`ERROR_TYPE_SESSION_BROKEN`], and [`ERROR_TYPE_OPERATOR_FORCE_FAILED`]):
+/// handler code that fabricates a failure carrying this type itself is
+/// classified identically to a genuine caught panic on the *terminal* path,
+/// but never triggers the workflow panic-retry loop — that loop is gated on the
+/// engine-internal caught-panic flag, not on the error-type string — so an
+/// author cannot use it to manufacture extra retries.
+pub const ERROR_TYPE_HANDLER_PANIC: &str = "HandlerPanic";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility
@@ -960,5 +984,47 @@ mod tests {
     fn into_workflow_error_payload_for_string_is_passthrough() {
         let s = "simple error".to_string();
         assert_eq!(s.into_workflow_error_payload(), "simple error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Contained handler-panic envelope round-trips (issue #782)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handler_panic_error_type_constant_has_correct_name() {
+        assert_eq!(ERROR_TYPE_HANDLER_PANIC, "HandlerPanic");
+    }
+
+    #[test]
+    fn activity_handler_panic_envelope_round_trips_error_type() {
+        // A contained activity panic is a *retryable* typed failure carrying
+        // the engine-reserved HandlerPanic error type (issue #782 AC1).
+        let payload =
+            ActivityFailure::retryable(ERROR_TYPE_HANDLER_PANIC, "boom").into_error_payload();
+        let full = parse_error_payload_full(&payload);
+        assert_eq!(full.error_type, ERROR_TYPE_HANDLER_PANIC);
+        assert_eq!(full.message, "boom");
+        assert!(
+            !full.non_retryable,
+            "a contained activity panic must be retryable so it follows the retry policy"
+        );
+    }
+
+    #[test]
+    fn workflow_handler_panic_envelope_round_trips_error_type() {
+        // A contained workflow panic is encoded as a typed WorkflowFailure so
+        // the terminal WorkflowFailed event carries the HandlerPanic class
+        // (issue #782 AC2). This is exactly what the #523 exclusion guard keys
+        // on to avoid also firing a fresh-execution retry.
+        let payload = WorkflowFailure::new(ERROR_TYPE_HANDLER_PANIC, "boom")
+            .non_retryable()
+            .into_workflow_error_payload();
+        let decoded = decode_workflow_failure(&payload);
+        assert_eq!(
+            decoded.error_type.as_deref(),
+            Some(ERROR_TYPE_HANDLER_PANIC)
+        );
+        assert_eq!(decoded.message, "boom");
+        assert_eq!(decoded.non_retryable, Some(true));
     }
 }

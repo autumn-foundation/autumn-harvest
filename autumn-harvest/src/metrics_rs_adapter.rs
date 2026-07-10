@@ -45,10 +45,10 @@ use metrics::{Key, Label, counter, gauge, histogram};
 
 use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED,
-    METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_GATES_ACTIVE,
-    METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED, METRIC_COMPLETION_TRIGGER_FIRED,
-    METRIC_COMPLETION_TRIGGER_SKIPPED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES,
-    METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY,
+    METRIC_ACTIVITY_PANIC, METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED,
+    METRIC_ADMISSION_GATES_ACTIVE, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED,
+    METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED, METRIC_DEBOUNCE_FIRED,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY,
     METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
     METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
     METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_QUERY,
@@ -68,11 +68,12 @@ use crate::telemetry::{
     METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
     METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
-    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
-    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
-    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder,
-    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION,
+    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
+    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
+    WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -234,6 +235,24 @@ impl MetricsRecorder for MetricsRsRecorder {
         counter!(
             METRIC_ACTIVITY_RETRIES,
             METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_activity_panic(&self, activity_name: &str, queue: &str) {
+        counter!(
+            METRIC_ACTIVITY_PANIC,
+            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_panic(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_PANIC,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
@@ -889,6 +908,15 @@ mod tests {
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
         rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
+    }
+
+    #[test]
+    fn record_handler_panic_bridges_do_not_panic() {
+        // Contained-handler-panic counter bridges (issue #782). Must not panic
+        // with no global recorder installed (metrics 0.24 routes to a no-op sink).
+        let rec = MetricsRsRecorder;
+        rec.record_activity_panic("send_email", "default");
+        rec.record_workflow_panic("onboarding", "default");
     }
 
     #[test]

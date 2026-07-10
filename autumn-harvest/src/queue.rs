@@ -1335,6 +1335,101 @@ pub async fn requeue_workflow_task_nd_blocked(
     Ok(())
 }
 
+/// Build the `SET` clause used by [`requeue_workflow_task_after_panic`] so a
+/// no-DB unit test can assert the generated SQL shape (issue #782). Mirrors the
+/// `park_workflow_task_query`/`PendingRequeueChangeset` shape-test precedent.
+///
+/// Takes the changeset by value so the returned query owns it (the caller only
+/// needs the SQL text, never to execute it).
+#[cfg(test)]
+fn requeue_after_panic_query(changeset: PendingRequeueChangeset) -> String {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::debug_query;
+    use diesel::pg::Pg;
+
+    let query = diesel::update(
+        dsl::harvest_task_queue
+            .find(Uuid::nil())
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+        dsl::sticky_timeout.eq(None::<chrono::Duration>),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ));
+    debug_query::<Pg, _>(&query).to_string()
+}
+
+/// Re-pend a workflow task after a **contained handler panic** with a future
+/// `scheduled_at` (issue #782).
+///
+/// Behaviourally identical to [`requeue_workflow_task_nd_blocked`] — it reuses
+/// the shared [`PendingRequeueChangeset`] (task → `PENDING`, `crash_strikes =
+/// 0` so the poison-pill reclaimer never trips, `worker_id`/`started_at`/
+/// `last_heartbeat_at` nulled), plus clears the sticky affinity columns,
+/// `wake_requested`, and any stale `activity_name` sentinel, and appends **no**
+/// event — but is a distinct, named entry point so the panic-retry path is
+/// self-documenting and separately testable.
+///
+/// Unlike the ND-block path this stamps **no** execution-row diagnostic columns
+/// and needs **no** `FOR UPDATE` pause-guarded transaction: the panic re-pend
+/// touches only the task row, and the claim-layer `PAUSED` gate defers a
+/// re-pended task on a paused execution exactly like any pending workflow task.
+///
+/// The owning execution row (`harvest_workflow_executions`) is never touched, so
+/// its state stays `RUNNING` throughout the panic-retry loop; the task is
+/// deferred purely by `scheduled_at` (`claim_task` enforces `scheduled_at <=
+/// NOW()`), so a signal/timer arriving mid-backoff is processed on the next
+/// dispatch. No `pg_notify`: the row is deliberately not claimable until
+/// `scheduled_at`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_after_panic(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: chrono::Duration,
+    reason: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+        dsl::sticky_timeout.eq(None::<chrono::Duration>),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // force_retry_activity_now (issue #516)
 // ---------------------------------------------------------------------------
@@ -2456,6 +2551,58 @@ mod tests {
         assert!(debug.contains("\"crash_strikes\" = "));
         assert!(debug.contains("\"scheduled_at\" = "));
         assert!(debug.contains("\"error\" = "));
+    }
+
+    /// Issue #782: `requeue_workflow_task_after_panic` must generate a `SET`
+    /// clause that (a) resets the shared pending-requeue columns (`state` →
+    /// PENDING, `crash_strikes` bound so the poison-pill reclaimer never trips,
+    /// `worker_id`/`started_at`/`last_heartbeat_at` nulled) and (b) clears the
+    /// sticky affinity, `wake_requested`, and stale `activity_name` columns —
+    /// mirroring the ND-block re-pend so a panicking workflow task is deferred
+    /// purely by `scheduled_at` and re-claimable by any worker.
+    #[test]
+    fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
+        let changeset =
+            PendingRequeueChangeset::new(chrono::Utc::now(), "handler panic: boom".to_string());
+        let sql = requeue_after_panic_query(changeset);
+
+        // Every column is emitted as a bound parameter (`= $N`) by
+        // `debug_query`, mirroring the sibling `pending_requeue_changeset`
+        // shape test — the sticky/activity_name columns bind `None` (SQL NULL)
+        // rather than rendering a literal `NULL`.
+        for column in [
+            "state",
+            "crash_strikes",
+            "scheduled_at",
+            "worker_id",
+            "started_at",
+            "last_heartbeat_at",
+            "sticky_worker_id",
+            "sticky_until",
+            "sticky_timeout",
+            "wake_requested",
+            "activity_name",
+            "error",
+        ] {
+            assert!(
+                sql.contains(&format!("\"{column}\" = $")),
+                "{column} must appear as a bound column in the SET clause: {sql}"
+            );
+        }
+        // The null-ing columns (worker_id/started_at/last_heartbeat_at +
+        // sticky_worker_id/sticky_until/sticky_timeout + activity_name) all bind
+        // `None` (SQL NULL), and wake_requested binds `false`.
+        assert!(
+            sql.matches("None").count() >= 7,
+            "the seven null-ing columns must all bind to None (SQL NULL): {sql}"
+        );
+        assert!(
+            sql.contains("false"),
+            "wake_requested must bind to false: {sql}"
+        );
+        // Restricted to claimed (RUNNING) workflow rows.
+        assert!(sql.contains("\"task_type\""), "{sql}");
+        assert!(sql.contains("\"state\""), "{sql}");
     }
 
     #[test]

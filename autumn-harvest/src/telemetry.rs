@@ -418,6 +418,30 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
+/// Counter: incremented each time an activity handler **panics** (unwinds)
+/// instead of returning a clean `Err`, and the engine contains the panic as a
+/// retryable typed `HandlerPanic` failure (issue #782).
+///
+/// Fires once per panicking attempt (a retried activity that panics again on
+/// its next attempt increments again), so this is a per-attempt panic-rate
+/// signal. Labeled by `activity` (registered activity name) and `queue` (task
+/// queue name). `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_ACTIVITY_PANIC: &str = "harvest.activity.panic";
+
+/// Counter: a contained workflow handler panic (issue #782).
+///
+/// Incremented each time a workflow handler **panics** (unwinds) instead of
+/// returning a clean `Err`, and the engine contains the panic as a non-terminal
+/// re-dispatch (or, once `workflow_panic_max_attempts` is reached, a terminal
+/// typed `HandlerPanic` failure).
+///
+/// Fires on **every** panic entry — each non-terminal panic-retry *and* the
+/// final terminal panic — so a workflow that panics `N` times before exhausting
+/// its panic budget emits `N` samples. Labeled by `workflow` (workflow name)
+/// and `queue` (task queue name). `execution.id` stays span-only per
+/// ADR-0001 §7.
+pub const METRIC_WORKFLOW_PANIC: &str = "harvest.workflow.panic";
+
 /// Counter: incremented each time a start request is admitted to a debounce
 /// pending record — i.e. the burst is absorbed without starting a run (issue #499).
 ///
@@ -1271,6 +1295,26 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to [`METRIC_WORKFLOW_ND_BLOCKED`].
     /// Per ADR-0001 §7, `execution.id` must never be a label here.
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// An activity handler panicked (unwound) and the engine contained the
+    /// panic as a retryable typed `HandlerPanic` failure (issue #782).
+    ///
+    /// Emitted once per panicking attempt. Maps to [`METRIC_ACTIVITY_PANIC`].
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_activity_panic(&self, activity_name: &str, queue: &str) {
+        let _ = (activity_name, queue);
+    }
+
+    /// A workflow handler panicked (unwound) and the engine contained the panic
+    /// as a non-terminal re-dispatch or (once the panic budget is exhausted) a
+    /// terminal typed `HandlerPanic` failure (issue #782).
+    ///
+    /// Emitted on every panic entry — each retry and the final terminal failure.
+    /// Maps to [`METRIC_WORKFLOW_PANIC`]. Per ADR-0001 §7, `execution.id` must
+    /// never be a label here.
+    fn record_workflow_panic(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
 
@@ -2229,6 +2273,18 @@ mod tests {
             METRIC_COMPLETION_TRIGGER_SKIPPED,
             "harvest.completion_trigger.skipped"
         );
+        assert_eq!(METRIC_ACTIVITY_PANIC, "harvest.activity.panic");
+        assert_eq!(METRIC_WORKFLOW_PANIC, "harvest.workflow.panic");
+    }
+
+    #[test]
+    fn record_handler_panic_has_noop_defaults() {
+        // Contained-handler-panic counters (issue #782). Both must exist with a
+        // no-op default body so existing MetricsRecorder implementations compile
+        // without changes.
+        let rec = NoOpMetrics;
+        rec.record_activity_panic("send_email", "default");
+        rec.record_workflow_panic("onboarding", "default");
     }
 
     #[test]
