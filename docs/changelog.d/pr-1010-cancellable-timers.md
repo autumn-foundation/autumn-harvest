@@ -341,3 +341,62 @@ consumes the timers, no signal → `NoMatch`/suspend, NOT a false `Diverged`).
 Full `autumn-harvest` lib suite (1363 tests) completes without hang and with no
 skipped tests; the full cancellable-timer matrix, reset-loop, and round-6/7/10/
 11/12 reorder tests stay green.
+
+## Post-review hardening round 14 (Codex 2× P2)
+
+Two genuine consumer/scan completeness gaps in the cancellable-timer feature
+(issue #768), each fixed TDD (failing test first, confirmed RED, then GREEN).
+
+**Fix 1 — `WorkflowSimulator` now handles `ArmTimer`/`CancelTimer`
+(`simulator.rs`).** The new bookkeeping commands emitted by
+`start_timer`/`await_fire`/`cancel`/`reset` previously fell through
+`process_simulator_commands`'s wildcard arm, so a simulated
+`let h = ctx.start_timer("t", 1); h.await_fire().await` made no progress and
+tripped the deadlock assertion, and arm/cancel-then-complete workflows omitted
+the timer lifecycle events from simulated history. The simulator now mirrors
+`WorkflowTestEnv`: a fresh arm (`for_await: false`) records `TimerStarted`
+(deduped via a shared active-in-history check); a re-arm (`for_await: true`)
+fires (`TimerFired`) only on a bookkeeping-only `await_fire` batch — gated by a
+new `is_competing_suspension` check so it never synthesises impossible history
+like `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]` — and
+`CancelTimer` records `TimerCancelled`. Timer bookkeeping emitted on a TERMINAL
+(sealing) cycle (arm/cancel then complete/fail/continue-as-new in the same task)
+is recorded from the run loop's now-captured `pending` commands via
+`record_terminal_timer_commands`, mirroring
+`WorkflowTestEnv::process_terminal_commands`; only fired timers appear as
+`TimerFired`, keeping the simulator's history consistent with the round-9
+fired-only accounting. Tests: `test_simulator_cancellable_timer_fires` (arm +
+await → completes, `TimerStarted` then `TimerFired`) and
+`test_simulator_timer_cancel_then_complete` (arm + cancel + complete →
+`TimerStarted` + `TimerCancelled`, never `TimerFired`).
+
+**Fix 2 — foreign (sibling) `TimerFired` is crossable in the timer outcome scan
+(`replay.rs`).** The shared crossable set in `timer_scan_cross_or_stop` crossed
+a foreign-id `TimerStarted`/`TimerCancelled` but treated a foreign-id
+`TimerFired` as a STOP boundary, so a concurrent
+`tokio::join!(slow.await_fire(), fast.await_fire())` — where both rows are armed
+and `fast` fires first — diverged on replay: polling `slow` first stopped on the
+unconsumed `TimerFired(fast)` and `await_timer_fire` reported non-determinism
+instead of yielding so the `fast` branch could consume its own fire. A foreign
+`TimerFired` is now CROSSED NON-CONSUMINGLY (like foreign start/cancel) so the
+sibling's own `match_timer_or_cancel` claims it; the worker planner supports
+multiple `for_await` arms and wakes at the minimum deadline, so a sibling fire
+is a legitimate interleaving, not a command-ordering point. A SAME-id
+`TimerFired` is still the target (claimed by the caller) or an anchor (cancel
+scan) — never crossed — and a genuine command (activity/child/local-activity)
+still STOPS the scan, preserving every round-5/10/11/12/13 reorder and
+divergence soundness gate. Applied via the shared helper so both
+`match_timer_or_cancel` and `match_timer_cancel` get it consistently. Tests:
+`matcher_timer_or_cancel_crosses_foreign_sibling_fire`,
+`matcher_timer_cancel_crosses_foreign_sibling_fire`, and
+`matcher_timer_or_cancel_still_stops_at_foreign_command` (genuine-command
+reorder still diverges).
+
+**Command-consumer audit.** Every `match` over `WorkflowCommand` variants was
+re-audited for `ArmTimer`/`CancelTimer` handling: `worker.rs` (extractors +
+persist), `testing.rs` (`WorkflowTestEnv`), `context.rs` (emitters/tests), and
+`executor.rs` (bookkeeping/continue-as-new checks) already handle or correctly
+ignore them; `simulator.rs` was the sole gap (closed by Fix 1). Full
+`autumn-harvest` lib suite (1368 tests) and the no-DB `testing` integration
+suite (797 tests) complete with no skips, no hangs, and all prior
+reorder/matrix/reset-loop tests green.

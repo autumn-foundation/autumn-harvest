@@ -2911,11 +2911,13 @@ impl HistoryMatcher {
     /// effects the two callers used inline — for the genuinely transparent /
     /// interleavable classes: bookkeeping markers & side effects, fire-and-forget
     /// detached child spawns, a **foreign-id** sibling `reset()`'s
-    /// `[TimerCancelled(x), TimerStarted(x)]` arm/cancel interleaving, stashed
-    /// signals, external signal/cancel triplets, and update events.
+    /// `[TimerCancelled(x), TimerStarted(x)]` arm/cancel interleaving, a
+    /// **foreign-id** sibling's `TimerFired` (a concurrent `await_fire` sibling's
+    /// own outcome — Codex P2 round 14), stashed signals, external signal/cancel
+    /// triplets, and update events.
     /// Returns [`TimerScanStep::Stop`] for any other command-bearing event
     /// (`ActivityScheduled`/`Completed`/`Failed`, an attached `ChildWorkflow*`,
-    /// `LocalActivity*`, a foreign `TimerFired`, ...): a timer outcome/cancel
+    /// `LocalActivity*`, ...): a timer outcome/cancel
     /// claim is NOT allowed to cross a real command-ordering point, or a code
     /// change that moved the await/cancel BEFORE such a command would silently
     /// pass strict replay (Codex P2 soundness fix). Factoring this into one shared
@@ -2940,14 +2942,25 @@ impl HistoryMatcher {
             WorkflowEvent::MarkerRecorded { .. }
             | WorkflowEvent::SideEffectRecorded { .. }
             | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => TimerScanStep::Cross,
-            // A FOREIGN sibling timer's arm/cancel interleaving is transparent; an
-            // UNCONSUMED SAME-id `TimerStarted`/`TimerCancelled` is this id's own
-            // command-ordering anchor and falls through to `_ => Stop` below (Codex
-            // P2 round 10). Our-id fire/cancel *targets* are claimed by the caller
-            // BEFORE this call, so a same-id one reaching here is a genuine
-            // unconsumed ordering point the scan must not cross.
+            // A FOREIGN sibling timer's arm/cancel/fire interleaving is
+            // transparent; an UNCONSUMED SAME-id `TimerStarted`/`TimerCancelled` is
+            // this id's own command-ordering anchor and falls through to `_ => Stop`
+            // below (Codex P2 round 10). Our-id fire/cancel *targets* are claimed by
+            // the caller BEFORE this call, so a same-id one reaching here is a
+            // genuine unconsumed ordering point the scan must not cross.
+            //
+            // A FOREIGN `TimerFired` is a concurrent-await sibling's own outcome
+            // (Codex P2 round 14, issue #768): with `tokio::join!(slow.await_fire(),
+            // fast.await_fire())` both rows are armed and the worker planner wakes
+            // at the minimum deadline, so `fast` may fire first. On replay the
+            // `slow` branch is polled first; its outcome scan must CROSS the
+            // unconsumed `TimerFired(fast)` NON-CONSUMINGLY (leaving it for `fast`'s
+            // own `match_timer_or_cancel` to claim) rather than treating it as an
+            // unrelated command and diverging. A sibling timer fire is a legitimate
+            // interleaving, not a command-ordering point.
             WorkflowEvent::TimerStarted { timer_id: id, .. }
             | WorkflowEvent::TimerCancelled { timer_id: id }
+            | WorkflowEvent::TimerFired { timer_id: id }
                 if id.as_str() != timer_id =>
             {
                 TimerScanStep::Cross
@@ -3079,10 +3092,11 @@ impl HistoryMatcher {
     /// [`Self::match_timer_strict`]'s transparent set: markers, side effects,
     /// detached-child spawns, the reset `TimerCancelled`/`TimerStarted`
     /// interleaving, stashed signals & external-signal/cancel triplets, and
-    /// update events). It STOPS (returns [`TimerFireMatch::NoMatch`]) at any
-    /// UNCONSUMED command-bearing event NOT on that allowlist
+    /// update events, and a foreign sibling's `TimerFired`). It STOPS (returns
+    /// [`TimerFireMatch::NoMatch`]) at any UNCONSUMED command-bearing event NOT on
+    /// that allowlist
     /// (`ActivityScheduled`/`Completed`/`Failed`, attached `ChildWorkflow*`,
-    /// `LocalActivity*`, a foreign `TimerFired`, ...). Without the stop, a code
+    /// `LocalActivity*`, ...). Without the stop, a code
     /// change that awaits the timer BEFORE such a command would let the scan claim
     /// the trailing `TimerFired` across the unrelated command and pass strict
     /// replay despite a real command-order change; stopping surfaces it as a
@@ -3102,9 +3116,11 @@ impl HistoryMatcher {
                 continue;
             }
             // The resolving outcome for THIS timer — claim it (recorded-order
-            // fire-vs-cancel resolution). A foreign `TimerFired` (or any other
-            // command-bearing event) is delegated to the shared crossable-set
-            // helper below, which STOPS the scan on it.
+            // fire-vs-cancel resolution). A foreign `TimerFired` (a concurrent
+            // `await_fire` sibling's outcome) is delegated to the shared
+            // crossable-set helper below, which CROSSES it non-consumingly (Codex P2
+            // round 14) so the sibling's own scan claims it; a genuine command-
+            // bearing event STOPS the scan there.
             match &self.events[scan] {
                 WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
                     self.consumed_out_of_order_events.insert(scan);
@@ -5147,6 +5163,95 @@ mod tests {
             HistoryMatch::Matched { .. }
         ));
         assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::NoMatch);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_crosses_foreign_sibling_fire() {
+        // Concurrent `join!(slow.await_fire(), fast.await_fire())`: both timers
+        // armed, `fast` fires first, then `slow`. On replay the `slow` branch is
+        // polled first; its outcome scan must CROSS the unconsumed foreign
+        // `TimerFired(fast)` and claim its own `TimerFired(slow)`, leaving fast's
+        // fire for fast's own scan (Codex P2 round 14, issue #768). Before the fix
+        // the foreign `TimerFired` STOPPED the scan → NoMatch → false divergence.
+        let mut m = HistoryMatcher::new(vec![
+            ts("slow", 300),
+            ts("fast", 60),
+            tf("fast"),
+            tf("slow"),
+        ]);
+        assert!(matches!(
+            m.match_timer_arm("slow", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(matches!(
+            m.match_timer_arm("fast", 60),
+            HistoryMatch::Matched { .. }
+        ));
+        // slow polled first must cross the foreign fast fire and resolve Fired.
+        assert_eq!(m.match_timer_or_cancel("slow"), TimerFireMatch::Fired);
+        assert!(
+            !m.timer_scan_stopped_at_command(),
+            "crossing a foreign sibling fire must NOT set the blocked-scan flag"
+        );
+        // fast's own fire is still claimable afterward (crossed non-consumingly).
+        assert_eq!(m.match_timer_or_cancel("fast"), TimerFireMatch::Fired);
+    }
+
+    #[test]
+    fn matcher_timer_cancel_crosses_foreign_sibling_fire() {
+        // The shared crossable set applies to the cancel scan too: a concurrent
+        // sibling `await_fire` firing while this timer is being cancelled must be
+        // crossed non-consumingly (Codex P2 round 14, issue #768).
+        let mut m = HistoryMatcher::new(vec![
+            ts("keep", 300),
+            ts("drop", 60),
+            tf("keep"),
+            tc("drop"),
+        ]);
+        assert!(matches!(
+            m.match_timer_arm("keep", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(matches!(
+            m.match_timer_arm("drop", 60),
+            HistoryMatch::Matched { .. }
+        ));
+        // The cancel scan for `drop` must cross the foreign `TimerFired(keep)`.
+        assert!(matches!(
+            m.match_timer_cancel("drop"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(!m.timer_scan_stopped_at_command());
+        // keep's own fire is still claimable.
+        assert_eq!(m.match_timer_or_cancel("keep"), TimerFireMatch::Fired);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_still_stops_at_foreign_command() {
+        // A foreign `TimerFired` now crosses, but a genuine command (an activity)
+        // still STOPS the outcome scan — the round-5/13 soundness gate is
+        // preserved (Codex P2 round 14, issue #768).
+        let aid = ActivityExecId::new();
+        let mut m = HistoryMatcher::new(vec![
+            ts("idle", 300),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: aid,
+                name: "work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            tf("idle"),
+        ]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        // await_fire BEFORE the recorded activity → scan STOPS at the activity.
+        assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::NoMatch);
+        assert!(
+            m.timer_scan_stopped_at_command(),
+            "a genuine command must still stop the scan"
+        );
     }
 
     #[test]
