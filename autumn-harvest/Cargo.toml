@@ -63,6 +63,15 @@ schemars = { version = "0.8", optional = true }
 name = "integration"
 path = "tests/integration/mod.rs"
 
+# Property-based (proptest) test suite. Mirrors the `integration` target's
+# single-entry-point convention: `tests/property/mod.rs` includes a module tree.
+# The pure-function suites run under `cargo test -p autumn-harvest
+# --no-default-features` (no DB); db-gated suites (build_routing, dlq) are
+# `#[cfg(feature = "db")]` submodules that only compile in a `db` build.
+[[test]]
+name = "property"
+path = "tests/property/mod.rs"
+
 [[bench]]
 name = "metrics_noop"
 harness = false
@@ -101,7 +110,7 @@ name = "sleep_until_renewal_reminder"
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-proptest = "1.11.0"
+proptest = { workspace = true }
 loom = "0.7.2"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

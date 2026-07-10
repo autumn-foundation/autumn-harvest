@@ -1,0 +1,66 @@
+# cargo-fuzz harness for autumn-harvest.
+#
+# This crate is deliberately EXCLUDED from the parent workspace (see the root
+# Cargo.toml `[workspace] exclude` list) and additionally declares its own
+# empty `[workspace]` below, so `cargo build`/`cargo test` at the repo root
+# never sees these libFuzzer-only, nightly-only binaries. Build/run it directly:
+#
+#   cargo +nightly fuzz build
+#   cargo +nightly fuzz run <target> -- -max_total_time=15
+#
+# See docs/testing/property-and-fuzz.md for the full rationale and target list.
+[package]
+name = "autumn-harvest-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace root so the parent workspace resolver never pulls this in.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+# The `db` feature is required by the `fuzz_failure_signature` target
+# (`dlq` is a `#[cfg(feature = "db")]` module). It also pulls diesel in, which
+# is harmless for the other three targets.
+[dependencies.autumn-harvest]
+path = "../autumn-harvest"
+features = ["db"]
+
+# Keep line-level debug info so libFuzzer crash reports symbolicate, but keep
+# optimizations on so the fuzzer covers ground quickly.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_workflow_event_deser"
+path = "fuzz_targets/fuzz_workflow_event_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_det_check_source"
+path = "fuzz_targets/fuzz_det_check_source.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_validate_target_url"
+path = "fuzz_targets/fuzz_validate_target_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_failure_signature"
+path = "fuzz_targets/fuzz_failure_signature.rs"
+test = false
+doc = false
+bench = false
