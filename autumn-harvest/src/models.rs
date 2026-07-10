@@ -1280,6 +1280,10 @@ pub struct ExecutionSummary {
     pub search_attrs: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// Parent execution UUID for a child-workflow summary, else `None`
+    /// (issue #752). Links a demoted child to its parent for the #495 PII-erase
+    /// cascade.
+    pub parent_id: Option<Uuid>,
     pub summarized_at: DateTime<Utc>,
 }
 
@@ -1300,4 +1304,7 @@ pub struct NewExecutionSummary {
     pub search_attrs: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// Parent execution UUID when demoting a child workflow, else `None`
+    /// (issue #752).
+    pub parent_id: Option<Uuid>,
 }

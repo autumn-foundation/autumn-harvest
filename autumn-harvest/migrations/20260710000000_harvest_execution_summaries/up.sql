@@ -20,6 +20,15 @@
 --                     or offloaded payloads become a typed "_harvest_omitted"
 --                     marker (valid JSON, never silent truncation). NULL when
 --                     payload capture is disabled.
+--   - parent_id:      the parent execution's UUID when this summary is for a
+--                     child workflow, else NULL (issue #752 review). Load-bearing
+--                     for the #495 PII-erase cascade: a terminal child is
+--                     independently retention-eligible and may be demoted into a
+--                     summary and have its own execution row deleted BEFORE its
+--                     parent is erased. Without this link, erasing the parent
+--                     (which finds children via harvest_workflow_executions.
+--                     parent_id) could never reach the child summary, leaving its
+--                     captured PII intact and undiscoverable.
 --   - summarized_at:  when this summary row was written.
 
 CREATE TABLE IF NOT EXISTS harvest_execution_summaries (
@@ -34,6 +43,7 @@ CREATE TABLE IF NOT EXISTS harvest_execution_summaries (
     search_attrs   JSONB NULL,
     result         JSONB NULL,
     error          TEXT NULL,
+    parent_id      UUID NULL,
     summarized_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -48,3 +58,8 @@ CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_name
 -- Search-attribute containment filtering.
 CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_search
     ON harvest_execution_summaries USING GIN (search_attrs);
+
+-- Parent → child-summary lookup for the #495 PII-erase cascade (issue #752).
+-- Partial: only child summaries carry a non-NULL parent_id.
+CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_parent
+    ON harvest_execution_summaries (parent_id) WHERE parent_id IS NOT NULL;

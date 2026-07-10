@@ -321,6 +321,24 @@ fn workflow_summaries_filters_map_to_query_string() {
 }
 
 #[test]
+fn workflow_summaries_order_maps_to_query_string() {
+    let cli = Cli::try_parse_from(["harvest", "workflow", "summaries", "--order", "asc"])
+        .expect("summaries --order args should parse");
+    let request = cli.api_request().expect("summaries request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/workflows/summaries?order=asc");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_summaries_reject_invalid_order() {
+    // Restricted at clap parse time to asc|desc.
+    let parsed = Cli::try_parse_from(["harvest", "workflow", "summaries", "--order", "sideways"]);
+    assert!(parsed.is_err(), "invalid --order value must be rejected");
+}
+
+#[test]
 fn workflow_summaries_reject_search_attr_without_equals() {
     let cli = Cli::try_parse_from([
         "harvest",

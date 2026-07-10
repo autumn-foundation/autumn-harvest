@@ -263,6 +263,31 @@ async fn insert_completed(
     .await
 }
 
+/// Point `child`'s `parent_id` at `parent`.
+async fn set_parent(conn: &mut AsyncPgConnection, child: uuid::Uuid, parent: uuid::Uuid) {
+    diesel::sql_query("UPDATE harvest_workflow_executions SET parent_id = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(child)
+        .bind::<diesel::sql_types::Uuid, _>(parent)
+        .execute(conn)
+        .await
+        .expect("set parent_id");
+}
+
+/// Read a summary row's `parent_id` (issue #752 erase-cascade link).
+async fn summary_parent(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    #[derive(diesel::QueryableByName)]
+    struct ParentRow {
+        #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
+        parent_id: Option<uuid::Uuid>,
+    }
+    diesel::sql_query("SELECT parent_id FROM harvest_execution_summaries WHERE execution_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .get_result::<ParentRow>(conn)
+        .await
+        .expect("summary row must exist")
+        .parent_id
+}
+
 /// Seed a summary row directly (for GC tests) with the given `completed_at`.
 async fn insert_summary(
     conn: &mut AsyncPgConnection,
@@ -798,4 +823,176 @@ async fn legal_held_execution_is_not_summarized_until_released() {
     assert_eq!(result.summarized_count, 1);
     assert_eq!(count_executions(&mut conn).await, 0, "now deleted");
     assert_eq!(count_summaries(&mut conn).await, 1, "now summarized");
+}
+
+// AC6 (child-summary erase cascade, issue #752 review): a TERMINAL child is
+// independently retention-eligible, so it is demoted into a summary (with its
+// PII captured) and its execution row deleted BEFORE the parent is erased.
+// Erasing the parent must reach the child summary via `parent_id`, or the
+// child's captured PII survives undiscoverably. Also proves the `parent_id`
+// link is preserved through deletion regardless of retention processing order.
+#[tokio::test]
+async fn erase_parent_scrubs_a_demoted_child_summary() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let parent = insert_completed_full(
+        &mut conn,
+        "parent_wf",
+        "p1",
+        "COMPLETED",
+        old,
+        Some(serde_json::json!({"parent_card": "4111-1111-1111-1111"})),
+        None,
+        Some(serde_json::json!({"parent_pii": "yes"})),
+    )
+    .await;
+    let child = insert_completed_full(
+        &mut conn,
+        "child_wf",
+        "c1",
+        "COMPLETED",
+        old,
+        Some(serde_json::json!({"child_ssn": "123-45-6789"})),
+        Some("child operational error"),
+        Some(serde_json::json!({"child_pii": "yes"})),
+    )
+    .await;
+    set_parent(&mut conn, child, parent).await;
+
+    // Demote BOTH into summaries with payload capture (child captures its PII).
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+    assert_eq!(result.summarized_count, 2, "parent and child both demoted");
+    assert_eq!(count_executions(&mut conn).await, 0, "both rows deleted");
+
+    // The child→parent link survives deletion (order-independent).
+    assert_eq!(
+        summary_parent(&mut conn, child).await,
+        Some(parent),
+        "child summary retains parent_id after deletion"
+    );
+
+    // Sanity: the child summary still holds the real PII before the erase.
+    let before = load_summary(&mut conn, child).await.expect("child summary");
+    assert_eq!(
+        before.result,
+        Some(serde_json::json!({"child_ssn": "123-45-6789"}))
+    );
+
+    // Erase the PARENT — the child execution row is already gone, so the cascade
+    // must reach the child SUMMARY via parent_id.
+    let outcome = erase_workflow_payloads(&mut conn, ExecutionId::from_uuid(parent), "test")
+        .await
+        .expect("summary-only parent erase should succeed");
+    assert!(outcome.summary_scrubbed, "parent summary scrubbed");
+    assert_eq!(outcome.children.len(), 1, "reached the child summary");
+    assert!(
+        outcome.children[0].summary_scrubbed,
+        "child summary scrubbed"
+    );
+
+    // The child summary's PII is now tombstoned; error deliberately kept (#495).
+    let after = load_summary(&mut conn, child).await.expect("child summary");
+    assert_eq!(
+        after.result,
+        Some(serde_json::json!({"_harvest_erased": true})),
+        "child summary result tombstoned by the parent erase"
+    );
+    assert_eq!(
+        after.search_attrs,
+        Some(serde_json::json!({"_harvest_erased": true})),
+        "child summary search_attrs tombstoned"
+    );
+    assert_eq!(
+        after.error.as_deref(),
+        Some("child operational error"),
+        "child summary error kept (consistent with #495)"
+    );
+
+    // The parent summary itself is also tombstoned.
+    let parent_after = load_summary(&mut conn, parent)
+        .await
+        .expect("parent summary");
+    assert_eq!(
+        parent_after.result,
+        Some(serde_json::json!({"_harvest_erased": true}))
+    );
+}
+
+// AC6 recursion: a grandchild demoted into a summary is reached when the
+// top-level parent is erased (parent → child → grandchild summary links).
+#[tokio::test]
+async fn erase_parent_recurses_into_grandchild_summary() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let parent = insert_completed_full(
+        &mut conn,
+        "gp_wf",
+        "gp1",
+        "COMPLETED",
+        old,
+        Some(serde_json::json!({"p": "x"})),
+        None,
+        None,
+    )
+    .await;
+    let child = insert_completed_full(
+        &mut conn,
+        "gc_child_wf",
+        "gc_c1",
+        "COMPLETED",
+        old,
+        Some(serde_json::json!({"c": "x"})),
+        None,
+        None,
+    )
+    .await;
+    let grandchild = insert_completed_full(
+        &mut conn,
+        "grandchild_wf",
+        "g1",
+        "COMPLETED",
+        old,
+        Some(serde_json::json!({"grandchild_secret": "top-secret"})),
+        None,
+        Some(serde_json::json!({"gc_pii": "yes"})),
+    )
+    .await;
+    set_parent(&mut conn, child, parent).await;
+    set_parent(&mut conn, grandchild, child).await;
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+    assert_eq!(result.summarized_count, 3, "all three demoted");
+    assert_eq!(count_executions(&mut conn).await, 0);
+    assert_eq!(summary_parent(&mut conn, grandchild).await, Some(child));
+
+    erase_workflow_payloads(&mut conn, ExecutionId::from_uuid(parent), "test")
+        .await
+        .expect("erase parent");
+
+    let gc = load_summary(&mut conn, grandchild)
+        .await
+        .expect("grandchild summary");
+    assert_eq!(
+        gc.result,
+        Some(serde_json::json!({"_harvest_erased": true})),
+        "grandchild summary reached recursively and tombstoned"
+    );
+    assert_eq!(
+        gc.search_attrs,
+        Some(serde_json::json!({"_harvest_erased": true}))
+    );
 }

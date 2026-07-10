@@ -98,7 +98,9 @@ impl SummaryPolicy {
     #[must_use]
     pub const fn for_days(days: u64) -> Self {
         Self {
-            retention: SummaryRetention::For(Duration::from_secs(days * 86_400)),
+            // `saturating_mul` guards a huge `days` value from overflowing the
+            // seconds product; the validated horizon range clamps it anyway.
+            retention: SummaryRetention::For(Duration::from_secs(days.saturating_mul(86_400))),
             capture_payload: false,
             max_payload_bytes: DEFAULT_SUMMARY_PAYLOAD_CAP,
         }
@@ -204,10 +206,22 @@ pub fn cap_result_payload(
 ) -> Option<serde_json::Value> {
     let output = output?;
     // Never store an offload reference envelope — the blob may be GC'd (#524).
+    //
+    // Offload detection relies on the offloader storing a ROOT envelope
+    // (`extract_offload_ref` inspects the top-level value; `search_attrs` is
+    // never offloadable). A future nested-envelope offload change MUST recurse
+    // this check, or a summary could store a value referencing a blob that
+    // #524's GC later reclaims, leaving a dangling summary→blob reference.
     if crate::payload_store::extract_offload_ref(output).is_some() {
         return Some(omitted_marker("offloaded", None));
     }
-    let len = serde_json::to_vec(output).map_or(0, |v| v.len());
+    // Fail SAFE on a (near-impossible) serialize failure of an already-parsed
+    // JSONB value: emit an omitted marker rather than storing an unmeasured
+    // payload verbatim, consistent with the oversized-payload path below.
+    let len = match serde_json::to_vec(output) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => return Some(omitted_marker("too_large", None)),
+    };
     if len > cap {
         return Some(omitted_marker("too_large", Some(len)));
     }
@@ -395,6 +409,12 @@ impl RetentionConfig {
     /// Enable tiered/summary retention with a `days`-day summary horizon
     /// (payload capture off). Shorthand for
     /// `with_summary_retention(SummaryPolicy::for_days(days))`.
+    ///
+    /// The summary horizon should **exceed** the history horizon
+    /// ([`with_max_age`](Self::with_max_age)) to be useful: a summary is created
+    /// only when the history is deleted, so a summary window at or below the
+    /// history window means the summary is GC'd almost immediately. A mismatch
+    /// logs a one-time warning at [`RetentionRuntime::spawn`].
     #[must_use]
     pub const fn with_summary_retention_days(mut self, days: u64) -> Self {
         self.summary = Some(SummaryPolicy::for_days(days));
@@ -701,6 +721,22 @@ impl RetentionRuntime {
     ) -> Option<Self> {
         if !config.enabled() {
             return None;
+        }
+        // Foot-gun warning (issue #752): a BOUNDED summary horizon at or below
+        // the global history horizon means a demoted summary is GC'd almost as
+        // soon as it is created, so tiering buys nothing. Non-fatal — the
+        // operator may genuinely want a tiny summary window — but worth a
+        // one-time startup warning.
+        if let (Some(summary_age), Some(max_age)) = (config.summary_age(), config.max_age())
+            && summary_age <= max_age
+        {
+            tracing::warn!(
+                summary_age_secs = summary_age.as_secs(),
+                history_max_age_secs = max_age.as_secs(),
+                "harvest summary-retention horizon is <= the history-retention horizon; \
+                 summaries will be GC'd almost immediately after creation — set a longer \
+                 summary horizon (or Unbounded) for tiering to be useful"
+            );
         }
         let monitor = RetentionMonitor::new(config.clone(), pools.shard_ids().into_iter());
         let shutdown = CancellationToken::new();
@@ -1752,6 +1788,7 @@ async fn delete_candidate_execution(
                         harvest_workflow_executions::output,
                         harvest_workflow_executions::error,
                         harvest_workflow_executions::search_attrs,
+                        harvest_workflow_executions::parent_id,
                     ))
                     .for_update()
                     .first::<SummarySourceRow>(conn)
@@ -1774,6 +1811,7 @@ async fn delete_candidate_execution(
                     output,
                     error,
                     search_attrs,
+                    parent_id,
                 )) = row
                 {
                     if legal_hold_active(set_at, until, now) {
@@ -1783,7 +1821,9 @@ async fn delete_candidate_execution(
                     // clause; fall back to started_at defensively so the NOT
                     // NULL summary column always has a value.
                     let completed = completed_at.unwrap_or(started_at);
-                    let duration_ms = Some((completed - started_at).num_milliseconds());
+                    // Clamp at 0: a `completed_at` before `started_at` (clock
+                    // skew across nodes) must never produce a negative duration.
+                    let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
                     // Payload capture is opt-in (AC3): a policy with capture
                     // disabled leaves result/error NULL.
                     let (result, error_out) = if policy.capture_payload {
@@ -1794,6 +1834,13 @@ async fn delete_candidate_execution(
                     } else {
                         (None, None)
                     };
+                    // Codec caveat (issue #752): the summary stores the
+                    // `output`/`search_attrs` COLUMNS verbatim — these are
+                    // codec-ENCODED at rest (the same columns #608's
+                    // `decode_workflow_execution_fields` decodes on read). So
+                    // encryption-at-rest is preserved: the longer-retained
+                    // summary tier can never hold plaintext that the event
+                    // history encrypts.
                     let new_summary = NewExecutionSummary {
                         execution_id: candidate_id,
                         workflow_name,
@@ -1806,6 +1853,7 @@ async fn delete_candidate_execution(
                         search_attrs,
                         result,
                         error: error_out,
+                        parent_id,
                     };
                     // ON CONFLICT DO NOTHING makes the demotion idempotent
                     // across a retried delete tx.
@@ -1839,22 +1887,37 @@ async fn delete_candidate_execution(
                 }
             }
 
-            diesel::update(
-                harvest_workflow_executions::table
-                    .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
-                    .filter(harvest_workflow_executions::state.eq_any([
-                        "COMPLETED",
-                        "FAILED",
-                        "CANCELLED",
-                        "TIMED_OUT",
-                        "CONTINUED_AS_NEW",
-                        "TERMINATED",
-                    ])),
-            )
-            .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // Orphan the deleted parent's terminal children so their `parent_id`
+            // does not dangle to a gone row. Tiered/summary retention (issue
+            // #752): when a summary policy is set, this null-out is SKIPPED so
+            // the child→parent lineage survives deletion. A terminal child is
+            // independently retention-eligible and may be summarized in a LATER
+            // transaction than its parent; if we nulled its `parent_id` here,
+            // its own demotion would capture a NULL parent and the #495 PII-erase
+            // cascade (which reaches a demoted child summary via
+            // `harvest_execution_summaries.parent_id`) could never find it.
+            // Preserving the link makes the cascade order-independent regardless
+            // of whether the parent or child is processed first. The retained
+            // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
+            // `should_skip_candidate` only reads `parent_id` downward).
+            if summary.is_none() {
+                diesel::update(
+                    harvest_workflow_executions::table
+                        .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
+                        .filter(harvest_workflow_executions::state.eq_any([
+                            "COMPLETED",
+                            "FAILED",
+                            "CANCELLED",
+                            "TIMED_OUT",
+                            "CONTINUED_AS_NEW",
+                            "TERMINATED",
+                        ])),
+                )
+                .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            }
 
             // `task_type = 'CALLBACK'` dead letters (issue #605) are
             // excluded here (issue #921 review, Codex P2): a CALLBACK
@@ -1936,6 +1999,7 @@ type SummarySourceRow = (
     Option<serde_json::Value>, // output
     Option<String>,            // error
     Option<serde_json::Value>, // search_attrs
+    Option<uuid::Uuid>,        // parent_id
 );
 
 /// Garbage-collect execution summaries older than the summary horizon (issue
@@ -2005,7 +2069,11 @@ pub(crate) async fn purge_expired_summaries(
         for r in rows {
             *counts.entry(r.workflow_name).or_insert(0) += 1;
         }
-        if n < batch_size {
+        // Terminate when a batch came back short OR empty. Compare against the
+        // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`:
+        // a `batch_size` of 0 makes the LIMIT 1 while `n < 0` is impossible, so
+        // an `n == 0` early break is required or the loop would spin forever.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
             break;
         }
     }
@@ -2033,10 +2101,15 @@ pub struct SummaryQuery {
     /// JSONB containment (`@>`) predicates over `search_attrs`; combined with
     /// `AND`.
     pub search_attrs: Vec<serde_json::Value>,
-    /// Keyset cursor `(completed_at, execution_id)` — return only rows strictly
-    /// older than this pair under the `(completed_at DESC, execution_id DESC)`
-    /// ordering.
+    /// Keyset cursor `(completed_at, execution_id)` — under the default
+    /// descending order, return only rows strictly *older* than this pair; under
+    /// ascending order (`ascending = true`), only rows strictly *newer*.
     pub cursor: Option<(DateTime<Utc>, uuid::Uuid)>,
+    /// Sort direction (issue #752, AC4 parity with `GET /workflows`). `false`
+    /// (the default) is `(completed_at DESC, execution_id DESC)`; `true` is the
+    /// ascending order. Threaded through both the `ORDER BY` and the keyset
+    /// cursor comparison so a paginated `order=asc` walk is consistent.
+    pub ascending: bool,
 }
 
 /// List execution summaries matching `query`, newest-first, up to `limit` rows
@@ -2059,24 +2132,43 @@ pub async fn list_execution_summaries(
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Jsonb};
 
-    let mut q = harvest_execution_summaries::table
-        .into_boxed()
-        .order(harvest_execution_summaries::completed_at.desc())
-        .then_order_by(harvest_execution_summaries::execution_id.desc())
-        .limit(limit.max(0));
+    let mut q = harvest_execution_summaries::table.into_boxed();
+    q = if query.ascending {
+        q.order(harvest_execution_summaries::completed_at.asc())
+            .then_order_by(harvest_execution_summaries::execution_id.asc())
+    } else {
+        q.order(harvest_execution_summaries::completed_at.desc())
+            .then_order_by(harvest_execution_summaries::execution_id.desc())
+    };
+    q = q.limit(limit.max(0));
 
     if let Some(cursor) = &query.cursor {
         let (ts, id) = (cursor.0, cursor.1);
-        q = q.filter(
-            sql::<Bool>(
-                "(harvest_execution_summaries.completed_at, \
-                 harvest_execution_summaries.execution_id) < (",
+        // Row-value keyset comparison: `>` walks forward under ascending order,
+        // `<` under descending — matching the `GET /workflows` contract.
+        q = if query.ascending {
+            q.filter(
+                sql::<Bool>(
+                    "(harvest_execution_summaries.completed_at, \
+                     harvest_execution_summaries.execution_id) > (",
+                )
+                .bind::<Timestamptz, _>(ts)
+                .sql(", ")
+                .bind::<SqlUuid, _>(id)
+                .sql(")"),
             )
-            .bind::<Timestamptz, _>(ts)
-            .sql(", ")
-            .bind::<SqlUuid, _>(id)
-            .sql(")"),
-        );
+        } else {
+            q.filter(
+                sql::<Bool>(
+                    "(harvest_execution_summaries.completed_at, \
+                     harvest_execution_summaries.execution_id) < (",
+                )
+                .bind::<Timestamptz, _>(ts)
+                .sql(", ")
+                .bind::<SqlUuid, _>(id)
+                .sql(")"),
+            )
+        };
     }
     if !query.states.is_empty() {
         q = q.filter(harvest_execution_summaries::state.eq_any(query.states.clone()));

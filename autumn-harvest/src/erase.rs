@@ -227,9 +227,11 @@ pub struct EraseOutcome {
 
 #[cfg(feature = "db")]
 mod db {
+    use std::collections::HashSet;
     use std::future::Future;
     use std::pin::Pin;
 
+    use chrono::{DateTime, Utc};
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
     use diesel::QueryDsl;
@@ -269,54 +271,69 @@ mod db {
     ) -> HarvestResult<EraseOutcome> {
         conn.transaction::<EraseOutcome, HarvestError, _>(|conn| {
             async move {
-                // Tiered/summary retention (issue #752, AC6): a terminal
-                // execution may have been demoted into a
-                // `harvest_execution_summaries` row and its full execution row
-                // already retention-deleted. Erasing PII must therefore scrub
-                // the summary too, and must SUCCEED when only the summary
-                // remains (the execution row is gone → `NotFound` from the
-                // gate). Otherwise a summarized execution's PII would be
-                // un-erasable once its history was collected.
-                match erase_single_execution(conn, exec_id).await {
-                    Ok(mut outcome) => {
-                        // Execution row present + terminal + scrubbed. Also
-                        // scrub the matching summary (if any) in the same tx.
-                        outcome.summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
-                        Ok(outcome)
-                    }
-                    Err(HarvestError::NotFound(_)) => {
-                        // No execution row: scrub a lingering summary if one
-                        // remains, and report success on that basis alone.
-                        let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
-                        if summary_scrubbed {
-                            Ok(EraseOutcome {
-                                execution_id: exec_id.to_string(),
-                                events_scrubbed: 0,
-                                fields_tombstoned: 0,
-                                execution_row_scrubbed: false,
-                                summary_scrubbed: true,
-                                signals_scrubbed: 0,
-                                completion_deliveries_scrubbed: 0,
-                                dead_letters_scrubbed: 0,
-                                children: Vec::new(),
-                                skipped_children: Vec::new(),
-                                failures: Vec::new(),
-                            })
-                        } else {
-                            Err(HarvestError::NotFound(format!(
-                                "workflow execution {exec_id}"
-                            )))
-                        }
-                    }
-                    // A non-terminal execution (Config → 409) or a DB error
-                    // propagates unchanged — a non-terminal run can never have
-                    // a summary, so there is nothing extra to scrub.
-                    Err(e) => Err(e),
-                }
+                // A `visited` set guards the unified downward traversal against
+                // diamonds and any pathological `parent_id` cycle across the two
+                // child sources (`harvest_workflow_executions` and
+                // `harvest_execution_summaries`).
+                let mut visited: HashSet<Uuid> = HashSet::new();
+                erase_top_level(conn, exec_id, &mut visited).await
             }
             .scope_boxed()
         })
         .await
+    }
+
+    /// Top-level erase entry with gate-REJECT semantics (issue #495): a
+    /// non-terminal execution → `Config` (409), a legal-held execution →
+    /// `Config` (409). Falls back to a summary-only erase when the execution
+    /// row is already retention-deleted (issue #752, AC6): a terminal execution
+    /// may have been demoted into a `harvest_execution_summaries` row and its
+    /// full row collected, so erasing PII must scrub the summary too and
+    /// SUCCEED when only the summary (or a lingering child-summary subtree)
+    /// remains. A truly-unknown id still returns `NotFound` (404).
+    async fn erase_top_level(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        visited: &mut HashSet<Uuid>,
+    ) -> HarvestResult<EraseOutcome> {
+        visited.insert(exec_id.as_uuid());
+        let now = Utc::now();
+        match load_erase_gate_row(conn, exec_id).await {
+            Ok((state, set_at, until, reason)) => {
+                if !is_terminal_state(&state) {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is not in a terminal state \
+                         (current state: {state}); payload erasure is only permitted \
+                         for terminal executions"
+                    )));
+                }
+                if crate::retention::legal_hold_active(set_at, until, now) {
+                    let reason = reason.as_deref().unwrap_or("no reason recorded");
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is under legal hold \
+                         (reason: {reason}); payload erasure rejected until the hold \
+                         is released"
+                    )));
+                }
+                let mut outcome = scrub_execution_node(conn, exec_id, now, visited).await?;
+                // Scrub the matching summary (if any) in the same tx. A live
+                // execution row and a summary are mutually exclusive in the
+                // steady state, but this is harmless and idempotent.
+                outcome.summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+                Ok(outcome)
+            }
+            Err(HarvestError::NotFound(_)) => {
+                // No execution row: scrub a lingering summary (and any
+                // summarized child subtree) and report success on that basis.
+                // Nothing at all found → NotFound (404).
+                erase_summary_only_node(conn, exec_id, now, visited)
+                    .await?
+                    .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+            }
+            // A non-terminal execution (Config → 409) or a DB error propagates
+            // unchanged.
+            Err(e) => Err(e),
+        }
     }
 
     /// Scrub the payload of a matching `harvest_execution_summaries` row
@@ -346,17 +363,68 @@ mod db {
         Ok(updated > 0)
     }
 
-    /// Erase one execution and cascade to its terminal children.
+    /// A boxed future yielding an optional erase outcome (a summary-only node
+    /// that turns out to reference nothing yields `None`).
+    type OptEraseFuture<'a> =
+        Pin<Box<dyn Future<Output = HarvestResult<Option<EraseOutcome>>> + Send + 'a>>;
+
+    /// Erase one CHILD execution (row present, terminal, not held) and cascade.
     ///
-    /// The gate read acquires a `FOR UPDATE` row lock (via `load_erase_gate_row`)
-    /// for the execution — top-level and every cascaded child alike — held for
-    /// the life of the outer transaction. Returns a `BoxFuture` to satisfy the
-    /// recursion requirement: async recursive functions require boxing.
-    fn erase_single_execution(
-        conn: &mut AsyncPgConnection,
+    /// Scrubs the child's events/row/signals/deliveries/DLQ and its own summary
+    /// (if any), then recurses into its children. Boxed to satisfy the async
+    /// recursion requirement.
+    fn erase_child_execution_node<'a>(
+        conn: &'a mut AsyncPgConnection,
         exec_id: ExecutionId,
-    ) -> EraseFuture<'_> {
-        Box::pin(async move { erase_single_execution_inner(conn, exec_id).await })
+        now: DateTime<Utc>,
+        visited: &'a mut HashSet<Uuid>,
+    ) -> EraseFuture<'a> {
+        Box::pin(async move {
+            let mut outcome = scrub_execution_node(conn, exec_id, now, visited).await?;
+            outcome.summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+            Ok(outcome)
+        })
+    }
+
+    /// Erase a summary-ONLY node (issue #752, AC6): the execution row is gone
+    /// (retention-collected), only a `harvest_execution_summaries` row remains.
+    ///
+    /// Tombstones the summary's `result`/`search_attrs` and recurses into its
+    /// children via the same two-source lookup (a summarized child may itself
+    /// have summarized grandchildren, linked by `parent_id`). Returns `None`
+    /// only when nothing at all is found for `exec_id` (no summary, no children,
+    /// no skips, no failures) so a truly-unknown top-level id still 404s.
+    fn erase_summary_only_node<'a>(
+        conn: &'a mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        now: DateTime<Utc>,
+        visited: &'a mut HashSet<Uuid>,
+    ) -> OptEraseFuture<'a> {
+        Box::pin(async move {
+            let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+            let (children, skipped_children, failures) =
+                cascade_children(conn, exec_id, now, visited).await?;
+            if !summary_scrubbed
+                && children.is_empty()
+                && skipped_children.is_empty()
+                && failures.is_empty()
+            {
+                return Ok(None);
+            }
+            Ok(Some(EraseOutcome {
+                execution_id: exec_id.to_string(),
+                events_scrubbed: 0,
+                fields_tombstoned: 0,
+                execution_row_scrubbed: false,
+                summary_scrubbed,
+                signals_scrubbed: 0,
+                completion_deliveries_scrubbed: 0,
+                dead_letters_scrubbed: 0,
+                children,
+                skipped_children,
+                failures,
+            }))
+        })
     }
 
     /// Scrub event rows for one execution; return `(events_scrubbed, fields_tombstoned)`.
@@ -388,65 +456,120 @@ mod db {
         Ok((events_scrubbed, fields_tombstoned))
     }
 
-    /// Cascade erasure to child executions; return (children, skipped, failures).
-    async fn cascade_to_children(
+    /// Collect child execution ids from BOTH the live-execution table and the
+    /// summary table (issue #752), deduped and in a stable order.
+    ///
+    /// A terminal child is independently retention-eligible, so by the time a
+    /// parent is erased a child may exist as a live row, as a summary-only row,
+    /// or (transiently) neither. Unioning both sources is what lets the erase
+    /// cascade reach a child that was already demoted into a summary and had its
+    /// own execution row collected.
+    async fn collect_child_ids(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> HarvestResult<(Vec<EraseOutcome>, Vec<SkippedChild>, Vec<EraseFailure>)> {
-        let child_ids = harvest_workflow_executions::table
+    ) -> HarvestResult<Vec<Uuid>> {
+        let exec_children = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::parent_id.eq(Some(exec_id.as_uuid())))
             .select(harvest_workflow_executions::id)
             .load::<Uuid>(conn)
             .await
             .map_err(database_error)?;
+        let summary_children = harvest_execution_summaries::table
+            .filter(harvest_execution_summaries::parent_id.eq(Some(exec_id.as_uuid())))
+            .select(harvest_execution_summaries::execution_id)
+            .load::<Uuid>(conn)
+            .await
+            .map_err(database_error)?;
+
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let mut ids = Vec::with_capacity(exec_children.len() + summary_children.len());
+        for id in exec_children.into_iter().chain(summary_children) {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Cascade erasure to child executions AND child summaries; return
+    /// (children, skipped, failures).
+    ///
+    /// For each child id (from either source, deduped): a live terminal,
+    /// non-held execution row is scrubbed and recursed; a non-terminal or held
+    /// row is skipped; a child with no execution row is a summary-only node
+    /// whose summary (and any summarized grandchildren) is scrubbed recursively.
+    async fn cascade_children(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        now: DateTime<Utc>,
+        visited: &mut HashSet<Uuid>,
+    ) -> HarvestResult<(Vec<EraseOutcome>, Vec<SkippedChild>, Vec<EraseFailure>)> {
+        let child_ids = collect_child_ids(conn, exec_id).await?;
 
         let mut children = Vec::new();
         let mut skipped_children = Vec::new();
         let mut failures = Vec::new();
         for child_uuid in child_ids {
+            // Guard against diamonds / pathological parent_id cycles.
+            if !visited.insert(child_uuid) {
+                continue;
+            }
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
             // Re-read state + hold under a FOR UPDATE row lock (issue #747 MINOR
             // 2a): the parent's erase tx only locks the parent, so a hold placed
             // directly on this child after the unlocked list read above must
             // still be caught. Locking here serializes against `set_legal_hold`.
-            let (child_state, set_at, until, reason) =
-                match load_erase_gate_row(conn, child_exec_id).await {
-                    Ok(row) => row,
-                    Err(e) => {
-                        failures.push(EraseFailure {
+            match load_erase_gate_row(conn, child_exec_id).await {
+                Ok((child_state, set_at, until, reason)) => {
+                    if !is_terminal_state(&child_state) {
+                        skipped_children.push(SkippedChild {
                             execution_id: child_exec_id.to_string(),
-                            reason: e.to_string(),
+                            state: child_state,
+                            reason: None,
                         });
                         continue;
                     }
-                };
-            if !is_terminal_state(&child_state) {
-                skipped_children.push(SkippedChild {
-                    execution_id: child_exec_id.to_string(),
-                    state: child_state,
-                    reason: None,
-                });
-                continue;
-            }
-            // A held child is a deliberate SKIP, not a failure (issue #747 MINOR
-            // 2b): its events are left intact while the parent and other
-            // children erase normally.
-            if crate::retention::legal_hold_active(set_at, until, now) {
-                let hold_reason = reason.as_deref().unwrap_or("no reason recorded");
-                skipped_children.push(SkippedChild {
-                    execution_id: child_exec_id.to_string(),
-                    state: child_state,
-                    reason: Some(format!("legal hold ({hold_reason})")),
-                });
-                continue;
-            }
-            match erase_single_execution(conn, child_exec_id).await {
-                Ok(outcome) => children.push(outcome),
-                Err(e) => failures.push(EraseFailure {
-                    execution_id: child_exec_id.to_string(),
-                    reason: e.to_string(),
-                }),
+                    // A held child is a deliberate SKIP, not a failure (issue
+                    // #747 MINOR 2b): its events are left intact while the parent
+                    // and other children erase normally.
+                    if crate::retention::legal_hold_active(set_at, until, now) {
+                        let hold_reason = reason.as_deref().unwrap_or("no reason recorded");
+                        skipped_children.push(SkippedChild {
+                            execution_id: child_exec_id.to_string(),
+                            state: child_state,
+                            reason: Some(format!("legal hold ({hold_reason})")),
+                        });
+                        continue;
+                    }
+                    match erase_child_execution_node(conn, child_exec_id, now, visited).await {
+                        Ok(outcome) => children.push(outcome),
+                        Err(e) => failures.push(EraseFailure {
+                            execution_id: child_exec_id.to_string(),
+                            reason: e.to_string(),
+                        }),
+                    }
+                }
+                // No execution row: a summary-only child (issue #752, AC6). Its
+                // execution row was already retention-collected; scrub its
+                // summary and any summarized grandchildren.
+                Err(HarvestError::NotFound(_)) => {
+                    match erase_summary_only_node(conn, child_exec_id, now, visited).await {
+                        // `None` = the summary vanished between `collect_child_ids`
+                        // and here (a concurrent GC race): nothing to do.
+                        Ok(None) => {}
+                        Ok(Some(outcome)) => children.push(outcome),
+                        Err(e) => failures.push(EraseFailure {
+                            execution_id: child_exec_id.to_string(),
+                            reason: e.to_string(),
+                        }),
+                    }
+                }
+                Err(e) => {
+                    failures.push(EraseFailure {
+                        execution_id: child_exec_id.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
             }
         }
         Ok((children, skipped_children, failures))
@@ -489,41 +612,18 @@ mod db {
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
     }
 
-    async fn erase_single_execution_inner(
+    /// Scrub a single execution node's own data (events, row columns, signals,
+    /// completion deliveries, CALLBACK dead letters) and cascade to its
+    /// children. Does NOT check the terminal/hold gate — the caller
+    /// (`erase_top_level` for the top node, `cascade_children` for a child) has
+    /// already gated. `summary_scrubbed` is left `false`; the caller sets it.
+    async fn scrub_execution_node(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
+        now: DateTime<Utc>,
+        visited: &mut HashSet<Uuid>,
     ) -> HarvestResult<EraseOutcome> {
-        let now = chrono::Utc::now();
-
-        // ── 1. Load & lock the execution row, check terminal + hold gates ─────
-        let (state, legal_hold_set_at, legal_hold_until, legal_hold_reason) =
-            load_erase_gate_row(conn, exec_id).await?;
-
-        if !is_terminal_state(&state) {
-            return Err(HarvestError::Config(format!(
-                "workflow execution {exec_id} is not in a terminal state \
-                 (current state: {state}); payload erasure is only permitted \
-                 for terminal executions"
-            )));
-        }
-
-        // Legal hold gate (issue #747): a held execution's history is exempt
-        // from PII erasure until the hold is released or expires. Rejected with
-        // `HarvestError::Config` (→ HTTP 409 via `conflict_from`) naming the
-        // active hold so the operator knows why it was blocked. (Children under
-        // a hold are reclassified as SKIPPED, not rejected — see
-        // `cascade_to_children`; this top-level gate rejects a direct erase of a
-        // held execution.)
-        if crate::retention::legal_hold_active(legal_hold_set_at, legal_hold_until, now) {
-            let reason = legal_hold_reason.as_deref().unwrap_or("no reason recorded");
-            return Err(HarvestError::Config(format!(
-                "workflow execution {exec_id} is under legal hold \
-                 (reason: {reason}); payload erasure rejected until the hold \
-                 is released"
-            )));
-        }
-
-        // ── 2. Scrub events, execution row, signals ───────────────────────────
+        // ── Scrub events, execution row, signals ──────────────────────────────
         let (events_scrubbed, fields_tombstoned) = scrub_events(conn, exec_id).await?;
         let tombstone = erasure_tombstone();
         diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
@@ -586,9 +686,9 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        // ── 3. Cascade to terminal children ───────────────────────────────────
+        // ── Cascade to child executions AND child summaries ───────────────────
         let (children, skipped_children, failures) =
-            cascade_to_children(conn, exec_id, now).await?;
+            cascade_children(conn, exec_id, now, visited).await?;
 
         Ok(EraseOutcome {
             execution_id: exec_id.to_string(),

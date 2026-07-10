@@ -5955,6 +5955,9 @@ pub(crate) struct SummaryListFilters {
     pub(crate) completed_after: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) completed_before: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) cursor: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    /// Sort direction (issue #752, AC4 — parity with `GET /workflows`). Defaults
+    /// to `Desc` (newest-first).
+    pub(crate) order: WorkflowSortOrder,
 }
 
 /// Parse `GET /workflows/summaries` query params (issue #752).
@@ -6048,6 +6051,19 @@ pub(crate) fn parse_summary_filters(
                 let decoded = parse_workflow_cursor(value.trim())?;
                 filters.cursor = Some((decoded.created_at, decoded.exec_id));
             }
+            "order" => {
+                // AC4 parity with `GET /workflows`: accept only `asc`/`desc`,
+                // 400 on anything else (never a silent fallback to desc).
+                filters.order = match value.trim().to_ascii_lowercase().as_str() {
+                    "asc" => WorkflowSortOrder::Asc,
+                    "desc" => WorkflowSortOrder::Desc,
+                    other => {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid order '{other}'; expected 'asc' or 'desc'"
+                        )));
+                    }
+                };
+            }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
             }
@@ -6126,6 +6142,7 @@ async fn load_summaries_from_shards(
     use autumn_harvest::retention::{SummaryQuery, list_execution_summaries};
 
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let ascending = filters.order == WorkflowSortOrder::Asc;
     let query = SummaryQuery {
         workflow_name: filters.workflow_name.clone(),
         workflow_id: filters.workflow_id.clone(),
@@ -6134,6 +6151,7 @@ async fn load_summaries_from_shards(
         completed_before: filters.completed_before,
         search_attrs: filters.search_attrs.clone(),
         cursor: filters.cursor,
+        ascending,
     };
     // Over-fetch one extra row per shard so the merge can detect a next page.
     let probe_limit = filters.limit.saturating_add(1);
@@ -6147,13 +6165,22 @@ async fn load_summaries_from_shards(
         rows.append(&mut shard_rows);
     }
 
-    // Newest-first total order; tie-break on execution_id for stability.
-    rows.sort_by(|left, right| {
-        right
-            .completed_at
-            .cmp(&left.completed_at)
-            .then_with(|| right.execution_id.cmp(&left.execution_id))
-    });
+    // Total order in the requested direction; tie-break on execution_id for
+    // stability across the cross-shard merge.
+    if ascending {
+        rows.sort_by(|left, right| {
+            left.completed_at
+                .cmp(&right.completed_at)
+                .then_with(|| left.execution_id.cmp(&right.execution_id))
+        });
+    } else {
+        rows.sort_by(|left, right| {
+            right
+                .completed_at
+                .cmp(&left.completed_at)
+                .then_with(|| right.execution_id.cmp(&left.execution_id))
+        });
+    }
 
     let limit = usize::try_from(filters.limit).unwrap_or(usize::MAX);
     let next_cursor = if limit > 0 && rows.len() > limit {

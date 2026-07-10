@@ -208,7 +208,7 @@
     {
       "method": "GET",
       "path": "/workflows/summaries",
-      "category": "admin",
+      "category": "workflow",
       "read_only": true,
       "description": "List tiered/summary-retention execution summaries (issue #752): compact, queryable rows the retention janitor demotes a hard-deleted terminal execution into instead of losing it entirely. Admin-guarded (summaries may carry retained/redacted payloads). Cross-shard fan-out with the same keyset-cursor pagination contract as GET /workflows (issue #498), ordered by (completed_at DESC, execution_id DESC). Each item carries summarized:true and history_available:false so it is unambiguously distinguishable from a live execution. An unreachable shard fails the call (matching GET /workflows).",
       "params": [
@@ -261,6 +261,12 @@
           "in": "query",
           "required": false,
           "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Sort direction: 'desc' (default, newest-first) or 'asc'. Any other value returns 400. Threaded through both the ordering and the keyset cursor comparison, matching GET /workflows (issue #498)."
         }
       ],
       "request_body": null,

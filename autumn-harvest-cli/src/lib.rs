@@ -805,6 +805,9 @@ enum WorkflowCommand {
         /// Opaque keyset pagination cursor returned by the previous response.
         #[arg(long)]
         cursor: Option<String>,
+        /// Sort direction: `desc` (default, newest-first) or `asc`.
+        #[arg(long, value_parser = ["asc", "desc"])]
+        order: Option<String>,
         /// Print the raw JSON API payload instead of a human table.
         #[arg(long)]
         json: bool,
@@ -3840,6 +3843,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             search_attr,
             limit,
             cursor,
+            order,
             json: _,
         } => Ok(ApiRequest::get(build_summary_list_path(
             workflow_name.as_deref(),
@@ -3850,6 +3854,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             search_attr,
             *limit,
             cursor.as_deref(),
+            order.as_deref(),
         )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
@@ -5389,6 +5394,7 @@ fn build_summary_list_path(
     search_attrs: &[String],
     limit: Option<i64>,
     cursor: Option<&str>,
+    order: Option<&str>,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(name) = workflow_name {
@@ -5417,6 +5423,9 @@ fn build_summary_list_path(
     }
     if let Some(value) = cursor {
         params.push(("cursor", value.to_string()));
+    }
+    if let Some(value) = order {
+        params.push(("order", value.to_string()));
     }
 
     if params.is_empty() {

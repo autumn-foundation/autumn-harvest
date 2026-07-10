@@ -801,6 +801,11 @@ diesel::table! {
         /// OPT-IN captured error text (capped-with-marker). NULL when payload
         /// capture is disabled.
         error         -> Nullable<Text>,
+        /// Parent execution UUID for a child-workflow summary, else NULL
+        /// (issue #752). Links a demoted child summary to its parent so the
+        /// #495 PII-erase cascade can reach it after both the child's and the
+        /// parent's execution rows are gone.
+        parent_id     -> Nullable<Uuid>,
         summarized_at -> Timestamptz,
     }
 }

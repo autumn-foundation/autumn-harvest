@@ -384,6 +384,124 @@ async fn list_paginates_with_keyset_cursor() {
     }
 }
 
+// AC4 (tie-break): summaries sharing an identical `completed_at` still page
+// exactly once across the boundary via the `execution_id` keyset tie-break —
+// no drop, no dup (issue #752 review, FIX G).
+#[tokio::test]
+async fn list_paginates_across_identical_completed_at() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    scrub(&mut conn).await;
+
+    // Four summaries all sharing the EXACT same completed_at.
+    let ts = Utc::now() - Duration::minutes(5);
+    let mut expected = Vec::new();
+    for i in 0..4 {
+        expected.push(
+            seed_summary(
+                &mut conn,
+                "tie_wf",
+                &format!("t-{i}"),
+                "COMPLETED",
+                ts,
+                None,
+                None,
+            )
+            .await,
+        );
+    }
+
+    // Walk with limit=1 so every page boundary lands between two equal
+    // `completed_at` rows — only the execution_id tie-break disambiguates.
+    let mut seen: Vec<String> = Vec::new();
+    let mut uri = "/workflows/summaries?limit=1".to_string();
+    loop {
+        let (status, body) = get_json(&app, &uri, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let page = body["summaries"].as_array().unwrap();
+        assert_eq!(page.len(), 1, "one row per page: {body}");
+        seen.push(page[0]["execution_id"].as_str().unwrap().to_string());
+        match body["next_cursor"].as_str() {
+            Some(c) => uri = format!("/workflows/summaries?limit=1&cursor={c}"),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 4, "all four rows visited");
+    let unique: std::collections::HashSet<_> = seen.iter().collect();
+    assert_eq!(
+        unique.len(),
+        4,
+        "no duplicate rows across the equal-ts boundary"
+    );
+    for id in &expected {
+        assert!(seen.contains(id), "row {id} appears exactly once");
+    }
+}
+
+// AC4 (order parity with GET /workflows): `?order=asc` reverses the direction
+// and paginates gap/dup-free; an invalid order is 400 (issue #752 review, FIX C).
+#[tokio::test]
+async fn list_order_asc_and_desc() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    for i in 0..5 {
+        seed_summary(
+            &mut conn,
+            "ord_wf",
+            &format!("o-{i}"),
+            "COMPLETED",
+            now - Duration::minutes(i64::from(i)),
+            None,
+            None,
+        )
+        .await;
+    }
+    // o-0 newest ... o-4 oldest.
+
+    // desc (default): o-0 first.
+    let (_, body) = get_json(&app, "/workflows/summaries?order=desc", true).await;
+    let items = body["summaries"].as_array().unwrap();
+    assert_eq!(items[0]["workflow_id"], json!("o-0"));
+    assert_eq!(items[4]["workflow_id"], json!("o-4"));
+
+    // asc: o-4 (oldest) first.
+    let (status, body) = get_json(&app, "/workflows/summaries?order=asc", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["summaries"].as_array().unwrap();
+    assert_eq!(items[0]["workflow_id"], json!("o-4"), "asc = oldest first");
+    assert_eq!(items[4]["workflow_id"], json!("o-0"));
+
+    // asc pagination round-trip: gap-free, dup-free, ascending.
+    let mut seen = Vec::new();
+    let mut uri = "/workflows/summaries?order=asc&limit=2".to_string();
+    loop {
+        let (_, body) = get_json(&app, &uri, true).await;
+        for r in body["summaries"].as_array().unwrap() {
+            seen.push(r["workflow_id"].as_str().unwrap().to_string());
+        }
+        match body["next_cursor"].as_str() {
+            Some(c) => uri = format!("/workflows/summaries?order=asc&limit=2&cursor={c}"),
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        vec!["o-4", "o-3", "o-2", "o-1", "o-0"],
+        "asc pagination yields oldest→newest with no gaps or dups"
+    );
+
+    // Invalid order value → 400 (never a silent fallback).
+    let (status, _) = get_json(&app, "/workflows/summaries?order=sideways", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 // AC4: the route is admin-guarded — no admin session returns 401.
 #[tokio::test]
 async fn list_requires_admin() {
