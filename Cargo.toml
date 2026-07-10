@@ -50,6 +50,7 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp", 
 # Dev / test
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
+proptest = "1.11.0"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
