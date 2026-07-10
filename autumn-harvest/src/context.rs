@@ -4440,12 +4440,25 @@ impl WorkflowContext {
         duration_secs: u64,
     ) -> HarvestResult<TimerOutcome> {
         loop {
+            // Use the CURRENT armed duration from the logical state map — the
+            // authoritative value that also produced the recorded `TimerStarted`
+            // — NOT the awaiting handle's cached `duration_secs`. A reset through
+            // `ctx.reset_timer(id, ..)` or another handle updates the state map's
+            // `Armed(dur)` without touching this handle's cached field, so using
+            // the cached value would arm the live deadline / advance the virtual
+            // clock for a duration history never recorded (Codex P2 round 8, issue
+            // #768). The `Cancelled` state resolves in the NoMatch arm below before
+            // this value is consulted; the param is a belt-and-braces fallback for
+            // the (unreachable via `start_timer`) no-entry case.
+            let armed_duration = self
+                .timer_logically_armed(timer_id)
+                .unwrap_or(duration_secs);
             match self.match_history(|m| m.match_timer_or_cancel(timer_id)) {
                 TimerFireMatch::Fired => {
                     // Advance the virtual clock so ctx.now() reflects elapsed
                     // time (mirrors ctx.timer()).
                     #[cfg(any(test, feature = "testing"))]
-                    self.advance_timer_clock(duration_secs);
+                    self.advance_timer_clock(armed_duration);
                     // Clear the Armed logical state so a subsequent
                     // start_timer(id, ..) reusing this id (a sliding-window /
                     // idle-session LOOP: arm; await→Fired; arm again — possibly
@@ -4482,7 +4495,7 @@ impl WorkflowContext {
                     // from `start_timer`.
                     self.push_command(WorkflowCommand::ArmTimer {
                         timer_id: TimerId::new(timer_id),
-                        duration_secs,
+                        duration_secs: armed_duration,
                         for_await: true,
                     });
                     // Park: the armed timer wakes the task on fire (or a cancel

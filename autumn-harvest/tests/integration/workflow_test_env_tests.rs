@@ -259,6 +259,28 @@ fn cancel_then_classic_timer_same_id_workflow<'a>(
     })
 }
 
+/// (Codex P2 round 8, issue #768 — FIX A) Arm `idle` at 300s via a handle, then
+/// reset it to 600s through `ctx.reset_timer` (NOT the handle), and await the
+/// original handle. `await_fire()` must use the CURRENT armed duration (600) —
+/// read from the logical state map — for the live deadline AND the virtual
+/// clock, NOT the handle's stale cached 300. Before the fix the handle's cached
+/// 300 armed the live deadline / advanced the clock even though the recorded
+/// `TimerStarted` was 600.
+fn reset_via_ctx_then_await_handle_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        // Reset through the CONTEXT, not the handle — the handle's cached
+        // duration stays 300 while the authoritative armed duration becomes 600.
+        ctx.reset_timer("idle", 600).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        let now = ctx.now().timestamp();
+        Ok(json!({ "outcome": format!("{outcome:?}"), "now": now }))
+    })
+}
+
 /// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
 /// activity. Exercises that the test harness persists the pre-suspension
 /// `SideEffectRecorded` event so the next replay iteration does not see drift.
@@ -744,6 +766,105 @@ async fn test_reset_then_fire() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "replay self-check failed:\n{report}"
     );
+}
+
+/// (Codex P2 round 8, issue #768 — FIX A) A reset performed through
+/// `ctx.reset_timer` (or another handle) must be honoured by a subsequent
+/// `await_fire()` on the ORIGINAL handle: the live deadline and the virtual
+/// clock must use the CURRENT armed duration (600) from the logical state map,
+/// not the awaiting handle's stale cached 300. Before the fix the clock
+/// advanced by 300 and disagreed with the recorded `TimerStarted(idle, 600)`.
+#[tokio::test]
+async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env
+        .run(reset_via_ctx_then_await_handle_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    // The final recorded TimerStarted(idle) is the reset's 600.
+    let last_ts = outcome.events().iter().rev().find_map(|e| match e {
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs,
+        } if timer_id.as_str() == "idle" => Some(*duration_secs),
+        _ => None,
+    });
+    assert_eq!(
+        last_ts,
+        Some(600),
+        "final TimerStarted(idle) must be the reset's 600: {:?}",
+        outcome.events()
+    );
+
+    // The virtual clock (ctx.now()) advanced by the CURRENT armed 600, not the
+    // stale handle's 300. This is the FIX A behaviour.
+    let v = outcome.result.as_ref().unwrap();
+    let now = v["now"].as_i64().unwrap();
+    assert_eq!(
+        now - start.timestamp(),
+        600,
+        "ctx.now() must advance by the current armed 600, not the stale handle 300"
+    );
+
+    // final_now()/elapsed() (the harness virtual clock) must AGREE with the
+    // workflow-observed ctx.now() and count only the fired 600 — not 300+600.
+    assert_eq!(
+        outcome.final_now().timestamp(),
+        now,
+        "final_now() must match the workflow-observed ctx.now()"
+    );
+    assert_eq!(
+        outcome.elapsed(),
+        chrono::Duration::seconds(600),
+        "elapsed() must be the fired 600, not the cancelled+fired sum (900)"
+    );
+
+    let report = outcome
+        .replay_check(reset_via_ctx_then_await_handle_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// (Codex P2 round 8, issue #768 — FIX B) The harness virtual clock
+/// (`final_now`/`elapsed`) must advance ONLY for timers that actually fired.
+/// A reset records `[TimerStarted(300), TimerCancelled, TimerStarted(300),
+/// TimerFired]`; only the second (fired) 300 counts — NOT the cancelled first
+/// arm. Before the fix `final_now` summed every `TimerStarted` → 600.
+#[tokio::test]
+async fn test_final_now_counts_only_fired_arm_not_cancelled_reset_arm() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env.run(cancellable_reset_once_workflow, json!(null)).await;
+    assert_eq!(outcome.result, Ok(json!("Fired")));
+    assert_eq!(
+        outcome.elapsed(),
+        chrono::Duration::seconds(300),
+        "virtual clock must advance only for the FIRED arm (300), not the \
+         cancelled-arm + fired-arm sum (600)"
+    );
+    assert_eq!(outcome.final_now(), start + chrono::Duration::seconds(300));
+}
+
+/// (Codex P2 round 8, issue #768 — FIX B) A cancelled timer never fired, so the
+/// harness virtual clock must not advance for its `TimerStarted` at all. Before
+/// the fix `final_now` counted the cancelled arm's 300.
+#[tokio::test]
+async fn test_final_now_does_not_advance_for_a_cancelled_never_fired_timer() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env.run(cancellable_cancel_workflow, json!(null)).await;
+    assert_eq!(outcome.result, Ok(json!("cancelled")));
+    assert_eq!(
+        outcome.elapsed(),
+        chrono::Duration::zero(),
+        "a cancelled (never-fired) timer must not advance the virtual clock"
+    );
+    assert_eq!(outcome.final_now(), start);
 }
 
 #[tokio::test]

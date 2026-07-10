@@ -83,3 +83,55 @@ Full local gate: `cargo fmt --all -- --check` clean; `cargo clippy -p autumn-har
 | `store.rs` / `erase.rs` / `executor.rs` | test fixtures / event-type name only | no | NA |
 
 RED→GREEN evidence: the two timeline tests FAILED under `--no-default-features --lib` with FIX B absent (`Pending`/`Completed` != `Cancelled`), then GREEN once the arm was added; the worker `plan_timer_lifecycle_pure_excludes_…` test FAILED under `--features db --lib` with the cancelled-exclusion clause disabled (`armed_indices == [0]`), then GREEN once restored. No new `WorkflowEvent` variant, no migration, no replay-determinism change — a same-batch cancel now wakes immediately and a cancelled timer becomes a closed timeline step.
+
+**Post-review hardening round 8 (Codex 2× P2, issue #768):** two genuine
+duration/clock-accounting bugs, TDD red→green.
+
+- **FIX A — `await_fire` used the awaiting handle's stale cached duration**
+  (`context.rs` `await_timer_fire`). A `TimerHandle` caches `duration_secs` at
+  creation; a reset through `ctx.reset_timer(id, secs)` (or another handle for the
+  same id) updates the logical state map's `Armed(dur)` — which is what records the
+  arm's `TimerStarted` — **without** touching the awaiting handle's cached field.
+  `await_fire` then used the stale cached value to arm the live `harvest_timers`
+  deadline and advance the test virtual clock, so `h = ctx.start_timer("idle",
+  300); ctx.reset_timer("idle", 600); h.await_fire()` recorded `TimerStarted(600)`
+  for replay but armed the deadline / advanced the clock for 300s. Fix:
+  `await_timer_fire` now reads the CURRENT armed duration from the logical state
+  map (`timer_logically_armed`) — the authoritative value that produced the
+  recorded `TimerStarted` — for both the `for_await: true` `ArmTimer` command
+  (live deadline) and `advance_timer_clock` (virtual clock); the handle's cached
+  `duration_secs` is now only a belt-and-braces fallback for the (unreachable via
+  `start_timer`) no-state-entry case. The state map's `Armed(dur)` is thus the
+  single authoritative source for the live deadline / recorded `TimerStarted` /
+  virtual clock everywhere post-arm; the handle's cached value is never used for a
+  live/recorded deadline when a state entry exists.
+
+- **FIX B — the WorkflowTestEnv virtual clock counted non-fired arms**
+  (`testing.rs` `TestRunOutcome::final_now`/`elapsed`; the round-7 "NA" assessment
+  above was WRONG). `final_now` summed every `TimerStarted { duration_secs }`, so a
+  cancellable timer that was cancelled or repeatedly reset advanced the virtual
+  clock for arms the workflow never observed firing, disagreeing with `ctx.now()`
+  after an `await_fire()` (which advances only on a real fire). Fix: new pure
+  `fired_timer_duration_secs(events)` sums only `TimerStarted`s paired with a
+  matching `TimerFired` (per id, FIFO; a `TimerCancelled` discards the earliest
+  pending arm uncounted). A cancelled timer now advances the clock by 0; a
+  reset-then-fire advances only by the fired arm. The classic `ctx.timer` path
+  always fires, so every one of its `TimerStarted` pairs with a `TimerFired` and
+  the sum is unchanged (`test_billing_loop_dates_and_elapsed`/`test_365_days`
+  green).
+
+Audit (context.rs/worker.rs/testing.rs duration & clock reads):
+
+| Site | Duration source | Correct? |
+|---|---|---|
+| `start_timer` / `reset_timer` fresh arm | call arg (the fresh arm's own duration) → `match_timer_arm` + `ArmTimer` cmd + `Armed(dur)` state | ✓ arg IS the fresh arm's duration |
+| `start_timer` duplicate-active | `armed_duration` from state map | ✓ round-5 |
+| `timer_logically_armed` | reads `Armed(dur)` from state map | ✓ authoritative source |
+| `await_timer_fire` | **now** state map `Armed(dur)` (param = fallback) → deadline + clock | ✓ **FIX A** |
+| `TimerHandle::{duration_secs,await_fire}` cached field | informational only; ignored by `await_timer_fire` when a state entry exists | ✓ |
+| `timer()` classic / `receive_signal_timeout` / `race()` timer | call arg (single always-fresh, no cancellable state) | ✓ |
+| `worker.rs` `arm_timer_events` (for_await:false) | `ArmTimer` cmd duration → `TimerStarted` | ✓ = fresh arm duration |
+| `worker.rs` `plan_timer_lifecycle` (for_await:true) | `ArmTimer` cmd duration → row `fires_at` | ✓ cmd now carries `armed_duration` (FIX A) |
+| `testing.rs` `final_now`/`elapsed` | **now** `fired_timer_duration_secs` (fired-only) | ✓ **FIX B** |
+
+No new `WorkflowEvent` variant, no migration, no replay-determinism change.

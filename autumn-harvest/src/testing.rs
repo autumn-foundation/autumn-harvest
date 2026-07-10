@@ -2174,6 +2174,50 @@ pub struct TestRunOutcome {
     start_time: DateTime<Utc>,
 }
 
+/// Sum the durations of durable timers that **actually fired** in `events`
+/// (issue #768, Codex P2 round 8).
+///
+/// Each `TimerStarted` for an id is enqueued (FIFO); a `TimerFired` for that id
+/// dequeues the earliest pending arm and adds its duration; a `TimerCancelled`
+/// dequeues (and discards) the earliest pending arm without counting it. In a
+/// valid history an id has at most one pending arm at a time (arm → fire/cancel
+/// → re-arm → …), so this exactly counts the fired arms and excludes cancelled /
+/// reset ones. The classic `ctx.timer` path always fires, so its every
+/// `TimerStarted` pairs with a `TimerFired` and the total is unchanged.
+fn fired_timer_duration_secs(events: &[WorkflowEvent]) -> u64 {
+    use std::collections::{HashMap, VecDeque};
+    let mut pending: HashMap<&str, VecDeque<u64>> = HashMap::new();
+    let mut total: u64 = 0;
+    for event in events {
+        match event {
+            WorkflowEvent::TimerStarted {
+                timer_id,
+                duration_secs,
+            } => {
+                pending
+                    .entry(timer_id.as_str())
+                    .or_default()
+                    .push_back(*duration_secs);
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                if let Some(secs) = pending
+                    .get_mut(timer_id.as_str())
+                    .and_then(VecDeque::pop_front)
+                {
+                    total = total.saturating_add(secs);
+                }
+            }
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                if let Some(queue) = pending.get_mut(timer_id.as_str()) {
+                    queue.pop_front();
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
 impl TestRunOutcome {
     /// Returns a reference to the ordered event log.
     ///
@@ -2186,16 +2230,19 @@ impl TestRunOutcome {
 
     /// The virtual "now" at the end of the run (issue #526).
     ///
-    /// Computed as `start_time + Σ duration_secs` over all `TimerStarted` events
-    /// in the recorded history — the authoritative set of durable timers that
-    /// fired along the taken path.  Signal-preempted timers produce no
-    /// `TimerStarted` event and therefore do not advance this clock.
+    /// Computed as `start_time + Σ duration_secs` over the durable timers that
+    /// **actually fired** along the taken path — every `TimerStarted` paired with
+    /// a matching `TimerFired` (per id, FIFO). A `TimerStarted` that was cancelled
+    /// or reset (a cancellable timer, issue #768) never fired, so its duration is
+    /// **excluded** — otherwise a cancelled/reset arm would advance the virtual
+    /// clock even though the workflow never observed its fire, disagreeing with
+    /// `ctx.now()` (Codex P2 round 8). Signal-preempted timers produce no
+    /// `TimerStarted` event and likewise do not advance this clock. The classic
+    /// `ctx.timer` path always fires, so every one of its `TimerStarted` events
+    /// pairs with a `TimerFired` and the sum is unchanged.
     #[must_use]
     pub fn final_now(&self) -> DateTime<Utc> {
-        let total_secs: u64 = self.events.iter().fold(0u64, |acc, e| match e {
-            WorkflowEvent::TimerStarted { duration_secs, .. } => acc.saturating_add(*duration_secs),
-            _ => acc,
-        });
+        let total_secs: u64 = fired_timer_duration_secs(&self.events);
         self.start_time
             + chrono::Duration::seconds(
                 i64::try_from(total_secs)
@@ -3443,9 +3490,57 @@ impl WorkflowTestEnv {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
+    use crate::types::TimerId;
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    fn ts(id: &str, secs: u64) -> WorkflowEvent {
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new(id),
+            duration_secs: secs,
+        }
+    }
+    fn tf(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(id),
+        }
+    }
+    fn tc(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new(id),
+        }
+    }
+
+    #[test]
+    fn fired_timer_duration_counts_only_fired_arms() {
+        // Classic timer: every TimerStarted fires — sum unchanged.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("t1", 30), tf("t1"), ts("t2", 5), tf("t2")]),
+            35
+        );
+        // Reset (cancellable): TS(300)[cancelled], TS(600)[fired] → only 600.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("idle", 300), tc("idle"), ts("idle", 600), tf("idle")]),
+            600
+        );
+        // Reset to same duration: only the fired arm counts (300, not 600).
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("idle", 300), tc("idle"), ts("idle", 300), tf("idle")]),
+            300
+        );
+        // Cancelled, never fired → 0.
+        assert_eq!(fired_timer_duration_secs(&[ts("idle", 300), tc("idle")]), 0);
+        // An older arm fired, a newer arm cancelled → only the fired one.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("a", 300), tf("a"), ts("a", 600), tc("a")]),
+            300
+        );
+        // Signal-preempted timer records no TimerStarted → 0.
+        assert_eq!(fired_timer_duration_secs(&[]), 0);
+        // A lone TimerFired with no matching TimerStarted contributes nothing.
+        assert_eq!(fired_timer_duration_secs(&[tf("ghost")]), 0);
+    }
 
     fn simple_workflow<'a>(
         _ctx: &'a crate::context::WorkflowContext,
