@@ -1904,29 +1904,44 @@ async fn run_local_activity_inline(
         // retryable typed HandlerPanic Err so it flows through the existing
         // Err branch (LocalActivityFailed retry path), honouring the retry
         // policy exactly like `Err(String)`.
-        let caught = {
-            use futures::FutureExt as _;
-            tokio::time::timeout(
-                per_attempt_timeout,
-                std::panic::AssertUnwindSafe((handler)(&ctx, run.input.clone())).catch_unwind(),
-            )
-            .await
-        };
-        let result = match caught {
-            Ok(Ok(inner)) => inner,
-            Ok(Err(panic_payload)) => {
+        // Issue #782 (PR #1012 review): contain a panic during future
+        // *construction* too — a hand-written local-activity handler may do
+        // synchronous work before returning its boxed future, and that would
+        // escape the poll-time `catch_unwind` below. Both a construction panic and
+        // a poll panic converge on the same retryable typed HandlerPanic Err and
+        // emit `record_activity_panic` exactly once per panicking attempt.
+        let result = match crate::error::catch_construct(|| (handler)(&ctx, run.input.clone())) {
+            Err(message) => {
                 registry
                     .telemetry()
                     .metrics
                     .record_activity_panic(&run.name, queue_name);
-                Err(handler_panic_activity_envelope(
-                    crate::error::panic_message(panic_payload),
-                ))
+                Err(handler_panic_activity_envelope(message))
             }
-            Err(_elapsed) => Err(format!(
-                "local activity '{}' timed out after {:?}",
-                run.name, per_attempt_timeout
-            )),
+            Ok(fut) => {
+                use futures::FutureExt as _;
+                let caught = tokio::time::timeout(
+                    per_attempt_timeout,
+                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                )
+                .await;
+                match caught {
+                    Ok(Ok(inner)) => inner,
+                    Ok(Err(panic_payload)) => {
+                        registry
+                            .telemetry()
+                            .metrics
+                            .record_activity_panic(&run.name, queue_name);
+                        Err(handler_panic_activity_envelope(
+                            crate::error::panic_message(panic_payload),
+                        ))
+                    }
+                    Err(_elapsed) => Err(format!(
+                        "local activity '{}' timed out after {:?}",
+                        run.name, per_attempt_timeout
+                    )),
+                }
+            }
         };
 
         match result {
@@ -6193,16 +6208,31 @@ async fn process_activity_task(
     // future object, so every poll — including the grace re-poll — is contained).
     // Without this the panic unwinds past the DB state-transition boundary and
     // leaves the task row stuck RUNNING on a live worker.
+    // Issue #782 (PR #1012 review): also contain a panic during future
+    // *construction* — a hand-written activity handler may do synchronous work
+    // before returning its boxed future, and that would escape the poll-time
+    // `catch_unwind`. On a construction panic, resolve immediately to the same
+    // retryable typed HandlerPanic envelope; it flows through the identical
+    // downstream path (cancellation adapter → `handle_activity_result`), which
+    // emits `record_activity_panic` once by inspecting the envelope's error type,
+    // so neither the metric nor the circuit-breaker treatment differs from a
+    // poll-phase panic.
     let mut activity_future = {
         use futures::FutureExt as _;
-        std::panic::AssertUnwindSafe((activity.handler)(&ctx, task.input.clone()))
-            .catch_unwind()
-            .map(|caught| match caught {
-                Ok(inner) => inner,
-                Err(panic_payload) => Err(handler_panic_activity_envelope(
-                    crate::error::panic_message(panic_payload),
-                )),
-            })
+        match crate::error::catch_construct(|| (activity.handler)(&ctx, task.input.clone())) {
+            Ok(fut) => std::panic::AssertUnwindSafe(fut)
+                .catch_unwind()
+                .map(|caught| match caught {
+                    Ok(inner) => inner,
+                    Err(panic_payload) => Err(handler_panic_activity_envelope(
+                        crate::error::panic_message(panic_payload),
+                    )),
+                })
+                .left_future(),
+            Err(message) => {
+                futures::future::ready(Err(handler_panic_activity_envelope(message))).right_future()
+            }
+        }
     };
     let cancellation_observer = observe_task_cancellation(pool, task.id);
     tokio::pin!(cancellation_observer);
@@ -13892,6 +13922,47 @@ mod tests {
         assert_eq!(failure.error_type, crate::failure::ERROR_TYPE_HANDLER_PANIC);
         assert_eq!(failure.message, "boom");
         assert!(!failure.non_retryable);
+    }
+
+    #[test]
+    fn activity_handler_construction_panic_is_contained_as_retryable_handler_panic() {
+        // Issue #782 / PR #1012 review: a hand-written activity handler `fn` (the
+        // supported public surface) that panics while *constructing* its future —
+        // synchronous work before returning `Box::pin(...)` — is caught by the
+        // dispatch sites' `catch_construct` guard, which the poll-time
+        // `catch_unwind` cannot reach. Both the regular- and local-activity paths
+        // then feed the extracted message into `handler_panic_activity_envelope`,
+        // so a construction panic and a poll panic are byte-identical downstream:
+        // the same retryable typed HandlerPanic failure (which
+        // `handle_activity_result` counts once via the error-type check).
+        fn constructing_panic_activity(
+            _ctx: &crate::context::ActivityContext,
+            _input: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+        > {
+            panic!("boom during activity future construction");
+        }
+
+        let handler: crate::info::ActivityHandlerFn = constructing_panic_activity;
+        let ctx = crate::context::ActivityContext::new_test();
+        // Match rather than `.expect_err()`: the `Ok` future variant is not
+        // `Debug`, so `.expect_err()` would not compile.
+        let message = match crate::error::catch_construct(|| handler(&ctx, serde_json::Value::Null))
+        {
+            Ok(_fut) => panic!("a construction-phase panic must be caught, not produce a future"),
+            Err(message) => message,
+        };
+        assert_eq!(message, "boom during activity future construction");
+
+        let payload = handler_panic_activity_envelope(message);
+        let failure = crate::failure::parse_error_payload_full(&payload);
+        assert_eq!(failure.error_type, crate::failure::ERROR_TYPE_HANDLER_PANIC);
+        assert_eq!(failure.message, "boom during activity future construction");
+        assert!(
+            !failure.non_retryable,
+            "a contained construction panic remains retryable, like a poll panic"
+        );
     }
 
     /// Property tests for the private [`nd_block_backoff`] helper (issue #603).

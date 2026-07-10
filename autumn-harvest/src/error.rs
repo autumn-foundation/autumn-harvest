@@ -757,6 +757,32 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
+/// Contain a panic raised while **constructing** a handler future (issue #782).
+///
+/// The poll-time `catch_unwind` at each dispatch site wraps only the *future*
+/// returned by a handler `fn`. But a hand-written `WorkflowInfo`/`ActivityInfo`
+/// handler (a supported surface — the public `handler` fields,
+/// `WorkflowReplayer::register_fn`, etc.) may run synchronous work (an
+/// `unwrap()`, a `panic!()`) **before** returning its boxed future; that work
+/// runs when the handler is *called*, before the returned future is ever polled,
+/// so the poll-time guard does not cover it and the panic would otherwise unwind
+/// the spawned worker task uncaught — bypassing the `HandlerPanic` conversion and
+/// leaving the task on the poison-pill path. Wrapping the construction call here
+/// closes that gap uniformly. Macro-generated handlers put the whole body inside
+/// the returned async block, so this only ever fires for hand-written handlers.
+///
+/// Returns `Ok(fut)` with the constructed future, or `Err(message)` with the
+/// extracted panic message (via [`panic_message`]) on a construction-phase panic.
+///
+/// `AssertUnwindSafe` is sound: on a construction panic the future is never
+/// produced and any context the closure borrowed is dropped without further use.
+pub(crate) fn catch_construct<F, Fut>(construct: F) -> Result<Fut, String>
+where
+    F: FnOnce() -> Fut,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(construct)).map_err(panic_message)
+}
+
 #[cfg(feature = "db")]
 impl From<diesel::result::Error> for HarvestError {
     fn from(value: diesel::result::Error) -> Self {
@@ -792,6 +818,22 @@ mod tests {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("real panic")))
                 .unwrap_err();
         assert_eq!(panic_message(payload), "real panic");
+    }
+
+    #[test]
+    fn catch_construct_returns_the_constructed_value_when_no_panic() {
+        // Issue #782 / PR #1012 review: on the happy path the constructed value
+        // (a future, in practice) is passed through unchanged.
+        let out: Result<u32, String> = catch_construct(|| 7_u32);
+        assert_eq!(out, Ok(7));
+    }
+
+    #[test]
+    fn catch_construct_contains_a_construction_phase_panic() {
+        // A panic raised while constructing the value is caught and its message
+        // extracted, rather than unwinding the caller.
+        let out: Result<u32, String> = catch_construct(|| panic!("construct boom"));
+        assert_eq!(out, Err("construct boom".to_string()));
     }
 
     #[test]

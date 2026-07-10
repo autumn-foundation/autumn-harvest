@@ -469,6 +469,15 @@ fn panic_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
     Box::pin(async move { panic!("workflow boom") })
 }
 
+/// Workflow whose handler panics **during future construction** — the panic
+/// unwinds synchronously *before* `Box::pin(...)` is produced (issue #782 / PR
+/// #1012 review). A registered hand-written handler doing synchronous work
+/// before returning its boxed future must be contained identically to a body
+/// panic; the poll-time `catch_unwind` cannot reach it.
+fn construction_panic_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+    panic!("workflow construction boom");
+}
+
 /// Workflow that calls a single (regular) activity that stays RUNNING for a
 /// short, deterministic window before panicking (issue #782, TEST B). The
 /// deliberate delay makes the RUNNING phase reliably sampleable so the test can
@@ -997,6 +1006,92 @@ async fn workflow_panic_max_attempts_zero_is_terminal_on_first_panic() {
     assert_eq!(
         poison_dlq, 0,
         "no PoisonPill DLQ row for a contained workflow panic"
+    );
+    let tasks = load_tasks(&url, exec_id).await;
+    assert!(
+        tasks.iter().all(|t| t.crash_strikes == 0),
+        "crash_strikes stays 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 (PR #1012 review) — a workflow handler that panics during future
+// *construction* (before returning its boxed future) is contained end-to-end
+// exactly like a body panic: HandlerPanic terminal, no poison-pill, strikes 0.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_construction_phase_panic_is_contained_as_handler_panic_terminal() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "construction_panic_wf",
+        serde_json::json!({"n": 1}),
+    )
+    .await;
+
+    let metrics = Arc::new(PanicMetrics::default());
+    let registry = build_registry(
+        vec![workflow_info(
+            "construction_panic_wf",
+            construction_panic_workflow,
+        )],
+        vec![],
+        Arc::clone(&metrics),
+    );
+    // max_attempts = 0 → terminal on the first panic (fast, no re-dispatch).
+    let worker = build_worker("worker-construction-panic", Arc::clone(&registry), 0);
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    let execution = wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(15)).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task joins cleanly");
+
+    // A construction panic is a genuine panic entry: the counter fires once.
+    assert_eq!(
+        metrics.workflow_panic_count(),
+        1,
+        "a construction-phase panic must be counted as a workflow panic entry"
+    );
+
+    let history = load_history(&url, exec_id).await;
+    let workflow_failures: Vec<_> = history
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::WorkflowFailed {
+                error_type, error, ..
+            } => Some((error_type.clone(), error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(workflow_failures.len(), 1, "one terminal WorkflowFailed");
+    assert_eq!(
+        workflow_failures[0].0.as_deref(),
+        Some(ERROR_TYPE_HANDLER_PANIC),
+        "a contained construction panic must carry the HandlerPanic error type"
+    );
+    assert!(
+        workflow_failures[0]
+            .1
+            .contains("workflow construction boom"),
+        "the construction panic message must surface, got {:?}",
+        workflow_failures[0].1
+    );
+
+    assert_eq!(execution.state, "FAILED");
+
+    // The panic never reached the poison-pill path: no PoisonPill DLQ row,
+    // crash_strikes never incremented.
+    let (_total, poison_dlq) = count_dead_letters(&url, exec_id).await;
+    assert_eq!(
+        poison_dlq, 0,
+        "no PoisonPill DLQ row for a contained construction panic"
     );
     let tasks = load_tasks(&url, exec_id).await;
     assert!(

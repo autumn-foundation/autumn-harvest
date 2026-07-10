@@ -105,9 +105,17 @@ async fn run_workflow_handler_cycle(
     input: Value,
 ) -> HandlerCycleResult {
     use futures::FutureExt as _;
+    // Issue #782 (PR #1012 review): contain a panic during future *construction*.
+    // The `catch_unwind` below wraps only the future's poll; a hand-written
+    // handler that does synchronous work before returning its boxed future would
+    // panic here, before the future exists, and escape the poll-time guard.
+    let handler_fut = match crate::error::catch_construct(|| handler(ctx, input)) {
+        Ok(fut) => fut,
+        Err(message) => return HandlerCycleResult::Panicked(message),
+    };
     match tokio::time::timeout(
         SUSPENSION_TIMEOUT,
-        std::panic::AssertUnwindSafe(handler(ctx, input)).catch_unwind(),
+        std::panic::AssertUnwindSafe(handler_fut).catch_unwind(),
     )
     .await
     {
@@ -228,7 +236,21 @@ pub fn drive_query_replay(
     let flag = std::sync::Arc::new(QueryReplayWaker(std::sync::atomic::AtomicBool::new(false)));
     let waker = futures::task::waker_ref(&flag);
     let mut poll_cx = std::task::Context::from_waker(&waker);
-    let handler_fut = handler(ctx, input);
+    // Issue #782 (PR #1012 review): contain a panic during future *construction*
+    // (a hand-written handler doing synchronous work before returning its boxed
+    // future), mirroring the poll-time containment below. Query replays emit no
+    // commands and append no events, so there is nothing to roll back.
+    let handler_fut = match crate::error::catch_construct(|| handler(ctx, input)) {
+        Ok(fut) => fut,
+        Err(message) => {
+            tracing::warn!(
+                panic = %message,
+                "harvest: workflow handler panicked constructing the query replay drive; \
+                 containing as a query error (issue #782)"
+            );
+            return QueryReplayOutcome::Panicked;
+        }
+    };
     tokio::pin!(handler_fut);
 
     // `checked_add` guards against a pathologically large `timeout` overflowing
@@ -1197,6 +1219,19 @@ mod tests {
         })
     }
 
+    /// A workflow whose handler panics **during future construction** — the panic
+    /// unwinds synchronously *before* the `Box::pin(...)` future is ever produced
+    /// (issue #782 / PR #1012 review). A hand-written `WorkflowInfo::handler` may
+    /// do synchronous work before returning its boxed future; this exercises the
+    /// construction-phase `catch_construct` guard, which the poll-time
+    /// `catch_unwind` cannot reach.
+    fn construction_panicking_workflow<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        panic!("boom during workflow future construction");
+    }
+
     /// A workflow that returns an author `Err` whose error type *happens* to be
     /// the engine-reserved `HandlerPanic` string. This must NOT be treated as a
     /// contained panic (issue #782 false-positive guard).
@@ -1396,6 +1431,56 @@ mod tests {
                     "the contained panic must carry the reserved HandlerPanic error type"
                 );
                 assert_eq!(decoded.message, "boom from workflow handler");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn construction_phase_panicking_workflow_is_contained_as_handler_panic() {
+        // Issue #782 / PR #1012 review: a hand-written handler that panics while
+        // *constructing* its future (before returning the boxed future) must be
+        // contained identically to a poll-phase panic — the poll-time
+        // `catch_unwind` cannot cover it, so the construction call itself is
+        // wrapped. Proves the construction-phase containment path.
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(
+            exec_id,
+            history,
+            construction_panicking_workflow,
+            Value::Null,
+        )
+        .await;
+
+        match outcome {
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                handler_panic,
+            } => {
+                assert!(
+                    handler_panic,
+                    "a construction-phase panic must set handler_panic = true"
+                );
+                assert!(
+                    non_deterministic_details.is_none(),
+                    "a construction-phase panic is not an engine non-determinism divergence"
+                );
+                let decoded = crate::failure::decode_workflow_failure(&error);
+                assert_eq!(
+                    decoded.error_type.as_deref(),
+                    Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                    "the contained construction panic must carry the reserved HandlerPanic error type"
+                );
+                assert_eq!(decoded.message, "boom during workflow future construction");
             }
             other => panic!("expected Failed, got {other:?}"),
         }

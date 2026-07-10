@@ -1020,7 +1020,17 @@ impl WorkflowHandle {
         let waker = futures::task::waker_ref(&waker_arc);
         let mut poll_cx = std::task::Context::from_waker(&waker);
 
-        let handler_fut = (workflow_info.handler)(&ctx, execution.input.clone());
+        // Issue #782 (PR #1012 review): contain a panic during future
+        // *construction* (a hand-written handler doing synchronous work before
+        // returning its boxed future), mirroring the poll-time containment below.
+        // Query replays emit no commands and append no events — map the caught
+        // construction panic to a clean `QueryHandlerPanicked` (503).
+        let handler_fut = match crate::error::catch_construct(|| {
+            (workflow_info.handler)(&ctx, execution.input.clone())
+        }) {
+            Ok(fut) => fut,
+            Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
+        };
         tokio::pin!(handler_fut);
 
         let mut replay_result = None;
