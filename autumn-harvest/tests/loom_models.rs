@@ -124,16 +124,37 @@ fn circuit_breaker_stale_failure_cannot_retrip_a_reset_breaker() {
     });
 }
 
-/// Model 2: at most **one half-open probe** is admitted under concurrency, and
-/// the registry never panics.
+/// Model 2: at most **one dispatch is admitted** across the half-open
+/// transition under concurrency, and the registry never panics.
 ///
 /// The breaker is tripped OPEN, then after the cooldown two dispatches race for
-/// the single probe slot. Exactly one must be admitted as the probe; the other
-/// must short-circuit. This is the "single probe" safety property that keeps a
-/// recovering downstream from being hammered by a thundering herd the instant
-/// the cooldown elapses.
+/// the single probe slot. Exactly one must be *admitted* (`Allow`) and the
+/// other must *short-circuit* (`ShortCircuit`) — a regression that let both
+/// dispatches through concurrently must fail here. The single admitted dispatch
+/// must additionally carry a probe token (`is_probe == true`). Asserting the
+/// loser's `ShortCircuit` (not merely "not a probe") is what proves the
+/// thundering-herd guard: only one attempt reaches the recovering downstream.
 #[test]
 fn circuit_breaker_admits_at_most_one_half_open_probe() {
+    // Faithful classification of a dispatch decision, so the model can assert
+    // on admission (not just the probe flag). A regression that admitted both
+    // dispatches would produce two `AllowedProbe`/`AllowedNonProbe` tags and
+    // fail the "exactly one allowed" assertion below.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Outcome {
+        AllowedProbe,
+        AllowedNonProbe,
+        ShortCircuit,
+    }
+
+    fn classify(decision: DispatchDecision) -> Outcome {
+        match decision {
+            DispatchDecision::Allow { token } if token.is_probe() => Outcome::AllowedProbe,
+            DispatchDecision::Allow { .. } => Outcome::AllowedNonProbe,
+            DispatchDecision::ShortCircuit { .. } => Outcome::ShortCircuit,
+        }
+    }
+
     loom::model(|| {
         let reg = breaker(Duration::from_secs(1));
         let t0 = Instant::now();
@@ -151,26 +172,32 @@ fn circuit_breaker_admits_at_most_one_half_open_probe() {
         // After the cooldown, two dispatches race for the single probe slot.
         let probe_time = t0 + Duration::from_secs(2);
         let r1 = Arc::clone(&reg);
-        let a = loom::thread::spawn(move || {
-            matches!(
-                r1.on_dispatch("svc", probe_time),
-                DispatchDecision::Allow { token } if token.is_probe()
-            )
-        });
+        let a = loom::thread::spawn(move || classify(r1.on_dispatch("svc", probe_time)));
         let r2 = Arc::clone(&reg);
-        let b = loom::thread::spawn(move || {
-            matches!(
-                r2.on_dispatch("svc", probe_time),
-                DispatchDecision::Allow { token } if token.is_probe()
-            )
-        });
+        let b = loom::thread::spawn(move || classify(r2.on_dispatch("svc", probe_time)));
 
-        let a_probe = a.join().unwrap();
-        let b_probe = b.join().unwrap();
+        let a_outcome = a.join().unwrap();
+        let b_outcome = b.join().unwrap();
 
+        // Exactly one dispatch was admitted; the other short-circuited. This is
+        // the property Codex asked for: the loser must be *rejected*, not merely
+        // "not a probe". A regression admitting both concurrently fails here.
+        let a_allowed = a_outcome != Outcome::ShortCircuit;
+        let b_allowed = b_outcome != Outcome::ShortCircuit;
         assert!(
-            a_probe ^ b_probe,
-            "exactly one half-open probe must be admitted (a={a_probe}, b={b_probe})"
+            a_allowed ^ b_allowed,
+            "exactly one dispatch must be admitted and the other short-circuit \
+             (a={a_outcome:?}, b={b_outcome:?})"
+        );
+
+        // The single admitted dispatch must be the half-open probe (preserves
+        // the original at-most-one-probe property).
+        let admitted = if a_allowed { a_outcome } else { b_outcome };
+        assert_eq!(
+            admitted,
+            Outcome::AllowedProbe,
+            "the single admitted dispatch must carry a probe token \
+             (a={a_outcome:?}, b={b_outcome:?})"
         );
     });
 }
