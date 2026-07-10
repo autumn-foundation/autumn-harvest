@@ -208,6 +208,9 @@ jobs:
       - name: Run retention override integration tests (issue #737)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests -- --test-threads=1
+      - name: Run retention summary integration tests (issue #752)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- retention_summary_tests -- --test-threads=1
       - name: Run Docker-backed typed workflow failure integration tests (issue #767)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests -- --test-threads=1

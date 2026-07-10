@@ -188,6 +188,14 @@ pub struct EraseOutcome {
     pub fields_tombstoned: usize,
     /// Whether the execution row's own payload columns were scrubbed.
     pub execution_row_scrubbed: bool,
+    /// Whether a matching `harvest_execution_summaries` row (issue #752) had
+    /// its captured `result` and `search_attrs` tombstoned. `true` even when
+    /// the original execution row was already retention-deleted and only the
+    /// summary remained (a summary-only erase). The summary's `error` column is
+    /// deliberately left intact, consistent with the #495 stance of keeping
+    /// operational error text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_scrubbed: bool,
     /// Number of `harvest_signals` rows whose `payload` was tombstoned.
     pub signals_scrubbed: usize,
     /// Number of `harvest_completion_deliveries` rows (issue #605) whose
@@ -233,8 +241,8 @@ mod db {
 
     use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::schema::{
-        harvest_completion_deliveries, harvest_dead_letters, harvest_events, harvest_signals,
-        harvest_workflow_executions,
+        harvest_completion_deliveries, harvest_dead_letters, harvest_events,
+        harvest_execution_summaries, harvest_signals, harvest_workflow_executions,
     };
     use crate::types::ExecutionId;
 
@@ -260,9 +268,82 @@ mod db {
         _reason: &str,
     ) -> HarvestResult<EraseOutcome> {
         conn.transaction::<EraseOutcome, HarvestError, _>(|conn| {
-            async move { erase_single_execution(conn, exec_id).await }.scope_boxed()
+            async move {
+                // Tiered/summary retention (issue #752, AC6): a terminal
+                // execution may have been demoted into a
+                // `harvest_execution_summaries` row and its full execution row
+                // already retention-deleted. Erasing PII must therefore scrub
+                // the summary too, and must SUCCEED when only the summary
+                // remains (the execution row is gone → `NotFound` from the
+                // gate). Otherwise a summarized execution's PII would be
+                // un-erasable once its history was collected.
+                match erase_single_execution(conn, exec_id).await {
+                    Ok(mut outcome) => {
+                        // Execution row present + terminal + scrubbed. Also
+                        // scrub the matching summary (if any) in the same tx.
+                        outcome.summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+                        Ok(outcome)
+                    }
+                    Err(HarvestError::NotFound(_)) => {
+                        // No execution row: scrub a lingering summary if one
+                        // remains, and report success on that basis alone.
+                        let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+                        if summary_scrubbed {
+                            Ok(EraseOutcome {
+                                execution_id: exec_id.to_string(),
+                                events_scrubbed: 0,
+                                fields_tombstoned: 0,
+                                execution_row_scrubbed: false,
+                                summary_scrubbed: true,
+                                signals_scrubbed: 0,
+                                completion_deliveries_scrubbed: 0,
+                                dead_letters_scrubbed: 0,
+                                children: Vec::new(),
+                                skipped_children: Vec::new(),
+                                failures: Vec::new(),
+                            })
+                        } else {
+                            Err(HarvestError::NotFound(format!(
+                                "workflow execution {exec_id}"
+                            )))
+                        }
+                    }
+                    // A non-terminal execution (Config → 409) or a DB error
+                    // propagates unchanged — a non-terminal run can never have
+                    // a summary, so there is nothing extra to scrub.
+                    Err(e) => Err(e),
+                }
+            }
+            .scope_boxed()
         })
         .await
+    }
+
+    /// Scrub the payload of a matching `harvest_execution_summaries` row
+    /// (issue #752, AC6).
+    ///
+    /// Tombstones `result` and `search_attrs`, leaving `error` intact
+    /// (consistent with the #495 stance of retaining operational error text).
+    /// Returns `true` when a summary row existed and was scrubbed, `false` when
+    /// none exists. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Database`] on any persistence failure.
+    pub async fn erase_execution_summary(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<bool> {
+        let tombstone = erasure_tombstone();
+        let updated = diesel::update(harvest_execution_summaries::table.find(exec_id.as_uuid()))
+            .set((
+                harvest_execution_summaries::result.eq(Some(&tombstone)),
+                harvest_execution_summaries::search_attrs.eq(Some(&tombstone)),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(updated > 0)
     }
 
     /// Erase one execution and cascade to its terminal children.
@@ -514,6 +595,9 @@ mod db {
             events_scrubbed,
             fields_tombstoned,
             execution_row_scrubbed: true,
+            // Set by the caller (`erase_workflow_payloads`) after this returns,
+            // which scrubs the matching summary in the same transaction.
+            summary_scrubbed: false,
             signals_scrubbed,
             completion_deliveries_scrubbed,
             dead_letters_scrubbed,
@@ -525,7 +609,7 @@ mod db {
 }
 
 #[cfg(feature = "db")]
-pub use db::erase_workflow_payloads;
+pub use db::{erase_execution_summary, erase_workflow_payloads};
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -721,6 +805,7 @@ mod tests {
             events_scrubbed: 5,
             fields_tombstoned: 7,
             execution_row_scrubbed: true,
+            summary_scrubbed: false,
             signals_scrubbed: 2,
             completion_deliveries_scrubbed: 3,
             dead_letters_scrubbed: 1,
@@ -735,5 +820,38 @@ mod tests {
         assert!(v.get("failures").is_none());
         assert_eq!(v["events_scrubbed"], 5);
         assert_eq!(v["execution_row_scrubbed"], true);
+        // A false summary_scrubbed is omitted (issue #752).
+        assert!(v.get("summary_scrubbed").is_none());
+    }
+
+    // ── summary scrub value (issue #752) ──────────────────────────────────────
+
+    #[test]
+    fn summary_scrub_uses_the_shared_erasure_tombstone() {
+        // The summary `result`/`search_attrs` are tombstoned with the SAME
+        // canonical tombstone as the execution-row erase, so a downstream
+        // reader detects an erased summary field identically.
+        let t = erasure_tombstone();
+        assert!(execution_input_is_erased(&t));
+    }
+
+    #[test]
+    fn summary_scrubbed_true_serialises() {
+        let outcome = EraseOutcome {
+            execution_id: "exec-2".into(),
+            events_scrubbed: 0,
+            fields_tombstoned: 0,
+            execution_row_scrubbed: false,
+            summary_scrubbed: true,
+            signals_scrubbed: 0,
+            completion_deliveries_scrubbed: 0,
+            dead_letters_scrubbed: 0,
+            children: vec![],
+            skipped_children: vec![],
+            failures: vec![],
+        };
+        let v = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(v["summary_scrubbed"], true);
+        assert_eq!(v["execution_row_scrubbed"], false);
     }
 }

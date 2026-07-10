@@ -76,6 +76,7 @@ mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
 mod retention_overrides_tests;
+mod retention_summary_tests;
 mod retry_now_tests;
 mod saga_tests;
 mod schedule_decisions;
