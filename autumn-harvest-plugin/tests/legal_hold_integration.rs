@@ -249,8 +249,12 @@ async fn set_describe_and_release_round_trip() {
     );
 
     // Release the hold.
-    let (status, body) =
-        post_json_admin(&app, &format!("/workflows/{exec_id}/legal-hold/release"), json!({})).await;
+    let (status, body) = post_json_admin(
+        &app,
+        &format!("/workflows/{exec_id}/legal-hold/release"),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "release body: {body}");
     assert_eq!(body["released"], json!(true));
     assert_eq!(body["held"], json!(false));
@@ -337,7 +341,10 @@ async fn list_filter_legal_hold_composes_with_state() {
         .iter()
         .map(|r| r["workflow_id"].as_str().unwrap_or_default().to_string())
         .collect();
-    assert!(ids.contains(&"lh-held".to_string()), "held row present: {ids:?}");
+    assert!(
+        ids.contains(&"lh-held".to_string()),
+        "held row present: {ids:?}"
+    );
     assert!(
         !ids.contains(&"lh-unheld".to_string()),
         "unheld row excluded: {ids:?}"
@@ -376,8 +383,12 @@ async fn erase_while_held_is_409_then_ok_after_release() {
     );
 
     // After release, erase succeeds.
-    let (status, _b) =
-        post_json_admin(&app, &format!("/workflows/{exec_id}/legal-hold/release"), json!({})).await;
+    let (status, _b) = post_json_admin(
+        &app,
+        &format!("/workflows/{exec_id}/legal-hold/release"),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = post_json_admin(
         &app,

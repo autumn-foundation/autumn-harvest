@@ -1824,8 +1824,7 @@ mod legal_hold_db {
         // concurrent set/release.
         conn.transaction::<LegalHoldOutcome, HarvestError, _>(|conn| {
             Box::pin(async move {
-                let (set_at, _until, _reason, _actor) =
-                    load_hold_for_update(conn, exec_id).await?;
+                let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
 
                 let was_set = set_at.is_some();
                 if was_set {

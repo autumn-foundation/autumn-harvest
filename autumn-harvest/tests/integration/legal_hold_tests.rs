@@ -800,16 +800,10 @@ async fn expired_hold_is_overwritten_by_a_fresh_set() {
     // Re-set with a FUTURE until: provenance replaced (expired hold does not
     // block the overwrite), newly_held == true.
     let future = now + chrono::Duration::days(3);
-    let second = autumn_harvest::set_legal_hold(
-        &mut conn,
-        exec_id,
-        "new-reason",
-        Some(future),
-        "bob",
-        now,
-    )
-    .await
-    .expect("second set");
+    let second =
+        autumn_harvest::set_legal_hold(&mut conn, exec_id, "new-reason", Some(future), "bob", now)
+            .await
+            .expect("second set");
     assert!(second.held && second.newly_held, "fresh active hold placed");
     assert_eq!(second.legal_hold_reason.as_deref(), Some("new-reason"));
     assert_eq!(second.legal_hold_actor.as_deref(), Some("bob"));
@@ -915,16 +909,21 @@ async fn indefinitely_held_row_survives_two_ticks_metric_zero() {
 
     let now = Utc::now();
     let two_days_ago = now - chrono::Duration::days(2);
-    insert_completed(&mut conn, "twotick_wf", "tt1", two_days_ago, Some(now), None).await;
+    insert_completed(
+        &mut conn,
+        "twotick_wf",
+        "tt1",
+        two_days_ago,
+        Some(now),
+        None,
+    )
+    .await;
 
     let metrics = Arc::new(CapturingMetrics::default());
     for pass in 1..=2 {
         let config = history_only(Some(Duration::from_secs(86_400)));
         let result = run_one_tick(pool.clone(), config, Arc::clone(&metrics)).await;
-        assert_eq!(
-            result.deleted_count, 0,
-            "held row must survive tick {pass}"
-        );
+        assert_eq!(result.deleted_count, 0, "held row must survive tick {pass}");
         assert_eq!(
             surviving_names(&mut conn).await,
             vec!["twotick_wf".to_string()],
