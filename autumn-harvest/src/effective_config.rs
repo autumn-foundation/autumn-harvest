@@ -156,6 +156,9 @@ pub struct WorkerConfigView {
     pub slot_tuner_enabled: bool,
     /// Advertised concurrent worker-session capacity (0 = sessions disabled).
     pub max_concurrent_sessions: i32,
+    /// Max panic strikes before a panicking workflow task fails terminally
+    /// (0 = terminal on first panic).
+    pub workflow_panic_max_attempts: u32,
     /// REDACTED: whether a LISTEN/NOTIFY notification URL is configured (never the URL).
     pub notification_channel_configured: bool,
     /// REDACTED: count of per-shard notification channels configured (never the URLs).
@@ -261,6 +264,7 @@ impl WorkerConfigView {
             #[cfg(feature = "db")]
                 sharded_pool: _,
             max_concurrent_sessions,
+            workflow_panic_max_attempts,
         } = worker;
 
         Self {
@@ -292,6 +296,7 @@ impl WorkerConfigView {
             default_debounce_max_wait_ms: dur_ms(*default_debounce_max_wait),
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
+            workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
             sharded_pool_configured,

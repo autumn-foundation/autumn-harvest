@@ -155,6 +155,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
+    // issue #747: per-execution legal hold columns on harvest_workflow_executions.
+    include_str!("../../migrations/20260709000000_harvest_legal_hold/up.sql"),
 );
 
 /// Returns a live URL to a migrated Postgres, keeping the container (if any)
