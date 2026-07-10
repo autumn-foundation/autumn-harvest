@@ -2832,3 +2832,63 @@ async fn test_env_root_typed_failure_records_typed_fields_and_human_message() {
     assert_eq!(non_retryable, Some(true));
     assert_eq!(details, Some(json!({ "cap": 5 })));
 }
+
+// ─────────── Non-blocking signal drain (issue #775) ───────────
+
+/// Aggregator pattern: block for the first "event" signal, then non-blockingly
+/// drain every remaining buffered "event" signal in one task execution.
+fn drain_aggregator_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Block until the batch of "event" signals is promoted into history.
+        let first = ctx
+            .wait_for_signal("event")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut collected = vec![first];
+        // Non-blocking: consume the rest already buffered.
+        collected.extend(ctx.drain_signals_raw("event").map_err(|e| e.to_string())?);
+        Ok(json!({ "collected": collected }))
+    })
+}
+
+#[tokio::test]
+async fn test_drain_signals_returns_all_queued_in_order() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .queue_signal("event", json!({"seq": 3}))
+        .run(drain_aggregator_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"collected": [{"seq": 1}, {"seq": 2}, {"seq": 3}]})),
+        "all queued same-name signals must be returned by the wait+drain in queued order"
+    );
+}
+
+/// Returns whether a non-blocking `try_receive_signal` saw anything.
+fn try_receive_none_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let got: Option<Value> = ctx.try_receive_signal("event").map_err(|e| e.to_string())?;
+        Ok(json!({ "got": got }))
+    })
+}
+
+#[tokio::test]
+async fn test_try_receive_signal_none_when_nothing_queued() {
+    let outcome = WorkflowTestEnv::new()
+        .run(try_receive_none_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"got": Value::Null})),
+        "try_receive_signal must return None (and never suspend) when nothing is buffered"
+    );
+}

@@ -3104,18 +3104,27 @@ impl WorkflowTestEnv {
             }
 
             WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                let Some(pos) = remaining_signals
-                    .iter()
-                    .position(|(n, _)| n == &signal_name)
-                else {
-                    return Ok(false);
-                };
-                let (_, payload) = remaining_signals.remove(pos);
-                deferred_events.push(WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                });
-                Ok(true)
+                // Promote EVERY currently-queued signal matching `signal_name`
+                // into history in queued order, mirroring production
+                // `ingest_pending_signals` batch promotion (issue #775). The
+                // matcher's `match_signal` consumes the first for this wait,
+                // leaving the rest buffered for a following non-blocking
+                // `drain_signals`/`try_receive_signal` call in the same task.
+                let mut delivered = false;
+                let mut i = 0;
+                while i < remaining_signals.len() {
+                    if remaining_signals[i].0 == signal_name {
+                        let (_, payload) = remaining_signals.remove(i);
+                        deferred_events.push(WorkflowEvent::SignalReceived {
+                            signal_name: signal_name.clone(),
+                            payload,
+                        });
+                        delivered = true;
+                    } else {
+                        i += 1;
+                    }
+                }
+                Ok(delivered)
             }
 
             WorkflowCommand::StartChildWorkflow {
