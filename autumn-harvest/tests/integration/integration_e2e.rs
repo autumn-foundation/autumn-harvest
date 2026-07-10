@@ -159,7 +159,7 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260710000000_harvest_workflow_continue_chain/up.sql"),
     "\n",
     // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000000_harvest_legal_hold/up.sql")
+    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

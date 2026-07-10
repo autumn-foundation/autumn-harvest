@@ -180,7 +180,7 @@ const INIT_SQL: &str = concat!(
     // `WorkflowExecution::as_select()`, which now selects the `legal_hold_*`
     // columns — without this the first DB op fails with
     // `column harvest_workflow_executions.legal_hold_set_at does not exist`.
-    include_str!("../../autumn-harvest/migrations/20260709000000_harvest_legal_hold/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260709000001_harvest_legal_hold/up.sql"),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260710000000_harvest_workflow_continue_chain/up.sql"
