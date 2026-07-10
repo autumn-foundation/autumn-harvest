@@ -738,7 +738,12 @@ pub async fn run_unified_dag(
         // A gate is always alone in its level (guaranteed by DagBuilder::build),
         // so it is handled inline: it awaits a signal, not an activity, and must
         // never be batched into `activity_futs`.
-        if level.len() == 1 && tasks[level[0]].signal.is_some() {
+        let gate_opt = if level.len() == 1 {
+            tasks[level[0]].signal.clone()
+        } else {
+            None
+        };
+        if let Some(gate) = gate_opt {
             let task_idx = level[0];
             let activity_name = tasks[task_idx].activity_name.clone();
             let upstreams = tasks[task_idx].upstreams.clone();
@@ -757,12 +762,8 @@ pub async fn run_unified_dag(
                 DagDispatchDecision::Run => {}
             }
 
-            let gate = tasks[task_idx]
-                .signal
-                .clone()
-                .expect("gate level task carries a signal");
-            let (status, val) = match gate.timeout {
-                Some(timeout) => match ctx
+            let (status, val) = if let Some(timeout) = gate.timeout {
+                match ctx
                     .wait_for_signal_timeout(&gate.signal_name, timeout)
                     .await
                     .map_err(|e| e.to_string())?
@@ -772,14 +773,13 @@ pub async fn run_unified_dag(
                         GateTimeoutAction::FailRun => (TaskStatus::Failed, Value::Null),
                         GateTimeoutAction::Continue => (TaskStatus::Succeeded, Value::Null),
                     },
-                },
-                None => {
-                    let payload = ctx
-                        .wait_for_signal(&gate.signal_name)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    (TaskStatus::Succeeded, payload)
                 }
+            } else {
+                let payload = ctx
+                    .wait_for_signal(&gate.signal_name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                (TaskStatus::Succeeded, payload)
             };
             statuses[task_idx] = status;
             outputs[task_idx] = val;
@@ -908,14 +908,12 @@ pub async fn run_unified_dag(
                     Ok::<_, String>((task_idx, status, final_val))
                 }));
             } else {
-                let has_mapped_upstream =
-                    upstreams.iter().any(|&i| tasks[i].map_upstream.is_some());
-                let activity_input = if has_mapped_upstream {
-                    let mapped_up_idx =
-                        *upstreams.iter().find(|&&i| tasks[i].map_upstream.is_some()).unwrap();
-                    outputs[mapped_up_idx].clone()
-                } else {
-                    match input.clone() {
+                let mapped_up = upstreams
+                    .iter()
+                    .copied()
+                    .find(|&i| tasks[i].map_upstream.is_some());
+                let activity_input = mapped_up.map_or_else(
+                    || match input.clone() {
                         Value::Object(mut object) => {
                             object.insert(
                                 "dag_task".to_owned(),
@@ -932,8 +930,9 @@ pub async fn run_unified_dag(
                             );
                             Value::Object(object)
                         }
-                    }
-                };
+                    },
+                    |mapped_up_idx| outputs[mapped_up_idx].clone(),
+                );
 
                 activity_futs.push(Box::pin(async move {
                     let (status, val) = match ctx

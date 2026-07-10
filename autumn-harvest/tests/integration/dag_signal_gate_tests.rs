@@ -19,7 +19,7 @@
 //!   `WaitForSignal` suspension is never batched with a level's activity
 //!   `ScheduleActivity` dispatches (the worker's homogeneous-batch requirement).
 
-#![allow(clippy::unused_async)]
+#![allow(clippy::unused_async, clippy::missing_const_for_fn)]
 
 use autumn_harvest::dag::{DagBuilder, DagSignalGate, GateTimeoutAction};
 use std::time::Duration;
