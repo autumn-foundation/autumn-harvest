@@ -139,8 +139,10 @@ pub fn outcome_for_state(state: &str) -> &'static str {
 /// back-links can never hang.
 ///
 /// `continued_to_exec_id` on each record is the `exec_id` of the next ordered
-/// run (`None` for the tail) — derived purely from ordering so it stays correct
-/// for legacy chains that never stored a forward index.
+/// run (`None` for the tail), *except* when the next run names a different,
+/// absent predecessor — a retention gap — in which case it is `None` rather
+/// than a synthesized false continuation. Legacy rows (no column linkage) still
+/// derive it from ordering, so pre-feature chains are unaffected.
 ///
 /// See the module docs and `head_unknown` for the head-confidence rule.
 // The rows are taken by value: this is the owned DB->wire boundary the plugin
@@ -237,9 +239,21 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     let mut runs: Vec<RunChainRecord> = Vec::with_capacity(ordered.len());
     for (seq, &row_idx) in ordered.iter().enumerate() {
         let row = &rows[row_idx];
-        let continued_to = ordered
-            .get(seq + 1)
-            .map(|&next_idx| rows[next_idx].exec_id.to_string());
+        // Forward link: only claim `row -> next` when the ordering did not have
+        // to bridge a gap. `next` is the next ordered row (`None` for the tail).
+        // A confirmed back-link (`next.continued_from == row.exec_id`) or a
+        // legacy/order-based row (`next.continued_from == None`, no column
+        // linkage) is a genuine continuation. But when `next` names a
+        // *different*, absent predecessor (`Some(other) != row.exec_id`), the
+        // real successor between them was deleted (e.g. a retention gap) — do
+        // NOT synthesize a false direct `row -> next` continuation.
+        let continued_to = ordered.get(seq + 1).and_then(|&next_idx| {
+            let next = &rows[next_idx];
+            match next.continued_from_exec_id {
+                Some(pred) if pred != row.exec_id => None,
+                _ => Some(next.exec_id.to_string()),
+            }
+        });
         runs.push(RunChainRecord {
             exec_id: row.exec_id.to_string(),
             run_id: row.run_id.to_string(),
@@ -260,20 +274,25 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     let head_participates_in_can = rows.len() > 1 || head_row.state == "CONTINUED_AS_NEW";
     let head_lacks_backlink =
         head_row.continued_from_exec_id.is_none() && head_row.first_exec_id.is_none();
-    // Retention-pruned origin: an operator querying a surviving successor gets
-    // that successor as the resolved head, but its own `continued_from_exec_id`
-    // names a predecessor absent from the gathered set — proof it is NOT the
-    // true origin. Flag the head as unknown so we never present a mid-chain run
-    // as a confirmed origin. A genuine origin (post-feature, legacy, standalone,
-    // or the mixed-chain boundary run) always has `continued_from_exec_id == None`
-    // at the resolved head, and a normal from-the-middle query gathers the real
-    // origin (its `first_exec_id`) so `ordered[0]`'s predecessor is `None` — this
-    // term is false for all of those.
-    let head_predecessor_missing = head_row
-        .continued_from_exec_id
-        .is_some_and(|pred| !rows.iter().any(|r| r.exec_id == pred));
+    // Missing-predecessor gap: ANY gathered row whose `continued_from_exec_id`
+    // names a predecessor absent from the gathered set proves the chain has a
+    // hole — a run that was retention-deleted (per-execution legal hold, #747,
+    // can delete an expired middle run while a held head and tail survive).
+    // Flag `head_unknown` so we never present an incomplete chain as fully
+    // resolved. This subsumes the retention-pruned-origin case (the resolved
+    // head is itself a gathered row, so a missing head predecessor still trips
+    // this) AND the deleted-middle case (the tail names an absent middle). A
+    // genuine origin (post-feature, legacy, standalone, or the mixed-chain
+    // boundary run) has `continued_from_exec_id == None`, and a complete chain
+    // gathers every predecessor, so this term is false for all of those. Legacy
+    // rows carry `continued_from_exec_id == None` and never trip it — their head
+    // confidence stays governed by the lacks-backlink / participates rule.
+    let any_predecessor_missing = rows.iter().any(|row| {
+        row.continued_from_exec_id
+            .is_some_and(|pred| !rows.iter().any(|r| r.exec_id == pred))
+    });
     let head_unknown = (head_lacks_backlink && head_participates_in_can && !confirmed_origin)
-        || head_predecessor_missing;
+        || any_predecessor_missing;
 
     let workflow_id = Some(head_row.workflow_id.clone());
 
@@ -545,6 +564,81 @@ mod tests {
         );
         assert_eq!(
             resp.runs[1].continued_to_exec_id, None,
+            "tail has no forward link"
+        );
+    }
+
+    // ── deleted-middle gap in a POST-feature chain (issue #701, Codex P2) ─────
+    //
+    // Per-execution legal-hold retention (#747) can delete an expired middle run
+    // while a held head and tail survive. The seed query
+    // `WHERE id = head OR first_exec_id = head` then returns `{head, tail}` with
+    // the middle gone. Ordering stalls at head (its successor `middle` is absent)
+    // and the time-order fallback appends tail right after head. We must NOT
+    // synthesize a `head -> tail` continuation, and we must flag the gap.
+
+    /// A post-feature chain `head -> middle -> tail` with `middle` retention-
+    /// deleted. All rows share `first_exec_id = head`; head is the resolved head.
+    fn post_feature_chain_with_deleted_middle() -> (Uuid, Uuid, Vec<RunChainRow>) {
+        let head = Uuid::new_v4();
+        let middle = Uuid::new_v4(); // deleted: never inserted into `rows`
+        let tail = Uuid::new_v4();
+        let rows = vec![
+            row(head, "CONTINUED_AS_NEW", 0, None, None),
+            // tail's real predecessor is `middle`, which is absent.
+            row(tail, "RUNNING", 20, Some(middle), Some(head)),
+        ];
+        (head, tail, rows)
+    }
+
+    #[test]
+    fn head_unknown_true_when_a_middle_run_is_deleted() {
+        let (head, _tail, rows) = post_feature_chain_with_deleted_middle();
+        let resp = assemble_run_chain(rows, head);
+        assert!(
+            resp.head_unknown,
+            "a gathered row (tail) names an absent predecessor (deleted middle) => head_unknown"
+        );
+    }
+
+    #[test]
+    fn continued_to_not_synthesized_across_a_gap() {
+        let (head, tail, rows) = post_feature_chain_with_deleted_middle();
+        let resp = assemble_run_chain(rows, head);
+        assert_eq!(resp.runs.len(), 2);
+        assert_eq!(resp.runs[0].exec_id, head.to_string());
+        assert_eq!(resp.runs[1].exec_id, tail.to_string());
+        // head's real successor (middle) was deleted; do NOT claim head -> tail.
+        assert_eq!(
+            resp.runs[0].continued_to_exec_id, None,
+            "no false direct continuation across the retention gap"
+        );
+        assert_eq!(
+            resp.runs[1].continued_to_exec_id, None,
+            "tail is the last ordered run"
+        );
+    }
+
+    #[test]
+    fn complete_post_feature_chain_has_no_gap_flag() {
+        // Positive control: a full 3-run post-feature chain (all present) never
+        // trips the generalized missing-predecessor flag and links head->mid->tail.
+        let (origin, mid, tail, rows) = post_feature_chain();
+        let resp = assemble_run_chain(rows, origin);
+        assert!(
+            !resp.head_unknown,
+            "a complete post-feature chain has no missing predecessor"
+        );
+        assert_eq!(
+            resp.runs[0].continued_to_exec_id.as_deref(),
+            Some(mid.to_string().as_str())
+        );
+        assert_eq!(
+            resp.runs[1].continued_to_exec_id.as_deref(),
+            Some(tail.to_string().as_str())
+        );
+        assert_eq!(
+            resp.runs[2].continued_to_exec_id, None,
             "tail has no forward link"
         );
     }
