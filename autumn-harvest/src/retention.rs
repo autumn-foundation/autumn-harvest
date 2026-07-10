@@ -2012,6 +2012,97 @@ pub(crate) async fn purge_expired_summaries(
     Ok(counts)
 }
 
+/// Filter set for the read-only execution-summary list query (issue #752).
+///
+/// Mirrors the `GET /workflows` filter vocabulary against the summary tier:
+/// `workflow_name`/`workflow_id`/`state`/completed-time-range/search-attr
+/// containment, plus a keyset `cursor` over `(completed_at, execution_id)`.
+/// Every field is optional; an all-default query returns the newest summaries.
+#[derive(Debug, Clone, Default)]
+pub struct SummaryQuery {
+    /// Exact-match `workflow_name` filter.
+    pub workflow_name: Option<String>,
+    /// Exact-match `workflow_id` filter.
+    pub workflow_id: Option<String>,
+    /// Terminal-state filter (`ANY` of the listed states).
+    pub states: Vec<String>,
+    /// Only summaries whose `completed_at` is at/after this instant.
+    pub completed_after: Option<DateTime<Utc>>,
+    /// Only summaries whose `completed_at` is at/before this instant.
+    pub completed_before: Option<DateTime<Utc>>,
+    /// JSONB containment (`@>`) predicates over `search_attrs`; combined with
+    /// `AND`.
+    pub search_attrs: Vec<serde_json::Value>,
+    /// Keyset cursor `(completed_at, execution_id)` — return only rows strictly
+    /// older than this pair under the `(completed_at DESC, execution_id DESC)`
+    /// ordering.
+    pub cursor: Option<(DateTime<Utc>, uuid::Uuid)>,
+}
+
+/// List execution summaries matching `query`, newest-first, up to `limit` rows
+/// (issue #752).
+///
+/// Ordered by `(completed_at DESC, execution_id DESC)` for a total, stable
+/// keyset order; the caller over-fetches `limit + 1` to detect a further page.
+/// Shard-local: `conn` is already routed to a single shard, and the cross-shard
+/// merge happens in the management layer.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on any persistence failure.
+#[cfg(feature = "db")]
+pub async fn list_execution_summaries(
+    conn: &mut diesel_async::AsyncPgConnection,
+    query: &SummaryQuery,
+    limit: i64,
+) -> HarvestResult<Vec<crate::models::ExecutionSummary>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Jsonb};
+
+    let mut q = harvest_execution_summaries::table
+        .into_boxed()
+        .order(harvest_execution_summaries::completed_at.desc())
+        .then_order_by(harvest_execution_summaries::execution_id.desc())
+        .limit(limit.max(0));
+
+    if let Some(cursor) = &query.cursor {
+        let (ts, id) = (cursor.0, cursor.1);
+        q = q.filter(
+            sql::<Bool>(
+                "(harvest_execution_summaries.completed_at, \
+                 harvest_execution_summaries.execution_id) < (",
+            )
+            .bind::<Timestamptz, _>(ts)
+            .sql(", ")
+            .bind::<SqlUuid, _>(id)
+            .sql(")"),
+        );
+    }
+    if !query.states.is_empty() {
+        q = q.filter(harvest_execution_summaries::state.eq_any(query.states.clone()));
+    }
+    if let Some(name) = &query.workflow_name {
+        q = q.filter(harvest_execution_summaries::workflow_name.eq(name.clone()));
+    }
+    if let Some(wid) = &query.workflow_id {
+        q = q.filter(harvest_execution_summaries::workflow_id.eq(wid.clone()));
+    }
+    if let Some(after) = query.completed_after {
+        q = q.filter(harvest_execution_summaries::completed_at.ge(after));
+    }
+    if let Some(before) = query.completed_before {
+        q = q.filter(harvest_execution_summaries::completed_at.le(before));
+    }
+    for attr in &query.search_attrs {
+        q = q.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(attr.clone()));
+    }
+
+    q.select(crate::models::ExecutionSummary::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
 /// Common bookkeeping for a "routine skip" of a retention candidate (issue
 /// #737): release the candidate's retention lease so a later tick can revisit
 /// it, advance the scan cursor when the tick has not already failed, and drop

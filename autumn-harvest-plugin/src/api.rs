@@ -79,9 +79,9 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
 };
 use autumn_harvest::models::{
-    AuditRecord, BackfillLogRow, CompletionTriggerDb, DeadLetter, HarvestCalendar, HarvestSchedule,
-    NewAuditRecord, NewBackfillLogRow, NewCompletionTriggerDb, RateLimitBucket, ScheduleDecision,
-    WorkflowExecution,
+    AuditRecord, BackfillLogRow, CompletionTriggerDb, DeadLetter, ExecutionSummary,
+    HarvestCalendar, HarvestSchedule, NewAuditRecord, NewBackfillLogRow, NewCompletionTriggerDb,
+    RateLimitBucket, ScheduleDecision, WorkflowExecution,
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
@@ -3335,6 +3335,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // issue #544: static /workflows/count must be registered before any
         // /workflows/{param} routes so axum does not capture "count" as a path param.
         .route("/workflows/count", get(count_workflows))
+        // issue #752: static /workflows/summaries must be registered before any
+        // /workflows/{param} routes so axum does not capture "summaries" as a
+        // path param. Admin-guarded (summaries can carry retained payloads).
+        .route(
+            "/workflows/summaries",
+            get(list_workflow_summaries).route_layer(require_admin.clone()),
+        )
         .route(
             "/workflows/{id}/history/export",
             get(export_workflow_history),
@@ -3971,6 +3978,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows"),
         ("GET", "/workflows/count"),
+        ("GET", "/workflows/summaries"),
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
         ("GET", "/workflows/{id}"),
@@ -4505,6 +4513,8 @@ pub const fn management_api_response_fields()
                 "unavailable_shards",
             ]),
         ),
+        // Free-form envelope { summaries, next_cursor } (issue #752).
+        ("GET", "/workflows/summaries", None),
         (
             "GET",
             "/workflows/{id}",
@@ -5922,6 +5932,241 @@ async fn list_workflows(
         // Legacy bare-array response for callers using only limit/state/search_attr.
         Ok(Json(rows).into_response())
     }
+}
+
+// ── Issue #752: tiered/summary retention list route ──────────────────────────
+
+const DEFAULT_SUMMARY_LIMIT: i64 = 50;
+const MAX_SUMMARY_LIMIT: i64 = 500;
+
+/// Parsed query params for `GET /workflows/summaries` (issue #752).
+///
+/// Mirrors the `GET /workflows` filter vocabulary (`workflow_name`,
+/// `workflow_id`, `state`, completed-time-range, `search_attr` containment)
+/// against the summary tier, plus the same keyset-cursor pagination contract
+/// (issue #498) — here keyed on `(completed_at, execution_id)`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SummaryListFilters {
+    pub(crate) limit: i64,
+    pub(crate) states: Vec<String>,
+    pub(crate) workflow_name: Option<String>,
+    pub(crate) workflow_id: Option<String>,
+    pub(crate) search_attrs: Vec<Value>,
+    pub(crate) completed_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) completed_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) cursor: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+}
+
+/// Parse `GET /workflows/summaries` query params (issue #752).
+///
+/// Malformed params return `400` with a JSON error body (never `500`, never a
+/// silent empty match). `limit` clamps to `[1, MAX_SUMMARY_LIMIT]` (default
+/// [`DEFAULT_SUMMARY_LIMIT`]); unknown params are ignored so future additions
+/// stay non-breaking.
+pub(crate) fn parse_summary_filters(
+    pairs: &[(String, String)],
+) -> Result<SummaryListFilters, AutumnError> {
+    let mut limit_raw: Option<i64> = None;
+    let mut filters = SummaryListFilters::default();
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "limit" | "page_size" => {
+                let parsed = value.trim().parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid {key} '{value}'"))
+                })?;
+                limit_raw = Some(parsed);
+            }
+            "state" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !KNOWN_WORKFLOW_STATES.contains(&trimmed) {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "unknown workflow state '{trimmed}'; expected one of {KNOWN_WORKFLOW_STATES:?}"
+                        )));
+                    }
+                    let owned = trimmed.to_string();
+                    if !filters.states.contains(&owned) {
+                        filters.states.push(owned);
+                    }
+                }
+            }
+            "workflow_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "workflow_id" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_id = Some(trimmed.to_string());
+                }
+            }
+            "search_attr" => {
+                let (raw_key, raw_val) = value.split_once(':').ok_or_else(|| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid search_attr '{value}'; expected 'key:value'"
+                    ))
+                })?;
+                let attr_key = raw_key.trim();
+                if attr_key.is_empty() {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "search_attr '{value}' is missing a key"
+                    )));
+                }
+                let mut object = serde_json::Map::with_capacity(1);
+                object.insert(attr_key.to_string(), Value::String(raw_val.to_string()));
+                filters.search_attrs.push(Value::Object(object));
+            }
+            "completed_after" => {
+                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                    .map_err(|_| {
+                        AutumnError::bad_request_msg(format!(
+                            "invalid completed_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                filters.completed_after = Some(dt);
+            }
+            "completed_before" => {
+                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                    .map_err(|_| {
+                        AutumnError::bad_request_msg(format!(
+                            "invalid completed_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                filters.completed_before = Some(dt);
+            }
+            "cursor" => {
+                // Reuse the `<rfc3339>|<uuid>` opaque cursor format (issue #498);
+                // here the timestamp is `completed_at` rather than `created_at`.
+                let decoded = parse_workflow_cursor(value.trim())?;
+                filters.cursor = Some((decoded.created_at, decoded.exec_id));
+            }
+            _ => {
+                // Ignore unknown query parameters so future additions stay non-breaking.
+            }
+        }
+    }
+
+    let limit = limit_raw
+        .unwrap_or(DEFAULT_SUMMARY_LIMIT)
+        .clamp(1, MAX_SUMMARY_LIMIT);
+    filters.limit = limit;
+    Ok(filters)
+}
+
+/// One row of `GET /workflows/summaries` (issue #752).
+///
+/// Flattens the [`ExecutionSummary`] columns and adds `summarized: true` +
+/// `history_available: false` so a summary is unambiguously distinguishable
+/// from a live execution returned by `GET /workflows` (AC4).
+#[derive(Debug, Serialize)]
+pub struct SummaryListItem {
+    #[serde(flatten)]
+    summary: ExecutionSummary,
+    /// Always `true` — this row is a retention-demoted summary, not a live run.
+    summarized: bool,
+    /// Always `false` — the full event history was deleted; only the summary
+    /// remains.
+    history_available: bool,
+}
+
+/// Response envelope for `GET /workflows/summaries` (issue #752), mirroring the
+/// paginated `GET /workflows` shape `{ ..., next_cursor }`.
+#[derive(Debug, Serialize)]
+pub struct SummaryListPage {
+    summaries: Vec<SummaryListItem>,
+    next_cursor: Option<String>,
+}
+
+/// `GET /workflows/summaries` — list retention-demoted execution summaries
+/// (issue #752). Admin-guarded (summaries can carry retained/redacted
+/// payloads).
+///
+/// Cross-shard fan-out + merge with the same `(completed_at DESC,
+/// execution_id DESC)` keyset ordering and opaque cursor as `GET /workflows`
+/// (issue #498). Each item carries `summarized: true` / `history_available:
+/// false` so a summary is never mistaken for a live execution.
+async fn list_workflow_summaries(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<SummaryListPage>, AutumnError> {
+    let filters = parse_summary_filters(&pairs)?;
+    let (summaries, next_cursor) = load_summaries_from_shards(&api_state, &filters).await?;
+    let items: Vec<SummaryListItem> = summaries
+        .into_iter()
+        .map(|summary| SummaryListItem {
+            summary,
+            summarized: true,
+            history_available: false,
+        })
+        .collect();
+    Ok(Json(SummaryListPage {
+        summaries: items,
+        next_cursor,
+    }))
+}
+
+/// Load execution summaries from every shard with keyset pagination (issue
+/// #752), mirroring `load_workflows_from_shards`.
+///
+/// Each shard is over-fetched by one probe row; after the cross-shard merge and
+/// truncation a `next_cursor` is derived from the last kept row. An unreachable
+/// shard hard-fails the call (matching `GET /workflows`).
+async fn load_summaries_from_shards(
+    api_state: &HarvestApiState,
+    filters: &SummaryListFilters,
+) -> Result<(Vec<ExecutionSummary>, Option<String>), AutumnError> {
+    use autumn_harvest::retention::{SummaryQuery, list_execution_summaries};
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let query = SummaryQuery {
+        workflow_name: filters.workflow_name.clone(),
+        workflow_id: filters.workflow_id.clone(),
+        states: filters.states.clone(),
+        completed_after: filters.completed_after,
+        completed_before: filters.completed_before,
+        search_attrs: filters.search_attrs.clone(),
+        cursor: filters.cursor,
+    };
+    // Over-fetch one extra row per shard so the merge can detect a next page.
+    let probe_limit = filters.limit.saturating_add(1);
+
+    let mut rows: Vec<ExecutionSummary> = Vec::new();
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut shard_rows = list_execution_summaries(&mut conn, &query, probe_limit)
+            .await
+            .map_err(map_error)?;
+        rows.append(&mut shard_rows);
+    }
+
+    // Newest-first total order; tie-break on execution_id for stability.
+    rows.sort_by(|left, right| {
+        right
+            .completed_at
+            .cmp(&left.completed_at)
+            .then_with(|| right.execution_id.cmp(&left.execution_id))
+    });
+
+    let limit = usize::try_from(filters.limit).unwrap_or(usize::MAX);
+    let next_cursor = if limit > 0 && rows.len() > limit {
+        let last_kept = &rows[limit - 1];
+        let cursor =
+            encode_workflow_list_cursor_raw(&last_kept.completed_at, &last_kept.execution_id);
+        rows.truncate(limit);
+        Some(cursor)
+    } else {
+        None
+    };
+
+    Ok((rows, next_cursor))
 }
 
 /// `GET /workflows/count` — grouped execution-count fleet snapshot (issue #544).
