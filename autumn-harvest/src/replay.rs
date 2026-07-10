@@ -2836,6 +2836,27 @@ impl HistoryMatcher {
     /// Returns [`TimerFireMatch::NoMatch`] when neither is recorded yet (the
     /// timer is armed but unresolved, or the cursor is past end): the caller
     /// re-arms idempotently and suspends.
+    ///
+    /// # Soundness — the scan STOPS at intervening commands (Codex P2, issue #768)
+    ///
+    /// The forward scan is deliberately **not** a "skip everything until the
+    /// outcome" loop. It may cross only (a) already-`is_consumed` events — the
+    /// legitimate case where the workflow ran other operations (an activity, a
+    /// side effect) BEFORE awaiting the timer, so those events were consumed by
+    /// their own `match_*` calls in program order — and (b) a small allowlist of
+    /// genuinely transparent / interleavable events (mirroring
+    /// [`Self::match_timer_strict`]'s transparent set: markers, side effects,
+    /// detached-child spawns, the reset `TimerCancelled`/`TimerStarted`
+    /// interleaving, stashed signals & external-signal/cancel triplets, and
+    /// update events). It STOPS (returns [`TimerFireMatch::NoMatch`]) at any
+    /// UNCONSUMED command-bearing event NOT on that allowlist
+    /// (`ActivityScheduled`/`Completed`/`Failed`, attached `ChildWorkflow*`,
+    /// `LocalActivity*`, a foreign `TimerFired`, ...). Without the stop, a code
+    /// change that awaits the timer BEFORE such a command would let the scan claim
+    /// the trailing `TimerFired` across the unrelated command and pass strict
+    /// replay despite a real command-order change; stopping surfaces it as a
+    /// non-determinism divergence instead.
+    #[allow(clippy::too_many_lines)]
     pub fn match_timer_or_cancel(&mut self, timer_id: &str) -> TimerFireMatch {
         if !self.prepare_match() {
             return TimerFireMatch::NoMatch;
@@ -2847,6 +2868,8 @@ impl HistoryMatcher {
                 continue;
             }
             match &self.events[scan] {
+                // The resolving outcome for THIS timer — claim it (recorded-order
+                // fire-vs-cancel resolution).
                 WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
                     self.consumed_out_of_order_events.insert(scan);
                     self.advance_to_next_unconsumed_event();
@@ -2857,9 +2880,130 @@ impl HistoryMatcher {
                     self.advance_to_next_unconsumed_event();
                     return TimerFireMatch::Cancelled;
                 }
-                _ => {
+                // ── Transparent / genuinely-interleaved events the scan MAY cross
+                //    (mirrors match_timer_strict's transparent set). None impose a
+                //    positional command-order a timer-fire claim could violate:
+                //    bookkeeping markers/side-effects, fire-and-forget detached
+                //    child spawns, and a sibling `reset()`'s
+                //    `[TimerCancelled(x), TimerStarted(x)]` interleaving for
+                //    ANOTHER id (our-id cancel is caught above; a foreign
+                //    `TimerFired` is a real resolution and STOPS below).
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
                     scan += 1;
                 }
+                // Signals can arrive while a timer is armed; stash them for a
+                // later wait_for_signal and continue (mirrors match_timer_strict).
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan, signal_name, payload);
+                    scan += 1;
+                }
+                // External-signal / external-cancel triplets can interleave with an
+                // in-flight timer (e.g. a concurrent request); stash so their own
+                // matchers find them after the timer resolves.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target,
+                    signal_name,
+                    payload,
+                    idempotency_key,
+                } => {
+                    self.stash_external_signal_request(
+                        scan,
+                        *signal_id,
+                        *target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
+                    scan += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    let id = *signal_id;
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan);
+                    scan += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    let id = *signal_id;
+                    let code = reason_code.clone();
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(scan);
+                    scan += 1;
+                }
+                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                    let stashed = StashedExternalCancel {
+                        cancel_id: *cancel_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_cancels.push(stashed);
+                    self.consumed_signal_events.insert(scan);
+                    scan += 1;
+                }
+                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                    let id = *cancel_id;
+                    if let Some(p) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|p| p.cancel_id == id)
+                    {
+                        p.terminal = Some(StashedCancelTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan);
+                    scan += 1;
+                }
+                WorkflowEvent::ExternalCancelFailed {
+                    cancel_id,
+                    reason_code,
+                } => {
+                    let id = *cancel_id;
+                    let code = reason_code.clone();
+                    if let Some(p) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|p| p.cancel_id == id)
+                    {
+                        p.terminal = Some(StashedCancelTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(scan);
+                    scan += 1;
+                }
+                // Update events are transparent to the timer scan.
+                e if Self::is_update_event(e) => {
+                    scan += 1;
+                }
+                // Any other UNCONSUMED command-bearing event (activities, attached
+                // child workflows, local activities, a foreign TimerFired, ...) is
+                // a real ordering point the outcome scan is NOT allowed to cross:
+                // a code change that awaits the timer BEFORE such a command would
+                // otherwise silently claim a future TimerFired and pass strict
+                // replay. STOP so the caller returns NoMatch and strict replay
+                // surfaces the divergence (Codex P2 soundness fix, issue #768).
+                _ => break,
             }
         }
         TimerFireMatch::NoMatch

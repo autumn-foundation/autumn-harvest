@@ -733,7 +733,16 @@ pub enum TimerOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerLogicalState {
     /// The timer is armed (or has been re-armed by `reset`) and awaiting a fire.
-    Armed,
+    ///
+    /// Carries the duration recorded by the arm's `TimerStarted` so a duplicate
+    /// **active** `start_timer(id, new_dur)` returns a handle preserving the
+    /// RECORDED duration rather than a divergent `new_dur`: the arm records no
+    /// second `TimerStarted`, so honouring `new_dur` on the handle would arm the
+    /// durable row (and advance the virtual clock) for a deadline history never
+    /// recorded — a live-vs-replay divergence. A genuine duration change must go
+    /// through `reset`, which records `TimerCancelled` + a fresh `TimerStarted`
+    /// (Codex P2, issue #768).
+    Armed(u64),
     /// The timer was cancelled this task and must not be re-armed by a
     /// subsequent `await_fire`.
     Cancelled,
@@ -1622,7 +1631,8 @@ pub struct WorkflowContext {
     saga_seq: Mutex<u32>,
     /// Per-`timer_id` logical lifecycle of author-controlled durable timers
     /// (issue #768). `start_timer`/`reset_timer` set the entry to
-    /// [`TimerLogicalState::Armed`]; `cancel_timer` sets it to
+    /// [`TimerLogicalState::Armed`] (carrying the recorded duration);
+    /// `cancel_timer` sets it to
     /// [`TimerLogicalState::Cancelled`]. `await_timer_fire` consults this only
     /// when recorded history holds no resolving event, so a same-task
     /// `cancel(); await_fire()` (live or on replay) resolves
@@ -4174,8 +4184,16 @@ impl WorkflowContext {
     ///
     /// The single `TimerStarted` event is recorded on the first live execution
     /// and consumed positionally on replay — no new `WorkflowEvent` variant is
-    /// introduced for arming. Reusing an id that is still armed is idempotent.
-    /// Avoid the engine-reserved `__`-prefixed id namespace.
+    /// introduced for arming. Reusing an id that is still armed is a
+    /// **duration-preserving idempotent no-op**: the returned handle carries the
+    /// duration recorded by the ORIGINAL arm, and any `duration_secs` passed to
+    /// the duplicate call is ignored (no second `TimerStarted` / reset event is
+    /// recorded, so honouring a different duration would silently change the live
+    /// deadline while history records the original — a live-vs-replay
+    /// divergence). To change an active timer's duration, call
+    /// [`TimerHandle::reset`] (or [`WorkflowContext::reset_timer`]), which records
+    /// a `TimerCancelled` + fresh `TimerStarted`. Avoid the engine-reserved
+    /// `__`-prefixed id namespace.
     ///
     /// # Panics
     ///
@@ -4195,11 +4213,15 @@ impl WorkflowContext {
         // wrote). A prior `cancel_timer` clears the Armed state and `reset_timer`
         // re-sets it, so a subsequent `start_timer` matches/records again
         // (Codex P2, issue #768).
-        if self.timer_logically_armed(timer_id) {
+        // The handle preserves the RECORDED duration (from the original arm),
+        // NOT the new `duration_secs` arg — the durable row / virtual clock must
+        // stay consistent with the single recorded `TimerStarted`; a duration
+        // change must go through `reset` (Codex P2 round 5, issue #768).
+        if let Some(armed_duration) = self.timer_logically_armed(timer_id) {
             return TimerHandle {
                 context: self,
                 timer_id: timer_id.to_string(),
-                duration_secs,
+                duration_secs: armed_duration,
             };
         }
         match self.match_history(|m| m.match_timer_arm(timer_id, duration_secs)) {
@@ -4222,7 +4244,7 @@ impl WorkflowContext {
             // other variant: nothing to emit.
             _ => {}
         }
-        self.set_timer_logical_state(timer_id, TimerLogicalState::Armed);
+        self.set_timer_logical_state(timer_id, TimerLogicalState::Armed(duration_secs));
         TimerHandle {
             context: self,
             timer_id: timer_id.to_string(),
@@ -4254,19 +4276,23 @@ impl WorkflowContext {
         )
     }
 
-    /// Whether the workflow logically holds `timer_id` armed this task (a
-    /// `start_timer`/`reset_timer` with no subsequent `cancel_timer`). Consulted
+    /// The armed duration (in seconds) the workflow logically holds for
+    /// `timer_id` this task (a `start_timer`/`reset_timer` with no subsequent
+    /// `cancel_timer`), or `None` when the id is not currently armed. Consulted
     /// by [`Self::start_timer`] to make a duplicate arm of an already-armed id a
     /// true idempotent no-op — the durable row is deduped, so re-running the
-    /// positional history match would diverge (Codex P2, issue #768).
-    fn timer_logically_armed(&self, timer_id: &str) -> bool {
-        matches!(
-            self.cancellable_timer_state
-                .lock()
-                .expect("cancellable_timer_state lock poisoned")
-                .get(timer_id),
-            Some(TimerLogicalState::Armed)
-        )
+    /// positional history match would diverge — while returning a handle that
+    /// preserves the ORIGINAL recorded duration (Codex P2 round 5, issue #768).
+    fn timer_logically_armed(&self, timer_id: &str) -> Option<u64> {
+        match self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned")
+            .get(timer_id)
+        {
+            Some(TimerLogicalState::Armed(duration_secs)) => Some(*duration_secs),
+            _ => None,
+        }
     }
 
     /// Cancel an author-controlled durable timer by id.
@@ -4357,7 +4383,7 @@ impl WorkflowContext {
         // A reset re-arms: the fresh arming supersedes any prior cancel so a
         // following `await_fire` waits/fires normally (never resolves Cancelled
         // from a pre-reset cancel).
-        self.set_timer_logical_state(timer_id, TimerLogicalState::Armed);
+        self.set_timer_logical_state(timer_id, TimerLogicalState::Armed(duration_secs));
         Ok(())
     }
 

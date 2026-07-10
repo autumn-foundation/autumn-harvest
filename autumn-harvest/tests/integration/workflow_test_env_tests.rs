@@ -116,6 +116,25 @@ fn cancellable_await_workflow<'a>(
     })
 }
 
+/// (Codex P2 round 5, issue #768 — FIX 1) Arm `idle` at 300s, then call
+/// `start_timer("idle", 600)` again with NO cancel/reset between. The second call
+/// is a duration-preserving idempotent no-op: the returned handle MUST carry the
+/// ORIGINAL 300s, not 600, so the durable row / virtual clock stay consistent with
+/// the single recorded `TimerStarted(idle, 300)`. Emits the armed duration so the
+/// test can assert 300 (before the fix the handle carried 600).
+fn duplicate_active_start_timer_diff_duration_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _first = ctx.start_timer("idle", 300);
+        let handle = ctx.start_timer("idle", 600); // duplicate active — MUST preserve 300
+        let armed = handle.duration_secs();
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({ "armed": armed, "outcome": format!("{outcome:?}") }))
+    })
+}
+
 /// (issue #768) Arm a cancellable timer then cancel it (fire-and-forget) — the
 /// timer must never fire.
 fn cancellable_cancel_workflow<'a>(
@@ -606,6 +625,53 @@ async fn test_cancellable_timer_fires_when_not_cancelled() {
     );
 
     let report = outcome.replay_check(cancellable_await_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// FIX 1 (Codex P2 round 5, issue #768): a duplicate active `start_timer` with a
+/// DIFFERENT duration preserves the RECORDED duration. The handle carries 300
+/// (not the second call's 600), exactly one `TimerStarted(idle, 300)` is
+/// recorded, the timer fires at the 300s deadline (the virtual clock advances by
+/// 300, not 600 — asserted via the armed duration the handle used), and the run
+/// replays cleanly. Before the fix the handle carried 600.
+#[tokio::test]
+async fn test_duplicate_active_start_timer_preserves_recorded_duration() {
+    let outcome = WorkflowTestEnv::new()
+        .run(
+            duplicate_active_start_timer_diff_duration_workflow,
+            json!(null),
+        )
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({ "armed": 300, "outcome": "Fired" })),
+        "duplicate active start_timer must preserve the recorded 300s duration, \
+         not the second call's 600s"
+    );
+
+    // Exactly ONE TimerStarted, recorded with duration 300 (the second
+    // start_timer emits no event).
+    let timer_starteds: Vec<u64> = outcome
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerStarted { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        timer_starteds,
+        vec![300],
+        "exactly one TimerStarted(idle, 300) must be recorded: {:?}",
+        outcome.events()
+    );
+
+    let report = outcome
+        .replay_check(duplicate_active_start_timer_diff_duration_workflow)
+        .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "replay self-check failed:\n{report}"
