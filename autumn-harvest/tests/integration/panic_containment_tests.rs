@@ -469,6 +469,47 @@ fn panic_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
     Box::pin(async move { panic!("workflow boom") })
 }
 
+/// Workflow that calls a single (regular) activity that stays RUNNING for a
+/// short, deterministic window before panicking (issue #782, TEST B). The
+/// deliberate delay makes the RUNNING phase reliably sampleable so the test can
+/// MEASURE how promptly the task leaves RUNNING once the handler panics.
+fn workflow_calls_slow_panic_activity(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("slow_panic_activity", input, "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Regular activity that holds RUNNING for ~120ms (so the poller can sample it)
+/// then panics. The RUNNING window is legitimate handler execution; the point of
+/// the test is that the row leaves RUNNING promptly AFTER the panic, not that
+/// the handler itself is fast.
+fn slow_panic_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    _input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        panic!("slow activity boom")
+    })
+}
+
+/// Parent workflow that spawns a single child and propagates the child's error
+/// (issue #782, TEST D). The child (`panic_child_wf`) panics; after its panic
+/// budget is exhausted it terminal-fails with a typed `HandlerPanic`
+/// `WorkflowFailed`, which the parent observes as a typed `ChildWorkflowFailed`.
+fn parent_spawns_panic_child(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("panic_child_wf", input)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn workflow_info(
     name: &'static str,
     handler: autumn_harvest::info::WorkflowHandlerFn,
@@ -961,5 +1002,274 @@ async fn workflow_panic_max_attempts_zero_is_terminal_on_first_panic() {
     assert!(
         tasks.iter().all(|t| t.crash_strikes == 0),
         "crash_strikes stays 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test B (AC7b success metric) — the panicking task leaves RUNNING promptly.
+//
+// #782's failure mode is a poisoned worker task that leaves the row wedged in
+// RUNNING forever (and then cascades via SKIP LOCKED re-claim). This test makes
+// the "off RUNNING within ~1 poll interval" success metric FALSIFIABLE rather
+// than inferred: it tight-polls `harvest_task_queue.state` for the activity
+// task, records the last instant it was seen RUNNING and the first instant it
+// was seen off RUNNING afterward, and asserts the containment transition is
+// bounded. A wedged task never leaves RUNNING, so any finite bound falsifies it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_activity_task_leaves_running_within_one_poll_interval() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "slow_panic_activity_wf",
+        serde_json::json!({"n": 5}),
+    )
+    .await;
+
+    let metrics = Arc::new(PanicMetrics::default());
+    let registry = build_registry(
+        vec![workflow_info(
+            "slow_panic_activity_wf",
+            workflow_calls_slow_panic_activity,
+        )],
+        // 1 attempt → the single panic is terminal, giving exactly one clean
+        // RUNNING → FAILED transition to measure (no requeue in between).
+        vec![activity_info(
+            "slow_panic_activity",
+            slow_panic_activity,
+            false,
+            Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
+        )],
+        Arc::clone(&metrics),
+    );
+    let worker = build_worker("worker-slow-panic-activity", Arc::clone(&registry), 3);
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // Tight-poll the activity task row. The handler holds RUNNING for ~120ms so
+    // the ~5ms poll reliably samples it many times; `last_running` is therefore
+    // within ~one poll of the actual panic, and `first_off` is the first sample
+    // after the engine finalized the contained failure — so the measured delta
+    // is the containment latency plus poll granularity, i.e. "~1 poll interval".
+    let mut last_running: Option<tokio::time::Instant> = None;
+    let mut first_off_after_running: Option<tokio::time::Instant> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let activity_task = load_tasks(&url, exec_id)
+            .await
+            .into_iter()
+            .find(|t| t.activity_name.as_deref() == Some("slow_panic_activity"));
+        if let Some(t) = activity_task {
+            if t.state == "RUNNING" {
+                last_running = Some(tokio::time::Instant::now());
+            } else if last_running.is_some() && first_off_after_running.is_none() {
+                first_off_after_running = Some(tokio::time::Instant::now());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The execution must reach FAILED (the worker process survived the panic).
+    let execution = wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(20)).await;
+    worker.shutdown();
+    handle.await.expect("worker task joins cleanly");
+    assert_eq!(execution.state, "FAILED");
+
+    let last_running = last_running.expect(
+        "the activity task must have been observed RUNNING — its handler sleeps ~120ms so the \
+         ~5ms poll should sample it; a never-RUNNING task means the measurement is vacuous",
+    );
+    let first_off = first_off_after_running
+        .expect("the activity task must transition OFF RUNNING (a wedged task never does)");
+
+    // BOUND: the 25ms poll_interval times a generous multiple (40×). A contained
+    // panic finalizes the row within a few DB-ms plus one poll of granularity, so
+    // 1s is enormous headroom; a #782 wedge (RUNNING forever) makes this delta
+    // unbounded, so the assertion falsifies exactly that failure mode while
+    // tolerating CI scheduling jitter.
+    let bound = Duration::from_secs(1);
+    let transition = first_off.duration_since(last_running);
+    assert!(
+        transition < bound,
+        "panicking activity task must leave RUNNING within {bound:?} of the panic \
+         (measured {transition:?}); a larger value means the task wedged in RUNNING (#782)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test C (AC3 read-surface) — the panic message is on the task-row `error`
+// column during retry backoff.
+//
+// This is the executable, data-layer proof for AC3's "surfaced via the stack
+// API" clause without the Docker-only plugin HTTP harness. A backing-off
+// (PENDING) regular activity does NOT append an `ActivityFailed` event; its last
+// error lives in `harvest_task_queue.error` (written by `requeue_for_retry`) —
+// the exact column `GET /workflows/{id}/stack`'s `PendingActivity.last_failure`
+// (#773) reads. `requeue_for_retry` stores the unwrapped panic message (the
+// typed `HandlerPanic` error_type rides the terminal `ActivityFailed` event once
+// the run goes terminal — covered by the terminal test above), so during backoff
+// the column carries the panic message.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backing_off_activity_task_error_column_carries_the_panic_message() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(&mut conn, "panic_backoff_wf", serde_json::json!({"n": 6})).await;
+
+    let metrics = Arc::new(PanicMetrics::default());
+    let registry = build_registry(
+        vec![workflow_info(
+            "panic_backoff_wf",
+            workflow_calls_panic_activity,
+        )],
+        // 3 attempts with a long 3s fixed backoff: attempt 1 panics → requeue
+        // PENDING with a future scheduled_at, giving a wide window to observe the
+        // backing-off task row before attempt 2 is claimed.
+        vec![activity_info(
+            "panic_activity",
+            panic_activity,
+            false,
+            Some(RetryPolicy::fixed(3, Duration::from_secs(3))),
+        )],
+        Arc::clone(&metrics),
+    );
+    let worker = build_worker("worker-panic-backoff", Arc::clone(&registry), 3);
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // Poll for the activity task in the backing-off state: PENDING, with a future
+    // scheduled_at (the 3s backoff) and a populated `error` column.
+    let mut observed_error: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let backing_off = load_tasks(&url, exec_id).await.into_iter().find(|t| {
+            t.activity_name.as_deref() == Some("panic_activity")
+                && t.state == "PENDING"
+                && t.scheduled_at > Utc::now()
+                && t.error.is_some()
+        });
+        if let Some(t) = backing_off {
+            observed_error = t.error;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    worker.shutdown();
+    handle.await.expect("worker task joins cleanly");
+
+    // This test deliberately shuts the worker down mid-backoff, leaving a
+    // claimable PENDING panic_activity task. Against a *shared* (persistent)
+    // HARVEST_TEST_DATABASE_URL cluster that leftover would be re-claimed by a
+    // later test's worker on the same default queue/shard and inflate its global
+    // panic counter, so delete this execution's task rows for isolation. (Under
+    // fresh testcontainers the whole DB is thrown away, so this is a no-op there.)
+    let mut cleanup = connect(&url).await;
+    diesel::delete(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+    )
+    .execute(&mut cleanup)
+    .await
+    .expect("delete leftover backing-off task rows");
+
+    let error = observed_error.expect(
+        "a backing-off (PENDING, future scheduled_at) panic_activity task with a populated \
+         error column must be observed during the 3s retry backoff",
+    );
+    assert!(
+        error.contains("activity boom"),
+        "the task-row error column (the data #773's PendingActivity.last_failure surfaces) must \
+         carry the contained panic message during backoff, got {error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test D (P2) — a child-workflow panic surfaces to the parent as a typed
+// `ChildWorkflowFailed` carrying error_type = "HandlerPanic" (routed via the
+// #767 typed-failure surface: child terminal `WorkflowFailed` → decode →
+// parent `ChildWorkflowFailed`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_workflow_panic_surfaces_to_parent_as_typed_handler_panic() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let parent_id = seed_workflow(
+        &mut conn,
+        "parent_panic_child_wf",
+        serde_json::json!({"n": 7}),
+    )
+    .await;
+
+    let metrics = Arc::new(PanicMetrics::default());
+    let registry = build_registry(
+        vec![
+            workflow_info("parent_panic_child_wf", parent_spawns_panic_child),
+            workflow_info("panic_child_wf", panic_workflow),
+        ],
+        vec![],
+        Arc::clone(&metrics),
+    );
+    // Budget 1 → the child's first panic is terminal (fast, no re-dispatch).
+    let worker = build_worker("worker-child-panic", Arc::clone(&registry), 1);
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // The parent propagates the child error → parent reaches FAILED once the
+    // child's panic has been contained, terminal-failed, and decoded upward.
+    let parent = wait_for_state(&url, parent_id, "FAILED", Duration::from_secs(30)).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task joins cleanly");
+    assert_eq!(parent.state, "FAILED");
+
+    // The parent observes the child failure as a typed ChildWorkflowFailed
+    // carrying the engine-reserved HandlerPanic error_type (the #767 surface).
+    let parent_history = load_history(&url, parent_id).await;
+    let child_failures: Vec<_> = parent_history
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::ChildWorkflowFailed {
+                error, error_type, ..
+            } => Some((error.clone(), error_type.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        child_failures.len(),
+        1,
+        "the parent must record exactly one ChildWorkflowFailed; history={parent_history:?}"
+    );
+    let (message, error_type) = &child_failures[0];
+    assert_eq!(
+        error_type.as_deref(),
+        Some(ERROR_TYPE_HANDLER_PANIC),
+        "a contained child-workflow panic must surface to the parent as a typed HandlerPanic \
+         (routed via decode_workflow_failure → child_workflow_failed_typed)"
+    );
+    assert!(
+        message.contains("workflow boom"),
+        "the child panic message must ride the typed ChildWorkflowFailed, got {message:?}"
+    );
+
+    // No poison-pill DLQ for the contained child panic.
+    let (_total, poison_dlq) = count_dead_letters(&url, parent_id).await;
+    assert_eq!(
+        poison_dlq, 0,
+        "no PoisonPill DLQ for a contained child panic"
     );
 }

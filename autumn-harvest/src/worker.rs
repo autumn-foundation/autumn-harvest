@@ -6892,6 +6892,30 @@ async fn fail_execution_on_error<T>(
     Err(error)
 }
 
+/// Terminal-fail wrapper for the `process_workflow_task` drive loop that also
+/// clears the execution's consecutive-panic strike entry (issue #782).
+///
+/// An early terminal-fail inside the drive loop (a transient error from an
+/// inline persist/local-activity DB call) ends the execution permanently
+/// *before* reaching the panic gate that would otherwise clear the strike. Any
+/// strike entry left by a prior contained-panic re-dispatch must be cleared
+/// here or it leaks one `u32` per such execution. The panic re-dispatch path
+/// returns `Ok(())` and is never routed through this wrapper, so its
+/// just-incremented strike is preserved (mirrors `workflow_task_timeout_strikes`).
+async fn fail_workflow_execution_clearing_strikes<T>(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    result: HarvestResult<T>,
+    workflow_panic_strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    exec_id: uuid::Uuid,
+) -> HarvestResult<T> {
+    if result.is_err() {
+        clear_panic_strike(workflow_panic_strikes, exec_id);
+    }
+    fail_execution_on_error(conn, task, worker_id, result).await
+}
+
 async fn load_task_execution(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -8205,11 +8229,13 @@ async fn process_workflow_task(
                         {
                             Ok(events) => events,
                             Err(e) => {
-                                return fail_execution_on_error(
+                                return fail_workflow_execution_clearing_strikes(
                                     conn,
                                     task,
                                     worker_id,
                                     Err::<(), _>(e),
+                                    workflow_panic_strikes,
+                                    prepared.exec_id.as_uuid(),
                                 )
                                 .await;
                             }
@@ -8265,8 +8291,15 @@ async fn process_workflow_task(
                 {
                     Ok(outcome) => outcome,
                     Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
+                        return fail_workflow_execution_clearing_strikes(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
+                            workflow_panic_strikes,
+                            prepared.exec_id.as_uuid(),
+                        )
+                        .await;
                     }
                 };
                 let new_events = match inline_outcome {
@@ -8358,17 +8391,41 @@ async fn process_workflow_task(
                 )
                 .await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
@@ -8388,8 +8445,15 @@ async fn process_workflow_task(
                 {
                     Ok(events) => events,
                     Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
+                        return fail_workflow_execution_clearing_strikes(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
+                            workflow_panic_strikes,
+                            prepared.exec_id.as_uuid(),
+                        )
+                        .await;
                     }
                 };
                 history_events.extend(new_events.clone());
@@ -8522,17 +8586,41 @@ async fn process_workflow_task(
                 )
                 .await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
@@ -8551,8 +8639,15 @@ async fn process_workflow_task(
                 {
                     Ok(events) => events,
                     Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
+                        return fail_workflow_execution_clearing_strikes(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
+                            workflow_panic_strikes,
+                            prepared.exec_id.as_uuid(),
+                        )
+                        .await;
                     }
                 };
                 let remaining_commands_with_unresolved = remaining_commands;
@@ -9893,17 +9988,25 @@ pub struct Worker {
     ///
     /// Each contained workflow-handler panic increments the counter for that
     /// execution ID; once it reaches `workflow_panic_max_attempts` the run is
-    /// failed terminally rather than re-dispatched. The counter is cleared when
-    /// a workflow-task cycle for that execution ends in any non-panic outcome
-    /// (completed / suspended / continued-as-new / author-Err failed /
-    /// ND-blocked), so only **consecutive** panics count and the map does not
-    /// grow unbounded.
+    /// failed terminally rather than re-dispatched. The counter is cleared on
+    /// **any completed non-panic decision cycle** for that execution (completed
+    /// / suspended / continued-as-new / author-Err failed / ND-blocked) AND on
+    /// an **early terminal-fail** inside the drive loop (a transient error that
+    /// takes the execution terminal FAILED before reaching the panic gate — see
+    /// `fail_workflow_execution_clearing_strikes`), so a strike entry never
+    /// outlives its execution. Only the panic **re-dispatch** path deliberately
+    /// leaves the just-incremented strike in place (it returns `Ok(())` and is
+    /// never routed through the clear); clearing there would reset the budget on
+    /// every panic and hot-loop forever.
     ///
     /// Keyed by `workflow_exec_id` (not `task.id`) so re-dispatched tasks from
     /// the same execution accumulate toward the same budget. In-process and
     /// per-worker-instance: it resets on worker restart, intentionally granting
     /// a fresh budget to a hotfix redeploy while still bounding churn on a
-    /// single long-lived worker.
+    /// single long-lived worker. An out-of-band cancel/terminate/reset that
+    /// takes the execution terminal without ever re-entering
+    /// `process_workflow_task` may leak one bounded entry until worker restart —
+    /// identical precedent to `workflow_task_timeout_strikes` (issue #494).
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     /// In-process registry of worker sessions currently hosted by this
     /// worker (issue #606), bounded against `config.max_concurrent_sessions`

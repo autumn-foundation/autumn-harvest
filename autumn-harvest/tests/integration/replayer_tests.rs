@@ -349,6 +349,41 @@ fn force_failed_compensating_workflow<'a>(
     })
 }
 
+/// Workflow that branches on a contained **handler-panic** activity cause
+/// (issue #782): a panicking activity is contained and, after its retry budget
+/// is exhausted, records a terminal `ActivityFailed` carrying the distinct
+/// `HandlerPanic` `error_type` on the *existing* event variant (no new variant).
+/// The workflow observes that typed cause via `activity_error_type()` and
+/// advances to its own compensation activity — proving AC6 "replay contract
+/// unchanged": a history containing a `HandlerPanic`-typed `ActivityFailed`
+/// replays deterministically down the same branch. If the typed `error_type`
+/// did not survive replay the handler would fall through to `Err(e)` and
+/// complete early, diverging from the recorded compensation activity — so
+/// `ReplaySucceeded` is falsifiable evidence.
+fn handler_panic_compensating_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match ctx
+            .execute_activity_raw("risky_step", Value::Null, "default")
+            .await
+        {
+            Ok(v) => Ok(serde_json::json!({"ok": v})),
+            // Branch purely on the typed HandlerPanic error_type — no substring
+            // matching on the message.
+            Err(e) if e.activity_error_type() == Some("HandlerPanic") => {
+                let r = ctx
+                    .execute_activity_raw("compensate", Value::Null, "default")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"compensated": r}))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Typed workflow failures (issue #767) — replay-determinism fixtures
 // ---------------------------------------------------------------------------
@@ -585,6 +620,10 @@ fn build_replayer() -> WorkflowReplayer {
             parent_typed_child_failure_workflow,
         )
         .register_fn("self_typed_failure_workflow", self_typed_failure_workflow)
+        .register_fn(
+            "handler_panic_compensating_workflow",
+            handler_panic_compensating_workflow,
+        )
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -733,6 +772,87 @@ async fn replay_force_failed_activity_takes_compensation_branch_deterministicall
         report.events_replayed > 0,
         "events_replayed must be positive"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (a0b) A contained activity HANDLER PANIC (issue #782) replays deterministically
+//       down the workflow's own compensation branch. The panic is contained by
+//       the engine into a terminal `ActivityFailed` carrying the distinct
+//       `HandlerPanic` error_type on the EXISTING event variant — AC6 requires
+//       the replay contract to be unchanged, i.e. such a history must replay
+//       clean and drive the same branch every cycle.
+// ---------------------------------------------------------------------------
+
+/// History recorded by a run whose `risky_step` activity panicked: after its
+/// retry budget was exhausted the engine recorded a terminal `ActivityFailed`
+/// carrying the engine-reserved `HandlerPanic` `error_type` (issue #782, no new
+/// event variant); the workflow then ran its compensation activity on the live
+/// frontier.
+fn handler_panic_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let risky_id = ActivityExecId::new();
+    let compensate_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: risky_id,
+            name: "risky_step".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: risky_id,
+            error: "activity handler panicked: risky boom".into(),
+            attempt: 2,
+            error_type: "HandlerPanic".into(),
+            non_retryable: true,
+            details: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: compensate_id,
+            name: "compensate".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: compensate_id,
+            output: serde_json::json!("compensated"),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replay_handler_panic_activity_takes_compensation_branch_deterministically() {
+    let (exec_id, events) = handler_panic_activity_history();
+    let replayer = build_replayer();
+
+    // Replay the SAME history multiple times — the contained HandlerPanic cause
+    // must drive the same (compensation) branch every cycle.
+    for cycle in 0..3 {
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "handler_panic_compensating_workflow",
+                exec_id,
+                events.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "cycle {cycle}: a history containing a HandlerPanic ActivityFailed must \
+             replay deterministically (issue #782 AC6, replay contract unchanged), got: {report}"
+        );
+        assert!(
+            report.events_replayed > 0,
+            "cycle {cycle}: events_replayed must be positive"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

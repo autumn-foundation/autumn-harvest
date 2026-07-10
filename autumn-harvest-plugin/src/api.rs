@@ -69,7 +69,7 @@ use autumn_harvest::dlq;
 use autumn_harvest::erase;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::executor::{
-    TerminalQueryDecision, classify_terminal_query, drive_query_replay,
+    QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay,
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
@@ -14834,6 +14834,18 @@ async fn hydrate_ctx_for_query(
         // Running/suspended: serve whatever state the drive reconstructed,
         // exactly as before #612 — the drive naturally stops at the first
         // suspension (or the deadline) for a partial, still-growing history.
+        //
+        // Issue #782: the shared driver catches a workflow-handler panic
+        // regardless of terminal/running state (a code-changed in-flight run
+        // whose query-drive panics). The reconstructed context is untrustworthy,
+        // so surface a clean `QueryHandlerPanicked` (503) rather than serving
+        // torn/partial state with a 200 — matching how the terminal path routes
+        // `Panicked` to an error via `classify_terminal_query`.
+        if matches!(outcome, QueryReplayOutcome::Panicked) {
+            return Err(map_error(HarvestError::QueryHandlerPanicked(format!(
+                "workflow handler panicked during query replay for execution {exec_id}"
+            ))));
+        }
         Ok(ctx)
     }
 }

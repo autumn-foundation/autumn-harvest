@@ -3816,6 +3816,118 @@
           "description": "Alert: harvest_saga_compensation_failed (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed) Unwinds that finished with at least one compensation error (issue #801) \u2014 the dangling-state case (HarvestError::SagaCompensationFailed). Any increase warrants a page: committed side effects were left un-rolled-back and need manual reconciliation. Distinct from harvest_workflow_terminal{outcome=\"failed\"}."
         }
       ]
+    },
+    {
+      "id": 89,
+      "type": "row",
+      "title": "Handler panics",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 63
+      },
+      "panels": [
+        {
+          "id": 90,
+          "type": "timeseries",
+          "title": "Activity handler panics",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity, queue) (rate(harvest_activity_panic_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{activity}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Contained activity/local-activity handler panics per second (issue #782) \u2014 a `panic!()`/`unwrap()` in an `#[activity]` body caught at the dispatch boundary and converted to a retryable typed `HandlerPanic` failure. Fires once per panicking attempt (a retry that panics again increments again), so this is a per-attempt panic-rate signal distinct from ordinary `Err` failures and from process-crash quarantine (harvest_task_quarantined). A sustained rise points at a code bug in an activity, not a downstream outage."
+        },
+        {
+          "id": 91,
+          "type": "timeseries",
+          "title": "Workflow handler panics",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (rate(harvest_workflow_panic_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Contained workflow-body handler panics per second (issue #782) \u2014 a panic in a `#[workflow]` body caught in the executor and re-dispatched under a bounded panic-retry budget (WorkerConfig::workflow_panic_max_attempts), then failed terminally as a typed `HandlerPanic`. Emitted on every panic entry (each retry and the final terminal failure), so a workflow that panics N times before exhausting its budget emits N samples. A rise indicates a deterministic code bug on the workflow path."
+        }
+      ]
     }
   ]
 }

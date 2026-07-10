@@ -254,6 +254,8 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATION_FAILED` | `harvest.saga.compensation_failed` | Counter | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
+| `METRIC_ACTIVITY_PANIC`    | `harvest.activity.panic`      | Counter      | `activity` (= `METRIC_LABEL_ACTIVITY`, bounded), `queue` (bounded) | `execution.id`, `activity.id` |
+| `METRIC_WORKFLOW_PANIC`    | `harvest.workflow.panic`      | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`        |
 
 **Cardinality rule**: `execution.id` (a UUID) is **explicitly forbidden** as a
 metric label. It is unbounded and would explode the metric time-series in any

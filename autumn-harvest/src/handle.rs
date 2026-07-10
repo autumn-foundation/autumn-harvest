@@ -1034,7 +1034,24 @@ impl WorkflowHandle {
                 });
             }
             flag.store(false, std::sync::atomic::Ordering::Release);
-            match handler_fut.as_mut().poll(&mut poll_cx) {
+            // Issue #782: contain a workflow-handler panic during the in-process
+            // read-only replay drive, mirroring `executor::drive_query_replay`
+            // exactly. Without this, a panicking query handler on a code-changed
+            // in-flight run unwinds through the in-process
+            // `TypedWorkflowHandle`/`WorkflowHandle` caller. Query replays emit no
+            // commands and append no events, so there is nothing to roll back —
+            // map the caught panic to a clean `QueryHandlerPanicked` (503).
+            let poll = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler_fut.as_mut().poll(&mut poll_cx)
+            })) {
+                Ok(poll) => poll,
+                Err(panic_payload) => {
+                    return Err(HarvestError::QueryHandlerPanicked(
+                        crate::error::panic_message(panic_payload),
+                    ));
+                }
+            };
+            match poll {
                 std::task::Poll::Ready(res) => {
                     replay_result = Some(res);
                     break;

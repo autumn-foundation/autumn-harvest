@@ -246,6 +246,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
