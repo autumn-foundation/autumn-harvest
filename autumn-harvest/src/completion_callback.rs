@@ -238,6 +238,13 @@ const fn is_ipv4_non_routable(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()
         // 100.64.0.0/10 — shared address space (CGNAT, RFC 6598).
         || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64)
+        // 0.0.0.0/8 — "this host on this network" (RFC 1122). On Linux the
+        // whole range routes to localhost, so it is an SSRF bypass of the
+        // host allowlist; `is_unspecified()` above only catches the bare
+        // 0.0.0.0 address, not the rest of the /8.
+        || ip.octets()[0] == 0
+        // 198.18.0.0/15 — benchmarking / device testing (RFC 2544).
+        || (ip.octets()[0] == 198 && (ip.octets()[1] == 18 || ip.octets()[1] == 19))
 }
 
 /// Reject non-routable IPv6 addresses (loopback, unspecified, link-local,
@@ -634,6 +641,140 @@ mod ssrf_tests {
                 host: "api.example.com".to_string()
             }
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // RFC-special-range coverage (PR #1004 review notes / issue #605 hardening)
+    //
+    // `is_ipv4_non_routable` must block every non-routable IPv4 range, not
+    // just the single representative address per range. These tests both
+    // audit the ranges documented as already covered (VERIFY, don't assume)
+    // and pin the two newly closed gaps: 0.0.0.0/8 and 198.18.0.0/15.
+    // ---------------------------------------------------------------------
+
+    /// A policy that allows IP literals (so the classifier — not the
+    /// blanket `IpLiteralNotAllowed` rule — is what makes the decision) with
+    /// no host allowlist (irrelevant for IP literals, which are never matched
+    /// against the domain allowlist).
+    fn ip_literal_policy() -> SsrfPolicy {
+        SsrfPolicy::default().with_allow_ip_literals(true)
+    }
+
+    fn assert_ip_rejected_non_routable(addr: &str) {
+        let policy = ip_literal_policy();
+        let target = if addr.contains(':') {
+            format!("https://[{addr}]/hook")
+        } else {
+            format!("https://{addr}/hook")
+        };
+        let err = validate_target_url(&target, &policy).unwrap_err();
+        assert!(
+            matches!(err, SsrfRejection::IpNotRoutable { .. }),
+            "expected {addr} to be rejected as non-routable, got {err:?}"
+        );
+    }
+
+    fn assert_ip_not_special_range_rejected(addr: &str) {
+        // With IP literals allowed and no allowlist gate, a genuinely
+        // routable public IP must pass — proving the special-range
+        // classifier does not over-reach into neighboring ranges.
+        let policy = ip_literal_policy();
+        assert!(
+            validate_target_url(&format!("https://{addr}/hook"), &policy).is_ok(),
+            "expected {addr} to pass the special-range classifier (routable public IP)"
+        );
+    }
+
+    #[test]
+    fn rejects_this_host_range_0_0_0_0_slash_8() {
+        // 0.0.0.0/8 ("this host on this network", RFC 1122). On Linux the
+        // whole range routes to localhost, so allowing it is a real SSRF
+        // bypass of the callback host allowlist. `is_unspecified()` only
+        // caught the single 0.0.0.0 address before this fix.
+        for addr in ["0.0.0.1", "0.1.2.3", "0.255.255.255", "0.0.0.0"] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn rejects_benchmarking_range_198_18_0_0_slash_15() {
+        // 198.18.0.0/15 (benchmarking, RFC 2544) — 198.18.0.0 .. 198.19.255.255.
+        for addr in [
+            "198.18.0.0",
+            "198.18.0.1",
+            "198.18.255.255",
+            "198.19.0.0",
+            "198.19.255.255",
+        ] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn benchmarking_range_neighbors_are_not_special_range_rejected() {
+        // Just outside 198.18.0.0/15 — ordinary public IPs that must NOT be
+        // rejected by the special-range classifier.
+        for addr in ["198.17.255.255", "198.20.0.0"] {
+            assert_ip_not_special_range_rejected(addr);
+        }
+    }
+
+    #[test]
+    fn audits_loopback_range_127_0_0_0_slash_8() {
+        // Whole 127.0.0.0/8, not just 127.0.0.1.
+        for addr in ["127.0.0.1", "127.1.2.3", "127.255.255.255"] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn audits_private_ranges_rfc1918() {
+        for addr in [
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "192.168.255.255",
+        ] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn audits_link_local_range_169_254_0_0_slash_16() {
+        for addr in ["169.254.0.1", "169.254.255.255"] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn audits_cgnat_shared_range_100_64_0_0_slash_10() {
+        for addr in ["100.64.0.1", "100.127.255.255"] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn audits_ipv6_unspecified_and_loopback() {
+        for addr in ["::", "::1"] {
+            assert_ip_rejected_non_routable(addr);
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_inherits_ipv4_special_range_rejection() {
+        // v4-mapped forms canonicalize to their IPv4 address via
+        // `to_ipv4_mapped()` and must hit the same classifier — including the
+        // two newly closed ranges.
+        for addr in [
+            "::ffff:0.0.0.1",    // 0.0.0.0/8
+            "::ffff:127.0.0.1",  // loopback
+            "::ffff:198.18.0.1", // 198.18.0.0/15 benchmarking
+            "::ffff:10.0.0.1",   // private
+        ] {
+            assert_ip_rejected_non_routable(addr);
+        }
     }
 }
 
