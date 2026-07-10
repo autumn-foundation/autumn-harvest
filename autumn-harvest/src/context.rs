@@ -4334,17 +4334,32 @@ impl WorkflowContext {
             "cancel_timer: timer_id must be non-empty"
         );
         // On replay the `TimerCancelled` is already recorded and was consumed
-        // (Matched) — nothing to do. Otherwise (NoMatch): a genuine LIVE cancel
-        // (record it), OR a strict-replay divergence — `match_timer_cancel`'s scan
-        // STOPPED at an unconsumed command before the recorded `TimerCancelled`,
-        // i.e. the cancel was moved earlier in the code (Codex P2 round 6, issue
-        // #768). Surface the divergence in strict replay before pushing a new
-        // command, mirroring `await_timer_fire`'s NoMatch handling.
-        if !matches!(
-            self.match_history(|m| m.match_timer_cancel(timer_id)),
-            HistoryMatch::Matched { .. }
-        ) {
+        // (Matched) — nothing to do. Otherwise (NoMatch) the scan either reached
+        // the live frontier (a genuine LIVE cancel — record it) or was BLOCKED at
+        // an unconsumed command before the recorded `TimerCancelled`, i.e. the
+        // cancel was moved earlier in the code (Codex P2 rounds 6/12, issue #768).
+        // A blocked scan is a non-determinism divergence in BOTH strict
+        // `WorkflowReplayer` mode AND normal worker replay: `check_strict_replay_no_match`
+        // surfaces it immediately under strict, and `timer_scan_stopped_at_command`
+        // distinguishes blocked-vs-frontier so a normal worker replay records a
+        // deferred nd error (→ #603 nd-block) instead of silently appending a new
+        // `CancelTimer` and extending history past a command it has not replayed.
+        let (matched, blocked) = self.match_history(|m| {
+            let r = m.match_timer_cancel(timer_id);
+            (
+                matches!(r, HistoryMatch::Matched { .. }),
+                m.timer_scan_stopped_at_command(),
+            )
+        });
+        if !matched {
             self.check_strict_replay_no_match(&format!("TimerCancelled({timer_id})"))?;
+            if blocked {
+                self.record_deferred_nd(format!(
+                    "non-deterministic replay: cancel_timer({timer_id}) emitted before a \
+                     command recorded earlier in history"
+                ));
+                return Ok(());
+            }
             self.push_command(WorkflowCommand::CancelTimer {
                 timer_id: TimerId::new(timer_id),
             });
@@ -4375,14 +4390,28 @@ impl WorkflowContext {
             "reset_timer: timer_id must be non-empty"
         );
         // Cancel the current arming. Matched → already recorded/consumed on
-        // replay (nothing to do). NoMatch → live reset (record the cancel), OR a
-        // strict-replay divergence — the reset was moved before an unconsumed
-        // command the cancel scan stopped at (Codex P2 round 6, issue #768).
-        if !matches!(
-            self.match_history(|m| m.match_timer_cancel(timer_id)),
-            HistoryMatch::Matched { .. }
-        ) {
+        // replay (nothing to do). NoMatch → live reset (record the cancel) at the
+        // frontier, OR a BLOCKED scan (the reset was moved before an unconsumed
+        // command the cancel scan stopped at — Codex P2 rounds 6/12, issue #768).
+        // A blocked scan is a divergence in normal worker replay too (not only
+        // strict `WorkflowReplayer` mode): nd-block via the deferred path instead
+        // of appending a `CancelTimer` past an unreplayed command.
+        let (matched, blocked) = self.match_history(|m| {
+            let r = m.match_timer_cancel(timer_id);
+            (
+                matches!(r, HistoryMatch::Matched { .. }),
+                m.timer_scan_stopped_at_command(),
+            )
+        });
+        if !matched {
             self.check_strict_replay_no_match(&format!("TimerCancelled({timer_id})"))?;
+            if blocked {
+                self.record_deferred_nd(format!(
+                    "non-deterministic replay: reset_timer({timer_id}) emitted before a \
+                     command recorded earlier in history"
+                ));
+                return Ok(());
+            }
             self.push_command(WorkflowCommand::CancelTimer {
                 timer_id: TimerId::new(timer_id),
             });
@@ -4453,7 +4482,11 @@ impl WorkflowContext {
             let armed_duration = self
                 .timer_logically_armed(timer_id)
                 .unwrap_or(duration_secs);
-            match self.match_history(|m| m.match_timer_or_cancel(timer_id)) {
+            let (fire_match, blocked) = self.match_history(|m| {
+                let r = m.match_timer_or_cancel(timer_id);
+                (r, m.timer_scan_stopped_at_command())
+            });
+            match fire_match {
                 TimerFireMatch::Fired => {
                     // Advance the virtual clock so ctx.now() reflects elapsed
                     // time (mirrors ctx.timer()).
@@ -4484,6 +4517,29 @@ impl WorkflowContext {
                         return Ok(TimerOutcome::Cancelled);
                     }
                     self.check_strict_replay_no_match(&format!("TimerFired({timer_id})"))?;
+                    // A BLOCKED scan (`match_timer_or_cancel` stopped at an
+                    // unconsumed command with the recorded `TimerFired`/`TimerCancelled`
+                    // still ahead) means the await was moved before a command
+                    // history recorded first — a non-determinism divergence in
+                    // NORMAL worker replay too, not only strict `WorkflowReplayer`
+                    // mode (Codex P2 round 12, issue #768). Record a deferred nd
+                    // (→ #603 nd-block) and return an error instead of re-arming
+                    // and parking, which would insert a durable timer row and
+                    // extend history past an unreplayed command. (In strict mode
+                    // the `check_strict_replay_no_match` above already returned.)
+                    if blocked {
+                        let msg = format!(
+                            "non-deterministic replay: await of timer {timer_id} emitted \
+                             before a command recorded earlier in history"
+                        );
+                        self.record_deferred_nd(msg.clone());
+                        return Err(self.nd_error(
+                            msg,
+                            i32::try_from(self.match_history(|m| m.position())).ok(),
+                            None,
+                            None,
+                        ));
+                    }
                     // Re-arm for firing (`for_await = true`): this is the ONE and
                     // only path that makes a cancellable timer fire-eligible — the
                     // worker inserts the durable `harvest_timers` row here (the
@@ -10478,6 +10534,102 @@ mod tests {
             &cmds[0],
             WorkflowCommand::CancelTimer { timer_id } if timer_id.as_str() == "idle"
         ));
+    }
+
+    #[tokio::test]
+    async fn cancel_timer_blocked_by_unreplayed_command_records_deferred_nd_in_normal_replay() {
+        // Codex P2 round 12 (issue #768): NORMAL worker replay (strict_replay =
+        // false, as `for_replay` builds). History records the cancel AFTER an
+        // activity; new code moved `cancel_timer` BEFORE it. `match_timer_cancel`'s
+        // scan STOPS at the unconsumed `ActivityScheduled` (blocked) rather than
+        // reaching the recorded `TimerCancelled`. This must surface as a
+        // non-determinism divergence (deferred nd → #603 nd-block), NOT silently
+        // append a new `CancelTimer` past a command it has not replayed.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            wf_started_event(),
+            timer_started_event("idle", 300),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::TimerCancelled {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Consume the recorded arm.
+        let _handle = ctx.start_timer("idle", 300);
+        let _ = ctx.drain_commands();
+        // Reordered: cancel BEFORE the activity replays.
+        ctx.cancel_timer("idle").expect("cancel returns Ok");
+        assert!(
+            ctx.take_deferred_nd_error().is_some(),
+            "a blocked cancel scan in normal replay must record a deferred nd error"
+        );
+        assert!(
+            !ctx.drain_commands()
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::CancelTimer { .. })),
+            "a blocked cancel scan must NOT append a new CancelTimer past an unreplayed command"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_timer_fire_blocked_by_unreplayed_command_records_deferred_nd_in_normal_replay() {
+        // Codex P2 round 12 (issue #768): the fire-outcome scan's blocked case in
+        // NORMAL worker replay. History records `TimerFired` AFTER an activity;
+        // new code awaits the timer BEFORE it. `match_timer_or_cancel` STOPS at the
+        // unconsumed `ActivityScheduled` (blocked) — this must be a divergence, not
+        // a re-arm+park that inserts a durable timer row and extends history past
+        // an unreplayed command.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            wf_started_event(),
+            timer_started_event("idle", 300),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let handle = ctx.start_timer("idle", 300);
+        let _ = ctx.drain_commands();
+        // Reordered: await BEFORE the activity replays.
+        let result = handle.await_fire().await;
+        assert!(
+            result.is_err(),
+            "a blocked await scan in normal replay must return a non-determinism error"
+        );
+        assert!(
+            ctx.take_deferred_nd_error().is_some(),
+            "a blocked await scan in normal replay must also record a deferred nd error"
+        );
+        assert!(
+            !ctx.drain_commands().iter().any(|c| matches!(
+                c,
+                WorkflowCommand::ArmTimer {
+                    for_await: true,
+                    ..
+                }
+            )),
+            "a blocked await scan must NOT re-arm (for_await) past an unreplayed command"
+        );
     }
 
     #[test]

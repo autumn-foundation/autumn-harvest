@@ -481,6 +481,23 @@ pub struct HistoryMatcher {
     /// `deprecate_patch` ORs this set into its presence computation so the
     /// live cycle agrees with every replay cycle.
     patch_ids_recorded_this_cycle: HashSet<String>,
+    /// Whether the MOST RECENT cancellable-timer forward scan
+    /// ([`Self::match_timer_cancel`] / [`Self::match_timer_or_cancel`], issue
+    /// #768) STOPPED at an unconsumed command-bearing event
+    /// ([`TimerScanStep::Stop`]) rather than claiming its target or running off
+    /// the end of history. Both scans reset this to `false` on entry (after
+    /// `prepare_match`) and set it `true` on the `Stop` break.
+    ///
+    /// A `NoMatch` return paired with this flag `true` means the scan was
+    /// **blocked**: a same-id `TimerCancelled`/`TimerFired` (or a genuinely new
+    /// cancel/await) is being emitted BEFORE a command history recorded first —
+    /// a real non-determinism divergence, distinct from a genuine live-frontier
+    /// `NoMatch` (scan ran off the end, cursor at the frontier) which is a
+    /// legitimate new live append. [`Self::timer_scan_stopped_at_command`]
+    /// exposes it so `cancel_timer`/`reset_timer`/`await_timer_fire` can treat a
+    /// blocked scan as a divergence in NORMAL worker replay too, not only under
+    /// strict `WorkflowReplayer` mode (Codex P2 round 12, issue #768).
+    timer_scan_stopped_at_command: bool,
 }
 
 impl HistoryMatcher {
@@ -540,7 +557,21 @@ impl HistoryMatcher {
             race_reserved_signal_events,
             deprecated_patches: HashMap::new(),
             patch_ids_recorded_this_cycle: HashSet::new(),
+            timer_scan_stopped_at_command: false,
         }
+    }
+
+    /// Returns whether the most recent cancellable-timer forward scan STOPPED at
+    /// an unconsumed command-bearing event (issue #768, Codex P2 round 12).
+    ///
+    /// Meaningful only immediately after a [`Self::match_timer_cancel`] /
+    /// [`Self::match_timer_or_cancel`] call that returned `NoMatch`: `true`
+    /// means the scan was **blocked** (a divergence — the cancel/await/fire is
+    /// being emitted before a command history recorded first), `false` means the
+    /// scan reached the live frontier (a legitimate new live append).
+    #[must_use]
+    pub const fn timer_scan_stopped_at_command(&self) -> bool {
+        self.timer_scan_stopped_at_command
     }
 
     /// Extracts the signal name from a signal-or-deadline race timer ID
@@ -2833,6 +2864,10 @@ impl HistoryMatcher {
     /// replay despite a real command-order change (the false negative this fix
     /// closes — sibling of the round-5 `match_timer_or_cancel` fix).
     pub fn match_timer_cancel(&mut self, timer_id: &str) -> HistoryMatch {
+        // Reset the blocked-scan flag on entry; the callers read it after a
+        // NoMatch return to distinguish a blocked scan (divergence) from a
+        // genuine live-frontier NoMatch (Codex P2 round 12, issue #768).
+        self.timer_scan_stopped_at_command = false;
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
@@ -2857,7 +2892,10 @@ impl HistoryMatcher {
             // cross).
             match self.timer_scan_cross_or_stop(scan, timer_id) {
                 TimerScanStep::Cross => scan += 1,
-                TimerScanStep::Stop => break,
+                TimerScanStep::Stop => {
+                    self.timer_scan_stopped_at_command = true;
+                    break;
+                }
             }
         }
         HistoryMatch::NoMatch
@@ -3051,6 +3089,9 @@ impl HistoryMatcher {
     /// non-determinism divergence instead. The crossable set is shared verbatim
     /// with [`Self::match_timer_cancel`] via [`Self::timer_scan_cross_or_stop`].
     pub fn match_timer_or_cancel(&mut self, timer_id: &str) -> TimerFireMatch {
+        // Reset the blocked-scan flag on entry (see `match_timer_cancel` — Codex
+        // P2 round 12, issue #768).
+        self.timer_scan_stopped_at_command = false;
         if !self.prepare_match() {
             return TimerFireMatch::NoMatch;
         }
@@ -3084,7 +3125,10 @@ impl HistoryMatcher {
             // crossable set is shared verbatim with `match_timer_cancel`.
             match self.timer_scan_cross_or_stop(scan, timer_id) {
                 TimerScanStep::Cross => scan += 1,
-                TimerScanStep::Stop => break,
+                TimerScanStep::Stop => {
+                    self.timer_scan_stopped_at_command = true;
+                    break;
+                }
             }
         }
         TimerFireMatch::NoMatch

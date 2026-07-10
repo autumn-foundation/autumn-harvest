@@ -271,3 +271,35 @@ round 11: empty), the round-8/9/10 pure tests kept green, and a new context test
 proving the real `await_fire()`-then-`reset()` API sequence emits exactly that
 `[Arm(true), Cancel, Arm(false)]` batch; the replay-resolves-`Cancelled` side is
 already covered by `await_fire_returns_cancelled_when_history_has_timercancelled_before_fire`.
+
+**Post-review hardening round 12 (Codex 1× P2):** a blocked cancellable-timer
+scan — one that STOPPED (`TimerScanStep::Stop`) at an unconsumed command-bearing
+event with the recorded `TimerCancelled`/`TimerFired` still ahead — is now treated
+as a non-determinism divergence in NORMAL worker replay too, not only under strict
+`WorkflowReplayer` mode. Previously the blocked case was surfaced solely through
+`check_strict_replay_no_match`, a no-op when `strict_replay`/`canary_mode` are
+false (i.e. the ordinary worker replay path). So a running execution whose history
+was `TimerStarted(id), ActivityScheduled(...), …, TimerCancelled(id)` and whose new
+code moved `cancel_timer(id)`/`reset_timer(id, …)` (or the `await_fire()`
+resolution) BEFORE that activity would take the live-frontier append path in
+production: the worker pushed a fresh `CancelTimer`/`ArmTimer` and extended history
+AFTER a command it had not replayed — a silent corruption where issue #603 should
+have nd-blocked. `WorkflowReplayer` (strict) caught it; the worker did not.
+
+The matcher now distinguishes a *blocked* `NoMatch` (scan stopped at an unconsumed
+command) from a *genuine live-frontier* `NoMatch` (scan ran off the end, cursor at
+the frontier) via a new `HistoryMatcher::timer_scan_stopped_at_command()` flag,
+reset on entry to `match_timer_cancel`/`match_timer_or_cancel` and set `true` on the
+`Stop` break. `cancel_timer`/`reset_timer`/`await_timer_fire` read it after a
+`NoMatch`: a blocked scan records a deferred nd error (→ #603 nd-block) and skips
+the command append/re-arm+park entirely, while a genuine live-frontier `NoMatch`
+still records a real new cancel/await as before. The strict `WorkflowReplayer`
+immediate-`Err` path (rounds 6/10 reorder soundness gates) is unchanged — the
+existing strict reorder tests stay green. No new `WorkflowEvent` variant, no
+migration. Tests (TDD red→green): two new normal-replay context tests
+`cancel_timer_blocked_by_unreplayed_command_records_deferred_nd_in_normal_replay`
+and `await_timer_fire_blocked_by_unreplayed_command_records_deferred_nd_in_normal_replay`
+(context.rs) — confirmed RED before the fix (the cancel test appended a stray
+`CancelTimer` with no deferred nd; the await test parked/re-armed forever) and
+GREEN after; the strict-mode reorder detection tests and the full timer matrix /
+reset-loop tests stay green.
