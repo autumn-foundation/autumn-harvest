@@ -15,6 +15,8 @@
 name: CI
 
 on:
+  # Manual trigger for the opt-in fuzz-smoke job (see the `fuzz-smoke` job).
+  workflow_dispatch:
   push:
     branches: [trunk, trunk-dev]
   pull_request:
@@ -152,6 +154,13 @@ jobs:
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib
+      - name: Run db-gated property suites (build_routing, dlq)
+        # The pure property suites run under the no-db line above; the db-gated
+        # submodules (build_routing_props, dlq_props) target pure functions in
+        # #[cfg(feature = "db")] modules and are otherwise only compiled — never
+        # executed — by the --no-run / --lib db steps. They need no live Postgres.
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --features db --test property
       - name: Free disk space
         if: needs.changes.outputs.code == 'true'
         run: cargo clean
@@ -266,3 +275,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace
+
+  # Opt-in fuzz smoke. NEVER runs on push/PR — GitHub Actions minutes are tight
+  # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab
+  # (Run workflow) when you want a quick "do the targets still build and run
+  # clean" check. For a real campaign, run a single target locally with a larger
+  # -max_total_time (see docs/testing/property-and-fuzz.md and fuzz/smoke.sh).
+  fuzz-smoke:
+    name: Fuzz smoke (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz smoke (30s per target)
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for t in fuzz_workflow_event_deser fuzz_det_check_source \
+                   fuzz_validate_target_url fuzz_failure_signature; do
+            echo "=== ${t} ==="
+            cargo +nightly fuzz run "${t}" -- -max_total_time=30
+          done
