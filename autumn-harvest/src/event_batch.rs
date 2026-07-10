@@ -466,6 +466,13 @@ async fn fire_due_on_conn(
                 .await;
             }
             if let Some(m) = metrics {
+                // issue #618, F1: the event-batch scanner relays a start already
+                // admitted through the gate at HTTP time; count the deferred fire
+                // as an exempt bypass so it never slips a gate silently. See
+                // `admission_gate::producer_contract`.
+                m.record_admission_bypassed(
+                    crate::admission_gate::StartProducer::EventBatch.as_str(),
+                );
                 for (wf_name, q_name) in cancel_metrics {
                     m.record_workflow_terminal(
                         &wf_name,

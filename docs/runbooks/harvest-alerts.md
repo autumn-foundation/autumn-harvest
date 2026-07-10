@@ -119,6 +119,13 @@ below (e.g. `dead_letters` → `harvest_dlq_growth`, `queues` /
 `harvest_no_active_workers` / `harvest_worker_saturation`, `shards` →
 `harvest_shard_unready`).
 
+To **halt new workflow starts** fleet-wide (or by name/queue/shard/owner) while
+you investigate — the incident-containment lever above the per-run
+pause/cancel/terminate — raise an admission gate. Which start producers honour a
+gate, which are exempt-by-design, and how to watch the
+`harvest.admission.bypassed` counter are documented in
+`docs/operations/admission-gate-producers.md`.
+
 ### Configurable thresholds
 
 The verdict boundaries are **starter defaults, not universal SLOs** — every

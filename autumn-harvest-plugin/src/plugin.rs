@@ -781,6 +781,19 @@ async fn start_harvest_runtime(
             )));
         }
     }
+    // issue #618 (F11): publish the SAME gate-cache Arc the management API uses
+    // into the process-global static BEFORE HarvestRunner::start spawns the
+    // worker poll loops and the timeout scanner (which fires completion-trigger /
+    // debounce / throttle / event-batch starts). Otherwise a scanner tick or a
+    // completion trigger firing in the boot window would run with the gate check
+    // skipped entirely. The cache starts fail-closed (uninitialized); a
+    // completion trigger firing before the boot-time gate load below sees the
+    // fail-closed sentinel and PROCEEDS (issue #618, F3) rather than dropping
+    // already-committed in-flight continuation, so publishing this early is safe.
+    // The background refresh loop mutates this same shared Arc in place, so a
+    // single publish is sufficient — no re-publish per refresh.
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(api_state.gate_cache()));
+
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
@@ -930,6 +943,9 @@ async fn start_harvest_runtime(
 
     api_state.install_storage_pool(harvest_db_pool.clone());
 
+    // issue #618: the process-global gate cache was published above, BEFORE
+    // HarvestRunner::start spawned the workers/scanners (F11).
+
     // issue #377: boot-time gate load — populate the cache before any traffic hits.
     if let Ok(mut boot_conn) = acquire_conn(harvest_db_pool.default_pool()).await {
         match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
@@ -1062,6 +1078,18 @@ fn harvest_database_url(
 }
 
 async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: HarvestApiState) {
+    // issue #618 (F5): clear the process-global gate cache so a stopped plugin's
+    // cache (whose refresh loop is about to be cancelled and will go stale) never
+    // leaks into a sibling plugin's completion-trigger gate check. Only clear it
+    // if the installed cache is OURS (ptr-eq), so stopping one plugin cannot
+    // clobber a concurrently-live sibling's cache. Mirrors #921's teardown of
+    // GLOBAL_CALLBACK_CONFIG.
+    if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
+        && Arc::ptr_eq(&installed, &api_state.gate_cache())
+    {
+        autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    }
+
     let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
 
     let Some(runtime) = runtime else {

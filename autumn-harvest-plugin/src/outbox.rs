@@ -349,6 +349,20 @@ pub(crate) async fn dispatch_workflow_start_request(
     )
     .await?;
 
+    // issue #618: the outbox relay is EXEMPT-BY-DESIGN from the admission gate.
+    // It replays workflow-start requests that were durably committed to the
+    // outbox before any gate was raised; gating them would drop already-accepted
+    // in-flight work, which is the opposite of the gate contract ("halt NEW
+    // starts while in-flight work drains"). We count every relayed start on
+    // `harvest.admission.bypassed{producer="outbox"}` so the exemption is
+    // observable — an operator can see in real time whether anything is slipping
+    // an active gate. See `admission_gate::producer_contract`.
+    if let Some(registry) = registry_ext.as_ref() {
+        registry.telemetry().metrics.record_admission_bypassed(
+            autumn_harvest::admission_gate::StartProducer::Outbox.as_str(),
+        );
+    }
+
     Ok(start.exec_id)
 }
 

@@ -1941,6 +1941,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
 
     let sweep_res = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &Some(bad_sharded_pool),
         &[ShardId::new(1)], // sweep targets Shard 1
     )
@@ -1961,6 +1962,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
     // 2. Now run outbox sweep with the correct/working sharded pool
     let sweep_res_success = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &Some(sharded_pool),
         &[ShardId::new(1)],
     )
@@ -2423,6 +2425,7 @@ async fn test_exact_pool_routing_cross_shard() {
 
     let sweep_count = enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &incomplete_sharded_pool,
         &[ShardId::new(0), ShardId::new(1)],
     )

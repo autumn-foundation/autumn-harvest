@@ -3093,7 +3093,16 @@ async fn list_gates_handler(
     match admission_gate_db::list_gates(&mut conn).await {
         Ok(rows) => {
             let views: Vec<AdmissionGateView> = rows.iter().map(AdmissionGateView::from).collect();
-            (StatusCode::OK, Json(serde_json::json!({ "gates": views }))).into_response()
+            // issue #618 (AC5): surface the discoverable start-producer contract
+            // alongside the active gates so an operator can see which in-process
+            // producers honour a gate and which are exempt-by-design (with a
+            // rationale) without reading source.
+            let producers = autumn_harvest::admission_gate::producer_contract();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "gates": views, "producers": producers })),
+            )
+                .into_response()
         }
         Err(e) => AutumnError::internal_server_error(e).into_response(),
     }
@@ -10646,6 +10655,14 @@ pub(crate) async fn start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, resolved_key);
 
+        // issue #618 (F12): gate pre-check before acquiring the DB connection, the
+        // same non-atomic check-then-admit shape the debounce path uses. There is
+        // a bounded TOCTOU window between this in-memory check and the batch
+        // upsert during which a gate could be raised. That window does NOT produce
+        // an un-counted admission: a start that slips it is durably deferred, and
+        // its later scanner fire is counted as an exempt bypass
+        // (harvest.admission.bypassed{producer="event_batch"}). Documented in
+        // docs/operations/admission-gate-producers.md.
         if let Some((gate_id, reason, scope_kind)) = {
             let wf_owner = runtime
                 .registry

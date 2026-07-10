@@ -994,6 +994,127 @@ pub fn evaluate_triggers_for_execution<'a>(
                 }
             }
 
+            // Resolve routing + target metadata BEFORE the fires-row insert so
+            // the admission-gate check (issue #618) can evaluate every scope
+            // (Fleet/WorkflowName/Queue/ShardId/Owner) and record the correct
+            // resolved outcome.
+            let router = crate::shard::GLOBAL_SHARD_ROUTER
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .ok_or_else(|| {
+                    tracing::error!("[completion_trigger] GLOBAL_SHARD_ROUTER is not initialized.");
+                    crate::error::database_error(diesel::result::Error::RollbackTransaction)
+                })?;
+            let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
+            let source_shard = router.shard_for_execution(exec_id);
+
+            // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
+            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
+                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+                lock.as_ref()
+                    .and_then(|guard| guard.as_ref())
+                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
+                    .map_or((None, None, None, None, None), |meta| {
+                        (
+                            meta.owner.clone(),
+                            meta.runbook_url.clone(),
+                            meta.severity.clone(),
+                            meta.sla,
+                            meta.retry_policy.clone(),
+                        )
+                    })
+            };
+
+            // issue #618: completion triggers are an in-process start producer
+            // and MUST honour an active admission gate. This runs INSIDE the
+            // source workflow's terminal-commit transaction, so a block is a
+            // CLEAN SKIP that NEVER rolls back the source's terminal commit —
+            // mirroring the #810 `condition_unmet` resolved-skip shape. The
+            // blocked start is DROPPED, not deferred: identically to a direct
+            // API start being refused during an incident. The resolved skip is
+            // recorded through the same ON CONFLICT DO NOTHING fires-row PK path
+            // a real fire uses (exactly-once, so cascade re-entry dedupes it and
+            // this terminal never retries the start), with the distinct
+            // `admission_blocked` outcome. When no gate cache is installed (the
+            // common path / standalone integrations) the check is skipped and
+            // resolution below is byte-identical to pre-#618.
+            // Resolve the target queue at most ONCE per trigger (issue #618, F9):
+            // the gate check below and the same-shard start further down both
+            // need it. `None` = not yet resolved (no gate cache installed, so the
+            // same-shard branch resolves it lazily as before).
+            let mut resolved_queue: Option<String> = None;
+            if let Some(cache) = crate::admission_gate::global_admission_gate_cache() {
+                let gate_queue = if let Some(ref q) = trigger_db.queue_name {
+                    q.clone()
+                } else {
+                    resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
+                };
+                resolved_queue = Some(gate_queue.clone());
+                if let Some((gate_id, reason, scope_kind)) = cache.check(
+                    &trigger_db.target_workflow_name,
+                    &gate_queue,
+                    target_shard.as_i32(),
+                    target_owner.as_deref(),
+                ) {
+                    // Distinguish a REAL operator gate (gate_id != nil) from the
+                    // fail-closed / uninitialized sentinel (`Uuid::nil()`), which
+                    // `AdmissionGateCache::check()` returns on a transient gate-DB
+                    // read error or before the first refresh (issue #618, F3). A
+                    // completion-trigger start is in-flight continuation of
+                    // already-committed work; permanently DROPPING it on a transient
+                    // infra blip (no operator gate raised) is worse than a ≤1s
+                    // window where triggers aren't gated. So on the sentinel we
+                    // PROCEED (no block, no fires row, no admission_blocked count),
+                    // degrading gracefully to the same "None cache = pre-#618"
+                    // behaviour. A real operator gate still blocks + drops + counts.
+                    if gate_id == crate::admission_gate::sentinel_gate_id() {
+                        tracing::warn!(
+                            trigger_id = %trigger_db.id,
+                            source_exec_id = %exec_id,
+                            target_workflow_name = %trigger_db.target_workflow_name,
+                            "Admission gate cache is fail-closed (transient / uninitialized); \
+                             proceeding with the completion-trigger start rather than dropping \
+                             already-committed in-flight continuation."
+                        );
+                    } else {
+                        tracing::info!(
+                            trigger_id = %trigger_db.id,
+                            source_exec_id = %exec_id,
+                            target_workflow_name = %trigger_db.target_workflow_name,
+                            scope_kind = %scope_kind,
+                            reason = %reason,
+                            "Completion trigger start blocked by an active admission gate; \
+                             dropping the trigger start (recorded once, not retried)."
+                        );
+                        let blocked_inserted =
+                            diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
+                                .values(&NewCompletionTriggerFireDb {
+                                    source_exec_id: exec_id.as_uuid(),
+                                    trigger_id: trigger_db.id,
+                                    outcome: Some("admission_blocked".to_string()),
+                                })
+                                .on_conflict_do_nothing()
+                                .execute(conn)
+                                .await
+                                .map_err(crate::error::database_error)?;
+                        if let Some(m) = metrics {
+                            // Only count the FIRST resolution of this (source, trigger)
+                            // pair (issue #618, F4): cascade re-entry / multi-terminal-
+                            // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
+                            // and must not double-count. Mirrors the sibling
+                            // `condition_unmet` -> `deduped` shape.
+                            if blocked_inserted > 0 {
+                                m.record_admission_blocked(scope_kind, &reason);
+                            } else {
+                                m.record_completion_trigger_fired(&trigger_name, "deduped");
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let inserted = diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
                 .values(&NewCompletionTriggerFireDb {
                     source_exec_id: exec_id.as_uuid(),
@@ -1013,17 +1134,6 @@ pub fn evaluate_triggers_for_execution<'a>(
                 }
                 continue;
             }
-
-            let router = crate::shard::GLOBAL_SHARD_ROUTER
-                .read()
-                .ok()
-                .and_then(|guard| guard.as_ref().cloned())
-                .ok_or_else(|| {
-                    tracing::error!("[completion_trigger] GLOBAL_SHARD_ROUTER is not initialized.");
-                    crate::error::database_error(diesel::result::Error::RollbackTransaction)
-                })?;
-            let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
-            let source_shard = router.shard_for_execution(exec_id);
 
             // Resolve target concurrency parameters
             let (concurrency_key, concurrency_limit) = {
@@ -1049,28 +1159,15 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
-            // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
-            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
-                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
-                lock.as_ref()
-                    .and_then(|guard| guard.as_ref())
-                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .map_or((None, None, None, None, None), |meta| {
-                        (
-                            meta.owner.clone(),
-                            meta.runbook_url.clone(),
-                            meta.severity.clone(),
-                            meta.sla,
-                            meta.retry_policy.clone(),
-                        )
-                    })
-            };
-
             let max_workflow_attempts_ceiling =
                 GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.read().ok().and_then(|g| *g);
 
             if target_shard == source_shard {
-                let queue_name = if let Some(ref q) = trigger_db.queue_name {
+                // Reuse the queue already resolved for the gate check (issue #618,
+                // F9); only resolve here when no gate cache was installed.
+                let queue_name = if let Some(q) = resolved_queue.take() {
+                    q
+                } else if let Some(ref q) = trigger_db.queue_name {
                     q.clone()
                 } else {
                     resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
@@ -1218,6 +1315,7 @@ pub fn evaluate_triggers_for_execution<'a>(
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_completion_triggers_outbox(
     conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
@@ -1347,6 +1445,15 @@ pub async fn enforce_completion_triggers_outbox(
                     .execute(conn)
                     .await;
                 processed_count += 1;
+                // issue #618, F1: the cross-shard completion-trigger relay is
+                // EXEMPT-BY-DESIGN. The gate was checked at evaluate time (in the
+                // source terminal commit) before this outbox row was written; the
+                // scanner relays that already-accepted work. Count it so an
+                // operator can see it never slips a gate that was raised after the
+                // row was persisted. See `admission_gate::producer_contract`.
+                metrics.record_admission_bypassed(
+                    crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
+                );
             }
             Err(crate::error::HarvestError::PayloadTooLarge {
                 kind,

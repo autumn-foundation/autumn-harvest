@@ -636,6 +636,12 @@ pub async fn fire_due_debounced_starts(
                 );
             }
             metrics.record_debounce_fired(&workflow_name, &queue_name);
+            // issue #618, F1: the debounce scanner relays a start already
+            // admitted through the gate at HTTP time; count the deferred fire as
+            // an exempt bypass so an operator can see it never slips a gate
+            // silently. See `admission_gate::producer_contract`.
+            metrics
+                .record_admission_bypassed(crate::admission_gate::StartProducer::Debounce.as_str());
         }
         count
     }
