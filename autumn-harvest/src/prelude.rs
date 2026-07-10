@@ -18,7 +18,7 @@ pub use crate::context::{
 };
 pub use crate::dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
-    DagTask, DagTaskRef,
+    DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
 };
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::{SideEffectKind, WorkflowEvent};

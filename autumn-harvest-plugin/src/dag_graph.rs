@@ -133,6 +133,21 @@ pub enum DagNodeStatus {
     /// The node was skipped by a data-dependent condition (#482): a
     /// `dag_skip:{task_index}` marker was recorded for it.
     Skipped,
+    /// A signal/timer gate node (issue #746) that is still waiting for its
+    /// named signal on a live run (no `SignalReceived` recorded yet).
+    Waiting,
+}
+
+/// The kind of a DAG node (issue #746). Distinguishes an ordinary activity
+/// node from a signal/timer gate node so a UI can render gates specially.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DagNodeKind {
+    /// An ordinary activity-dispatch node.
+    Activity,
+    /// A signal/timer gate node (`DagBuilder::signal_gate`): it awaits a named
+    /// signal rather than dispatching an activity.
+    Gate,
 }
 
 /// One node entry in a DAG run graph.
@@ -140,6 +155,9 @@ pub enum DagNodeStatus {
 pub struct DagRunNode {
     /// The node (== activity) name.
     pub node_name: String,
+    /// Whether this node is an ordinary activity or a signal/timer gate
+    /// (issue #746).
+    pub kind: DagNodeKind,
     /// The node's status on this run.
     pub status: DagNodeStatus,
     /// Static topology: the upstream node (activity) names this node depends on,
@@ -412,6 +430,30 @@ pub fn build_run_graph(
         .enumerate()
         .map(|(task_index, task)| {
             let node_name = task.activity_name.clone();
+
+            // ── Signal/timer gate node (issue #746) ─────────────────────────
+            // A gate has no activity dispatch (and thus no activity events), so
+            // it is classified purely from `SignalReceived` / gate-timer history
+            // rather than through `node_outcome`.
+            if let Some(gate) = &task.signal {
+                let depends_on: Vec<String> = task
+                    .upstreams
+                    .iter()
+                    .filter_map(|&i| tasks.get(i).map(|t| t.activity_name.clone()))
+                    .collect();
+                return DagRunNode {
+                    node_name,
+                    kind: DagNodeKind::Gate,
+                    status: gate_status(&events, &gate.signal_name, exec_state),
+                    depends_on,
+                    started_at: None,
+                    finished_at: None,
+                    attempts: 0,
+                    error_type: None,
+                    error: None,
+                };
+            }
+
             let base = node_outcome(&events, &node_name);
 
             // `classify` is the single source of truth for status, timing,
@@ -436,6 +478,7 @@ pub fn build_run_graph(
 
             DagRunNode {
                 node_name,
+                kind: DagNodeKind::Activity,
                 status,
                 depends_on,
                 started_at,
@@ -446,6 +489,42 @@ pub fn build_run_graph(
             }
         })
         .collect()
+}
+
+/// Classify a signal/timer gate node (issue #746) from recorded history.
+///
+/// * `SignalReceived` for the gate's signal → [`DagNodeStatus::Succeeded`].
+/// * else a matching gate race-timer `TimerFired` (a bounded
+///   `wait_for_signal_timeout` deadline fired first) → [`DagNodeStatus::TimedOut`].
+/// * else, while the run is live → [`DagNodeStatus::Waiting`].
+/// * else (the run reached a terminal state without ever reaching/resolving the
+///   gate) → [`DagNodeStatus::Pending`].
+fn gate_status(events: &[WorkflowEvent], signal_name: &str, exec_state: &str) -> DagNodeStatus {
+    let signal_received = events.iter().any(|e| {
+        matches!(e, WorkflowEvent::SignalReceived { signal_name: s, .. } if s == signal_name)
+    });
+    if signal_received {
+        return DagNodeStatus::Succeeded;
+    }
+    // A bounded gate arms a race timer id of the form
+    // `__signal_timeout:{seq}:{signal_name}` (issue #476). If that timer fired
+    // and no signal arrived, the gate's deadline won.
+    let timer_suffix = format!(":{signal_name}");
+    let gate_timer_fired = events.iter().any(|e| match e {
+        WorkflowEvent::TimerFired { timer_id } => {
+            let id = timer_id.to_string();
+            id.starts_with("__signal_timeout:") && id.ends_with(&timer_suffix)
+        }
+        _ => false,
+    });
+    if gate_timer_fired {
+        return DagNodeStatus::TimedOut;
+    }
+    if is_live_state(exec_state) {
+        DagNodeStatus::Waiting
+    } else {
+        DagNodeStatus::Pending
+    }
 }
 
 /// Resolve the derived status and timing/error fields for one node.
@@ -1294,5 +1373,71 @@ mod tests {
         // so the graph and the #366 retry path agree.
         let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
         assert_eq!(node_outcome(&plain, "a"), NodeOutcome::NotAttempted);
+    }
+
+    // ── Issue #746 — signal/timer gate nodes (Phase 1 RED) ───────────────────
+    //
+    // References the not-yet-implemented `DagBuilder::signal_gate`, the new
+    // `DagNodeKind::Gate` kind, and the new `DagNodeStatus::Waiting` variant —
+    // compile-error RED per the repo's TDD convention.
+
+    /// `extract(a) -> signal_gate("approval") -> load(b)`.
+    fn gate_dag() -> DagDefinition {
+        let mut builder = DagBuilder::new();
+        let extract = builder.activity(a);
+        let gate = builder.signal_gate("approval").upstream(&extract);
+        let _load = builder.activity(b).upstream(&gate);
+        builder.build().expect("gate dag builds")
+    }
+
+    fn signal_received(name: &str) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: name.to_string(),
+            payload: Value::Null,
+        }
+    }
+
+    #[test]
+    fn gate_node_reports_kind_gate_and_waiting_status() {
+        let def = gate_dag();
+        let ia = ActivityExecId::new();
+        // extract completed; the gate has not yet received its signal; run RUNNING.
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        let gate = node(&nodes, "approval");
+        assert_eq!(
+            gate.kind,
+            DagNodeKind::Gate,
+            "AC4: a signal gate must be a first-class `gate` node"
+        );
+        assert_eq!(
+            gate.status,
+            DagNodeStatus::Waiting,
+            "AC4: an un-signalled gate on a live run reports `waiting`"
+        );
+    }
+
+    #[test]
+    fn gate_node_reports_succeeded_once_signal_received() {
+        let def = gate_dag();
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), signal_received("approval")),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        let gate = node(&nodes, "approval");
+        assert_eq!(gate.kind, DagNodeKind::Gate);
+        assert_eq!(
+            gate.status,
+            DagNodeStatus::Succeeded,
+            "a gate whose signal has arrived reports `succeeded`"
+        );
     }
 }
