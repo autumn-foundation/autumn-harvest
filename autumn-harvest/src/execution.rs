@@ -1141,10 +1141,7 @@ async fn notify_awaited_parent_of_child_terminal(
             store::append_single_event(
                 conn,
                 parent_exec_id,
-                WorkflowEvent::ChildWorkflowFailed {
-                    child_id: child_exec_id,
-                    error,
-                },
+                WorkflowEvent::child_workflow_failed(child_exec_id, error),
             )
             .await?;
             queue::wake_workflow_task(conn, parent_exec_id).await?;
@@ -2305,9 +2302,7 @@ async fn cascade_terminate_detached_child(
     store::append_single_event(
         conn,
         exec_id,
-        WorkflowEvent::WorkflowFailed {
-            error: reason.to_string(),
-        },
+        WorkflowEvent::workflow_failed(reason.to_string()),
     )
     .await?;
     queue::fail_open_tasks_for_execution(

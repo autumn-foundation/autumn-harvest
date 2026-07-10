@@ -1369,9 +1369,7 @@ mod tests {
     fn events_to_rows_preserves_event_type_name() {
         let exec_id = ExecutionId::new();
         let events = vec![
-            WorkflowEvent::WorkflowFailed {
-                error: "boom".into(),
-            },
+            WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::TimerFired {
                 timer_id: crate::types::TimerId::new("t1"),
             },

@@ -2712,10 +2712,13 @@ impl WorkflowTestEnv {
                 Ok(output)
             }
             WorkflowOutcome::Failed { error, .. } => {
-                history.push(WorkflowEvent::WorkflowFailed {
-                    error: error.clone(),
-                });
-                Err(error)
+                // Decode the failure payload so a `#[workflow] -> Result<_, WorkflowFailure>`
+                // run records the typed `error_type`/`details`/`non_retryable` fields and
+                // surfaces the human message (not the raw `harvest_workflow_failure_v1`
+                // envelope), matching the worker and simulator paths (issue #767, Codex P2).
+                let decoded = crate::failure::decode_workflow_failure(&error);
+                history.push(WorkflowEvent::workflow_failed_typed(&decoded));
+                Err(decoded.message)
             }
             WorkflowOutcome::ContinuedAsNew { input } => {
                 history.push(WorkflowEvent::WorkflowContinuedAsNew {
@@ -2965,8 +2968,16 @@ impl WorkflowTestEnv {
                             .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
                     }
                     Err(error) => {
-                        deferred_events
-                            .push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
+                        // Decode the child mock's error so a typed
+                        // `WorkflowFailure` envelope surfaces the child's
+                        // `error_type`/`details`/`non_retryable` to the parent
+                        // (issue #767), mirroring the worker's
+                        // `wake_parent_for_child_failure`. A plain string decodes
+                        // to all-None typed fields (unchanged legacy behaviour).
+                        let decoded = crate::failure::decode_workflow_failure(&error);
+                        deferred_events.push(WorkflowEvent::child_workflow_failed_typed(
+                            child_id, &decoded,
+                        ));
                     }
                 }
                 Ok(true)
@@ -3071,10 +3082,10 @@ impl WorkflowTestEnv {
                     });
                 }
                 for child_id in children {
-                    deferred_events.push(WorkflowEvent::ChildWorkflowFailed {
+                    deferred_events.push(WorkflowEvent::child_workflow_failed(
                         child_id,
-                        error: "lost race to a sibling branch".to_string(),
-                    });
+                        "lost race to a sibling branch".to_string(),
+                    ));
                 }
                 Ok(true)
             }

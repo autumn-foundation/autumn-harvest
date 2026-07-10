@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure};
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::schema::harvest_workflow_executions;
@@ -206,6 +207,75 @@ fn non_retryable_fail_handler(
     _input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
     Box::pin(async move { Err("NullPointerException: bad input".to_string()) })
+}
+
+/// Fails with a *typed* `WorkflowFailure` whose `error_type` is
+/// `"ValidationRejected"` (issue #767). The message is deliberately generic so
+/// the retry gate can only halt by matching the typed `error_type` class, never
+/// a substring of the message.
+fn typed_non_retryable_fail_handler(
+    _ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        Err(
+            WorkflowFailure::new("ValidationRejected", "input did not pass validation")
+                .into_workflow_error_payload(),
+        )
+    })
+}
+
+/// Fails with a typed `WorkflowFailure` whose `error_type`
+/// (`"TransientGlitch"`) is NOT in the policy's `non_retryable_errors` list —
+/// the control that must still retry after FIX B.
+fn typed_retryable_fail_handler(
+    _ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        Err(
+            WorkflowFailure::new("TransientGlitch", "temporary upstream hiccup")
+                .into_workflow_error_payload(),
+        )
+    })
+}
+
+/// Fails with a typed `WorkflowFailure` whose `error_type` (`"TransientTimeout"`)
+/// is NOT in the policy's `non_retryable_errors` list, but whose HUMAN MESSAGE
+/// (`"fatal"`) coincidentally equals a `non_retryable_errors` pattern (Codex P2,
+/// issue #767). A typed failure must be classified by its `error_type` class
+/// ONLY — this class is retryable, so the run must still retry even though the
+/// message text matches. (`is_non_retryable` matches on exact equality, so the
+/// message must exactly equal the pattern for the pre-fix gate — which combined
+/// the class match with a raw-message match — to have wrongly suppressed it.)
+fn typed_message_collision_fail_handler(
+    _ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        Err(WorkflowFailure::new("TransientTimeout", "fatal").into_workflow_error_payload())
+    })
+}
+
+/// Fails via the `Result<_, WorkflowFailure>` sentinel path (issue #767,
+/// Codex P2): a workflow returning `Err("fatal".into())` — where the `Err` is a
+/// `WorkflowFailure` built from a plain string — collapses `error_type` to
+/// `None` (the reserved `"Error"` sentinel) with `message == "fatal"`. The
+/// engine's `encode_err` shim wraps it in the `harvest_workflow_failure_v1`
+/// envelope, so the raw boundary string is the envelope JSON, NOT `"fatal"`.
+/// The retry gate must match `non_retryable_errors` against the *decoded human
+/// message* (`"fatal"`), never the envelope, or this workflow would retry to
+/// exhaustion.
+fn sentinel_string_non_retryable_fail_handler(
+    _ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        // Mirrors `Err("fatal".into())` in a `Result<_, WorkflowFailure>`
+        // workflow: `WorkflowFailure::from("fatal")` → class `"Error"` (sentinel),
+        // message `"fatal"`; the shim serialises it to the wire envelope.
+        Err(WorkflowFailure::from("fatal").into_workflow_error_payload())
+    })
 }
 
 /// Waits on a 10-second timer (effectively suspends; can be cancelled).
@@ -796,6 +866,313 @@ async fn workflow_non_retryable_error_no_retry() {
             .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
         "non-retryable failure must NOT have WorkflowRetryScheduled"
     );
+}
+
+/// FIX B (issue #767): the #523 workflow-level retry gate matches the policy's
+/// `non_retryable_errors` class list against the *decoded typed workflow
+/// `error_type`*, not just a raw-string match on the envelope. A workflow
+/// returning `WorkflowFailure::new("ValidationRejected", ...)` whose class is in
+/// `non_retryable_errors` must NOT be retried — even though the wire envelope
+/// string never equals the class name. (Before the fix this workflow would
+/// wrongly retry to exhaustion, since `failure_is_non_retryable` only matched
+/// the ACTIVITY envelope / the raw string.)
+#[tokio::test]
+async fn workflow_typed_non_retryable_error_type_no_retry() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 5,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        non_retryable_errors: vec!["ValidationRejected".to_string()],
+        jitter: JitterPolicy::None,
+    };
+
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = "typed-non-retryable-001";
+    let exec_id = start_workflow(
+        &mut conn,
+        "typed_non_retryable_wf",
+        workflow_id,
+        Some(policy.clone()),
+    )
+    .await;
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "typed_non_retryable_wf",
+            typed_non_retryable_fail_handler,
+            Some(policy),
+        )],
+        empty_shared_state(),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    wait_for_state(&mut check, exec_id, &["FAILED"]).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(
+        metrics.retry_count(),
+        0,
+        "a typed non-retryable error_type class must not trigger any retry"
+    );
+    assert_eq!(
+        count_by_workflow_id(&mut check, workflow_id).await,
+        1,
+        "only the original execution must exist (no retry run created)"
+    );
+    let history = get_history(&mut check, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
+        "typed non-retryable class must NOT have WorkflowRetryScheduled"
+    );
+    // The stored terminal WorkflowFailed carries the human message, not the envelope.
+    let stored_error: Option<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .select(harvest_workflow_executions::error)
+        .first::<Option<String>>(&mut check)
+        .await
+        .expect("execution must exist");
+    assert_eq!(
+        stored_error.as_deref(),
+        Some("input did not pass validation")
+    );
+}
+
+/// FIX B control (issue #767): a typed `WorkflowFailure` whose `error_type`
+/// (`"TransientGlitch"`) is NOT in the policy's `non_retryable_errors` list must
+/// STILL be retried — proving the gate change did not break normal retries.
+#[tokio::test]
+async fn workflow_typed_retryable_error_type_still_retries() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 2,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        non_retryable_errors: vec!["ValidationRejected".to_string()],
+        jitter: JitterPolicy::None,
+    };
+
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = "typed-retryable-001";
+    let exec_id = start_workflow(
+        &mut conn,
+        "typed_retryable_wf",
+        workflow_id,
+        Some(policy.clone()),
+    )
+    .await;
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "typed_retryable_wf",
+            typed_retryable_fail_handler,
+            Some(policy),
+        )],
+        empty_shared_state(),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    wait_for_state(&mut check, exec_id, &["FAILED"]).await;
+
+    // The first (original) execution must schedule a retry for the non-listed
+    // typed class.
+    let history = get_history(&mut check, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
+        "a typed error_type NOT in non_retryable_errors must still schedule a retry"
+    );
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert!(
+        count_by_workflow_id(&mut check, workflow_id).await >= 1,
+        "at least the original execution must exist"
+    );
+}
+
+/// Codex P2 regression guard (issue #767): a typed `WorkflowFailure` whose
+/// `error_type` (`"TransientTimeout"`) is NOT in `non_retryable_errors`, but
+/// whose HUMAN MESSAGE (`"fatal"`) equals a `non_retryable_errors` pattern, must
+/// STILL retry. The pre-fix gate passed `decoded.message` as the raw arg to
+/// `is_non_retryable`, so the class OR'd with a message match and wrongly
+/// suppressed the retry of a retryable typed class. The fix classifies typed
+/// failures by `error_type` class ONLY.
+#[tokio::test]
+async fn workflow_typed_message_collision_still_retries() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 2,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        // The message "fatal" collides with this pattern, but the typed class
+        // "TransientTimeout" does not — so the run must still retry.
+        non_retryable_errors: vec!["fatal".to_string()],
+        jitter: JitterPolicy::None,
+    };
+
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = "typed-message-collision-001";
+    let exec_id = start_workflow(
+        &mut conn,
+        "typed_message_collision_wf",
+        workflow_id,
+        Some(policy.clone()),
+    )
+    .await;
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "typed_message_collision_wf",
+            typed_message_collision_fail_handler,
+            Some(policy),
+        )],
+        empty_shared_state(),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    wait_for_state(&mut check, exec_id, &["FAILED"]).await;
+
+    // A retryable typed class must schedule a retry even though its message text
+    // coincides with a `non_retryable_errors` pattern.
+    let history = get_history(&mut check, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
+        "a typed error_type NOT in non_retryable_errors must still retry even when \
+         its human message coincides with a non_retryable_errors pattern"
+    );
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert!(
+        count_by_workflow_id(&mut check, workflow_id).await >= 1,
+        "at least the original execution must exist"
+    );
+}
+
+/// FIX B — sentinel path (issue #767, Codex P2): a `Result<_, WorkflowFailure>`
+/// workflow returning `Err("fatal".into())` collapses its `error_type` to `None`
+/// (reserved `"Error"` sentinel) with `message == "fatal"`, and the engine wraps
+/// it in the `harvest_workflow_failure_v1` envelope on the boundary. With
+/// `non_retryable_errors = ["fatal"]`, the retry gate must halt retries by
+/// matching the **decoded human message** — NOT the raw envelope JSON. Before
+/// the fix (which matched against the raw envelope) this workflow would wrongly
+/// retry to exhaustion because the envelope string never equals `"fatal"`.
+#[tokio::test]
+async fn workflow_sentinel_string_non_retryable_message_no_retry() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 5,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        non_retryable_errors: vec!["fatal".to_string()],
+        jitter: JitterPolicy::None,
+    };
+
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = "sentinel-non-retryable-001";
+    let exec_id = start_workflow(
+        &mut conn,
+        "sentinel_non_retryable_wf",
+        workflow_id,
+        Some(policy.clone()),
+    )
+    .await;
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "sentinel_non_retryable_wf",
+            sentinel_string_non_retryable_fail_handler,
+            Some(policy),
+        )],
+        empty_shared_state(),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    wait_for_state(&mut check, exec_id, &["FAILED"]).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(
+        metrics.retry_count(),
+        0,
+        "a sentinel Err(\"fatal\") whose decoded message is in non_retryable_errors \
+         must not trigger any retry"
+    );
+    assert_eq!(
+        count_by_workflow_id(&mut check, workflow_id).await,
+        1,
+        "only the original execution must exist (no retry run created)"
+    );
+    let history = get_history(&mut check, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
+        "sentinel non-retryable message must NOT have WorkflowRetryScheduled"
+    );
+    // AC4: the stored terminal error is the human message, never the envelope.
+    let stored_error: Option<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .select(harvest_workflow_executions::error)
+        .first::<Option<String>>(&mut check)
+        .await
+        .expect("execution must exist");
+    assert_eq!(stored_error.as_deref(), Some("fatal"));
 }
 
 /// AC #4: CANCELLED workflow is never retried.

@@ -191,6 +191,8 @@ jobs:
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
+      - name: Run typed_workflow_failure example tests (issue #767)
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Compile plugin integration tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --no-run
@@ -203,6 +205,12 @@ jobs:
       - name: Run retention override integration tests (issue #737)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests -- --test-threads=1
+      - name: Run Docker-backed typed workflow failure integration tests (issue #767)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests -- --test-threads=1
+      - name: Run Docker-backed typed workflow-failure retry-gate tests (issue #767 FIX B)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests::workflow_typed -- --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1

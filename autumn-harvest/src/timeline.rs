@@ -1295,13 +1295,7 @@ mod tests {
                     input: serde_json::Value::Null,
                 },
             ),
-            row(
-                90,
-                WorkflowEvent::ChildWorkflowFailed {
-                    child_id: c1,
-                    error: "nope".into(),
-                },
-            ),
+            row(90, WorkflowEvent::child_workflow_failed(c1, "nope")),
         ];
         let tl = derive(&rows, Some(90), 90);
         let ch = find(&tl.steps, StepKind::ChildWorkflow);

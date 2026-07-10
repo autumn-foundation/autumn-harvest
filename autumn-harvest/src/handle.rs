@@ -663,7 +663,9 @@ impl WorkflowHandle {
     pub async fn result_raw(&self) -> HarvestResult<Value> {
         let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
-            return result;
+            return self
+                .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                .await;
         }
 
         let mut listener = self.connect_listener().await?;
@@ -671,7 +673,9 @@ impl WorkflowHandle {
         loop {
             let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
-                return result;
+                return self
+                    .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                    .await;
             }
 
             match listener.wait_for_notification().await? {
@@ -698,7 +702,9 @@ impl WorkflowHandle {
         })?;
         let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
-            return result;
+            return self
+                .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                .await;
         }
         if Instant::now() >= deadline {
             return Err(wait_timeout_error(&execution));
@@ -709,7 +715,9 @@ impl WorkflowHandle {
         loop {
             let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
-                return result;
+                return self
+                    .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                    .await;
             }
 
             let now = Instant::now();
@@ -722,7 +730,9 @@ impl WorkflowHandle {
                 WorkflowEventWaitOutcome::TimedOut => {
                     let execution = self.load_effective_execution().await?;
                     if let Some(result) = terminal_raw_result(&execution) {
-                        return result;
+                        return self
+                            .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                            .await;
                     }
                     return Err(wait_timeout_error(&execution));
                 }
@@ -730,6 +740,122 @@ impl WorkflowHandle {
                     listener = self.connect_listener().await?;
                 }
             }
+        }
+    }
+
+    /// Load the typed fields of the terminal `WorkflowFailed` event for
+    /// `exec_id` (issue #767).
+    ///
+    /// Returns `Some(DecodedWorkflowFailure)` when a `WorkflowFailed` event
+    /// exists in history (carrying its `error_type`/`details`/`non_retryable`, all
+    /// `None` for a legacy untyped failure), or `None` when the execution has no
+    /// `WorkflowFailed` event. Callers should invoke this only on the `FAILED`
+    /// branch, since it performs an extra history load.
+    ///
+    /// `exec_id` is an explicit parameter (rather than `self.exec_id`) because
+    /// `result_raw` follows the workflow-level retry chain (issue #523) and must
+    /// recover the typed failure from the *effective* (final-attempt) execution,
+    /// not the original handle id. `result_snapshot` (which reports the original
+    /// row, not the chain) passes `self.exec_id()` so its typed fields stay
+    /// consistent with the execution row it actually reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns database or history-load errors.
+    pub(crate) async fn terminal_typed_failure(
+        &self,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Option<crate::failure::DecodedWorkflowFailure>> {
+        let shard = self.client.inner.router.shard_for_execution(exec_id);
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let history = crate::store::load_history_with_codecs(
+            &mut conn,
+            exec_id,
+            &self.client.inner.payload_codecs,
+        )
+        .await?;
+        drop(conn);
+
+        Ok(history.events.iter().rev().find_map(|event| match event {
+            crate::event::WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => Some(crate::failure::DecodedWorkflowFailure {
+                message: error.clone(),
+                error_type: error_type.clone(),
+                details: details.clone(),
+                non_retryable: *non_retryable,
+            }),
+            _ => None,
+        }))
+    }
+
+    /// Enrich a terminal `result_raw` outcome with the typed failure fields.
+    ///
+    /// For a `FAILED` execution (`Err(HarvestError::WorkflowFailed { .. })`) this
+    /// performs one extra history load to recover the typed
+    /// `error_type`/`details`/`non_retryable` (issue #767). The `reason` stays the
+    /// human message from `execution.error`. Every other outcome is passed through
+    /// untouched (no extra DB round-trip).
+    ///
+    /// `exec_id` is the id of the execution the failure was reported from — for
+    /// `result_raw` this is the *effective* execution after following the
+    /// workflow-level retry chain (issue #523), so a retried run whose final
+    /// attempt failed with a different typed cause surfaces that final attempt's
+    /// typed fields, not the original attempt's.
+    async fn enrich_terminal_result(
+        &self,
+        exec_id: ExecutionId,
+        result: HarvestResult<Value>,
+    ) -> HarvestResult<Value> {
+        let Err(HarvestError::WorkflowFailed {
+            name,
+            reason,
+            error_type,
+            details,
+            non_retryable,
+        }) = result
+        else {
+            return result;
+        };
+        // Only reload history when the message-only branch produced an untyped
+        // failure (the common terminal path); if typed fields are already present
+        // there is nothing to recover.
+        if error_type.is_some() || details.is_some() || non_retryable.is_some() {
+            return Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type,
+                details,
+                non_retryable,
+            });
+        }
+        match self.terminal_typed_failure(exec_id).await {
+            Ok(Some(decoded)) => Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type: decoded.error_type,
+                details: decoded.details,
+                non_retryable: decoded.non_retryable,
+            }),
+            // No WorkflowFailed event or a history-load error: fall back to the
+            // untyped result rather than masking the terminal failure.
+            _ => Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            }),
         }
     }
 
@@ -926,10 +1052,10 @@ impl WorkflowHandle {
         }
 
         if let Some(Err(reason)) = replay_result {
-            return Err(HarvestError::WorkflowFailed {
-                name: self.exec_id.to_string(),
+            return Err(HarvestError::workflow_failed_untyped(
+                self.exec_id.to_string(),
                 reason,
-            });
+            ));
         }
 
         ctx.execute_query_with_args(query_name, args)
@@ -966,12 +1092,9 @@ impl WorkflowHandle {
                 .await?;
                 match crate::replay::HistoryMatcher::new(h.events).match_update(update_id) {
                     crate::replay::HistoryMatch::Matched { output } => Some(Ok(output)),
-                    crate::replay::HistoryMatch::Failed { error, .. } => {
-                        Some(Err(HarvestError::WorkflowFailed {
-                            name: self.exec_id.to_string(),
-                            reason: error,
-                        }))
-                    }
+                    crate::replay::HistoryMatch::Failed { error, .. } => Some(Err(
+                        HarvestError::workflow_failed_untyped(self.exec_id.to_string(), error),
+                    )),
                     _ => None,
                 }
             };
@@ -997,13 +1120,16 @@ fn terminal_raw_result(execution: &WorkflowExecution) -> Option<HarvestResult<Va
         "COMPLETED" | "CONTINUED_AS_NEW" => {
             Some(Ok(execution.output.clone().unwrap_or(Value::Null)))
         }
-        "FAILED" => Some(Err(HarvestError::WorkflowFailed {
-            name: execution.workflow_name.clone(),
-            reason: execution
+        // Message-only here (no history access); `enrich_terminal_result`
+        // augments this with the typed fields from the terminal `WorkflowFailed`
+        // event on the `FAILED` branch (issue #767).
+        "FAILED" => Some(Err(HarvestError::workflow_failed_untyped(
+            execution.workflow_name.clone(),
+            execution
                 .error
                 .clone()
                 .unwrap_or_else(|| "workflow failed".to_string()),
-        })),
+        ))),
         "CANCELLED" => Some(Err(HarvestError::Cancelled(
             execution
                 .error

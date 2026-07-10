@@ -21,7 +21,9 @@ pub use crate::dag::{
 };
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::{SideEffectKind, WorkflowEvent};
-pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
+pub use crate::failure::{
+    ActivityFailure, IntoActivityErrorString, IntoWorkflowErrorString, WorkflowFailure,
+};
 #[cfg(feature = "db")]
 pub use crate::handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,

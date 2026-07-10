@@ -54,10 +54,7 @@ fn entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 }
 
 fn workflow_failed(reason: &str) -> HarvestError {
-    HarvestError::WorkflowFailed {
-        name: "book_trip".into(),
-        reason: reason.into(),
-    }
+    HarvestError::workflow_failed_untyped("book_trip", reason)
 }
 
 #[tokio::test]

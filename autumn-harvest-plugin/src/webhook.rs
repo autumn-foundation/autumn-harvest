@@ -27,9 +27,11 @@ pub async fn webhook_delivery(
 ) -> HarvestResult<()> {
     ctx.execute_activity_raw(
         "deliver_webhook",
-        serde_json::to_value(input).map_err(|e| HarvestError::WorkflowFailed {
-            name: "webhook_delivery".to_owned(),
-            reason: format!("failed to serialize activity input: {e}"),
+        serde_json::to_value(input).map_err(|e| {
+            HarvestError::workflow_failed_untyped(
+                "webhook_delivery",
+                format!("failed to serialize activity input: {e}"),
+            )
         })?,
         "webhooks",
     )
