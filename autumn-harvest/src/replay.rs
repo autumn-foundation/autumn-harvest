@@ -1206,8 +1206,16 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 // Fan-out markers and deterministic side-effect captures (issue
-                // #384) can be interleaved during concurrent execution.
-                WorkflowEvent::MarkerRecorded { .. } | WorkflowEvent::SideEffectRecorded { .. } => {
+                // #384) can be interleaved during concurrent execution. A
+                // cancellable-timer arm/cancel (issue #768) — e.g. a concurrent
+                // `start_timer()`/`handle.cancel()`/`reset()`, where a reset emits
+                // both `[TimerCancelled, TimerStarted]` — is likewise interleavable
+                // here (mirrors `scan_activity_terminal`): rewind without consuming
+                // so `match_timer_arm` / `match_timer_cancel` claim each later.
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
@@ -2703,13 +2711,19 @@ impl HistoryMatcher {
                 continue;
             }
 
-            // A cancellable-timer cancel (issue #768) for another timer may be
-            // interleaved while this timer is pending. Treat it as an interleaved
-            // command (rewind after the fire settles) so it stays at the cursor
-            // for its own claimer to re-scan, rather than being skipped past.
+            // A cancellable-timer arm/cancel (issue #768) for another timer may be
+            // interleaved while this timer is pending — e.g. a sibling branch
+            // `reset()` records `[TimerCancelled(idle), TimerStarted(idle)]` between
+            // this `ctx.timer`'s own `TimerStarted` and its `TimerFired`. Treat
+            // BOTH as interleaved commands (rewind after the fire settles) so each
+            // stays at the cursor for its own claimer (`match_timer_cancel` /
+            // `match_timer_arm`) to re-scan. Skipping only the cancel would STOP
+            // the scan on the paired re-arm and wrongly return NoMatch, so strict
+            // replay would fail and a worker could re-park an already-fired timer
+            // (Codex P2, issue #768).
             if matches!(
                 &self.events[scan_cursor],
-                WorkflowEvent::TimerCancelled { .. }
+                WorkflowEvent::TimerCancelled { .. } | WorkflowEvent::TimerStarted { .. }
             ) {
                 first_interleaved_command.get_or_insert(scan_cursor);
                 scan_cursor += 1;
@@ -2904,15 +2918,22 @@ impl HistoryMatcher {
                     // Update events are transparent to signal scanning.
                     scan_cursor += 1;
                 }
-                // A detached-spawn or a cancellable-timer cancel (issue #768) —
-                // e.g. a `[CancelTimer, WaitForSignal]` batch from a
+                // A detached-spawn or a cancellable-timer arm/cancel (issue #768)
+                // — e.g. a `[CancelTimer, TimerStarted]` reset, or a
+                // `[CancelTimer, WaitForSignal]` batch from a
                 // `cancel_timer()`/`reset()` in the same cycle as a
-                // `wait_for_signal`, or a push signal handler cancelling a timer
-                // — is transparent to the signal scan. Rewind WITHOUT consuming so
-                // its own claimer (`match_timer_cancel` for the cancel) can still
+                // `wait_for_signal`, or a push signal handler resetting a timer
+                // — is transparent to the signal scan. A `reset()` records
+                // `[TimerCancelled, TimerStarted]`, so BOTH must be skipped: on a
+                // `wait_for_signal` polled before a same-cycle reset branch, the
+                // history before the signal is `TimerCancelled, TimerStarted`, and
+                // stopping on the re-arm would wrongly report a missing signal
+                // (Codex P2, issue #768). Rewind WITHOUT consuming so each event's
+                // own claimer (`match_timer_cancel` / `match_timer_arm`) can still
                 // claim it exactly once (mirrors `scan_activity_terminal`).
                 WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
-                | WorkflowEvent::TimerCancelled { .. } => {
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::TimerStarted { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
@@ -4050,10 +4071,15 @@ impl HistoryMatcher {
             }
             match &self.events[scan] {
                 // A command-less `WorkflowCancelled`, or a cancellable-timer
-                // cancel (issue #768) interleaved in a compensation cycle, is
-                // transparent to the saga marker scan; leave `TimerCancelled`
-                // unconsumed so `match_timer_cancel` claims it later.
-                WorkflowEvent::WorkflowCancelled { .. } | WorkflowEvent::TimerCancelled { .. } => {
+                // arm/cancel (issue #768) interleaved in a compensation cycle, is
+                // transparent to the saga marker scan. A `reset()` records
+                // `[TimerCancelled, TimerStarted]`, so BOTH are skipped for
+                // symmetry — stopping on the re-arm would wrongly return `Absent`
+                // (Codex P2, issue #768). Left unconsumed so `match_timer_cancel`
+                // / `match_timer_arm` claim them later.
+                WorkflowEvent::WorkflowCancelled { .. }
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::TimerStarted { .. } => {
                     scan += 1;
                 }
                 WorkflowEvent::SignalReceived { .. } => {
@@ -6640,6 +6666,69 @@ mod tests {
             },
             "signal buffered during timer scan should be returned by match_signal"
         );
+    }
+
+    #[test]
+    fn matcher_timer_reaches_fire_past_interleaved_reset() {
+        // Codex P2 (issue #768): a sibling branch `reset()` of another timer
+        // records `[TimerCancelled(idle), TimerStarted(idle)]` between this
+        // `ctx.timer("sleep")`'s own TimerStarted and its TimerFired. The fire
+        // scan must step over BOTH the cancel AND the paired re-arm and still
+        // reach the fire — skipping only the cancel would STOP on the re-arm and
+        // return NoMatch, failing strict replay and re-parking a fired timer.
+        let events = vec![ts("sleep", 30), tc("idle"), ts("idle", 300), tf("sleep")];
+        let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_timer("sleep"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            },
+            "the primary timer must reach its fire past an interleaved reset"
+        );
+        // The interleaved reset stays claimable afterward, in order (the reset's
+        // cancel then its re-arm) — both were skipped without being consumed.
+        assert!(
+            matches!(m.match_timer_cancel("idle"), HistoryMatch::Matched { .. }),
+            "reset's TimerCancelled must still be claimable"
+        );
+        assert!(
+            matches!(m.match_timer_arm("idle", 300), HistoryMatch::Matched { .. }),
+            "reset's re-arm TimerStarted must still be claimable"
+        );
+    }
+
+    #[test]
+    fn matcher_signal_scan_skips_interleaved_reset() {
+        // Codex P2 (issue #768): a `wait_for_signal` polled before a same-cycle
+        // `reset()` branch sees `[TimerCancelled(idle), TimerStarted(idle),
+        // SignalReceived]`. The signal scan must step over BOTH timer events and
+        // still match the signal — skipping only the cancel would STOP on the
+        // re-arm and wrongly report a missing signal.
+        let events = vec![
+            tc("idle"),
+            ts("idle", 300),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_signal("approved"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            },
+            "signal scan must step over an interleaved reset's [TimerCancelled, TimerStarted]"
+        );
+        // The interleaved reset stays claimable afterward (non-consuming skip).
+        assert!(matches!(
+            m.match_timer_cancel("idle"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
     }
 
     // ── Pause/Resume replay transparency (issue #383) ─────────────────────

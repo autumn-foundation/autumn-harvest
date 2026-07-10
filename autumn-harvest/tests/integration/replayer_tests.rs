@@ -312,6 +312,24 @@ fn cancellable_timer_workflow<'a>(
     })
 }
 
+/// Arms a cancellable durable timer and then COMPLETES in the same task without
+/// awaiting it (Codex P1, issue #768). The live worker emits `[ArmTimer(idle)]`
+/// and then seals the execution; the terminal-cycle persist path
+/// (`plan_timer_lifecycle` with `skip_arm_inserts = true`) must still record the
+/// `TimerStarted` event (while skipping the never-firing `harvest_timers` row),
+/// or the positional `match_timer_arm` diverges strict replay when `start_timer`
+/// re-runs.
+fn arm_timer_then_complete_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _handle = ctx.start_timer("idle", 300);
+        // Do NOT await the timer — complete in the same task.
+        Ok(serde_json::json!("done"))
+    })
+}
+
 /// Cancellable timer reset loop (issue #768): arm, reset N times, then either
 /// await the fire or cancel. Drives the O(K)-history, zero-orphan reset path.
 fn cancellable_timer_reset_workflow<'a>(
@@ -697,6 +715,10 @@ fn build_replayer() -> WorkflowReplayer {
         )
         .register_fn("self_typed_failure_workflow", self_typed_failure_workflow)
         .register_fn("cancellable_timer_workflow", cancellable_timer_workflow)
+        .register_fn(
+            "arm_timer_then_complete_workflow",
+            arm_timer_then_complete_workflow,
+        )
         .register_fn(
             "cancellable_timer_reset_workflow",
             cancellable_timer_reset_workflow,
@@ -1378,6 +1400,62 @@ async fn cancelled_timer_replays_succeeded() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a cancelled cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+/// Codex P1 (issue #768): a `start_timer` that arms a timer and then completes in
+/// the SAME task must record the `TimerStarted` event in its terminal history.
+/// The FIXED worker produces `[WorkflowStarted, TimerStarted(idle),
+/// WorkflowCompleted]`; replaying that against the same workflow code must
+/// succeed — `start_timer`'s positional `match_timer_arm` consumes the recorded
+/// `TimerStarted` at the cursor.
+#[tokio::test]
+async fn arm_then_complete_replays_when_timer_started_recorded() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("done"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "arm_timer_then_complete_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a fixed-worker terminal history WITH TimerStarted must replay cleanly, got: {report}"
+    );
+}
+
+/// Codex P1 (issue #768): proves the `TimerStarted` event is load-bearing — i.e.
+/// the consequence of the FINDING-6 bug. The BUGGY worker dropped the event,
+/// recording `[WorkflowStarted, WorkflowCompleted]`. Replaying that history
+/// against the same workflow code diverges: `start_timer`'s positional
+/// `match_timer_arm` expects `TimerStarted` at the cursor but finds the terminal
+/// `WorkflowCompleted` instead.
+#[tokio::test]
+async fn arm_then_complete_diverges_without_recorded_timer_started() {
+    let events = vec![
+        wf_started(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("done"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "arm_timer_then_complete_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a terminal history MISSING TimerStarted must diverge (proving the event is \
+         load-bearing), got: {report}"
     );
 }
 
