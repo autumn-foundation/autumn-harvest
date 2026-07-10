@@ -181,5 +181,19 @@ harness.
 - `history_export` / read-path payload-codec envelope parsing over arbitrary
   JSON (the `_harvest_*` envelope discriminators).
 
+### Production follow-ups surfaced by this workstream
+
+Genuine product-code gaps found while writing the tests (filed separately —
+out of scope for the test/tooling slices themselves):
+
+- **SSRF guard `0.0.0.0/8` (and `198.18.0.0/15`) bypass** (issue #1005).
+  `completion_callback::is_ipv4_non_routable` blocks only the exact `0.0.0.0`
+  (via `is_unspecified()`), so a general `0.10.20.30` in the `0.0.0.0/8` "this
+  host" range is not rejected — a documented SSRF bypass (`0.x` routes to
+  localhost on Linux); `198.18.0.0/15` (RFC 2544 benchmarking) is likewise
+  uncovered. Surfaced by the `validate_target_url` property test
+  (`completion_callback_props.rs`). Suggested fix: add `octets()[0] == 0` and
+  the `198.18.0.0/15` range to the block list.
+
 [`proptest`]: https://docs.rs/proptest
 [`cargo-fuzz`]: https://rust-fuzz.github.io/book/cargo-fuzz.html

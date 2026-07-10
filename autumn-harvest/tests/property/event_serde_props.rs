@@ -60,6 +60,12 @@ fn json_value() -> impl Strategy<Value = Value> {
 /// top-level `Null` keeps the generator to shapes the round-trip contract
 /// actually covers. (Nested nulls inside an array/object round-trip fine and are
 /// still generated.)
+///
+/// Note: the engine CAN legitimately produce `Some(Value::Null)` for
+/// `last_completion_result` (issue #488 — when a prior scheduled run's output is
+/// JSON `null`), which then benignly collapses to `None` on reload. That is a
+/// real but harmless serde-`Option` quirk this property intentionally cannot
+/// cover, by construction of this generator.
 fn json_value_non_null() -> impl Strategy<Value = Value> {
     prop_oneof![
         any::<bool>().prop_map(Value::from),
