@@ -23,7 +23,9 @@ use crate::builder::{
 use crate::error::{HarvestError, HarvestResult, NonDeterministicDetails, PayloadKind};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
-use crate::replay::{HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch};
+use crate::replay::{
+    HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch, TimerFireMatch,
+};
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
@@ -475,6 +477,38 @@ pub enum WorkflowCommand {
         /// Timer IDs of losing timer branches to remove from `harvest_timers`.
         timers: Vec<TimerId>,
     },
+
+    /// Arm (or re-arm) an author-controlled durable timer (issue #768).
+    ///
+    /// Bookkeeping command — carries no result channel and never drives a
+    /// suspension shape. Pushed by [`WorkflowContext::start_timer`] and the
+    /// re-arm half of `TimerHandle::reset`. The worker resolves it (in the same
+    /// transaction as every other bookkeeping command) by upserting a
+    /// `harvest_timers` row (`fires_at = db_clock_now + duration_secs`) and, only
+    /// when the row is newly created, appending a [`WorkflowEvent::TimerStarted`].
+    /// When a bookkeeping-only batch arms a timer, the worker reschedules the
+    /// workflow task to the armed `fires_at` instead of waking immediately, so the
+    /// timer actually fires the workflow.
+    ArmTimer {
+        /// Stable id of the timer being armed.
+        timer_id: TimerId,
+        /// Duration in seconds from arm time until the timer fires.
+        duration_secs: u64,
+    },
+
+    /// Cancel an author-controlled durable timer (issue #768).
+    ///
+    /// Bookkeeping command. Pushed by [`WorkflowContext::cancel_timer`],
+    /// `TimerHandle::cancel`, and the cancel half of `TimerHandle::reset`. The
+    /// worker deletes the pending `harvest_timers` row (via
+    /// [`crate::queue::delete_pending_timer`], which filters `fired = false` so a
+    /// fire that already committed is left intact) and appends a
+    /// [`WorkflowEvent::TimerCancelled`]. Because the row is deleted before it can
+    /// be selected as due, no `TimerFired` is ever produced for a cancelled timer.
+    CancelTimer {
+        /// Stable id of the timer being cancelled.
+        timer_id: TimerId,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -629,6 +663,18 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("workflow_name", workflow_name)
                 .field("parent_close_policy", parent_close_policy)
                 .finish_non_exhaustive(),
+            Self::ArmTimer {
+                timer_id,
+                duration_secs,
+            } => f
+                .debug_struct("ArmTimer")
+                .field("timer_id", timer_id)
+                .field("duration_secs", duration_secs)
+                .finish(),
+            Self::CancelTimer { timer_id } => f
+                .debug_struct("CancelTimer")
+                .field("timer_id", timer_id)
+                .finish(),
         }
     }
 }
@@ -640,6 +686,77 @@ impl std::fmt::Debug for WorkflowCommand {
 async fn park_until_dropped() -> HarvestResult<()> {
     std::future::pending::<()>().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cancellable / renewable durable timers (issue #768)
+// ---------------------------------------------------------------------------
+
+/// The observed outcome of an author-controlled durable timer awaited via
+/// [`TimerHandle::await_fire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerOutcome {
+    /// The durable timer elapsed and fired.
+    Fired,
+    /// The timer was cancelled (or reset) before it fired.
+    Cancelled,
+}
+
+/// A handle to an author-controlled durable timer armed by
+/// [`WorkflowContext::start_timer`] (issue #768).
+///
+/// Lets the workflow cancel, reset (re-arm to a fresh duration), or await the
+/// timer's outcome without leaving orphaned firings. Borrows the
+/// [`WorkflowContext`] for the timer's lifetime.
+#[must_use = "a started timer handle should be cancelled, reset, or awaited"]
+pub struct TimerHandle<'a> {
+    context: &'a WorkflowContext,
+    timer_id: String,
+    duration_secs: u64,
+}
+
+impl TimerHandle<'_> {
+    /// The stable id of this timer.
+    #[must_use]
+    pub fn timer_id(&self) -> &str {
+        &self.timer_id
+    }
+
+    /// The current armed duration in seconds (updated by [`Self::reset`]).
+    #[must_use]
+    pub const fn duration_secs(&self) -> u64 {
+        self.duration_secs
+    }
+
+    /// Cancel this timer so it never fires.
+    ///
+    /// # Errors
+    ///
+    /// See [`WorkflowContext::cancel_timer`].
+    pub fn cancel(&self) -> HarvestResult<()> {
+        self.context.cancel_timer(&self.timer_id)
+    }
+
+    /// Reset (re-arm) this timer to a fresh duration measured from now.
+    ///
+    /// # Errors
+    ///
+    /// See [`WorkflowContext::reset_timer`].
+    pub fn reset(&mut self, duration_secs: u64) -> HarvestResult<()> {
+        self.duration_secs = duration_secs;
+        self.context.reset_timer(&self.timer_id, duration_secs)
+    }
+
+    /// Suspend until this timer fires or is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// See [`WorkflowContext::await_timer_fire`].
+    pub async fn await_fire(&self) -> HarvestResult<TimerOutcome> {
+        self.context
+            .await_timer_fire(&self.timer_id, self.duration_secs)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3977,6 +4094,199 @@ impl WorkflowContext {
         let now = self.system_now();
         let remaining_secs = remaining_secs_until(deadline, now);
         self.timer(timer_id, remaining_secs).await
+    }
+
+    // ── Cancellable / renewable durable timers (issue #768) ───────────────
+
+    /// Arm an author-controlled durable timer and return a [`TimerHandle`] to
+    /// cancel, reset, or await it.
+    ///
+    /// Unlike [`WorkflowContext::timer`] (which suspends until the timer fires),
+    /// `start_timer` is **non-suspending**: it records the timer via a
+    /// bookkeeping command and returns immediately, so the workflow can keep
+    /// running and later `cancel()`, `reset(..)`, or `await_fire()` it. This is
+    /// the primitive for idle-session timeouts and sliding-window debounces,
+    /// where cancelling/renewing a pending timer must not leave an orphaned
+    /// firing (issue #768).
+    ///
+    /// # Determinism
+    ///
+    /// The single `TimerStarted` event is recorded on the first live execution
+    /// and consumed positionally on replay — no new `WorkflowEvent` variant is
+    /// introduced for arming. Reusing an id that is still armed is idempotent
+    /// (the durable row is deduped by `timer_id`). Avoid the engine-reserved
+    /// `__`-prefixed id namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timer_id` is empty, or if the internal matcher/commands mutex
+    /// is poisoned.
+    pub fn start_timer(&self, timer_id: &str, duration_secs: u64) -> TimerHandle<'_> {
+        assert!(
+            !timer_id.is_empty(),
+            "start_timer: timer_id must be non-empty"
+        );
+        match self.match_history(|m| m.match_timer_arm(timer_id, duration_secs)) {
+            // Live: record the arm.
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::ArmTimer {
+                    timer_id: TimerId::new(timer_id),
+                    duration_secs,
+                });
+            }
+            HistoryMatch::Diverged {
+                expected, actual, ..
+            } => {
+                self.record_deferred_nd(format!(
+                    "timer mismatch: expected {expected}, got {actual}"
+                ));
+            }
+            // Replay (Matched — TimerStarted already recorded/consumed) or any
+            // other variant: nothing to emit.
+            _ => {}
+        }
+        TimerHandle {
+            context: self,
+            timer_id: timer_id.to_string(),
+            duration_secs,
+        }
+    }
+
+    /// Cancel an author-controlled durable timer by id.
+    ///
+    /// Deletes the pending durable timer row and records a `TimerCancelled`
+    /// event so no `TimerFired` is ever produced for it (a genuine fire-vs-cancel
+    /// race is resolved by recorded-history order). Non-suspending and
+    /// idempotent: cancelling an already-fired or unknown timer is a no-op that
+    /// still records the intent.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; returns `Ok(())`. Returns a `Result` for forward
+    /// compatibility and symmetry with [`TimerHandle::cancel`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timer_id` is empty, or the internal matcher/commands mutex is
+    /// poisoned.
+    pub fn cancel_timer(&self, timer_id: &str) -> HarvestResult<()> {
+        assert!(
+            !timer_id.is_empty(),
+            "cancel_timer: timer_id must be non-empty"
+        );
+        match self.match_history(|m| m.match_timer_cancel(timer_id)) {
+            // Replay: the TimerCancelled is already recorded and was consumed.
+            HistoryMatch::Matched { .. } => {}
+            // Live: record the cancel.
+            _ => {
+                self.push_command(WorkflowCommand::CancelTimer {
+                    timer_id: TimerId::new(timer_id),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reset (re-arm) an author-controlled durable timer to a fresh duration.
+    ///
+    /// Records a `TimerCancelled` for the current arming followed by a fresh
+    /// `TimerStarted` — intentionally O(1) history per reset (two events) with
+    /// **zero** orphaned firings, which is the whole point of the primitive: a
+    /// sliding window that resets on every event never leaves a stale timer that
+    /// could fire late.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; returns `Ok(())` for forward compatibility.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timer_id` is empty, or the internal matcher/commands mutex is
+    /// poisoned.
+    pub fn reset_timer(&self, timer_id: &str, duration_secs: u64) -> HarvestResult<()> {
+        assert!(
+            !timer_id.is_empty(),
+            "reset_timer: timer_id must be non-empty"
+        );
+        // Cancel the current arming.
+        match self.match_history(|m| m.match_timer_cancel(timer_id)) {
+            HistoryMatch::Matched { .. } => {}
+            _ => {
+                self.push_command(WorkflowCommand::CancelTimer {
+                    timer_id: TimerId::new(timer_id),
+                });
+            }
+        }
+        // Arm afresh.
+        match self.match_history(|m| m.match_timer_arm(timer_id, duration_secs)) {
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::ArmTimer {
+                    timer_id: TimerId::new(timer_id),
+                    duration_secs,
+                });
+            }
+            HistoryMatch::Diverged {
+                expected, actual, ..
+            } => {
+                self.record_deferred_nd(format!(
+                    "timer mismatch: expected {expected}, got {actual}"
+                ));
+            }
+            // Replay (Matched) or any other variant: nothing to emit.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Suspend until an armed timer fires or is cancelled, returning which.
+    ///
+    /// Resolves to [`TimerOutcome::Fired`] when the durable timer elapses, or
+    /// [`TimerOutcome::Cancelled`] when a `TimerCancelled` for the id precedes
+    /// any `TimerFired` in recorded history (deterministic recorded-order
+    /// resolution of a fire-vs-cancel race). On the first live await the timer is
+    /// re-armed idempotently (reusing the existing durable row) and the workflow
+    /// parks until the timer fires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`] via the deferred-error path
+    /// only through the arming call; the await itself resolves cleanly to a
+    /// [`TimerOutcome`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher/commands mutex is poisoned.
+    async fn await_timer_fire(
+        &self,
+        timer_id: &str,
+        duration_secs: u64,
+    ) -> HarvestResult<TimerOutcome> {
+        loop {
+            match self.match_history(|m| m.match_timer_or_cancel(timer_id)) {
+                TimerFireMatch::Fired => {
+                    // Advance the virtual clock so ctx.now() reflects elapsed
+                    // time (mirrors ctx.timer()).
+                    #[cfg(any(test, feature = "testing"))]
+                    self.advance_timer_clock(duration_secs);
+                    return Ok(TimerOutcome::Fired);
+                }
+                TimerFireMatch::Cancelled => return Ok(TimerOutcome::Cancelled),
+                TimerFireMatch::NoMatch => {
+                    self.check_strict_replay_no_match(&format!("TimerFired({timer_id})"))?;
+                    // Re-arm idempotently: keeps the parked task scheduled to the
+                    // armed deadline and guarantees a non-empty bookkeeping batch
+                    // so the suspension is recognized (never re-records
+                    // TimerStarted because the durable row already exists).
+                    self.push_command(WorkflowCommand::ArmTimer {
+                        timer_id: TimerId::new(timer_id),
+                        duration_secs,
+                    });
+                    // Park: the armed timer wakes the task on fire (or a cancel
+                    // recorded earlier is observed on the next cycle).
+                    park_until_dropped().await?;
+                }
+            }
+        }
     }
 
     /// Spawn a child workflow and await its terminal result.
@@ -9903,6 +10213,150 @@ mod tests {
         assert!(ctx.patched("x"));
         assert!(ctx.patched("x"));
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    // ── Cancellable / renewable durable timers (issue #768) ───────────────
+
+    fn timer_started_event(id: &str, dur: u64) -> WorkflowEvent {
+        WorkflowEvent::TimerStarted {
+            timer_id: crate::types::TimerId::new(id),
+            duration_secs: dur,
+        }
+    }
+
+    fn wf_started_event() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    #[test]
+    fn start_timer_emits_arm_command_without_suspending() {
+        let ctx = WorkflowContext::new_test();
+        // `start_timer` is synchronous (non-suspending) — it returns a handle
+        // immediately without parking the coroutine.
+        let handle = ctx.start_timer("idle", 300);
+        assert_eq!(handle.timer_id(), "idle");
+        assert_eq!(handle.duration_secs(), 300);
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "arming pushes exactly one command: {cmds:?}");
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::ArmTimer { timer_id, duration_secs }
+                if timer_id.as_str() == "idle" && *duration_secs == 300
+        ));
+    }
+
+    #[test]
+    fn cancel_timer_emits_cancel_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.cancel_timer("idle").expect("cancel is infallible");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::CancelTimer { timer_id } if timer_id.as_str() == "idle"
+        ));
+    }
+
+    #[test]
+    fn reset_emits_cancel_then_arm_command() {
+        let ctx = WorkflowContext::new_test();
+        let mut handle = ctx.start_timer("idle", 300);
+        // Clear the initial arm so we observe only the reset's commands.
+        let _ = ctx.drain_commands();
+        handle.reset(600).expect("reset is infallible");
+        assert_eq!(handle.duration_secs(), 600);
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 2, "reset pushes cancel + arm: {cmds:?}");
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::CancelTimer { timer_id } if timer_id.as_str() == "idle"
+        ));
+        assert!(matches!(
+            &cmds[1],
+            WorkflowCommand::ArmTimer { timer_id, duration_secs }
+                if timer_id.as_str() == "idle" && *duration_secs == 600
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_fire_returns_cancelled_when_history_has_timercancelled_before_fire() {
+        let events = vec![
+            wf_started_event(),
+            timer_started_event("idle", 300),
+            WorkflowEvent::TimerCancelled {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.expect("await resolves");
+        assert_eq!(outcome, TimerOutcome::Cancelled);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a fully-resolved cancelled timer emits no new commands on replay"
+        );
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn await_fire_returns_fired_and_fire_wins_over_late_cancel() {
+        // A genuine fire-vs-cancel race: TimerFired precedes TimerCancelled in
+        // history, so the fire wins (AC3). The trailing cancel replays as a no-op.
+        let events = vec![
+            wf_started_event(),
+            timer_started_event("idle", 300),
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowEvent::TimerCancelled {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.expect("await resolves");
+        assert_eq!(outcome, TimerOutcome::Fired);
+        // The recorded cancel is consumed as a no-op (fire already won).
+        ctx.cancel_timer("idle").expect("cancel is infallible");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "fire wins over a late cancel; no new commands emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_fire_reams_timer_and_parks_on_first_live_await() {
+        // On the first live await the timer is re-armed (idempotently) so the
+        // parked task is scheduled to the armed deadline, and the coroutine
+        // suspends (park) rather than returning.
+        let ctx = WorkflowContext::new_test();
+        let handle = ctx.start_timer("idle", 300);
+        // Drain the initial arm.
+        let _ = ctx.drain_commands();
+        // await_fire should park forever on a live NoMatch; race it against a
+        // timeout to prove it suspends and pushes exactly one re-arm command.
+        let awaited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle.await_fire()).await;
+        assert!(awaited.is_err(), "await_fire must park (suspend) when live");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "a live await re-arms exactly once: {cmds:?}");
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::ArmTimer { timer_id, .. } if timer_id.as_str() == "idle"
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "timer_id must be non-empty")]
+    fn start_timer_panics_on_empty_id() {
+        let ctx = WorkflowContext::new_test();
+        let _ = ctx.start_timer("", 300);
     }
 
     #[test]

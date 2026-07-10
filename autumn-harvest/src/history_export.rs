@@ -419,7 +419,9 @@ impl MermaidExporter {
                 | WorkflowEvent::ActivityHeartbeat { .. } => {
                     self.handle_activity_event(event)?;
                 }
-                WorkflowEvent::TimerStarted { .. } | WorkflowEvent::TimerFired { .. } => {
+                WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
                     self.handle_timer_event(event)?;
                 }
                 WorkflowEvent::ChildWorkflowStarted { .. }
@@ -646,6 +648,16 @@ impl MermaidExporter {
             WorkflowEvent::TimerFired { timer_id } => {
                 let participant = "Timer";
                 writeln!(self.out, "    {participant}-->>-WF: Timer {timer_id} Fired")?;
+            }
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                let participant = "Timer";
+                if self.participants.insert(participant.to_string()) {
+                    writeln!(self.out, "    participant {participant} as Timer")?;
+                }
+                writeln!(
+                    self.out,
+                    "    WF-->>-{participant}: Timer {timer_id} Cancelled"
+                )?;
             }
             _ => unreachable!(),
         }

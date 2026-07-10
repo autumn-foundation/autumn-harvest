@@ -208,6 +208,25 @@ pub enum SignalOrTimerMatch {
     },
 }
 
+/// Result of observing a cancellable durable timer's outcome against recorded
+/// history (issue #768: `TimerHandle::await_fire`).
+///
+/// The fire-vs-cancel outcome is resolved **deterministically by recorded
+/// history order**: whichever of `TimerFired` or `TimerCancelled` for the timer
+/// id appears first in history wins on every replay, regardless of wall-clock
+/// timing on the replaying worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimerFireMatch {
+    /// A `TimerFired` for the id was recorded before any `TimerCancelled`.
+    Fired,
+    /// A `TimerCancelled` for the id was recorded before any `TimerFired`.
+    Cancelled,
+    /// The timer is armed but neither a fire nor a cancel is recorded yet, or
+    /// the cursor is past the end of history (first live await). The caller
+    /// re-arms (idempotently) and suspends again.
+    NoMatch,
+}
+
 /// Result of matching a `patched()` call against recorded history (issue #687).
 ///
 /// A deliberate three-state result rather than a bare `bool`: the caller
@@ -996,8 +1015,14 @@ impl HistoryMatcher {
                 // activity (e.g. via tokio::join!). Track as an interleaved
                 // command so the cursor returns to it after matching the
                 // terminal event. Deterministic side-effect captures (issue
-                // #384) are cursor-ordered like markers and treated the same.
-                WorkflowEvent::MarkerRecorded { .. } | WorkflowEvent::SideEffectRecorded { .. } => {
+                // #384) are cursor-ordered like markers and treated the same. A
+                // cancellable-timer cancel (issue #768, e.g. a concurrent
+                // `handle.cancel()`) is likewise an interleaved command: the
+                // rewind keeps it at the cursor for its own claimer to re-scan
+                // (timer cancels are re-scanned from history, not stashed).
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
@@ -2455,7 +2480,9 @@ impl HistoryMatcher {
                 | WorkflowEvent::ExternalCancelRequested { .. }
                 | WorkflowEvent::ExternalCancelDelivered { .. }
                 | WorkflowEvent::ExternalCancelFailed { .. }
-                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                // A cancellable-timer cancel (issue #768) is transparent here.
+                | WorkflowEvent::TimerCancelled { .. } => {
                     idx += 1;
                 }
                 WorkflowEvent::TimerStarted { timer_id: id, .. } => {
@@ -2667,11 +2694,152 @@ impl HistoryMatcher {
                 continue;
             }
 
+            // A cancellable-timer cancel (issue #768) for another timer may be
+            // interleaved while this timer is pending. Treat it as an interleaved
+            // command (rewind after the fire settles) so it stays at the cursor
+            // for its own claimer to re-scan, rather than being skipped past.
+            if matches!(
+                &self.events[scan_cursor],
+                WorkflowEvent::TimerCancelled { .. }
+            ) {
+                first_interleaved_command.get_or_insert(scan_cursor);
+                scan_cursor += 1;
+                continue;
+            }
+
             break;
         }
 
         // Timer was started but never fired — incomplete history
         HistoryMatch::NoMatch
+    }
+
+    // ── Cancellable / renewable durable timers (issue #768) ──────────────────
+
+    /// Match the *arm* of an author-controlled durable timer against history.
+    ///
+    /// Positional (like a marker): expects `TimerStarted { timer_id,
+    /// duration_secs }` at the current cursor, consumes it, and returns
+    /// [`HistoryMatch::Matched`]. Unlike [`Self::match_timer_strict`] it does
+    /// **not** scan for a `TimerFired` — arming is non-suspending; the fire is
+    /// observed later via [`Self::match_timer_or_cancel`].
+    ///
+    /// Returns [`HistoryMatch::NoMatch`] when the cursor is past end (first live
+    /// arm) and [`HistoryMatch::Diverged`] when a different event / id / duration
+    /// is at the cursor.
+    pub fn match_timer_arm(&mut self, timer_id: &str, expected_duration: u64) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            duration_secs: recorded_duration,
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        };
+
+        if recorded_id.as_str() != timer_id {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: format!("TimerStarted({recorded_id})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+
+        if *recorded_duration != expected_duration {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected_duration}s)"),
+                actual: format!("TimerStarted({timer_id}, duration={recorded_duration}s)"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+
+        self.cursor += 1;
+        self.advance_to_next_unconsumed_event();
+        HistoryMatch::Matched {
+            output: Value::Null,
+        }
+    }
+
+    /// Match the *cancel* of an author-controlled durable timer against history.
+    ///
+    /// Forward-scans from the cursor for the first unconsumed
+    /// `TimerCancelled { timer_id }`, skipping already-consumed events, a
+    /// racing `TimerFired` for the same id (fire-vs-cancel is resolved by
+    /// [`Self::match_timer_or_cancel`], not here), and the interleavable event
+    /// classes. Claims it out of order (marks it consumed) and returns
+    /// [`HistoryMatch::Matched`].
+    ///
+    /// Returns [`HistoryMatch::NoMatch`] when no such event exists (live
+    /// cancel — the caller emits a `CancelTimer` command).
+    pub fn match_timer_cancel(&mut self, timer_id: &str) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+        let mut scan = self.cursor;
+        while scan < self.events.len() {
+            if self.is_consumed(scan) {
+                scan += 1;
+                continue;
+            }
+            if let WorkflowEvent::TimerCancelled { timer_id: id } = &self.events[scan]
+                && id.as_str() == timer_id
+            {
+                self.consumed_out_of_order_events.insert(scan);
+                self.advance_to_next_unconsumed_event();
+                return HistoryMatch::Matched {
+                    output: Value::Null,
+                };
+            }
+            scan += 1;
+        }
+        HistoryMatch::NoMatch
+    }
+
+    /// Observe a cancellable durable timer's outcome (issue #768).
+    ///
+    /// Forward-scans from the cursor for the **first** unconsumed
+    /// `TimerFired { timer_id }` or `TimerCancelled { timer_id }` — whichever
+    /// appears first in history decides the outcome (`Fired` vs `Cancelled`),
+    /// giving deterministic recorded-order resolution of a genuine fire-vs-cancel
+    /// race. Claims the winning event (marks it consumed).
+    ///
+    /// Returns [`TimerFireMatch::NoMatch`] when neither is recorded yet (the
+    /// timer is armed but unresolved, or the cursor is past end): the caller
+    /// re-arms idempotently and suspends.
+    pub fn match_timer_or_cancel(&mut self, timer_id: &str) -> TimerFireMatch {
+        if !self.prepare_match() {
+            return TimerFireMatch::NoMatch;
+        }
+        let mut scan = self.cursor;
+        while scan < self.events.len() {
+            if self.is_consumed(scan) {
+                scan += 1;
+                continue;
+            }
+            match &self.events[scan] {
+                WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
+                    self.consumed_out_of_order_events.insert(scan);
+                    self.advance_to_next_unconsumed_event();
+                    return TimerFireMatch::Fired;
+                }
+                WorkflowEvent::TimerCancelled { timer_id: id } if id.as_str() == timer_id => {
+                    self.consumed_out_of_order_events.insert(scan);
+                    self.advance_to_next_unconsumed_event();
+                    return TimerFireMatch::Cancelled;
+                }
+                _ => {
+                    scan += 1;
+                }
+            }
+        }
+        TimerFireMatch::NoMatch
     }
 
     /// Match a signal wait command against history.
@@ -3094,7 +3262,12 @@ impl HistoryMatcher {
                 | WorkflowEvent::LocalActivityScheduled { .. }
                 | WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
-                | WorkflowEvent::TimerStarted { .. } => {
+                | WorkflowEvent::TimerStarted { .. }
+                // A cancellable-timer cancel (issue #768) interleaved with the
+                // race is an interleaved command: rewind to it after the race
+                // settles so its own claimer can re-scan, rather than skipping
+                // past it (which would make it unreachable).
+                | WorkflowEvent::TimerCancelled { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
@@ -4512,6 +4685,158 @@ mod tests {
         let mut matcher = HistoryMatcher::new(vec![]);
         let result = matcher.match_timer("t1");
         assert_eq!(result, HistoryMatch::NoMatch);
+    }
+
+    // ── Cancellable / renewable durable timers (issue #768) ──────────────────
+
+    fn ts(id: &str, dur: u64) -> WorkflowEvent {
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new(id),
+            duration_secs: dur,
+        }
+    }
+    fn tf(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(id),
+        }
+    }
+    fn tc(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new(id),
+        }
+    }
+
+    #[test]
+    fn matcher_timer_arm_consumes_started() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300)]);
+        assert_eq!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(m.position(), 1);
+    }
+
+    #[test]
+    fn matcher_timer_arm_no_match_past_end() {
+        let mut m = HistoryMatcher::new(vec![]);
+        assert_eq!(m.match_timer_arm("idle", 300), HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn matcher_timer_arm_diverges_on_duration() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300)]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 600),
+            HistoryMatch::Diverged { .. }
+        ));
+    }
+
+    #[test]
+    fn matcher_timer_cancel_finds_and_consumes() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300), tc("idle")]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(matches!(
+            m.match_timer_cancel("idle"),
+            HistoryMatch::Matched { .. }
+        ));
+    }
+
+    #[test]
+    fn matcher_timer_cancel_no_match_when_absent() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300)]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.match_timer_cancel("idle"), HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_fired() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300), tf("idle")]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::Fired);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_cancelled() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300), tc("idle")]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::Cancelled);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_fire_wins_over_later_cancel() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300), tf("idle"), tc("idle")]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::Fired);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_cancel_wins_over_later_fire() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300), tc("idle"), tf("idle")]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::Cancelled);
+    }
+
+    #[test]
+    fn matcher_timer_or_cancel_no_match_when_unresolved() {
+        let mut m = HistoryMatcher::new(vec![ts("idle", 300)]);
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.match_timer_or_cancel("idle"), TimerFireMatch::NoMatch);
+    }
+
+    #[test]
+    fn matcher_activity_scan_skips_interleaved_timer_cancel() {
+        // A TimerCancelled interleaved between an activity's Scheduled and
+        // Completed events must not break the activity scan, and must remain
+        // claimable afterward (transparent, non-consuming skip).
+        let aid = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id: aid,
+                name: "work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            tc("idle"),
+            WorkflowEvent::ActivityCompleted {
+                activity_id: aid,
+                output: serde_json::json!("done"),
+            },
+        ];
+        let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_activity("work"),
+            HistoryMatch::Matched {
+                output: serde_json::json!("done")
+            }
+        );
+        // The interleaved cancel is still claimable afterward.
+        assert!(matches!(
+            m.match_timer_cancel("idle"),
+            HistoryMatch::Matched { .. }
+        ));
     }
 
     #[test]

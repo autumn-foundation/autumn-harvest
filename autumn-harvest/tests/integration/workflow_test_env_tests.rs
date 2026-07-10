@@ -104,6 +104,45 @@ fn race_workflow<'a>(
     })
 }
 
+/// (issue #768) Arm a cancellable timer and await its outcome.
+fn cancellable_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!(format!("{outcome:?}")))
+    })
+}
+
+/// (issue #768) Arm a cancellable timer then cancel it (fire-and-forget) — the
+/// timer must never fire.
+fn cancellable_cancel_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        Ok(json!("cancelled"))
+    })
+}
+
+/// (issue #768) Arm, reset once, then await — the reset re-arms with zero
+/// orphaned firings.
+fn cancellable_reset_once_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut handle = ctx.start_timer("idle", 300);
+        handle.reset(300).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!(format!("{outcome:?}")))
+    })
+}
+
 /// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
 /// activity. Exercises that the test harness persists the pre-suspension
 /// `SideEffectRecorded` event so the next replay iteration does not see drift.
@@ -437,6 +476,110 @@ async fn test_signal_wins_when_queued() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
         "timer must not fire when signal wins"
+    );
+}
+
+// ──────────── Cancellable / renewable durable timers (issue #768) ────────────
+
+#[tokio::test]
+async fn test_cancellable_timer_fires_when_not_cancelled() {
+    let outcome = WorkflowTestEnv::new()
+        .run(cancellable_await_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("Fired")));
+
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "expected TimerStarted"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "expected TimerFired"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "an uncancelled timer must not record TimerCancelled"
+    );
+
+    let report = outcome.replay_check(cancellable_await_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_cancellable_timer_does_not_fire_when_cancelled() {
+    let outcome = WorkflowTestEnv::new()
+        .run(cancellable_cancel_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("cancelled")));
+
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "a cancelled timer must record TimerCancelled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "a cancelled timer must never fire"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_then_fire() {
+    let outcome = WorkflowTestEnv::new()
+        .run(cancellable_reset_once_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("Fired")));
+
+    // History: TimerStarted, TimerCancelled, TimerStarted, TimerFired.
+    let all_events = outcome.events();
+    let timer_events: Vec<&WorkflowEvent> = all_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::TimerStarted { .. }
+                    | WorkflowEvent::TimerCancelled { .. }
+                    | WorkflowEvent::TimerFired { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        timer_events.len(),
+        4,
+        "expected 4 timer events: {timer_events:?}"
+    );
+    assert!(matches!(
+        timer_events[0],
+        WorkflowEvent::TimerStarted { .. }
+    ));
+    assert!(matches!(
+        timer_events[1],
+        WorkflowEvent::TimerCancelled { .. }
+    ));
+    assert!(matches!(
+        timer_events[2],
+        WorkflowEvent::TimerStarted { .. }
+    ));
+    assert!(matches!(timer_events[3], WorkflowEvent::TimerFired { .. }));
+
+    let report = outcome.replay_check(cancellable_reset_once_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
     );
 }
 

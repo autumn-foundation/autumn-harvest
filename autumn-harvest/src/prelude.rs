@@ -13,7 +13,8 @@ pub use crate::circuit_breaker::{
     DispatchDecision, DispatchToken,
 };
 pub use crate::context::{
-    ActivityContext, DEFAULT_SESSION_ACQUISITION_TIMEOUT, Session, SessionOptions, WorkflowContext,
+    ActivityContext, DEFAULT_SESSION_ACQUISITION_TIMEOUT, Session, SessionOptions, TimerHandle,
+    TimerOutcome, WorkflowContext,
 };
 pub use crate::dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,

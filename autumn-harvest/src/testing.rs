@@ -100,6 +100,12 @@ pub enum NonDeterminismKind {
     /// (issue #687's deploy-3 step taken too early) — and was encountered by
     /// the next command at that cursor position.
     PatchMarkerMismatch,
+    /// A `TimerCancelled` event was left unconsumed — e.g. a
+    /// [`crate::context::WorkflowContext::cancel_timer`] / `TimerHandle::cancel`
+    /// / `TimerHandle::reset` call was removed before all cancel-bearing
+    /// executions drained (issue #768) — and was encountered by the next
+    /// command at that cursor position.
+    TimerCancelMismatch,
     /// The divergence could not be classified into a known category.
     Unknown,
 }
@@ -120,6 +126,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::EarlyCompletion => write!(f, "EarlyCompletion"),
             Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
             Self::PatchMarkerMismatch => write!(f, "PatchMarkerMismatch"),
+            Self::TimerCancelMismatch => write!(f, "TimerCancelMismatch"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -1332,8 +1339,17 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
     if actual.starts_with("MarkerRecorded(patch:") {
         return NonDeterminismKind::PatchMarkerMismatch;
     }
+    // A `TimerCancelled` found where another event was expected means a
+    // `cancel_timer` / `handle.cancel` / `handle.reset` call was removed before
+    // all cancel-bearing executions drained (issue #768) — classify specifically
+    // so the message points at the cancelled timer rather than the command that
+    // first noticed it.
+    if actual.starts_with("TimerCancelled") {
+        return NonDeterminismKind::TimerCancelMismatch;
+    }
     match kind_str {
         "activity" => NonDeterminismKind::ActivityScheduleMismatch,
+        "timer-cancel" => NonDeterminismKind::TimerCancelMismatch,
         "local activity" => NonDeterminismKind::LocalActivityScheduleMismatch,
         "timer" => NonDeterminismKind::TimerMismatch,
         "signal" => NonDeterminismKind::SignalMismatch,
@@ -2776,6 +2792,25 @@ impl WorkflowTestEnv {
                         parent_close_policy: *parent_close_policy,
                     });
                 }
+                // Cancellable/renewable timer bookkeeping on a terminal cycle
+                // (issue #768): arm records TimerStarted (idempotent); cancel
+                // records TimerCancelled. No fire is deferred — the run is sealing.
+                WorkflowCommand::ArmTimer {
+                    timer_id,
+                    duration_secs,
+                } => {
+                    if !Self::timer_is_active_in_history(history, timer_id) {
+                        history.push(WorkflowEvent::TimerStarted {
+                            timer_id: timer_id.clone(),
+                            duration_secs: *duration_secs,
+                        });
+                    }
+                }
+                WorkflowCommand::CancelTimer { timer_id } => {
+                    history.push(WorkflowEvent::TimerCancelled {
+                        timer_id: timer_id.clone(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -3090,6 +3125,41 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
+            // Cancellable/renewable durable timer arm (issue #768). Mirrors the
+            // real worker's `apply_timer_lifecycle`: record TimerStarted and
+            // defer a TimerFired so the timer resolves on the next iteration
+            // (no real sleep). Idempotent — a re-arm of an already-active timer
+            // (e.g. `await_fire`'s re-arm in the same cycle as `start_timer`)
+            // records nothing.
+            WorkflowCommand::ArmTimer {
+                timer_id,
+                duration_secs,
+            } => {
+                let already_armed = deferred_events.iter().any(
+                    |e| matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
+                ) || Self::timer_is_active_in_history(history, &timer_id);
+                if already_armed {
+                    return Ok(false);
+                }
+                history.push(WorkflowEvent::TimerStarted {
+                    timer_id: timer_id.clone(),
+                    duration_secs,
+                });
+                deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                Ok(true)
+            }
+
+            // Cancellable/renewable durable timer cancel (issue #768). Record
+            // TimerCancelled and drop the deferred TimerFired for this id so the
+            // timer never fires — the cancelled branch is taken deterministically.
+            WorkflowCommand::CancelTimer { timer_id } => {
+                deferred_events.retain(
+                    |e| !matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
+                );
+                history.push(WorkflowEvent::TimerCancelled { timer_id });
+                Ok(true)
+            }
+
             // WaitForActivity: activity was scheduled in a previous iteration;
             // its terminal event is already in history and will be matched on replay.
             WorkflowCommand::WaitForActivity { .. }
@@ -3101,6 +3171,29 @@ impl WorkflowTestEnv {
             | WorkflowCommand::Fail { .. }
             | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
         }
+    }
+
+    /// Whether `timer_id` has an active (unfired, uncancelled) `TimerStarted`
+    /// in `history` — used by the harness to make cancellable-timer arming
+    /// idempotent (issue #768).
+    fn timer_is_active_in_history(
+        history: &[WorkflowEvent],
+        timer_id: &crate::types::TimerId,
+    ) -> bool {
+        let mut active = false;
+        for event in history {
+            match event {
+                WorkflowEvent::TimerStarted { timer_id: id, .. } if id == timer_id => active = true,
+                WorkflowEvent::TimerFired { timer_id: id }
+                | WorkflowEvent::TimerCancelled { timer_id: id }
+                    if id == timer_id =>
+                {
+                    active = false;
+                }
+                _ => {}
+            }
+        }
+        active
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -3432,6 +3525,32 @@ mod tests {
         let (kind, _, _) =
             parse_nd_message("timer mismatch: expected TimerStarted(t1), got ActivityScheduled");
         assert_eq!(kind, NonDeterminismKind::TimerMismatch);
+    }
+
+    #[test]
+    fn parse_nd_message_timer_cancel_mismatch() {
+        // The activity matcher trips over an unconsumed TimerCancelled left by a
+        // removed cancel_timer / handle.cancel / handle.reset call (issue #768).
+        let (kind, _, actual) = parse_nd_message(
+            "activity mismatch: expected ActivityScheduled(work), got TimerCancelled",
+        );
+        assert_eq!(kind, NonDeterminismKind::TimerCancelMismatch);
+        assert_eq!(actual, "TimerCancelled");
+    }
+
+    #[test]
+    fn classify_kind_timer_cancel_prefix_and_actual() {
+        // Explicit "timer-cancel" prefix maps to TimerCancelMismatch.
+        assert_eq!(
+            classify_kind("timer-cancel", "TimerStarted(idle)"),
+            NonDeterminismKind::TimerCancelMismatch
+        );
+        // A TimerCancelled `actual` always classifies as TimerCancelMismatch,
+        // regardless of which command noticed it.
+        assert_eq!(
+            classify_kind("activity", "TimerCancelled"),
+            NonDeterminismKind::TimerCancelMismatch
+        );
     }
 
     #[test]

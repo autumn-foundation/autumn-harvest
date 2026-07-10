@@ -250,7 +250,8 @@ pub use completion_trigger::{
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
     DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder, RaceWinner, Session, SessionOptions,
-    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, is_reserved_session_activity_name,
+    TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy,
+    is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -331,6 +332,7 @@ pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
     HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch, SignalOrTimerMatch,
+    TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{

@@ -300,6 +300,71 @@ fn sleep_until_workflow<'a>(
     })
 }
 
+/// Cancellable durable timer (issue #768): arm, then await the outcome.
+fn cancellable_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Cancellable timer reset loop (issue #768): arm, reset N times, then either
+/// await the fire or cancel. Drives the O(K)-history, zero-orphan reset path.
+fn cancellable_timer_reset_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let reset_count = input["reset_count"].as_u64().unwrap_or(0);
+        let cancel_at_end = input["cancel_at_end"].as_bool().unwrap_or(false);
+        let mut handle = ctx.start_timer("idle", 300);
+        for _ in 0..reset_count {
+            handle.reset(300).map_err(|e| e.to_string())?;
+        }
+        if cancel_at_end {
+            handle.cancel().map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("cancelled_by_workflow"))
+        } else {
+            let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(format!("{outcome:?}")))
+        }
+    })
+}
+
+/// Arms a timer then runs an activity — never cancels or awaits. Used to prove
+/// that removing a `cancel_timer` call while history still records a
+/// `TimerCancelled` surfaces as `TimerCancelMismatch` (issue #768).
+fn cancellable_timer_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _handle = ctx.start_timer("idle", 300);
+        let out = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Same as `cancellable_timer_workflow` but arms a differently-named timer —
+/// used to prove a renamed timer id surfaces as `TimerMismatch` (issue #768).
+fn cancellable_timer_renamed_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("renamed", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
 /// Workflow that derives a timer duration from deterministic retry-jitter math.
 fn jitter_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -585,6 +650,19 @@ fn build_replayer() -> WorkflowReplayer {
             parent_typed_child_failure_workflow,
         )
         .register_fn("self_typed_failure_workflow", self_typed_failure_workflow)
+        .register_fn("cancellable_timer_workflow", cancellable_timer_workflow)
+        .register_fn(
+            "cancellable_timer_reset_workflow",
+            cancellable_timer_reset_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_then_activity_workflow",
+            cancellable_timer_then_activity_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_renamed_workflow",
+            cancellable_timer_renamed_workflow,
+        )
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -1181,6 +1259,190 @@ async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
             }
         ),
         "dropping the frozen system_now() capture must surface as SideEffectDrift, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cancellable / renewable durable timers (issue #768)
+// ---------------------------------------------------------------------------
+
+fn cancellable_ts() -> WorkflowEvent {
+    WorkflowEvent::TimerStarted {
+        timer_id: TimerId::new("idle"),
+        duration_secs: 300,
+    }
+}
+fn cancellable_tf() -> WorkflowEvent {
+    WorkflowEvent::TimerFired {
+        timer_id: TimerId::new("idle"),
+    }
+}
+fn cancellable_tc() -> WorkflowEvent {
+    WorkflowEvent::TimerCancelled {
+        timer_id: TimerId::new("idle"),
+    }
+}
+fn wf_started() -> WorkflowEvent {
+    wf_started_with_input(Value::Null)
+}
+fn wf_started_with_input(input: Value) -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+#[tokio::test]
+async fn fired_timer_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a fired cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_timer_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tc()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a cancelled cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+/// Builds the history recorded by `cancellable_timer_reset_workflow`: an initial
+/// arm, then two events per reset (cancel + fresh arm), then a terminal
+/// fire-or-cancel. Deliberately O(K) with zero orphaned firings (AC4).
+fn cancellable_reset_history(reset_count: u64, cancel_at_end: bool) -> Vec<WorkflowEvent> {
+    let input = serde_json::json!({
+        "reset_count": reset_count,
+        "cancel_at_end": cancel_at_end,
+    });
+    let mut events = vec![wf_started_with_input(input), cancellable_ts()];
+    for _ in 0..reset_count {
+        events.push(cancellable_tc());
+        events.push(cancellable_ts());
+    }
+    events.push(if cancel_at_end {
+        cancellable_tc()
+    } else {
+        cancellable_tf()
+    });
+    events
+}
+
+/// The falsifiable success-metric bar for issue #768: reset-heavy cancellable
+/// timer histories replay deterministically across N = 1000 DISTINCT fixtures
+/// (reset cadence and terminal outcome both vary with `i`), each with zero
+/// divergences, and the history stays bounded at exactly 2 events per reset.
+#[tokio::test]
+async fn reset_1000_times_replays_with_bounded_history() {
+    let replayer = build_replayer();
+    for i in 0..1000_u64 {
+        let reset_count = i % 20;
+        let cancel_at_end = i % 2 == 0;
+        let events = cancellable_reset_history(reset_count, cancel_at_end);
+
+        // Bounded history: WorkflowStarted + initial arm + 2 events/reset + 1
+        // terminal = 2*reset_count + 3, i.e. exactly two events per reset.
+        assert_eq!(
+            events.len() as u64,
+            2 * reset_count + 3,
+            "history must be bounded at 2 events per reset (i={i})"
+        );
+
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "cancellable_timer_reset_workflow",
+                ExecutionId::new(),
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "reset replay pass {i} (resets={reset_count}, cancel={cancel_at_end}) must \
+             succeed with zero divergences, got: {report}"
+        );
+    }
+}
+
+/// Removing a `cancel_timer` call while history still records the
+/// `TimerCancelled` leaves it unconsumed; the next command trips over it and
+/// the divergence is classified precisely as `TimerCancelMismatch` (AC).
+#[tokio::test]
+async fn removed_cancel_surfaces_as_timer_cancel_mismatch() {
+    let aid = ActivityExecId::new();
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: aid,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: aid,
+            output: serde_json::json!("done"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_then_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::TimerCancelMismatch,
+                ..
+            }
+        ),
+        "an unconsumed TimerCancelled must classify as TimerCancelMismatch, got: {report}"
+    );
+}
+
+/// Renaming a timer id surfaces as an ordinary `TimerMismatch` (AC).
+#[tokio::test]
+async fn renamed_timer_surfaces_as_timer_mismatch() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_renamed_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::TimerMismatch,
+                ..
+            }
+        ),
+        "a renamed timer id must classify as TimerMismatch, got: {report}"
     );
 }
 

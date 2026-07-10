@@ -753,6 +753,8 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
+        WorkflowCommand::ArmTimer { .. } => "ArmTimer",
+        WorkflowCommand::CancelTimer { .. } => "CancelTimer",
     }
 }
 
@@ -807,6 +809,8 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. }
         )
     });
 
@@ -825,6 +829,8 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
+                    | WorkflowCommand::ArmTimer { .. }
+                    | WorkflowCommand::CancelTimer { .. }
             )
         })
 }
@@ -1045,6 +1051,8 @@ fn extract_single_command<T>(
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. }
         )
     });
 
@@ -1072,7 +1080,9 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            | WorkflowCommand::CancelRaceLosers { .. } => {}
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -1119,7 +1129,9 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            | WorkflowCommand::CancelRaceLosers { .. } => {}
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -1174,6 +1186,8 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. }
         )
     });
 
@@ -1199,6 +1213,8 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
+                    | WorkflowCommand::ArmTimer { .. }
+                    | WorkflowCommand::CancelTimer { .. }
             )
         })
         .collect();
@@ -3489,6 +3505,10 @@ async fn persist_signal_wait_park(
                     registry,
                 )
                 .await?;
+                // Cancellable/renewable timer bookkeeping (issue #768). Armed
+                // timers wake the parked task independently via the timer-fire
+                // ingest, so the returned deadline is not needed on this path.
+                apply_timer_lifecycle(conn, exec_id, commands, &mut race_next_event_id).await?;
                 let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
                 Ok((deferred, had_wake_requested))
             }
@@ -3607,6 +3627,10 @@ async fn persist_activity_wait_park(
                     registry,
                 )
                 .await?;
+                // Cancellable/renewable timer bookkeeping (issue #768). Armed
+                // timers wake the parked task independently via the timer-fire
+                // ingest, so the returned deadline is not needed on this path.
+                apply_timer_lifecycle(conn, exec_id, commands, &mut next_event_id).await?;
 
                 // `had_wake_requested` closes the residual race window `has_terminal`
                 // cannot cover (PR #901 review): an already-scheduled activity
@@ -3836,6 +3860,10 @@ async fn persist_scheduled_activities(
                     registry,
                 )
                 .await?;
+                // Cancellable/renewable timer bookkeeping (issue #768). Armed
+                // timers wake the parked task independently via the timer-fire
+                // ingest, so the returned deadline is not needed on this path.
+                apply_timer_lifecycle(conn, exec_id, commands, &mut race_next_event_id).await?;
 
                 // Worker sessions (issue #606): a member activity's session
                 // may have already left ACTIVE (the broken-session scanner
@@ -4020,6 +4048,11 @@ async fn persist_started_timer(
                 registry,
             )
             .await?;
+            // Cancellable/renewable timer bookkeeping (issue #768). Any ArmTimer
+            // whose id is the StartTimer being suspended on here is skipped inside
+            // apply_timer_lifecycle (this path owns its row + event below); only
+            // *other* timers' arm/cancel commands are resolved here.
+            apply_timer_lifecycle(conn, exec_id, commands, &mut race_next_event_id).await?;
 
             if is_new {
                 let new_timer = NewHarvestTimer {
@@ -4327,6 +4360,11 @@ async fn persist_all_started_child_workflows(
                     registry,
                 )
                 .await?;
+                // Cancellable/renewable timer bookkeeping (issue #768). Armed
+                // timers wake the parked parent independently via the timer-fire
+                // ingest, so the returned deadline is not needed on this path.
+                apply_timer_lifecycle(conn, parent_exec_id, commands, &mut race_next_event_id)
+                    .await?;
 
                 // Insert rows and enqueue tasks for new children.
                 for child in &new_children {
@@ -6261,6 +6299,10 @@ async fn persist_scheduled_external_activity(
                         registry,
                     )
                     .await?;
+                    // Cancellable/renewable timer bookkeeping (issue #768). Armed
+                    // timers wake the parked task independently via the timer-fire
+                    // ingest, so the returned deadline is not needed on this path.
+                    apply_timer_lifecycle(conn, exec_id, commands, &mut race_next_event_id).await?;
 
                     // Park first to clear worker ownership; wake_workflow_task only
                     // ever moves parked rows.
@@ -6345,6 +6387,10 @@ async fn persist_scheduled_external_activity(
                     registry,
                 )
                 .await?;
+                // Cancellable/renewable timer bookkeeping (issue #768). Armed
+                // timers wake the parked task independently via the timer-fire
+                // ingest, so the returned deadline is not needed on this path.
+                apply_timer_lifecycle(conn, exec_id, commands, &mut race_next_event_id).await?;
                 let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
                 Ok((deferred, had_wake_requested))
             }
@@ -6390,8 +6436,18 @@ async fn persist_bookkeeping_and_requeue_workflow(
                     registry,
                 )
                 .await?;
+                // Cancellable/renewable timer bookkeeping (issue #768). When a
+                // bookkeeping-only batch armed a durable timer, reschedule the
+                // task to that deadline so the armed timer actually wakes the
+                // workflow, instead of the default wake-now.
+                let armed_fires_at =
+                    apply_timer_lifecycle(conn, exec_id, commands, &mut race_next_event_id).await?;
                 queue::park_workflow_task(conn, task_id, sticky).await?;
-                queue::wake_workflow_task(conn, exec_id).await?;
+                if let Some(fires_at) = armed_fires_at {
+                    queue::reschedule_task(conn, task_id, fires_at).await?;
+                } else {
+                    queue::wake_workflow_task(conn, exec_id).await?;
+                }
                 Ok(deferred)
             }
             .scope_boxed()
@@ -6534,6 +6590,115 @@ async fn apply_race_loser_cancellations(
     }
 
     Ok(deferred)
+}
+
+/// Resolve the `WorkflowCommand::ArmTimer` / `WorkflowCommand::CancelTimer`
+/// bookkeeping commands in `commands` (issue #768): the durable side of
+/// author-controlled cancellable/renewable timers.
+///
+/// Runs inside the caller's transaction (mirroring
+/// [`apply_race_loser_cancellations`]), at every persist site. Commands are
+/// processed in emission order so a `reset` (which emits `CancelTimer` then
+/// `ArmTimer` for the same id) records `TimerCancelled` before the fresh
+/// `TimerStarted`.
+///
+/// - `ArmTimer { id, dur }`: upsert the `harvest_timers` row and append
+///   `TimerStarted` **only when the row is newly created** (dedup mirrors
+///   [`persist_started_timer`]). An `ArmTimer` whose id also has a `StartTimer`
+///   command in the same batch is **skipped** here — that is the arm+`await_fire`
+///   same-cycle case, and `persist_started_timer` owns the row insert / event /
+///   task reschedule for it, so processing both would double-insert.
+/// - `CancelTimer { id }`: delete the pending (`fired = false`) row via
+///   [`queue::delete_pending_timer`] and append `TimerCancelled`. The delete
+///   filters `fired = false`, so a fire that already committed is a no-op and
+///   the recorded-history order (`TimerFired` vs `TimerCancelled`) decides the
+///   observed outcome.
+///
+/// Returns the **minimum** armed `fires_at` across all `ArmTimer` commands (or
+/// `None` when none armed a new deadline), so a bookkeeping-only batch can
+/// reschedule the workflow task to that instant instead of waking immediately.
+async fn apply_timer_lifecycle(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    next_event_id: &mut i32,
+) -> HarvestResult<Option<chrono::DateTime<chrono::Utc>>> {
+    use crate::schema::harvest_timers;
+
+    // Timers armed via `start_timer` in the *same* cycle they are awaited emit
+    // both an `ArmTimer` (bookkeeping) and a `StartTimer` (suspension). The
+    // StartTimer suspension path (`persist_started_timer`) owns the row insert,
+    // `TimerStarted`, and task reschedule for those ids, so skip them here.
+    let start_timer_ids: std::collections::HashSet<&str> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let mut events: Vec<WorkflowEvent> = Vec::new();
+    let mut min_fires_at: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::ArmTimer {
+                timer_id,
+                duration_secs,
+            } => {
+                if start_timer_ids.contains(timer_id.as_str()) {
+                    continue;
+                }
+                let existing: Option<HarvestTimer> = harvest_timers::table
+                    .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(harvest_timers::timer_id.eq(timer_id.as_str()))
+                    .filter(harvest_timers::fired.eq(false))
+                    .first::<HarvestTimer>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+
+                let fires_at = if let Some(ref ext) = existing {
+                    ext.fires_at
+                } else {
+                    let fire_delay = chrono_duration_from_secs(*duration_secs, "timer duration")?;
+                    let db_now = db_clock_now(conn).await?;
+                    let fires_at = db_now + fire_delay;
+                    let new_timer = NewHarvestTimer {
+                        workflow_exec_id: exec_id.as_uuid(),
+                        timer_id: timer_id.as_str(),
+                        fires_at,
+                    };
+                    diesel::insert_into(harvest_timers::table)
+                        .values(&new_timer)
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    events.push(WorkflowEvent::TimerStarted {
+                        timer_id: timer_id.clone(),
+                        duration_secs: *duration_secs,
+                    });
+                    fires_at
+                };
+                min_fires_at =
+                    Some(min_fires_at.map_or(fires_at, |existing_min| existing_min.min(fires_at)));
+            }
+            WorkflowCommand::CancelTimer { timer_id } => {
+                queue::delete_pending_timer(conn, exec_id, timer_id).await?;
+                events.push(WorkflowEvent::TimerCancelled {
+                    timer_id: timer_id.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if !events.is_empty() {
+        let inserted = store::append_events(conn, exec_id, &events, *next_event_id).await?;
+        *next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
+    }
+
+    Ok(min_fires_at)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7431,6 +7596,11 @@ async fn persist_terminal_outcome_commands(
         registry,
     )
     .await?;
+    // Cancellable/renewable timer bookkeeping (issue #768). On a terminal cycle
+    // this primarily records a trailing `cancel_timer`/`handle.cancel` cleanup
+    // (`TimerCancelled` + row delete). The workflow is sealing, so any returned
+    // armed deadline is not used to reschedule.
+    apply_timer_lifecycle(conn, persistence.exec_id, pending_cmds, &mut next_event_id).await?;
 
     create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
 
