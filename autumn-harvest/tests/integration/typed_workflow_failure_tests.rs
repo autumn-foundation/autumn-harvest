@@ -284,7 +284,7 @@ mod db_handle_surface {
         "\n",
         include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
         include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-        include_str!("../../migrations/20260709000000_harvest_workflow_continue_chain/up.sql"),
+        include_str!("../../migrations/20260710000000_harvest_workflow_continue_chain/up.sql"),
     );
 
     async fn setup() -> (String, ContainerAsync<Postgres>) {
