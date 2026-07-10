@@ -358,6 +358,9 @@ pub struct HarvestApiState {
     /// HTTP start route dedups a repeated `idempotency_key` within this window.
     /// Defaults to 24h.
     start_idempotency_window: Arc<Mutex<std::time::Duration>>,
+    /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
+    /// Starter defaults; overridable per deployment via the plugin builder.
+    status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
 }
 
 impl Default for HarvestApiState {
@@ -403,6 +406,9 @@ impl Default for HarvestApiState {
             decode_payloads_on_read: Arc::new(Mutex::new(false)),
             start_idempotency_window: Arc::new(Mutex::new(
                 autumn_harvest::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+            )),
+            status_thresholds: Arc::new(Mutex::new(
+                crate::status_summary::StatusThresholds::default(),
             )),
         }
     }
@@ -585,6 +591,32 @@ impl HarvestApiState {
             .decode_payloads_on_read
             .lock()
             .expect("harvest api state lock poisoned") = enabled;
+    }
+
+    /// Override the thresholds for the rolled-up `GET /admin/status` verdict
+    /// (issue #679). Mirrored from the plugin builder at startup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_status_thresholds(&self, thresholds: crate::status_summary::StatusThresholds) {
+        *self
+            .status_thresholds
+            .lock()
+            .expect("harvest api state lock poisoned") = thresholds;
+    }
+
+    /// Current thresholds for the rolled-up `GET /admin/status` verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn status_thresholds(&self) -> crate::status_summary::StatusThresholds {
+        self.status_thresholds
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
     }
 
     /// Whether read-path payload decoding is enabled (issue #608).
@@ -3370,6 +3402,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(shards_health).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/status",
+            get(admin_status).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/version-gates/usage",
             get(version_usage).route_layer(require_admin.clone()),
         )
@@ -3934,6 +3970,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/health"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
+        ("GET", "/admin/status"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -4807,6 +4844,11 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/admin/status",
+            Some(&["status", "as_of", "subsystems", "unavailable_shards"]),
+        ),
+        (
+            "GET",
             "/admin/version-gates/usage",
             Some(&["status", "observed_at", "filters", "items", "shards"]),
         ),
@@ -5262,6 +5304,18 @@ async fn shards_health(
     Query(query): Query<ShardHealthQuery>,
 ) -> Json<ShardHealthReport> {
     Json(build_shard_health_report(&api_state, query.candidate_shard).await)
+}
+
+/// `GET /admin/status` — rolled-up management health summary (issue #679).
+///
+/// Composes five existing read models (workers, shards, dead-letters, queues,
+/// stalled workflows) into one JSON document with a single worst-of verdict.
+/// Read-only and admin-gated; never fails wholesale on an unreachable shard.
+async fn admin_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Json<crate::status_summary::HealthSummaryReport> {
+    let thresholds = api_state.status_thresholds();
+    Json(crate::status_summary::build_status_report(&api_state, &thresholds).await)
 }
 
 async fn version_usage(
@@ -25220,7 +25274,7 @@ where
 /// JSON rather than the source shard — could even return a non-source-shard copy
 /// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
 /// the worker's true liveness regardless of which shard it was read from.
-fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
+pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
     let mut by_id: std::collections::HashMap<String, WorkerRow> = std::collections::HashMap::new();
     for row in rows {
         match by_id.get(&row.worker.worker_id) {

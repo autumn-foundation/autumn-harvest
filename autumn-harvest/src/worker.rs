@@ -13461,6 +13461,60 @@ mod tests {
         assert_eq!(nd_block_backoff(i32::MAX), Duration::from_secs(300));
     }
 
+    /// Property tests for the private [`nd_block_backoff`] helper (issue #603).
+    /// Kept in-crate because the fn is private and `worker` is `db`-gated, so it
+    /// cannot be reached from `tests/property/`. `nd_block_backoff` is a thin
+    /// wrapper over [`crate::policy::compute_retry_delay`] (covered directly by
+    /// the `tests/property/policy_props.rs` suite); these properties pin its own
+    /// cap / monotonicity / totality contract.
+    ///
+    /// `PROPTEST_CASES` overrides the (low) default case count; on-disk failure
+    /// persistence is disabled to keep CI runners artifact-free.
+    mod nd_block_backoff_props {
+        use super::nd_block_backoff;
+        use proptest::prelude::*;
+        use std::time::Duration;
+
+        const CAP: Duration = Duration::from_secs(300);
+
+        fn config() -> proptest::test_runner::Config {
+            let cases = std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&c| c > 0)
+                .unwrap_or(128);
+            proptest::test_runner::Config {
+                cases,
+                failure_persistence: None,
+                ..proptest::test_runner::Config::default()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            /// Never exceeds the 300s cap and never panics — for any `i32`,
+            /// including `i32::MIN` and `i32::MAX`.
+            #[test]
+            fn never_exceeds_cap(count in any::<i32>()) {
+                prop_assert!(nd_block_backoff(count) <= CAP);
+            }
+
+            /// Monotonic non-decreasing in `block_count` over the non-negative
+            /// range (capped ties satisfy `<=`).
+            #[test]
+            fn monotonic_non_decreasing(count in 0i32..1_000) {
+                prop_assert!(nd_block_backoff(count) <= nd_block_backoff(count + 1));
+            }
+
+            /// Counts at/above the cap threshold saturate exactly at the cap.
+            #[test]
+            fn large_counts_saturate(count in 6i32..=i32::MAX) {
+                prop_assert_eq!(nd_block_backoff(count), CAP);
+            }
+        }
+    }
+
     #[test]
     fn apply_raw_search_attrs_patch_in_memory_inserts_and_removes() {
         let base = Some(serde_json::json!({"tenant": "acme", "build_id": "v1"}));

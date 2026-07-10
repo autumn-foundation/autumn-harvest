@@ -10081,6 +10081,78 @@ mod tests {
         );
     }
 
+    /// Property tests for the `pub(crate)` [`remaining_secs_until`] helper
+    /// (issue #749 `sleep_until`). Kept in-crate because the fn is not part of
+    /// the public API, so it cannot be reached from `tests/property/`.
+    ///
+    /// `PROPTEST_CASES` overrides the (low) default case count; on-disk failure
+    /// persistence is disabled to keep CI runners artifact-free.
+    mod remaining_secs_until_props {
+        use chrono::{DateTime, Duration, Utc};
+        use proptest::prelude::*;
+
+        fn dt(secs: i64, nanos: u32) -> DateTime<Utc> {
+            DateTime::from_timestamp(secs, nanos).expect("in-range timestamp")
+        }
+
+        fn config() -> proptest::test_runner::Config {
+            let cases = std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&c| c > 0)
+                .unwrap_or(128);
+            proptest::test_runner::Config {
+                cases,
+                failure_persistence: None,
+                ..proptest::test_runner::Config::default()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            /// Any past-or-equal deadline clamps to zero (never wraps).
+            #[test]
+            fn past_or_equal_clamps_to_zero(
+                secs in 0i64..4_000_000_000,
+                nanos in 0u32..1_000_000_000,
+                back_ns in 0i64..=10_000_000_000_000,
+            ) {
+                let now = dt(secs, nanos);
+                let deadline = now - Duration::nanoseconds(back_ns);
+                prop_assert_eq!(super::remaining_secs_until(deadline, now), 0);
+            }
+
+            /// A future deadline rounds up: the reconstructed fire instant
+            /// (`now + result seconds`) is at or after the deadline — the wait
+            /// never resolves strictly before the deadline.
+            #[test]
+            fn future_deadline_never_fires_early(
+                secs in 0i64..4_000_000_000,
+                nanos in 0u32..1_000_000_000,
+                delta_ns in 1i64..=10_000_000_000_000,
+            ) {
+                let now = dt(secs, nanos);
+                let deadline = now + Duration::nanoseconds(delta_ns);
+                let result = super::remaining_secs_until(deadline, now);
+                prop_assert!(result >= 1, "positive delta produced zero wait");
+                let fire_at = now + Duration::seconds(i64::try_from(result).expect("small result"));
+                prop_assert!(fire_at >= deadline, "would fire early: {fire_at} < {deadline}");
+            }
+
+            /// An exact whole-second delta is not over-rounded.
+            #[test]
+            fn whole_seconds_do_not_over_round(
+                secs in 0i64..4_000_000_000,
+                delta_secs in 0u64..=1_000_000,
+            ) {
+                let now = dt(secs, 0);
+                let deadline = now + Duration::seconds(i64::try_from(delta_secs).expect("small"));
+                prop_assert_eq!(super::remaining_secs_until(deadline, now), delta_secs);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn sleep_until_live_emits_side_effect_then_timer() {
         let ctx = WorkflowContext::new_test();
