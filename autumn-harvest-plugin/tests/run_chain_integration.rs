@@ -175,6 +175,13 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
+    // Per-execution legal hold (#747). The run-chain handler loads rows via
+    // `WorkflowExecution::as_select()`, which now selects the `legal_hold_*`
+    // columns — without this the first DB op fails with
+    // `column harvest_workflow_executions.legal_hold_set_at does not exist`.
+    include_str!("../../autumn-harvest/migrations/20260709000000_harvest_legal_hold/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260710000000_harvest_workflow_continue_chain/up.sql"
     ),
@@ -535,6 +542,67 @@ async fn run_chain_standalone_run_is_single_entry() {
     assert_eq!(runs[0]["sequence"], 0);
     assert_eq!(runs[0]["outcome"], "completed");
     assert!(runs[0]["continued_to_exec_id"].is_null());
+}
+
+/// (4b) A POST-feature chain `head -> middle -> tail` whose expired MIDDLE run was
+/// retention-deleted (per-execution legal hold, #747) while a held head and tail
+/// survive. The seed query `WHERE id = head OR first_exec_id = head` returns
+/// `{head, tail}` (middle gone). The assembler must flag `head_unknown = true`
+/// (tail names an absent predecessor) and must NOT synthesize a false
+/// `head -> tail` continuation — never a 500. (issue #701, Codex P2)
+#[tokio::test]
+async fn run_chain_post_feature_chain_with_deleted_middle_flags_gap() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let t0 = Utc::now() - Duration::seconds(300);
+    // head = origin; middle is deleted (never seeded); tail is the live run.
+    let head = seed_run(
+        &mut conn,
+        "gap-run-head",
+        "CONTINUED_AS_NEW",
+        t0,
+        Some(t0 + Duration::seconds(10)),
+        None,
+        None,
+    )
+    .await;
+    // The deleted middle: only its id exists, to name it as tail's predecessor.
+    let middle = ExecutionId::new_for_shard(ShardId::new(0));
+    let tail = seed_run(
+        &mut conn,
+        "gap-run-tail",
+        "RUNNING",
+        t0 + Duration::seconds(200),
+        None,
+        Some(middle), // real predecessor, absent from the gathered set
+        Some(head),   // shares the chain origin so the seed query gathers it
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{head}/run-chain")).await;
+    assert_eq!(status, StatusCode::OK, "deleted-middle chain must not 500");
+    assert_eq!(
+        body["head_unknown"], true,
+        "tail names an absent (deleted) predecessor => head_unknown"
+    );
+    assert_eq!(
+        run_ids(&body),
+        vec![head.to_string(), tail.to_string()],
+        "head then tail; the deleted middle is simply absent"
+    );
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs[0]["continued_to_exec_id"].is_null(),
+        "no synthesized head -> tail continuation across the retention gap"
+    );
+    assert!(
+        runs[1]["continued_to_exec_id"].is_null(),
+        "tail is the last ordered run"
+    );
 }
 
 /// (5) A pure legacy chain: rows carry NO back-links (both columns NULL) and are
