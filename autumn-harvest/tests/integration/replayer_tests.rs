@@ -353,6 +353,41 @@ fn cancellable_timer_reset_workflow<'a>(
     })
 }
 
+/// Same-cycle cancel-then-await (Codex P2, issue #768): arm a timer, cancel it,
+/// then await its outcome in the SAME task. Must resolve `Cancelled` and must
+/// NOT re-arm — otherwise the "cancelled" timer re-arms and later fires
+/// (AC2/AC3 violation). Proves the fix is correct on the REPLAY path, not just
+/// live: `cancel()` consumes the recorded `TimerCancelled`, so `await_fire`'s
+/// `match_timer_or_cancel` sees `NoMatch` and must fall back to the per-context
+/// cancelled state rather than re-arming.
+fn cancel_then_await_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Cancel-then-reset-then-await (issue #768): the reset re-arms after the
+/// cancel, so `await_fire` must wait/fire normally — NOT short-circuit to
+/// `Cancelled` from the earlier cancel.
+fn cancel_then_reset_then_await_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        handle.reset(300).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
 /// Arms a timer then runs an activity — never cancels or awaits. Used to prove
 /// that removing a `cancel_timer` call while history still records a
 /// `TimerCancelled` surfaces as `TimerCancelMismatch` (issue #768).
@@ -722,6 +757,14 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn(
             "cancellable_timer_reset_workflow",
             cancellable_timer_reset_workflow,
+        )
+        .register_fn(
+            "cancel_then_await_timer_workflow",
+            cancel_then_await_timer_workflow,
+        )
+        .register_fn(
+            "cancel_then_reset_then_await_timer_workflow",
+            cancel_then_reset_then_await_timer_workflow,
         )
         .register_fn(
             "cancellable_timer_then_activity_workflow",
@@ -1400,6 +1443,60 @@ async fn cancelled_timer_replays_succeeded() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a cancelled cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+/// Codex P2 (issue #768) — determinism gate: a same-task
+/// `start_timer; cancel; await_fire` replays cleanly against the history the
+/// FIXED worker produces (`[WorkflowStarted, TimerStarted, TimerCancelled]`).
+/// On replay `cancel()` consumes the recorded `TimerCancelled`, so `await_fire`
+/// sees `match_timer_or_cancel == NoMatch` and MUST resolve `Cancelled` from the
+/// per-context cancelled state rather than re-arming and parking — a re-arm here
+/// would suspend mid-replay (never reaching completion) and the run would never
+/// resolve, so `ReplaySucceeded` here is the direct proof the fix holds on
+/// replay, not just live.
+#[tokio::test]
+async fn cancel_then_await_same_cycle_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tc()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_then_await_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a same-cycle cancel-then-await cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+/// Codex P2 (issue #768) — determinism gate for reset-after-cancel: a
+/// `cancel(); reset(); await_fire()` re-arms after the cancel, so the timer
+/// fires. Replays cleanly against the FIXED worker history
+/// `[WorkflowStarted, TimerStarted, TimerCancelled, TimerCancelled, TimerStarted,
+/// TimerFired]` and resolves `Fired` — proving the reset flips the per-context
+/// state back to Armed so `await_fire` does NOT short-circuit to `Cancelled`.
+#[tokio::test]
+async fn cancel_then_reset_then_await_replays_fired() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        cancellable_tc(),
+        cancellable_ts(),
+        cancellable_tf(),
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_then_reset_then_await_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a cancel-then-reset-then-await cancellable timer replays cleanly (fires), got: {report}"
     );
 }
 

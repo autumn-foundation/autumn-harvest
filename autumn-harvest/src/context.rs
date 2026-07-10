@@ -702,6 +702,25 @@ pub enum TimerOutcome {
     Cancelled,
 }
 
+/// The per-context *logical* lifecycle of an author-controlled durable timer
+/// (issue #768). Tracked per `timer_id` on [`WorkflowContext`] so that a
+/// same-task `cancel(); await_fire()` (or a replay of the equivalent history)
+/// resolves [`TimerOutcome::Cancelled`] without re-arming the timer.
+///
+/// This is *logical* — a pure function of the calls the workflow made this
+/// task, replayed identically live and on replay — so it is deterministic. It
+/// does **not** override the recorded fire-vs-cancel race: `await_timer_fire`
+/// always consults recorded history first (`match_timer_or_cancel`) and only
+/// falls back to this state when history holds no resolving event yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerLogicalState {
+    /// The timer is armed (or has been re-armed by `reset`) and awaiting a fire.
+    Armed,
+    /// The timer was cancelled this task and must not be re-armed by a
+    /// subsequent `await_fire`.
+    Cancelled,
+}
+
 /// A handle to an author-controlled durable timer armed by
 /// [`WorkflowContext::start_timer`] (issue #768).
 ///
@@ -1583,6 +1602,14 @@ pub struct WorkflowContext {
     /// names across replays, mirroring `fan_out_seq`/`race_seq`/`session_seq`.
     /// Numbers are never released once allocated.
     saga_seq: Mutex<u32>,
+    /// Per-`timer_id` logical lifecycle of author-controlled durable timers
+    /// (issue #768). `start_timer`/`reset_timer` set the entry to
+    /// [`TimerLogicalState::Armed`]; `cancel_timer` sets it to
+    /// [`TimerLogicalState::Cancelled`]. `await_timer_fire` consults this only
+    /// when recorded history holds no resolving event, so a same-task
+    /// `cancel(); await_fire()` (live or on replay) resolves
+    /// [`TimerOutcome::Cancelled`] instead of re-arming a cancelled timer.
+    cancellable_timer_state: Mutex<std::collections::HashMap<String, TimerLogicalState>>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -1916,6 +1943,7 @@ impl WorkflowContext {
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             saga_seq: Mutex::new(0),
+            cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2030,6 +2058,7 @@ impl WorkflowContext {
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             saga_seq: Mutex::new(0),
+            cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2081,6 +2110,7 @@ impl WorkflowContext {
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             saga_seq: Mutex::new(0),
+            cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -4145,11 +4175,36 @@ impl WorkflowContext {
             // other variant: nothing to emit.
             _ => {}
         }
+        self.set_timer_logical_state(timer_id, TimerLogicalState::Armed);
         TimerHandle {
             context: self,
             timer_id: timer_id.to_string(),
             duration_secs,
         }
+    }
+
+    /// Record the logical lifecycle of an author-controlled durable timer
+    /// (issue #768). Runs identically on the live frontier and on replay, since
+    /// it is driven purely by the workflow's own `start_timer`/`cancel_timer`/
+    /// `reset_timer` calls in program order.
+    fn set_timer_logical_state(&self, timer_id: &str, state: TimerLogicalState) {
+        self.cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned")
+            .insert(timer_id.to_string(), state);
+    }
+
+    /// Whether the workflow logically cancelled `timer_id` this task without a
+    /// subsequent re-arm. Consulted by [`Self::await_timer_fire`] only when
+    /// recorded history holds no resolving event.
+    fn timer_logically_cancelled(&self, timer_id: &str) -> bool {
+        matches!(
+            self.cancellable_timer_state
+                .lock()
+                .expect("cancellable_timer_state lock poisoned")
+                .get(timer_id),
+            Some(TimerLogicalState::Cancelled)
+        )
     }
 
     /// Cancel an author-controlled durable timer by id.
@@ -4184,6 +4239,7 @@ impl WorkflowContext {
                 });
             }
         }
+        self.set_timer_logical_state(timer_id, TimerLogicalState::Cancelled);
         Ok(())
     }
 
@@ -4235,6 +4291,10 @@ impl WorkflowContext {
             // Replay (Matched) or any other variant: nothing to emit.
             _ => {}
         }
+        // A reset re-arms: the fresh arming supersedes any prior cancel so a
+        // following `await_fire` waits/fires normally (never resolves Cancelled
+        // from a pre-reset cancel).
+        self.set_timer_logical_state(timer_id, TimerLogicalState::Armed);
         Ok(())
     }
 
@@ -4272,6 +4332,18 @@ impl WorkflowContext {
                 }
                 TimerFireMatch::Cancelled => return Ok(TimerOutcome::Cancelled),
                 TimerFireMatch::NoMatch => {
+                    // History holds no resolving event. If the workflow logically
+                    // cancelled this timer earlier in the same task (a same-cycle
+                    // `cancel(); await_fire()`, live or on replay of the equivalent
+                    // history), resolve Cancelled instead of re-arming — otherwise a
+                    // fresh ArmTimer would re-create the durable row the cancel just
+                    // tore down, and the "cancelled" timer would later fire (AC2/AC3
+                    // violation, Codex P2). A `reset` between the cancel and the
+                    // await flips the state back to Armed, so it falls through and
+                    // waits/fires normally.
+                    if self.timer_logically_cancelled(timer_id) {
+                        return Ok(TimerOutcome::Cancelled);
+                    }
                     self.check_strict_replay_no_match(&format!("TimerFired({timer_id})"))?;
                     // Re-arm idempotently: keeps the parked task scheduled to the
                     // armed deadline and guarantees a non-empty bookkeeping batch
@@ -10344,6 +10416,51 @@ mod tests {
         let awaited =
             tokio::time::timeout(std::time::Duration::from_millis(50), handle.await_fire()).await;
         assert!(awaited.is_err(), "await_fire must park (suspend) when live");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "a live await re-arms exactly once: {cmds:?}");
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::ArmTimer { timer_id, .. } if timer_id.as_str() == "idle"
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_fire_after_same_cycle_cancel_resolves_cancelled_without_rearming() {
+        // Codex P2 (issue #768): a same-task `start_timer; cancel; await_fire`
+        // on the LIVE frontier must resolve Cancelled and must NOT push a third
+        // (re-arm) ArmTimer after the cancel — otherwise the worker persists
+        // TimerStarted, TimerCancelled, TimerStarted and the "cancelled" timer
+        // re-arms and later fires (AC2/AC3 violation).
+        let ctx = WorkflowContext::new_test();
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().expect("cancel is infallible");
+        // Drain the initial arm + cancel so we observe only await_fire's output.
+        let pre = ctx.drain_commands();
+        assert_eq!(pre.len(), 2, "arm + cancel: {pre:?}");
+        let outcome = handle.await_fire().await.expect("await resolves");
+        assert_eq!(outcome, TimerOutcome::Cancelled);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a logically-cancelled timer must not re-arm on await_fire"
+        );
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn await_fire_after_cancel_then_reset_rearms_and_parks() {
+        // A `cancel(); reset(30); await_fire()` must re-arm and wait/fire (the
+        // reset supersedes the earlier cancel), NOT short-circuit to Cancelled.
+        let ctx = WorkflowContext::new_test();
+        let mut handle = ctx.start_timer("idle", 300);
+        handle.cancel().expect("cancel is infallible");
+        handle.reset(30).expect("reset is infallible");
+        let _ = ctx.drain_commands();
+        let awaited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle.await_fire()).await;
+        assert!(
+            awaited.is_err(),
+            "await_fire must park after a reset re-arm, not resolve Cancelled"
+        );
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 1, "a live await re-arms exactly once: {cmds:?}");
         assert!(matches!(

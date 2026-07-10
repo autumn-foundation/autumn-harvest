@@ -143,6 +143,24 @@ fn cancellable_reset_once_workflow<'a>(
     })
 }
 
+/// (Codex P2, issue #768) Arm a cancellable timer, then suspend on an activity
+/// in the SAME cycle. The armed timer must NOT fire before the activity
+/// completes — mirrors the real worker, which records the arm and leaves the
+/// workflow parked on the activity.
+fn arm_timer_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"work": result}))
+    })
+}
+
 /// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
 /// activity. Exercises that the test harness persists the pre-suspension
 /// `SideEffectRecorded` event so the next replay iteration does not see drift.
@@ -577,6 +595,56 @@ async fn test_reset_then_fire() {
     assert!(matches!(timer_events[3], WorkflowEvent::TimerFired { .. }));
 
     let report = outcome.replay_check(cancellable_reset_once_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_armed_timer_does_not_fire_during_a_mixed_activity_suspension() {
+    // Codex P2 (issue #768): arming a cancellable timer in the same cycle as an
+    // activity suspension must NOT interleave a TimerFired before the activity
+    // completes. The real worker records the arm and parks on the activity;
+    // firing the timer here would synthesise impossible history such as
+    // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_then_activity_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!({"work": "done"})));
+
+    let events = outcome.events();
+    // The timer is armed...
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "expected the arm to record TimerStarted: {events:?}"
+    );
+    // ...but never fires (the workflow parked on the activity, then completed).
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "an armed-but-unawaited timer must not fire during a mixed activity \
+         suspension (impossible history): {events:?}"
+    );
+
+    // No TimerFired ever precedes ActivityCompleted — assert the exact ordering
+    // invariant Codex flagged.
+    let ts = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
+    let tf = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }));
+    assert!(
+        tf.is_none() || tf > ts,
+        "TimerFired must never precede ActivityCompleted: {events:?}"
+    );
+
+    let report = outcome.replay_check(arm_timer_then_activity_workflow).await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "replay self-check failed:\n{report}"

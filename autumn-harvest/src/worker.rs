@@ -7875,7 +7875,52 @@ fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
             _ => None,
         })
         .sum();
-    u64::try_from(simple_events.saturating_add(race_cancel_events)).unwrap_or(u64::MAX)
+    let timer_lifecycle_events = timer_lifecycle_event_count(commands);
+    u64::try_from(
+        simple_events
+            .saturating_add(race_cancel_events)
+            .saturating_add(timer_lifecycle_events),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Conservative upper bound on the durable timer-lifecycle events an
+/// `ArmTimer`/`CancelTimer` batch appends, for the history hard-cap preflight
+/// (Codex P2, issue #768). `plan_timer_lifecycle`/`terminal_arm_timer_events`
+/// append one `TimerStarted` per emitting `ArmTimer` and one `TimerCancelled`
+/// per `CancelTimer`; without counting them a near-cap reset batch
+/// (`CancelTimer` + `ArmTimer`) would pass the `>= cap` check as ~one pending
+/// event yet append two, breaching the hard cap instead of failing to the
+/// dead-letter queue first.
+///
+/// Counted **conservatively** — the preflight runs before the DB-dependent
+/// dedup, so an `ArmTimer` whose durable row already exists (an idempotent
+/// re-arm that appends nothing) is still counted `+1`. Over-counting only ever
+/// nudges the cap check earlier (DLQ one event early), never masks an overflow.
+///
+/// An `ArmTimer` whose id also has a `StartTimer` in the same batch is
+/// **excluded**: `plan_timer_lifecycle` skips it (the `StartTimer` suspension
+/// path owns that id's row/event), and its `TimerStarted` is already counted by
+/// the `extract_started_timer_for_suspension` branch — counting it here too
+/// would double-count.
+fn timer_lifecycle_event_count(commands: &[WorkflowCommand]) -> usize {
+    let start_timer_ids: HashSet<&str> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    commands
+        .iter()
+        .filter(|cmd| match cmd {
+            WorkflowCommand::ArmTimer { timer_id, .. } => {
+                !start_timer_ids.contains(timer_id.as_str())
+            }
+            WorkflowCommand::CancelTimer { .. } => true,
+            _ => false,
+        })
+        .count()
 }
 
 fn pending_detached_parent_close_cascade_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -13632,6 +13677,64 @@ mod tests {
             events[1].is_none(),
             "a repeat arm of an active id emits nothing, got {events:?}"
         );
+    }
+
+    /// Codex P2 (issue #768): a reset batch (`CancelTimer` + `ArmTimer`) appends
+    /// two durable timer-lifecycle events (`TimerCancelled` + `TimerStarted`), so
+    /// the history hard-cap preflight must count 2 — otherwise a near-cap reset
+    /// slips past the `>= cap` check and breaches the hard cap.
+    #[test]
+    fn timer_lifecycle_count_counts_reset_batch_as_two() {
+        let commands = vec![
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+            },
+        ];
+        assert_eq!(timer_lifecycle_event_count(&commands), 2);
+        // The shared preflight accessor must reflect it too (no other bookkeeping
+        // in this batch).
+        assert_eq!(pre_suspension_event_count(&commands), 2);
+    }
+
+    /// An `ArmTimer` whose id also carries a `StartTimer` in the batch is owned by
+    /// the suspension path and counted by `extract_started_timer_for_suspension`;
+    /// counting it here too would double-count, so the timer-lifecycle count
+    /// excludes it. A `CancelTimer` for a *different* id still counts.
+    #[test]
+    fn timer_lifecycle_count_excludes_start_timer_owned_arm() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                result_tx: oneshot::channel::<()>().0,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("other"),
+            },
+        ];
+        // ArmTimer(x) excluded (StartTimer-owned); CancelTimer(other) counts.
+        assert_eq!(timer_lifecycle_event_count(&commands), 1);
+    }
+
+    /// A batch with no timer bookkeeping counts zero timer-lifecycle events
+    /// (backward-compatible: non-timer batches are unaffected).
+    #[test]
+    fn timer_lifecycle_count_is_zero_without_timer_commands() {
+        let commands = vec![WorkflowCommand::RecordMarker {
+            name: "m".to_string(),
+            details: serde_json::Value::Null,
+        }];
+        assert_eq!(timer_lifecycle_event_count(&commands), 0);
+        // But RecordMarker still counts as a pre-suspension event.
+        assert_eq!(pre_suspension_event_count(&commands), 1);
     }
 
     /// A `start_timer` immediately followed same-cycle by a `new_uuid`/

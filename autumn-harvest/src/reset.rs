@@ -571,8 +571,7 @@ fn apply_event_to_pending(
         // unresolved side effect. Without closing on the cancel, a reset point
         // after a cancel/reset would leave the cancelled arming counted as pending
         // and reset validation would reject or mis-plan the fork (Codex P2).
-        WorkflowEvent::TimerFired { timer_id }
-        | WorkflowEvent::TimerCancelled { timer_id } => {
+        WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id } => {
             remove_pending(pending, "TimerStarted", &timer_id.to_string());
         }
         WorkflowEvent::ChildWorkflowStarted {

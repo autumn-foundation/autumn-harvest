@@ -2869,12 +2869,24 @@ impl WorkflowTestEnv {
             }
         });
 
+        // Whether this batch also carries a genuine non-timer suspension
+        // (activity/signal/child-workflow/classic timer). In production the
+        // worker records an `ArmTimer` and leaves the workflow parked on that
+        // other wait — it only reschedules the armed cancellable timer to fire
+        // on the bookkeeping-only `await_fire` path. When a competing suspension
+        // is present the harness must NOT auto-fire the armed timer, or it would
+        // synthesise impossible history such as
+        // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`
+        // (Codex P2, issue #768).
+        let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
+
         let mut made_progress = false;
         let mut deferred_events = Vec::new();
         for cmd in commands {
             made_progress |= self.process_command(
                 cmd,
                 signal_will_resolve,
+                batch_has_competing_suspension,
                 history,
                 &mut deferred_events,
                 remaining_signals,
@@ -2884,6 +2896,25 @@ impl WorkflowTestEnv {
         }
         history.extend(deferred_events);
         Ok(made_progress)
+    }
+
+    /// Whether a command is a genuine non-timer suspension that would keep the
+    /// workflow parked on an external event (activity result, signal, child
+    /// result, or a classic `ctx.timer` fire) — as opposed to author-controlled
+    /// cancellable-timer bookkeeping (`ArmTimer`/`CancelTimer`) or an inline
+    /// local activity. Used to gate cancellable-timer auto-firing in the harness
+    /// so it only fires on the bookkeeping-only `await_fire` path, matching the
+    /// real worker (Codex P2, issue #768).
+    const fn is_competing_suspension(cmd: &WorkflowCommand) -> bool {
+        matches!(
+            cmd,
+            WorkflowCommand::ScheduleActivity { .. }
+                | WorkflowCommand::WaitForActivity { .. }
+                | WorkflowCommand::ScheduleExternalActivity { .. }
+                | WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::StartChildWorkflow { .. }
+                | WorkflowCommand::StartTimer { .. }
+        )
     }
 
     /// Resolve a single workflow command and append the resulting events.
@@ -2896,6 +2927,7 @@ impl WorkflowTestEnv {
         &self,
         cmd: WorkflowCommand,
         signal_will_resolve: bool,
+        batch_has_competing_suspension: bool,
         history: &mut Vec<WorkflowEvent>,
         deferred_events: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
@@ -3148,7 +3180,16 @@ impl WorkflowTestEnv {
                     timer_id: timer_id.clone(),
                     duration_secs,
                 });
-                deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                // Only auto-fire when this batch is bookkeeping-only (the
+                // `await_fire` path). When a genuine non-timer suspension shares
+                // the batch, the real worker records the arm and leaves the
+                // workflow parked on that other wait, so the timer must NOT fire
+                // yet — deferring a TimerFired here would produce impossible
+                // history (Codex P2, issue #768). The timer resolves later, on a
+                // subsequent bookkeeping-only `await_fire` cycle.
+                if !batch_has_competing_suspension {
+                    deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                }
                 Ok(true)
             }
 
