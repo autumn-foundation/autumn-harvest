@@ -2855,7 +2855,7 @@ impl HistoryMatcher {
             // Any other unconsumed event: cross it if transparent/interleavable,
             // otherwise STOP (a command-ordering point the cancel claim must not
             // cross).
-            match self.timer_scan_cross_or_stop(scan) {
+            match self.timer_scan_cross_or_stop(scan, timer_id) {
                 TimerScanStep::Cross => scan += 1,
                 TimerScanStep::Stop => break,
             }
@@ -2872,9 +2872,9 @@ impl HistoryMatcher {
     /// Returns [`TimerScanStep::Cross`] — performing the same stashing side
     /// effects the two callers used inline — for the genuinely transparent /
     /// interleavable classes: bookkeeping markers & side effects, fire-and-forget
-    /// detached child spawns, a sibling `reset()`'s
-    /// `[TimerCancelled(x), TimerStarted(x)]` arm/cancel interleaving for ANOTHER
-    /// id, stashed signals, external signal/cancel triplets, and update events.
+    /// detached child spawns, a **foreign-id** sibling `reset()`'s
+    /// `[TimerCancelled(x), TimerStarted(x)]` arm/cancel interleaving, stashed
+    /// signals, external signal/cancel triplets, and update events.
     /// Returns [`TimerScanStep::Stop`] for any other command-bearing event
     /// (`ActivityScheduled`/`Completed`/`Failed`, an attached `ChildWorkflow*`,
     /// `LocalActivity*`, a foreign `TimerFired`, ...): a timer outcome/cancel
@@ -2882,18 +2882,38 @@ impl HistoryMatcher {
     /// change that moved the await/cancel BEFORE such a command would silently
     /// pass strict replay (Codex P2 soundness fix). Factoring this into one shared
     /// helper keeps the two scans' crossable sets provably identical.
+    ///
+    /// # Same-id `TimerStarted`/`TimerCancelled` is an ANCHOR, not transparent (Codex P2 round 10)
+    ///
+    /// The scan is id-aware: an UNCONSUMED **same-id** `TimerStarted` (or
+    /// `TimerCancelled`) is this timer's own command-ordering anchor — the arm
+    /// that must precede its cancel/fire — so the scan STOPS at it. Only a
+    /// **foreign** (different-id) sibling timer's arm/cancel lifecycle is
+    /// transparent. Without this, strict replay of
+    /// `start_timer("idle"); cancel_timer("idle")` with the two lines reordered to
+    /// `cancel_timer("idle"); start_timer("idle")` would let
+    /// `match_timer_cancel("idle")` skip the unconsumed same-id `TimerStarted`,
+    /// claim the later `TimerCancelled`, and then let `start_timer` consume the
+    /// start — accepting a real command-order change.
     #[allow(clippy::too_many_lines)]
-    fn timer_scan_cross_or_stop(&mut self, scan: usize) -> TimerScanStep {
+    fn timer_scan_cross_or_stop(&mut self, scan: usize, timer_id: &str) -> TimerScanStep {
         match &self.events[scan] {
-            // Bookkeeping / fire-and-forget / sibling-reset interleaving — cross.
-            // (An our-id timer target is handled by the caller BEFORE this call,
-            // so any `TimerStarted`/`TimerCancelled` reaching here is a foreign
-            // sibling reset's arm/cancel interleaving.)
+            // Bookkeeping / fire-and-forget — always cross.
             WorkflowEvent::MarkerRecorded { .. }
             | WorkflowEvent::SideEffectRecorded { .. }
-            | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
-            | WorkflowEvent::TimerStarted { .. }
-            | WorkflowEvent::TimerCancelled { .. } => TimerScanStep::Cross,
+            | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => TimerScanStep::Cross,
+            // A FOREIGN sibling timer's arm/cancel interleaving is transparent; an
+            // UNCONSUMED SAME-id `TimerStarted`/`TimerCancelled` is this id's own
+            // command-ordering anchor and falls through to `_ => Stop` below (Codex
+            // P2 round 10). Our-id fire/cancel *targets* are claimed by the caller
+            // BEFORE this call, so a same-id one reaching here is a genuine
+            // unconsumed ordering point the scan must not cross.
+            WorkflowEvent::TimerStarted { timer_id: id, .. }
+            | WorkflowEvent::TimerCancelled { timer_id: id }
+                if id.as_str() != timer_id =>
+            {
+                TimerScanStep::Cross
+            }
             // Signals can arrive while a timer is armed; stash them for a later
             // wait_for_signal and cross.
             WorkflowEvent::SignalReceived {
@@ -3062,7 +3082,7 @@ impl HistoryMatcher {
             // command would otherwise silently claim a future TimerFired across it
             // and pass strict replay — Codex P2 soundness fix, issue #768). The
             // crossable set is shared verbatim with `match_timer_cancel`.
-            match self.timer_scan_cross_or_stop(scan) {
+            match self.timer_scan_cross_or_stop(scan, timer_id) {
                 TimerScanStep::Cross => scan += 1,
                 TimerScanStep::Stop => break,
             }

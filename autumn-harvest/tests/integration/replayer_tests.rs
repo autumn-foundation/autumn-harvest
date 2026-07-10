@@ -612,6 +612,40 @@ fn cancellable_timer_loop_reuse_workflow<'a>(
     })
 }
 
+/// Codex P2 round 10 (issue #768) — CANONICAL ORDER: arm the timer, THEN cancel
+/// it (no intervening activity), matching the recorded history
+/// `[TimerStarted(idle), TimerCancelled(idle)]`. Must replay cleanly: `start_timer`
+/// consumes the `TimerStarted` at the cursor, then `match_timer_cancel` claims the
+/// `TimerCancelled` directly at the (now-advanced) cursor.
+fn start_then_cancel_no_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("cancelled"))
+    })
+}
+
+/// Codex P2 round 10 (issue #768) — REORDERED: cancel the timer BEFORE arming it,
+/// replayed against the canonical `[TimerStarted(idle), TimerCancelled(idle)]`
+/// history. `match_timer_cancel("idle")`'s scan must STOP at the unconsumed
+/// SAME-id `TimerStarted` (this id's own command-ordering anchor) rather than
+/// crossing it to claim the trailing `TimerCancelled` — so strict replay reports
+/// `NonDeterminismDetected`. Before the round-10 fix the shared helper crossed a
+/// same-id `TimerStarted` transparently, wrongly passing the reorder.
+fn cancel_then_start_no_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.cancel_timer("idle").map_err(|e| e.to_string())?; // reordered: cancel BEFORE the arm
+        let _handle = ctx.start_timer("idle", 300);
+        Ok(serde_json::json!("cancelled"))
+    })
+}
+
 /// Workflow that derives a timer duration from deterministic retry-jitter math.
 fn jitter_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -957,6 +991,14 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn(
             "cancellable_timer_loop_reuse_workflow",
             cancellable_timer_loop_reuse_workflow,
+        )
+        .register_fn(
+            "start_then_cancel_no_activity_workflow",
+            start_then_cancel_no_activity_workflow,
+        )
+        .register_fn(
+            "cancel_then_start_no_activity_workflow",
+            cancel_then_start_no_activity_workflow,
         )
 }
 
@@ -1903,6 +1945,67 @@ async fn activity_then_cancel_timer_replays_succeeded() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "the legitimate arm->activity->cancel flow must still replay cleanly, got: {report}"
+    );
+}
+
+/// Codex P2 round 10 SOUNDNESS GATE (issue #768): the reordered code cancels the
+/// timer BEFORE arming it, replayed against the canonical
+/// `[TimerStarted(idle), TimerCancelled(idle)]` history. `match_timer_cancel`'s
+/// scan must STOP at the unconsumed SAME-id `TimerStarted` (its ordering anchor)
+/// so strict replay reports `NonDeterminismDetected` — NOT `ReplaySucceeded`.
+/// Before the fix the shared helper crossed a same-id `TimerStarted` transparently,
+/// letting the cancel claim the trailing `TimerCancelled` and wrongly passing.
+#[tokio::test]
+async fn cancel_then_start_no_activity_detects_command_reorder() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("cancelled"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_then_start_no_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "cancelling a same-id timer before its arm must be caught as non-determinism \
+         (the cancel scan must not claim the trailing TimerCancelled across the \
+         unconsumed same-id TimerStarted anchor), got: {report}"
+    );
+}
+
+/// Codex P2 round 10 LEGIT control (issue #768): the canonical `arm→cancel` order
+/// (no intervening activity) must still replay cleanly against the same history —
+/// `start_timer` consumes the `TimerStarted` at the cursor, then
+/// `match_timer_cancel` claims the `TimerCancelled` directly. Proves the same-id
+/// anchor stop does not break the legitimate ordering.
+#[tokio::test]
+async fn start_then_cancel_no_activity_replays_succeeded() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("cancelled"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "start_then_cancel_no_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the canonical arm->cancel flow (same id, no activity) must still replay \
+         cleanly, got: {report}"
     );
 }
 

@@ -180,3 +180,62 @@ dedup, and the in-order DB delete/insert are unchanged. New pure unit tests:
 RED before the fix) and `plan_timer_lifecycle_pure_resolves_two_ids_independently_by_order`
 (per-id order-sensitivity: one reset-then-await arms, one await-then-cancel drops).
 No new `WorkflowEvent` variant, no migration, no replay-determinism change.
+
+## Post-review hardening round 10 (Codex 2× P2)
+
+**Fix B (replay.rs) — the timer outcome/cancel scans now stop at an UNCONSUMED
+SAME-id `TimerStarted`.** The round-6/7 shared helper `timer_scan_cross_or_stop`
+(used by `match_timer_cancel` and `match_timer_or_cancel`) crossed *every*
+`TimerStarted`/`TimerCancelled` transparently, regardless of id. That was too
+loose: a same-id `TimerStarted` is the command-ordering **anchor** the cancel/fire
+of that id must not cross. In strict replay of `start_timer("idle");
+cancel_timer("idle")` with the two lines **reordered** to `cancel_timer("idle");
+start_timer("idle")`, `match_timer_cancel("idle")` skipped over the unconsumed
+same-id `TimerStarted`, consumed the later `TimerCancelled`, and then `start_timer`
+consumed the start — so a real command-order change was silently accepted
+(`ReplaySucceeded`). The helper is now **id-aware** (`timer_scan_cross_or_stop(scan,
+timer_id)`): only a FOREIGN-id `TimerStarted`/`TimerCancelled` (an interleaved
+sibling timer's lifecycle) stays crossable; an unconsumed SAME-id
+`TimerStarted`/`TimerCancelled` falls through to the `_ => Stop` catch-all. The
+caller claims its own-id fire/cancel *target* BEFORE this call, so a same-id one
+reaching the helper is always a genuine unconsumed ordering point. In the normal
+(non-reordered) flow the arm was already consumed by the preceding `start_timer`,
+so the cancel scan skips it via `is_consumed` and never reaches the STOP — and the
+reset loop `[TimerStarted(idle), TimerCancelled(idle), TimerStarted(idle),
+TimerFired(idle)]` still replays cleanly (each scan claims its target directly
+without crossing an unconsumed same-id start). Regression tests in
+`tests/integration/replayer_tests.rs`:
+`cancel_then_start_no_activity_detects_command_reorder` (RED before the fix →
+`NonDeterminismDetected`) and `start_then_cancel_no_activity_replays_succeeded`
+(the canonical arm→cancel order still `ReplaySucceeded`); the round-6/7 reorder
+tests (`cancel_timer_before_activity_detects_command_reorder`,
+`activity_then_cancel_timer_replays_succeeded`) and the full cancellable-timer
+matrix stay green. No new `WorkflowEvent` variant, no migration.
+
+**Fix A (worker.rs:6719 / reset boundary scanner) — DEFERRED pending maintainer
+decision.** Codex's second P2: under the round-5 `for_await` model a lazy
+cancellable arm (`start_timer`/`reset` → `ArmTimer { for_await: false }`) records a
+plain `TimerStarted` **without** inserting a durable `harvest_timers` row (only
+`await_fire`'s `for_await: true` arm inserts the row, and it emits no event), yet
+`reset.rs::apply_event_to_pending` treats *every* open `TimerStarted` as an
+unresolved pending side effect until a `TimerFired`/`TimerCancelled`. So a running
+workflow that `start_timer("idle", …)`s then parks on an activity/signal — without
+awaiting or cancelling — cannot be reset to a later clean boundary, even though
+there is no durable timer row to carry over or remove. This is **SAFE** (it refuses
+valid resets; it never produces a wrong fork), a genuine completeness gap.
+
+The correct history-based fix is an additive `cancellable: bool` field on
+`WorkflowEvent::TimerStarted` (`start_timer`/`reset` emit `true`; classic
+`ctx.timer` emits the default `false`), with the reset scanner skipping
+`pending`-insertion for an open `cancellable:true` arm. **Deferred** because the
+field breaks ~109 exhaustive-binding sites (46 matchers in `replay.rs` alone that
+bind `duration_secs` without `..`, plus `context.rs` 14, `timeline.rs` 10,
+`worker.rs` 5, tests, …) — genuinely disproportionate churn for a Codex-confirmed
+SAFE over-conservatism, and high-risk to iterate under this environment's severe
+compile throttling. The history alone also cannot distinguish an *awaited*
+(durable-row) cancellable timer from an *un-awaited* lazy arm (both are a bare
+`cancellable:true` `TimerStarted` until fired/cancelled), so the field marks both
+non-blocking — safe (the fork re-arms via `await_fire` replay and
+`remove_pending_timers` deletes the source row), but a subtlety worth a maintainer
+review. Left as a documented known limitation pending the decision between the
+field and a doc-only note.
