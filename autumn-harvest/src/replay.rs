@@ -3298,6 +3298,27 @@ impl HistoryMatcher {
             }
         }
 
+        // The signal scan reached the end of history without finding the
+        // signal. If it crossed one or more UNCONSUMED interleaved
+        // timer/detached-spawn commands (issue #768) on the way, those events
+        // are a divergence boundary — NOT a swallowed suspend. An already-
+        // consumed reset's timers (claimed by a companion `match_timer_cancel`/
+        // `match_timer_arm` earlier this cycle) are skipped at the top of the
+        // loop and never set `first_interleaved_command`, so a genuine
+        // "signal has not arrived yet" suspend still returns `NoMatch` and
+        // parks correctly. But a STRAY unconsumed `TimerStarted`/`TimerCancelled`
+        // where the workflow expected a signal must diverge (→ NonDeterministic
+        // / #603 nd-block) rather than push a `WaitForSignal` command and park
+        // the workflow forever on a signal that will never arrive
+        // (round 13 regression fix, issue #768).
+        if let Some(first) = first_interleaved_command {
+            return HistoryMatch::Diverged {
+                expected: format!("SignalReceived({signal_name})"),
+                actual: Self::actual_event_name(&self.events[first]),
+                event_index: i32::try_from(first).ok(),
+            };
+        }
+
         HistoryMatch::NoMatch
     }
 
@@ -6998,6 +7019,81 @@ mod tests {
             m.match_timer_arm("idle", 300),
             HistoryMatch::Matched { .. }
         ));
+    }
+
+    #[test]
+    fn matcher_signal_scan_diverges_on_unconsumed_stray_timer() {
+        // Round 13 regression fix (issue #768): a `wait_for_signal` over a
+        // history carrying a STRAY, unconsumed `TimerStarted` and NO matching
+        // signal must DIVERGE — not silently reach the end of the scan and
+        // return `NoMatch` (which `wait_for_signal` would turn into a
+        // `WaitForSignal` command + `rx.await`, parking a genuinely-diverged
+        // workflow forever instead of nd-blocking, #603).
+        let events = vec![ts("timer-1", 10)];
+        let mut m = HistoryMatcher::new(events);
+        assert!(
+            matches!(m.match_signal("my-signal"), HistoryMatch::Diverged { .. }),
+            "a stray unconsumed TimerStarted where a signal was expected must diverge, not suspend"
+        );
+    }
+
+    #[test]
+    fn matcher_signal_scan_sequential_reset_then_signal_matches() {
+        // Legit case (round-7 reason preserved): a sequential
+        // `reset_timer(); receive_signal().await` records
+        // `[TimerCancelled, TimerStarted, SignalReceived]`. The reset's own
+        // matchers run FIRST and consume the two timer events, so by the time
+        // the signal scan runs they are already `is_consumed` (skipped at the
+        // top of the loop). The signal must still be found → Matched.
+        let events = vec![
+            tc("idle"),
+            ts("idle", 300),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut m = HistoryMatcher::new(events);
+        // The reset's matchers claim the timer events first (sequential order).
+        assert!(matches!(
+            m.match_timer_cancel("idle"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(
+            m.match_signal("approved"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            },
+            "sequential reset then wait_for_signal with a later signal must match"
+        );
+    }
+
+    #[test]
+    fn matcher_signal_scan_sequential_reset_no_signal_suspends() {
+        // Legit suspend case: a sequential `reset_timer(); receive_signal()`
+        // where the signal has NOT yet arrived records only
+        // `[TimerCancelled, TimerStarted]`. The reset's matchers consume both
+        // timer events first, so the signal scan crosses NOTHING unconsumed and
+        // must return `NoMatch` (a genuine suspend) — NOT a false `Diverged`.
+        let events = vec![tc("idle"), ts("idle", 300)];
+        let mut m = HistoryMatcher::new(events);
+        assert!(matches!(
+            m.match_timer_cancel("idle"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(matches!(
+            m.match_timer_arm("idle", 300),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(
+            m.match_signal("approved"),
+            HistoryMatch::NoMatch,
+            "a consumed reset's timers with no signal yet must suspend, not diverge"
+        );
     }
 
     // ── Pause/Resume replay transparency (issue #383) ─────────────────────

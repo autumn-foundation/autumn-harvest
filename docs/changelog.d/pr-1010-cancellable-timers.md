@@ -303,3 +303,41 @@ and `await_timer_fire_blocked_by_unreplayed_command_records_deferred_nd_in_norma
 `CancelTimer` with no deferred nd; the await test parked/re-armed forever) and
 GREEN after; the strict-mode reorder detection tests and the full timer matrix /
 reset-loop tests stay green.
+
+**Post-review hardening round 13 (regression fix, issue #768):** round 7 added
+`WorkflowEvent::TimerStarted`/`TimerCancelled` to `match_signal`'s transparent
+interleaved-command skip-arm so a signal scan could cross a same-cycle
+`reset()`/`cancel_timer()`'s `[TimerCancelled, TimerStarted]` and still find a
+later `SignalReceived` (`Matched`). But the arm skipped those events
+**unconditionally**, so a `wait_for_signal` over a history carrying a STRAY,
+unconsumed `TimerStarted` (or `TimerCancelled`) and NO matching signal ran the
+scan off the end of history and returned `HistoryMatch::NoMatch` — which
+`wait_for_signal` turns into a `WaitForSignal` command + `rx.await`, **parking a
+genuinely-diverged workflow forever** instead of nd-blocking (#603). On base
+(`origin/trunk-dev`) `TimerStarted` fell to `match_signal`'s divergence arm, so
+`context::tests::wait_for_signal_returns_nondeterministic_on_diverged_history`
+passed in 0.00s; this PR's round-7 change regressed it into an infinite hang.
+Fixed by making `match_signal` diverge — not swallow to `NoMatch`/suspend — when
+the scan reaches the end of history after crossing one or more UNCONSUMED
+interleaved timer/detached-spawn commands (`first_interleaved_command.is_some()`).
+An already-consumed reset's timers (claimed by a companion
+`match_timer_cancel`/`match_timer_arm` earlier in the cycle) are skipped at the
+top of the loop and never set `first_interleaved_command`, so a genuine
+"signal has not arrived yet" suspend (its reset timers consumed) still returns
+`NoMatch` and parks correctly; only a stray unconsumed timer where the workflow
+expected a signal now diverges (→ `NonDeterministic`). The round-7 legit tests
+(`matcher_signal_scan_skips_interleaved_reset`,
+`matcher_signal_scan_skips_interleaved_timer_cancel`) — which cross UNCONSUMED
+timers but find the signal later → `Matched` — are unaffected (they return
+before end-of-scan). Tests: the hanging RED
+`wait_for_signal_returns_nondeterministic_on_diverged_history` now passes; three
+new pure-matcher guards in `replay.rs`
+(`matcher_signal_scan_diverges_on_unconsumed_stray_timer` — stray unconsumed
+`TimerStarted` + no signal → `Diverged`;
+`matcher_signal_scan_sequential_reset_then_signal_matches` — sequential reset
+consumes the timers, later signal → `Matched`;
+`matcher_signal_scan_sequential_reset_no_signal_suspends` — sequential reset
+consumes the timers, no signal → `NoMatch`/suspend, NOT a false `Diverged`).
+Full `autumn-harvest` lib suite (1363 tests) completes without hang and with no
+skipped tests; the full cancellable-timer matrix, reset-loop, and round-6/7/10/
+11/12 reorder tests stay green.
