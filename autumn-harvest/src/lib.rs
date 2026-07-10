@@ -142,6 +142,8 @@ pub mod replay;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;
+/// Continue-as-new run-chain assembly (issue #701).
+pub mod run_chain;
 pub mod saga;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
@@ -346,6 +348,9 @@ pub use retention::{
 pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
+};
+pub use run_chain::{
+    RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };
 pub use saga::Saga;
 #[cfg(feature = "db")]

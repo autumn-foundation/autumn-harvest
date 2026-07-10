@@ -84,6 +84,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
 async fn setup_test_db() -> (
@@ -123,6 +124,8 @@ async fn test_send_and_load_signals() {
 
     // Create workflow execution first (FK constraint)
     let new_exec = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "test_workflow",
         workflow_id: "test_id",
@@ -185,6 +188,8 @@ async fn test_mark_signals_consumed() {
 
     // Create workflow execution
     let new_exec = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "test_workflow",
         workflow_id: "test_id",
@@ -262,6 +267,8 @@ async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) ->
     // (workflow_name, workflow_id) rejects a second RUNNING row otherwise.
     let workflow_id = exec_id.to_string();
     let new_exec = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "test_workflow",
         workflow_id: &workflow_id,

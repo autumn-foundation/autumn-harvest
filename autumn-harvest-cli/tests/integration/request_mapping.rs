@@ -201,6 +201,23 @@ fn workflow_list_and_query_use_get_requests() {
         "/workflows/00000000-0000-0000-0000-000000000001/timeline"
     );
     assert_eq!(timeline_request.body, None);
+
+    let run_chain = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "run-chain",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow run-chain args should parse");
+    let run_chain_request = run_chain
+        .api_request()
+        .expect("run-chain request should build");
+    assert_eq!(run_chain_request.method, ApiMethod::Get);
+    assert_eq!(
+        run_chain_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/run-chain"
+    );
+    assert_eq!(run_chain_request.body, None);
 }
 
 #[test]

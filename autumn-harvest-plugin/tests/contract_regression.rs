@@ -291,6 +291,42 @@ fn timeline_route_is_classified() {
     );
 }
 
+/// `GET /workflows/{id}/run-chain` (issue #701) must be registered in the
+/// management route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES` — the exact
+/// read-only precedent set by `GET /workflows/{id}/timeline`.
+#[test]
+fn run_chain_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/{id}/run-chain";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
 /// The DAG run graph view (issue #690) must be registered in the live route
 /// registry and classified `ReadOnly` in `autumn_harvest::audit::CLASSIFIED_ROUTES`.
 ///

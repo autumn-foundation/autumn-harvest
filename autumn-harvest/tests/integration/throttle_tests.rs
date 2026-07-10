@@ -153,6 +153,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #606: harvest_task_queue.session_id (worker sessions), merged in from trunk-dev.
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     "\n",
     // issue #607 code review: companion index for the per-key-fair scanner query.
     include_str!(

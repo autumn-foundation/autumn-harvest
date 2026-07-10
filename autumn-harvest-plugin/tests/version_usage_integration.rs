@@ -180,6 +180,8 @@ async fn insert_version_execution_with_markers(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id,

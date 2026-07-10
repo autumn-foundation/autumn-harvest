@@ -197,6 +197,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #808: the start-idempotency table under test.
     include_str!("../../autumn-harvest/migrations/20260709000000_harvest_start_idempotency/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
