@@ -1351,10 +1351,14 @@ enum CandidateDeleteOutcome {
     /// The execution (and its dependent rows) were deleted.
     Deleted,
     /// A legal hold was found active under the delete-tx row lock; the delete
-    /// was aborted and NOTHING was touched (no payload_refs, no blobs, no
+    /// was aborted and NOTHING was touched (no `payload_refs`, no blobs, no
     /// execution row). The caller treats this exactly like a routine skip.
     SkippedHeld,
 }
+
+/// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
+#[cfg(feature = "db")]
+type HoldTimestamps = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// Best-effort, non-locking read of a candidate's legal-hold columns, used for
 /// the pre-archival re-read gate (issue #747 BLOCKER 1). A concurrently-deleted
@@ -1364,14 +1368,14 @@ enum CandidateDeleteOutcome {
 async fn read_candidate_hold(
     conn: &mut diesel_async::AsyncPgConnection,
     candidate_id: uuid::Uuid,
-) -> HarvestResult<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+) -> HarvestResult<HoldTimestamps> {
     harvest_workflow_executions::table
         .find(candidate_id)
         .select((
             harvest_workflow_executions::legal_hold_set_at,
             harvest_workflow_executions::legal_hold_until,
         ))
-        .first::<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(conn)
+        .first::<HoldTimestamps>(conn)
         .await
         .optional()
         .map_err(database_error)
@@ -1400,18 +1404,17 @@ async fn delete_candidate_execution(
             // the operator's `set_legal_hold` observes a missing row (404). If
             // the hold is active, abort the delete entirely: do NOT touch
             // payload_refs or blobs.
-            let hold: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
-                harvest_workflow_executions::table
-                    .find(candidate_id)
-                    .select((
-                        harvest_workflow_executions::legal_hold_set_at,
-                        harvest_workflow_executions::legal_hold_until,
-                    ))
-                    .for_update()
-                    .first::<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?;
+            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
+                .find(candidate_id)
+                .select((
+                    harvest_workflow_executions::legal_hold_set_at,
+                    harvest_workflow_executions::legal_hold_until,
+                ))
+                .for_update()
+                .first::<HoldTimestamps>(conn)
+                .await
+                .optional()
+                .map_err(database_error)?;
             if let Some((set_at, until)) = hold
                 && legal_hold_active(set_at, until, now)
             {

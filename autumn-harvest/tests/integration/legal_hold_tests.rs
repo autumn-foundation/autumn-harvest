@@ -291,6 +291,7 @@ async fn hold_columns(
     id: uuid::Uuid,
 ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>) {
     #[derive(diesel::QueryableByName)]
+    #[allow(clippy::struct_field_names)]
     struct HoldRow {
         #[diesel(sql_type = Nullable<Timestamptz>)]
         legal_hold_set_at: Option<DateTime<Utc>>,
@@ -714,14 +715,14 @@ async fn held_row_is_not_archived() {
 
     // Only the unheld sibling was archived; the held id was never shipped to
     // cold storage.
-    let archived = archiver.archived_ids();
+    let shipped_ids = archiver.archived_ids();
     assert!(
-        archived.contains(&plain_id),
+        shipped_ids.contains(&plain_id),
         "the unheld sibling must be archived"
     );
     assert!(
-        !archived.contains(&held_id),
-        "the held execution must NEVER be archived; got {archived:?}"
+        !shipped_ids.contains(&held_id),
+        "the held execution must NEVER be archived; got {shipped_ids:?}"
     );
 
     assert_eq!(

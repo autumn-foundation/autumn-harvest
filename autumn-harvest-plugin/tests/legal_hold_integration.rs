@@ -153,7 +153,7 @@ async fn send(
     (status, json)
 }
 
-/// Seed a COMPLETED execution (shard 0) with one WorkflowStarted event carrying
+/// Seed a COMPLETED execution (shard 0) with one `WorkflowStarted` event carrying
 /// PII, so an erase attempt has something to tombstone.
 async fn seed_completed(
     conn: &mut AsyncPgConnection,

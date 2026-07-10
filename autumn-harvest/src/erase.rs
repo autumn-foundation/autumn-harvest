@@ -151,8 +151,9 @@ pub fn execution_input_is_erased(input: &Value) -> bool {
 
 // ── Outcome types ─────────────────────────────────────────────────────────────
 
-/// A child execution that was skipped during cascade erasure — either because
-/// it is not yet terminal, or because it is under an active legal hold (issue
+/// A child execution skipped during cascade erasure.
+///
+/// Either it is not yet terminal, or it is under an active legal hold (issue
 /// #747). The parent and other children still erase normally.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkippedChild {
