@@ -7945,11 +7945,18 @@ async fn reconstruct_legacy_run_chain(
     conn: &mut AsyncPgConnection,
     queried: &WorkflowExecution,
 ) -> HarvestResult<LegacyReconstruction> {
-    // Gather same-(workflow_name, workflow_id) candidates, capped. Fetch one over
+    // Gather same-(workflow_name, workflow_id) candidates on the queried row's
+    // logical shard, capped. The `shard_id` filter is required because multiple
+    // logical shards can share one physical Postgres database, so an unscoped
+    // scan would see same-id rows from other logical shards; since continue-as-new
+    // chains are shard-local, another shard's chain could consume the candidate
+    // cap and wrongly overflow this shard's reconstruction. `shard_id` is
+    // `Int4` (NOT NULL) so a plain equality filter is correct. Fetch one over
     // the cap so an overflow is detectable.
     let candidates: Vec<WorkflowExecution> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(&queried.workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(&queried.workflow_id))
+        .filter(harvest_workflow_executions::shard_id.eq(queried.shard_id))
         .select(WorkflowExecution::as_select())
         .limit(i64::try_from(MAX_LEGACY_CANDIDATES + 1).unwrap_or(i64::MAX))
         .load(conn)
