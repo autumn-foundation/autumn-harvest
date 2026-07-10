@@ -13007,6 +13007,7 @@ async fn set_legal_hold_handler(
         .map(truncate_operator_reason)
         .unwrap_or_default();
 
+    let now = chrono::Utc::now();
     let hold_until = match request.hold_until.as_deref() {
         None => None,
         Some(raw) => Some(
@@ -13018,19 +13019,23 @@ async fn set_legal_hold_handler(
         ),
     };
 
+    // Reject a `hold_until` already in the past (issue #747 MAJOR): for a
+    // compliance primitive, silently reporting `held: true` for a hold that is
+    // immediately inactive (eligible for deletion/erasure) is the worst failure
+    // mode. A clear 400 is returned before any DB round-trip, mirroring the
+    // malformed-RFC3339 rejection above.
+    if let Some(until) = hold_until
+        && until <= now
+    {
+        return Err(AutumnError::bad_request_msg("hold_until is in the past"));
+    }
+
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
-    let result = autumn_harvest::set_legal_hold(
-        &mut conn,
-        exec_id,
-        &reason,
-        hold_until,
-        &actor,
-        chrono::Utc::now(),
-    )
-    .await;
+    let result =
+        autumn_harvest::set_legal_hold(&mut conn, exec_id, &reason, hold_until, &actor, now).await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),

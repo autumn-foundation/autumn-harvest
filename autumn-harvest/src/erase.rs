@@ -151,13 +151,20 @@ pub fn execution_input_is_erased(input: &Value) -> bool {
 
 // ── Outcome types ─────────────────────────────────────────────────────────────
 
-/// A child execution that was skipped because it is not yet terminal.
+/// A child execution that was skipped during cascade erasure — either because
+/// it is not yet terminal, or because it is under an active legal hold (issue
+/// #747). The parent and other children still erase normally.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkippedChild {
-    /// Execution ID of the non-terminal child.
+    /// Execution ID of the skipped child.
     pub execution_id: String,
     /// Current state of the skipped child.
     pub state: String,
+    /// Why the child was skipped, when more specific than "not yet terminal" —
+    /// e.g. an active legal hold (issue #747). `None` for the ordinary
+    /// non-terminal skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A single failure encountered while erasing a child execution.
@@ -252,23 +259,22 @@ mod db {
         _reason: &str,
     ) -> HarvestResult<EraseOutcome> {
         conn.transaction::<EraseOutcome, HarvestError, _>(|conn| {
-            async move { erase_single_execution(conn, exec_id, true).await }.scope_boxed()
+            async move { erase_single_execution(conn, exec_id).await }.scope_boxed()
         })
         .await
     }
 
-    /// Erase one execution (and optionally cascade to its children).
+    /// Erase one execution and cascade to its terminal children.
     ///
-    /// `top_level = true` means acquire a `FOR UPDATE` row lock on the
-    /// execution; child calls set it to `false` (the outer transaction already
-    /// covers those rows). Returns a `BoxFuture` to satisfy the recursion
-    /// requirement: async recursive functions require boxing.
+    /// The gate read acquires a `FOR UPDATE` row lock (via `load_erase_gate_row`)
+    /// for the execution — top-level and every cascaded child alike — held for
+    /// the life of the outer transaction. Returns a `BoxFuture` to satisfy the
+    /// recursion requirement: async recursive functions require boxing.
     fn erase_single_execution(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        top_level: bool,
     ) -> EraseFuture<'_> {
-        Box::pin(async move { erase_single_execution_inner(conn, exec_id, top_level).await })
+        Box::pin(async move { erase_single_execution_inner(conn, exec_id).await })
     }
 
     /// Scrub event rows for one execution; return `(events_scrubbed, fields_tombstoned)`.
@@ -304,30 +310,56 @@ mod db {
     async fn cascade_to_children(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> HarvestResult<(Vec<EraseOutcome>, Vec<SkippedChild>, Vec<EraseFailure>)> {
         let child_ids = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::parent_id.eq(Some(exec_id.as_uuid())))
-            .select((
-                harvest_workflow_executions::id,
-                harvest_workflow_executions::state,
-            ))
-            .load::<(Uuid, String)>(conn)
+            .select(harvest_workflow_executions::id)
+            .load::<Uuid>(conn)
             .await
             .map_err(database_error)?;
 
         let mut children = Vec::new();
         let mut skipped_children = Vec::new();
         let mut failures = Vec::new();
-        for (child_uuid, child_state) in child_ids {
+        for child_uuid in child_ids {
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
+            // Re-read state + hold under a FOR UPDATE row lock (issue #747 MINOR
+            // 2a): the parent's erase tx only locks the parent, so a hold placed
+            // directly on this child after the unlocked list read above must
+            // still be caught. Locking here serializes against `set_legal_hold`.
+            let (child_state, set_at, until, reason) =
+                match load_erase_gate_row(conn, child_exec_id).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        failures.push(EraseFailure {
+                            execution_id: child_exec_id.to_string(),
+                            reason: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
             if !is_terminal_state(&child_state) {
                 skipped_children.push(SkippedChild {
                     execution_id: child_exec_id.to_string(),
                     state: child_state,
+                    reason: None,
                 });
                 continue;
             }
-            match erase_single_execution(conn, child_exec_id, false).await {
+            // A held child is a deliberate SKIP, not a failure (issue #747 MINOR
+            // 2b): its events are left intact while the parent and other
+            // children erase normally.
+            if crate::retention::legal_hold_active(set_at, until, now) {
+                let hold_reason = reason.as_deref().unwrap_or("no reason recorded");
+                skipped_children.push(SkippedChild {
+                    execution_id: child_exec_id.to_string(),
+                    state: child_state,
+                    reason: Some(format!("legal hold ({hold_reason})")),
+                });
+                continue;
+            }
+            match erase_single_execution(conn, child_exec_id).await {
                 Ok(outcome) => children.push(outcome),
                 Err(e) => failures.push(EraseFailure {
                     execution_id: child_exec_id.to_string(),
@@ -346,42 +378,44 @@ mod db {
         Option<String>,
     );
 
-    /// Load the execution's `state` and legal-hold columns for the erase gates.
-    /// `top_level` acquires a `FOR UPDATE` row lock; child calls rely on the
-    /// outer transaction.
+    /// Load the execution's `state` and legal-hold columns for the erase gates,
+    /// acquiring a `FOR UPDATE` row lock.
+    ///
+    /// The lock is taken for BOTH the top-level execution and each cascaded
+    /// child (issue #747 MINOR 2a): the outer transaction only locks the parent
+    /// row, so a hold placed directly on a child between an unlocked read and
+    /// its scrub could otherwise be missed. Locking the row here serializes the
+    /// gate against `set_legal_hold`. A re-entrant lock on a row already locked
+    /// by the same transaction is a no-op in Postgres.
     async fn load_erase_gate_row(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        top_level: bool,
     ) -> HarvestResult<EraseGateRow> {
-        let base = harvest_workflow_executions::table
+        harvest_workflow_executions::table
             .find(exec_id.as_uuid())
             .select((
                 harvest_workflow_executions::state,
                 harvest_workflow_executions::legal_hold_set_at,
                 harvest_workflow_executions::legal_hold_until,
                 harvest_workflow_executions::legal_hold_reason,
-            ));
-        let row = if top_level {
-            base.for_update()
-                .first::<EraseGateRow>(conn)
-                .await
-                .optional()
-        } else {
-            base.first::<EraseGateRow>(conn).await.optional()
-        }
-        .map_err(database_error)?;
-        row.ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+            ))
+            .for_update()
+            .first::<EraseGateRow>(conn)
+            .await
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
     }
 
     async fn erase_single_execution_inner(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        top_level: bool,
     ) -> HarvestResult<EraseOutcome> {
+        let now = chrono::Utc::now();
+
         // ── 1. Load & lock the execution row, check terminal + hold gates ─────
         let (state, legal_hold_set_at, legal_hold_until, legal_hold_reason) =
-            load_erase_gate_row(conn, exec_id, top_level).await?;
+            load_erase_gate_row(conn, exec_id).await?;
 
         if !is_terminal_state(&state) {
             return Err(HarvestError::Config(format!(
@@ -394,12 +428,11 @@ mod db {
         // Legal hold gate (issue #747): a held execution's history is exempt
         // from PII erasure until the hold is released or expires. Rejected with
         // `HarvestError::Config` (→ HTTP 409 via `conflict_from`) naming the
-        // active hold so the operator knows why it was blocked.
-        if crate::retention::legal_hold_active(
-            legal_hold_set_at,
-            legal_hold_until,
-            chrono::Utc::now(),
-        ) {
+        // active hold so the operator knows why it was blocked. (Children under
+        // a hold are reclassified as SKIPPED, not rejected — see
+        // `cascade_to_children`; this top-level gate rejects a direct erase of a
+        // held execution.)
+        if crate::retention::legal_hold_active(legal_hold_set_at, legal_hold_until, now) {
             let reason = legal_hold_reason.as_deref().unwrap_or("no reason recorded");
             return Err(HarvestError::Config(format!(
                 "workflow execution {exec_id} is under legal hold \
@@ -472,7 +505,8 @@ mod db {
         .map_err(database_error)?;
 
         // ── 3. Cascade to terminal children ───────────────────────────────────
-        let (children, skipped_children, failures) = cascade_to_children(conn, exec_id).await?;
+        let (children, skipped_children, failures) =
+            cascade_to_children(conn, exec_id, now).await?;
 
         Ok(EraseOutcome {
             execution_id: exec_id.to_string(),
