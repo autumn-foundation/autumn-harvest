@@ -39,15 +39,16 @@ use autumn_harvest::audit::{
     OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
     OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW,
+    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
+    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
+    TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -1346,6 +1347,10 @@ struct WorkflowDetailsResponse {
     history_truncated: bool,
     /// URL path of the paginated history endpoint for this execution (issue #529).
     history_endpoint: String,
+    /// `true` when the execution is currently under an ACTIVE legal hold
+    /// (issue #747): derived via `legal_hold_active` against the current time.
+    /// The raw `legal_hold_*` columns are also auto-surfaced under `execution`.
+    legal_hold: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2884,6 +2889,9 @@ pub(crate) struct WorkflowFilters {
     /// When true, return only RUNNING executions currently blocked on replay
     /// non-determinism (issue #603).
     pub(crate) nd_blocked: bool,
+    /// When true, return only executions currently under an active legal hold
+    /// (issue #747).
+    pub(crate) legal_hold: bool,
     /// Only return executions with at least this many recorded events (issue #493).
     pub(crate) min_history_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
@@ -3357,6 +3365,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/legal-hold",
+            post(set_legal_hold_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/legal-hold/release",
+            post(release_legal_hold_handler).route_layer(require_admin.clone()),
         )
         .route(
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
@@ -3972,6 +3988,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/erase-payloads"),
+        ("POST", "/workflows/{id}/legal-hold"),
+        ("POST", "/workflows/{id}/legal-hold/release"),
         (
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
@@ -4191,6 +4209,12 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         ("POST", "/workflows/{id}/erase-payloads", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/legal-hold",
+            Some(&["reason", "hold_until"]),
+        ),
+        ("POST", "/workflows/{id}/legal-hold/release", Some(&[])),
         (
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
@@ -4655,6 +4679,34 @@ pub const fn management_api_response_fields()
                 "children",
                 "skipped_children",
                 "failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/legal-hold",
+            Some(&[
+                "execution_id",
+                "held",
+                "legal_hold_reason",
+                "legal_hold_actor",
+                "legal_hold_set_at",
+                "legal_hold_until",
+                "newly_held",
+                "released",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/legal-hold/release",
+            Some(&[
+                "execution_id",
+                "held",
+                "legal_hold_reason",
+                "legal_hold_actor",
+                "legal_hold_set_at",
+                "legal_hold_until",
+                "newly_held",
+                "released",
             ]),
         ),
         (
@@ -6218,6 +6270,9 @@ pub(crate) fn parse_workflow_filters(
             "nd_blocked" => {
                 filters.nd_blocked = value.trim().eq_ignore_ascii_case("true");
             }
+            "legal_hold" => {
+                filters.legal_hold = value.trim().eq_ignore_ascii_case("true");
+            }
             "min_history_events" => {
                 let parsed = value.trim().parse::<u64>().map_err(|_| {
                     AutumnError::bad_request_msg(format!(
@@ -6669,6 +6724,12 @@ async fn get_workflow(
         .await;
     }
 
+    let legal_hold = autumn_harvest::legal_hold_active(
+        execution.legal_hold_set_at,
+        execution.legal_hold_until,
+        chrono::Utc::now(),
+    );
+
     Ok(Json(WorkflowDetailsResponse {
         parent_id: execution.parent_id,
         execution,
@@ -6679,6 +6740,7 @@ async fn get_workflow(
         scheduled_time,
         history_truncated,
         history_endpoint,
+        legal_hold,
     }))
 }
 
@@ -13771,6 +13833,155 @@ async fn erase_workflow_payloads_handler(
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_ERASE_PAYLOADS,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+// ── Legal hold (issue #747) ───────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct SetLegalHoldRequest {
+    /// Operator-supplied justification for the hold (e.g. "litigation hold —
+    /// case 2026-CV-1234"). Recorded in `legal_hold_reason` and the audit
+    /// trail. Truncated to 500 characters at the API boundary.
+    reason: Option<String>,
+    /// Optional RFC3339 auto-expiry. `None` = indefinite hold (released only by
+    /// an explicit release call).
+    hold_until: Option<String>,
+}
+
+/// `POST /workflows/{id}/legal-hold` — place (or refresh) a per-execution legal
+/// hold (issue #747). Admin-guarded. Exempts the execution's history from
+/// retention deletion and PII erasure until released or auto-expired. Idempotent:
+/// re-holding an actively-held execution returns the existing hold unchanged
+/// (`newly_held: false`) without overwriting provenance. Returns 200 on success,
+/// 404 if the execution is not found, 400 on a malformed `hold_until`.
+async fn set_legal_hold_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<SetLegalHoldRequest>>,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<autumn_harvest::LegalHoldOutcome>,
+    ),
+    AutumnError,
+> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/legal-hold";
+    let request = request.map(|Json(b)| b).unwrap_or_default();
+
+    let reason = request
+        .reason
+        .as_deref()
+        .map(truncate_operator_reason)
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+    let hold_until = match request.hold_until.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| {
+                    AutumnError::bad_request_msg(format!("invalid hold_until (RFC3339): {e}"))
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
+    };
+
+    // Reject a `hold_until` already in the past (issue #747 MAJOR): for a
+    // compliance primitive, silently reporting `held: true` for a hold that is
+    // immediately inactive (eligible for deletion/erasure) is the worst failure
+    // mode. A clear 400 is returned before any DB round-trip, mirroring the
+    // malformed-RFC3339 rejection above.
+    if let Some(until) = hold_until
+        && until <= now
+    {
+        return Err(AutumnError::bad_request_msg("hold_until is in the past"));
+    }
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result =
+        autumn_harvest::set_legal_hold(&mut conn, exec_id, &reason, hold_until, &actor, now).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_LEGAL_HOLD_SET,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `POST /workflows/{id}/legal-hold/release` — release a per-execution legal
+/// hold (issue #747). Admin-guarded. Idempotent: releasing an execution with no
+/// active hold returns `released: false` (200 no-op). Returns 200 on success,
+/// 404 if the execution is not found.
+async fn release_legal_hold_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<autumn_harvest::LegalHoldOutcome>,
+    ),
+    AutumnError,
+> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/legal-hold/release";
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result = autumn_harvest::release_legal_hold(&mut conn, exec_id, chrono::Utc::now()).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_LEGAL_HOLD_RELEASE,
         target_type: TARGET_WORKFLOW,
         target_id: Some(exec_id_str.as_str()),
         route_or_command: route,
@@ -22693,6 +22904,19 @@ pub(crate) async fn load_workflows(
             .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
             .filter(harvest_workflow_executions::state.eq("RUNNING"));
     }
+    if filters.legal_hold {
+        // Active-hold predicate (issue #747, mirrors `legal_hold_active`):
+        // set_at IS NOT NULL AND (until IS NULL OR until > now). Plain column
+        // predicates, cross-shard safe. Composes (AND) with all other filters.
+        let now = chrono::Utc::now();
+        query = query
+            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(
+                harvest_workflow_executions::legal_hold_until
+                    .is_null()
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+            );
+    }
     if let Some(min_events) = filters.min_history_events {
         // Correlated subquery: filter to executions with at least `min_events`
         // recorded events. No schema migration is required — the count is
@@ -22861,6 +23085,18 @@ pub(crate) async fn load_stalled_workflows(
         query = query
             .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
             .filter(harvest_workflow_executions::state.eq("RUNNING"));
+    }
+    // Honor the legal-hold filter on the stalled path too (issue #747), for the
+    // same bypass reason as sla_breached/nd_blocked above.
+    if filters.legal_hold {
+        let now = chrono::Utc::now();
+        query = query
+            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(
+                harvest_workflow_executions::legal_hold_until
+                    .is_null()
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+            );
     }
     // Honor the time-range and exec-id-prefix filters (issue #498) on the
     // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
@@ -29337,6 +29573,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_workflow_filters_parses_legal_hold_flag() {
+        // Absent → false (issue #747).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(!absent.legal_hold);
+
+        // Explicit true (case-insensitive).
+        let on = parse_workflow_filters(&pairs(&[("legal_hold", "TRUE")]))
+            .expect("legal_hold=true parses");
+        assert!(on.legal_hold);
+
+        // Explicit false and any non-"true" value → false, never an error.
+        let off = parse_workflow_filters(&pairs(&[("legal_hold", "false")]))
+            .expect("legal_hold=false parses");
+        assert!(!off.legal_hold);
+        let other = parse_workflow_filters(&pairs(&[("legal_hold", "1")]))
+            .expect("legal_hold=1 parses without error");
+        assert!(!other.legal_hold);
+    }
+
+    #[test]
     fn parse_workflow_children_filters_accepts_statuses_limit_and_depth() {
         let filters = parse_workflow_children_filters(&pairs(&[
             ("status", "Failed,Running"),
@@ -31438,6 +31694,10 @@ mod tests {
             nd_block_reason: None,
             nd_block_count: 0,
             completion_callbacks: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
         }
     }
 

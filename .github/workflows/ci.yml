@@ -198,7 +198,7 @@ jobs:
         run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Compile plugin integration tests
         if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --no-run
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --test legal_hold_integration --no-run
       - name: Run Docker-backed integration tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
@@ -229,6 +229,9 @@ jobs:
       - name: Run plugin fail-now integration tests (issue #765)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test fail_now_integration -- --test-threads=1
+      - name: Run plugin legal-hold integration tests (issue #747)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test legal_hold_integration -- --test-threads=1
       - name: Run plugin DAG run graph integration tests (issue #690)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test dag_run_graph_integration -- --test-threads=1

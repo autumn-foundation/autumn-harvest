@@ -334,9 +334,14 @@ pub use reset::{
     WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
-pub use retention::{ArchiverFuture, HistoryArchiver, RetentionConfig};
+pub use retention::{
+    ArchiverFuture, HistoryArchiver, LegalHoldOutcome, RetentionConfig, legal_hold_active,
+};
 #[cfg(feature = "db")]
-pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
+pub use retention::{
+    RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
+    set_legal_hold,
+};
 pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use schedule_decision::record_decision_graceful;

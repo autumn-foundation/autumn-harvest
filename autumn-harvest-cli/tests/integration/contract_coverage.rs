@@ -266,6 +266,26 @@ fn workflow_children_is_covered() {
 }
 
 #[test]
+fn legal_hold_set_is_covered() {
+    assert_covered(&[
+        "legal-hold",
+        "set",
+        "00000000-0000-0000-0000-000000000001",
+        "--reason",
+        "case 42",
+    ]);
+}
+
+#[test]
+fn legal_hold_release_is_covered() {
+    assert_covered(&[
+        "legal-hold",
+        "release",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
 fn workflow_start_is_covered() {
     assert_covered(&["workflow", "start", "my_workflow"]);
 }

@@ -158,6 +158,18 @@ pub struct WorkflowExecution {
     /// of `{url, filter}` objects. `None` = no per-execution targets; the
     /// effective set is still the union with any builder-wide defaults.
     pub completion_callbacks: Option<serde_json::Value>,
+    /// Wall-clock the per-execution legal hold was placed (issue #747).
+    /// `None` = no hold. A hold is ACTIVE when this is non-`None` and
+    /// `legal_hold_until` is `None` or in the future; an active hold exempts
+    /// this execution's history from retention deletion and PII erasure.
+    pub legal_hold_set_at: Option<DateTime<Utc>>,
+    /// Optional auto-expiry for the legal hold (issue #747). `None` =
+    /// indefinite; a past value means the hold is inactive again.
+    pub legal_hold_until: Option<DateTime<Utc>>,
+    /// Operator-supplied justification for the legal hold (issue #747).
+    pub legal_hold_reason: Option<String>,
+    /// Principal that placed the legal hold (issue #747, audit trail).
+    pub legal_hold_actor: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.
