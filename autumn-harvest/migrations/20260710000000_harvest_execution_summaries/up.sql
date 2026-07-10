@@ -55,6 +55,12 @@ CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_gc
 CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_name
     ON harvest_execution_summaries (workflow_name, completed_at DESC);
 
+-- Filter-by-workflow_id, keyset-ordered (completed_at DESC, execution_id DESC)
+-- lookup for GET /workflows/summaries?workflow_id= — the feature's headline
+-- "find the retained outcome by workflow_id" success metric (issue #752 review).
+CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_wfid
+    ON harvest_execution_summaries (workflow_id, completed_at DESC, execution_id DESC);
+
 -- Search-attribute containment filtering.
 CREATE INDEX IF NOT EXISTS idx_harvest_execution_summaries_search
     ON harvest_execution_summaries USING GIN (search_attrs);
