@@ -166,6 +166,57 @@ async fn effective_config_served_from_installed_runtime_without_a_set_call() {
 }
 
 #[tokio::test]
+async fn effective_config_fails_closed_when_runtime_has_no_captured_config() {
+    // Regression for the PR #987 review P2 (api.rs:268): `HarvestApiRuntime::new`
+    // is a *public* constructor. A runtime installed directly through it — without
+    // the shared runner's `with_effective_config` bring-up call — carries no
+    // captured snapshot. For an incident-triage endpoint a plausible-but-wrong
+    // fabricated defaults config is worse than an honest error, so the handler must
+    // fail closed (400) rather than serve a 200 placeholder.
+    let api_state = HarvestApiState::new();
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        None,
+        Vec::new(),
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = app_with_api_state(api_state);
+
+    let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
+    // Admin-authorized and a runtime *is* installed (so this is not the
+    // "runtime not started" case), yet the response is the fail-closed 400 —
+    // never a 200.
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // The body must NOT be a fabricated config: no config sections present.
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(obj) = json.as_object()
+    {
+        for key in [
+            "worker",
+            "payload_caps",
+            "shard_topology",
+            "features",
+            "pool",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "fail-closed response must not carry a fabricated config section: {key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn effective_config_happy_path_returns_secret_free_view() {
     let api_state = HarvestApiState::new();
     // The snapshot rides on the installed runtime; the endpoint gates on
