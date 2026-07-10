@@ -19,6 +19,11 @@
 
 use std::time::Duration;
 
+// `Arc`/`Mutex` resolve to `std::sync` under a normal build and to `loom::sync`
+// under `RUSTFLAGS="--cfg loom"` so `tests/loom_models.rs` can model-check the
+// concurrent session-slot registry. See `crate::loom_sync`.
+use crate::loom_sync::{Arc, Mutex};
+
 /// Sticky-lease duration applied to a session member activity's task row
 /// (`harvest_task_queue.sticky_timeout`).
 ///
@@ -230,13 +235,12 @@ pub fn acquire_retry_backoff(rng_fraction: f64, min: Duration, max: Duration) ->
 /// registry against `harvest_sessions` and drops any entry that left
 /// `ACTIVE` through any path -- scanner reclaim, or a release whose
 /// `record_session_completed` call failed after committing.
-pub type SessionSlotRegistry =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<crate::types::SessionId>>>;
+pub type SessionSlotRegistry = Arc<Mutex<std::collections::HashSet<crate::types::SessionId>>>;
 
 /// Build a new, empty session-slot registry.
 #[must_use]
 pub fn new_session_slot_registry() -> SessionSlotRegistry {
-    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    Arc::new(Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Attempt to claim `session_id`'s slot, bounded by `max_concurrent_sessions`.
