@@ -7,6 +7,9 @@ use std::sync::Arc;
 use autumn_harvest::BuiltHarvest;
 use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
+use autumn_harvest::effective_config::{
+    EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
+};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
@@ -14,7 +17,9 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
-use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::worker::{
+    DEFAULT_WORKER_POLL_INTERVAL, DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig,
+};
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use tokio::task::JoinHandle;
@@ -106,6 +111,13 @@ struct PreparedHarvestRuntime {
     shard_router: ShardRouter,
     retention_config: RetentionConfig,
     history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
+    /// Secret-free effective-config snapshot (issue #695) captured here — the
+    /// single seam every `BuiltHarvest` consumer (the `HarvestPlugin` web-app
+    /// path and the standalone runner) funnels through — so it rides on the
+    /// resulting `HarvestApiRuntime` and is served by `GET /admin/config`
+    /// automatically, without a separate `set_effective_config` call the
+    /// integrator must remember.
+    effective_config: EffectiveConfigView,
 }
 
 impl PreparedHarvestRuntime {
@@ -197,6 +209,12 @@ impl PreparedHarvestRuntime {
         // being silently narrowed to a single shard when the runner is started
         // with only `HarvestRunnerResources::new(default_pool)` (the plugin
         // path), which would strand all non-default-shard work.
+        // Capture the runner-provided sharded-pool provenance before the move
+        // below consumes `resources.sharded_pool`. The `WorkerConfig` knob is
+        // still readable afterwards from `built`, but this override is not — and
+        // the effective-config snapshot must report the resolved runtime pool's
+        // sharded-ness, not solely the `WorkerConfig` field (issue #695 review).
+        let resources_sharded_pool = resources.sharded_pool.is_some();
         let storage_pool = if let Some(sp) = resources.sharded_pool {
             HarvestDbPool::sharded(sp)
         } else if let Some(sp) = built.worker_config().sharded_pool.clone() {
@@ -218,6 +236,10 @@ impl PreparedHarvestRuntime {
                  ShardedDbPool configuration"
             )));
         }
+        // Capture the secret-free effective-config snapshot (issue #695) while
+        // `built` is still owned — `built.into_worker_parts_*` below consumes it.
+        let effective_config =
+            capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -252,6 +274,7 @@ impl PreparedHarvestRuntime {
             shard_router,
             retention_config,
             history_archiver,
+            effective_config,
         })
     }
 }
@@ -460,7 +483,8 @@ impl HarvestRunner {
             ),
             shard_router,
         )
-        .with_registered_dag_names(prepared.registered_dag_names.iter().cloned());
+        .with_registered_dag_names(prepared.registered_dag_names.iter().cloned())
+        .with_effective_config(prepared.effective_config.clone());
 
         Ok(Self {
             api_runtime,
@@ -531,6 +555,77 @@ impl HarvestRunner {
 /// shard-N `ExecutionId`s are written into shard-0's database and become
 /// permanently invisible after shard N is provisioned later.  Call this at
 /// startup and fail if the result is non-empty.
+/// Build the secret-free effective-config snapshot (issue #695) from the
+/// resolved runtime parts.
+///
+/// Payload caps come from `built`; the pool sizing is read from the
+/// already-resolved `storage_pool`, so it honours the full
+/// resources/`WorkerConfig` sharded-pool precedence and always describes the
+/// pool the runtime actually uses. `poll_interval` reads the side-effect-free
+/// [`DEFAULT_WORKER_POLL_INTERVAL`] — the single source of truth the
+/// `WorkerRuntimeConfig` conversion also uses — so this stays a pure read.
+///
+/// `resources_sharded_pool` reports whether a runner-provided
+/// [`HarvestRunnerResources::with_sharded_pool`] override was supplied — that
+/// provenance is erased once `storage_pool` is built, so the caller captures it
+/// before the move. It, together with `WorkerConfig::with_sharded_pool` and the
+/// resolved `storage_pool` shard count, drives the two `WorkerConfigView`
+/// sharded-pool fields so they describe the resolved runtime pool, not solely
+/// the `WorkerConfig` knob (issue #695 review).
+fn capture_effective_config(
+    built: &BuiltHarvest,
+    storage_pool: &HarvestDbPool,
+    router: &ShardRouter,
+    resources_sharded_pool: bool,
+) -> EffectiveConfigView {
+    let (payload_offload_enabled, payload_offload_threshold_bytes) = built
+        .payload_offloader()
+        .map_or((false, 0), |o| (true, o.threshold()));
+    let caps = PayloadCapsView::new(
+        built.max_activity_input_bytes,
+        built.max_activity_result_bytes,
+        built.max_signal_payload_bytes,
+        built.max_workflow_input_bytes,
+        built.max_current_details_bytes,
+        built.max_workflow_execution_timeout,
+        built.max_workflow_attempts,
+        built
+            .max_workflow_history_events
+            .or_else(|| built.worker_config().max_workflow_history_events),
+        built.usage_window_ceiling,
+        built.usage_max_groups,
+        payload_offload_enabled,
+        payload_offload_threshold_bytes,
+    );
+    let shard_count = storage_pool.iter_shards().count();
+    let pool_view = PoolConfigView {
+        worker_pool_max_connections: storage_pool.default_pool().status().max_size,
+        shard_pool_count: shard_count,
+    };
+    // The runtime uses a sharded pool when either the runner supplied one or the
+    // WorkerConfig carried one; the fallback single pool (a 1-shard wrapper of
+    // `harvest_pool`) is not "sharded_pool_configured". Report the resolved
+    // pool's actual shard count when sharded, else 0.
+    let sharded_pool_configured =
+        resources_sharded_pool || built.worker_config().sharded_pool.is_some();
+    let resolved_sharding = ShardedInfo {
+        configured: sharded_pool_configured,
+        shard_count: if sharded_pool_configured {
+            shard_count
+        } else {
+            0
+        },
+    };
+    EffectiveConfigView::capture(
+        built.worker_config(),
+        caps,
+        router,
+        pool_view,
+        DEFAULT_WORKER_POLL_INTERVAL,
+        Some(resolved_sharding),
+    )
+}
+
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
     let mut missing: Vec<ShardId> = router
         .readable_shards()

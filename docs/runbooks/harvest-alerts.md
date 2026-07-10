@@ -148,6 +148,13 @@ count. Override them per environment with
 - **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
 - **`/api/harvest/admin/preflight`** is **startup validation** — is this
   deployment safe to promote — run at deploy time, not during an incident.
+- **`/api/harvest/admin/config`** is the **effective-config introspection**
+  surface (issue #695): what config is this fleet actually running with, right
+  now? Pull the resolved effective runtime configuration (secret-free,
+  admin-gated) before guessing at a knob:
+  `curl -s .../api/harvest/admin/config | jq`. Durations are milliseconds;
+  unset ceilings are explicit `null`; secret-bearing fields (notification URLs,
+  sharded pool) show only presence booleans/counts.
 
 ## harvest_preflight_failed
 

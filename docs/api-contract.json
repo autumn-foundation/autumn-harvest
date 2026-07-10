@@ -3429,6 +3429,31 @@
     },
     {
       "method": "GET",
+      "path": "/admin/config",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "worker",
+          "payload_caps",
+          "shard_topology",
+          "features",
+          "pool"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (effective-config snapshot not yet captured)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/version-gates/usage",
       "category": "admin",
       "read_only": true,

@@ -70,6 +70,16 @@ pub type DbPool = deadpool::managed::Pool<
 // WorkerRuntimeConfig
 // ---------------------------------------------------------------------------
 
+/// Default interval between queue poll attempts when a worker is idle.
+///
+/// This is the single source of truth for the runtime poll interval: the
+/// `From<WorkerConfig>` conversion below sets `poll_interval` from it, and
+/// side-effect-free callers (e.g. the effective-config introspection snapshot,
+/// issue #695) can read it directly instead of constructing a
+/// [`WorkerRuntimeConfig`] — whose conversion writes the write-once
+/// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
+pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Validated, runtime-ready worker configuration.
 ///
 /// Built from [`WorkerConfig`] (the user-facing builder) via `From`, which
@@ -245,7 +255,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
-            poll_interval: Duration::from_millis(500),
+            poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,

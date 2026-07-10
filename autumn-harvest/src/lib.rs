@@ -80,6 +80,14 @@ pub mod debounce;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
+/// Effective runtime-configuration introspection (issue #695).
+///
+/// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free
+/// snapshot served from `GET /api/harvest/admin/config`. The
+/// [`effective_config::WorkerConfigView::from_worker_config`] mapping
+/// destructures [`builder::WorkerConfig`] exhaustively (no `..`) so a new
+/// tunable is a compile error until it is surfaced.
+pub mod effective_config;
 pub mod eligibility;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
