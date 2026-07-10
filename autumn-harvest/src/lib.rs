@@ -114,6 +114,11 @@ pub mod handle;
 pub mod handle_typed;
 pub mod history_export;
 pub mod info;
+/// `cfg(loom)` synchronization-primitive shim (std under normal builds).
+///
+/// Contained to the modules that opt into loom model checking; see
+/// `docs/testing/loom.md`. Internal — not part of the public API.
+mod loom_sync;
 /// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
 ///
 /// Bridges every `record_*` call to the global [`metrics`] registry so

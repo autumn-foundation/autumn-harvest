@@ -44,8 +44,12 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+// `Mutex`/`MutexGuard` resolve to `std::sync` under a normal build and to
+// `loom::sync` under `RUSTFLAGS="--cfg loom"` so `tests/loom_models.rs` can
+// model-check the breaker's concurrent state machine. See `crate::loom_sync`.
+use crate::loom_sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -292,7 +296,7 @@ impl CircuitBreakerRegistry {
         self.policies.contains_key(activity_name)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, BreakerState>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, BreakerState>> {
         // Poisoning only happens if a thread panicked while holding the lock.
         // The state is just counters/timestamps, so recovering the inner value
         // is always safe and far preferable to cascading a panic across the
