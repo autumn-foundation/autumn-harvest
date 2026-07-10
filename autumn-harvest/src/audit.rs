@@ -310,6 +310,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /dead-letters", RouteClass::ReadOnly),
     ("GET /admin/preflight", RouteClass::ReadOnly),
     ("GET /admin/shards/health", RouteClass::ReadOnly),
+    ("GET /admin/status", RouteClass::ReadOnly),
     ("GET /admin/version-gates/usage", RouteClass::ReadOnly),
     (
         "GET /admin/version-gates/retirement-check",
@@ -546,6 +547,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /health",
     "GET /admin/preflight",
     "GET /admin/shards/health",
+    "GET /admin/status",
     "GET /admin/version-gates/usage",
     "GET /admin/version-gates/retirement-check",
     "GET /admin/retention",
@@ -644,6 +646,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /health", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
+    ("GET /admin/status", None),
     ("GET /admin/version-gates/usage", None),
     ("GET /admin/version-gates/retirement-check", None),
     ("GET /admin/retention", None),
@@ -1066,6 +1069,28 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn admin_status_route_is_classified_read_only() {
+        // The rolled-up health summary (issue #679) is a read-only fan-out
+        // projection. This pin — not just the general exhaustiveness guards,
+        // which only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
+        // against each other — is what catches the route shipping unclassified.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/status" && *c == RouteClass::ReadOnly),
+            "GET /admin/status must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #679)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/status" && op.is_none()),
+            "GET /admin/status must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #679)"
         );
     }
 

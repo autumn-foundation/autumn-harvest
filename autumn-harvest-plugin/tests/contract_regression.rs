@@ -98,6 +98,33 @@ fn workflow_count_route_is_classified() {
     );
 }
 
+/// `GET /admin/status` (issue #679) must be registered in the live route
+/// registry AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router, so this pin closes that gap for the new route.
+#[test]
+fn admin_status_route_is_classified() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    let route = "GET /admin/status";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+        "{route} must be classified RouteClass::ReadOnly in \
+         autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// `GET /admin/usage` (issue #596) must have an entry in
 /// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
 ///
