@@ -537,6 +537,90 @@ async fn set_release_idempotency_round_trip() {
     );
 }
 
+// ── MINOR 2b: held child is SKIPPED (not failed) during cascade ───────────────
+
+// During cascade erasure, a child under an active legal hold is reported as a
+// SKIPPED child (with a legal-hold reason), NOT a failure; its events are left
+// intact while the parent's are tombstoned.
+#[tokio::test]
+async fn held_child_is_skipped_not_failed_during_cascade() {
+    let (url, _container) = setup_db().await;
+    let _pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    let ago = now - chrono::Duration::days(1);
+
+    // Parent (terminal, unheld) with a PII event.
+    let parent_id = insert_completed(&mut conn, "parent_wf", "pw-child", ago, None, None).await;
+
+    // Child (terminal) UNDER a legal hold, parented to the above, with its own
+    // PII event.
+    let child_id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
+             parent_id, legal_hold_set_at, legal_hold_until, legal_hold_reason, legal_hold_actor)
+         VALUES ('child_wf', 'cw-held', 0, 'COMPLETED', '{}'::jsonb, $1, $1,
+                 $2, $3, NULL, 'child subpoena', 'legal')
+         RETURNING id",
+    )
+    .bind::<Timestamptz, _>(ago)
+    .bind::<diesel::sql_types::Uuid, _>(parent_id)
+    .bind::<Timestamptz, _>(now)
+    .get_result::<IdRow>(&mut conn)
+    .await
+    .expect("insert child")
+    .id;
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data)
+         VALUES ($1, 0, 'WorkflowStarted', '{\"type\":\"WorkflowStarted\",\"data\":{\"input\":{\"pii\":\"childsecret\"}}}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(child_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert child event");
+
+    let parent_exec = ExecutionId::from_uuid(parent_id);
+    let outcome = autumn_harvest::erase::erase_workflow_payloads(&mut conn, parent_exec, "gdpr")
+        .await
+        .expect("parent erase succeeds even with a held child");
+
+    // The held child is a SKIP, not a failure.
+    assert!(
+        outcome.failures.is_empty(),
+        "a held child must not be a failure; got {:?}",
+        outcome.failures
+    );
+    assert_eq!(
+        outcome.skipped_children.len(),
+        1,
+        "the held child is reported as skipped"
+    );
+    let skipped = &outcome.skipped_children[0];
+    assert_eq!(
+        skipped.execution_id,
+        ExecutionId::from_uuid(child_id).to_string()
+    );
+    let reason = skipped.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("legal hold") && reason.contains("child subpoena"),
+        "skip reason names the legal hold; got: {reason:?}"
+    );
+
+    // The parent's events ARE tombstoned; the held child's are NOT.
+    assert_eq!(
+        tombstoned_event_count(&mut conn, parent_id).await,
+        1,
+        "the parent's input is tombstoned"
+    );
+    assert_eq!(
+        tombstoned_event_count(&mut conn, child_id).await,
+        0,
+        "the held child's events are left intact"
+    );
+}
+
 // ── BLOCKER 1: delete-time hold TOCTOU ────────────────────────────────────────
 
 // A hold placed AFTER candidate selection but before the delete transaction
