@@ -1128,7 +1128,7 @@ async fn terminal_detached_spawn_setup_error_fails_workflow() {
         parent_history.iter().any(|event| {
             matches!(
                 event,
-                WorkflowEvent::WorkflowFailed { error }
+                WorkflowEvent::WorkflowFailed { error, .. }
                     if error.contains("no workflow handler registered for 'missing_detached_child'")
             )
         }),

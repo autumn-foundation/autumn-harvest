@@ -12,6 +12,7 @@ use std::pin::Pin;
 
 use autumn_harvest::context::{SessionOptions, WorkflowContext};
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure, decode_workflow_failure};
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
@@ -349,6 +350,126 @@ fn force_failed_compensating_workflow<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// Typed workflow failures (issue #767) — replay-determinism fixtures
+// ---------------------------------------------------------------------------
+
+/// Parent that spawns a child, then branches on the child's *typed* failure
+/// class (issue #767). The compensation branch is only taken for a typed
+/// `ValidationRejected` + `non_retryable` child failure, and it emits a
+/// **command** (the `issue_refund` activity) so the branch decision is
+/// observable in history — if the typed fields did not survive replay, the
+/// handler would take the `Err(e)` fall-through and complete early, diverging
+/// from the recorded history (falsifiable).
+fn parent_typed_child_failure_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match ctx
+            .spawn_child_workflow_raw("charge_card_child", Value::Null)
+            .await
+        {
+            Ok(v) => Ok(serde_json::json!({ "child_ok": v })),
+            // Branch purely on the typed error_type + non_retryable — ZERO
+            // substring matching on the message.
+            Err(e)
+                if e.workflow_error_type() == Some("ValidationRejected")
+                    && e.is_workflow_non_retryable() =>
+            {
+                let refund = ctx
+                    .execute_activity_raw("issue_refund", Value::Null, "default")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "compensated": refund }))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
+/// A workflow that fails with its own *typed* [`WorkflowFailure`] (issue #767),
+/// serialised through [`IntoWorkflowErrorString`] exactly as the `#[workflow]`
+/// dispatch shim does.
+fn self_typed_failure_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        Err(
+            WorkflowFailure::new("BudgetExceeded", "monthly spend cap reached")
+                .with_details(serde_json::json!({ "cap_usd": 5000 }))
+                .non_retryable()
+                .into_workflow_error_payload(),
+        )
+    })
+}
+
+/// Parent history that ends with the parent completing *after* observing a
+/// typed `ChildWorkflowFailed` and compensating.
+fn parent_typed_child_failure_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let child_id = ExecutionId::new();
+    let refund_id = ActivityExecId::new();
+    let decoded = decode_workflow_failure(
+        &WorkflowFailure::new("ValidationRejected", "card declined by issuer")
+            .with_details(serde_json::json!({ "code": 402 }))
+            .non_retryable()
+            .into_workflow_error_payload(),
+    );
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "charge_card_child".into(),
+            input: Value::Null,
+        },
+        WorkflowEvent::child_workflow_failed_typed(child_id, &decoded),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: refund_id,
+            name: "issue_refund".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: refund_id,
+            output: serde_json::json!("refunded"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({ "compensated": "refunded" }),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// History for a run that ended in a typed `WorkflowFailed` (issue #767).
+fn self_typed_failure_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let decoded = decode_workflow_failure(
+        &WorkflowFailure::new("BudgetExceeded", "monthly spend cap reached")
+            .with_details(serde_json::json!({ "cap_usd": 5000 }))
+            .non_retryable()
+            .into_workflow_error_payload(),
+    );
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::workflow_failed_typed(&decoded),
+    ];
+    (exec_id, events)
+}
+
+// ---------------------------------------------------------------------------
 // Helper: build canonical event history
 // ---------------------------------------------------------------------------
 
@@ -459,6 +580,11 @@ fn build_replayer() -> WorkflowReplayer {
             "force_failed_compensating_workflow",
             force_failed_compensating_workflow,
         )
+        .register_fn(
+            "parent_typed_child_failure_workflow",
+            parent_typed_child_failure_workflow,
+        )
+        .register_fn("self_typed_failure_workflow", self_typed_failure_workflow)
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -606,6 +732,81 @@ async fn replay_force_failed_activity_takes_compensation_branch_deterministicall
     assert!(
         report.events_replayed > 0,
         "events_replayed must be positive"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (a1) Typed workflow failures (issue #767, AC6) replay deterministically.
+//
+//   Proof 1: a parent that branches on a *typed* `ChildWorkflowFailed`'s
+//   error_type/non_retryable replays down its compensation branch. The branch
+//   emits a command (issue_refund), so if the typed fields did NOT survive
+//   replay the parent would take the fall-through and complete early, diverging
+//   from history — ReplaySucceeded over multiple cycles proves the typed fields
+//   are reproduced identically. This is the parent-side surface of AC6.
+//
+//   Proof 2: a run that ended in a typed `WorkflowFailed` round-trips through
+//   replay deterministically — the reproduced failure carries the identical
+//   typed error_type/details/non_retryable on every cycle.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn replay_parent_typed_child_failure_compensation_is_deterministic() {
+    let (exec_id, events) = parent_typed_child_failure_history();
+    let replayer = build_replayer();
+
+    // Replay the SAME history 3 times — the typed child failure must drive the
+    // same (compensation) branch every cycle.
+    for cycle in 0..3 {
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "parent_typed_child_failure_workflow",
+                exec_id,
+                events.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "cycle {cycle}: a parent branching on a typed child failure must \
+             replay deterministically down the compensation branch, got: {report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_typed_workflow_failed_round_trips_with_identical_typed_fields() {
+    let (exec_id, events) = self_typed_failure_history();
+    let replayer = build_replayer();
+
+    let mut reproduced = Vec::new();
+    for _ in 0..2 {
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "self_typed_failure_workflow",
+                exec_id,
+                events.clone(),
+            ))
+            .await;
+        // A self-failing workflow surfaces as `WorkflowFailed` (it did not
+        // complete successfully) — the *determinism* is the point: the same
+        // typed envelope is reproduced on every cycle.
+        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
+            panic!("expected WorkflowFailed status, got: {report}");
+        };
+        reproduced.push(error);
+    }
+    assert_eq!(
+        reproduced[0], reproduced[1],
+        "typed WorkflowFailed must reproduce byte-identically across replay cycles"
+    );
+
+    // The reproduced failure decodes to the identical typed fields.
+    let decoded = decode_workflow_failure(&reproduced[0]);
+    assert_eq!(decoded.error_type.as_deref(), Some("BudgetExceeded"));
+    assert_eq!(decoded.non_retryable, Some(true));
+    assert_eq!(
+        decoded.details,
+        Some(serde_json::json!({ "cap_usd": 5000 }))
     );
 }
 
@@ -2345,9 +2546,7 @@ async fn replayer_diverges_at_marker_not_at_a_phantom_child_for_payload_cap_fail
             last_error: None,
             scheduled_time: None,
         },
-        WorkflowEvent::WorkflowFailed {
-            error: "payload too large: child input exceeds cap".into(),
-        },
+        WorkflowEvent::workflow_failed("payload too large: child input exceeds cap"),
     ];
     let report = WorkflowReplayer::new()
         .register_fn(
@@ -2412,9 +2611,7 @@ async fn known_limitation_early_config_dependent_failure_does_not_replay_cleanly
             last_error: None,
             scheduled_time: None,
         },
-        WorkflowEvent::WorkflowFailed {
-            error: "payload too large".into(),
-        },
+        WorkflowEvent::workflow_failed("payload too large"),
     ];
     let report = WorkflowReplayer::new()
         .register_fn(

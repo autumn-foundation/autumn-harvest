@@ -18,6 +18,7 @@ pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;
 pub mod state;
+pub mod status_summary;
 pub mod ui;
 pub mod usage;
 pub mod version_gate_retirement;

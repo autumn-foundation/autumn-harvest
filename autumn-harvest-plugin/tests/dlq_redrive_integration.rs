@@ -333,9 +333,7 @@ async fn seed_failed(
         workflow_id,
         queue,
         "FAILED",
-        WorkflowEvent::WorkflowFailed {
-            error: error.to_string(),
-        },
+        WorkflowEvent::workflow_failed(error.to_string()),
         error,
     )
     .await

@@ -14,7 +14,11 @@ use crate::handle::{WorkflowHandle, WorkflowResultState};
 use crate::types::ExecutionId;
 
 /// Compact type-safe workflow result payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived: `error_details` is a
+/// [`serde_json::Value`], which is only `PartialEq` (issue #767).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
 pub struct TypedWorkflowResult<T> {
     /// Current compact state.
     pub state: WorkflowResultState,
@@ -24,6 +28,18 @@ pub struct TypedWorkflowResult<T> {
     pub error: Option<String>,
     /// Timestamp when the execution entered a terminal state.
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Stable error-type class from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    ///
+    /// `Some` only for a failure state produced by a typed workflow failure;
+    /// `None` for success states and legacy/untyped failures.
+    pub error_type: Option<String>,
+    /// Structured details from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    pub error_details: Option<serde_json::Value>,
+    /// Non-retryable flag from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    pub non_retryable: Option<bool>,
 }
 
 /// Type-safe awaitable handle for one workflow execution.
@@ -156,11 +172,40 @@ impl<T> TypedWorkflowHandle<T> {
             Some(val) => Some(serde_json::from_value(val).map_err(HarvestError::Serialization)?),
             None => None,
         };
+        // Only a `Failed` state emits a `WorkflowFailed` event carrying typed
+        // fields (issue #767); the extra history load is skipped for every other
+        // state (`Cancelled`/`TimedOut`/`Terminated` never carry a typed
+        // `WorkflowFailure`). A transient history-load failure is *swallowed*
+        // (falls back to untyped `None` fields), mirroring
+        // `HandleInner::enrich_terminal_result` — it must not turn an otherwise
+        // correct snapshot (state + human `error` message intact) into an `Err`.
+        //
+        // `result_snapshot` reports the original handle's execution row (it does
+        // NOT follow the #523 retry chain — unlike `result_raw`), so the typed
+        // failure is loaded from `self.inner`'s own `exec_id` to stay consistent
+        // with the snapshot's `state`/`error`.
+        let (error_type, error_details, non_retryable) =
+            if snap.state == WorkflowResultState::Failed {
+                if let Ok(Some(decoded)) = self
+                    .inner
+                    .terminal_typed_failure(self.inner.exec_id())
+                    .await
+                {
+                    (decoded.error_type, decoded.details, decoded.non_retryable)
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
         Ok(TypedWorkflowResult {
             state: snap.state,
             output,
             error: snap.error,
             completed_at: snap.completed_at,
+            error_type,
+            error_details,
+            non_retryable,
         })
     }
 }

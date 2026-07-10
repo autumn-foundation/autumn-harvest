@@ -116,6 +116,9 @@ pub struct HarvestPlugin {
     /// Deployment-level opt-in for operator read-path payload decoding
     /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
     decode_payloads_on_read: bool,
+    /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
+    /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
+    status_thresholds: crate::status_summary::StatusThresholds,
     /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
@@ -144,6 +147,7 @@ impl HarvestPlugin {
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
             decode_payloads_on_read: false,
+            status_thresholds: crate::status_summary::StatusThresholds::default(),
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
             #[cfg(feature = "metrics")]
@@ -321,6 +325,20 @@ impl HarvestPlugin {
         self
     }
 
+    /// Override the thresholds for the rolled-up `GET /admin/status` verdict
+    /// (issue #679).
+    ///
+    /// The defaults are **starter values, not universal SLOs**; tune DLQ depth,
+    /// queue backlog, stalled-run, and worker-health thresholds per deployment.
+    #[must_use]
+    pub const fn with_status_thresholds(
+        mut self,
+        thresholds: crate::status_summary::StatusThresholds,
+    ) -> Self {
+        self.status_thresholds = thresholds;
+        self
+    }
+
     /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
     /// (issue #344).
     ///
@@ -408,6 +426,7 @@ impl Plugin for HarvestPlugin {
             mcp_tools_enabled,
             mcp_tools_prefix,
             decode_payloads_on_read,
+            status_thresholds,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
             #[cfg(feature = "metrics")]
@@ -523,6 +542,8 @@ impl Plugin for HarvestPlugin {
         // gate. Must run before `builder` is moved into the runtime slot.
         api_state.set_payload_codecs(builder.payload_codecs().clone());
         api_state.set_decode_payloads_on_read(decode_payloads_on_read);
+        // Issue #679: mirror the rolled-up status thresholds into the API state.
+        api_state.set_status_thresholds(status_thresholds);
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
@@ -686,6 +707,13 @@ async fn start_harvest_runtime(
     api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
     // Propagate the server-side workflow retry attempt ceiling (issue #523).
     api_state.set_max_workflow_attempts(built.max_workflow_attempts);
+    // Propagate the request-scoped start-idempotency retention window (issue
+    // #808): the HTTP start route reads it to dedup a repeated idempotency_key,
+    // and the background expiry sweep reads the same value from a process-global
+    // static (mirroring GLOBAL_CALLBACK_CONFIG) so it needs no extra param
+    // threaded through enforce_timeouts_once.
+    api_state.set_start_idempotency_window(built.start_idempotency_window);
+    autumn_harvest::start_idempotency::set_purge_window_secs(built.start_idempotency_window);
     // Propagate the GET /admin/usage window ceiling (issue #596).
     api_state.set_usage_window_ceiling(built.usage_window_ceiling);
     // Propagate the GET /admin/usage group-count cap (issue #596).
@@ -709,6 +737,13 @@ async fn start_harvest_runtime(
     if let Some(days) = api_state.audit_retention_days() {
         built.set_audit_retention_days(days);
     }
+
+    // The resolved effective runtime configuration (issue #695) served by
+    // `GET /admin/config` is captured inside `PreparedHarvestRuntime::build`
+    // (in `HarvestRunner::start` below) and rides on the resulting
+    // `HarvestApiRuntime`, so it is populated on any deployment that installs
+    // that runtime — the plugin web-app path here and the standalone runner
+    // alike — without a separate `set_effective_config` call to remember.
 
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
@@ -1341,6 +1376,24 @@ mod tests {
         assert!(
             plugin.decode_payloads_on_read,
             "HarvestPlugin::decode_payloads_on_read() must set the opt-in flag"
+        );
+    }
+
+    /// Issue #679: the rolled-up status thresholds default to the starter
+    /// values and are overridable via the builder.
+    #[test]
+    fn status_thresholds_default_and_override_on_builder() {
+        let plugin = HarvestPlugin::new();
+        assert_eq!(plugin.status_thresholds.dlq_critical_total, 100);
+
+        let custom = crate::status_summary::StatusThresholds {
+            dlq_critical_total: 7,
+            ..crate::status_summary::StatusThresholds::default()
+        };
+        let plugin = plugin.with_status_thresholds(custom);
+        assert_eq!(
+            plugin.status_thresholds.dlq_critical_total, 7,
+            "HarvestPlugin::with_status_thresholds() must override the thresholds"
         );
     }
 

@@ -657,6 +657,22 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Request-scoped start idempotency claims — one row per
+    /// `(workflow_name, idempotency_key)` (issue #808).
+    harvest_start_idempotency (workflow_name, idempotency_key) {
+        workflow_name    -> Text,
+        idempotency_key  -> Text,
+        /// The execution this key first created; returned as a no-op on a dup.
+        workflow_exec_id -> Uuid,
+        created_at       -> Timestamptz,
+        /// Shard this claim was routed to (for the per-shard expiry sweep).
+        shard_id         -> Int4,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Pending event batch records — one row per `(workflow_name, batch_key)` (issue #518).
     harvest_event_batches (id) {
         id                -> Uuid,
@@ -783,6 +799,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_trigger_outbox,
     harvest_debounce,
     harvest_start_throttle,
+    harvest_start_idempotency,
     harvest_event_batches,
     harvest_payload_refs,
     harvest_completion_deliveries,

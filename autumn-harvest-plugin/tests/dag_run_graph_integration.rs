@@ -487,9 +487,7 @@ async fn dag_run_graph_returns_annotated_topology() {
         completed(ia),
         sched("step_b", ib),
         failed(ib),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed"),
     ];
     let exec_id = seed_run(&mut conn, "graph_linear_dag", "graph-1", events, "FAILED").await;
 

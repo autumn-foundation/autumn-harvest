@@ -554,9 +554,9 @@ async fn test_get_update_result_orphaned_timed_out() {
         .unwrap();
 
     let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
-    let fail_event = vec![WorkflowEvent::WorkflowFailed {
-        error: "timeout: workflow exceeded execution timeout".to_string(),
-    }];
+    let fail_event = vec![WorkflowEvent::workflow_failed(
+        "timeout: workflow exceeded execution timeout".to_string(),
+    )];
     store::append_events(&mut conn, exec_id, &fail_event, history2.next_event_id)
         .await
         .expect("append WorkflowFailed event");

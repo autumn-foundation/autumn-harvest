@@ -2053,9 +2053,7 @@ mod tests {
                 queue: "default".to_string(),
             },
             activity_completed(act_id),
-            WorkflowEvent::WorkflowFailed {
-                error: "oops".to_string(),
-            },
+            WorkflowEvent::workflow_failed("oops".to_string()),
         ];
         assert_eq!(
             resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
@@ -2123,9 +2121,7 @@ mod tests {
                 queue: "default".to_string(),
             },
             activity_completed(act_id),
-            WorkflowEvent::WorkflowFailed {
-                error: "transient".to_string(),
-            },
+            WorkflowEvent::workflow_failed("transient".to_string()),
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id,
                 attempt: 2,

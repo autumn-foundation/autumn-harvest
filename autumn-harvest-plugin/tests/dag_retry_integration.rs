@@ -450,9 +450,7 @@ fn linear_failed_events() -> (Vec<WorkflowEvent>, ActivityExecId, ActivityExecId
         completed(ib),
         sched("step_c", ic),
         failed(ic),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed".to_string()),
     ];
     (events, ia, ib)
 }
@@ -620,9 +618,7 @@ async fn retry_fanout_dag_re_executes_failed_node_level() {
         completed(ib),
         completed(id),
         failed(ic),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed".to_string()),
     ];
     let exec_id = seed_run(&mut conn, "fanout_retry_dag", "fan-1", events, "FAILED").await;
 
