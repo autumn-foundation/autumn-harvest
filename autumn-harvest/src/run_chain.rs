@@ -284,6 +284,87 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     }
 }
 
+/// Reconstruct the ordered member set of a *legacy* continue-as-new chain from
+/// `WorkflowContinuedAsNew`-event linkage, id-reuse-safe (issue #701, Codex P2).
+///
+/// Pre-feature chains carry no back-link columns, so a chain queried from its
+/// **tail** (or a **middle** run) cannot be resolved by the indexed
+/// `first_exec_id` gather — the tail has no successors carrying the back-link
+/// and no forward `WorkflowContinuedAsNew` event of its own. This function walks
+/// the chain purely through CAN-event linkage:
+///
+/// - `queried` is the `exec_id` the operator asked about.
+/// - `links` is `(new_exec_id, predecessor_exec_id)` for every candidate that
+///   recorded a `WorkflowContinuedAsNew { new_exec_id }` event — i.e. `predecessor`
+///   continued into `new_exec_id`.
+///
+/// The walk goes **backward** from `queried` toward the origin (following
+/// `new_exec_id -> predecessor`) and **forward** toward the tail (following the
+/// inverse `predecessor -> new_exec_id`), each bounded by `max_hops` and guarded
+/// against cycles. Only runs reachable through CAN linkage from `queried` are
+/// returned: a run that merely *reused the same `workflow_id`* for an unrelated
+/// logical run points its own CAN event at a **different** successor and is
+/// therefore never linked into this chain — id-reuse cannot contaminate the
+/// result by construction.
+///
+/// Returns the member `exec_ids` ordered **origin-first**; the resolved chain head
+/// is the first element. When `queried` has no links at all the result is just
+/// `[queried]` (a standalone run is its own complete chain).
+#[must_use]
+pub fn reconstruct_legacy_chain_order(
+    queried: Uuid,
+    links: &[(Uuid, Uuid)],
+    max_hops: usize,
+) -> Vec<Uuid> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // new_exec_id -> predecessor (each successor has exactly one predecessor).
+    let pred_of: BTreeMap<Uuid, Uuid> = links.iter().copied().collect();
+    // predecessor -> new_exec_id (keep the first successor for a given
+    // predecessor so a corrupt-fork duplicate can never split the walk).
+    let mut succ_of: BTreeMap<Uuid, Uuid> = BTreeMap::new();
+    for &(new_id, pred) in links {
+        succ_of.entry(pred).or_insert(new_id);
+    }
+
+    let mut seen: BTreeSet<Uuid> = BTreeSet::new();
+    seen.insert(queried);
+
+    // Backward: queried <- predecessor <- ... toward the origin.
+    let mut back: Vec<Uuid> = Vec::new();
+    let mut cur = queried;
+    for _ in 0..max_hops {
+        match pred_of.get(&cur) {
+            Some(&pred) if !seen.contains(&pred) => {
+                seen.insert(pred);
+                back.push(pred);
+                cur = pred;
+            }
+            _ => break,
+        }
+    }
+    back.reverse(); // origin-first
+
+    // Forward: queried -> successor -> ... toward the tail.
+    let mut fwd: Vec<Uuid> = Vec::new();
+    let mut cur = queried;
+    for _ in 0..max_hops {
+        match succ_of.get(&cur) {
+            Some(&succ) if !seen.contains(&succ) => {
+                seen.insert(succ);
+                fwd.push(succ);
+                cur = succ;
+            }
+            _ => break,
+        }
+    }
+
+    let mut ordered = back;
+    ordered.push(queried);
+    ordered.extend(fwd);
+    ordered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +697,81 @@ mod tests {
         let mut expected = vec![a.to_string(), b.to_string()];
         expected.sort();
         assert_eq!(ids, expected);
+    }
+
+    // ── reconstruct_legacy_chain_order ───────────────────────────────────────
+
+    #[test]
+    fn reconstruct_legacy_from_tail_walks_back_to_origin() {
+        // Legacy chain a -> b -> c (c is the queried tail). Links are
+        // (new_exec_id, predecessor): a continued into b, b into c.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let links = vec![(b, a), (c, b)];
+        let ordered = reconstruct_legacy_chain_order(c, &links, 128);
+        assert_eq!(ordered, vec![a, b, c], "origin-first, tail last");
+    }
+
+    #[test]
+    fn reconstruct_legacy_from_middle_walks_both_directions() {
+        // Chain a -> b -> c, queried from the middle (b).
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let links = vec![(b, a), (c, b)];
+        let ordered = reconstruct_legacy_chain_order(b, &links, 128);
+        assert_eq!(ordered, vec![a, b, c]);
+    }
+
+    #[test]
+    fn reconstruct_standalone_run_is_single_entry() {
+        // No links reference the queried run — it is its own complete chain.
+        let a = Uuid::new_v4();
+        let unrelated_pred = Uuid::new_v4();
+        let unrelated_succ = Uuid::new_v4();
+        let links = vec![(unrelated_succ, unrelated_pred)];
+        let ordered = reconstruct_legacy_chain_order(a, &links, 128);
+        assert_eq!(ordered, vec![a]);
+    }
+
+    #[test]
+    fn reconstruct_ignores_id_reuse_run_not_linked_by_can_event() {
+        // Legacy chain a -> b (b queried). An unrelated run `x` reused the same
+        // workflow_id and continued into some `y` NOT in our chain. `x`/`y` must
+        // never be linked into the a -> b chain.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let x = Uuid::new_v4();
+        let y = Uuid::new_v4();
+        let links = vec![(b, a), (y, x)];
+        let ordered = reconstruct_legacy_chain_order(b, &links, 128);
+        assert_eq!(ordered, vec![a, b]);
+        assert!(!ordered.contains(&x));
+        assert!(!ordered.contains(&y));
+    }
+
+    #[test]
+    fn reconstruct_respects_max_hops_bound() {
+        // Long backward chain; a tight hop bound truncates without hanging.
+        let ids: Vec<Uuid> = (0..10).map(|_| Uuid::new_v4()).collect();
+        // ids[0] -> ids[1] -> ... -> ids[9]; query the tail.
+        let links: Vec<(Uuid, Uuid)> = (1..ids.len()).map(|i| (ids[i], ids[i - 1])).collect();
+        let ordered = reconstruct_legacy_chain_order(ids[9], &links, 3);
+        // At most 3 backward hops from the tail + the tail itself.
+        assert_eq!(ordered.len(), 4);
+        assert_eq!(*ordered.last().unwrap(), ids[9]);
+    }
+
+    #[test]
+    fn reconstruct_cycle_in_links_does_not_hang() {
+        // Corrupt linkage a <-> b. The seen-guard terminates the walk.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let links = vec![(b, a), (a, b)];
+        let ordered = reconstruct_legacy_chain_order(b, &links, 128);
+        // b, then back to a, then a's pred is b (already seen) -> stop.
+        assert_eq!(ordered.len(), 2);
+        assert!(ordered.contains(&a) && ordered.contains(&b));
     }
 }

@@ -9,6 +9,9 @@
 //!   (5) A pure legacy chain (rows lack the back-link columns, linked only by
 //!       `WorkflowContinuedAsNew` events) resolves best-effort with
 //!       `head_unknown = true` and no 500.
+//!   (7) A legacy chain queried from its TAIL reconstructs every predecessor via
+//!       shared-`workflow_id` CAN-event linkage (issue #701, Codex P2).
+//!   (8) An id-reuse run sharing the `workflow_id` but not CAN-linked is excluded.
 //!
 //! The pure ordering / `head_unknown` math is unit-tested in
 //! `autumn-harvest/src/run_chain.rs`; these tests verify the HTTP wiring plus
@@ -173,7 +176,7 @@ const INIT_SQL: &str = concat!(
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
     include_str!(
-        "../../autumn-harvest/migrations/20260709000000_harvest_workflow_continue_chain/up.sql"
+        "../../autumn-harvest/migrations/20260710000000_harvest_workflow_continue_chain/up.sql"
     ),
 );
 
@@ -339,6 +342,22 @@ async fn insert_continue_event(
             harvest_events::event_data.eq(data),
             harvest_events::timestamp.eq(Utc::now()),
         ))
+        .execute(conn)
+        .await
+        .unwrap();
+}
+
+/// Overwrite a seeded row's `workflow_id` to a shared value. `seed_run` starts
+/// each run under a distinct `workflow_id` to dodge the active-run uniqueness
+/// index; a real continue-as-new chain shares one `workflow_id`, and the legacy
+/// backward reconstruction (issue #701, Codex P2) resolves by it — so tests that
+/// exercise reconstruction set the members to a shared id afterward. Safe against
+/// the partial unique index `(workflow_name, workflow_id) WHERE state NOT IN
+/// ('CONTINUED_AS_NEW','TERMINATED')` as long as at most one non-excluded row
+/// shares the id (a legacy chain has exactly one live/terminal tail).
+async fn set_workflow_id(conn: &mut AsyncPgConnection, exec_id: ExecutionId, workflow_id: &str) {
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .execute(conn)
         .await
         .unwrap();
@@ -657,4 +676,178 @@ async fn run_chain_legacy_middle_run_flags_head_unknown() {
     );
     assert!(runs[1]["continued_to_exec_id"].is_null());
     assert_eq!(runs[1]["outcome"], "running");
+}
+
+/// (7) The Codex P2 money test (issue #701): a pre-feature legacy chain queried
+/// from its live/final TAIL. The tail carries no back-link metadata and no
+/// forward `WorkflowContinuedAsNew` event of its own, so the indexed gather only
+/// finds the tail. Legacy backward reconstruction walks the shared `workflow_id`
+/// candidates via CAN-event linkage back to the origin, returning every
+/// predecessor in order with `head_unknown = true` — AC4 (backward navigation
+/// from the latest run returns every predecessor) and AC5 (graceful degradation).
+#[tokio::test]
+async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let t0 = Utc::now() - Duration::seconds(400);
+    // Legacy rows: continued_from + first_exec_id both NULL. Seeded under
+    // distinct ids to dodge the uniqueness index, then joined to a shared
+    // workflow_id — exactly the shape a real pre-feature continue-as-new chain
+    // has on disk.
+    let run0 = seed_run(
+        &mut conn,
+        "legacy-tail-0",
+        "CONTINUED_AS_NEW",
+        t0,
+        Some(t0 + Duration::seconds(10)),
+        None,
+        None,
+    )
+    .await;
+    let run1 = seed_run(
+        &mut conn,
+        "legacy-tail-1",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(100),
+        Some(t0 + Duration::seconds(110)),
+        None,
+        None,
+    )
+    .await;
+    // The tail is the live/final run — COMPLETED, no CAN event of its own.
+    let run2 = seed_run(
+        &mut conn,
+        "legacy-tail-2",
+        "COMPLETED",
+        t0 + Duration::seconds(200),
+        Some(t0 + Duration::seconds(205)),
+        None,
+        None,
+    )
+    .await;
+
+    // The only linkage a legacy chain carries: forward CAN events.
+    insert_continue_event(&mut conn, run0, 100, run1).await;
+    insert_continue_event(&mut conn, run1, 100, run2).await;
+
+    // Join all members onto one shared workflow_id (the real chain shape).
+    let shared = "legacy-tail-shared";
+    set_workflow_id(&mut conn, run0, shared).await;
+    set_workflow_id(&mut conn, run1, shared).await;
+    set_workflow_id(&mut conn, run2, shared).await;
+
+    // Query the TAIL — the exact scenario Codex flagged.
+    let (status, body) = get_json(&app, &format!("/workflows/{run2}/run-chain")).await;
+    assert_eq!(status, StatusCode::OK, "legacy tail query must not 500");
+    assert_eq!(
+        run_ids(&body),
+        vec![run0.to_string(), run1.to_string(), run2.to_string()],
+        "backward reconstruction returns every predecessor in order (AC4)"
+    );
+    assert_eq!(
+        body["head_unknown"], true,
+        "a reconstructed legacy chain cannot confirm its origin (AC5)"
+    );
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0]["sequence"], 0);
+    assert_eq!(runs[1]["sequence"], 1);
+    assert_eq!(runs[2]["sequence"], 2);
+    assert_eq!(
+        runs[0]["continued_to_exec_id"].as_str(),
+        Some(run1.to_string().as_str())
+    );
+    assert_eq!(
+        runs[1]["continued_to_exec_id"].as_str(),
+        Some(run2.to_string().as_str())
+    );
+    assert!(runs[2]["continued_to_exec_id"].is_null());
+    assert_eq!(runs[2]["outcome"], "completed");
+}
+
+/// (8) id-reuse safety (issue #701, Codex P2): a legacy chain plus an unrelated
+/// run that reused the SAME `workflow_id` but is NOT linked into the chain by a
+/// `WorkflowContinuedAsNew` event (its own CAN event points at a different
+/// successor). Backward reconstruction must exclude the unrelated run — linkage
+/// is by CAN event, never by raw `workflow_id` membership.
+#[tokio::test]
+async fn run_chain_legacy_id_reuse_not_contaminated() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let t0 = Utc::now() - Duration::seconds(400);
+    let run0 = seed_run(
+        &mut conn,
+        "reuse-0",
+        "CONTINUED_AS_NEW",
+        t0,
+        Some(t0 + Duration::seconds(10)),
+        None,
+        None,
+    )
+    .await;
+    let run1 = seed_run(
+        &mut conn,
+        "reuse-1",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(100),
+        Some(t0 + Duration::seconds(110)),
+        None,
+        None,
+    )
+    .await;
+    let run2 = seed_run(
+        &mut conn,
+        "reuse-2",
+        "COMPLETED",
+        t0 + Duration::seconds(200),
+        Some(t0 + Duration::seconds(205)),
+        None,
+        None,
+    )
+    .await;
+    insert_continue_event(&mut conn, run0, 100, run1).await;
+    insert_continue_event(&mut conn, run1, 100, run2).await;
+
+    // An unrelated run that reused the same workflow_id. Kept CONTINUED_AS_NEW
+    // (so it is excluded from the active-run uniqueness index and coexists with
+    // the tail) and given its OWN CAN event pointing at a successor that is NOT a
+    // member of our chain — the strongest id-reuse shape.
+    let unrelated = seed_run(
+        &mut conn,
+        "reuse-unrelated",
+        "CONTINUED_AS_NEW",
+        t0 + Duration::seconds(300),
+        Some(t0 + Duration::seconds(305)),
+        None,
+        None,
+    )
+    .await;
+    let unrelated_successor = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_continue_event(&mut conn, unrelated, 100, unrelated_successor).await;
+
+    let shared = "reuse-shared";
+    set_workflow_id(&mut conn, run0, shared).await;
+    set_workflow_id(&mut conn, run1, shared).await;
+    set_workflow_id(&mut conn, run2, shared).await;
+    set_workflow_id(&mut conn, unrelated, shared).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{run2}/run-chain")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = run_ids(&body);
+    assert_eq!(
+        ids,
+        vec![run0.to_string(), run1.to_string(), run2.to_string()],
+        "only the CAN-linked chain is reconstructed"
+    );
+    assert!(
+        !ids.contains(&unrelated.to_string()),
+        "an id-reuse run not linked by a CAN event must not contaminate the chain"
+    );
+    assert_eq!(body["head_unknown"], true);
 }

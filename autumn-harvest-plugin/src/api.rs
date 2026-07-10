@@ -7897,6 +7897,109 @@ async fn get_workflow_timeline(
 /// legacy path so a corrupt or unusually long chain can never spin.
 const MAX_RUN_CHAIN_HOPS: usize = 128;
 
+/// Upper bound on same-`workflow_id` candidate rows the legacy backward
+/// reconstruction (issue #701, Codex P2) will scan. A pre-feature chain queried
+/// from its tail has no back-link metadata, so reconstruction loads each
+/// candidate's history to read its `WorkflowContinuedAsNew` linkage — bounded by
+/// this cap so a heavily id-reused `workflow_id` can never trigger an unbounded
+/// scan. Above the cap the chain is served best-effort with `head_unknown = true`.
+const MAX_LEGACY_CANDIDATES: usize = 256;
+
+/// Outcome of legacy backward reconstruction (issue #701, Codex P2).
+enum LegacyReconstruction {
+    /// The chain was reconstructed from `WorkflowContinuedAsNew` linkage. `rows`
+    /// are the ordered members and `head` is the resolved origin `exec_id`.
+    Reconstructed {
+        rows: Vec<autumn_harvest::run_chain::RunChainRow>,
+        head: uuid::Uuid,
+    },
+    /// The same-`workflow_id` candidate set exceeded [`MAX_LEGACY_CANDIDATES`];
+    /// reconstruction was skipped. Serve the fast-path rows best-effort but flag
+    /// `head_unknown = true`.
+    Overflowed,
+}
+
+/// Reconstruct a legacy continue-as-new chain by walking `WorkflowContinuedAsNew`
+/// linkage across same-`workflow_id` rows, id-reuse-safe (issue #701, Codex P2).
+///
+/// Triggered only for a run with no back-link metadata (`first_exec_id` and
+/// `continued_from_exec_id` both `NULL`) that the indexed gather could not resolve
+/// into a multi-run chain — i.e. a pre-feature chain queried from its tail or a
+/// middle run, or a genuine standalone run. Post-feature chains never reach here
+/// (their successors carry `first_exec_id`, so the fast indexed gather is
+/// complete).
+///
+/// All members of a continue-as-new chain share the same `(workflow_name,
+/// workflow_id)`, so candidates are gathered by that pair on the caller's already
+/// held, shard-local connection (never a second acquire — the pool-size-1 safety
+/// the whole run-chain gather relies on). Each candidate's history is loaded
+/// (undecoded — only the typed `new_exec_id` is read) to build the CAN linkage,
+/// then [`reconstruct_legacy_chain_order`](autumn_harvest::run_chain::reconstruct_legacy_chain_order)
+/// walks backward to the origin and forward to the tail. A same-`workflow_id` run
+/// reused for an unrelated logical run points its CAN event at a different
+/// successor, so it is excluded by construction.
+///
+/// Cost: up to [`MAX_LEGACY_CANDIDATES`] history loads. This is the degraded
+/// legacy path only; it is never hit for post-feature chains.
+async fn reconstruct_legacy_run_chain(
+    conn: &mut AsyncPgConnection,
+    queried: &WorkflowExecution,
+) -> HarvestResult<LegacyReconstruction> {
+    // Gather same-(workflow_name, workflow_id) candidates, capped. Fetch one over
+    // the cap so an overflow is detectable.
+    let candidates: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(&queried.workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(&queried.workflow_id))
+        .select(WorkflowExecution::as_select())
+        .limit(i64::try_from(MAX_LEGACY_CANDIDATES + 1).unwrap_or(i64::MAX))
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    if candidates.len() > MAX_LEGACY_CANDIDATES {
+        return Ok(LegacyReconstruction::Overflowed);
+    }
+
+    let by_id: std::collections::BTreeMap<uuid::Uuid, autumn_harvest::run_chain::RunChainRow> =
+        candidates
+            .iter()
+            .map(|e| (e.id, run_row_from_execution(e)))
+            .collect();
+
+    // Build CAN linkage: (new_exec_id, predecessor_exec_id) for each candidate
+    // that recorded a `WorkflowContinuedAsNew` event.
+    let mut links: Vec<(uuid::Uuid, uuid::Uuid)> = Vec::new();
+    for candidate in &candidates {
+        let successor =
+            continue_as_new_successor_on_conn(conn, ExecutionId::from_uuid(candidate.id)).await?;
+        if let Some(successor_id) = successor {
+            links.push((successor_id.as_uuid(), candidate.id));
+        }
+    }
+
+    let ordered = autumn_harvest::run_chain::reconstruct_legacy_chain_order(
+        queried.id,
+        &links,
+        MAX_RUN_CHAIN_HOPS,
+    );
+
+    // Project ordered member exec_ids back to their loaded rows. A member absent
+    // from the candidate set (e.g. a retention-pruned successor) is skipped —
+    // best-effort, never a 500.
+    let rows: Vec<autumn_harvest::run_chain::RunChainRow> = ordered
+        .iter()
+        .filter_map(|id| by_id.get(id).cloned())
+        .collect();
+    // `rows.as_slice()` avoids the diesel `RunQueryDsl::first` method-resolution
+    // ambiguity that a bare `rows.first()` triggers on a `Vec` of query rows.
+    let head = match rows.as_slice() {
+        [first, ..] => first.exec_id,
+        [] => queried.id,
+    };
+
+    Ok(LegacyReconstruction::Reconstructed { rows, head })
+}
+
 /// Map a loaded `WorkflowExecution` row into the minimal `RunChainRow` the pure
 /// [`autumn_harvest::run_chain::assemble_run_chain`] assembler consumes.
 fn run_row_from_execution(execution: &WorkflowExecution) -> autumn_harvest::run_chain::RunChainRow {
@@ -8044,7 +8147,58 @@ async fn get_run_chain(
         .await
         .map_err(map_error)?;
 
-    let response = autumn_harvest::run_chain::assemble_run_chain(rows, head_exec_id.as_uuid());
+    // Legacy backward reconstruction (issue #701, Codex P2). A pre-feature chain
+    // queried from its TAIL (or a MIDDLE run) has no back-link metadata, so the
+    // indexed gather above only finds the queried run (plus any legacy successors
+    // reachable via its own forward CAN events) — never its predecessors. Fall
+    // back to `workflow_id`-scoped reconstruction, but only when the queried run
+    // carries no back-link metadata AND the fast gather did not already resolve a
+    // post-feature chain (a post-feature origin's successors carry
+    // `first_exec_id = queried.id`, so it stays on the cheap indexed path).
+    let mut head_uuid = head_exec_id.as_uuid();
+    let mut force_head_unknown = false;
+    let mut rows = rows;
+    let needs_legacy_reconstruction = queried.first_exec_id.is_none()
+        && queried.continued_from_exec_id.is_none()
+        && !rows.iter().any(|r| r.first_exec_id == Some(queried.id));
+    if needs_legacy_reconstruction {
+        match reconstruct_legacy_run_chain(&mut conn, &queried)
+            .await
+            .map_err(map_error)?
+        {
+            LegacyReconstruction::Reconstructed {
+                rows: recon_rows,
+                head,
+            } => {
+                // Merge — never shrink. Reconstruction adds any chain member the
+                // indexed gather could not reach (the predecessors of a tail
+                // query, the whole point of this fallback), while the fast
+                // path's forward-walked successors are kept. When reconstruction
+                // finds nothing new (e.g. a head query the fast path already
+                // resolved) this is a no-op. The resolved origin (`head`) is
+                // never worse than the fast-path head: for a tail it walks back
+                // to the true origin, otherwise it equals the queried run.
+                let existing: std::collections::BTreeSet<uuid::Uuid> =
+                    rows.iter().map(|r| r.exec_id).collect();
+                for r in recon_rows {
+                    if !existing.contains(&r.exec_id) {
+                        rows.push(r);
+                    }
+                }
+                head_uuid = head;
+            }
+            // Too many same-workflow_id candidates to bound safely: keep the
+            // fast-path rows but be honest the head cannot be confirmed.
+            LegacyReconstruction::Overflowed => {
+                force_head_unknown = true;
+            }
+        }
+    }
+
+    let mut response = autumn_harvest::run_chain::assemble_run_chain(rows, head_uuid);
+    if force_head_unknown {
+        response.head_unknown = true;
+    }
     Ok(Json(response))
 }
 
