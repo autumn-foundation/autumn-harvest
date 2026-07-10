@@ -6740,15 +6740,19 @@ fn arm_timer_events(commands: &[WorkflowCommand]) -> Vec<Option<WorkflowEvent>> 
 /// `fires_at` timestamps and performs the `harvest_timers` row upserts/deletes —
 /// so it is unit-testable without a database.
 ///
-/// A same-batch `CancelTimer(X)` supersedes an `ArmTimer(X)` re-arm
-/// (round 7 fix): X is excluded from the contributing set **order-independently**
-/// (a cancel anywhere in the batch cancels the arm for that id). Without this, an
-/// `await_fire` that pushed its `for_await: true` re-arm *before* a sibling branch
-/// pushed `cancel_timer(X)` in the same workflow task would contribute X's
-/// deadline to `min_fires_at`; the caller would then reschedule the parked task to
-/// that now-deleted row's deadline instead of waking it immediately to consume the
-/// recorded `TimerCancelled` — delaying the cancellation by up to a full timer
-/// duration.
+/// A same-batch `CancelTimer(X)` supersedes an `ArmTimer(X)` re-arm in
+/// **batch order** (round 7 fix, refined in round 9): X's `for_await: true` arm is
+/// excluded from the contributing set iff X is *cancelled and not re-established*
+/// by the end of the batch — i.e. the last fresh-establish (`ArmTimer(X, for_await:
+/// false)` from `reset`/`start_timer`, or `StartTimer(X)`) vs `CancelTimer(X)` op
+/// for X is a cancel. Without exclusion, an `await_fire` racing a sibling
+/// `cancel_timer(X)` in the same task would reschedule the parked task to a
+/// now-deleted row's deadline instead of waking immediately to consume the recorded
+/// `TimerCancelled`. Order-sensitivity (round 9) is what lets a reset-then-await in
+/// one task — `[CancelTimer(X), ArmTimer(X, false), ArmTimer(X, true)]`, whose fresh
+/// arm re-establishes X *after* the cancel — still arm the durable row in the
+/// transaction that recorded the reset, rather than waking immediately and only
+/// starting the deadline on the next claim (the FINDING this refinement fixes).
 fn plan_timer_lifecycle_pure(
     commands: &[WorkflowCommand],
 ) -> (Vec<Option<WorkflowEvent>>, Vec<usize>) {
@@ -6766,15 +6770,49 @@ fn plan_timer_lifecycle_pure(
         })
         .collect();
 
-    // Ids cancelled anywhere in the batch (see fn doc): a same-batch `CancelTimer`
-    // supersedes an `await_fire` re-arm for the same id.
-    let cancelled_ids: std::collections::HashSet<&str> = commands
-        .iter()
-        .filter_map(|cmd| match cmd {
-            WorkflowCommand::CancelTimer { timer_id } => Some(timer_id.as_str()),
-            _ => None,
-        })
-        .collect();
+    // Per-id liveness against a same-batch cancel, resolved in **batch order**
+    // (round 9 fix): an `await_fire` re-arm (`for_await: true`) contributes its
+    // deadline unless the timer is *cancelled and not re-established* by the end
+    // of the batch. Liveness is decided by the last fresh-establish vs cancel op
+    // for the id — a fresh arm (`for_await: false`, from `reset`/`start_timer`) or
+    // a `StartTimer` re-establishes the timer; a `CancelTimer` removes it. The
+    // `for_await: true` arm itself is only a firing request on an already-(being-)
+    // established timer, so it does NOT count as an establish here.
+    //
+    // This distinguishes the two shapes an order-independent "cancel anywhere
+    // cancels the arm" rule conflated:
+    //   - reset-then-await `[Cancel, Arm(false), Arm(true)]` → last establish/cancel
+    //     op is the fresh arm → timer live → the await arms the durable row in this
+    //     transaction (so the deadline starts when the reset was recorded, not one
+    //     claim later).
+    //   - await raced by a later sibling cancel `[Arm(true), Cancel]` and
+    //     cancel-then-await-with-no-reset `[Cancel, Arm(true)]` → last
+    //     establish/cancel op is the cancel → timer dead → the await is dropped and
+    //     the parked task wakes immediately (round 7 behavior preserved).
+    let mut last_cancel: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut last_fresh_arm: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (i, cmd) in commands.iter().enumerate() {
+        match cmd {
+            WorkflowCommand::CancelTimer { timer_id } => {
+                last_cancel.insert(timer_id.as_str(), i);
+            }
+            WorkflowCommand::ArmTimer {
+                timer_id,
+                for_await: false,
+                ..
+            } => {
+                last_fresh_arm.insert(timer_id.as_str(), i);
+            }
+            _ => {}
+        }
+    }
+    // `X` is dead at end-of-batch iff a cancel exists with no fresh arm after it.
+    let cancelled_and_not_reestablished = |id: &str| -> bool {
+        last_cancel
+            .get(id)
+            .is_some_and(|&c| last_fresh_arm.get(id).is_none_or(|&a| a < c))
+    };
 
     let mut armed_indices = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
@@ -6785,7 +6823,7 @@ fn plan_timer_lifecycle_pure(
                 ..
             } => {
                 if start_timer_ids.contains(timer_id.as_str())
-                    || cancelled_ids.contains(timer_id.as_str())
+                    || cancelled_and_not_reestablished(timer_id.as_str())
                 {
                     continue;
                 }
@@ -6836,11 +6874,13 @@ fn plan_timer_lifecycle_pure(
 ///   contributes its `fires_at` to `min_fires_at`, and emits **no** event (the
 ///   arm's `TimerStarted` was already recorded by the fresh arm). An id that also
 ///   has a `StartTimer` command in the batch is skipped (owned by
-///   `persist_started_timer`), and an id **cancelled anywhere in the same batch**
-///   is skipped too (round 7 fix — see [`plan_timer_lifecycle_pure`]): it neither
-///   arms a row nor contributes to `min_fires_at`, so an `await_fire` raced by a
-///   sibling branch's `cancel` wakes immediately instead of rescheduling to the
-///   deleted row's deadline.
+///   `persist_started_timer`), and an id **cancelled and not re-established in the
+///   same batch** is skipped too (round 7 fix, order-sensitive in round 9 — see
+///   [`plan_timer_lifecycle_pure`]): it neither arms a row nor contributes to
+///   `min_fires_at`, so an `await_fire` raced by a sibling branch's `cancel` wakes
+///   immediately instead of rescheduling to the deleted row's deadline — while a
+///   reset-then-await (whose fresh arm re-establishes the id after the cancel) still
+///   arms the durable row in this transaction.
 /// - `CancelTimer { id }`: delete the pending (`fired = false`) row via
 ///   [`queue::delete_pending_timer`] and resolve `TimerCancelled`. The delete
 ///   filters `fired = false`, so a fire that already committed is a no-op and the
@@ -6887,9 +6927,11 @@ async fn plan_timer_lifecycle(
     let (events_by_index, armed_indices) = plan_timer_lifecycle_pure(commands);
 
     // Row deletes for every `CancelTimer` (idempotent; `delete_pending_timer`
-    // filters `fired = false`). A same-batch-cancelled arm is excluded from
-    // `armed_indices`, so deletes and inserts touch disjoint ids — the two loops
-    // are order-independent.
+    // filters `fired = false`). Deletes run entirely BEFORE the insert loop below,
+    // so for a reset-then-await id (delete the old row, then arm a fresh one) the
+    // insert wins and the row ends present — matching the end-of-batch liveness
+    // `armed_indices` encodes. An await-raced-by-cancel id is excluded from
+    // `armed_indices`, so only its delete runs and the row ends absent.
     for cmd in commands {
         if let WorkflowCommand::CancelTimer { timer_id } = cmd {
             queue::delete_pending_timer(conn, exec_id, timer_id).await?;
@@ -13701,7 +13743,11 @@ mod tests {
             "the await re-arm records no positional event, got {events:?}"
         );
 
-        // Order-independent: a cancel BEFORE the arm cancels it too.
+        // Cancel-then-await with NO fresh arm in between (a genuine cancellation
+        // racing an await, not a reset): the cancel is the last establish/cancel op
+        // for the id, so the timer is dead at end-of-batch and the await is dropped
+        // (wake now). Distinct from reset-then-await, which interposes a fresh arm —
+        // see `plan_timer_lifecycle_pure_arms_a_reset_then_await_in_one_batch`.
         let rev = vec![
             WorkflowCommand::CancelTimer {
                 timer_id: crate::types::TimerId::new("x"),
@@ -13715,7 +13761,90 @@ mod tests {
         let (_ev, armed_rev) = plan_timer_lifecycle_pure(&rev);
         assert!(
             armed_rev.is_empty(),
-            "cancel-before-arm must cancel the arm too, got {armed_rev:?}"
+            "cancel-then-await with no re-establishing fresh arm must wake now, got {armed_rev:?}"
+        );
+    }
+
+    /// Round 9 FINDING: a reset-then-await in ONE task —
+    /// `[CancelTimer(X), ArmTimer(X, for_await: false), ArmTimer(X, for_await: true)]`
+    /// — must arm the durable row and contribute its deadline in THIS transaction.
+    /// The fresh arm (`for_await: false`, from `reset`) re-establishes X *after* the
+    /// cancel, so X is live at end-of-batch and the `await_fire` re-arm at index 2
+    /// contributes. Before the round-9 fix the order-independent "cancel anywhere
+    /// cancels the arm" rule dropped it, shifting the deadline to the next claim.
+    #[test]
+    fn plan_timer_lifecycle_pure_arms_a_reset_then_await_in_one_batch() {
+        let commands = vec![
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 600,
+                for_await: false,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 600,
+                for_await: true,
+            },
+        ];
+        let (events, armed) = plan_timer_lifecycle_pure(&commands);
+        assert_eq!(
+            armed,
+            vec![2],
+            "reset-then-await must arm the await re-arm at index 2, got {armed:?}"
+        );
+        // The cancel still emits TimerCancelled at its position; the fresh arm emits
+        // TimerStarted; the await re-arm records no positional event.
+        assert!(
+            matches!(&events[0], Some(WorkflowEvent::TimerCancelled { timer_id }) if timer_id.as_str() == "idle"),
+            "the reset's cancel must emit TimerCancelled, got {events:?}"
+        );
+        assert!(
+            matches!(&events[1], Some(WorkflowEvent::TimerStarted { timer_id, .. }) if timer_id.as_str() == "idle"),
+            "the reset's fresh arm must emit TimerStarted, got {events:?}"
+        );
+        assert!(
+            events[2].is_none(),
+            "the await re-arm records no positional event, got {events:?}"
+        );
+    }
+
+    /// Per-id order-sensitivity with two ids in one batch: one reset-then-await
+    /// (arms) and one await-then-cancel (wakes now) must be resolved independently.
+    #[test]
+    fn plan_timer_lifecycle_pure_resolves_two_ids_independently_by_order() {
+        let commands = vec![
+            // id "keep": reset then await -> arms.
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("keep"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("keep"),
+                duration_secs: 600,
+                for_await: false,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("keep"),
+                duration_secs: 600,
+                for_await: true,
+            },
+            // id "drop": await then a later sibling cancel -> wakes now.
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("drop"),
+                duration_secs: 300,
+                for_await: true,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("drop"),
+            },
+        ];
+        let (_events, armed) = plan_timer_lifecycle_pure(&commands);
+        assert_eq!(
+            armed,
+            vec![2],
+            "only the reset-then-await id must arm; the await-then-cancel id is dropped, got {armed:?}"
         );
     }
 

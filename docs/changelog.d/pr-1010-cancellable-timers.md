@@ -135,3 +135,48 @@ Audit (context.rs/worker.rs/testing.rs duration & clock reads):
 | `testing.rs` `final_now`/`elapsed` | **now** `fired_timer_duration_secs` (fired-only) | ✓ **FIX B** |
 
 No new `WorkflowEvent` variant, no migration, no replay-determinism change.
+
+## Post-review hardening round 9 (Codex 1× P2)
+
+**FIX — reset-then-await in one task must arm the durable row in the transaction
+that recorded the reset** (`worker.rs` `plan_timer_lifecycle_pure`). Round 8's
+`cancelled_ids` set excluded an `await_fire` re-arm from `armed_indices`/`min_fires_at`
+whenever a `CancelTimer(id)` appeared **anywhere** in the batch — an order-independent
+rule. That over-suppressed the reset-then-await shape: a `reset_timer(id)` pushes
+`CancelTimer(id) + ArmTimer(id, for_await: false)` and a following `await_fire()`
+pushes `ArmTimer(id, for_await: true)`, so the batch is
+`[CancelTimer(id), ArmTimer(id, false), ArmTimer(id, true)]`. Because a cancel was
+present, the order-independent rule dropped the await's arm, so no durable
+`harvest_timers` row was inserted and no `fires_at` was returned in the reset's own
+transaction; `persist_bookkeeping_and_requeue_workflow` then woke/replayed the task
+immediately and only armed the deadline on the *next* claim — under worker backlog
+shifting the deadline later than the `await_fire()` call instead of anchoring it at
+the reset.
+
+The `harvest_timers` row state was already correct (the DB delete/insert loops
+process commands in order: delete-all-then-insert-all leaves a reset-then-await id's
+row present and an await-then-cancel id's row absent) — the bug was **only** in the
+`armed_indices`/`min_fires_at` computation, which must match that end-of-batch row
+state. The contribution is now **order-sensitive**: a `for_await: true` arm for id X
+contributes iff X is *cancelled and not re-established* is false — i.e. the last
+fresh-establish (`ArmTimer(X, for_await: false)` from `reset`/`start_timer`, or a
+same-batch `StartTimer(X)`) vs `CancelTimer(X)` op for X is not a trailing cancel.
+The `for_await: true` arm is only a firing request on an already-(being-)established
+timer, so it does not itself count as an establish. This satisfies both shapes with
+one rule:
+
+- reset-then-await `[Cancel, Arm(false), Arm(true)]` → last establish/cancel op is
+  the fresh arm → X live → the await arms the durable row + contributes its `fires_at`
+  in this transaction (deadline starts when the reset was recorded). **The FIX.**
+- await raced by a later sibling cancel `[Arm(true), Cancel]`, and
+  cancel-then-await-with-no-reset `[Cancel, Arm(true)]` → last establish/cancel op is
+  the cancel → X dead → the await is dropped and the parked task wakes immediately.
+  **Round 7 behavior preserved** (both round-8 sub-assertions stay green).
+
+Purely a change to the contribution/`armed_indices` computation in
+`plan_timer_lifecycle_pure`; the event emission (`TimerStarted`/`TimerCancelled`),
+dedup, and the in-order DB delete/insert are unchanged. New pure unit tests:
+`plan_timer_lifecycle_pure_arms_a_reset_then_await_in_one_batch` (the FINDING,
+RED before the fix) and `plan_timer_lifecycle_pure_resolves_two_ids_independently_by_order`
+(per-id order-sensitivity: one reset-then-await arms, one await-then-cancel drops).
+No new `WorkflowEvent` variant, no migration, no replay-determinism change.
