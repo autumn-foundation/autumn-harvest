@@ -2793,11 +2793,15 @@ impl WorkflowTestEnv {
                     });
                 }
                 // Cancellable/renewable timer bookkeeping on a terminal cycle
-                // (issue #768): arm records TimerStarted (idempotent); cancel
-                // records TimerCancelled. No fire is deferred — the run is sealing.
+                // (issue #768): a sealing run never awaits, so any arm is a fresh
+                // arm (`for_await: false`) that records TimerStarted (idempotent);
+                // a `for_await: true` re-arm cannot reach a terminal cycle (await
+                // parks) and records nothing. Cancel records TimerCancelled. No
+                // fire is deferred — the run is sealing.
                 WorkflowCommand::ArmTimer {
                     timer_id,
                     duration_secs,
+                    for_await: false,
                 } => {
                     if !Self::timer_is_active_in_history(history, timer_id) {
                         history.push(WorkflowEvent::TimerStarted {
@@ -2811,6 +2815,8 @@ impl WorkflowTestEnv {
                         timer_id: timer_id.clone(),
                     });
                 }
+                // A `for_await: true` re-arm cannot reach a terminal cycle (await
+                // parks), so it records nothing here.
                 _ => {}
             }
         }
@@ -3157,57 +3163,53 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
-            // Cancellable/renewable durable timer arm (issue #768). Mirrors the
-            // real worker's `plan_timer_lifecycle` + emission-position
-            // interleaving: record TimerStarted at this command's position (the
-            // harness already applies each command in emission order, matching the
-            // fixed worker) and defer a TimerFired so the timer resolves on the
-            // next iteration
-            // (no real sleep). Idempotent — a re-arm of an already-active timer
-            // (e.g. `await_fire`'s re-arm in the same cycle as `start_timer`)
-            // records nothing.
+            // Cancellable/renewable durable timer arm (issue #768, Codex P2
+            // round 4). Two roles by `for_await`, mirroring the real worker's
+            // `plan_timer_lifecycle`:
+            //
+            // - `for_await: false` (fresh arm from `start_timer`/`reset`): record
+            //   `TimerStarted` at this command's position (dedup: skip if already
+            //   active in history) and NEVER fire. A cancellable timer is only
+            //   fire-eligible once awaited, so an armed-but-unawaited timer cannot
+            //   fire while parked on a competing suspension — no impossible history
+            //   such as `[TimerStarted, ActivityScheduled, TimerFired,
+            //   ActivityCompleted]`.
+            // - `for_await: true` (re-arm from `await_fire`): record NO event
+            //   (the arm's `TimerStarted` was already recorded by the fresh arm).
+            //   On a bookkeeping-only `await_fire` batch, fire now (defer
+            //   `TimerFired`, no real sleep); on a competing suspension, stay
+            //   parked and let a later bookkeeping-only cycle fire it.
             WorkflowCommand::ArmTimer {
                 timer_id,
                 duration_secs,
+                for_await,
             } => {
-                let fire_already_deferred = deferred_events.iter().any(
-                    |e| matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
-                );
-                if fire_already_deferred {
-                    // Armed AND already firing this batch (e.g. `await_fire`'s
-                    // re-arm in the same cycle as `start_timer`): idempotent no-op.
-                    return Ok(false);
-                }
-                if Self::timer_is_active_in_history(history, &timer_id) {
-                    // The durable row already exists (recorded in an EARLIER batch,
-                    // e.g. `start_timer()` before an activity — its `TimerStarted`
-                    // was recorded then but not fired). No new `TimerStarted`
-                    // (dedup). On a bookkeeping-only `await_fire` batch, production
-                    // reschedules the existing row to fire, so the harness must
-                    // fire it here too — otherwise `process_suspension` finds no
-                    // resolvable command and the test stalls. On a competing
-                    // suspension the timer stays parked (Codex P2, issue #768).
+                if for_await {
+                    let fire_already_deferred = deferred_events.iter().any(|e| {
+                        matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id)
+                    });
+                    if fire_already_deferred {
+                        // Another `await_fire` re-arm for this id already deferred
+                        // the fire this batch — idempotent no-op.
+                        return Ok(false);
+                    }
                     if batch_has_competing_suspension {
+                        // Awaited alongside a genuine non-timer suspension: parked,
+                        // fires on a later bookkeeping-only cycle.
                         return Ok(false);
                     }
                     deferred_events.push(WorkflowEvent::TimerFired { timer_id });
                     return Ok(true);
                 }
-                // Fresh arm this batch.
+                // Fresh arm: record TimerStarted (dedup by active-in-history), never
+                // fire.
+                if Self::timer_is_active_in_history(history, &timer_id) {
+                    return Ok(false);
+                }
                 history.push(WorkflowEvent::TimerStarted {
-                    timer_id: timer_id.clone(),
+                    timer_id,
                     duration_secs,
                 });
-                // Only auto-fire when this batch is bookkeeping-only (the
-                // `await_fire` path). When a genuine non-timer suspension shares
-                // the batch, the real worker records the arm and leaves the
-                // workflow parked on that other wait, so the timer must NOT fire
-                // yet — deferring a TimerFired here would produce impossible
-                // history (Codex P2, issue #768). The timer resolves later, on a
-                // subsequent bookkeeping-only `await_fire` cycle.
-                if !batch_has_competing_suspension {
-                    deferred_events.push(WorkflowEvent::TimerFired { timer_id });
-                }
                 Ok(true)
             }
 

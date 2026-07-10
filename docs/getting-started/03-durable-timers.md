@@ -84,29 +84,35 @@ async fn fulfillment(ctx: &WorkflowContext, order: Order) -> HarvestResult<Strin
 }
 ```
 
-- **`start_timer` does not suspend** — it records the arming and returns a
-  handle immediately, so the workflow keeps running.
-- **`cancel()`** deletes the durable timer row and records a `TimerCancelled`
-  event, so **no `TimerFired` is ever produced** for a cancelled timer.
+- **`start_timer` does not suspend** — it records the arming (a single
+  `TimerStarted` event) and returns a handle immediately, so the workflow keeps
+  running. It does **not** yet make the timer fire-eligible (see below).
+- **`cancel()`** records a `TimerCancelled` event (and deletes the durable timer
+  row if one has been created), so **no `TimerFired` is ever produced** for a
+  cancelled timer.
 - **`reset(secs)`** = cancel + re-arm; intentionally O(1) history per reset
   (two events) with **zero orphaned firings**.
-- **`await_fire()`** suspends until the timer fires (`TimerOutcome::Fired`) or
-  is cancelled (`TimerOutcome::Cancelled`).
+- **`await_fire()`** creates the durable `harvest_timers` row (`fires_at = now +
+  duration` at *this* instant) and suspends until the timer fires
+  (`TimerOutcome::Fired`) or is cancelled (`TimerOutcome::Cancelled`).
 
-**An armed timer is observed only at the next `await_fire()` / wake — never
-mid-activity.** `start_timer`/`reset`/`cancel` are non-suspending bookkeeping:
-they record the arming and return. The engine does not preempt a running
-activity, child workflow, or signal wait when an armed timer's deadline passes;
-the fire is only surfaced the next time the workflow *suspends and wakes on that
-timer* via `await_fire()`. In the loop above, the SLA breach is therefore
-detected after the loop, at `await_fire()` — not the instant `fires_at` elapses
-mid-`pick_item`.
+**The deadline is measured from `await_fire()`, not from `start_timer()`.** A
+cancellable timer becomes fire-eligible only when it is *awaited* — arming
+records the event but inserts no durable row. An armed-but-unawaited timer is
+therefore **never observed** while the workflow is parked on some other wait (an
+activity, a child workflow, a signal): it cannot fire spuriously mid-activity,
+and a `reset()` or `await_fire()` reached *after* that other wait is never
+confronted with a stale fire (which would otherwise leave an unconsumed
+`TimerFired` and break the run). In the loop above, the timer's `fires_at` is set
+when the loop's final `await_fire()` runs, so the SLA is measured from there —
+not from `start_timer`. This suits the intended idle-timeout / debounce / lease
+patterns, which always await or reset the timer. If you need a deadline anchored
+to `start_timer` time, capture `ctx.system_now()` at arm time and pass the
+residual to `ctx.sleep_until()`.
 
-> **Footgun.** If you arm a cancellable timer and then suspend on a *different*
-> await — a signal (`wait_for_signal`) or an activity — **without** an
-> `await_fire()`, the timer's fire is not observed until that other suspension
-> wakes for its own reason. An armed timer alone will *not* wake a workflow that
-> is parked on a signal. To bound a signal wait with a deadline, use
+> **Bounding a *signal* wait with a deadline.** An armed cancellable timer alone
+> will not wake a workflow parked on a `wait_for_signal` — the two are separate
+> waits. To race a signal against a deadline in one call, use
 > [`ctx.receive_signal_timeout`](04-signals.md) (below), which arms the deadline
 > and the signal wait together as one race.
 

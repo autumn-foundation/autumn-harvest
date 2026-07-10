@@ -200,6 +200,46 @@ fn arm_timer_activity_cancel_then_await_workflow<'a>(
     })
 }
 
+/// (Codex P2 round 4, issue #768 — FIX A primary flow) Arm a cancellable timer,
+/// suspend on an activity, then `reset()` and `await_fire()` AFTER the activity
+/// completes. Under the round-4 model the armed timer's `harvest_timers` row is
+/// inserted only at `await_fire`, so it can NEVER fire while the workflow is
+/// parked on the activity — no spurious `TimerFired` that would break the
+/// subsequent `reset()` (an unconsumed fire → non-determinism) or diverge replay.
+fn arm_timer_activity_reset_then_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        handle.reset(300).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({"work": result, "timer": format!("{outcome:?}")}))
+    })
+}
+
+/// (Codex P2 round 4, issue #768 — FIX B) Arm a cancellable timer, cancel it, and
+/// then start a CLASSIC `ctx.timer` with the SAME id in one task. The classic
+/// timer must arm cleanly and fire — the same-batch `CancelTimer` must not leave
+/// the classic timer rescheduled to a deleted row (no hang), and the run must
+/// replay deterministically.
+fn cancel_then_classic_timer_same_id_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        // Classic (suspending) timer, SAME id — replaces the cancelled one.
+        ctx.timer("idle", 60).await.map_err(|e| e.to_string())?;
+        Ok(json!("classic_fired"))
+    })
+}
+
 /// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
 /// activity. Exercises that the test harness persists the pre-suspension
 /// `SideEffectRecorded` event so the next replay iteration does not see drift.
@@ -791,6 +831,105 @@ async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
 
     let report = outcome
         .replay_check(arm_timer_activity_cancel_then_await_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
+    // FIX A primary flow (Codex P2 round 4, issue #768): arm → activity →
+    // reset → await. The armed timer must NOT fire while parked on the
+    // activity — under the round-4 model its durable row is inserted only at
+    // `await_fire`, so a `reset()` after the activity is never confronted with an
+    // already-fired timer (which would leave an unconsumed TimerFired → non-
+    // determinism), and the run replays deterministically to a final `Fired`.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_activity_reset_then_await_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"work": "done", "timer": "Fired"})),
+        "the reset timer must fire after the activity completes: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // No TimerFired may precede ActivityCompleted (the arm-during-activity window
+    // is exactly what round 4 makes non-fire-eligible).
+    let ac = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("ActivityCompleted present");
+    let first_tf = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }));
+    assert!(
+        first_tf.is_none_or(|tf| tf > ac),
+        "no TimerFired may precede ActivityCompleted: {events:?}"
+    );
+    // Exactly one fire (the awaited one), and the reset recorded a cancel + a
+    // fresh arm.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+            .count(),
+        1,
+        "exactly one TimerFired: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "the reset records a TimerCancelled: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(arm_timer_activity_reset_then_await_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_then_classic_timer_same_id_arms_and_fires() {
+    // FIX B (Codex P2 round 4, issue #768): a same-task `start_timer("idle");
+    // cancel(); ctx.timer("idle", n)` must arm the CLASSIC timer cleanly and
+    // fire — the same-batch cancel must not leave the classic timer wedged (no
+    // hang), and the run must replay deterministically.
+    let outcome = WorkflowTestEnv::new()
+        .run(cancel_then_classic_timer_same_id_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!("classic_fired")),
+        "the classic timer must fire after a same-id cancel: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // A cancel is recorded, and the classic timer both starts and fires.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "the cancel records TimerCancelled: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "the classic timer must fire: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(cancel_then_classic_timer_same_id_workflow)
         .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),

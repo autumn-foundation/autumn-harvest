@@ -36,14 +36,24 @@
 //! ## Determinism & the fire-vs-cancel contract
 //!
 //! Arming records a single `TimerStarted`; cancel records a `TimerCancelled`
-//! (an event added for this feature) and deletes the durable timer row so no
-//! `TimerFired` is ever produced for a cancelled timer. A genuine fire-vs-cancel
-//! *race* is resolved deterministically by **recorded-history order** — whichever
-//! of `TimerFired` / `TimerCancelled` for the id is recorded first wins on every
-//! replay, regardless of wall-clock timing on the replaying worker. Fires are
-//! anchored to the Postgres clock (`fires_at = db_now + remaining`, inherited
-//! from `ctx.timer`), so absolute honoring is subject to worker↔database skew —
-//! this is not a skew-proof absolute-time guarantee.
+//! (an event added for this feature) so no `TimerFired` is ever produced for a
+//! cancelled timer. A genuine fire-vs-cancel *race* is resolved deterministically
+//! by **recorded-history order** — whichever of `TimerFired` / `TimerCancelled`
+//! for the id is recorded first wins on every replay, regardless of wall-clock
+//! timing on the replaying worker.
+//!
+//! ## Deadline is measured from `await_fire`, not from `start_timer`
+//!
+//! Arming records only the `TimerStarted` event — the durable `harvest_timers`
+//! row (which makes the timer fire-eligible) is inserted when the timer is
+//! **awaited**, with `fires_at = db_now + duration` at that instant. An
+//! armed-but-unawaited timer therefore never fires while the workflow is parked
+//! on some other wait, matching the "observed only at `await_fire()`" contract.
+//! This suits idle-timeout / debounce / lease patterns (which always await or
+//! reset). Fires are anchored to the Postgres clock, so absolute honoring is
+//! subject to worker↔database skew — this is not a skew-proof absolute-time
+//! guarantee. (This example arms and awaits in the same cycle, so its SLA
+//! deadline coincides with `start_timer` time.)
 //!
 //! ## Composition note
 //!
