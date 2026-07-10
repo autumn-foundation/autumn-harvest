@@ -47,6 +47,10 @@ use uuid::Uuid;
 
 const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
     "\n",
     include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
@@ -296,9 +300,7 @@ async fn seed_failed_with_dlq(
         conn,
         exec_id,
         "FAILED",
-        WorkflowEvent::WorkflowFailed {
-            error: error.to_string(),
-        },
+        WorkflowEvent::workflow_failed(error.to_string()),
     )
     .await;
     let dlq_id = insert_dlq(conn, exec_id, queue, error).await;

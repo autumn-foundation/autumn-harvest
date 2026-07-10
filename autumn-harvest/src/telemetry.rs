@@ -1420,6 +1420,21 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, candidate_count, deleted_count, duration_secs);
     }
 
+    /// Number of history rows the retention janitor deleted for a specific
+    /// workflow type in one tick (issue #737).
+    ///
+    /// Maps to the counter [`METRIC_RETENTION_DELETED`], labeled with the
+    /// low-cardinality `workflow` registry key so operators can confirm
+    /// per-type deletion. Emitted for real deletes only (never dry-run).
+    /// `sum(harvest.retention.deleted)` over the label equals the aggregate
+    /// **workflow-history** deletion count for the tick, *excluding* orphaned
+    /// `harvest_completion_deliveries` reclaims (issue #921) — those rows have
+    /// no owning execution and therefore no workflow name to attribute — so it
+    /// may read below the tick's total `deleted_count`.
+    fn record_retention_deleted(&self, workflow: &str, count: u64) {
+        let _ = (workflow, count);
+    }
+
     /// Current number of RUNNING tasks for a concurrency group key.
     ///
     /// Emitted by the concurrency sampler on every sample interval. The value
@@ -2707,6 +2722,7 @@ mod tests {
         rec.record_schedule_run("workflow", "daily_digest");
         rec.record_schedule_skipped("workflow", "daily_digest", "paused");
         rec.record_retention_tick(0, 100, 50, 0.02);
+        rec.record_retention_deleted("onboarding", 50);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_schedule_to_start("default", 1.5);

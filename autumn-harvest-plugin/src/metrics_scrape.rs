@@ -263,12 +263,21 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         &self,
         shard: u16,
         _candidate_count: u64,
-        deleted_count: u64,
+        _deleted_count: u64,
         _duration_secs: f64,
     ) {
+        // The `harvest.retention.deleted` counter is now owned by
+        // `record_retention_deleted`, which carries a per-workflow-type label
+        // (issue #737). Emitting it here too would double-count. Candidate
+        // count and duration have no scrape metric today; the per-shard tick
+        // observability point is kept as a no-op.
+        let _ = shard;
+    }
+
+    fn record_retention_deleted(&self, workflow: &str, count: u64) {
         self.0
             .retention_deleted
-            .incr(vec![shard.to_string()], deleted_count);
+            .incr(vec![workflow.to_owned()], count);
     }
 
     fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
@@ -465,8 +474,8 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_counter(
         families,
         "harvest_retention_deleted_total",
-        "Total number of records deleted by the retention sweep",
-        &[METRIC_LABEL_SHARD],
+        "Total number of records deleted by the retention sweep, per workflow type",
+        &[METRIC_LABEL_WORKFLOW],
         inner.retention_deleted.snapshot(),
     );
 }
@@ -691,13 +700,19 @@ mod tests {
     }
 
     #[test]
-    fn retention_deleted_is_a_counter_labeled_by_shard() {
+    fn retention_deleted_is_a_counter_labeled_by_workflow() {
+        // Issue #737: the `harvest.retention.deleted` counter is now owned by
+        // `record_retention_deleted` and carries a per-workflow-type label; the
+        // per-shard `record_retention_tick` no longer emits it (avoids
+        // double-count). See metrics_rs_adapter.rs for the mirror.
         let recorder = HarvestMetricsRecorder::new();
+        // A tick alone emits nothing for this counter now.
         recorder.record_retention_tick(0, 100, 42, 0.5);
+        recorder.record_retention_deleted("onboarding", 42);
 
         let families = recorder.collect();
         let f = family(&families, "harvest_retention_deleted_total");
-        assert_eq!(sample_value(f, &[("shard", "0")]), 42.0);
+        assert_eq!(sample_value(f, &[("workflow", "onboarding")]), 42.0);
     }
 
     #[test]

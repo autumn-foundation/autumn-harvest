@@ -14,6 +14,7 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -38,15 +39,16 @@ use autumn_harvest::audit::{
     OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
     OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW,
+    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
+    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
+    TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -173,6 +175,24 @@ pub struct HarvestApiRuntime {
     scheduler: SchedulerMonitor,
     retention: HarvestRetentionRuntime,
     router: ShardRouter,
+    /// Secret-free effective-config snapshot (issue #695), served by
+    /// `GET /admin/config`. Carried on the runtime itself so the snapshot is
+    /// captured exactly where the resolved config is known — no separate
+    /// `set_effective_config` call the integrator must remember. The shared
+    /// `HarvestRunner::start` seam (which every `BuiltHarvest` consumer funnels
+    /// through) attaches the resolved snapshot via
+    /// [`HarvestApiRuntime::with_effective_config`], so any deployment that boots
+    /// through the runner/plugin path serves the real config.
+    ///
+    /// **`None` when never captured** — `HarvestApiRuntime::new` deliberately
+    /// leaves this unset so a runtime built directly through the public
+    /// constructor (bypassing the runner seam) *fails closed* on `GET
+    /// /admin/config` rather than serving a fabricated defaults placeholder. For
+    /// an incident-triage endpoint a plausible-but-wrong config is worse than an
+    /// honest error, so a snapshot is only ever served when it was genuinely
+    /// captured from the resolved configuration.
+    /// Wrapped in `Arc` so the per-request `runtime()` clone stays cheap.
+    effective_config: Option<Arc<autumn_harvest::effective_config::EffectiveConfigView>>,
 }
 
 impl HarvestApiRuntime {
@@ -211,6 +231,12 @@ impl HarvestApiRuntime {
             scheduler,
             retention,
             router: router.clone(),
+            // Left unset here — the resolved snapshot is attached by the shared
+            // `HarvestRunner::start` seam via `with_effective_config`. A runtime
+            // built directly through this public constructor that skips the
+            // override fails closed on `GET /admin/config` (see the field doc)
+            // rather than serving a fabricated defaults placeholder.
+            effective_config: None,
         };
         if let Some(first_queue) = this.queues.as_slice().first()
             && let Ok(mut lock) =
@@ -247,6 +273,38 @@ impl HarvestApiRuntime {
         registered.extend(names);
         self.registered_dag_names = Arc::new(registered);
         self
+    }
+
+    /// Attach the resolved, secret-free effective-config snapshot (issue #695).
+    ///
+    /// Called by the shared `HarvestRunner::start` bring-up path — the one seam
+    /// every `BuiltHarvest` consumer (the `HarvestPlugin` web-app path and the
+    /// standalone runner) funnels through — so `GET /admin/config` serves the
+    /// resolved configuration on any deployment that installs this runtime,
+    /// without a separate `set_effective_config` call to remember. A runtime
+    /// built through [`HarvestApiRuntime::new`] without this call carries no
+    /// snapshot and fails closed on `GET /admin/config`.
+    #[must_use]
+    pub fn with_effective_config(
+        mut self,
+        view: autumn_harvest::effective_config::EffectiveConfigView,
+    ) -> Self {
+        self.effective_config = Some(Arc::new(view));
+        self
+    }
+
+    /// The resolved effective-config snapshot carried by this runtime (issue #695).
+    ///
+    /// Returns `None` when the runtime was built through the public
+    /// [`HarvestApiRuntime::new`] constructor without
+    /// [`with_effective_config`](HarvestApiRuntime::with_effective_config) — the
+    /// `GET /admin/config` handler fails closed in that case rather than serving
+    /// a fabricated placeholder.
+    #[must_use]
+    pub(crate) fn effective_config(
+        &self,
+    ) -> Option<autumn_harvest::effective_config::EffectiveConfigView> {
+        self.effective_config.as_ref().map(|v| (**v).clone())
     }
 
     #[must_use]
@@ -352,6 +410,14 @@ pub struct HarvestApiState {
     /// Default **off**: responses are byte-for-byte identical to a build
     /// without the feature.
     decode_payloads_on_read: Arc<Mutex<bool>>,
+    /// Retention window for request-scoped start idempotency keys (issue #808),
+    /// mirrored from `BuiltHarvest::start_idempotency_window` at startup so the
+    /// HTTP start route dedups a repeated `idempotency_key` within this window.
+    /// Defaults to 24h.
+    start_idempotency_window: Arc<Mutex<std::time::Duration>>,
+    /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
+    /// Starter defaults; overridable per deployment via the plugin builder.
+    status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
 }
 
 impl Default for HarvestApiState {
@@ -395,6 +461,12 @@ impl Default for HarvestApiState {
                 autumn_harvest::payload_codec::PayloadCodecs::default(),
             )),
             decode_payloads_on_read: Arc::new(Mutex::new(false)),
+            start_idempotency_window: Arc::new(Mutex::new(
+                autumn_harvest::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+            )),
+            status_thresholds: Arc::new(Mutex::new(
+                crate::status_summary::StatusThresholds::default(),
+            )),
         }
     }
 }
@@ -578,6 +650,32 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = enabled;
     }
 
+    /// Override the thresholds for the rolled-up `GET /admin/status` verdict
+    /// (issue #679). Mirrored from the plugin builder at startup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_status_thresholds(&self, thresholds: crate::status_summary::StatusThresholds) {
+        *self
+            .status_thresholds
+            .lock()
+            .expect("harvest api state lock poisoned") = thresholds;
+    }
+
+    /// Current thresholds for the rolled-up `GET /admin/status` verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn status_thresholds(&self) -> crate::status_summary::StatusThresholds {
+        self.status_thresholds
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
+    }
+
     /// Whether read-path payload decoding is enabled (issue #608).
     ///
     /// # Panics
@@ -725,6 +823,32 @@ impl HarvestApiState {
             .default_debounce_max_wait
             .lock()
             .expect("harvest api state lock poisoned") = max_wait;
+    }
+
+    /// Returns the retention window for request-scoped start idempotency keys
+    /// (issue #808). Defaults to 24h.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
+    pub fn start_idempotency_window(&self) -> std::time::Duration {
+        *self
+            .start_idempotency_window
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the start-idempotency retention window (issue #808).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_start_idempotency_window(&self, window: std::time::Duration) {
+        *self
+            .start_idempotency_window
+            .lock()
+            .expect("harvest api state lock poisoned") = window;
     }
 
     /// Returns the ceiling on the `[from, to]` window accepted by
@@ -1223,6 +1347,10 @@ struct WorkflowDetailsResponse {
     history_truncated: bool,
     /// URL path of the paginated history endpoint for this execution (issue #529).
     history_endpoint: String,
+    /// `true` when the execution is currently under an ACTIVE legal hold
+    /// (issue #747): derived via `legal_hold_active` against the current time.
+    /// The raw `legal_hold_*` columns are also auto-surfaced under `execution`.
+    legal_hold: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1753,6 +1881,16 @@ pub(crate) struct StartWorkflowResponse {
     workflow_name: String,
     workflow_id: String,
     state: String,
+    /// `true` when this request created the execution, `false` when it
+    /// deduplicated onto an earlier same-`idempotency_key` start (issue #808).
+    /// Populated only on the idempotency-key path; omitted (byte-identical to a
+    /// pre-#808 response) otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_fresh: Option<bool>,
+    /// `true` when this request was a no-op that returned an existing execution
+    /// via a matching `idempotency_key` (issue #808). Omitted on the no-key path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deduplicated: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2056,6 +2194,15 @@ pub(crate) struct StartWorkflowRequest {
     context_headers: Option<std::collections::HashMap<String, String>>,
     /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
     priority: Option<autumn_harvest::types::Priority>,
+    /// Request-scoped idempotency key (issue #808). Two starts carrying the same
+    /// key (within the configured retention window, default 24h) converge on
+    /// exactly one execution — the second returns the same `execution_id` as a
+    /// no-op (`200`), with no second `WorkflowStarted` event. Dedup scope is
+    /// `(workflow_name, idempotency_key)`, independent of `workflow_id`. The
+    /// `Idempotency-Key` request header takes precedence over this field.
+    /// Mutually exclusive with a throttle / debounce / batch policy.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 impl StartWorkflowRequest {
@@ -2085,6 +2232,7 @@ impl StartWorkflowRequest {
             completion_callbacks: None,
             context_headers: None,
             priority: None,
+            idempotency_key: None,
         }
     }
 
@@ -2123,6 +2271,7 @@ impl StartWorkflowRequest {
             completion_callbacks: None,
             context_headers: None,
             priority: None,
+            idempotency_key: None,
         }
     }
 }
@@ -2740,6 +2889,9 @@ pub(crate) struct WorkflowFilters {
     /// When true, return only RUNNING executions currently blocked on replay
     /// non-determinism (issue #603).
     pub(crate) nd_blocked: bool,
+    /// When true, return only executions currently under an active legal hold
+    /// (issue #747).
+    pub(crate) legal_hold: bool,
     /// Only return executions with at least this many recorded events (issue #493).
     pub(crate) min_history_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
@@ -3216,6 +3368,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/legal-hold",
+            post(set_legal_hold_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/legal-hold/release",
+            post(release_legal_hold_handler).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
             post(retry_activity_now).route_layer(require_admin.clone()),
         )
@@ -3269,6 +3429,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             post(retry_dag_run),
         )
+        // DAG run graph view (issue #690): read-only, admin-guarded per AC1.
+        // Note the asymmetry with the sibling `/dags/*` read routes (e.g.
+        // GET /dags/{dag_name}/runs), which carry no `require_admin` layer and
+        // rely only on the embedder's optional `api_with_auth` boundary — a
+        // pre-existing posture left unchanged here. This route adds the admin
+        // layer because issue #690 AC1 explicitly mandates it.
+        .route(
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            get(get_dag_run_graph).route_layer(require_admin.clone()),
+        )
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
         .route(
@@ -3303,6 +3473,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/admin/shards/health",
             get(shards_health).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/status",
+            get(admin_status).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/config",
+            get(effective_config).route_layer(require_admin.clone()),
         )
         .route(
             "/admin/version-gates/usage",
@@ -3812,6 +3990,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/erase-payloads"),
+        ("POST", "/workflows/{id}/legal-hold"),
+        ("POST", "/workflows/{id}/legal-hold/release"),
         (
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
@@ -3835,6 +4015,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags"),
         ("GET", "/dags/{dag_name}/runs"),
+        ("GET", "/dags/{dag_name}/runs/{run_exec_id}"),
         ("POST", "/dags/{dag_name}/runs/{run_exec_id}/retry"),
         ("POST", "/dags/{dag_name}/trigger"),
         ("PATCH", "/dags/{dag_name}"),
@@ -3869,6 +4050,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/health"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
+        ("GET", "/admin/status"),
+        ("GET", "/admin/config"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -3971,6 +4154,7 @@ pub const fn management_api_request_fields()
                 "batch_max_size",
                 "batch_max_wait",
                 "completion_callbacks",
+                "idempotency_key",
             ]),
         ),
         (
@@ -4027,6 +4211,12 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         ("POST", "/workflows/{id}/erase-payloads", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/legal-hold",
+            Some(&["reason", "hold_until"]),
+        ),
+        ("POST", "/workflows/{id}/legal-hold/release", Some(&[])),
         (
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
@@ -4391,6 +4581,8 @@ pub const fn management_api_response_fields()
             // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
             // A debounced workflow (issue #499) instead returns 202 Accepted with the
             // debounce fields below (no execution_id exists until the scanner fires).
+            // With an idempotency_key (issue #808) the response also carries the
+            // started_fresh/deduplicated flags (200 on a dedup replay).
             Some(&[
                 "execution_id",
                 "workflow_name",
@@ -4404,6 +4596,8 @@ pub const fn management_api_response_fields()
                 "flushed",
                 "batch_key",
                 "max_size",
+                "started_fresh",
+                "deduplicated",
             ]),
         ),
         (
@@ -4496,6 +4690,34 @@ pub const fn management_api_response_fields()
         ),
         (
             "POST",
+            "/workflows/{id}/legal-hold",
+            Some(&[
+                "execution_id",
+                "held",
+                "legal_hold_reason",
+                "legal_hold_actor",
+                "legal_hold_set_at",
+                "legal_hold_until",
+                "newly_held",
+                "released",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/legal-hold/release",
+            Some(&[
+                "execution_id",
+                "held",
+                "legal_hold_reason",
+                "legal_hold_actor",
+                "legal_hold_set_at",
+                "legal_hold_until",
+                "newly_held",
+                "released",
+            ]),
+        ),
+        (
+            "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
             Some(&[
                 "ok",
@@ -4581,6 +4803,18 @@ pub const fn management_api_response_fields()
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags", None),                 // Vec<DagSummary>
         ("GET", "/dags/{dag_name}/runs", None), // Vec<WorkflowExecution>
+        (
+            "GET",
+            "/dags/{dag_name}/runs/{run_exec_id}",
+            Some(&[
+                "run_exec_id",
+                "dag_name",
+                "state",
+                "started_at",
+                "finished_at",
+                "nodes",
+            ]),
+        ),
         (
             "POST",
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
@@ -4726,6 +4960,22 @@ pub const fn management_api_response_fields()
                 "freshness_window_secs",
                 "candidate_shard",
                 "shards",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/status",
+            Some(&["status", "as_of", "subsystems", "unavailable_shards"]),
+        ),
+        (
+            "GET",
+            "/admin/config",
+            Some(&[
+                "worker",
+                "payload_caps",
+                "shard_topology",
+                "features",
+                "pool",
             ]),
         ),
         (
@@ -5185,6 +5435,49 @@ async fn shards_health(
     Query(query): Query<ShardHealthQuery>,
 ) -> Json<ShardHealthReport> {
     Json(build_shard_health_report(&api_state, query.candidate_shard).await)
+}
+
+/// `GET /admin/status` — rolled-up management health summary (issue #679).
+///
+/// Composes five existing read models (workers, shards, dead-letters, queues,
+/// stalled workflows) into one JSON document with a single worst-of verdict.
+/// Read-only and admin-gated; never fails wholesale on an unreachable shard.
+async fn admin_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Json<crate::status_summary::HealthSummaryReport> {
+    let thresholds = api_state.status_thresholds();
+    Json(crate::status_summary::build_status_report(&api_state, &thresholds).await)
+}
+
+/// `GET /admin/config` — return the resolved effective runtime configuration,
+/// secret-free (issue #695).
+///
+/// Read-only, admin-gated. Serves the [`EffectiveConfigView`] carried by the
+/// installed runtime. Secret-bearing configuration (notification URLs, sharded
+/// pool handle) is surfaced only as presence booleans/counts — never a value —
+/// so a connection string can never appear in the response.
+///
+/// The snapshot lives *on* the [`HarvestApiRuntime`] (attached by the shared
+/// `HarvestRunner::start` bring-up seam every deployment funnels through). A
+/// genuinely un-started runtime fails closed with the standard "runtime not
+/// started" error. A runtime installed through the public
+/// [`HarvestApiRuntime::new`] constructor without
+/// [`HarvestApiRuntime::with_effective_config`] carries no captured snapshot and
+/// *also* fails closed — for an incident-triage endpoint a plausible-but-wrong
+/// fabricated config is worse than an honest error, so a placeholder is never
+/// served.
+///
+/// [`EffectiveConfigView`]: autumn_harvest::effective_config::EffectiveConfigView
+async fn effective_config(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<autumn_harvest::effective_config::EffectiveConfigView>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let view = runtime.effective_config().ok_or_else(|| {
+        map_error(HarvestError::Config(
+            "effective configuration not available".to_string(),
+        ))
+    })?;
+    Ok(Json(view))
 }
 
 async fn version_usage(
@@ -5984,6 +6277,9 @@ pub(crate) fn parse_workflow_filters(
             "nd_blocked" => {
                 filters.nd_blocked = value.trim().eq_ignore_ascii_case("true");
             }
+            "legal_hold" => {
+                filters.legal_hold = value.trim().eq_ignore_ascii_case("true");
+            }
             "min_history_events" => {
                 let parsed = value.trim().parse::<u64>().map_err(|_| {
                     AutumnError::bad_request_msg(format!(
@@ -6435,6 +6731,12 @@ async fn get_workflow(
         .await;
     }
 
+    let legal_hold = autumn_harvest::legal_hold_active(
+        execution.legal_hold_set_at,
+        execution.legal_hold_until,
+        chrono::Utc::now(),
+    );
+
     Ok(Json(WorkflowDetailsResponse {
         parent_id: execution.parent_id,
         execution,
@@ -6445,6 +6747,7 @@ async fn get_workflow(
         scheduled_time,
         history_truncated,
         history_endpoint,
+        legal_hold,
     }))
 }
 
@@ -8374,15 +8677,274 @@ fn workflow_resolving_throttle(
     )
 }
 
+/// Maximum accepted length (in bytes, after trimming) for a request-scoped
+/// `idempotency_key` (issue #808).
+///
+/// The key is half of the composite PRIMARY KEY `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency`; an oversized key would
+/// exceed Postgres's ~2704-byte btree index tuple limit and error at INSERT,
+/// leaking a `500` on client-controlled input. Cap it conservatively so
+/// `workflow_name` + key stays well under that limit and a too-long key is a
+/// clean `400` at the API boundary instead.
+const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
+
+/// Shared trim + empty-`400` + length-cap validation for a request-scoped
+/// `idempotency_key` (issue #808), used by both the `Idempotency-Key` header
+/// and the body-field source so the two never diverge. `Ok(None)` = no key;
+/// `Ok(Some(k))` = a valid trimmed key; `Err(resp)` = a `400` for an empty or
+/// over-long key.
+#[allow(clippy::result_large_err)]
+fn validate_start_idempotency_key(
+    raw: Option<String>,
+) -> Result<Option<String>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    match raw {
+        Some(s) if s.trim().is_empty() => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "idempotency_key must not be empty" })),
+        )
+            .into_response()),
+        Some(s) => {
+            let trimmed = s.trim();
+            // Cap the key length: it is half of the composite PK on
+            // harvest_start_idempotency, so an oversized key would overflow the
+            // btree tuple limit and 500 at INSERT on client-controlled input.
+            // Reject it cleanly at the boundary instead.
+            if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN})"
+                        )
+                    })),
+                )
+                    .into_response());
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Extract the `Idempotency-Key` HEADER value (issue #808), applying the same
+/// trim/empty/length-cap rules as the body field via
+/// [`validate_start_idempotency_key`]. `Err` is a `400` (invalid UTF-8, empty,
+/// or over-long); `Ok(None)` = header absent. Independent of the request body,
+/// so it is usable even when the JSON body failed to deserialize.
+#[allow(clippy::result_large_err)]
+fn extract_start_idempotency_header_key(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let raw = match headers.get(HEADER_IDEMPOTENCY_KEY) {
+        Some(hv) => match hv.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Idempotency-Key header must be valid UTF-8"
+                    })),
+                )
+                    .into_response());
+            }
+        },
+        None => None,
+    };
+    validate_start_idempotency_key(raw)
+}
+
+/// Read-only committed-replay dedup probe (issue #808). On `shard`, look up a
+/// live idempotency claim for `(workflow_name, key)`; on a hit, load the claimed
+/// execution and return a `200` no-op response (writing a best-effort dedup
+/// audit row). Returns `None` on a miss, a vanished row (retention-deleted in
+/// the gap), or any read error — the caller then falls through to the
+/// fresh-start path (or, for a malformed body, the extractor rejection).
+///
+/// Standard idempotency-key semantics: on a hit the original execution is
+/// returned verbatim, the retry's body is irrelevant, and there is no
+/// body-mismatch detection (out of scope for #808).
+#[allow(clippy::too_many_arguments)]
+async fn probe_committed_start_replay(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    key: &str,
+    shard: ShardId,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    route: &'static str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let pool = api_state.storage_pool().ok()?;
+    let mut probe_conn = acquire_conn(pool.pool_for(shard)).await.ok()?;
+    let window_secs = api_state.start_idempotency_window().as_secs_f64();
+    let claim_exec_id = autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
+        &mut probe_conn,
+        workflow_name,
+        key,
+        window_secs,
+    )
+    .await
+    .ok()??;
+    // `lookup_live_start_idempotency_claim` JOINs to the execution row, so a
+    // `Some` claim implies the row existed at lookup time. Re-read its identity
+    // for the no-op response; if it vanished or the read errors, return `None`
+    // so the caller re-reserves / reclaims as needed.
+    let (dup_workflow_id, dup_state) = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
+        .select((
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+        ))
+        .first::<(String, String)>(&mut probe_conn)
+        .await
+        .optional()
+        .ok()??;
+    // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
+    // 503-on-audit-failure): the original start was already audited when it
+    // created the run, so a failed audit here is a no-op read and never fails
+    // the reply.
+    let exec_id_str = claim_exec_id.to_string();
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_START,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id,
+        idempotency_key: Some(key),
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(shard.as_i32()),
+        source,
+    };
+    let _ = audit::insert_audit(&mut probe_conn, &ar).await;
+    Some(
+        (
+            axum::http::StatusCode::OK,
+            Json(StartWorkflowResponse {
+                execution_id: claim_exec_id.to_string(),
+                workflow_name: workflow_name.to_string(),
+                workflow_id: dup_workflow_id,
+                state: dup_state,
+                started_fresh: Some(false),
+                deduplicated: Some(true),
+            }),
+        )
+            .into_response(),
+    )
+}
+
+/// Handle a `start_workflow` request whose JSON body failed to deserialize
+/// (issue #808, Codex P2). axum rejects a malformed `Json<T>` body before the
+/// handler runs, but a retry that carries its exactly-once key in the
+/// `Idempotency-Key` HEADER (body irrelevant on a committed-key hit) must still
+/// return the advertised `200` no-op rather than the extractor's `400`/`422`.
+///
+/// If a valid header key is present we probe the committed claim routed by the
+/// KEY — the body is unparsed so `workflow_id` is unknown, and the
+/// `workflow_id`-aware routing rule cannot be applied here (see the residual
+/// documented at the call site). On a hit we return the `200` no-op; on a miss
+/// (or no header key / an over-long or invalid-UTF-8 header key surfaced as its
+/// own `400`) we return the exact axum rejection, so the malformed-body wire
+/// response is byte-for-byte what axum produces today (AC1: the no-key path is
+/// unchanged).
+///
+/// This fallback recognizes only the HEADER key. A key supplied solely in the
+/// body `idempotency_key` field cannot be recovered from an undeserializable
+/// body (`JsonRejection` carries no raw bytes), so by design a body-field key
+/// requires a structurally-valid body to be recognized on retry — use the
+/// `Idempotency-Key` header for body-independent replay recognition. See the
+/// no-header-key arm below and docs/getting-started/06-idempotency.md.
+async fn handle_malformed_start_body(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    headers: &axum::http::HeaderMap,
+    rejection: JsonRejection,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let header_key = match extract_start_idempotency_header_key(headers) {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
+    let Some(key) = header_key else {
+        // No header key → the exact axum rejection (AC1: byte-for-byte no-key
+        // malformed-body behavior).
+        //
+        // NOTE (issue #808, Codex P2): this fallback probes the HEADER key ONLY.
+        // A key supplied solely in the body `idempotency_key` field is NOT
+        // recovered here: `JsonRejection` does not carry the raw request bytes,
+        // so an otherwise-undeserializable body cannot be parsed to read that
+        // field without abandoning the clean `Result<Json, JsonRejection>`
+        // extractor for raw-byte parsing plus manually replicating axum's exact
+        // per-variant rejection responses (preserving the AC1 byte-for-byte
+        // no-key wire behavior). By design, a body-field key therefore requires a
+        // structurally-valid (deserializable) body to be recognized on retry;
+        // the `Idempotency-Key` header is the body-independent mechanism. See
+        // docs/getting-started/06-idempotency.md.
+        return rejection.into_response();
+    };
+    let Ok(runtime) = api_state.runtime() else {
+        // Runtime not installed → surface the body error unchanged; we cannot
+        // route without the router.
+        return rejection.into_response();
+    };
+    // NOTE (issue #808, Codex P2 residual): route the probe by the KEY only —
+    // the body is unparsed so `workflow_id` is unknown, so the explicit-
+    // `workflow_id` → route-by-`workflow_id` rule (see the shard resolution at
+    // the main call site) cannot be applied here. A committed replay whose
+    // ORIGINAL delivery supplied an explicit `workflow_id` (and was therefore
+    // routed to, and claimed on, the `workflow_id`-derived shard) is not found
+    // by this key-routed fallback and still returns the extractor rejection.
+    // This is safe (never a false dedup, never a duplicate run) and narrow: the
+    // common header-key usage omits `workflow_id` (auto-generated), which routes
+    // by the key and IS found. A well-behaved client sends a consistent valid
+    // body on retries.
+    let shard = runtime.router.pick_for_idempotency_key(workflow_name, &key);
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+    if let Some(resp) = probe_committed_start_replay(
+        api_state,
+        workflow_name,
+        &key,
+        shard,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        route,
+    )
+    .await
+    {
+        return resp;
+    }
+    rejection.into_response()
+}
+
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<StartWorkflowRequest>,
+    body: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
+    // body no longer short-circuits with axum's `400`/`422` before the handler
+    // runs. A retry that carries its exactly-once key in the `Idempotency-Key`
+    // HEADER (its body being irrelevant on a committed-key hit) is routed to the
+    // committed-replay probe; otherwise the exact axum rejection is returned so
+    // the no-key malformed-body wire response is unchanged (AC1).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return handle_malformed_start_body(&api_state, &workflow_name, &headers, rejection)
+                .await;
+        }
+    };
 
     if matches!(
         request.reuse_policy.as_deref(),
@@ -8448,6 +9010,172 @@ pub(crate) async fn start_workflow(
         .into_response();
     }
 
+    // Request-scoped idempotency key (issue #808). The `Idempotency-Key` request
+    // header wins over the body `idempotency_key` field. A present-but-empty (or
+    // whitespace-only) key is a client error surfaced as `400`, never silently
+    // downgraded to a non-idempotent start. Header and body share one validation
+    // path (`validate_start_idempotency_key`), so the two never diverge — the
+    // same helpers back the malformed-body probe above.
+    let idempotency_key: Option<String> = match extract_start_idempotency_header_key(&headers) {
+        Err(resp) => return resp,
+        // Header wins when present and valid.
+        Ok(Some(k)) => Some(k),
+        // Header absent → fall back to the body field, same validation.
+        Ok(None) => match validate_start_idempotency_key(request.idempotency_key.clone()) {
+            Err(resp) => return resp,
+            Ok(k) => k,
+        },
+    };
+
+    let explicit_workflow_id = request.workflow_id.is_some();
+    let mut workflow_id = request
+        .workflow_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let queue_name = request
+        .queue
+        .or_else(|| runtime.queues.as_slice().first().cloned())
+        .unwrap_or_else(|| "default".to_string());
+    let input = request.input.unwrap_or(Value::Null);
+
+    // Compute target shard early so the gate check can filter by shard-scoped gates.
+    //
+    // issue #808: a request-scoped `idempotency_key` routes by the KEY
+    // (rendezvous over `(workflow_name, idempotency_key)`) — but ONLY when the
+    // `workflow_id` was auto-generated (omitted). In that case there is no
+    // stable business identity to preserve, and the per-request `workflow_id`
+    // varies per retry, so routing by `workflow_id` would scatter same-key
+    // retries across shards in a multi-shard deployment (a separate
+    // `harvest_start_idempotency` claim row per shard, hence a separate
+    // execution per shard), defeating dedup — routing by the key is what
+    // co-locates them.
+    //
+    // When the caller supplies an EXPLICIT `workflow_id`, route by
+    // `workflow_id` instead (the pre-#808 behavior). An explicit `workflow_id`
+    // is a stable business identity: routing by it *also* co-locates same-key
+    // retries (the `workflow_id` is constant across them) AND keeps the start
+    // on the shard that owns `(workflow_name, workflow_id)`, which the
+    // reuse-policy matrix and the shard-local `(name, workflow_id)` uniqueness
+    // invariant depend on. Routing a keyed-and-explicit start by the key would
+    // land it on the key-derived shard, where `start_or_load_workflow_execution`
+    // cannot see an existing `(name, workflow_id)` run living on the
+    // `workflow_id`-derived shard — silently breaking `RejectDuplicate` /
+    // `AllowDuplicate` and the uniqueness invariant. This branch is the
+    // resolution of the P1↔P2 routing tension (see docs/getting-started/
+    // 06-idempotency.md): always-route-by-key reintroduces the P1 duplicate-run
+    // for explicit-`workflow_id` starts, and always-route-by-`workflow_id`
+    // breaks the P2/AC3 auto-gen dedup case — the two cannot coexist under
+    // #808's shard-local, no-cross-shard-probe scope. Consistency caveat: for
+    // keyed dedup to converge, a client must supply a consistent `workflow_id`
+    // (same value, or consistently omitted) across retries of the same delivery
+    // — a retry that changes its explicit `workflow_id` is not a retry of the
+    // same delivery and can route to a different shard. The no-key path is
+    // byte-for-byte unchanged.
+    let shard = if let Some(ref key) = idempotency_key
+        && !explicit_workflow_id
+    {
+        runtime.router.pick_for_idempotency_key(&workflow_name, key)
+    } else {
+        runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+    };
+
+    // issue #808 (Codex P2): when a keyed start OMITS `workflow_id`, the server
+    // auto-generates it AND (per the routing rule above) routes the start by the
+    // KEY onto `shard`. But a random auto-generated `workflow_id` hashes via
+    // `pick_for_new_workflow` to a potentially DIFFERENT shard than `shard` (the
+    // key-shard). If a later request then uses the RETURNED `workflow_id`
+    // explicitly — a client echoing the response's `workflow_id`, or a fresh
+    // no-key `RejectDuplicate` start on that id — it routes via
+    // `pick_for_new_workflow` to the `workflow_id`-shard, cannot see the
+    // execution (which lives on the key-shard), and creates a SECOND active run
+    // with the same `workflow_id`, breaking the shard-local `(workflow_name,
+    // workflow_id)` uniqueness invariant. Mint the auto-generated `workflow_id`
+    // by bounded rejection sampling so it hashes to the key-shard, making its
+    // later explicit reuse route consistently to the shard the execution lives
+    // on. Both `pick_for_new_workflow` and `pick_for_idempotency_key` apply the
+    // writable-subset redirect, so `shard` is comparable. Single-shard (default)
+    // converges on the first candidate (`pick_for_new_workflow` returns the one
+    // shard); multi-shard converges in ~N expected iterations (cheap seahash) —
+    // the cap is a safety backstop only. Explicit client-chosen `workflow_id`s
+    // (routed by `workflow_id`, subject to the documented consistency caveat) and
+    // the no-key path are UNCHANGED.
+    if idempotency_key.is_some() && !explicit_workflow_id {
+        const MINT_CAP: u32 = 10_000;
+        let mut attempts = 0u32;
+        while runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+            != shard
+        {
+            attempts += 1;
+            if attempts > MINT_CAP {
+                tracing::warn!(
+                    workflow_name = %workflow_name,
+                    shard = ?shard,
+                    "could not mint a workflow_id on the idempotency-key shard after {attempts} attempts; using last candidate"
+                );
+                break;
+            }
+            workflow_id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
+    // precede ALL fresh-start-only rejections (reuse-policy parse,
+    // throttle/debounce/batch mutual-exclusion, input-schema #373,
+    // completion-callback SSRF #605, delay/`start_at`, admission gate #377) so a
+    // retry of an already-successful key always returns the `200` no-op
+    // regardless of a now-invalid replay body or a policy tightened after the
+    // original delivery. Those rules govern *fresh* work; a retry of an
+    // already-successful keyed start creates no new work, so tightening any of
+    // them — or sending a now-invalid `reuse_policy` string, or the workflow
+    // gaining a throttle/debounce/batch policy — between the original delivery
+    // and a retry must not reject the retry. The probe therefore runs before
+    // `parse_reuse_policy` and before the debounce/batch/throttle applicability
+    // is even computed; those apply only to a genuine fresh keyed start (a probe
+    // miss). Only genuine prerequisites run above it: key validation, the
+    // registry/DAG 404/400 existence check, and workflow_id + shard resolution
+    // (needed to know which shard to probe). The `terminate_if_running` admin
+    // gate at the very top of the handler is an authorization boundary (not a
+    // fresh-start validation) and deliberately stays ahead of the probe — a
+    // non-admin must never be able to invoke that capability, and a legitimate
+    // idempotent retry comes from the same authorized caller anyway.
+    //
+    // We probe the keyed claim read-only on the same key-derived `shard` the
+    // reserve below uses (so we observe the claim the original delivery wrote),
+    // and a hit returns the original execution verbatim — standard
+    // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
+    // detection (out of scope for #808). A miss falls through to the full
+    // fresh-start path unchanged, whose reserve+start transaction's `ON CONFLICT`
+    // upsert (with a row lock) remains the *authoritative* dedup for the
+    // concurrent-first-delivery race: two simultaneous first deliveries both miss
+    // this probe (nothing committed yet), both proceed, and the reserve
+    // serializes them → one creates, one dedups. This early probe is an
+    // additional fast-path for COMMITTED replays only, never a replacement for
+    // the reserve.
+    if let Some(ref key) = idempotency_key
+        && let Some(resp) = probe_committed_start_replay(
+            &api_state,
+            &workflow_name,
+            key,
+            shard,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            route,
+        )
+        .await
+    {
+        return resp;
+    }
+
+    // Fresh-start-only validation: parse the reuse policy. Runs AFTER the
+    // committed-replay probe above (issue #808, Codex P2) so a retry of an
+    // already-successful keyed start with a now-invalid `reuse_policy` string
+    // returns the `200` no-op rather than a `400` — the retry's body is
+    // irrelevant on a dedup hit. The parsed `reuse_policy` is only consumed by
+    // the reserve+start path further down.
     let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -8472,20 +9200,6 @@ pub(crate) async fn start_workflow(
             return e.into_response();
         }
     };
-    let explicit_workflow_id = request.workflow_id.is_some();
-    let workflow_id = request
-        .workflow_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let queue_name = request
-        .queue
-        .or_else(|| runtime.queues.as_slice().first().cloned())
-        .unwrap_or_else(|| "default".to_string());
-    let input = request.input.unwrap_or(Value::Null);
-
-    // Compute target shard early so the gate check can filter by shard-scoped gates.
-    let shard = runtime
-        .router
-        .pick_for_new_workflow(&workflow_name, &workflow_id);
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
@@ -8586,6 +9300,25 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
+    // issue #808: a request-scoped idempotency key requires a synchronous, single
+    // execution id to converge on. Throttle / debounce / batch all defer the
+    // start and return no exec id up front, so "converge on the same exec id" has
+    // no coherent meaning combined with them — reject the combination. This only
+    // reaches a *genuine fresh* keyed start: the committed-replay probe above
+    // already short-circuited an at-least-once retry of an earlier keyed start to
+    // a `200` no-op before this check, so a workflow that gained a throttle/
+    // debounce/batch policy after an original keyed start still returns the
+    // existing execution rather than a `400` on retry.
+    if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "idempotency_key cannot be combined with throttle/debounce/batch start"
+            })),
+        )
+            .into_response();
+    }
+
     // issue #377: check admission gates before touching the DB.
     if !is_debounced_start && !has_batch_policy {
         let wf_owner = runtime
@@ -8611,6 +9344,14 @@ pub(crate) async fn start_workflow(
             // so the gate must not block that case either. Checked only when
             // this workflow actually resolves a throttle policy, to avoid an
             // extra round-trip for the common non-throttled case.
+            //
+            // issue #808 (Codex P2): a *keyed* replay is handled earlier — a
+            // committed keyed claim short-circuits to the `200` no-op before this
+            // gate is even consulted (see the probe above the gate). So by the
+            // time control reaches here with an idempotency key set, it is a
+            // genuinely fresh keyed start with no live claim, which must pass
+            // through the gate normally. This bypass therefore only covers the
+            // explicit-`workflow_id` idempotent-retry case.
             let is_idempotent_retry = if explicit_workflow_id {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
@@ -9844,6 +10585,233 @@ pub(crate) async fn start_workflow(
         }
     }
 
+    // issue #808: request-scoped idempotency. The reserve + start run in a single
+    // transaction (reserve short-circuits the reuse-policy matrix entirely); a
+    // same-key retry converges on the same execution as a `200` no-op. This is
+    // mutually exclusive with throttle/debounce/batch (rejected above), so
+    // `throttle_reserved` is always `None` here and no token refund is needed.
+    if let Some(ref key) = idempotency_key {
+        // Validate execution_timeout_secs BEFORE building params: the range
+        // guard inside the debounce/batch blocks is skipped for keyed starts
+        // (they are mutually exclusive), and `chrono::Duration::seconds` panics
+        // on an out-of-range i64. Mirror the existing 400 guard so an untrusted
+        // value is a clean bad request, never a 500. (issue #808)
+        if let Some(secs) = request.execution_timeout_secs
+            && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: Some(key.as_str()),
+                status: STATUS_FAILED,
+                error_summary: Some("invalid execution_timeout_secs"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("execution_timeout_secs ({secs}) is out of range or negative")
+                })),
+            )
+                .into_response();
+        }
+        let window_secs = api_state.start_idempotency_window().as_secs_f64();
+        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
+            &mut conn,
+            StartWorkflowParams {
+                workflow_name: &workflow_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: request
+                    .execution_timeout_secs
+                    .map(chrono::Duration::seconds)
+                    .or_else(|| {
+                        info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
+                    }),
+                memo: request.memo.clone(),
+                search_attrs: request.search_attrs.clone(),
+                reuse_policy,
+                trace_context: trace_ctx,
+                max_execution_timeout_ceiling: api_state
+                    .max_workflow_execution_timeout()
+                    .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+                concurrency_key,
+                concurrency_limit,
+                priority: request.priority.unwrap_or_default(),
+                max_workflow_input_bytes: effective_wf_cap,
+                start_at: request.start_at,
+                delay,
+                max_workflow_start_delay: max_delay_chrono,
+                owner,
+                runbook_url,
+                severity,
+                context_headers: request.context_headers.clone(),
+                sla: effective_sla,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                origin: None,
+                completion_callbacks,
+            },
+            key,
+            window_secs,
+            Some(runtime.registry.telemetry().metrics.as_ref()),
+        )
+        .await;
+
+        return match idem {
+            Ok(autumn_harvest::IdempotentStartOutcome::Started(start)) => {
+                let exec_id_str = start.exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(error = %audit_err, "audit insert failed for workflow.start");
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+                (
+                    if start.created {
+                        axum::http::StatusCode::CREATED
+                    } else {
+                        axum::http::StatusCode::OK
+                    },
+                    // Three honest states on this Started arm (issue #808):
+                    //  - fresh key, fresh run: created=true  → started_fresh:true,  deduplicated:false
+                    //  - fresh key, attached to an existing workflow_id run under
+                    //    the reuse policy (e.g. AllowDuplicate): created=false
+                    //                                          → started_fresh:false, deduplicated:false
+                    //  - same key hit is handled by the Deduplicated arm below
+                    //                                          → started_fresh:false, deduplicated:true
+                    // `deduplicated` is false here because no *idempotency-key*
+                    // dedup occurred (this request won the claim); `started_fresh`
+                    // reflects whether a new WorkflowStarted event was written.
+                    Json(StartWorkflowResponse {
+                        execution_id: start.exec_id.to_string(),
+                        workflow_name: start.workflow_name,
+                        workflow_id: start.workflow_id,
+                        state: start.state,
+                        started_fresh: Some(start.created),
+                        deduplicated: Some(false),
+                    }),
+                )
+                    .into_response()
+            }
+            Ok(autumn_harvest::IdempotentStartOutcome::Deduplicated {
+                exec_id: dup_exec_id,
+                workflow_id: dup_workflow_id,
+                state: dup_state,
+            }) => {
+                // A dedup replay is a successful, idempotent start — audit it as
+                // workflow.start succeeded pointing at the original execution.
+                let exec_id_str = dup_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                // Intentional asymmetry with the Started arm (which returns 503
+                // on audit-insert failure): a dedup replay is a no-op read — the
+                // original start was already audited when it created the run — so
+                // a failed audit here is best-effort and never fails the reply.
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    axum::http::StatusCode::OK,
+                    Json(StartWorkflowResponse {
+                        execution_id: dup_exec_id.to_string(),
+                        workflow_name: workflow_name.clone(),
+                        workflow_id: dup_workflow_id,
+                        state: dup_state,
+                        started_fresh: Some(false),
+                        deduplicated: Some(true),
+                    }),
+                )
+                    .into_response()
+            }
+            Err(HarvestError::AlreadyExists {
+                existing_exec_id,
+                existing_state,
+            }) => {
+                let exec_id_str = existing_exec_id.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some("workflow already exists"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                // Best-effort audit on the failure paths (intentional asymmetry
+                // with the Started arm's 503-on-audit-failure): the reserve
+                // rolled back, so there is no persisted start to keep consistent.
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(AlreadyExistsResponse {
+                        existing_execution_id: existing_exec_id.to_string(),
+                        existing_state,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: None,
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                map_error(e).into_response()
+            }
+        };
+    }
+
     let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
@@ -9990,6 +10958,10 @@ pub(crate) async fn start_workflow(
                     workflow_name: start.workflow_name,
                     workflow_id: start.workflow_id,
                     state: start.state,
+                    // No-key path: omit the #808 flags so the response is
+                    // byte-for-byte identical to a pre-#808 build.
+                    started_fresh: None,
+                    deduplicated: None,
                 }),
             )
                 .into_response()
@@ -13042,6 +14014,155 @@ async fn erase_workflow_payloads_handler(
     }
 }
 
+// ── Legal hold (issue #747) ───────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct SetLegalHoldRequest {
+    /// Operator-supplied justification for the hold (e.g. "litigation hold —
+    /// case 2026-CV-1234"). Recorded in `legal_hold_reason` and the audit
+    /// trail. Truncated to 500 characters at the API boundary.
+    reason: Option<String>,
+    /// Optional RFC3339 auto-expiry. `None` = indefinite hold (released only by
+    /// an explicit release call).
+    hold_until: Option<String>,
+}
+
+/// `POST /workflows/{id}/legal-hold` — place (or refresh) a per-execution legal
+/// hold (issue #747). Admin-guarded. Exempts the execution's history from
+/// retention deletion and PII erasure until released or auto-expired. Idempotent:
+/// re-holding an actively-held execution returns the existing hold unchanged
+/// (`newly_held: false`) without overwriting provenance. Returns 200 on success,
+/// 404 if the execution is not found, 400 on a malformed `hold_until`.
+async fn set_legal_hold_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<SetLegalHoldRequest>>,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<autumn_harvest::LegalHoldOutcome>,
+    ),
+    AutumnError,
+> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/legal-hold";
+    let request = request.map(|Json(b)| b).unwrap_or_default();
+
+    let reason = request
+        .reason
+        .as_deref()
+        .map(truncate_operator_reason)
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+    let hold_until = match request.hold_until.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| {
+                    AutumnError::bad_request_msg(format!("invalid hold_until (RFC3339): {e}"))
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
+    };
+
+    // Reject a `hold_until` already in the past (issue #747 MAJOR): for a
+    // compliance primitive, silently reporting `held: true` for a hold that is
+    // immediately inactive (eligible for deletion/erasure) is the worst failure
+    // mode. A clear 400 is returned before any DB round-trip, mirroring the
+    // malformed-RFC3339 rejection above.
+    if let Some(until) = hold_until
+        && until <= now
+    {
+        return Err(AutumnError::bad_request_msg("hold_until is in the past"));
+    }
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result =
+        autumn_harvest::set_legal_hold(&mut conn, exec_id, &reason, hold_until, &actor, now).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_LEGAL_HOLD_SET,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `POST /workflows/{id}/legal-hold/release` — release a per-execution legal
+/// hold (issue #747). Admin-guarded. Idempotent: releasing an execution with no
+/// active hold returns `released: false` (200 no-op). Returns 200 on success,
+/// 404 if the execution is not found.
+async fn release_legal_hold_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<autumn_harvest::LegalHoldOutcome>,
+    ),
+    AutumnError,
+> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/legal-hold/release";
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result = autumn_harvest::release_legal_hold(&mut conn, exec_id, chrono::Utc::now()).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_LEGAL_HOLD_RELEASE,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
 /// `POST /workflows/{id}/activities/{activity_exec_id}/retry-now` — skip
 /// remaining backoff for a PENDING activity and make it immediately eligible
 /// for claiming. Admin-guarded. Returns 202 Accepted with `advanced: true`
@@ -14152,24 +15273,37 @@ async fn hydrate_ctx_for_query(
     );
 
     if terminal {
-        match classify_terminal_query(outcome, sealed) {
+        // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
+        // settled to a servable state while genuine recorded non-lifecycle
+        // history remains unmatched, the workflow code changed since the run
+        // executed — the reconstructed state is misleading. `has_non_lifecycle_unconsumed`
+        // excludes trailing terminal-lifecycle events, so a truthfully replayed
+        // completed / sealed-while-parked run still reports false and Serves.
+        // Computed after the drive advances the replay cursor; read-only.
+        let has_unconsumed_history = ctx.history_has_unconsumed_events();
+        match classify_terminal_query(outcome, sealed, has_unconsumed_history) {
             // Full drive to Poll::Ready, OR a run the engine sealed while its
             // function was parked mid-command (TIMED_OUT / CONTINUED_AS_NEW /
-            // mid-await CANCELLED / FAILED): serve the reconstructed state at
-            // the recorded terminal point.
+            // mid-await CANCELLED / FAILED), with all recorded non-lifecycle
+            // history faithfully consumed: serve the reconstructed state at the
+            // recorded terminal point.
             TerminalQueryDecision::Serve => Ok(ctx),
             TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
                     .unwrap_or(u64::MAX),
             })),
-            // The recorded history has no terminal seal at all — it was pruned by
-            // retention or released on reset. Never serve a partial/empty answer;
-            // surface a distinct 410.
+            // The recorded history has no terminal seal at all (pruned by
+            // retention / released on reset), or the drifted handler stopped
+            // short leaving recorded non-lifecycle history unconsumed (code
+            // drift). Never serve a partial/misleading answer; surface a
+            // distinct 410.
             TerminalQueryDecision::HistoryUnavailable => {
                 Err(map_error(HarvestError::HistoryUnavailable {
                     exec_id,
-                    reason: "pruned by retention or released".to_string(),
+                    reason: "pruned by retention, released, or replay diverged from \
+                             recorded history (workflow code changed)"
+                        .to_string(),
                 }))
             }
         }
@@ -14409,6 +15543,92 @@ async fn list_dag_runs(
     Ok(Json(runs))
 }
 
+/// `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (issue #690).
+///
+/// Read-only: reconstructs a unified DAG run's node topology annotated with
+/// per-node status/timing/attempts/error, purely from the registered
+/// [`DagDefinition`](autumn_harvest::dag::DagDefinition) plus the run's recorded
+/// history. No new event variant, no migration, no writes to `harvest_dag_runs`.
+///
+/// * `404` — unknown `dag_name`, or a `run_exec_id` that is not a run of that DAG.
+/// * `400` (JSON body) — a classic (non-unified) DAG has no `DagDefinition`
+///   topology to annotate.
+///
+/// Cross-shard correct (AC8): reads from the owning shard via
+/// [`db_conn_for_execution`] ([`ExecutionId::shard`](autumn_harvest::types::ExecutionId)
+/// routing), no cross-shard fan-out.
+async fn get_dag_run_graph(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Resolve the DAG by name; reject classic (non-unified) DAGs (AC6).
+    let Some(dag) = runtime.dags().get(&dag_name).cloned() else {
+        return AutumnError::not_found_msg(format!("DAG '{dag_name}' is not registered"))
+            .into_response();
+    };
+    if !dag.is_unified {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "DAG '{dag_name}' is a classic (non-unified) DAG with no DagDefinition \
+                     topology to annotate; the run graph view is only supported for unified DAGs."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    let exec_id = match parse_execution_id(&run_exec_id) {
+        Ok(eid) => eid,
+        Err(e) => return e.into_response(),
+    };
+
+    // AC8: route to the owning shard via ExecutionId::shard().
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load the run and verify it belongs to this DAG (AC6: 404 otherwise).
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => return map_error(e).into_response(),
+    };
+    if execution.workflow_name != dag_name {
+        return AutumnError::not_found_msg(format!(
+            "execution {exec_id} is not a run of DAG '{dag_name}'"
+        ))
+        .into_response();
+    }
+
+    // Timestamped history for per-node started_at/finished_at (issue #690).
+    let ts_events = match store::load_history_with_timestamps(&mut conn, exec_id).await {
+        Ok(evts) => evts,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let nodes = crate::dag_graph::build_run_graph(&dag.definition, &ts_events, &execution.state);
+
+    let response = crate::dag_graph::DagRunGraphResponse {
+        run_exec_id: exec_id.to_string(),
+        dag_name,
+        state: execution.state,
+        started_at: execution.started_at,
+        finished_at: execution.completed_at,
+        nodes,
+    };
+
+    (axum::http::StatusCode::OK, Json(response)).into_response()
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn trigger_dag_run(
     Extension(api_state): Extension<HarvestApiState>,
@@ -14569,6 +15789,8 @@ pub(crate) async fn trigger_dag_run_inner(
                     workflow_name: started.workflow_name,
                     workflow_id: started.workflow_id,
                     state: started.state,
+                    started_fresh: None,
+                    deduplicated: None,
                 }),
             ))
         }
@@ -21845,6 +23067,19 @@ pub(crate) async fn load_workflows(
             .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
             .filter(harvest_workflow_executions::state.eq("RUNNING"));
     }
+    if filters.legal_hold {
+        // Active-hold predicate (issue #747, mirrors `legal_hold_active`):
+        // set_at IS NOT NULL AND (until IS NULL OR until > now). Plain column
+        // predicates, cross-shard safe. Composes (AND) with all other filters.
+        let now = chrono::Utc::now();
+        query = query
+            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(
+                harvest_workflow_executions::legal_hold_until
+                    .is_null()
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+            );
+    }
     if let Some(min_events) = filters.min_history_events {
         // Correlated subquery: filter to executions with at least `min_events`
         // recorded events. No schema migration is required — the count is
@@ -22013,6 +23248,18 @@ pub(crate) async fn load_stalled_workflows(
         query = query
             .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
             .filter(harvest_workflow_executions::state.eq("RUNNING"));
+    }
+    // Honor the legal-hold filter on the stalled path too (issue #747), for the
+    // same bypass reason as sla_breached/nd_blocked above.
+    if filters.legal_hold {
+        let now = chrono::Utc::now();
+        query = query
+            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(
+                harvest_workflow_executions::legal_hold_until
+                    .is_null()
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+            );
     }
     // Honor the time-range and exec-id-prefix filters (issue #498) on the
     // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
@@ -23338,8 +24585,7 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         }
         | HarvestError::Cancelled(message)
         | HarvestError::WorkflowFailed {
-            name: _,
-            reason: message,
+            reason: message, ..
         } => AutumnError::bad_request_msg(message),
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
@@ -24530,7 +25776,7 @@ where
 /// JSON rather than the source shard — could even return a non-source-shard copy
 /// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
 /// the worker's true liveness regardless of which shard it was read from.
-fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
+pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
     let mut by_id: std::collections::HashMap<String, WorkerRow> = std::collections::HashMap::new();
     for row in rows {
         match by_id.get(&row.worker.worker_id) {
@@ -26586,6 +27832,58 @@ pub struct TaskEligibilityResponse {
     pub summary: EligibilitySummary,
 }
 
+/// Compute the reason codes that depend only on the task and shared runtime
+/// state — not on any particular worker (issue #611).
+///
+/// These are the impediments that block *every* worker equally: a saturated
+/// per-key concurrency cap, an exhausted rate-limit bucket, and an OPEN /
+/// HALF-OPEN circuit breaker on the task's next activity. The worker-specific
+/// reasons (`build_incompatible`, `sticky_owned_by_other_worker`,
+/// `unsatisfied_requirement:*`) are computed separately by the caller and
+/// appended alongside these, preserving the existing multi-reason behaviour
+/// (AC5).
+///
+/// Rate-limit suppression (issue #369): an activity that carries a circuit
+/// breaker (`has_cb`) enforces rate limiting at dispatch, not at claim, so a
+/// stale `rate_limit_exhausted` reason is never surfaced for it — its
+/// impediment is the circuit reason instead.
+fn task_intrinsic_impediment_reasons(
+    activity_name: Option<&str>,
+    rate_limit_key: Option<&str>,
+    has_cb: bool,
+    saturated_rate_limits: &std::collections::HashSet<String>,
+    concurrency_saturated: bool,
+    cb_phase: &std::collections::HashMap<String, &'static str>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    if concurrency_saturated {
+        reasons.push("concurrency_saturated".to_string());
+    }
+
+    // Rate limiting for CB activities is enforced at dispatch, not at claim
+    // (issue #369), so a saturated bucket never surfaces here for them — the
+    // circuit reason below is the accurate impediment.
+    if !has_cb
+        && let Some(rlk) = rate_limit_key
+        && saturated_rate_limits.contains(rlk)
+    {
+        reasons.push("rate_limit_exhausted".to_string());
+    }
+
+    // An OPEN or HALF-OPEN breaker on the task's next activity blocks the claim;
+    // a CLOSED (or absent) breaker contributes nothing.
+    if let Some(name) = activity_name {
+        match cb_phase.get(name).copied() {
+            Some("open") => reasons.push("circuit_open".to_string()),
+            Some("half_open") => reasons.push("circuit_half_open".to_string()),
+            _ => {}
+        }
+    }
+
+    reasons
+}
+
 #[allow(
     clippy::collapsible_if,
     clippy::cast_precision_loss,
@@ -26773,6 +28071,26 @@ async fn evaluate_eligibility_for_shard(
         })
         .unwrap_or_default();
 
+    // Observable circuit-breaker phase per tracked activity (issue #611).
+    // `list()` prunes each breaker's rolling failure window and reads its phase;
+    // it never transitions phase (Open→HalfOpen is driven exclusively by
+    // dispatch), so an open breaker reads "open" through the cooldown until a
+    // probe is admitted — safe to consult read-only from this diagnostic
+    // endpoint (`list()`/`snapshot` only, never `on_dispatch`/`on_result`/
+    // `force_*`).
+    let cb_phase: HashMap<String, &'static str> = api_state
+        .runtime()
+        .ok()
+        .map(|r| {
+            r.registry()
+                .circuit_breakers()
+                .list(std::time::Instant::now())
+                .into_iter()
+                .map(|snap| (snap.activity_name, snap.state))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut rate_limit_keys = Vec::new();
     for t in tasks.iter().filter(|t| t.state == "PENDING") {
         if let Some(ref rlk) = t.rate_limit_key {
@@ -26922,25 +28240,32 @@ async fn evaluate_eligibility_for_shard(
                     }
                 }
 
-                if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
-                    let running = running_map
-                        .get(&(key.clone(), t.task_type.clone()))
-                        .copied()
-                        .unwrap_or(0);
-                    if running >= i64::from(cap) {
-                        reasons.push("concurrency_saturated".to_string());
-                    }
-                }
-
-                if let Some(ref rlk) = t.rate_limit_key {
-                    let has_cb = t
-                        .activity_name
-                        .as_ref()
-                        .is_some_and(|act_name| cb_activities.contains(act_name));
-                    if !has_cb && saturated_rate_limits.contains(rlk) {
-                        reasons.push("rate_limit_saturated".to_string());
-                    }
-                }
+                // Task-intrinsic impediments (issue #611): per-key concurrency
+                // saturation, rate-limit exhaustion, and circuit-breaker phase.
+                // These block every worker equally; they are computed once per
+                // task and appended alongside the worker-specific reasons above.
+                let concurrency_saturated =
+                    if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
+                        let running = running_map
+                            .get(&(key.clone(), t.task_type.clone()))
+                            .copied()
+                            .unwrap_or(0);
+                        running >= i64::from(cap)
+                    } else {
+                        false
+                    };
+                let has_cb = t
+                    .activity_name
+                    .as_ref()
+                    .is_some_and(|act_name| cb_activities.contains(act_name));
+                reasons.extend(task_intrinsic_impediment_reasons(
+                    t.activity_name.as_deref(),
+                    t.rate_limit_key.as_deref(),
+                    has_cb,
+                    &saturated_rate_limits,
+                    concurrency_saturated,
+                    &cb_phase,
+                ));
 
                 let parsed_reqs = if t.task_type == "activity" {
                     t.required_capabilities.as_ref().map_or_else(
@@ -27278,6 +28603,175 @@ async fn get_task_eligibility(
     Err(AutumnError::not_found_msg(format!(
         "task {task_id} not found"
     )))
+}
+
+#[cfg(test)]
+mod eligibility_reason_tests {
+    use super::task_intrinsic_impediment_reasons;
+    use std::collections::{HashMap, HashSet};
+
+    fn saturated(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    fn phases(pairs: &[(&str, &'static str)]) -> HashMap<String, &'static str> {
+        pairs.iter().map(|(n, s)| ((*n).to_string(), *s)).collect()
+    }
+
+    // AC1: a task deferred solely because its rate-limit bucket is exhausted
+    // reports `rate_limit_exhausted` — never `concurrency_saturated`.
+    #[test]
+    fn rate_limit_only_reports_rate_limit_exhausted() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("send_email"),
+            Some("rl-key"),
+            false,
+            &saturated(&["rl-key"]),
+            false,
+            &HashMap::new(),
+        );
+        assert_eq!(reasons, vec!["rate_limit_exhausted".to_string()]);
+    }
+
+    // AC2: a genuinely concurrency-capped task reports `concurrency_saturated`
+    // and nothing else.
+    #[test]
+    fn concurrency_only_reports_concurrency_saturated() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("do_work"),
+            None,
+            false,
+            &HashSet::new(),
+            true,
+            &HashMap::new(),
+        );
+        assert_eq!(reasons, vec!["concurrency_saturated".to_string()]);
+    }
+
+    // AC3: a task whose next activity is gated by an OPEN breaker reports
+    // `circuit_open` (never an empty/unknown impediment set for that cause).
+    #[test]
+    fn open_circuit_reports_circuit_open() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            false,
+            &phases(&[("charge_card", "open")]),
+        );
+        assert!(
+            reasons.contains(&"circuit_open".to_string()),
+            "expected circuit_open, got {reasons:?}"
+        );
+    }
+
+    // AC4: a HALF-OPEN breaker (task is not the probe) reports
+    // `circuit_half_open`.
+    #[test]
+    fn half_open_circuit_reports_circuit_half_open() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            false,
+            &phases(&[("charge_card", "half_open")]),
+        );
+        assert!(
+            reasons.contains(&"circuit_half_open".to_string()),
+            "expected circuit_half_open, got {reasons:?}"
+        );
+    }
+
+    // AC4: a CLOSED breaker contributes no reason.
+    #[test]
+    fn closed_circuit_contributes_no_reason() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            false,
+            &phases(&[("charge_card", "closed")]),
+        );
+        assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
+
+    // #369 suppression preserved: a CB activity with a saturated bucket reports
+    // `circuit_open` and never a stale `rate_limit_exhausted`.
+    #[test]
+    fn cb_activity_suppresses_rate_limit_and_reports_circuit() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            Some("rl-key"),
+            true,
+            &saturated(&["rl-key"]),
+            false,
+            &phases(&[("charge_card", "open")]),
+        );
+        assert!(
+            reasons.contains(&"circuit_open".to_string()),
+            "expected circuit_open, got {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&"rate_limit_exhausted".to_string()),
+            "rate-limit reason must be suppressed for a CB activity, got {reasons:?}"
+        );
+    }
+
+    // AC5: multiple impediments list all applicable reason codes.
+    #[test]
+    fn concurrency_and_circuit_report_both() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            true,
+            &HashSet::new(),
+            true,
+            &phases(&[("charge_card", "open")]),
+        );
+        assert!(
+            reasons.contains(&"concurrency_saturated".to_string()),
+            "expected concurrency_saturated, got {reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"circuit_open".to_string()),
+            "expected circuit_open, got {reasons:?}"
+        );
+    }
+
+    // A non-saturated rate limit and no other impediment yields no reasons.
+    #[test]
+    fn no_impediment_yields_no_reasons() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("send_email"),
+            Some("rl-key"),
+            false,
+            &HashSet::new(),
+            false,
+            &HashMap::new(),
+        );
+        assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
+
+    // Documented #369 boundary: a CB activity whose breaker is CLOSED but whose
+    // rate-limit bucket is exhausted surfaces NO claim-time impediment — rate
+    // limiting for a CB activity is enforced at dispatch, not claim, so its
+    // stall is dispatch-side (visible via `GET /admin/circuits/{activity}` + the
+    // token bucket), never through this claim-time eligibility explainer.
+    #[test]
+    fn cb_activity_closed_breaker_with_exhausted_bucket_reports_nothing() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("a"),
+            Some("k"),
+            true,
+            &saturated(&["k"]),
+            false,
+            &phases(&[("a", "closed")]),
+        );
+        assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
 }
 
 #[cfg(test)]
@@ -28239,6 +29733,26 @@ mod tests {
         let other = parse_workflow_filters(&pairs(&[("nd_blocked", "1")]))
             .expect("nd_blocked=1 parses without error");
         assert!(!other.nd_blocked);
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_legal_hold_flag() {
+        // Absent → false (issue #747).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(!absent.legal_hold);
+
+        // Explicit true (case-insensitive).
+        let on = parse_workflow_filters(&pairs(&[("legal_hold", "TRUE")]))
+            .expect("legal_hold=true parses");
+        assert!(on.legal_hold);
+
+        // Explicit false and any non-"true" value → false, never an error.
+        let off = parse_workflow_filters(&pairs(&[("legal_hold", "false")]))
+            .expect("legal_hold=false parses");
+        assert!(!off.legal_hold);
+        let other = parse_workflow_filters(&pairs(&[("legal_hold", "1")]))
+            .expect("legal_hold=1 parses without error");
+        assert!(!other.legal_hold);
     }
 
     #[test]
@@ -30345,6 +31859,10 @@ mod tests {
             completion_callbacks: None,
             continued_from_exec_id: None,
             first_exec_id: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
         }
     }
 

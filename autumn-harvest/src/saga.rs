@@ -357,12 +357,7 @@ mod tests {
         // Third step fails, triggering compensation
         let err_result: HarvestResult<()> = saga
             .step(
-                || async {
-                    Err(HarvestError::WorkflowFailed {
-                        name: "test".into(),
-                        reason: "error".into(),
-                    })
-                },
+                || async { Err(HarvestError::workflow_failed_untyped("test", "error")) },
                 |()| async { Ok::<_, HarvestError>(()) },
             )
             .await;
@@ -389,22 +384,14 @@ mod tests {
             .step(
                 || async { Ok::<_, HarvestError>("step1") },
                 |_| async {
-                    Err::<(), _>(HarvestError::WorkflowFailed {
-                        name: "comp".into(),
-                        reason: "comp error".into(),
-                    })
+                    Err::<(), _>(HarvestError::workflow_failed_untyped("comp", "comp error"))
                 },
             )
             .await;
 
         let err_result: HarvestResult<()> = saga
             .step(
-                || async {
-                    Err(HarvestError::WorkflowFailed {
-                        name: "test".into(),
-                        reason: "step2 error".into(),
-                    })
-                },
+                || async { Err(HarvestError::workflow_failed_untyped("test", "step2 error")) },
                 |()| async { Ok::<_, HarvestError>(()) },
             )
             .await;

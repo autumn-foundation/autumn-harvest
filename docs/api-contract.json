@@ -112,6 +112,12 @@
           "in": "query",
           "required": false,
           "description": "When 'true', return only RUNNING executions currently blocked on replay non-determinism (issue #603). Each row carries nd_blocked_at / nd_block_reason / nd_block_count plus the structured divergence diagnostic (failure_cause, expected, actual, event_index, workflow_type, build_id) in search_attrs."
+        },
+        {
+          "name": "legal_hold",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', return only executions currently under an active legal hold (issue #747): legal_hold_set_at IS NOT NULL AND (legal_hold_until IS NULL OR legal_hold_until > now)."
         }
       ],
       "request_body": null,
@@ -668,12 +674,17 @@
             "name": "completion_callbacks",
             "required": false,
             "description": "Per-execution completion-callback targets (issue #605): a JSON array of {url, filter} objects. Each target's URL is validated against the operator-configured SSRF host allowlist before admission; a non-allowlisted target rejects the start with 422."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. A committed keyed replay short-circuits to the 200 no-op before fresh-start-only validations (input-schema #373, completion-callback SSRF #605, delay/start_at) and before the admission gate #377, returning the original execution regardless of the retry's body; a genuinely fresh keyed start (no live claim) still runs every validation and the gate. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."
           }
         ]
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -686,13 +697,15 @@
           "batched",
           "flushed",
           "batch_key",
-          "max_size"
+          "max_size",
+          "started_fresh",
+          "deduplicated"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, or when input exceeds the workflow input cap."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, or when idempotency_key is combined with a throttle/debounce/batch policy (issue #808)."
         },
         {
           "status": 409,
@@ -700,7 +713,7 @@
         },
         {
           "status": 503,
-          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts)."
+          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
         },
         {
           "status": 500,
@@ -1190,7 +1203,114 @@
         },
         {
           "status": 409,
-          "description": "Execution is not in a terminal state."
+          "description": "Execution is not in a terminal state, or is under an active legal hold (issue #747) — erasure is rejected until the hold is released or expires."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/legal-hold",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Place (or refresh) a per-execution legal hold (issue #747). An active hold exempts the execution's event history from retention deletion (issue #737) and from PII erasure (issue #495) until the hold is released or auto-expires. Additive nullable columns only; shard-local (routed via the execution UUID). Admin-only, audited under legal_hold.set.",
+      "idempotency": "Idempotent: if an active hold already exists, its provenance is left unchanged and newly_held=false is returned (no write). A previously-set-but-expired hold is refreshed.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Operator-supplied justification for the hold (e.g. litigation hold case number), recorded in legal_hold_reason and the audit log. Truncated to 500 characters."
+          },
+          {
+            "name": "hold_until",
+            "required": false,
+            "description": "Optional RFC3339 auto-expiry. Omit for an indefinite hold released only by an explicit release call."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "held",
+          "legal_hold_reason",
+          "legal_hold_actor",
+          "legal_hold_set_at",
+          "legal_hold_until",
+          "newly_held",
+          "released"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id or hold_until (not RFC3339)."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/legal-hold/release",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Release a per-execution legal hold (issue #747): NULLs all four legal_hold_* columns so the execution becomes eligible for retention and PII erasure again. Admin-only, audited under legal_hold.release.",
+      "idempotency": "Idempotent: releasing an execution with no hold set returns released=false (200 no-op).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "held",
+          "legal_hold_reason",
+          "legal_hold_actor",
+          "legal_hold_set_at",
+          "legal_hold_until",
+          "newly_held",
+          "released"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
         },
         {
           "status": 500,
@@ -1875,6 +1995,72 @@
         {
           "status": 500,
           "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/dags/{dag_name}/runs/{run_exec_id}",
+      "category": "dag",
+      "read_only": true,
+      "description": "DAG run graph view (issue #690): the run's node topology annotated with per-node status/timing/attempts/error, reconstructed purely from the registered DagDefinition and recorded history. Admin-guarded, read-only. Unified DAGs only. No new event variant, no migration, no writes.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered (unified) DAG name."
+        },
+        {
+          "name": "run_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Execution id of the DAG run to inspect."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "run_exec_id",
+            "description": "The DAG run execution id."
+          },
+          {
+            "name": "dag_name",
+            "description": "The DAG name."
+          },
+          {
+            "name": "state",
+            "description": "The run's execution state (e.g. RUNNING, FAILED, COMPLETED)."
+          },
+          {
+            "name": "started_at",
+            "description": "When the run started."
+          },
+          {
+            "name": "finished_at",
+            "description": "When the run finished (omitted while still running)."
+          },
+          {
+            "name": "nodes",
+            "description": "Array of node entries: node_name, status (succeeded/failed/timed_out/cancelled/running/pending/skipped), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed."
+          }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The named DAG is a classic (non-unified) DAG with no DagDefinition topology to annotate, or run_exec_id is not a parseable execution id (JSON body: 'invalid execution id'). The unknown-DAG and classic-DAG checks run before the id parse, so an unparseable id is reached only for a valid unified DAG name."
+        },
+        {
+          "status": 404,
+          "description": "Unknown DAG name, or run_exec_id is not a run of that DAG."
+        },
+        {
+          "status": 503,
+          "description": "Database error (transient / service unavailable)."
         }
       ]
     },
@@ -3366,6 +3552,55 @@
         {
           "status": 503,
           "description": "Database or shard connectivity error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/status",
+      "category": "admin",
+      "read_only": true,
+      "description": "Rolled-up management health summary (issue #679): composes five existing read models (workers, shards, dead-letters, queues, stalled workflows) into one JSON document with a single worst-of verdict (healthy/degraded/critical). Composes, never duplicates, per-domain check semantics. Each subsystem carries headline numbers, bounded reason_codes, and a drill_down management-API path (present only when non-healthy). An unreachable shard degrades the affected subsystems and is named in unavailable_shards rather than failing the call wholesale. Thresholds are starter defaults, not universal SLOs.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "subsystems",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Database or shard connectivity error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/config",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "worker",
+          "payload_caps",
+          "shard_topology",
+          "features",
+          "pool"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (effective-config snapshot not yet captured)."
         }
       ]
     },
@@ -5920,7 +6155,8 @@
           "summary",
           "shards",
           "shard_errors"
-        ]
+        ],
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker — a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
         {
@@ -5962,7 +6198,8 @@
           "eligible_workers",
           "ineligible_workers",
           "summary"
-        ]
+        ],
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker — a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
         {

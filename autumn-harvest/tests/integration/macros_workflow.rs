@@ -150,3 +150,94 @@ fn workflow_mcp_composes_with_other_attributes() {
     assert!(info.mcp);
     assert_eq!(info.description, Some("an MCP-exposed workflow"));
 }
+
+// ── typed workflow failures (issue #767) ──────────────────────────────────────
+
+#[cfg(feature = "testing")]
+#[workflow]
+async fn wf_typed_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), WorkflowFailure> {
+    Err(WorkflowFailure::new("ValidationRejected", "bad").non_retryable())
+}
+
+#[cfg(feature = "testing")]
+#[workflow]
+async fn wf_string_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), String> {
+    Err("boom".into())
+}
+
+/// A custom error enum (AC1): a workflow returning `Result<_, MyErr>` must NOT
+/// be false-detected as a `WorkflowFailure` — it routes through `.to_string()`
+/// and stays untyped.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+enum MyErr {
+    Boom,
+}
+
+#[cfg(feature = "testing")]
+impl std::fmt::Display for MyErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Boom => write!(f, "boom-enum"),
+        }
+    }
+}
+
+#[cfg(feature = "testing")]
+#[workflow]
+async fn wf_enum_fail(_ctx: &WorkflowContext, _in: ()) -> Result<(), MyErr> {
+    Err(MyErr::Boom)
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn workflow_typed_failure_encodes_wire_envelope() {
+    let info = __autumn_workflow_info_wf_typed_fail();
+    let ctx = WorkflowContext::new_test();
+    let result = futures::executor::block_on((info.handler)(
+        &ctx,
+        autumn_harvest::serde_json::Value::Null,
+    ));
+    let payload = result.expect_err("workflow returned Err");
+    let decoded = autumn_harvest::failure::decode_workflow_failure(&payload);
+    assert_eq!(decoded.error_type, Some("ValidationRejected".to_string()));
+    assert_eq!(decoded.non_retryable, Some(true));
+    assert_eq!(decoded.message, "bad");
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn workflow_string_failure_stays_untyped() {
+    let info = __autumn_workflow_info_wf_string_fail();
+    let ctx = WorkflowContext::new_test();
+    let result = futures::executor::block_on((info.handler)(
+        &ctx,
+        autumn_harvest::serde_json::Value::Null,
+    ));
+    let payload = result.expect_err("workflow returned Err");
+    assert_eq!(payload, "boom");
+    let decoded = autumn_harvest::failure::decode_workflow_failure(&payload);
+    assert!(decoded.error_type.is_none());
+    assert_eq!(decoded.message, "boom");
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn workflow_custom_enum_failure_stays_untyped() {
+    // AC1: an `Err(MyEnum)` must route through `.to_string()` and stay untyped —
+    // the macro's `WorkflowFailure` detector must not false-positive on a custom
+    // enum type.
+    let info = __autumn_workflow_info_wf_enum_fail();
+    let ctx = WorkflowContext::new_test();
+    let result = futures::executor::block_on((info.handler)(
+        &ctx,
+        autumn_harvest::serde_json::Value::Null,
+    ));
+    let payload = result.expect_err("workflow returned Err");
+    assert_eq!(payload, MyErr::Boom.to_string());
+    assert!(
+        autumn_harvest::failure::decode_workflow_failure(&payload)
+            .error_type
+            .is_none()
+    );
+}

@@ -38,6 +38,7 @@ mod havoc_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
+mod legal_hold_tests;
 mod macros_activity;
 mod macros_collect;
 #[cfg(feature = "testing")]
@@ -74,6 +75,7 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+mod retention_overrides_tests;
 mod retry_now_tests;
 mod saga_tests;
 mod schedule_decisions;
@@ -96,6 +98,8 @@ mod signal_tests;
 mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slot_tuner_tests;
+#[cfg(feature = "db")]
+mod start_idempotency_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
@@ -104,6 +108,7 @@ mod throttle_tests;
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
 mod typed_stubs_tests;
+mod typed_workflow_failure_tests;
 mod updt_with_start_tests;
 mod webhook_trigger_tests;
 mod worker_session_tests;

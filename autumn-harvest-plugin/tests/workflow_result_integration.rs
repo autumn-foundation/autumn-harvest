@@ -40,6 +40,10 @@ use tower::ServiceExt;
 
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -553,9 +557,9 @@ async fn test_get_update_result_orphaned_timed_out() {
         .unwrap();
 
     let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
-    let fail_event = vec![WorkflowEvent::WorkflowFailed {
-        error: "timeout: workflow exceeded execution timeout".to_string(),
-    }];
+    let fail_event = vec![WorkflowEvent::workflow_failed(
+        "timeout: workflow exceeded execution timeout".to_string(),
+    )];
     store::append_events(&mut conn, exec_id, &fail_event, history2.next_event_id)
         .await
         .expect("append WorkflowFailed event");

@@ -225,6 +225,34 @@ async fn eris_unauthenticated_fail_activity_now_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_legal_hold_set_is_blocked() {
+    // Per-execution legal hold (issue #747): admin-only mutation.
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/legal-hold",
+            r#"{"reason": "litigation hold"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_legal_hold_release_is_blocked() {
+    // Per-execution legal hold release (issue #747): admin-only mutation.
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/legal-hold/release",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_query_workflow_is_accessible() {
     let app = unauthenticated_app();
     let res = app
@@ -394,6 +422,15 @@ async fn eris_require_auth_blocks_patch_dag() {
 async fn eris_unauthenticated_list_dead_letters_is_blocked() {
     let app = unauthenticated_app();
     let res = app.oneshot(get("/dead-letters")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_admin_status_is_blocked() {
+    // Issue #679: the rolled-up health summary is admin-gated; the built-in
+    // guard rejects before the handler runs, so no DB is needed here.
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/admin/status")).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 

@@ -664,10 +664,7 @@ async fn wake_parent_for_child_timeout(
     // Use append_single_event so concurrent sibling timeout/completion paths
     // serialise around the parent execution row and cannot collide on the
     // (workflow_exec_id, event_id) unique constraint.
-    let event = WorkflowEvent::ChildWorkflowFailed {
-        child_id: child_exec_id,
-        error: error.to_string(),
-    };
+    let event = WorkflowEvent::child_workflow_failed(child_exec_id, error.to_string());
     store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
@@ -1193,9 +1190,7 @@ async fn enforce_workflow_timeout(
     let execution = load_workflow_execution(conn, exec_id).await?;
     let error = timeout_error(&execution.workflow_name, reason);
     let history = store::load_history(conn, exec_id).await?;
-    let workflow_event = WorkflowEvent::WorkflowFailed {
-        error: error.clone(),
-    };
+    let workflow_event = WorkflowEvent::workflow_failed(error.clone());
 
     let (deferred_starts, closed_children) = conn
         .transaction::<_, HarvestError, _>(|conn| {
@@ -2361,6 +2356,15 @@ pub async fn enforce_timeouts_once(
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
     count += crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs).await?;
+    // Sweep expired request-scoped start-idempotency claims (issue #808). Best
+    // effort table growth control; the reserve upsert overwrites an expired row
+    // in place regardless, so correctness does not depend on this running.
+    count += crate::start_idempotency::sweep_expired_start_idempotency(
+        conn,
+        sharded_pool,
+        shard_assignments,
+    )
+    .await?;
     Ok(count)
 }
 
@@ -2498,9 +2502,7 @@ pub async fn enforce_workflow_history_ceiling(
 
         let error_msg =
             format!("history_ceiling_exceeded: event count {event_count} >= ceiling {ceiling}");
-        let fail_event = WorkflowEvent::WorkflowFailed {
-            error: error_msg.clone(),
-        };
+        let fail_event = WorkflowEvent::workflow_failed(error_msg.clone());
 
         let parent_uuid = if row.parent_close_policy.is_none() {
             row.parent_id

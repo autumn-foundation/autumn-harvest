@@ -1957,3 +1957,54 @@ fn build_ramp_set_rejects_percent_out_of_range_at_parse_or_request_time() {
         }
     }
 }
+
+#[test]
+fn legal_hold_set_maps_to_post_with_reason_and_until() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "legal-hold",
+        "set",
+        "exec-1",
+        "--reason",
+        "litigation hold",
+        "--until",
+        "2027-01-01T00:00:00Z",
+    ])
+    .expect("legal-hold set args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/workflows/exec-1/legal-hold");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "reason": "litigation hold",
+            "hold_until": "2027-01-01T00:00:00Z",
+        }))
+    );
+}
+
+#[test]
+fn legal_hold_set_without_until_omits_hold_until() {
+    let cli = Cli::try_parse_from(["harvest", "legal-hold", "set", "exec-1", "--reason", "hold"])
+        .expect("legal-hold set args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/workflows/exec-1/legal-hold");
+    assert_eq!(request.body, Some(json!({ "reason": "hold" })));
+}
+
+#[test]
+fn legal_hold_release_maps_to_post_with_no_body() {
+    let cli = Cli::try_parse_from(["harvest", "legal-hold", "release", "exec-1"])
+        .expect("legal-hold release args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/workflows/exec-1/legal-hold/release");
+    assert_eq!(request.body, None);
+}

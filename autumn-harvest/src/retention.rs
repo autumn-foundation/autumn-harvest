@@ -1,5 +1,6 @@
 //! Time-based retention janitor for completed workflow history.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "db")]
@@ -9,7 +10,7 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel::prelude::*;
 #[cfg(feature = "db")]
-use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{Array, BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, RunQueryDsl};
 #[cfg(feature = "db")]
@@ -89,6 +90,15 @@ pub struct RetentionConfig {
     /// Maximum age in seconds for closed workflows before they are eligible for deletion.
     /// If `None`, workflow history retention is disabled.
     pub max_age_secs: Option<u64>,
+    /// Per-workflow-type retention overrides keyed by registered workflow name,
+    /// each mapping to its own max-age in seconds (matching `max_age_secs`).
+    ///
+    /// A completed execution whose `workflow_name` has an override is retained
+    /// for that type's age instead of the global `max_age_secs`. A type with no
+    /// override falls back to the global `max_age_secs`; if neither is set, that
+    /// type is never deleted. Uses [`BTreeMap`] for deterministic ordering and
+    /// serialization. Issue #737.
+    pub overrides: BTreeMap<String, u64>,
     /// How often the background retention job wakes up to scan for expired data.
     pub tick_interval_secs: u64,
     /// The maximum number of records to process in a single transaction/batch.
@@ -111,6 +121,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             max_age_secs: None,
+            overrides: BTreeMap::new(),
             tick_interval_secs: DEFAULT_TICK_INTERVAL.as_secs(),
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
@@ -129,6 +140,34 @@ impl RetentionConfig {
             max_age_secs: Some(max_age.as_secs()),
             ..Self::default()
         }
+    }
+
+    /// Register a per-workflow-type retention override (issue #737).
+    ///
+    /// The named workflow type is retained for `max_age` instead of the global
+    /// `max_age`. Overrides are validated against the same
+    /// `MIN_MAX_AGE..=MAX_MAX_AGE` bounds as the global `max_age` at build time.
+    #[must_use]
+    pub fn with_workflow_override(
+        mut self,
+        workflow_name: impl Into<String>,
+        max_age: Duration,
+    ) -> Self {
+        self.overrides
+            .insert(workflow_name.into(), max_age.as_secs());
+        self
+    }
+
+    /// Bulk-register per-workflow-type retention overrides (issue #737).
+    #[must_use]
+    pub fn with_workflow_overrides<S: Into<String>>(
+        mut self,
+        iter: impl IntoIterator<Item = (S, Duration)>,
+    ) -> Self {
+        for (name, max_age) in iter {
+            self.overrides.insert(name.into(), max_age.as_secs());
+        }
+        self
     }
 
     /// Override the audit log retention window.
@@ -157,6 +196,53 @@ impl RetentionConfig {
     #[must_use]
     pub fn max_age(&self) -> Option<Duration> {
         self.max_age_secs.map(Duration::from_secs)
+    }
+
+    /// Resolves the effective history max-age for a given workflow type (issue #737).
+    ///
+    /// Returns the per-type override if one is registered for `workflow_name`,
+    /// otherwise the global `max_age`. Returns `None` when neither is set — in
+    /// which case that type's history is never deleted.
+    #[must_use]
+    pub fn effective_max_age(&self, workflow_name: &str) -> Option<Duration> {
+        self.overrides
+            .get(workflow_name)
+            .copied()
+            .map(Duration::from_secs)
+            .or_else(|| self.max_age())
+    }
+
+    /// The smallest effective retention age across the global `max_age` and all
+    /// per-type overrides (issue #737).
+    ///
+    /// This is the SQL candidate pre-filter age: the smallest age yields the
+    /// cutoff closest to "now", which is a correct *superset* of every
+    /// deletable row (any row deletable under a type-specific age `age(T)`
+    /// satisfies `completed_at < now - age(T) <= now - min_age`). The scanner
+    /// then applies the exact per-type age to each candidate in Rust.
+    ///
+    /// Returns `None` iff the global `max_age` is unset *and* there are no
+    /// overrides.
+    #[must_use]
+    pub fn loosest_cutoff_age(&self) -> Option<Duration> {
+        self.max_age()
+            .into_iter()
+            .chain(self.overrides.values().copied().map(Duration::from_secs))
+            .min()
+    }
+
+    /// Returns `true` if workflow-history retention should run this tick, i.e.
+    /// either the global `max_age` or at least one per-type override is set
+    /// (issue #737).
+    #[must_use]
+    pub fn history_retention_active(&self) -> bool {
+        self.loosest_cutoff_age().is_some()
+    }
+
+    /// Read access to the per-workflow-type retention overrides (issue #737).
+    #[must_use]
+    pub const fn workflow_overrides(&self) -> &BTreeMap<String, u64> {
+        &self.overrides
     }
 
     /// Translates the raw numeric tick value into a standard [`Duration`] for the scheduler loop.
@@ -194,13 +280,32 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // Each per-type override is validated against the same bounds as the
+        // global max_age; an out-of-range override fails the build rather than
+        // silently clamping (issue #737, AC5).
+        for (name, secs) in &self.overrides {
+            let age = Duration::from_secs(*secs);
+            if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
+                return Err(format!(
+                    "retention override for '{name}' must be between {}s and {}s",
+                    MIN_MAX_AGE.as_secs(),
+                    MAX_MAX_AGE.as_secs()
+                ));
+            }
+        }
         Ok(())
     }
 
-    /// Returns `true` if any retention features (workflow history, audit log, or schedule decision purging) are enabled.
+    /// Returns `true` if any retention features (workflow history, per-type
+    /// history overrides, audit log, or schedule decision purging) are enabled.
+    ///
+    /// Per-workflow-type overrides count as enabling workflow-history retention
+    /// even when the global `max_age` is unset (issue #737), so an
+    /// overrides-only configuration still spawns the janitor.
     #[must_use]
-    pub const fn enabled(&self) -> bool {
+    pub fn enabled(&self) -> bool {
         self.max_age_secs.is_some()
+            || !self.overrides.is_empty()
             || self.audit_retention_days > 0
             || self.schedule_decision_retention_days > 0
     }
@@ -229,6 +334,13 @@ pub struct RetentionTickResult {
     pub duration_ms: u128,
     /// The last error encountered during the tick, if any.
     pub last_error: Option<String>,
+    /// Per-workflow-type deletion counts for this tick (issue #737).
+    ///
+    /// In dry-run mode these are the counts the janitor *would* delete under
+    /// each type's resolved retention age. In a real run they are the counts
+    /// actually deleted. Surfaced via `GET /admin/retention` for per-type
+    /// reporting.
+    pub deleted_by_workflow: BTreeMap<String, u64>,
 }
 
 /// The current overall status of the retention subsystem.
@@ -342,10 +454,34 @@ impl RetentionRuntime {
                     }
                 }
 
-                // Workflow-history retention: only when max_age is configured.
-                if let Some(max_age) = config.max_age() {
-                    let cutoff =
-                        Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
+                // Workflow-history retention: runs when the global max_age OR
+                // any per-workflow-type override is configured (issue #737).
+                // Resolve the loosest cutoff age up front. `None` here means
+                // either no retention age is configured (the common case) OR —
+                // fail-safe — the configured loosest age is unrepresentable as a
+                // `chrono::Duration` (unreachable for validated ages, which are
+                // bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range). In the
+                // latter case we skip the workflow-history retention phase this
+                // tick and retain everything, rather than falling back to a zero
+                // cutoff that would make `loose_cutoff == now` and over-select
+                // nearly every completed row. The audit/schedule purges below
+                // still run.
+                if config
+                    .loosest_cutoff_age()
+                    .and_then(|age| chrono::Duration::from_std(age).ok())
+                    .is_some()
+                {
+                    // Phase-active gate (issue #737): the `and_then(from_std)`
+                    // above is the fail-safe guard from commit 34ddb62 — if the
+                    // loosest configured age is unrepresentable as a
+                    // `chrono::Duration` (unreachable for validated ages) we skip
+                    // the whole workflow-history phase this tick rather than
+                    // over-selecting. Compute `now` once so every shard's SQL
+                    // predicate and per-candidate resolution use one consistent
+                    // clock. The exact per-type cutoffs are pushed into the SELECT
+                    // inside `run_shard_tick` (PR #990 review) — there is no
+                    // single "loose cutoff" SQL bind any more.
+                    let now = Utc::now();
                     let tick_futures = pools.iter_shards().map(|(shard, pool)| {
                         let pool = pool.clone();
                         let config = config.clone();
@@ -358,7 +494,7 @@ impl RetentionRuntime {
                             let tick = run_shard_tick(
                                 pool,
                                 shard,
-                                cutoff,
+                                now,
                                 &config,
                                 archiver,
                                 cursor,
@@ -383,6 +519,7 @@ impl RetentionRuntime {
                                 result.candidate_count = ok.candidate_count;
                                 result.deleted_count = ok.deleted_count;
                                 result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
+                                result.deleted_by_workflow = ok.deleted_by_workflow.clone();
                                 tracing::info!(
                                     shard = %shard,
                                     candidates = ok.candidate_count,
@@ -399,6 +536,16 @@ impl RetentionRuntime {
                                     ok.deleted_count as u64,
                                     result.duration_ms as f64 / 1000.0,
                                 );
+                                // Per-workflow-type deletion counter (issue
+                                // #737, AC8). Real deletes only — the metric
+                                // confirms ACTUAL deletion (it reads 0 for a
+                                // long-retained type until its own age), so a
+                                // dry-run's would-delete counts are excluded.
+                                if !config.dry_run {
+                                    for (name, count) in &ok.deleted_by_workflow {
+                                        metrics.record_retention_deleted(name, *count);
+                                    }
+                                }
                             }
                             Err(error) => {
                                 result.last_error = Some(error.to_string());
@@ -492,6 +639,9 @@ struct ShardTickOutcome {
     deleted_count: usize,
     oldest_age_secs_skipped: Option<u64>,
     next_cursor: Option<RetentionScanCursor>,
+    /// Per-workflow-type deletion counts (real deletes and dry-run
+    /// would-deletes). Issue #737.
+    deleted_by_workflow: BTreeMap<String, u64>,
 }
 
 #[cfg(feature = "db")]
@@ -509,6 +659,13 @@ struct CandidateExecution {
     context_headers: Option<serde_json::Value>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     completed_at: Option<DateTime<Utc>>,
+    /// Legal-hold columns (issue #747), read only for the per-candidate skip
+    /// gate. The SELECT's WHERE clause is intentionally NOT changed — the gate
+    /// is evaluated in Rust so the two-variant bind numbering stays stable.
+    #[diesel(sql_type = Nullable<Timestamptz>) ]
+    legal_hold_set_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = Nullable<Timestamptz>) ]
+    legal_hold_until: Option<DateTime<Utc>>,
 }
 
 #[cfg(feature = "db")]
@@ -566,7 +723,7 @@ impl Drop for RetentionLeaseGuard {
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
-    cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
     config: &RetentionConfig,
     archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
@@ -581,6 +738,40 @@ async fn run_shard_tick(
     let mut wrapped = false;
     let mut remaining = config.batch_size;
     let mut has_failed = false;
+
+    // Per-type effective cutoff pushed into the candidate SELECT (issue #737,
+    // PR #990 review). Instead of a single loose cutoff (`now - min(all ages)`)
+    // followed by a Rust per-candidate skip — which selects, claims, and re-skips
+    // a long-retained type's not-yet-eligible rows every tick, consuming batch
+    // budget and starving newer already-expired rows of a shorter policy — we
+    // build one (name, cutoff) pair per override and let the SQL COALESCE resolve
+    // each row's own effective cutoff. Only genuinely-eligible rows are ever
+    // selected, so mixed-policy deployments never starve.
+    //
+    // `override_cut_names[i]` ↔ `override_cuts[i]` are kept in lockstep (unnest
+    // requires equal-length arrays). A non-overridden type falls through COALESCE
+    // to `global_fallback` (the global `max_age` cutoff) or, when no global age is
+    // set, to `'-infinity'` — meaning it is never selected.
+    let mut override_cut_names: Vec<String> = Vec::new();
+    let mut override_cuts: Vec<DateTime<Utc>> = Vec::new();
+    for (name, secs) in config.workflow_overrides() {
+        // Fail safe: an unrepresentable override age (unreachable for validated
+        // ages, bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range) is omitted so
+        // its rows are never selected under a too-aggressive cutoff. With a global
+        // `max_age` set they then fall back to it; without one they fall back to
+        // `'-infinity'` (never selected). Retaining is the correct failure mode.
+        if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
+            override_cut_names.push(name.clone());
+            override_cuts.push(now - delta);
+        }
+    }
+    // The global fallback cutoff for un-overridden types. `None` means "no global
+    // age" (or an unrepresentable one — same fail-safe): the SQL uses an
+    // `'-infinity'` literal so those types are never selected.
+    let global_fallback: Option<DateTime<Utc>> = config
+        .max_age()
+        .and_then(|age| chrono::Duration::from_std(age).ok())
+        .map(|delta| now - delta);
 
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
     let guard = RetentionLeaseGuard {
@@ -630,30 +821,85 @@ async fn run_shard_tick(
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
         let lease_id_inner = lease_id.clone();
+        let names_inner = override_cut_names.clone();
+        let cuts_inner = override_cuts.clone();
         let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
             Box::pin(async move {
-                let rows = diesel::sql_query(
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
+                // Push each row's exact per-type effective cutoff into the
+                // predicate (issue #737, PR #990 review): the correlated
+                // `unnest` subquery resolves the override cutoff for this row's
+                // workflow_name, falling through COALESCE to the global cutoff
+                // ($3) or, when there is no global age, to `'-infinity'` — so a
+                // non-overridden never-delete type is never selected. Only
+                // genuinely-eligible rows are returned, so a long-retained
+                // type's not-yet-eligible backlog can neither consume the batch
+                // budget nor starve newer expired rows of a shorter policy.
+                //
+                // Two query-string variants keep the bind numbering unambiguous:
+                // with a global age the fallback is bound as $3; without one it
+                // is the `'-infinity'` literal and the cursor/limit binds shift
+                // down by one.
+                let sql = if global_fallback.is_some() {
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
-                       AND completed_at < $1
                        AND sticky_worker_id IS NULL
+                       AND completed_at < COALESCE(
+                           (SELECT ov.cut
+                              FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                             WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                           $3)
                        AND (
-                           $2 IS NULL
-                           OR completed_at > $2
-                           OR (completed_at = $2 AND id > $3)
+                           $4 IS NULL
+                           OR completed_at > $4
+                           OR (completed_at = $4 AND id > $5)
                        )
                      ORDER BY completed_at ASC, id ASC
-                     LIMIT $4
-                     FOR UPDATE SKIP LOCKED",
-                )
-                .bind::<Timestamptz, _>(cutoff)
-                .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                .load::<CandidateExecution>(conn)
-                .await
+                     LIMIT $6
+                     FOR UPDATE SKIP LOCKED"
+                } else {
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until
+                     FROM harvest_workflow_executions
+                     WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                       AND completed_at IS NOT NULL
+                       AND sticky_worker_id IS NULL
+                       AND completed_at < COALESCE(
+                           (SELECT ov.cut
+                              FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                             WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                           '-infinity'::timestamptz)
+                       AND (
+                           $3 IS NULL
+                           OR completed_at > $3
+                           OR (completed_at = $3 AND id > $4)
+                       )
+                     ORDER BY completed_at ASC, id ASC
+                     LIMIT $5
+                     FOR UPDATE SKIP LOCKED"
+                };
+                // Bind order maps to $1..$N regardless of textual position. The
+                // override arrays ($1/$2) are always bound; $3 is the global
+                // fallback only in the global-age variant.
+                let query = diesel::sql_query(sql)
+                    .bind::<Array<Text>, _>(names_inner)
+                    .bind::<Array<Timestamptz>, _>(cuts_inner);
+                let rows = if let Some(fallback) = global_fallback {
+                    query
+                        .bind::<Timestamptz, _>(fallback)
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
+                } else {
+                    query
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
+                }
                 .map_err(database_error)?;
 
                 if !rows.is_empty() {
@@ -715,8 +961,79 @@ async fn run_shard_tick(
                 .await
                 .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-            if should_skip_candidate(&mut conn, &candidate, cutoff).await? {
-                let age = Utc::now()
+            // --- Per-candidate retention decision (issue #737) ------------
+            // This is the single seam where a candidate's fate is decided.
+            // Resolve the effective max-age for THIS workflow type (override
+            // or global fallback), then gate on it before any archive/delete.
+            // Future policies (#747 legal hold, #752 tiered summary) hook in
+            // here.
+            //
+            // Legal hold (issue #747) is the FIRST gate — it precedes archival
+            // (#345 hook below) AND delete, and precedes the metric emission, so
+            // `harvest.retention.deleted` never increments for a held id. An
+            // active hold (`legal_hold_active`) exempts this execution's history
+            // from retention entirely, until the hold is released or expires.
+            // Evaluated against the tick's `now` (the same clock the SELECT cutoff
+            // uses) so the decision is consistent with candidate selection.
+            if legal_hold_active(candidate.legal_hold_set_at, candidate.legal_hold_until, now) {
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            }
+            //
+            // NB (PR #990 review): the candidate SELECT now pushes each row's
+            // exact per-type cutoff into SQL, so the two skip branches below
+            // (`effective_max_age == None` and `completed_at >= resolved_cutoff`)
+            // are effectively unreachable — no not-yet-eligible or never-delete
+            // row is ever selected. They are kept as cheap defense-in-depth. The
+            // `should_skip_candidate` chain-link check below still needs the
+            // RESOLVED per-type cutoff, which is derived here.
+            let Some(age) = config.effective_max_age(&candidate.workflow_name) else {
+                // Neither an override nor a global max-age applies to this
+                // type: never delete it. Routine skip.
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            };
+            let Ok(chrono_age) = chrono::Duration::from_std(age) else {
+                // Unrepresentable duration (unreachable for validated ages, which
+                // are bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range); fail
+                // safe toward RETAINING the row rather than deleting it. A zero
+                // fallback would make `resolved_cutoff = now`, deleting nearly
+                // every completed row — the wrong failure mode for a retention
+                // janitor. Routine skip.
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            };
+            let resolved_cutoff = now - chrono_age;
+            if completed_at >= resolved_cutoff {
+                // The loosest-cutoff SQL pre-filter is a superset; this type is
+                // not old enough under its own effective age. Routine skip, and
+                // record its age for tuning observability (as the existing
+                // should_skip branch does for not-yet-collectable candidates).
+                let skipped_age = now
                     .signed_duration_since(completed_at)
                     .num_seconds()
                     .max(0)
@@ -724,32 +1041,80 @@ async fn run_shard_tick(
                 outcome.oldest_age_secs_skipped = Some(
                     outcome
                         .oldest_age_secs_skipped
-                        .map_or(age, |existing| existing.max(age)),
+                        .map_or(skipped_age, |existing| existing.max(skipped_age)),
                 );
-
-                // Release its lease immediately so it can be picked up on subsequent ticks
-                diesel::update(
-                    harvest_workflow_executions::table
-                        .filter(harvest_workflow_executions::id.eq(candidate.id)),
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
                 )
-                .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
-                .execute(&mut conn)
-                .await
-                .map_err(database_error)?;
-
-                // Advance cursor for routine skips
-                if !has_failed {
-                    outcome.next_cursor = Some(candidate_cursor);
-                }
-
-                {
-                    let mut active_guard =
-                        guard.active_ids.lock().expect("lease guard lock poisoned");
-                    if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
-                        active_guard.swap_remove(pos);
-                    }
-                }
+                .await?;
                 continue;
+            }
+
+            // NOTE: pass the per-type `resolved_cutoff` (not the loose cutoff)
+            // to should_skip_candidate — its continue-as-new chain-link check
+            // compares `completed_at >= $cutoff` and must see this type's own
+            // cutoff to be correct.
+            if should_skip_candidate(&mut conn, &candidate, resolved_cutoff).await? {
+                let skipped_age = now
+                    .signed_duration_since(completed_at)
+                    .num_seconds()
+                    .max(0)
+                    .cast_unsigned();
+                outcome.oldest_age_secs_skipped = Some(
+                    outcome
+                        .oldest_age_secs_skipped
+                        .map_or(skipped_age, |existing| existing.max(skipped_age)),
+                );
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            }
+
+            // Best-effort pre-archival legal-hold re-read (issue #747 BLOCKER 1):
+            // a hold placed between candidate selection and now must not be
+            // archived to cold storage. This NARROWS (does not fully close) the
+            // archival window — a hold landing DURING the multi-second archival
+            // network call below may still be archived, then skipped at
+            // delete-time by the authoritative FOR UPDATE re-check in
+            // `delete_candidate_execution`. That residual is acceptable: the row
+            // is preserved in place (never deleted), so archiving an
+            // about-to-be-held copy leaks a cold-storage copy but loses no data.
+            // We deliberately do NOT hold a row lock across the archival network
+            // call. Runs before dry-run too, so a held row is never counted.
+            match read_candidate_hold(&mut conn, candidate.id).await {
+                Ok((set_at, until)) if legal_hold_active(set_at, until, now) => {
+                    routine_skip_candidate(
+                        &mut conn,
+                        candidate.id,
+                        candidate_cursor,
+                        has_failed,
+                        &mut outcome,
+                        &guard.active_ids,
+                    )
+                    .await?;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    // Fail safe toward RETAINING on uncertainty (the retention
+                    // janitor's correct failure mode): do not archive/delete.
+                    has_failed = true;
+                    batch_failed = true;
+                    tracing::error!(candidate_id = %candidate.id, error = %err, "failed to re-read legal hold before archival; skipping deletion");
+                    break;
+                }
             }
 
             let mut doc = None;
@@ -858,6 +1223,11 @@ async fn run_shard_tick(
 
             if config.dry_run {
                 outcome.deleted_count += 1;
+                // Per-type would-delete count (issue #737, AC7).
+                *outcome
+                    .deleted_by_workflow
+                    .entry(candidate.workflow_name.clone())
+                    .or_insert(0) += 1;
                 if !has_failed {
                     outcome.next_cursor = Some(candidate_cursor);
                 }
@@ -887,13 +1257,39 @@ async fn run_shard_tick(
                 Vec::new()
             };
 
-            if let Err(err) = delete_candidate_execution(&mut conn, candidate.id).await {
-                has_failed = true;
-                batch_failed = true;
-                tracing::error!(candidate_id = %candidate.id, error = %err, "failed to delete candidate execution");
-                break;
+            match delete_candidate_execution(&mut conn, candidate.id, now).await {
+                Err(err) => {
+                    has_failed = true;
+                    batch_failed = true;
+                    tracing::error!(candidate_id = %candidate.id, error = %err, "failed to delete candidate execution");
+                    break;
+                }
+                Ok(CandidateDeleteOutcome::SkippedHeld) => {
+                    // A legal hold landed after selection (issue #747 BLOCKER 1):
+                    // the delete-tx FOR UPDATE re-check found it active and
+                    // aborted the delete. Treat exactly like a routine skip —
+                    // no delete, no blob GC, no metric, no `has_failed`. The
+                    // previously-loaded `candidate_blob_refs` are simply
+                    // discarded; the rows still exist (nothing cascaded).
+                    routine_skip_candidate(
+                        &mut conn,
+                        candidate.id,
+                        candidate_cursor,
+                        has_failed,
+                        &mut outcome,
+                        &guard.active_ids,
+                    )
+                    .await?;
+                    continue;
+                }
+                Ok(CandidateDeleteOutcome::Deleted) => {}
             }
             outcome.deleted_count += 1;
+            // Per-type real-delete count (issue #737, AC7/AC8).
+            *outcome
+                .deleted_by_workflow
+                .entry(candidate.workflow_name.clone())
+                .or_insert(0) += 1;
 
             // After the execution row (and its refs) are durably gone, delete any
             // blob no longer referenced by a surviving execution. A blob still
@@ -945,13 +1341,86 @@ async fn run_shard_tick(
     Ok(outcome)
 }
 
+/// Outcome of a candidate-deletion attempt (issue #747 BLOCKER 1). A hold that
+/// commits AFTER candidate selection but before this delete transaction must be
+/// honored, so the delete tx re-checks the legal-hold columns under a row lock
+/// as its first statement and aborts the delete when the hold is active.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateDeleteOutcome {
+    /// The execution (and its dependent rows) were deleted.
+    Deleted,
+    /// A legal hold was found active under the delete-tx row lock; the delete
+    /// was aborted and NOTHING was touched (no `payload_refs`, no blobs, no
+    /// execution row). The caller treats this exactly like a routine skip.
+    SkippedHeld,
+}
+
+/// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
+#[cfg(feature = "db")]
+type HoldTimestamps = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// Best-effort, non-locking read of a candidate's legal-hold columns, used for
+/// the pre-archival re-read gate (issue #747 BLOCKER 1). A concurrently-deleted
+/// row (`None`) reports "not held" — the subsequent delete of a missing row is a
+/// harmless no-op.
+#[cfg(feature = "db")]
+async fn read_candidate_hold(
+    conn: &mut diesel_async::AsyncPgConnection,
+    candidate_id: uuid::Uuid,
+) -> HarvestResult<HoldTimestamps> {
+    harvest_workflow_executions::table
+        .find(candidate_id)
+        .select((
+            harvest_workflow_executions::legal_hold_set_at,
+            harvest_workflow_executions::legal_hold_until,
+        ))
+        .first::<HoldTimestamps>(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+        .map(|opt| opt.unwrap_or((None, None)))
+}
+
 #[cfg(feature = "db")]
 async fn delete_candidate_execution(
     conn: &mut diesel_async::AsyncPgConnection,
     candidate_id: uuid::Uuid,
-) -> HarvestResult<()> {
+    now: DateTime<Utc>,
+) -> HarvestResult<CandidateDeleteOutcome> {
     conn.transaction::<_, HarvestError, _>(|conn| {
         Box::pin(async move {
+            // ── Authoritative legal-hold re-check under a row lock (issue #747
+            // BLOCKER 1) ─────────────────────────────────────────────────────
+            // The candidate SELECT read the hold columns then committed and
+            // released its lock BEFORE archival + delete, so a hold placed via
+            // `set_legal_hold` in that window would otherwise be missed and the
+            // held execution deleted. Reading the hold columns FOR UPDATE here,
+            // as the FIRST statement of the delete transaction, closes that
+            // window absolutely: it serializes against `set_legal_hold`'s own
+            // locking read/update, so a hold committed before this SELECT is
+            // seen (→ abort the delete), and a hold committing after must wait
+            // for this delete tx to finish — by which point the row is gone and
+            // the operator's `set_legal_hold` observes a missing row (404). If
+            // the hold is active, abort the delete entirely: do NOT touch
+            // payload_refs or blobs.
+            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
+                .find(candidate_id)
+                .select((
+                    harvest_workflow_executions::legal_hold_set_at,
+                    harvest_workflow_executions::legal_hold_until,
+                ))
+                .for_update()
+                .first::<HoldTimestamps>(conn)
+                .await
+                .optional()
+                .map_err(database_error)?;
+            if let Some((set_at, until)) = hold
+                && legal_hold_active(set_at, until, now)
+            {
+                return Ok(CandidateDeleteOutcome::SkippedHeld);
+            }
+
             diesel::update(
                 harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
@@ -1028,10 +1497,49 @@ async fn delete_candidate_execution(
             .execute(conn)
             .await
             .map_err(database_error)?;
-            Ok(())
+            Ok(CandidateDeleteOutcome::Deleted)
         })
     })
     .await
+}
+
+/// Common bookkeeping for a "routine skip" of a retention candidate (issue
+/// #737): release the candidate's retention lease so a later tick can revisit
+/// it, advance the scan cursor when the tick has not already failed, and drop
+/// the id from the lease guard's active set. Used by every non-deleting,
+/// non-failing per-candidate decision (never-delete type, not-old-enough for
+/// its type, and the pre-existing dependency-based `should_skip_candidate`).
+/// It must NOT freeze the cursor and must NOT set `has_failed`.
+#[cfg(feature = "db")]
+async fn routine_skip_candidate(
+    conn: &mut diesel_async::AsyncPgConnection,
+    candidate_id: uuid::Uuid,
+    candidate_cursor: RetentionScanCursor,
+    has_failed: bool,
+    outcome: &mut ShardTickOutcome,
+    active_ids: &Arc<Mutex<Vec<uuid::Uuid>>>,
+) -> HarvestResult<()> {
+    // Release its lease immediately so it can be picked up on subsequent ticks.
+    diesel::update(
+        harvest_workflow_executions::table.filter(harvest_workflow_executions::id.eq(candidate_id)),
+    )
+    .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+
+    // Advance cursor for routine skips.
+    if !has_failed {
+        outcome.next_cursor = Some(candidate_cursor);
+    }
+
+    {
+        let mut active_guard = active_ids.lock().expect("lease guard lock poisoned");
+        if let Some(pos) = active_guard.iter().position(|&x| x == candidate_id) {
+            active_guard.swap_remove(pos);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "db")]
@@ -1120,6 +1628,244 @@ struct CountRow {
     count: i64,
 }
 
+// ── Per-execution legal hold (issue #747) ─────────────────────────────────────
+
+/// Returns `true` when a per-execution legal hold is currently ACTIVE.
+///
+/// This is the **single source of truth** for the active-hold predicate, shared
+/// by the retention-skip gate, the PII-erasure gate (issue #495), the
+/// describe/list surfaces, and the set/release core functions. A hold is active
+/// when it was placed (`set_at IS NOT NULL`) and has not auto-expired
+/// (`until IS NULL`, i.e. indefinite, or `until > now`).
+///
+/// An expired hold (`until <= now`) is treated as inactive: the execution
+/// becomes eligible for retention and erasure again without any explicit
+/// release.
+#[must_use]
+pub fn legal_hold_active(
+    set_at: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    set_at.is_some() && until.is_none_or(|deadline| deadline > now)
+}
+
+/// Result of a [`set_legal_hold`] or [`release_legal_hold`] call.
+///
+/// Modeled on the idempotency shape of `terminate_workflow_execution`: the
+/// operation is idempotent, and `newly_held` / `released` report whether this
+/// call actually changed state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LegalHoldOutcome {
+    /// The execution the hold operation targeted.
+    pub execution_id: String,
+    /// Whether a legal hold is ACTIVE after this operation completed.
+    pub held: bool,
+    /// The active hold's reason, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_reason: Option<String>,
+    /// The active hold's actor (the principal who placed it), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_actor: Option<String>,
+    /// When the active hold was placed, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_set_at: Option<DateTime<Utc>>,
+    /// The active hold's auto-expiry, if any (`None` = indefinite).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_until: Option<DateTime<Utc>>,
+    /// `true` when this `set` call actually placed a fresh hold; `false` when a
+    /// hold was already active (idempotent no-op, provenance preserved).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub newly_held: bool,
+    /// `true` when this `release` call actually cleared a hold; `false` when no
+    /// hold was set (idempotent no-op).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
+}
+
+#[cfg(feature = "db")]
+mod legal_hold_db {
+    use chrono::{DateTime, Utc};
+    use diesel::prelude::*;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    use crate::error::{HarvestError, HarvestResult, database_error};
+    use crate::schema::harvest_workflow_executions;
+    use crate::types::ExecutionId;
+
+    use super::{LegalHoldOutcome, legal_hold_active};
+
+    /// The four legal-hold columns loaded from a locked execution row.
+    type HoldColumns = (
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn load_hold_for_update(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<HoldColumns> {
+        harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select((
+                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions::legal_hold_until,
+                harvest_workflow_executions::legal_hold_reason,
+                harvest_workflow_executions::legal_hold_actor,
+            ))
+            .for_update()
+            .first::<HoldColumns>(conn)
+            .await
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
+    /// Place (or refresh) a per-execution legal hold (issue #747). Shard-local:
+    /// the caller routes `conn` to the execution's own shard.
+    ///
+    /// Idempotent: if an ACTIVE hold already exists, its provenance is left
+    /// unchanged and `newly_held = false` is returned (no write). If there is no
+    /// hold, or a previously-set hold has expired, the four columns are set and
+    /// `newly_held = true` is returned.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::Database`] on any persistence failure.
+    pub async fn set_legal_hold(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        reason: &str,
+        hold_until: Option<DateTime<Utc>>,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> HarvestResult<LegalHoldOutcome> {
+        // Empty reason normalizes to NULL (issue #747 MINOR 4) so a blank hold
+        // stores `NULL` rather than `Some("")`, keeping the erase-rejection
+        // message and describe field clean.
+        let stored_reason = (!reason.is_empty()).then_some(reason);
+
+        // The read + update run in one transaction (issue #747 MINOR 1) so the
+        // `FOR UPDATE` lock in `load_hold_for_update` actually serializes the
+        // read-modify-write against a concurrent set/release (and against the
+        // retention delete-tx re-check), rather than releasing at statement end
+        // in autocommit mode.
+        conn.transaction::<LegalHoldOutcome, HarvestError, _>(|conn| {
+            Box::pin(async move {
+                let (set_at, until, cur_reason, cur_actor) =
+                    load_hold_for_update(conn, exec_id).await?;
+
+                if legal_hold_active(set_at, until, now) {
+                    // Idempotent: an active hold already exists. Do NOT overwrite
+                    // provenance — return the existing hold unchanged.
+                    return Ok(LegalHoldOutcome {
+                        execution_id: exec_id.to_string(),
+                        held: true,
+                        legal_hold_reason: cur_reason,
+                        legal_hold_actor: cur_actor,
+                        legal_hold_set_at: set_at,
+                        legal_hold_until: until,
+                        newly_held: false,
+                        released: false,
+                    });
+                }
+
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .set((
+                        harvest_workflow_executions::legal_hold_set_at.eq(Some(now)),
+                        harvest_workflow_executions::legal_hold_until.eq(hold_until),
+                        harvest_workflow_executions::legal_hold_reason.eq(stored_reason),
+                        harvest_workflow_executions::legal_hold_actor.eq(Some(actor)),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                // Report held/newly_held ACCURATELY (issue #747 MAJOR): a
+                // `hold_until` already in the past writes the columns but places
+                // no ACTIVE hold, so a direct core/CLI caller never gets a false
+                // `held: true`. (The HTTP handler rejects a past `hold_until`
+                // with 400 before reaching here — this is the belt-and-braces
+                // core-layer guard.)
+                let active = legal_hold_active(Some(now), hold_until, now);
+
+                Ok(LegalHoldOutcome {
+                    execution_id: exec_id.to_string(),
+                    held: active,
+                    legal_hold_reason: stored_reason.map(str::to_string),
+                    legal_hold_actor: Some(actor.to_string()),
+                    legal_hold_set_at: Some(now),
+                    legal_hold_until: hold_until,
+                    newly_held: active,
+                    released: false,
+                })
+            })
+        })
+        .await
+    }
+
+    /// Release a per-execution legal hold (issue #747). Shard-local.
+    ///
+    /// Idempotent: NULLs all four columns. `released = true` when a hold was
+    /// previously set (regardless of whether it had already expired),
+    /// `released = false` when the execution carried no hold at all (no-op).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::Database`] on any persistence failure.
+    pub async fn release_legal_hold(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        _now: DateTime<Utc>,
+    ) -> HarvestResult<LegalHoldOutcome> {
+        // Read + update in one transaction (issue #747 MINOR 1) so the
+        // `FOR UPDATE` lock holds across the clear, serializing against a
+        // concurrent set/release.
+        conn.transaction::<LegalHoldOutcome, HarvestError, _>(|conn| {
+            Box::pin(async move {
+                let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
+
+                let was_set = set_at.is_some();
+                if was_set {
+                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                        .set((
+                            harvest_workflow_executions::legal_hold_set_at
+                                .eq::<Option<DateTime<Utc>>>(None),
+                            harvest_workflow_executions::legal_hold_until
+                                .eq::<Option<DateTime<Utc>>>(None),
+                            harvest_workflow_executions::legal_hold_reason
+                                .eq::<Option<String>>(None),
+                            harvest_workflow_executions::legal_hold_actor
+                                .eq::<Option<String>>(None),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                }
+
+                Ok(LegalHoldOutcome {
+                    execution_id: exec_id.to_string(),
+                    held: false,
+                    legal_hold_reason: None,
+                    legal_hold_actor: None,
+                    legal_hold_set_at: None,
+                    legal_hold_until: None,
+                    newly_held: false,
+                    released: was_set,
+                })
+            })
+        })
+        .await
+    }
+}
+
+#[cfg(feature = "db")]
+pub use legal_hold_db::{release_legal_hold, set_legal_hold};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,6 +1912,142 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    // --- Issue #737: per-workflow-type history retention overrides ---
+
+    #[test]
+    fn test_effective_max_age_resolution() {
+        // override present -> override wins over global
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("slow_wf", Duration::from_secs(7200));
+        assert_eq!(
+            config.effective_max_age("slow_wf"),
+            Some(Duration::from_secs(7200))
+        );
+        // no override for this type -> falls back to global
+        assert_eq!(
+            config.effective_max_age("other_wf"),
+            Some(Duration::from_secs(3600))
+        );
+
+        // no global, override present -> override for that type, None for others
+        // (Default already leaves max_age_secs = None.)
+        let config =
+            RetentionConfig::default().with_workflow_override("only_wf", Duration::from_secs(500));
+        assert_eq!(
+            config.effective_max_age("only_wf"),
+            Some(Duration::from_secs(500))
+        );
+        assert_eq!(config.effective_max_age("other_wf"), None);
+
+        // neither -> None (never delete)
+        let config = RetentionConfig::default();
+        assert_eq!(config.effective_max_age("anything"), None);
+    }
+
+    #[test]
+    fn test_loosest_cutoff_age() {
+        // global only
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(3600)));
+
+        // global + overrides -> min of all
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("longer", Duration::from_secs(7200))
+            .with_workflow_override("shorter", Duration::from_secs(600));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(600)));
+
+        // no global, overrides only -> min override
+        let config = RetentionConfig::default()
+            .with_workflow_override("a", Duration::from_secs(900))
+            .with_workflow_override("b", Duration::from_secs(300));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(300)));
+
+        // global present but larger than an override -> override wins as loosest
+        let config = RetentionConfig::with_max_age(Duration::from_secs(5000))
+            .with_workflow_override("tiny", Duration::from_secs(100));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(100)));
+
+        // neither -> None
+        let config = RetentionConfig::default();
+        assert_eq!(config.loosest_cutoff_age(), None);
+    }
+
+    #[test]
+    fn test_history_retention_active() {
+        // both unset
+        let config = RetentionConfig::default();
+        assert!(!config.history_retention_active());
+
+        // global set
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(config.history_retention_active());
+
+        // only overrides set
+        let config =
+            RetentionConfig::default().with_workflow_override("wf", Duration::from_secs(60));
+        assert!(config.history_retention_active());
+    }
+
+    #[test]
+    fn test_validate_overrides_bounds() {
+        // below MIN_MAX_AGE
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(0));
+        assert!(config.validate().is_err());
+
+        // above MAX_MAX_AGE
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(60 * 60 * 24 * 365 * 20));
+        assert!(config.validate().is_err());
+
+        // in range
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(7200));
+        assert!(config.validate().is_ok());
+
+        // exactly MIN_MAX_AGE (1s) -> Ok (inclusive lower bound; guards against
+        // an off-by-one flip of ..= to ..)
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(1));
+        assert!(config.validate().is_ok());
+
+        // exactly MAX_MAX_AGE (10 years) -> Ok (inclusive upper bound)
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(60 * 60 * 24 * 365 * 10));
+        assert!(config.validate().is_ok());
+
+        // empty overrides + valid global -> Ok
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_overrides_backward_compat_empty() {
+        // With no overrides, effective_max_age(any) == max_age() for all names.
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(config.workflow_overrides().is_empty());
+        assert_eq!(config.effective_max_age("any_wf"), config.max_age());
+        assert_eq!(config.effective_max_age("another"), config.max_age());
+    }
+
+    #[test]
+    fn test_with_workflow_overrides_bulk() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_overrides([
+                ("a".to_string(), Duration::from_secs(100)),
+                ("b".to_string(), Duration::from_secs(200)),
+            ]);
+        assert_eq!(config.workflow_overrides().len(), 2);
+        assert_eq!(
+            config.effective_max_age("a"),
+            Some(Duration::from_secs(100))
+        );
+        assert_eq!(
+            config.effective_max_age("b"),
+            Some(Duration::from_secs(200))
+        );
+    }
+
     #[test]
     fn test_retention_config_enabled() {
         let config = RetentionConfig {
@@ -1195,6 +2077,17 @@ mod tests {
             ..Default::default()
         };
         assert!(config.enabled());
+
+        // Overrides-only (no global max_age, no audit/schedule purging) still
+        // enables the janitor (issue #737).
+        let config = RetentionConfig {
+            max_age_secs: None,
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        }
+        .with_workflow_override("wf", Duration::from_secs(3600));
+        assert!(config.enabled());
     }
 
     #[test]
@@ -1220,6 +2113,8 @@ mod tests {
             state: "COMPLETED".to_string(),
             completed_at: Some(Utc::now() - chrono::Duration::days(10)),
             context_headers: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -1228,6 +2123,8 @@ mod tests {
             state: "COMPLETED".to_string(),
             completed_at: Some(Utc::now() - chrono::Duration::days(9)),
             context_headers: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,
@@ -1256,5 +2153,92 @@ mod tests {
         }
 
         assert_eq!(outcome.next_cursor, Some(cursor1));
+    }
+
+    // ── Legal hold (issue #747) ───────────────────────────────────────────────
+
+    #[test]
+    fn legal_hold_inactive_when_never_set() {
+        let now = Utc::now();
+        assert!(!legal_hold_active(None, None, now));
+        // A stray `until` with no `set_at` is still not a hold.
+        assert!(!legal_hold_active(
+            None,
+            Some(now + chrono::Duration::days(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_active_when_set_and_indefinite() {
+        let now = Utc::now();
+        assert!(legal_hold_active(
+            Some(now - chrono::Duration::hours(1)),
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_active_when_until_in_future() {
+        let now = Utc::now();
+        assert!(legal_hold_active(
+            Some(now - chrono::Duration::hours(1)),
+            Some(now + chrono::Duration::hours(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_inactive_when_expired() {
+        let now = Utc::now();
+        // until == now is expired (strict `>`): a hold whose deadline has been
+        // reached is no longer active.
+        assert!(!legal_hold_active(
+            Some(now - chrono::Duration::hours(2)),
+            Some(now),
+            now
+        ));
+        assert!(!legal_hold_active(
+            Some(now - chrono::Duration::hours(2)),
+            Some(now - chrono::Duration::hours(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_outcome_omits_optional_none_fields() {
+        let released = LegalHoldOutcome {
+            execution_id: "exec-1".into(),
+            held: false,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            newly_held: false,
+            released: true,
+        };
+        let v = serde_json::to_value(&released).unwrap();
+        assert_eq!(v["held"], false);
+        assert_eq!(v["released"], true);
+        assert!(v.get("newly_held").is_none(), "false flag is omitted");
+        assert!(v.get("legal_hold_reason").is_none());
+        assert!(v.get("legal_hold_until").is_none());
+
+        let held = LegalHoldOutcome {
+            execution_id: "exec-2".into(),
+            held: true,
+            legal_hold_reason: Some("subpoena".into()),
+            legal_hold_actor: Some("legal@corp".into()),
+            legal_hold_set_at: Some(Utc::now()),
+            legal_hold_until: None,
+            newly_held: true,
+            released: false,
+        };
+        let v = serde_json::to_value(&held).unwrap();
+        assert_eq!(v["held"], true);
+        assert_eq!(v["newly_held"], true);
+        assert_eq!(v["legal_hold_reason"], "subpoena");
+        assert!(v.get("released").is_none(), "false flag is omitted");
     }
 }

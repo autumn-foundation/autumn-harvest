@@ -103,6 +103,18 @@ diesel::table! {
         /// Set on every successor to the chain head so any member resolves the head
         /// in one lookup. NULL for the origin run and all non-continued runs.
         first_exec_id -> Nullable<Uuid>,
+        /// Wall-clock the per-execution legal hold was placed (issue #747).
+        /// NULL = no hold. A hold is ACTIVE when this is non-NULL and
+        /// `legal_hold_until` is NULL or in the future; an active hold exempts
+        /// this execution's history from retention deletion and PII erasure.
+        legal_hold_set_at -> Nullable<Timestamptz>,
+        /// Optional auto-expiry for the legal hold (issue #747). NULL =
+        /// indefinite; a past value means the hold is inactive again.
+        legal_hold_until -> Nullable<Timestamptz>,
+        /// Operator-supplied justification for the legal hold (issue #747).
+        legal_hold_reason -> Nullable<Text>,
+        /// Principal that placed the legal hold (issue #747, audit trail).
+        legal_hold_actor -> Nullable<Text>,
     }
 }
 
@@ -653,6 +665,22 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Request-scoped start idempotency claims — one row per
+    /// `(workflow_name, idempotency_key)` (issue #808).
+    harvest_start_idempotency (workflow_name, idempotency_key) {
+        workflow_name    -> Text,
+        idempotency_key  -> Text,
+        /// The execution this key first created; returned as a no-op on a dup.
+        workflow_exec_id -> Uuid,
+        created_at       -> Timestamptz,
+        /// Shard this claim was routed to (for the per-shard expiry sweep).
+        shard_id         -> Int4,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Pending event batch records — one row per `(workflow_name, batch_key)` (issue #518).
     harvest_event_batches (id) {
         id                -> Uuid,
@@ -779,6 +807,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_trigger_outbox,
     harvest_debounce,
     harvest_start_throttle,
+    harvest_start_idempotency,
     harvest_event_batches,
     harvest_payload_refs,
     harvest_completion_deliveries,

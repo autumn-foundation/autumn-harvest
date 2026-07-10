@@ -63,6 +63,15 @@ schemars = { version = "0.8", optional = true }
 name = "integration"
 path = "tests/integration/mod.rs"
 
+# Property-based (proptest) test suite. Mirrors the `integration` target's
+# single-entry-point convention: `tests/property/mod.rs` includes a module tree.
+# The pure-function suites run under `cargo test -p autumn-harvest
+# --no-default-features` (no DB); db-gated suites (build_routing, dlq) are
+# `#[cfg(feature = "db")]` submodules that only compile in a `db` build.
+[[test]]
+name = "property"
+path = "tests/property/mod.rs"
+
 [[bench]]
 name = "metrics_noop"
 harness = false
@@ -94,17 +103,37 @@ required-features = ["schema"]
 [[example]]
 name = "business_metrics"
 
+[[example]]
+name = "sleep_until_renewal_reminder"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-proptest = "1.11.0"
-loom = "0.7.2"
+proptest = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
 schemars = { version = "0.8" }
+
+# testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
+# global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out
+# (`#![cfg(not(loom))]`), so hyper-util fails to compile. The loom model target
+# (`tests/loom_models.rs`) never uses testcontainers, so gate it to non-loom
+# builds; the Docker-backed integration tests that DO use it always run under a
+# normal build where `cfg(not(loom))` is true, so this is transparent to them.
+[target.'cfg(not(loom))'.dev-dependencies]
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+# loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
+# `cfg(loom)` target dependency rather than `[dev-dependencies]` because the
+# `crate::loom_sync` shim references `loom::sync::*` from the *library* sources
+# (the `SessionSlotRegistry` type alias is production code, not test code), and
+# `[dev-dependencies]` are not available to the normal library build that the
+# `tests/loom_models.rs` integration target links against. Inert (not fetched
+# or compiled) on every normal build. See `docs/testing/loom.md`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
 
 [[bench]]
 name = "replay_bench"

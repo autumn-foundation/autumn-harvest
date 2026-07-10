@@ -298,9 +298,7 @@ mod scanner {
         crate::store::append_events(
             conn,
             exec_id,
-            &[WorkflowEvent::WorkflowFailed {
-                error: error.to_string(),
-            }],
+            &[WorkflowEvent::workflow_failed(error.to_string())],
             history.next_event_id,
         )
         .await?;
@@ -370,10 +368,7 @@ mod scanner {
             crate::store::append_single_event(
                 conn,
                 parent_exec_id,
-                WorkflowEvent::ChildWorkflowFailed {
-                    child_id: exec_id,
-                    error: error.to_string(),
-                },
+                WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
             )
             .await?;
             crate::queue::wake_workflow_task(conn, parent_exec_id).await?;

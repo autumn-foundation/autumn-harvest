@@ -1,9 +1,29 @@
+# Changelog: CI cost controls — reduce GitHub Actions minutes on iterative draft
+# work. Three standard controls (this repo has no docs/changelog.d/ newsfragment
+# convention on the base branch, so this changelog note lives here as a comment):
+#   1. concurrency.cancel-in-progress — a new push cancels the superseded in-progress
+#      run instead of queueing (already present below).
+#   2. Draft-PR skip — expensive jobs are guarded with
+#      `github.event_name != 'pull_request' || github.event.pull_request.draft == false`
+#      so intermediate draft-PR pushes don't run CI. The team iterates on DRAFT PRs
+#      and flips to "Ready for review" when final, so CI runs once per PR at the end
+#      plus any post-ready fixes. Push events (e.g. to trunk-dev) always run.
+#   3. Docs-only skip — the `changes` guard job gates the build/test jobs so a change
+#      touching only docs/** or **/*.md doesn't run the compile/test matrix. A job
+#      skipped via `if:` still reports success to branch protection, so this is safe
+#      for required status checks (unlike paths-ignore, which reports nothing).
 name: CI
 
 on:
+  # Manual trigger for the opt-in fuzz-smoke job (see the `fuzz-smoke` job).
+  workflow_dispatch:
   push:
     branches: [trunk, trunk-dev]
   pull_request:
+    # ready_for_review is required so flipping a draft to "Ready for review"
+    # triggers a fresh run; the GitHub default [opened, synchronize, reopened]
+    # does not include it. The other three keep normal PR pushes triggering.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [trunk, trunk-dev]
 
 concurrency:
@@ -15,9 +35,61 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Detects whether any non-docs file changed, so the build/test jobs below can
+  # skip on docs-only PRs/pushes. Plain `git diff` — no third-party action.
+  changes:
+    name: Detect non-docs changes
+    runs-on: ubuntu-latest
+    # Draft-skip (see header): don't even compute changes on draft-PR pushes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        name: Check whether any non-docs file changed
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            base="$PUSH_BEFORE"; head="${{ github.sha }}"
+          fi
+          # Fall back to the previous commit if base is empty/all-zeros/unknown
+          # (e.g. a brand-new branch push).
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          echo "Comparing ${base}...${head}"
+          # --no-renames disables rename detection so a code->docs move surfaces
+          # the deleted source path (setting code=true) instead of a docs-only add.
+          changed="$(git diff --name-only --no-renames "$base" "$head")"
+          echo "Changed files:"
+          echo "$changed"
+          # Docs-only = every changed path matches docs/** or **/*.md. If any
+          # other path is present, we have code changes and must run the matrix.
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # Draft-skip: the team iterates on DRAFT PRs (many pushes) and flips to
+    # "Ready for review" when final, so CI runs once per PR at the end plus any
+    # post-ready fixes. Push events (e.g. trunk-dev) always run via the
+    # `github.event_name != 'pull_request'` clause. Lint intentionally runs on
+    # docs-only changes (it's a single cheap job); the expensive build/test jobs
+    # below additionally gate on the `changes` guard.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,86 +113,160 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
-    needs: lint
+    needs: [lint, changes]
+    # Draft-skip only at the JOB level (see lint). Docs-only is handled at the
+    # STEP level below, not here: a job-level `if:` on a MATRIX job that evaluates
+    # false prevents matrix expansion entirely, so the `Test (<os>)` leg contexts
+    # are never created — not even as "skipped" — and any branch-protection rule
+    # requiring those legs by name is left stuck pending forever on a docs-only PR.
+    # Guarding each expensive step with `needs.changes.outputs.code == 'true'`
+    # instead keeps every leg context reporting (success, with the costly work
+    # skipped) while still saving the minutes on docs-only changes.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # Setup steps stay unconditional so the leg still spins up and reports a
+      # conclusion. The expensive cargo steps below carry the docs-only guard;
+      # when they all skip, the leg reports success — keeping the required
+      # `Test (<os>)` contexts satisfied without running the matrix work.
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run no-db tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
       - name: Run testing-feature integration tests (replayer)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --test integration
       - name: Run metrics-rs adapter integration tests (issue #754)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,metrics-rs --test integration -- metrics_rs_adapter
       - name: Run classic (non-unified) DAG tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features db --lib
       - name: Compile db-backed tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --tests --no-run
       - name: Run all-features lib tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib
+      - name: Run db-gated property suites (build_routing, dlq)
+        # The pure property suites run under the no-db line above; the db-gated
+        # submodules (build_routing_props, dlq_props) target pure functions in
+        # #[cfg(feature = "db")] modules and are otherwise only compiled — never
+        # executed — by the --no-run / --lib db steps. They need no live Postgres.
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --features db --test property
       - name: Free disk space
+        if: needs.changes.outputs.code == 'true'
         run: cargo clean
       - name: Run plugin lib tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --lib
       - name: Run plugin contract regression tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test contract_regression
+      - name: Run plugin effective-config HTTP tests (issue #695)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --test effective_config_http_tests
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
       - name: Compile plugin MCP integration tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --test mcp_tools_integration --no-run
       - name: Run plugin metrics scrape tests (issue #355)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
       - name: Compile plugin metrics scrape example
+        if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       - name: Run macros tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-macros
       - name: Run CLI tests (issue #753)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-cli
       - name: Run business_metrics example tests (issue #758)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
+      - name: Run typed_workflow_failure example tests (issue #767)
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Compile plugin integration tests
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test query_integration --test timeline_integration --no-run
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --test legal_hold_integration --no-run
       - name: Run Docker-backed integration tests
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
       - name: Run Docker-backed force-fail integration tests (issue #765)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- force_fail -- --test-threads=1
-      - name: Run plugin API and scheduler integration tests
+      - name: Run retention override integration tests (issue #737)
         if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests -- --test-threads=1
+      - name: Run Docker-backed typed workflow failure integration tests (issue #767)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests -- --test-threads=1
+      - name: Run Docker-backed typed workflow-failure retry-gate tests (issue #767 FIX B)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests::workflow_typed -- --test-threads=1
+      - name: Run plugin API and scheduler integration tests
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
       - name: Run plugin read-path decode integration tests (issue #608)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test read_path_decode_integration -- --test-threads=1
       - name: Run plugin UI integration tests
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test ui_integration -- --test-threads=1
       - name: Run plugin completion trigger integration tests (issue #810)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test completion_triggers_integration -- --test-threads=1
       - name: Run plugin fail-now integration tests (issue #765)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test fail_now_integration -- --test-threads=1
-      - name: Run core schedule run-history integration tests (issue #762)
+      - name: Run plugin legal-hold integration tests (issue #747)
         if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test legal_hold_integration -- --test-threads=1
+      - name: Run plugin DAG run graph integration tests (issue #690)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --test dag_run_graph_integration -- --test-threads=1
+      - name: Run core schedule run-history integration tests (issue #762)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- schedule_runs_tests -- --test-threads=1
       - name: Run plugin schedule run-history integration tests (issue #762)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test schedule_runs_integration -- --test-threads=1
-      - name: Run plugin timeline integration tests (issue #739)
+      - name: Run core start-idempotency integration tests (issue #808)
         if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- start_idempotency_tests -- --test-threads=1
+      - name: Run plugin start-idempotency integration tests (issue #808)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test start_idempotency_integration -- --test-threads=1
+      - name: Run plugin status-summary integration tests (issue #679)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --test status_summary_integration -- --test-threads=1
+      - name: Run plugin timeline integration tests (issue #739)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test timeline_integration -- --test-threads=1
       - name: Run plugin terminal-query integration tests (issue #612)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test query_integration -- --test-threads=1
+      - name: Run plugin eligibility explainer integration tests (issue #611)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test eligibility_tests -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +277,11 @@ jobs:
 
   msrv:
     name: MSRV (1.88.0)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -138,3 +289,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace
+
+  # Opt-in fuzz smoke. NEVER runs on push/PR — GitHub Actions minutes are tight
+  # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab
+  # (Run workflow) when you want a quick "do the targets still build and run
+  # clean" check. For a real campaign, run a single target locally with a larger
+  # -max_total_time (see docs/testing/property-and-fuzz.md and fuzz/smoke.sh).
+  fuzz-smoke:
+    name: Fuzz smoke (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz smoke (30s per target)
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for t in fuzz_workflow_event_deser fuzz_det_check_source \
+                   fuzz_validate_target_url fuzz_failure_signature; do
+            echo "=== ${t} ==="
+            cargo +nightly fuzz run "${t}" -- -max_total_time=30
+          done

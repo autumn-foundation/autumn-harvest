@@ -942,7 +942,7 @@ async fn start_tool(
         Path(workflow.to_string()),
         None,
         headers,
-        Json(crate::api::StartWorkflowRequest::from_input(body)),
+        Ok(Json(crate::api::StartWorkflowRequest::from_input(body))),
     ))
     .await
 }

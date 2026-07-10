@@ -344,6 +344,12 @@ enum Commands {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+    /// Place or release a per-execution legal hold (issue #747).
+    #[command(alias = "legal-holds")]
+    LegalHold {
+        #[command(subcommand)]
+        command: LegalHoldCommand,
+    },
     /// Inspect and resolve external activity handoffs.
     #[command(
         alias = "handoffs",
@@ -1375,6 +1381,30 @@ enum ConcurrencyCommand {
     Status,
 }
 
+/// Per-execution legal hold (issue #747): exempt an execution's history from
+/// retention deletion and PII erasure until released or auto-expired.
+#[derive(Debug, Subcommand)]
+enum LegalHoldCommand {
+    /// Place (or refresh) a legal hold on an execution.
+    Set {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Justification for the hold (recorded in the audit trail and
+        /// `legal_hold_reason`).
+        #[arg(long)]
+        reason: String,
+        /// Optional RFC3339 auto-expiry (e.g. `2027-01-01T00:00:00Z`). Omit for
+        /// an indefinite hold.
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// Release a legal hold on an execution.
+    Release {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum RateLimitCommand {
     /// Show all active per-activity rate limit token buckets and refill rates.
@@ -1694,6 +1724,7 @@ impl Cli {
             Commands::Shard { command } => Ok(shard_request(command)),
             Commands::Workflow { command } => workflow_request(command),
             Commands::History { command } => Ok(history_request(command)),
+            Commands::LegalHold { command } => Ok(legal_hold_request(command)),
             Commands::Handoff { command } => handoff_request(command),
             Commands::Dag { command } => dag_request(command, self.actor.as_deref()),
             Commands::Schedule { command } => schedule_request(command),
@@ -4578,6 +4609,31 @@ fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
     }
 }
 
+fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
+    match command {
+        LegalHoldCommand::Set {
+            execution_id,
+            reason,
+            until,
+        } => {
+            let mut body = Map::new();
+            insert_string(&mut body, "reason", Some(reason.as_str()));
+            insert_string(&mut body, "hold_until", until.as_deref());
+            ApiRequest::post(
+                format!("/workflows/{}/legal-hold", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            )
+        }
+        LegalHoldCommand::Release { execution_id } => ApiRequest::post(
+            format!(
+                "/workflows/{}/legal-hold/release",
+                path_segment(execution_id)
+            ),
+            None,
+        ),
+    }
+}
+
 fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
     match command {
         RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
@@ -6735,6 +6791,64 @@ mod erase_payloads_cli_tests {
             body.get("reason").is_none() || body["reason"].is_null(),
             "omitting --reason must not send the field"
         );
+    }
+}
+
+#[cfg(test)]
+mod legal_hold_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn legal_hold_set_builds_post_request_with_reason() {
+        let req = request(&["legal-hold", "set", "abc-123", "--reason", "case 42"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/legal-hold");
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["reason"], "case 42");
+        assert!(
+            body.get("hold_until").is_none() || body["hold_until"].is_null(),
+            "omitting --until must not send hold_until"
+        );
+    }
+
+    #[test]
+    fn legal_hold_set_includes_until_when_provided() {
+        let req = request(&[
+            "legal-hold",
+            "set",
+            "abc-123",
+            "--reason",
+            "case 42",
+            "--until",
+            "2027-01-01T00:00:00Z",
+        ]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["hold_until"], "2027-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn legal_hold_release_builds_post_request() {
+        let req = request(&["legal-hold", "release", "abc-123"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/legal-hold/release");
+    }
+
+    #[test]
+    fn legal_hold_set_requires_reason() {
+        // clap must reject `set` without --reason.
+        let res = Cli::try_parse_from(["harvest", "legal-hold", "set", "abc-123"]);
+        assert!(res.is_err(), "--reason is required for legal-hold set");
     }
 }
 

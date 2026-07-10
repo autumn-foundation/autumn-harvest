@@ -94,6 +94,10 @@ fn fanout_retry_dag(dag: &mut DagBuilder) {
 
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -449,9 +453,7 @@ fn linear_failed_events() -> (Vec<WorkflowEvent>, ActivityExecId, ActivityExecId
         completed(ib),
         sched("step_c", ic),
         failed(ic),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed".to_string()),
     ];
     (events, ia, ib)
 }
@@ -619,9 +621,7 @@ async fn retry_fanout_dag_re_executes_failed_node_level() {
         completed(ib),
         completed(id),
         failed(ic),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed".to_string()),
     ];
     let exec_id = seed_run(&mut conn, "fanout_retry_dag", "fan-1", events, "FAILED").await;
 

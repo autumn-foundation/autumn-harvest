@@ -7,6 +7,7 @@ pub mod api;
 /// auto-wired by [`crate::plugin::HarvestPlugin`].
 pub mod callback_deliverer;
 pub mod config;
+pub mod dag_graph;
 pub mod dag_retry;
 pub mod outbox;
 pub mod plugin;
@@ -17,6 +18,7 @@ pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;
 pub mod state;
+pub mod status_summary;
 pub mod ui;
 pub mod usage;
 pub mod version_gate_retirement;

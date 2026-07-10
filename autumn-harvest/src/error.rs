@@ -134,12 +134,30 @@ pub enum HarvestError {
     },
 
     /// A workflow execution failed permanently.
+    ///
+    /// The typed fields (issue #767) carry a decoded
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) when the workflow
+    /// returned one; they are `None` for untyped `Err(String)` failures.
     #[error("workflow failed: {name}: {reason}")]
     WorkflowFailed {
         /// The name of the failed workflow.
         name: String,
-        /// The reason string describing the failure.
+        /// The reason string describing the failure (human-readable message).
         reason: String,
+        /// Stable error-type name from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
+        /// untyped failures.
+        error_type: Option<String>,
+        /// Structured details from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
+        /// untyped failures.
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable classification hint from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
+        /// untyped failures. This is a hint for the caller / completion-trigger,
+        /// **not** a control input to the engine's workflow-level retry (#523)
+        /// loop (issue #767 scope).
+        non_retryable: Option<bool>,
     },
 
     /// The engine detected non-deterministic behavior during workflow replay.
@@ -609,6 +627,77 @@ impl HarvestError {
     pub fn is_operator_force_failed(&self) -> bool {
         self.activity_error_type() == Some(crate::failure::ERROR_TYPE_OPERATOR_FORCE_FAILED)
     }
+
+    /// Construct a [`WorkflowFailed`](HarvestError::WorkflowFailed) by decoding a
+    /// workflow failure payload, recovering the typed `error_type` / `details` /
+    /// `non_retryable` from a [`WorkflowFailure`](crate::failure::WorkflowFailure)
+    /// wire envelope (issue #767). A legacy `Err(String)` payload decodes to
+    /// `None` typed fields.
+    #[must_use]
+    pub fn workflow_failed(name: impl Into<String>, payload: &str) -> Self {
+        let decoded = crate::failure::decode_workflow_failure(payload);
+        Self::WorkflowFailed {
+            name: name.into(),
+            reason: decoded.message,
+            error_type: decoded.error_type,
+            details: decoded.details,
+            non_retryable: decoded.non_retryable,
+        }
+    }
+
+    /// Construct an untyped [`WorkflowFailed`](HarvestError::WorkflowFailed): the
+    /// typed fields default to `None` (issue #767).
+    #[must_use]
+    pub fn workflow_failed_untyped(name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::WorkflowFailed {
+            name: name.into(),
+            reason: reason.into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+
+    /// If this is a [`WorkflowFailed`](HarvestError::WorkflowFailed), return its
+    /// stable error-type class from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure). `None` for untyped
+    /// failures or other variants.
+    #[must_use]
+    pub fn workflow_error_type(&self) -> Option<&str> {
+        match self {
+            Self::WorkflowFailed { error_type, .. } => error_type.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// If this is a [`WorkflowFailed`](HarvestError::WorkflowFailed), return the
+    /// structured `details` carried by a typed failure. `None` for untyped
+    /// failures or other variants.
+    #[must_use]
+    pub const fn workflow_details(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::WorkflowFailed { details, .. } => details.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// `true` if this is a [`WorkflowFailed`](HarvestError::WorkflowFailed)
+    /// carrying a typed non-retryable [`WorkflowFailure`](crate::failure::WorkflowFailure).
+    /// `false` for untyped failures or other variants.
+    ///
+    /// This is an **advisory** classification hint for the caller /
+    /// completion-trigger — it is not a retry control input; the engine's
+    /// workflow-level retry (#523) loop never consults it (issue #767 scope).
+    /// To gate the retry loop on a failure class, list its `error_type` in the
+    /// workflow's `RetryPolicy::non_retryable_errors` — the scheduler matches
+    /// that list against the decoded `error_type`, not against this flag.
+    #[must_use]
+    pub fn is_workflow_non_retryable(&self) -> bool {
+        match self {
+            Self::WorkflowFailed { non_retryable, .. } => non_retryable.unwrap_or(false),
+            _ => false,
+        }
+    }
 }
 
 /// Standard result type for internal harvest engine operations.
@@ -870,13 +959,86 @@ mod tests {
 
     #[test]
     fn harvest_error_workflow_failed_display() {
-        let e = HarvestError::WorkflowFailed {
-            name: "test_workflow".into(),
-            reason: "logic error".into(),
-        };
+        let e = HarvestError::workflow_failed_untyped("test_workflow", "logic error");
         let msg = e.to_string();
         assert!(msg.contains("test_workflow"));
         assert!(msg.contains("logic error"));
+    }
+
+    // ── typed workflow failures (issue #767) ──────────────────────────────
+
+    #[test]
+    fn workflow_error_type_returns_type_for_typed_failure() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload =
+            WorkflowFailure::new("ValidationRejected", "bad").into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("wf", &payload);
+        assert_eq!(e.workflow_error_type(), Some("ValidationRejected"));
+        assert!(e.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn workflow_error_type_none_for_untyped() {
+        let e = HarvestError::workflow_failed("wf", "plain");
+        assert!(e.workflow_error_type().is_none());
+        assert!(e.workflow_details().is_none());
+        assert!(!e.is_workflow_non_retryable());
+        assert!(e.to_string().contains("plain"));
+    }
+
+    #[test]
+    fn workflow_details_returns_details() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload = WorkflowFailure::new("X", "y")
+            .with_details(serde_json::json!({"code": 42}))
+            .into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("wf", &payload);
+        let details = e.workflow_details().expect("typed failure carries details");
+        assert_eq!(details["code"], 42);
+    }
+
+    #[test]
+    fn is_workflow_non_retryable_true_for_non_retryable_envelope() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload = WorkflowFailure::new("Permanent", "no")
+            .non_retryable()
+            .into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("wf", &payload);
+        assert!(e.is_workflow_non_retryable());
+    }
+
+    #[test]
+    fn workflow_failed_decodes_envelope() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload = WorkflowFailure::new("BudgetExceeded", "over cap")
+            .with_details(serde_json::json!({"limit": 100}))
+            .non_retryable()
+            .into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("billing", &payload);
+        match &e {
+            HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(name, "billing");
+                assert_eq!(reason, "over cap");
+                assert_eq!(error_type.as_deref(), Some("BudgetExceeded"));
+                assert_eq!(*details, Some(serde_json::json!({"limit": 100})));
+                assert_eq!(*non_retryable, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn workflow_error_type_none_for_other_variants() {
+        let e = HarvestError::Cancelled("stop".into());
+        assert!(e.workflow_error_type().is_none());
+        assert!(e.workflow_details().is_none());
+        assert!(!e.is_workflow_non_retryable());
     }
 
     #[test]

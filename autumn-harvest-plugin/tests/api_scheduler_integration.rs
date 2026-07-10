@@ -55,6 +55,10 @@ use tower::ServiceExt;
 
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -3778,6 +3782,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .build(),
         &HarvestRuntimeConfig {

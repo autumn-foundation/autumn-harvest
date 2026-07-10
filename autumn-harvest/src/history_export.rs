@@ -474,7 +474,7 @@ impl MermaidExporter {
             WorkflowEvent::WorkflowCompleted { .. } => {
                 writeln!(self.out, "    Note over WF: Workflow Completed")?;
             }
-            WorkflowEvent::WorkflowFailed { error } => {
+            WorkflowEvent::WorkflowFailed { error, .. } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(self.out, "    Note over WF: Workflow Failed: {safe_error}")?;
             }
@@ -680,7 +680,9 @@ impl MermaidExporter {
                     "    Note right of WF: Child Workflow Completed (ID: {child_id})"
                 )?;
             }
-            WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id, error, ..
+            } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(
                     self.out,
@@ -1065,9 +1067,9 @@ mod tests {
                     queue: "payments".to_string(),
                     schedule_to_close_secs: 300,
                 },
-                WorkflowEvent::WorkflowFailed {
-                    error: "downstream returned bearer lower-secret".to_string(),
-                },
+                WorkflowEvent::workflow_failed(
+                    "downstream returned bearer lower-secret".to_string(),
+                ),
             ],
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,

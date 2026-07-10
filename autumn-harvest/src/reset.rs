@@ -1543,6 +1543,10 @@ mod tests {
             completion_callbacks: None,
             continued_from_exec_id: None,
             first_exec_id: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
         }
     }
 
@@ -2053,9 +2057,7 @@ mod tests {
                 queue: "default".to_string(),
             },
             activity_completed(act_id),
-            WorkflowEvent::WorkflowFailed {
-                error: "oops".to_string(),
-            },
+            WorkflowEvent::workflow_failed("oops".to_string()),
         ];
         assert_eq!(
             resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
@@ -2123,9 +2125,7 @@ mod tests {
                 queue: "default".to_string(),
             },
             activity_completed(act_id),
-            WorkflowEvent::WorkflowFailed {
-                error: "transient".to_string(),
-            },
+            WorkflowEvent::workflow_failed("transient".to_string()),
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id,
                 attempt: 2,

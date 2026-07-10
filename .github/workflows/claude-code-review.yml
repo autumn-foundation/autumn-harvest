@@ -17,6 +17,10 @@ concurrency:
 
 jobs:
   claude-review:
+    # CI cost control: skip the (expensive) automated review on intermediate
+    # draft-PR pushes. The pull_request `types` above include ready_for_review,
+    # so flipping the PR to "Ready for review" triggers the review once.
+    if: github.event.pull_request.draft == false
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
