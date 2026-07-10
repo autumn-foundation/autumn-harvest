@@ -2712,8 +2712,13 @@ impl WorkflowTestEnv {
                 Ok(output)
             }
             WorkflowOutcome::Failed { error, .. } => {
-                history.push(WorkflowEvent::workflow_failed(error.clone()));
-                Err(error)
+                // Decode the failure payload so a `#[workflow] -> Result<_, WorkflowFailure>`
+                // run records the typed `error_type`/`details`/`non_retryable` fields and
+                // surfaces the human message (not the raw `harvest_workflow_failure_v1`
+                // envelope), matching the worker and simulator paths (issue #767, Codex P2).
+                let decoded = crate::failure::decode_workflow_failure(&error);
+                history.push(WorkflowEvent::workflow_failed_typed(&decoded));
+                Err(decoded.message)
             }
             WorkflowOutcome::ContinuedAsNew { input } => {
                 history.push(WorkflowEvent::WorkflowContinuedAsNew {

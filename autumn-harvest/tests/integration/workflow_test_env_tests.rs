@@ -1947,3 +1947,58 @@ async fn test_env_threads_workflow_and_queue_labels_into_saga_metrics() {
          must fire exactly once across the env's iterations"
     );
 }
+
+// ─────────────── Typed workflow failure (issue #767, Codex P2) ────────────────
+
+/// A root workflow that fails with a typed `WorkflowFailure`. The macro encodes
+/// `Err(WorkflowFailure)` into the `harvest_workflow_failure_v1` envelope on the
+/// engine's `Result<Value, String>` boundary; this handler reproduces that
+/// encoding via `into_workflow_error_payload` so the harness sees exactly what
+/// the worker would.
+fn typed_failing_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure};
+    Box::pin(async move {
+        Err(WorkflowFailure::new("BudgetExceeded", "over")
+            .non_retryable()
+            .with_details(json!({ "cap": 5 }))
+            .into_workflow_error_payload())
+    })
+}
+
+#[tokio::test]
+async fn test_env_root_typed_failure_records_typed_fields_and_human_message() {
+    let outcome = WorkflowTestEnv::new()
+        .run(typed_failing_workflow, json!(null))
+        .await;
+
+    // The outcome error string is the decoded human message, not the raw envelope.
+    assert_eq!(outcome.result, Err("over".to_owned()));
+
+    let recorded = outcome
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => Some((
+                error.clone(),
+                error_type.clone(),
+                details.clone(),
+                *non_retryable,
+            )),
+            _ => None,
+        })
+        .expect("a WorkflowFailed event must be recorded");
+
+    let (error, error_type, details, non_retryable) = recorded;
+    assert_eq!(error, "over");
+    assert_eq!(error_type.as_deref(), Some("BudgetExceeded"));
+    assert_eq!(non_retryable, Some(true));
+    assert_eq!(details, Some(json!({ "cap": 5 })));
+}
