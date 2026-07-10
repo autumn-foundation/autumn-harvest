@@ -126,7 +126,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!("../../migrations/20260710000000_harvest_execution_summaries/up.sql"),
+    include_str!("../../migrations/20260710000001_harvest_execution_summaries/up.sql"),
 );
 
 /// Capturing metrics recorder — records `(workflow, count)` from

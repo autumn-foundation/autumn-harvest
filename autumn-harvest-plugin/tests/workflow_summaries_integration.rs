@@ -49,7 +49,7 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
     "\n",
     include_str!(
-        "../../autumn-harvest/migrations/20260710000000_harvest_execution_summaries/up.sql"
+        "../../autumn-harvest/migrations/20260710000001_harvest_execution_summaries/up.sql"
     ),
 );
 
