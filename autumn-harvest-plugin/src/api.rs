@@ -163,6 +163,43 @@ impl HarvestRetentionRuntime {
     }
 }
 
+/// Well-formed, secret-free defaults snapshot used to seed a freshly
+/// constructed [`HarvestApiRuntime`] (issue #695).
+///
+/// The shard topology reflects the runtime's real `router`; every other section
+/// is a default/zero placeholder. Production runtimes always replace this via
+/// [`HarvestApiRuntime::with_effective_config`] inside `HarvestRunner::start`, so
+/// this is only ever observed by a hand-built runtime that skips the override
+/// (e.g. a test); it must therefore never carry a secret, and does not.
+fn placeholder_effective_config(
+    router: &ShardRouter,
+) -> autumn_harvest::effective_config::EffectiveConfigView {
+    use autumn_harvest::effective_config::{PayloadCapsView, PoolConfigView};
+    autumn_harvest::effective_config::EffectiveConfigView::capture(
+        &autumn_harvest::builder::WorkerConfig::default(),
+        PayloadCapsView::new(
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            std::time::Duration::ZERO,
+            0,
+            false,
+            0,
+        ),
+        router,
+        PoolConfigView {
+            worker_pool_max_connections: 0,
+            shard_pool_count: 0,
+        },
+        autumn_harvest::worker::DEFAULT_WORKER_POLL_INTERVAL,
+    )
+}
+
 #[derive(Clone)]
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
@@ -174,6 +211,16 @@ pub struct HarvestApiRuntime {
     scheduler: SchedulerMonitor,
     retention: HarvestRetentionRuntime,
     router: ShardRouter,
+    /// Secret-free effective-config snapshot (issue #695), served by
+    /// `GET /admin/config`. Carried on the runtime itself so a snapshot is
+    /// present whenever the runtime is installed — no separate
+    /// `set_effective_config` call the integrator must remember, and no
+    /// runtime-present-but-snapshot-absent boot window. `HarvestApiRuntime::new`
+    /// seeds a defaults placeholder; the shared `HarvestRunner::start` seam
+    /// (which every `BuiltHarvest` consumer funnels through) overrides it with
+    /// the resolved snapshot via [`HarvestApiRuntime::with_effective_config`].
+    /// Wrapped in `Arc` so the per-request `runtime()` clone stays cheap.
+    effective_config: Arc<autumn_harvest::effective_config::EffectiveConfigView>,
 }
 
 impl HarvestApiRuntime {
@@ -212,6 +259,12 @@ impl HarvestApiRuntime {
             scheduler,
             retention,
             router: router.clone(),
+            // Defaults placeholder — the real, resolved snapshot is attached by
+            // the shared `HarvestRunner::start` seam via `with_effective_config`.
+            // Never served in production (the runner always overrides it); a
+            // hand-built runtime that skips the override serves this well-formed,
+            // secret-free defaults view.
+            effective_config: Arc::new(placeholder_effective_config(&router)),
         };
         if let Some(first_queue) = this.queues.as_slice().first()
             && let Ok(mut lock) =
@@ -248,6 +301,29 @@ impl HarvestApiRuntime {
         registered.extend(names);
         self.registered_dag_names = Arc::new(registered);
         self
+    }
+
+    /// Attach the resolved, secret-free effective-config snapshot (issue #695).
+    ///
+    /// Called by the shared `HarvestRunner::start` bring-up path — the one seam
+    /// every `BuiltHarvest` consumer (the `HarvestPlugin` web-app path and the
+    /// standalone runner) funnels through — so `GET /admin/config` serves the
+    /// resolved configuration on any deployment that installs this runtime,
+    /// without a separate `set_effective_config` call to remember. Replaces the
+    /// defaults placeholder seeded by [`HarvestApiRuntime::new`].
+    #[must_use]
+    pub fn with_effective_config(
+        mut self,
+        view: autumn_harvest::effective_config::EffectiveConfigView,
+    ) -> Self {
+        self.effective_config = Arc::new(view);
+        self
+    }
+
+    /// The resolved effective-config snapshot carried by this runtime (issue #695).
+    #[must_use]
+    pub(crate) fn effective_config(&self) -> autumn_harvest::effective_config::EffectiveConfigView {
+        (*self.effective_config).clone()
     }
 
     #[must_use]
@@ -361,11 +437,6 @@ pub struct HarvestApiState {
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Starter defaults; overridable per deployment via the plugin builder.
     status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
-    /// Snapshot of the resolved effective runtime configuration (issue #695),
-    /// captured once at startup and served (secret-free) from
-    /// `GET /admin/config`. `None` until the runtime starts — the handler
-    /// fails closed in that boot window.
-    effective_config: Arc<Mutex<Option<autumn_harvest::effective_config::EffectiveConfigView>>>,
 }
 
 impl Default for HarvestApiState {
@@ -415,7 +486,6 @@ impl Default for HarvestApiState {
             status_thresholds: Arc::new(Mutex::new(
                 crate::status_summary::StatusThresholds::default(),
             )),
-            effective_config: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -636,42 +706,6 @@ impl HarvestApiState {
             .decode_payloads_on_read
             .lock()
             .expect("harvest api state lock poisoned")
-    }
-
-    /// Install the resolved effective-config snapshot (issue #695).
-    ///
-    /// Call this during startup from the plugin, once the [`WorkerConfig`],
-    /// shard router, payload caps, and pool sizing are all resolved, so
-    /// `GET /admin/config` can serve the secret-free view. Until it is set the
-    /// handler fails closed with the standard "runtime not started" error.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn set_effective_config(
-        &self,
-        view: autumn_harvest::effective_config::EffectiveConfigView,
-    ) {
-        *self
-            .effective_config
-            .lock()
-            .expect("harvest api state lock poisoned") = Some(view);
-    }
-
-    /// Snapshot of the resolved effective runtime configuration (issue #695),
-    /// or `None` if the runtime has not started yet.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    #[must_use]
-    pub fn effective_config(
-        &self,
-    ) -> Option<autumn_harvest::effective_config::EffectiveConfigView> {
-        self.effective_config
-            .lock()
-            .expect("harvest api state lock poisoned")
-            .clone()
     }
 
     /// Set the hard ceiling on per-execution event count (issue #493).
@@ -5379,31 +5413,24 @@ async fn admin_status(
 /// `GET /admin/config` — return the resolved effective runtime configuration,
 /// secret-free (issue #695).
 ///
-/// Read-only, admin-gated. Serves the [`EffectiveConfigView`] captured once at
-/// startup. Secret-bearing configuration (notification URLs, sharded pool
-/// handle) is surfaced only as presence booleans/counts — never a value — so a
-/// connection string can never appear in the response. Fails closed with the
-/// standard "runtime not started" error if the snapshot is not yet installed.
+/// Read-only, admin-gated. Serves the [`EffectiveConfigView`] carried by the
+/// installed runtime. Secret-bearing configuration (notification URLs, sharded
+/// pool handle) is surfaced only as presence booleans/counts — never a value —
+/// so a connection string can never appear in the response.
+///
+/// The snapshot lives *on* the [`HarvestApiRuntime`] (attached by the shared
+/// `HarvestRunner::start` bring-up seam every deployment funnels through), so a
+/// single `runtime()` gate is both the readiness check and the source of the
+/// view — there is no separate snapshot slot that could be present without a
+/// runtime, or absent while one is installed. A genuinely un-started runtime
+/// still fails closed with the standard "runtime not started" error.
 ///
 /// [`EffectiveConfigView`]: autumn_harvest::effective_config::EffectiveConfigView
 async fn effective_config(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<autumn_harvest::effective_config::EffectiveConfigView>, AutumnError> {
-    // Gate readiness on the runtime being installed, exactly like every other
-    // management handler (issue #695 review, P2). The snapshot is captured early
-    // in plugin startup — before the fallible multi-shard checks and before
-    // `install(runtime)` — so a present snapshot is NOT a readiness signal on its
-    // own: without this gate the endpoint could 200 during the startup window
-    // while `runtime()` still reports "not started", or keep serving a stale
-    // snapshot if a later startup step errored and never installed a runtime.
-    // Requiring the runtime fails closed in both cases.
-    api_state.runtime().map_err(map_error)?;
-    let view = api_state.effective_config().ok_or_else(|| {
-        map_error(HarvestError::Config(
-            "harvest runtime is not started".to_string(),
-        ))
-    })?;
-    Ok(Json(view))
+    let runtime = api_state.runtime().map_err(map_error)?;
+    Ok(Json(runtime.effective_config()))
 }
 
 async fn version_usage(

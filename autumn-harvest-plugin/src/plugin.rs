@@ -738,75 +738,12 @@ async fn start_harvest_runtime(
         built.set_audit_retention_days(days);
     }
 
-    // Capture the resolved effective runtime configuration (issue #695) so
-    // `GET /admin/config` can serve a secret-free introspection snapshot. This
-    // must run before `harvest_pool` and `router` are moved into
-    // `HarvestRunnerResources` below. Payload/history ceilings mirror the same
-    // resolution used for the API-state scalars above (the builder value falls
-    // back to the WorkerConfig value for the history ceiling).
-    {
-        use autumn_harvest::effective_config::{
-            EffectiveConfigView, PayloadCapsView, PoolSizing, resolve_pool_view,
-        };
-        let (payload_offload_enabled, payload_offload_threshold_bytes) = built
-            .payload_offloader()
-            .map_or((false, 0), |o| (true, o.threshold()));
-        let caps = PayloadCapsView::new(
-            built.max_activity_input_bytes,
-            built.max_activity_result_bytes,
-            built.max_signal_payload_bytes,
-            built.max_workflow_input_bytes,
-            built.max_current_details_bytes,
-            built.max_workflow_execution_timeout,
-            built.max_workflow_attempts,
-            built
-                .max_workflow_history_events
-                .or_else(|| built.worker_config().max_workflow_history_events),
-            built.usage_window_ceiling,
-            built.usage_max_groups,
-            payload_offload_enabled,
-            payload_offload_threshold_bytes,
-        );
-        // Mirror `HarvestRunner::start`'s pool-selection precedence: a
-        // `WorkerConfig::with_sharded_pool` (single-shard, valid on the plugin
-        // path) is used by the runtime *instead of* `harvest_pool`, so the
-        // snapshot must report that pool's sizing, not the fallback's (issue
-        // #695 review). The fallback shard count is derived from the router's
-        // shard set rather than a hardcoded `1`, so it stays correct if
-        // multi-shard is ever enabled. On the plugin path both counts are always
-        // 1 in practice because multi-shard deployments are rejected below.
-        let fallback_pool_sizing = PoolSizing {
-            max_connections: harvest_pool.status().max_size,
-            shard_count: router.readable_shards().len(),
-        };
-        // `sharded_pool` is a `db`-only field; the plugin always depends on
-        // `autumn-harvest` with `db`, so it is always present here (mirroring the
-        // ungated access at the multi-shard preflight check below).
-        let sharded_pool_sizing =
-            built
-                .worker_config()
-                .sharded_pool
-                .as_ref()
-                .map(|sp| PoolSizing {
-                    max_connections: sp.pool_for(sp.default_shard()).status().max_size,
-                    shard_count: sp.iter_shards().count(),
-                });
-        let pool_view = resolve_pool_view(sharded_pool_sizing, fallback_pool_sizing);
-        // Read the poll interval from the side-effect-free constant rather than
-        // constructing a `WorkerRuntimeConfig`, whose `From<WorkerConfig>`
-        // conversion prematurely locks the write-once
-        // `GLOBAL_DEFAULT_WORKFLOW_QUEUE` (issue #695 review). This capture runs
-        // before the fallible preflight/`HarvestRunner::start`, so a read-only
-        // introspection snapshot must not mutate that global.
-        let poll_interval = autumn_harvest::worker::DEFAULT_WORKER_POLL_INTERVAL;
-        api_state.set_effective_config(EffectiveConfigView::capture(
-            built.worker_config(),
-            caps,
-            &router,
-            pool_view,
-            poll_interval,
-        ));
-    }
+    // The resolved effective runtime configuration (issue #695) served by
+    // `GET /admin/config` is captured inside `PreparedHarvestRuntime::build`
+    // (in `HarvestRunner::start` below) and rides on the resulting
+    // `HarvestApiRuntime`, so it is populated on any deployment that installs
+    // that runtime — the plugin web-app path here and the standalone runner
+    // alike — without a separate `set_effective_config` call to remember.
 
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());

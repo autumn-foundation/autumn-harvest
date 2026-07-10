@@ -1,11 +1,18 @@
 //! No-database HTTP tests for the effective-config introspection endpoint
 //! (issue #695).
 //!
-//! `GET /admin/config` reads only the in-process snapshot on `HarvestApiState`
-//! — no database — so these drive the real `harvest_api_router` (including its
-//! `require_admin` route layer) against `AppState::for_test()` via `tower`,
-//! mirroring the `security.rs` pattern. The full plugin-wired capture at
-//! startup is exercised by the testcontainers integration test.
+//! `GET /admin/config` reads only the in-process snapshot carried by the
+//! installed `HarvestApiRuntime` — no database — so these drive the real
+//! `harvest_api_router` (including its `require_admin` route layer) against
+//! `AppState::for_test()` via `tower`, mirroring the `security.rs` pattern.
+//!
+//! Since the snapshot lives *on* the runtime (attached by the shared
+//! `HarvestRunner::start` bring-up seam that both the plugin web-app path and
+//! the standalone runner funnel through), installing a runtime is the only step
+//! needed to serve the endpoint — there is no separate `set_effective_config`
+//! call. These tests deliberately install the runtime *without* any such call,
+//! exercising the exact install shape the standalone runner uses
+//! (`api_state.install(runner.api_runtime())`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,21 +99,25 @@ fn sample_view() -> EffectiveConfigView {
     )
 }
 
-/// Install a minimal, DB-free runtime so `HarvestApiState::runtime()` succeeds —
-/// the readiness gate the handler now requires before serving the snapshot
-/// (issue #695 review, P2). Mirrors the runtime shape the crate's internal
+/// Install a minimal, DB-free runtime carrying `view` — mirroring the standalone
+/// runner's `api_state.install(runner.api_runtime())` shape, where the snapshot
+/// rides on the runtime and no separate `set_effective_config` call is made
+/// (issue #695). The runtime shape otherwise mirrors what the crate's internal
 /// tests build.
-fn install_minimal_runtime(api_state: &HarvestApiState) {
-    api_state.install(HarvestApiRuntime::new(
-        Arc::new(HandlerRegistry::new(vec![], vec![])),
-        Arc::new(DagCatalog::default()),
-        Arc::new(Vec::new()),
-        None,
-        Vec::new(),
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
-        ShardRouter::single(),
-    ));
+fn install_runtime_with_view(api_state: &HarvestApiState, view: EffectiveConfigView) {
+    api_state.install(
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+            ShardRouter::single(),
+        )
+        .with_effective_config(view),
+    );
 }
 
 #[tokio::test]
@@ -117,8 +128,10 @@ async fn eris_unauthenticated_effective_config_is_blocked() {
 }
 
 #[tokio::test]
-async fn effective_config_fails_closed_when_snapshot_not_installed() {
-    // Admin-authorized, but the runtime never captured a snapshot: must NOT 200.
+async fn effective_config_fails_closed_when_runtime_not_installed() {
+    // Admin-authorized, but the runtime was never installed: the endpoint gates
+    // on `runtime()`, so a genuinely un-started deployment must fail closed with
+    // the standard "runtime not started" 400 — never 200 (P2#1 readiness gate).
     let app = app_with_api_state(HarvestApiState::new());
     let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
     assert_ne!(res.status(), StatusCode::OK);
@@ -128,32 +141,36 @@ async fn effective_config_fails_closed_when_snapshot_not_installed() {
 }
 
 #[tokio::test]
-async fn effective_config_snapshot_present_but_runtime_not_installed_fails_closed() {
-    // Regression for the issue #695 review P2: the snapshot is captured early in
-    // plugin startup, before the runtime is installed. A present snapshot must
-    // NOT, on its own, make the endpoint serve a 200 — otherwise a request in the
-    // startup window (or after a startup step errored before `install`) would see
-    // config for a fleet that is not running. The runtime-not-installed gate must
-    // fail closed even though the snapshot is present.
+async fn effective_config_served_from_installed_runtime_without_a_set_call() {
+    // Regression for the PR #987 review P2: the standalone-runner deployment
+    // shape starts a `HarvestRunner` and installs its runtime
+    // (`api_state.install(runner.api_runtime())`) — it never calls
+    // `set_effective_config`. The snapshot now rides on the runtime, so this
+    // install-only shape must serve a populated 200. (There is no
+    // `set_effective_config` to call — the footgun is structurally gone.)
     let api_state = HarvestApiState::new();
-    api_state.set_effective_config(sample_view());
-    // Deliberately do NOT install a runtime.
+    install_runtime_with_view(&api_state, sample_view());
     let app = app_with_api_state(api_state);
 
     let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
-    assert_ne!(res.status(), StatusCode::OK);
-    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
-    assert_ne!(res.status(), StatusCode::FORBIDDEN);
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // Populated body: the snapshot attached to the runtime (not a placeholder).
+    assert_eq!(json["pool"]["worker_pool_max_connections"], 10);
+    assert_eq!(json["worker"]["poll_interval_ms"], 500);
 }
 
 #[tokio::test]
 async fn effective_config_happy_path_returns_secret_free_view() {
     let api_state = HarvestApiState::new();
-    api_state.set_effective_config(sample_view());
-    // The handler gates on the runtime being installed (issue #695 review, P2),
-    // so a happy-path 200 requires an installed runtime alongside the snapshot.
-    install_minimal_runtime(&api_state);
+    // The snapshot rides on the installed runtime; the endpoint gates on
+    // `runtime()` being installed (P2#1), which this satisfies by installing a
+    // runtime carrying the sample view.
+    install_runtime_with_view(&api_state, sample_view());
     let app = app_with_api_state(api_state);
 
     let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
