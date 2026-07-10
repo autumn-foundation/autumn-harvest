@@ -4263,6 +4263,22 @@ impl WorkflowContext {
             .insert(timer_id.to_string(), state);
     }
 
+    /// Clear the logical lifecycle entry for `timer_id` (issue #768).
+    ///
+    /// Called when an awaited fire is CONSUMED so a subsequent
+    /// `start_timer(id, ..)` that reuses the id (a sliding-window / idle-session
+    /// loop) is treated as a FRESH arm — records a new `TimerStarted` with the
+    /// new duration — rather than a duplicate active arm of the (now-fired)
+    /// arming (Codex P2 round 6). The `Cancelled` state is deliberately NOT
+    /// cleared: a bare re-await must stay `Cancelled`, and a genuine reuse goes
+    /// through `start_timer`, which overwrites the entry to `Armed`.
+    fn clear_timer_logical_state(&self, timer_id: &str) {
+        self.cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned")
+            .remove(timer_id);
+    }
+
     /// Whether the workflow logically cancelled `timer_id` this task without a
     /// subsequent re-arm. Consulted by [`Self::await_timer_fire`] only when
     /// recorded history holds no resolving event.
@@ -4317,15 +4333,21 @@ impl WorkflowContext {
             !timer_id.is_empty(),
             "cancel_timer: timer_id must be non-empty"
         );
-        match self.match_history(|m| m.match_timer_cancel(timer_id)) {
-            // Replay: the TimerCancelled is already recorded and was consumed.
-            HistoryMatch::Matched { .. } => {}
-            // Live: record the cancel.
-            _ => {
-                self.push_command(WorkflowCommand::CancelTimer {
-                    timer_id: TimerId::new(timer_id),
-                });
-            }
+        // On replay the `TimerCancelled` is already recorded and was consumed
+        // (Matched) — nothing to do. Otherwise (NoMatch): a genuine LIVE cancel
+        // (record it), OR a strict-replay divergence — `match_timer_cancel`'s scan
+        // STOPPED at an unconsumed command before the recorded `TimerCancelled`,
+        // i.e. the cancel was moved earlier in the code (Codex P2 round 6, issue
+        // #768). Surface the divergence in strict replay before pushing a new
+        // command, mirroring `await_timer_fire`'s NoMatch handling.
+        if !matches!(
+            self.match_history(|m| m.match_timer_cancel(timer_id)),
+            HistoryMatch::Matched { .. }
+        ) {
+            self.check_strict_replay_no_match(&format!("TimerCancelled({timer_id})"))?;
+            self.push_command(WorkflowCommand::CancelTimer {
+                timer_id: TimerId::new(timer_id),
+            });
         }
         self.set_timer_logical_state(timer_id, TimerLogicalState::Cancelled);
         Ok(())
@@ -4352,14 +4374,18 @@ impl WorkflowContext {
             !timer_id.is_empty(),
             "reset_timer: timer_id must be non-empty"
         );
-        // Cancel the current arming.
-        match self.match_history(|m| m.match_timer_cancel(timer_id)) {
-            HistoryMatch::Matched { .. } => {}
-            _ => {
-                self.push_command(WorkflowCommand::CancelTimer {
-                    timer_id: TimerId::new(timer_id),
-                });
-            }
+        // Cancel the current arming. Matched → already recorded/consumed on
+        // replay (nothing to do). NoMatch → live reset (record the cancel), OR a
+        // strict-replay divergence — the reset was moved before an unconsumed
+        // command the cancel scan stopped at (Codex P2 round 6, issue #768).
+        if !matches!(
+            self.match_history(|m| m.match_timer_cancel(timer_id)),
+            HistoryMatch::Matched { .. }
+        ) {
+            self.check_strict_replay_no_match(&format!("TimerCancelled({timer_id})"))?;
+            self.push_command(WorkflowCommand::CancelTimer {
+                timer_id: TimerId::new(timer_id),
+            });
         }
         // Arm afresh.
         match self.match_history(|m| m.match_timer_arm(timer_id, duration_secs)) {
@@ -4420,6 +4446,14 @@ impl WorkflowContext {
                     // time (mirrors ctx.timer()).
                     #[cfg(any(test, feature = "testing"))]
                     self.advance_timer_clock(duration_secs);
+                    // Clear the Armed logical state so a subsequent
+                    // start_timer(id, ..) reusing this id (a sliding-window /
+                    // idle-session LOOP: arm; await→Fired; arm again — possibly
+                    // with a new duration) records a FRESH TimerStarted instead of
+                    // being swallowed as a duplicate active arm of this now-fired
+                    // arming (Codex P2 round 6, issue #768). Runs in all builds
+                    // (production replay + live), not just the test clock advance.
+                    self.clear_timer_logical_state(timer_id);
                     return Ok(TimerOutcome::Fired);
                 }
                 TimerFireMatch::Cancelled => return Ok(TimerOutcome::Cancelled),
@@ -10570,6 +10604,49 @@ mod tests {
             WorkflowCommand::ArmTimer { timer_id, for_await: true, .. }
                 if timer_id.as_str() == "idle"
         ));
+    }
+
+    #[tokio::test]
+    async fn await_fire_clears_armed_state_so_reused_id_records_fresh_arm() {
+        // Codex P2 round 6 (issue #768): consuming a fire must CLEAR the Armed
+        // logical state so a LOOP that reuses the same id (arm; await→Fired; arm
+        // again — here with a DIFFERENT duration) records a fresh arm per
+        // iteration rather than swallowing the second `start_timer` as a duplicate
+        // active arm of the now-fired arming. Proven on REPLAY (the harder path):
+        // both `TimerStarted`s must be consumed and the reused handle must carry
+        // the fresh duration.
+        let events = vec![
+            wf_started_event(),
+            timer_started_event("idle", 300),
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            timer_started_event("idle", 600),
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Iteration 0.
+        let h0 = ctx.start_timer("idle", 300);
+        assert_eq!(h0.await_fire().await.expect("await 0"), TimerOutcome::Fired);
+        // Iteration 1 reuses the id with a DIFFERENT duration — must NOT be a
+        // duplicate no-op; it must consume the second recorded TimerStarted(600).
+        let h1 = ctx.start_timer("idle", 600);
+        assert_eq!(
+            h1.duration_secs(),
+            600,
+            "the re-armed handle must carry the FRESH duration, not the stale 300"
+        );
+        assert_eq!(h1.await_fire().await.expect("await 1"), TimerOutcome::Fired);
+        assert!(
+            ctx.take_deferred_nd_error().is_none(),
+            "reusing the id after a fire must not diverge"
+        );
+        assert!(
+            !ctx.history_has_unconsumed_events(),
+            "both TimerStarted/TimerFired pairs must be consumed by the loop"
+        );
     }
 
     #[test]
