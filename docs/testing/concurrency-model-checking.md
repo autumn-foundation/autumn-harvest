@@ -120,7 +120,10 @@ Postgres *server*). A repo search confirms there is no peer-to-peer networking
 to simulate:
 
 - No `TcpListener` / `UdpSocket` / custom `tokio::net` server in
-  `autumn-harvest/src` or `autumn-harvest-plugin/src`.
+  `autumn-harvest/src` or `autumn-harvest-plugin/src`. (The only `TcpStream` /
+  `UdpSocket` string matches in the repo are forbidden-API *pattern literals* in
+  `det_check.rs`'s determinism deny-list — not a running server — so a future
+  grep hitting them is not a contradiction of this point.)
 - The only `std::net` usage is `completion_callback.rs`'s SSRF IP-literal
   validation (`IpAddr`/`Ipv4Addr`/`Ipv6Addr` parsing), which is not networking.
 - No `gossip` / `raft` / peer-replication module; no `turmoil`/`quinn` in any

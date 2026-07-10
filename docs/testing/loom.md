@@ -16,7 +16,7 @@ structures that are genuinely shared across threads.
 ```bash
 # From the repo root. No database required. --release is much faster (loom's
 # instrumentation is heavy in debug).
-RUSTFLAGS="--cfg loom" cargo test -p autumn-harvest --test loom_models --release
+RUSTFLAGS="--cfg loom" cargo test -p autumn-harvest --no-default-features --test loom_models --release
 ```
 
 Normal `cargo test` **never** runs these models: `tests/loom_models.rs` is
@@ -78,8 +78,11 @@ functions) — not a re-implementation.
 3. **`session_slot_bound_admits_at_most_one_at_capacity_one`.** Two acquires at
    capacity 1 (distinct ids) race; exactly one wins and the bound is never
    exceeded.
-4. **`session_slot_acquire_release_balances_and_never_underflows`.** Concurrent
-   acquire/release drains the registry back to empty under every interleaving.
+4. **`session_slot_acquire_release_balances_and_never_underflows`.** At capacity
+   two, both threads acquire distinct ids and release their own; under every
+   interleaving the registry drains back to empty and a fresh third acquire then
+   succeeds — proving release genuinely frees reusable capacity, not just a
+   counter.
 
 ## The `cfg(loom)` shim (`src/loom_sync.rs`)
 

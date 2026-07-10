@@ -14,7 +14,7 @@
 //! and runs nothing. The models only compile and run under:
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test -p autumn-harvest --test loom_models --release
+//! RUSTFLAGS="--cfg loom" cargo test -p autumn-harvest --no-default-features --test loom_models --release
 //! ```
 //!
 //! No database is required. `--release` is strongly recommended: loom's
@@ -48,6 +48,7 @@ use autumn_harvest::sessions::{
     new_session_slot_registry, release_session_slot, session_slot_count, try_acquire_session_slot,
 };
 use autumn_harvest::types::SessionId;
+use autumn_harvest::uuid::Uuid;
 use loom::sync::Arc;
 
 /// A breaker policy that trips on the very first retryable failure. A threshold
@@ -184,8 +185,11 @@ fn circuit_breaker_admits_at_most_one_half_open_probe() {
 fn session_slot_bound_admits_at_most_one_at_capacity_one() {
     loom::model(|| {
         let reg = new_session_slot_registry();
-        let id_a = SessionId::new();
-        let id_b = SessionId::new();
+        // Fixed distinct ids keep the model fully deterministic across loom
+        // iterations (`SessionId::new()` is a random v4 UUID). Control flow
+        // depends only on the ids being distinct, never on their values.
+        let id_a = SessionId::from_uuid(Uuid::from_u128(1));
+        let id_b = SessionId::from_uuid(Uuid::from_u128(2));
 
         let r1 = reg.clone();
         let a = loom::thread::spawn(move || try_acquire_session_slot(&r1, 1, id_a));
@@ -207,32 +211,43 @@ fn session_slot_bound_admits_at_most_one_at_capacity_one() {
     });
 }
 
-/// Model 4: acquire/release balances under every interleaving — the count never
-/// exceeds the bound and never underflows.
+/// Model 4: release genuinely frees reusable capacity under every interleaving.
 ///
-/// Two threads each acquire (distinct ids, capacity one) and release only if
-/// they won. Whatever the interleaving — both acquired at different times, or
-/// one lost the race at capacity and never released — the registry drains back
-/// to empty. This exercises `release_session_slot`'s idempotent removal racing a
-/// concurrent acquire.
+/// Capacity two, so under contention *both* threads acquire (distinct ids) and
+/// each releases only its own id. After both join, the registry must not only
+/// drain back to empty — a fresh acquire of a *third* distinct id must then
+/// succeed, proving the slots were genuinely freed and are reusable rather than
+/// merely counted down. A `release_session_slot` that removed the wrong key or
+/// no-op'd would leave the registry non-empty (or the reacquire blocked) under
+/// some interleaving and fail this model. Exercises the real
+/// `try_acquire_session_slot` / `release_session_slot` pair racing across
+/// threads at a capacity that admits both.
 #[test]
 fn session_slot_acquire_release_balances_and_never_underflows() {
     loom::model(|| {
         let reg = new_session_slot_registry();
-        let id_a = SessionId::new();
-        let id_b = SessionId::new();
+        // Fixed distinct ids keep the model fully deterministic across loom
+        // iterations (`SessionId::new()` is a random v4 UUID). Control flow
+        // depends only on the ids being distinct, never on their values.
+        let id_a = SessionId::from_uuid(Uuid::from_u128(1));
+        let id_b = SessionId::from_uuid(Uuid::from_u128(2));
+        let id_c = SessionId::from_uuid(Uuid::from_u128(3));
 
         let r1 = reg.clone();
         let a = loom::thread::spawn(move || {
-            if try_acquire_session_slot(&r1, 1, id_a) {
-                release_session_slot(&r1, id_a);
-            }
+            assert!(
+                try_acquire_session_slot(&r1, 2, id_a),
+                "capacity 2 admits this acquire even under contention"
+            );
+            release_session_slot(&r1, id_a);
         });
         let r2 = reg.clone();
         let b = loom::thread::spawn(move || {
-            if try_acquire_session_slot(&r2, 1, id_b) {
-                release_session_slot(&r2, id_b);
-            }
+            assert!(
+                try_acquire_session_slot(&r2, 2, id_b),
+                "capacity 2 admits this acquire even under contention"
+            );
+            release_session_slot(&r2, id_b);
         });
 
         a.join().unwrap();
@@ -241,7 +256,11 @@ fn session_slot_acquire_release_balances_and_never_underflows() {
         assert_eq!(
             session_slot_count(&reg),
             0,
-            "every winning acquire released, so the registry must drain to empty"
+            "both winners released their own id, so the registry must drain to empty"
+        );
+        assert!(
+            try_acquire_session_slot(&reg, 2, id_c),
+            "the freed slots must be genuinely reusable by a fresh acquire"
         );
     });
 }
