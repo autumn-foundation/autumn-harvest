@@ -2,6 +2,14 @@
 //!
 //! Provides rules and an engine to analyze workflow execution histories for
 //! anti-patterns, performance bottlenecks, and suspicious behavior.
+//!
+//! History analysis is a critical diagnostic tool in durable execution systems.
+//! By parsing the history of [`WorkflowEvent`]s, the analyzer can detect subtle issues
+//! like accidental tight loops, massive payloads bloating the database, or zero-second
+//! timers that should have been yields.
+//!
+//! This module provides a [`HistoryAnalyzer`] engine and a set of built-in
+//! [`AnalyzerRule`] implementations. You can also implement your own custom rules.
 
 use crate::event::WorkflowEvent;
 use std::collections::HashMap;
@@ -25,6 +33,32 @@ pub trait AnalyzerRule: Send + Sync {
 }
 
 /// The main entry point for analyzing workflow histories.
+///
+/// The [`HistoryAnalyzer`] evaluates a given slice of [`WorkflowEvent`]s against a
+/// suite of registered [`AnalyzerRule`]s, gathering all warnings into a unified list.
+/// It is often used in automated linting of workflow histories or integrated into
+/// UI views to alert developers of execution anti-patterns.
+///
+/// ## Examples
+///
+/// ```
+/// # use autumn_harvest::analyzer::{HistoryAnalyzer, SuspiciousTimerRule};
+/// # use autumn_harvest::event::WorkflowEvent;
+/// # use autumn_harvest::types::TimerId;
+/// let analyzer = HistoryAnalyzer::new()
+///     .with_rule(SuspiciousTimerRule::new());
+///
+/// let history = vec![
+///     WorkflowEvent::TimerStarted {
+///         timer_id: TimerId::new("zero-timer"),
+///         duration_secs: 0,
+///     },
+/// ];
+///
+/// let warnings = analyzer.analyze(&history);
+/// assert_eq!(warnings.len(), 1);
+/// assert_eq!(warnings[0].rule_name, "SuspiciousTimer");
+/// ```
 pub struct HistoryAnalyzer {
     rules: Vec<Box<dyn AnalyzerRule>>,
 }
@@ -62,6 +96,43 @@ impl Default for HistoryAnalyzer {
 // ── Rules ──────────────────────────────────────────────────────────────────
 
 /// Flags activities that have failed more than `threshold` times.
+///
+/// In distributed systems, retries are expected, but an excessively retrying activity
+/// might indicate a misconfiguration, a systemic outage, or a missing circuit breaker.
+/// This rule emits a warning if the number of consecutive failures for a given
+/// activity exceeds the configured `threshold`.
+///
+/// ## Examples
+///
+/// ```
+/// # use autumn_harvest::analyzer::{AnalyzerRule, ExcessiveRetriesRule};
+/// # use autumn_harvest::event::WorkflowEvent;
+/// # use autumn_harvest::types::ActivityExecId;
+/// let rule = ExcessiveRetriesRule::new(2);
+/// let activity_id = ActivityExecId::new();
+///
+/// let history = vec![
+///     WorkflowEvent::ActivityScheduled {
+///         activity_id,
+///         name: "ChargeCard".to_string(),
+///         input: serde_json::Value::Null,
+///         queue: "default".to_string(),
+///     },
+///     // 3 failures > threshold of 2
+///     WorkflowEvent::ActivityFailed {
+///         activity_id,
+///         error: "Insufficient funds".to_string(),
+///         attempt: 3,
+///         error_type: "Error".into(),
+///         non_retryable: false,
+///         details: None,
+///     },
+/// ];
+///
+/// let warnings = rule.analyze(&history);
+/// assert_eq!(warnings.len(), 1);
+/// assert!(warnings[0].message.contains("ChargeCard"));
+/// ```
 pub struct ExcessiveRetriesRule {
     threshold: u32,
 }
@@ -129,7 +200,31 @@ impl AnalyzerRule for ExcessiveRetriesRule {
 }
 
 /// Flags timers with a duration of 0 seconds.
-/// Zero duration timers are often an anti-pattern; consider yields or side effects.
+///
+/// Zero duration timers are often an anti-pattern. If a workflow needs to immediately
+/// yield execution back to the scheduler, it should use a side-effect or a specific
+/// yield command rather than abusing timers, which incur unnecessary database state
+/// transitions and scheduler overhead.
+///
+/// ## Examples
+///
+/// ```
+/// # use autumn_harvest::analyzer::{AnalyzerRule, SuspiciousTimerRule};
+/// # use autumn_harvest::event::WorkflowEvent;
+/// # use autumn_harvest::types::TimerId;
+/// let rule = SuspiciousTimerRule::new();
+///
+/// let history = vec![
+///     WorkflowEvent::TimerStarted {
+///         timer_id: TimerId::new("sleep-0"),
+///         duration_secs: 0,
+///     },
+/// ];
+///
+/// let warnings = rule.analyze(&history);
+/// assert_eq!(warnings.len(), 1);
+/// assert!(warnings[0].message.contains("0-second timer"));
+/// ```
 pub struct SuspiciousTimerRule;
 
 impl SuspiciousTimerRule {
@@ -170,7 +265,35 @@ impl AnalyzerRule for SuspiciousTimerRule {
 }
 
 /// Flags JSON payloads in events that exceed a specified byte threshold.
-/// Large payloads can bloat the database and impact history replay performance.
+///
+/// Large payloads in workflow inputs, outputs, or markers can severely bloat the database
+/// and impact history replay performance. Instead of passing large binaries or huge JSON
+/// objects directly through the workflow event history, developers should pass a reference
+/// (like an S3 URI or a database row ID). This rule helps detect when the payload size
+/// crosses a dangerous threshold.
+///
+/// ## Examples
+///
+/// ```
+/// # use autumn_harvest::analyzer::{AnalyzerRule, LargePayloadRule};
+/// # use autumn_harvest::event::WorkflowEvent;
+/// # use autumn_harvest::types::ActivityExecId;
+/// let rule = LargePayloadRule::new(50); // Warn if payload > 50 bytes
+///
+/// // This payload string length is > 50 bytes
+/// let large_json = serde_json::json!({"data": "a very long string that shouldn't be in the payload"});
+///
+/// let history = vec![
+///     WorkflowEvent::ActivityCompleted {
+///         activity_id: ActivityExecId::new(),
+///         output: large_json,
+///     },
+/// ];
+///
+/// let warnings = rule.analyze(&history);
+/// assert_eq!(warnings.len(), 1);
+/// assert!(warnings[0].message.contains("Large payload detected"));
+/// ```
 pub struct LargePayloadRule {
     max_bytes: usize,
 }

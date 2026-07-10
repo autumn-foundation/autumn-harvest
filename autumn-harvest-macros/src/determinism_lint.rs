@@ -542,7 +542,7 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
     fn visit_expr_for_loop(&mut self, i: &'ast syn::ExprForLoop) {
         // HVG011: NonDeterministicIteration (issue #785; the issue proposed
-        // HVG010, permanently taken by SelectMacro/#600, hence HVG011).
+        // HVG010, permanently taken by `SelectMacro`/#600, hence HVG011).
         // Command-aware severity: a loop body that schedules commands on the
         // context param is a HardBlocker (the recorded command order would
         // follow the randomized hash order and diverge on replay); a
@@ -682,7 +682,7 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 );
             }
 
-            // HVG010: SelectMacro (issue #799) — the futures combinator
+            // HVG010: `SelectMacro` (issue #799) — the futures combinator
             // FUNCTIONS are the function-call siblings of tokio::select!/
             // futures::select! and carry the identical non-deterministic-winner
             // + no-durable-loser-cancellation footgun (the select MACROS are
@@ -802,7 +802,7 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
     }
 
     fn visit_macro(&mut self, i: &'ast syn::Macro) {
-        // HVG010: SelectMacro (issue #600) -- tokio::select!/futures::select!/
+        // HVG010: `SelectMacro` (issue #600) -- tokio::select!/futures::select!/
         // futures::select_biased! racing ctx-managed awaitables is a double
         // footgun (non-deterministic winner on replay, no durable loser
         // cancellation). Checked at the generic `visit_macro` level (rather
@@ -905,7 +905,7 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
             alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive (issue #600). It records the winning branch durably via a MarkerRecorded event so replay always resolves the same winner, and durably cancels every losing branch (activity task rows, child-workflow executions, or a losing durable timer) so no leaked in-flight work remains. For a single signal bounded by a deadline, ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive ctx.race()'s timer-plus-signal shape wraps. To fan out many activities in parallel and collect their results in a deterministic order, use ctx.execute_activity_fan_out* instead of racing them; to block until a workflow-local predicate holds (optionally bounded by a deadline), use ctx.await_condition_timeout().".to_string(),
         },
         // HVG011 (issue #785; the issue proposed HVG010, permanently taken by
-        // SelectMacro/#600 — IDs are never reused). Text must stay
+        // `SelectMacro`/#600 — IDs are never reused). Text must stay
         // byte-identical to the guardrail.rs CATALOG entry.
         RuleInfo {
             id: "HVG011".to_string(),
@@ -929,7 +929,7 @@ mod hvg011_tests {
     //! iteration-order determinism.
     //!
     //! NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
-    //! already permanently assigned to SelectMacro (issue #600) and rule IDs
+    //! already permanently assigned to `SelectMacro` (issue #600) and rule IDs
     //! are never reused, so the iteration-order rule ships as HVG011.
 
     use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
@@ -1603,7 +1603,7 @@ mod hvg010_combinator_tests {
     //! The select-macro positive case is covered by the
     //! `hvg010_select_macro.rs` compile-fail fixture; the activity-body
     //! negative case (AC6) is covered by the `#[activity]` macro never running
-    //! this visitor (see `suppressed_guardrails.rs` and the det_check
+    //! this visitor (see `suppressed_guardrails.rs` and the `det_check`
     //! `det011_activity_bodies_are_never_flagged` test) — the visitor lints
     //! whatever `fn` it is handed, so an "activity" negative cannot be
     //! expressed at this layer.
