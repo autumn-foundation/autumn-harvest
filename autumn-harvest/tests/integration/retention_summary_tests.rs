@@ -774,6 +774,199 @@ async fn erase_after_gc_scrubs_the_summary() {
     );
 }
 
+// Seed a lingering completion-delivery row whose frozen `payload` envelope
+// carries the workflow's own output (PII), keyed to `exec_id`. Retention leaves
+// non-DELIVERED deliveries behind, so this survives even after the execution
+// row is summarized away.
+async fn insert_lingering_delivery(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+    payload: serde_json::Value,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_deliveries
+            (workflow_exec_id, callback_index, workflow_name, workflow_id,
+             target_url, event_filter, terminal_state, payload, state,
+             max_attempts, retry_policy)
+         VALUES ($1, 0, 'cb_wf', 'cb1', 'https://example.test/hook',
+                 '{}'::jsonb, 'COMPLETED', $2, 'PENDING', 10, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .bind::<Jsonb, _>(payload)
+    .execute(conn)
+    .await
+    .expect("insert lingering delivery");
+}
+
+// Seed a CALLBACK dead-letter row whose `input` carries the frozen envelope
+// (PII), keyed to `exec_id`. Retention leaves CALLBACK DLQ rows behind.
+async fn insert_callback_dlq(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+    input: serde_json::Value,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters
+            (original_task_id, queue_name, task_type, workflow_exec_id, input,
+             error, attempts)
+         VALUES (gen_random_uuid(), 'default', 'CALLBACK', $1, $2,
+                 'delivery exhausted', 10)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .bind::<Jsonb, _>(input)
+    .execute(conn)
+    .await
+    .expect("insert callback dlq");
+}
+
+#[derive(diesel::QueryableByName)]
+struct PayloadRow {
+    #[diesel(sql_type = Jsonb)]
+    payload: serde_json::Value,
+}
+
+async fn load_delivery_payload(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+) -> serde_json::Value {
+    diesel::sql_query(
+        "SELECT payload FROM harvest_completion_deliveries WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result::<PayloadRow>(conn)
+    .await
+    .expect("delivery row must exist")
+    .payload
+}
+
+#[derive(diesel::QueryableByName)]
+struct DlqInputRow {
+    #[diesel(sql_type = Jsonb)]
+    input: serde_json::Value,
+}
+
+async fn load_callback_dlq_input(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+) -> serde_json::Value {
+    diesel::sql_query(
+        "SELECT input FROM harvest_dead_letters
+         WHERE workflow_exec_id = $1 AND task_type = 'CALLBACK'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result::<DlqInputRow>(conn)
+    .await
+    .expect("callback dlq row must exist")
+    .input
+}
+
+// AC6 (Codex P1): a summary-ONLY erase (execution row already GC'd) must ALSO
+// scrub the lingering completion-callback PII — the frozen `payload` envelope
+// in `harvest_completion_deliveries` and the CALLBACK `harvest_dead_letters
+// .input` copy — both of which retention deliberately leaves behind and both of
+// which are still retryable/redrivable. Before the fix the summary-only path
+// hardcoded these counters to 0 and left the PII in place while returning 200.
+#[tokio::test]
+async fn erase_summary_only_scrubs_lingering_completion_callback_pii() {
+    let (url, _c) = setup_db().await;
+    let _pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    // A summarized execution: the summary row exists, the execution row does
+    // not. Seed the summary directly.
+    let exec_id = insert_summary(&mut conn, "cb_wf", "cb1", Utc::now()).await;
+
+    // The two lingering PII-bearing artifacts retention leaves behind, both
+    // keyed to the (now-gone) execution id.
+    let envelope = serde_json::json!({
+        "execution_id": exec_id.to_string(),
+        "state": "completed",
+        "result": {"ssn": "123-45-6789", "email": "victim@example.com"},
+    });
+    insert_lingering_delivery(&mut conn, exec_id, envelope.clone()).await;
+    insert_callback_dlq(&mut conn, exec_id, envelope.clone()).await;
+
+    // Sanity: the PII is present before the erase.
+    assert_eq!(load_delivery_payload(&mut conn, exec_id).await, envelope);
+    assert_eq!(load_callback_dlq_input(&mut conn, exec_id).await, envelope);
+
+    // Summary-only erase — the execution row is gone.
+    let outcome = erase_workflow_payloads(&mut conn, ExecutionId::from_uuid(exec_id), "test")
+        .await
+        .expect("summary-only erase should succeed even after history GC");
+    assert!(
+        !outcome.execution_row_scrubbed,
+        "execution row already gone"
+    );
+    assert!(outcome.summary_scrubbed, "the summary row was scrubbed");
+    assert!(
+        outcome.completion_deliveries_scrubbed > 0,
+        "the lingering completion delivery must be scrubbed (was hardcoded 0)"
+    );
+    assert!(
+        outcome.dead_letters_scrubbed > 0,
+        "the lingering CALLBACK DLQ input must be scrubbed (was hardcoded 0)"
+    );
+
+    // The PII is gone from both tables, replaced by the erase tombstone.
+    let tombstone = serde_json::json!({"_harvest_erased": true});
+    assert_eq!(
+        load_delivery_payload(&mut conn, exec_id).await,
+        tombstone,
+        "completion delivery payload tombstoned"
+    );
+    assert_eq!(
+        load_callback_dlq_input(&mut conn, exec_id).await,
+        tombstone,
+        "CALLBACK dead-letter input tombstoned"
+    );
+
+    // The summary itself is tombstoned too.
+    let after = load_summary(&mut conn, exec_id)
+        .await
+        .expect("summary still exists");
+    assert_eq!(after.result, Some(tombstone));
+}
+
+// Regression guard for the shared-helper extraction (issue #752 Codex P1): the
+// execution-EXISTS path must still scrub both callback-PII tables exactly as
+// before.
+#[tokio::test]
+async fn erase_execution_exists_still_scrubs_callback_pii() {
+    let (url, _c) = setup_db().await;
+    let _pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let exec_id = insert_completed_full(
+        &mut conn,
+        "cb_wf",
+        "cb1",
+        "COMPLETED",
+        Utc::now(),
+        Some(serde_json::json!({"ssn": "123-45-6789"})),
+        None,
+        None,
+    )
+    .await;
+
+    let envelope = serde_json::json!({"result": {"ssn": "123-45-6789"}});
+    insert_lingering_delivery(&mut conn, exec_id, envelope.clone()).await;
+    insert_callback_dlq(&mut conn, exec_id, envelope).await;
+
+    let outcome = erase_workflow_payloads(&mut conn, ExecutionId::from_uuid(exec_id), "test")
+        .await
+        .expect("erase should succeed on a terminal execution");
+    assert!(outcome.execution_row_scrubbed);
+    assert!(outcome.completion_deliveries_scrubbed > 0);
+    assert!(outcome.dead_letters_scrubbed > 0);
+
+    let tombstone = serde_json::json!({"_harvest_erased": true});
+    assert_eq!(load_delivery_payload(&mut conn, exec_id).await, tombstone);
+    assert_eq!(load_callback_dlq_input(&mut conn, exec_id).await, tombstone);
+}
+
 // AC7: a legal-held execution is neither deleted nor summarized; releasing the
 // hold lets the next tick delete + summarize it.
 #[tokio::test]

@@ -402,9 +402,19 @@ mod db {
     ) -> OptEraseFuture<'a> {
         Box::pin(async move {
             let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+            // The live execution row is gone, but retention deliberately leaves
+            // non-DELIVERED completion deliveries and CALLBACK DLQ rows behind
+            // (both keyed on `workflow_exec_id`) — each holds a frozen copy of
+            // the workflow's own result/error PII. Scrub them here too (issue
+            // #752 Codex P1), else a summarized run returns 200 while retryable
+            // / redrivable PII survives.
+            let (completion_deliveries_scrubbed, dead_letters_scrubbed) =
+                scrub_callback_pii(conn, exec_id).await?;
             let (children, skipped_children, failures) =
                 cascade_children(conn, exec_id, now, visited).await?;
             if !summary_scrubbed
+                && completion_deliveries_scrubbed == 0
+                && dead_letters_scrubbed == 0
                 && children.is_empty()
                 && skipped_children.is_empty()
                 && failures.is_empty()
@@ -418,8 +428,8 @@ mod db {
                 execution_row_scrubbed: false,
                 summary_scrubbed,
                 signals_scrubbed: 0,
-                completion_deliveries_scrubbed: 0,
-                dead_letters_scrubbed: 0,
+                completion_deliveries_scrubbed,
+                dead_letters_scrubbed,
                 children,
                 skipped_children,
                 failures,
@@ -612,6 +622,55 @@ mod db {
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
     }
 
+    /// Scrub the frozen completion-callback PII for one execution, keyed only
+    /// on `workflow_exec_id`, and return `(deliveries_scrubbed, dead_letters_scrubbed)`.
+    ///
+    /// Shared by the execution-exists path (`scrub_execution_node`) and the
+    /// summary-only path (`erase_summary_only_node`) so a summarized execution
+    /// whose live row is already gone still has its lingering callback PII
+    /// erased (issue #752 Codex P1). Two independent copies of the workflow's
+    /// own `result`/`error` can survive after retention:
+    ///
+    /// * `harvest_completion_deliveries.payload` — the frozen
+    ///   `CompletionEnvelope` (issue #605 / PR #921 review). Retention leaves
+    ///   non-`DELIVERED` deliveries in place, and a still-`PENDING`/`INFLIGHT`/
+    ///   `FAILED` delivery could still be `POST`ed to the external receiver (or
+    ///   redriven by an operator) after the erase. Only `payload` is tombstoned;
+    ///   `state`/`attempt`/`next_attempt_at`/`last_status` are untouched so
+    ///   delivery scheduling is unaffected — a pending delivery simply posts the
+    ///   tombstone marker instead of the real data.
+    /// * `harvest_dead_letters.input` where `task_type = 'CALLBACK'` — a second,
+    ///   independent copy the callback-delivery scanner writes on retry
+    ///   exhaustion (issue #921 review). Scoped to `CALLBACK` only: this is
+    ///   specifically issue #605's callback copy, not a general expansion of
+    ///   erasure to every dead-lettered activity/task (out of scope here).
+    async fn scrub_callback_pii(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<(usize, usize)> {
+        let tombstone = erasure_tombstone();
+        let completion_deliveries_scrubbed = diesel::update(
+            harvest_completion_deliveries::table
+                .filter(harvest_completion_deliveries::workflow_exec_id.eq(exec_id.as_uuid())),
+        )
+        .set(harvest_completion_deliveries::payload.eq(&tombstone))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+        let dead_letters_scrubbed = diesel::update(
+            harvest_dead_letters::table
+                .filter(harvest_dead_letters::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+                .filter(harvest_dead_letters::task_type.eq("CALLBACK")),
+        )
+        .set(harvest_dead_letters::input.eq(&tombstone))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+        Ok((completion_deliveries_scrubbed, dead_letters_scrubbed))
+    }
+
     /// Scrub a single execution node's own data (events, row columns, signals,
     /// completion deliveries, CALLBACK dead letters) and cascade to its
     /// children. Does NOT check the terminal/hold gate — the caller
@@ -645,46 +704,13 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        // Completion-callback deliveries (issue #605 / PR #921 review): the
-        // frozen `payload` column is a full CompletionEnvelope carrying the
-        // workflow's own `result`/`error`, so it must be scrubbed exactly
-        // like the execution row's payload columns above -- otherwise
-        // erased PII can sit in this table indefinitely, and worse, could
-        // still be POSTed to the external receiver later if the delivery
-        // is still PENDING/INFLIGHT/FAILED (retried by the scanner) or is
-        // redriven by an operator after the erase. Only `payload` is
-        // tombstoned; `state`/`attempt`/`next_attempt_at`/`last_status` are
-        // left untouched so delivery scheduling is unaffected -- a pending
-        // delivery now simply posts the tombstone marker instead of the
-        // real data.
-        let completion_deliveries_scrubbed = diesel::update(
-            harvest_completion_deliveries::table
-                .filter(harvest_completion_deliveries::workflow_exec_id.eq(exec_id.as_uuid())),
-        )
-        .set(harvest_completion_deliveries::payload.eq(&tombstone))
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-
-        // A completion delivery that exhausted retries writes a *second*,
-        // independent copy of the frozen envelope into `harvest_dead_letters
-        // .input` (issue #921 review) — scrubbing the delivery row's own
-        // `payload` above does not touch this copy, so erased PII would
-        // otherwise remain visible via the DLQ (management API / CLI) until
-        // retention eventually collects the row. Scoped to `task_type =
-        // 'CALLBACK'` only: this is specifically the copy issue #605's
-        // callback-delivery scanner creates, not a general expansion of
-        // erasure to every dead-lettered activity/task for this execution
-        // (out of scope here, and pre-existing before this feature).
-        let dead_letters_scrubbed = diesel::update(
-            harvest_dead_letters::table
-                .filter(harvest_dead_letters::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-                .filter(harvest_dead_letters::task_type.eq("CALLBACK")),
-        )
-        .set(harvest_dead_letters::input.eq(&tombstone))
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+        // Completion-callback PII (deliveries + CALLBACK DLQ), keyed only on
+        // `workflow_exec_id` so it applies whether or not a live execution row
+        // exists (issue #752 Codex P1 — the summary-only path must scrub these
+        // too, since retention deliberately leaves non-DELIVERED deliveries and
+        // CALLBACK DLQ rows behind).
+        let (completion_deliveries_scrubbed, dead_letters_scrubbed) =
+            scrub_callback_pii(conn, exec_id).await?;
 
         // ── Cascade to child executions AND child summaries ───────────────────
         let (children, skipped_children, failures) =
