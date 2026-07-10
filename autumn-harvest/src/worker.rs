@@ -6690,6 +6690,46 @@ async fn apply_race_loser_cancellations(
 /// `ArmTimer` indices are ever populated here. `CancelTimer` emission
 /// (`TimerCancelled`) and `for_await: true` row inserts stay with the DB loop in
 /// [`plan_timer_lifecycle`].
+/// Detect a same-batch collision between a LIVE cancellable arm and a classic
+/// `StartTimer` for the same id (issue #768, Codex P2 round 15).
+///
+/// Returns the colliding `timer_id` when the batch holds an `ArmTimer(X)` whose
+/// fresh `TimerStarted` would be dropped by `arm_timer_events`' `StartTimer`-owned
+/// skip **without** having been cancelled first — i.e. a `StartTimer(X)` appears
+/// and there is at least one preceding `ArmTimer(X)` with no `CancelTimer(X)`
+/// between that arm and the `StartTimer(X)`. The legit cancel-then-classic pattern
+/// (`[ArmTimer(X,false), CancelTimer(X), StartTimer(X)]`) is NOT a collision — the
+/// intervening cancel makes the arm dead — so it is not reported.
+fn same_batch_uncancelled_arm_start_collision(commands: &[WorkflowCommand]) -> Option<String> {
+    for (start_idx, cmd) in commands.iter().enumerate() {
+        let WorkflowCommand::StartTimer { timer_id, .. } = cmd else {
+            continue;
+        };
+        let id = timer_id.as_str();
+        // Walk the prefix before this StartTimer: an ArmTimer(id) marks the arm
+        // live; a CancelTimer(id) clears it. If the arm is still live when we reach
+        // the StartTimer, it's an uncancelled collision.
+        let mut arm_live = false;
+        for prior in &commands[..start_idx] {
+            match prior {
+                WorkflowCommand::ArmTimer {
+                    timer_id: arm_id, ..
+                } if arm_id.as_str() == id => arm_live = true,
+                WorkflowCommand::CancelTimer {
+                    timer_id: cancel_id,
+                } if cancel_id.as_str() == id => {
+                    arm_live = false;
+                }
+                _ => {}
+            }
+        }
+        if arm_live {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 fn arm_timer_events(commands: &[WorkflowCommand]) -> Vec<Option<WorkflowEvent>> {
     let start_timer_ids: HashSet<&str> = commands
         .iter()
@@ -6938,6 +6978,25 @@ async fn plan_timer_lifecycle(
         )
     }) {
         return Ok((vec![None; commands.len()], None));
+    }
+
+    // Defensive guard (issue #768, Codex P2 round 15): a batch must never carry a
+    // LIVE, un-cancelled cancellable arm (`ArmTimer(X)`) alongside a classic
+    // `StartTimer(X)` for the same id. `ctx.timer`/`sleep_until` already reject
+    // that collision at the source (see `WorkflowContext::timer`), so this should
+    // be unreachable — but if a future path ever lets both land in one batch, fail
+    // fast here rather than silently dropping the arm's `TimerStarted`
+    // (`arm_timer_events`' `StartTimer`-owned skip) and corrupting history. The
+    // legit cancel-then-classic pattern — `[ArmTimer(X,false), CancelTimer(X),
+    // StartTimer(X)]` — is NOT a collision (the arm was cancelled before the classic
+    // start), so the check requires the arm to be uncancelled BEFORE the same-id
+    // `StartTimer`.
+    if let Some(id) = same_batch_uncancelled_arm_start_collision(commands) {
+        return Err(HarvestError::Config(format!(
+            "timer id '{id}' has both a live cancellable start_timer arm and a classic \
+             ctx.timer/sleep_until in the same suspension batch — these two timer APIs must use \
+             distinct ids (issue #768)"
+        )));
     }
 
     // Pure event plan + the `for_await: true` arm indices that contribute a
@@ -13955,6 +14014,80 @@ mod tests {
         assert!(
             events.iter().all(Option::is_none),
             "StartTimer-owned arm must emit nothing, got {events:?}"
+        );
+    }
+
+    /// A LIVE cancellable arm colliding with a same-batch classic `StartTimer`
+    /// for the same id is a hard invariant violation (issue #768, round 15): the
+    /// arm's `TimerStarted` would be silently dropped, corrupting history. The
+    /// persist guard must flag it.
+    #[test]
+    fn uncancelled_arm_start_collision_is_detected() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 30,
+                for_await: false,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands).as_deref(),
+            Some("x"),
+            "uncancelled same-id arm + classic start must be flagged"
+        );
+    }
+
+    /// The legit cancel-then-classic pattern — `[ArmTimer(X,false),
+    /// CancelTimer(X), StartTimer(X)]` — is NOT a collision: the arm was cancelled
+    /// before the classic start, so the guard must stay silent.
+    #[test]
+    fn cancelled_arm_then_start_is_not_a_collision() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 60,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands),
+            None,
+            "cancel-then-classic reuse must not be flagged as a collision"
+        );
+    }
+
+    /// A classic `StartTimer` whose id has no cancellable arm at all is fine.
+    #[test]
+    fn plain_start_timer_with_distinct_id_is_not_a_collision() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("a"),
+                duration_secs: 30,
+                for_await: false,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("b"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands),
+            None,
+            "distinct-id classic start must not collide with an arm"
         );
     }
 

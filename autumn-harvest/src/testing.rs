@@ -2933,6 +2933,30 @@ impl WorkflowTestEnv {
         // (Codex P2, issue #768).
         let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
 
+        // Deadline-ordered firing for concurrent awaited cancellable timers
+        // (issue #768, Codex P2 round 15). Production inserts every
+        // `for_await: true` row, reschedules the parked task to the MINIMUM
+        // `fires_at`, and on the next claim ingests only DUE timers in `fires_at`
+        // order. So in a bookkeeping-only batch with multiple awaited arms, only
+        // the arm(s) with the smallest deadline fire this cycle; a strictly-later
+        // timer stays parked and fires on a subsequent cycle when the clock reaches
+        // it. All await arms in one batch are armed at the same instant, so the
+        // minimum `fires_at` is simply the minimum `duration_secs`. Without this,
+        // `tokio::join!(slow.await_fire(), fast.await_fire())` would record
+        // `TimerFired(slow)` before `TimerFired(fast)` in poll order — an ordering
+        // a live worker (deadline-ordered ingest) can never produce.
+        let min_await_deadline_secs = commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::ArmTimer {
+                    duration_secs,
+                    for_await: true,
+                    ..
+                } => Some(*duration_secs),
+                _ => None,
+            })
+            .min();
+
         let mut made_progress = false;
         let mut deferred_events = Vec::new();
         for cmd in commands {
@@ -2940,6 +2964,7 @@ impl WorkflowTestEnv {
                 cmd,
                 signal_will_resolve,
                 batch_has_competing_suspension,
+                min_await_deadline_secs,
                 history,
                 &mut deferred_events,
                 remaining_signals,
@@ -2981,6 +3006,7 @@ impl WorkflowTestEnv {
         cmd: WorkflowCommand,
         signal_will_resolve: bool,
         batch_has_competing_suspension: bool,
+        min_await_deadline_secs: Option<u64>,
         history: &mut Vec<WorkflowEvent>,
         deferred_events: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
@@ -3243,6 +3269,15 @@ impl WorkflowTestEnv {
                     if batch_has_competing_suspension {
                         // Awaited alongside a genuine non-timer suspension: parked,
                         // fires on a later bookkeeping-only cycle.
+                        return Ok(false);
+                    }
+                    // Deadline order (round 15): only the minimum-deadline awaited
+                    // timer(s) fire this cycle. A strictly-later awaited timer stays
+                    // parked (no progress from it) and fires when a subsequent
+                    // bookkeeping-only cycle re-arms it against the (now smaller) set
+                    // of remaining awaits — matching production's min-`fires_at`
+                    // reschedule + deadline-ordered ingest.
+                    if min_await_deadline_secs.is_some_and(|min| duration_secs > min) {
                         return Ok(false);
                     }
                     deferred_events.push(WorkflowEvent::TimerFired { timer_id });

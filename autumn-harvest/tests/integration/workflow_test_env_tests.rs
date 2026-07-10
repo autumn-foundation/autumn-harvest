@@ -241,6 +241,26 @@ fn arm_timer_activity_reset_then_await_workflow<'a>(
     })
 }
 
+/// (Codex P2 round 15, issue #768) Arm two cancellable timers with DIFFERENT
+/// durations and `await_fire()` both concurrently via `tokio::join!`. Production
+/// reschedules the parked task to the MINIMUM `fires_at` and ingests due timers in
+/// deadline order, so the FAST timer (dur 1) must fire before the SLOW one (dur
+/// 10) regardless of `join!` poll order (which polls `slow` first).
+fn concurrent_await_two_timers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let slow = ctx.start_timer("slow", 10);
+        let fast = ctx.start_timer("fast", 1);
+        let (s, f) = tokio::join!(slow.await_fire(), fast.await_fire());
+        Ok(json!({
+            "slow": format!("{:?}", s.map_err(|e| e.to_string())?),
+            "fast": format!("{:?}", f.map_err(|e| e.to_string())?),
+        }))
+    })
+}
+
 /// (Codex P2 round 4, issue #768 — FIX B) Arm a cancellable timer, cancel it, and
 /// then start a CLASSIC `ctx.timer` with the SAME id in one task. The classic
 /// timer must arm cleanly and fire — the same-batch `CancelTimer` must not leave
@@ -647,6 +667,40 @@ async fn test_cancellable_timer_fires_when_not_cancelled() {
     );
 
     let report = outcome.replay_check(cancellable_await_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// (Codex P2 round 15, issue #768) Concurrent awaited cancellable timers fire in
+/// DEADLINE order (min `fires_at` first), matching production's min-deadline
+/// reschedule + deadline-ordered ingest — never in `join!` poll order.
+#[tokio::test]
+async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
+    let outcome = WorkflowTestEnv::new()
+        .run(concurrent_await_two_timers_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    let fired_order: Vec<String> = outcome
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerFired { timer_id } => Some(timer_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fired_order,
+        vec!["fast".to_string(), "slow".to_string()],
+        "concurrent awaited timers must fire in deadline order (fast dur=1 before \
+         slow dur=10), never in join! poll order: {fired_order:?}"
+    );
+
+    let report = outcome
+        .replay_check(concurrent_await_two_timers_workflow)
+        .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "replay self-check failed:\n{report}"

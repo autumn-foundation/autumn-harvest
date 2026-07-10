@@ -400,3 +400,58 @@ ignore them; `simulator.rs` was the sole gap (closed by Fix 1). Full
 `autumn-harvest` lib suite (1368 tests) and the no-DB `testing` integration
 suite (797 tests) complete with no skips, no hangs, and all prior
 reorder/matrix/reset-loop tests green.
+
+**Post-review hardening round 15 (Codex 2× P2).** Two more findings, fixed
+TDD-style.
+
+- **Same-id collision across the two timer APIs now fails fast (was: silent
+  event drop → replay corruption).** When a workflow armed a cancellable timer
+  (`ctx.start_timer("x", ..)`) and then awaited a classic `ctx.timer("x", ..)` /
+  `ctx.sleep_until` for the *same* id in one task, both a `StartTimer(x)` and the
+  arm's `ArmTimer(x)` landed in one suspension batch; `arm_timer_events`' arm
+  helper silently DROPPED the arm's `TimerStarted` (because a `StartTimer` for the
+  id was present), so the live history recorded only one event for two logically
+  distinct timer calls and replay corrupted (`match_timer_arm` consumed/diverged
+  on the single event, leaving the following `ctx.timer` unable to replay history
+  the worker wrote). Reusing one id across the cancellable and classic timer APIs
+  in the same task is API misuse, and making two same-id timers coexist is messy
+  (two same-id rows / two `TimerStarted` events matched by two matchers), so the
+  collision is now REJECTED rather than silently corrupted. Primary detection is
+  at the source: `WorkflowContext::timer` returns a clear, deterministic
+  `HarvestError::Config` ("...use distinct timer ids across the two APIs...") when
+  `timer_id` is currently held by a LIVE, un-cancelled cancellable timer (state
+  `Armed`, via `timer_logically_armed`) — before it pushes any `StartTimer`, so
+  the collision never reaches the batch. A cancellable timer that was already
+  `cancel()`ed (state `Cancelled`) is dead, so the legit cancel-then-classic
+  reuse pattern (`[ArmTimer(X,false), CancelTimer(X), StartTimer(X)]`) is
+  untouched. A defensive persist-time guard
+  (`same_batch_uncancelled_arm_start_collision` in `worker.rs`, wired into
+  `plan_timer_lifecycle`) fails the transaction with the same clear error if an
+  uncancelled arm + same-id classic `StartTimer` ever reach persist (should be
+  unreachable given the source-level rejection, but never silently drops an
+  event). The `start_timer`/`ctx.timer` rustdoc documents the distinct-id
+  constraint. Tests: `context::tests::classic_timer_reusing_a_live_cancellable_arm_id_fails_fast`
+  (+ distinct-id still-works control), and three `worker.rs` pure unit tests for
+  `same_batch_uncancelled_arm_start_collision` (collision detected;
+  cancel-then-classic not flagged; distinct-id not flagged).
+- **`WorkflowTestEnv` fires concurrent awaited timers in DEADLINE order (was:
+  poll/command order).** In a bookkeeping-only batch with multiple
+  `for_await: true` arms, the harness fired every timer immediately in poll order,
+  so `tokio::join!(slow.await_fire(), fast.await_fire())` could record
+  `TimerFired(slow)` before `TimerFired(fast)` — an ordering a live worker can
+  never produce (production inserts all rows, reschedules the parked task to the
+  MINIMUM `fires_at`, and ingests only DUE timers in `fires_at` order). Tests
+  using parallel timer waits could therefore pass against histories production
+  cannot generate. `process_suspension` now computes the minimum awaited-arm
+  deadline for the batch and `process_command` fires only the minimum-deadline
+  arm(s) this cycle; a strictly-later awaited timer stays parked and fires on a
+  subsequent bookkeeping-only cycle when it re-arms alone — so
+  `join!(slow(10), fast(1))` records `TimerFired(fast)` before `TimerFired(slow)`
+  and the fast deadline advances the virtual clock first. Test:
+  `test_concurrent_awaited_timers_fire_in_deadline_order` (asserts fast-before-slow
+  fire order + a clean replay self-check).
+
+Both fixes: no new `WorkflowEvent` variant, no migration. Full `autumn-harvest`
+lib suite (1370 tests) and the no-DB `testing` integration suite (798 tests)
+complete with no skips, no hangs, and all prior reorder/matrix/reset-loop tests
+green.

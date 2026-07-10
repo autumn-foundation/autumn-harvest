@@ -4017,6 +4017,28 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn timer(&self, timer_id: &str, duration_secs: u64) -> HarvestResult<()> {
+        // Reject a same-id collision between the cancellable `start_timer` API and
+        // the classic `ctx.timer`/`sleep_until` API in one workflow task (issue
+        // #768, Codex P2 round 15). If `timer_id` is currently held by a LIVE,
+        // un-cancelled cancellable timer (`start_timer`/`reset_timer` with no
+        // intervening `cancel`), a classic `ctx.timer` for the same id would land
+        // a `StartTimer(id)` in the same suspension batch as the arm's
+        // `ArmTimer(id)` — the persist plan would then silently drop the arm's
+        // `TimerStarted`, so the live history records only one event for two
+        // logically distinct timer calls and replay corrupts. Fail fast with a
+        // clear, deterministic error instead. A cancellable timer that was already
+        // `cancel()`ed (state `Cancelled`, not `Armed`) is dead, so classically
+        // reusing its id is allowed (the cancel-then-classic pattern). Reusing one
+        // id across the two timer APIs in the same task is API misuse — use
+        // distinct ids.
+        if self.timer_logically_armed(timer_id).is_some() {
+            return Err(HarvestError::Config(format!(
+                "timer id '{timer_id}' is used for both a cancellable start_timer/reset_timer \
+                 and a classic ctx.timer/sleep_until in the same workflow task — use distinct \
+                 timer ids across the two APIs (or cancel the cancellable timer before reusing \
+                 its id classically)"
+            )));
+        }
         let history_match =
             self.match_history(|m| m.match_timer_strict(timer_id, Some(duration_secs)));
 
@@ -10953,6 +10975,56 @@ mod tests {
         assert!(matches!(&cmds[1], WorkflowCommand::CancelTimer { .. }));
         assert!(matches!(&cmds[2], WorkflowCommand::StartTimer { .. }));
         assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn classic_timer_reusing_a_live_cancellable_arm_id_fails_fast() {
+        // Issue #768, Codex P2 round 15: `start_timer("x")` (live arm) followed by
+        // a classic `ctx.timer("x")` in the same task must fail fast with a clear
+        // deterministic error — NOT silently drop the arm event and corrupt
+        // history, and NOT hang.
+        let ctx = WorkflowContext::new_test();
+        let _h = ctx.start_timer("x", 30);
+        let err = ctx
+            .timer("x", 5)
+            .await
+            .expect_err("same-id collision across the two timer APIs must fail");
+        assert!(
+            matches!(err, HarvestError::Config(_)),
+            "expected a clear Config error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("distinct"),
+            "error message must guide to distinct ids: {msg}"
+        );
+        // The classic timer must NOT have pushed a StartTimer (no batch collision).
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter()
+                .all(|c| !matches!(c, WorkflowCommand::StartTimer { .. })),
+            "collision must reject before pushing StartTimer: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn classic_timer_with_distinct_id_from_cancellable_arm_still_works() {
+        // The distinct-id case is unaffected: `ctx.timer("b")` alongside a
+        // cancellable `start_timer("a")` suspends normally.
+        let ctx = WorkflowContext::new_test();
+        let _h = ctx.start_timer("a", 30);
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(50), ctx.timer("b", 5)).await;
+        assert!(
+            outcome.is_err(),
+            "a distinct-id classic timer must suspend, not return"
+        );
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, WorkflowCommand::StartTimer { timer_id, .. } if timer_id.as_str() == "b")),
+            "distinct-id classic timer must push its StartTimer: {cmds:?}"
+        );
     }
 
     #[test]
