@@ -2972,25 +2972,38 @@ async fn persist_workflow_failure(
                 if attempt >= policy.max_attempts {
                     return None;
                 }
-                // The retry policy's `non_retryable_errors` class list IS matched
-                // against the decoded workflow `error_type` (issue #767), so an
-                // operator can halt the #523 workflow-level retry loop for a
-                // specific typed failure class (e.g. `"ValidationRejected"`) the
-                // same way they can for a typed activity failure. The
-                // `WorkflowFailure.non_retryable` FLAG itself, however, stays
-                // advisory-only and is deliberately NOT consulted here — it is a
-                // classification hint for the caller / completion-trigger, not a
-                // control input to the retry loop. `decoded.error_type` is `None`
-                // for a legacy `Err(String)` (and for an engine non-determinism
-                // string), so those fall back to the full-string match on the
-                // decoded HUMAN message (`decoded.message`) — never the raw
-                // `harvest_workflow_failure_v1` envelope JSON. Matching the raw
-                // envelope would mean a workflow returning `Err("fatal".into())`
-                // with `non_retryable_errors = ["fatal"]` never matches the
-                // envelope-wrapped string and keeps retrying (Codex P2). For a
-                // legacy `Err(String)` the decoded message equals the raw error,
-                // so legacy `non_retryable_errors` semantics are preserved.
-                if policy.is_non_retryable(decoded.error_type.as_deref(), &decoded.message) {
+                // The retry policy's `non_retryable_errors` class list controls the
+                // #523 workflow-level retry loop, and a TYPED workflow failure
+                // (issue #767) is classified by its `error_type` CLASS ONLY — never
+                // by its human message text. This lets an operator halt the retry
+                // loop for a specific typed failure class (e.g.
+                // `"ValidationRejected"`) exactly like a typed activity failure,
+                // without a retryable typed class being wrongly made terminal just
+                // because its human message happens to coincide with a
+                // `non_retryable_errors` pattern (Codex P2). For a typed failure we
+                // therefore pass an empty raw string to `is_non_retryable`: it
+                // matches on exact equality (`nr == raw_error`), so `""` can only
+                // ever match a literally-empty pattern (degenerate config) and never
+                // the message — the match reduces to a pure class check.
+                //
+                // `decoded.error_type` is `None` for a legacy `Err(String)` (and for
+                // an engine non-determinism string), so those fall back to the
+                // full-string match on the decoded HUMAN message (`decoded.message`)
+                // — never the raw `harvest_workflow_failure_v1` envelope JSON. This
+                // preserves legacy `non_retryable_errors` semantics (a workflow
+                // returning `Err("fatal".into())` with `non_retryable_errors =
+                // ["fatal"]` still halts, because the decoded message equals the raw
+                // error for the legacy path).
+                //
+                // The `WorkflowFailure.non_retryable` FLAG itself stays advisory-only
+                // and is deliberately NOT consulted here — it is a classification
+                // hint for the caller / completion-trigger, not a control input to
+                // the retry loop.
+                let non_retryable = match decoded.error_type.as_deref() {
+                    Some(error_type) => policy.is_non_retryable(Some(error_type), ""),
+                    None => policy.is_non_retryable(None, &decoded.message),
+                };
+                if non_retryable {
                     return None;
                 }
                 // Use the execution ID bytes as a deterministic seed so jitter is

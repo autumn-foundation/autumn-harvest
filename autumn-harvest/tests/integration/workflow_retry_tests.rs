@@ -240,6 +240,23 @@ fn typed_retryable_fail_handler(
     })
 }
 
+/// Fails with a typed `WorkflowFailure` whose `error_type` (`"TransientTimeout"`)
+/// is NOT in the policy's `non_retryable_errors` list, but whose HUMAN MESSAGE
+/// (`"fatal"`) coincidentally equals a `non_retryable_errors` pattern (Codex P2,
+/// issue #767). A typed failure must be classified by its `error_type` class
+/// ONLY — this class is retryable, so the run must still retry even though the
+/// message text matches. (`is_non_retryable` matches on exact equality, so the
+/// message must exactly equal the pattern for the pre-fix gate — which combined
+/// the class match with a raw-message match — to have wrongly suppressed it.)
+fn typed_message_collision_fail_handler(
+    _ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        Err(WorkflowFailure::new("TransientTimeout", "fatal").into_workflow_error_payload())
+    })
+}
+
 /// Fails via the `Result<_, WorkflowFailure>` sentinel path (issue #767,
 /// Codex P2): a workflow returning `Err("fatal".into())` — where the `Err` is a
 /// `WorkflowFailure` built from a plain string — collapses `error_type` to
@@ -991,6 +1008,79 @@ async fn workflow_typed_retryable_error_type_still_retries() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
         "a typed error_type NOT in non_retryable_errors must still schedule a retry"
+    );
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert!(
+        count_by_workflow_id(&mut check, workflow_id).await >= 1,
+        "at least the original execution must exist"
+    );
+}
+
+/// Codex P2 regression guard (issue #767): a typed `WorkflowFailure` whose
+/// `error_type` (`"TransientTimeout"`) is NOT in `non_retryable_errors`, but
+/// whose HUMAN MESSAGE (`"fatal"`) equals a `non_retryable_errors` pattern, must
+/// STILL retry. The pre-fix gate passed `decoded.message` as the raw arg to
+/// `is_non_retryable`, so the class OR'd with a message match and wrongly
+/// suppressed the retry of a retryable typed class. The fix classifies typed
+/// failures by `error_type` class ONLY.
+#[tokio::test]
+async fn workflow_typed_message_collision_still_retries() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 2,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        // The message "fatal" collides with this pattern, but the typed class
+        // "TransientTimeout" does not — so the run must still retry.
+        non_retryable_errors: vec!["fatal".to_string()],
+        jitter: JitterPolicy::None,
+    };
+
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = "typed-message-collision-001";
+    let exec_id = start_workflow(
+        &mut conn,
+        "typed_message_collision_wf",
+        workflow_id,
+        Some(policy.clone()),
+    )
+    .await;
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "typed_message_collision_wf",
+            typed_message_collision_fail_handler,
+            Some(policy),
+        )],
+        empty_shared_state(),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    wait_for_state(&mut check, exec_id, &["FAILED"]).await;
+
+    // A retryable typed class must schedule a retry even though its message text
+    // coincides with a `non_retryable_errors` pattern.
+    let history = get_history(&mut check, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
+        "a typed error_type NOT in non_retryable_errors must still retry even when \
+         its human message coincides with a non_retryable_errors pattern"
     );
 
     worker.shutdown();
