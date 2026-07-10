@@ -161,6 +161,45 @@ fn arm_timer_then_activity_workflow<'a>(
     })
 }
 
+/// (Codex P2, issue #768) Arm a cancellable timer, suspend on an activity in the
+/// SAME cycle, then `await_fire()` the timer AFTER the activity completes. The
+/// timer's `TimerStarted` is recorded in the mixed batch (competing suspension,
+/// so no fire yet); the later bookkeeping-only `await_fire` reschedules the
+/// already-armed row and it fires — never interleaved before `ActivityCompleted`.
+fn arm_timer_activity_then_await_fire_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({"work": result, "timer": format!("{outcome:?}")}))
+    })
+}
+
+/// (issue #768, matrix #6) Arm a cancellable timer, suspend on an activity, then
+/// `cancel()` and `await_fire()` AFTER the activity completes. The armed timer
+/// must resolve `Cancelled` and never fire.
+fn arm_timer_activity_cancel_then_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        handle.cancel().map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({"work": result, "timer": format!("{outcome:?}")}))
+    })
+}
+
 /// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
 /// activity. Exercises that the test harness persists the pre-suspension
 /// `SideEffectRecorded` event so the next replay iteration does not see drift.
@@ -645,6 +684,114 @@ async fn test_armed_timer_does_not_fire_during_a_mixed_activity_suspension() {
     );
 
     let report = outcome.replay_check(arm_timer_then_activity_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn start_timer_then_activity_then_await_fire_fires() {
+    // Codex P2 (issue #768): an armed timer whose `TimerStarted` was recorded in
+    // an EARLIER mixed (activity) suspension batch must still fire on a later
+    // bookkeeping-only `await_fire` cycle — production reschedules the existing
+    // durable row. Without the fix the harness returns a no-op for the re-arm and
+    // the run stalls ("suspended with no resolvable commands").
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_activity_then_await_fire_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"work": "done", "timer": "Fired"})),
+        "the armed timer must fire after the activity completes: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // Exactly one arm, one fire, no cancel.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            .count(),
+        1,
+        "exactly one TimerStarted: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+            .count(),
+        1,
+        "exactly one TimerFired: {events:?}"
+    );
+
+    // Production-shaped ordering: TimerStarted precedes ActivityCompleted, and
+    // TimerFired comes AFTER ActivityCompleted (never interleaved before it).
+    let ts = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+        .expect("TimerStarted present");
+    let ac = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("ActivityCompleted present");
+    let tf = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        .expect("TimerFired present");
+    assert!(
+        ts < ac,
+        "TimerStarted must precede ActivityCompleted: {events:?}"
+    );
+    assert!(
+        tf > ac,
+        "TimerFired must come AFTER ActivityCompleted, never interleaved before: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(arm_timer_activity_then_await_fire_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
+    // Matrix #6 (issue #768): arm → activity → cancel → await must resolve
+    // Cancelled and never fire, even though the arm was recorded in an earlier
+    // mixed-suspension batch.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_activity_cancel_then_await_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"work": "done", "timer": "Cancelled"})),
+        "the armed timer must resolve Cancelled: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "a cancelled timer records TimerCancelled: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "a cancelled timer must never fire: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(arm_timer_activity_cancel_then_await_workflow)
+        .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "replay self-check failed:\n{report}"

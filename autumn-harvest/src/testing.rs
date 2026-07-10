@@ -3170,12 +3170,30 @@ impl WorkflowTestEnv {
                 timer_id,
                 duration_secs,
             } => {
-                let already_armed = deferred_events.iter().any(
+                let fire_already_deferred = deferred_events.iter().any(
                     |e| matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
-                ) || Self::timer_is_active_in_history(history, &timer_id);
-                if already_armed {
+                );
+                if fire_already_deferred {
+                    // Armed AND already firing this batch (e.g. `await_fire`'s
+                    // re-arm in the same cycle as `start_timer`): idempotent no-op.
                     return Ok(false);
                 }
+                if Self::timer_is_active_in_history(history, &timer_id) {
+                    // The durable row already exists (recorded in an EARLIER batch,
+                    // e.g. `start_timer()` before an activity — its `TimerStarted`
+                    // was recorded then but not fired). No new `TimerStarted`
+                    // (dedup). On a bookkeeping-only `await_fire` batch, production
+                    // reschedules the existing row to fire, so the harness must
+                    // fire it here too — otherwise `process_suspension` finds no
+                    // resolvable command and the test stalls. On a competing
+                    // suspension the timer stays parked (Codex P2, issue #768).
+                    if batch_has_competing_suspension {
+                        return Ok(false);
+                    }
+                    deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                    return Ok(true);
+                }
+                // Fresh arm this batch.
                 history.push(WorkflowEvent::TimerStarted {
                     timer_id: timer_id.clone(),
                     duration_secs,

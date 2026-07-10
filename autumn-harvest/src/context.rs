@@ -4156,6 +4156,22 @@ impl WorkflowContext {
             !timer_id.is_empty(),
             "start_timer: timer_id must be non-empty"
         );
+        // Idempotent no-op for an id that is ALREADY logically armed with no
+        // intervening `cancel`/`reset`. The durable `harvest_timers` row is
+        // deduped by `timer_id`, so the live cycle records no second
+        // `TimerStarted`; replay must therefore NOT re-run the positional
+        // `match_timer_arm` (there is no second `TimerStarted` at the cursor, so
+        // it would diverge against the next real event — a timer mismatch for
+        // history this worker itself wrote). A prior `cancel_timer` clears the
+        // Armed state and `reset_timer` re-sets it, so a subsequent `start_timer`
+        // matches/records again (Codex P2, issue #768).
+        if self.timer_logically_armed(timer_id) {
+            return TimerHandle {
+                context: self,
+                timer_id: timer_id.to_string(),
+                duration_secs,
+            };
+        }
         match self.match_history(|m| m.match_timer_arm(timer_id, duration_secs)) {
             // Live: record the arm.
             HistoryMatch::NoMatch => {
@@ -4204,6 +4220,21 @@ impl WorkflowContext {
                 .expect("cancellable_timer_state lock poisoned")
                 .get(timer_id),
             Some(TimerLogicalState::Cancelled)
+        )
+    }
+
+    /// Whether the workflow logically holds `timer_id` armed this task (a
+    /// `start_timer`/`reset_timer` with no subsequent `cancel_timer`). Consulted
+    /// by [`Self::start_timer`] to make a duplicate arm of an already-armed id a
+    /// true idempotent no-op — the durable row is deduped, so re-running the
+    /// positional history match would diverge (Codex P2, issue #768).
+    fn timer_logically_armed(&self, timer_id: &str) -> bool {
+        matches!(
+            self.cancellable_timer_state
+                .lock()
+                .expect("cancellable_timer_state lock poisoned")
+                .get(timer_id),
+            Some(TimerLogicalState::Armed)
         )
     }
 
@@ -10467,6 +10498,78 @@ mod tests {
             &cmds[0],
             WorkflowCommand::ArmTimer { timer_id, .. } if timer_id.as_str() == "idle"
         ));
+    }
+
+    #[test]
+    fn duplicate_active_start_timer_is_idempotent_noop_live() {
+        // Codex P2 (issue #768): calling `start_timer` twice for the same id with
+        // no intervening cancel/reset must record exactly ONE arm on the live
+        // frontier (the durable row is deduped, so the worker emits one
+        // `TimerStarted`). The second call must push NO command and defer no Nd.
+        let ctx = WorkflowContext::new_test();
+        let _h1 = ctx.start_timer("idle", 300);
+        let _h2 = ctx.start_timer("idle", 300); // duplicate active arm
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            cmds.len(),
+            1,
+            "a duplicate active arm records nothing: {cmds:?}"
+        );
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::ArmTimer { timer_id, duration_secs }
+                if timer_id.as_str() == "idle" && *duration_secs == 300
+        ));
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[test]
+    fn duplicate_active_start_timer_does_not_consume_a_second_history_event() {
+        // Codex P2 (issue #768): on REPLAY, history holds exactly ONE
+        // `TimerStarted`. The first `start_timer` consumes it (Matched); the
+        // second must be a no-op that neither re-runs the positional
+        // `match_timer_arm` (which would diverge against the next real event) nor
+        // emits a command. Here `TimerFired` is the "next real event" the second
+        // arm must NOT trip over.
+        let events = vec![
+            wf_started_event(),
+            timer_started_event("idle", 300),
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let _h1 = ctx.start_timer("idle", 300);
+        let _h2 = ctx.start_timer("idle", 300); // duplicate active arm
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a duplicate active arm emits no command on replay"
+        );
+        assert!(
+            ctx.take_deferred_nd_error().is_none(),
+            "the second arm must NOT diverge against the trailing TimerFired"
+        );
+    }
+
+    #[test]
+    fn start_timer_after_cancel_re_matches_history() {
+        // The idempotent guard must NOT swallow a genuine re-arm after a cancel:
+        // `start_timer; cancel; start_timer` records a full
+        // [ArmTimer, CancelTimer, ArmTimer] on the live frontier.
+        let ctx = WorkflowContext::new_test();
+        let _h1 = ctx.start_timer("idle", 300);
+        ctx.cancel_timer("idle").expect("cancel is infallible");
+        let _h2 = ctx.start_timer("idle", 300); // re-arm after cancel — NOT a no-op
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            cmds.len(),
+            3,
+            "arm + cancel + re-arm after cancel: {cmds:?}"
+        );
+        assert!(matches!(&cmds[0], WorkflowCommand::ArmTimer { .. }));
+        assert!(matches!(&cmds[1], WorkflowCommand::CancelTimer { .. }));
+        assert!(matches!(&cmds[2], WorkflowCommand::ArmTimer { .. }));
+        assert!(ctx.take_deferred_nd_error().is_none());
     }
 
     #[test]

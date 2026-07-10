@@ -330,6 +330,24 @@ fn arm_timer_then_complete_workflow<'a>(
     })
 }
 
+/// Duplicate ACTIVE arm (Codex P2, issue #768): calls `start_timer("idle", 300)`
+/// twice with no intervening cancel/reset, then awaits the fire. The durable row
+/// is deduped, so the recorded history has exactly ONE `TimerStarted("idle")`.
+/// On replay the first `start_timer` consumes it; the second must be an
+/// idempotent no-op that does NOT re-run the positional `match_timer_arm`
+/// (which would diverge against the trailing `TimerFired`).
+fn duplicate_active_start_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _first = ctx.start_timer("idle", 300);
+        let handle = ctx.start_timer("idle", 300); // duplicate active arm — no-op
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
 /// Cancellable timer reset loop (issue #768): arm, reset N times, then either
 /// await the fire or cancel. Drives the O(K)-history, zero-orphan reset path.
 fn cancellable_timer_reset_workflow<'a>(
@@ -753,6 +771,10 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn(
             "arm_timer_then_complete_workflow",
             arm_timer_then_complete_workflow,
+        )
+        .register_fn(
+            "duplicate_active_start_timer_workflow",
+            duplicate_active_start_timer_workflow,
         )
         .register_fn(
             "cancellable_timer_reset_workflow",
@@ -1497,6 +1519,38 @@ async fn cancel_then_reset_then_await_replays_fired() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a cancel-then-reset-then-await cancellable timer replays cleanly (fires), got: {report}"
+    );
+}
+
+/// Codex P2 (issue #768) — determinism gate for a DUPLICATE ACTIVE arm: calling
+/// `start_timer("idle", 300)` twice with no cancel/reset between records exactly
+/// ONE `TimerStarted` (the durable row is deduped). Replaying the fixed-worker
+/// history `[WorkflowStarted, TimerStarted, TimerFired]` must succeed — the
+/// second `start_timer` must be an idempotent no-op that does NOT re-run the
+/// positional `match_timer_arm` against the trailing `TimerFired`. Without the
+/// fix the second arm diverges (a timer mismatch for history this worker wrote).
+#[tokio::test]
+async fn duplicate_active_start_timer_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    // Exactly ONE TimerStarted despite two start_timer calls (row dedup).
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            .count(),
+        1,
+        "the fixed-worker history records exactly one TimerStarted"
+    );
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "duplicate_active_start_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a duplicate active start_timer replays cleanly (idempotent no-op), got: {report}"
     );
 }
 
