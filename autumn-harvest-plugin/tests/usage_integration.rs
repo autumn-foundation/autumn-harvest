@@ -181,6 +181,9 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -309,6 +312,8 @@ async fn seed_execution(
         .expect("connect");
     let wf_id = format!("{workflow_name}-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id: &wf_id,

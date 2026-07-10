@@ -204,6 +204,9 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
+    ),
     "\n",
     // issue #607 / #688: workflow-start throttle table + its index follow-ups.
     include_str!("../../autumn-harvest/migrations/20260706000001_harvest_start_throttle/up.sql"),
@@ -868,6 +871,8 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
     let seeded_run_id = uuid::Uuid::new_v4();
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: seeded_run_id,
             workflow_name: dag_name,
             workflow_id: &seeded_run_id.to_string(),
@@ -1203,6 +1208,8 @@ async fn seed_scheduled_activity_task_from_url(
         .expect("failed to connect for scheduled activity seed");
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&autumn_harvest::models::NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name,
             workflow_id,

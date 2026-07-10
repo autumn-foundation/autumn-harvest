@@ -1244,6 +1244,8 @@ async fn insert_fork_execution(
     });
 
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: new_exec_id.as_uuid(),
         workflow_name: &source.workflow_name,
         workflow_id: &source.workflow_id,
@@ -1539,6 +1541,8 @@ mod tests {
             nd_block_reason: None,
             nd_block_count: 0,
             completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
             legal_hold_reason: None,

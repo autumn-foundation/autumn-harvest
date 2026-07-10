@@ -4355,6 +4355,8 @@ async fn persist_all_started_child_workflows(
                     let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
                     let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
                     let child_row = NewWorkflowExecution {
+                        continued_from_exec_id: None,
+                        first_exec_id: None,
                         id: child.child_id.as_uuid(),
                         workflow_name: &child.workflow_name,
                         workflow_id: &child_workflow_id,
@@ -5003,6 +5005,8 @@ async fn create_detached_child_executions(
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         let child_row = NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
             workflow_id: &child_workflow_id,
@@ -7037,6 +7041,12 @@ async fn persist_workflow_continue_as_new(
         // Continue-as-new is the same logical run forking forward: preserve
         // the predecessor's completion-callback targets (issue #605).
         completion_callbacks: execution.completion_callbacks.clone(),
+        // Back-link this successor to its predecessor and to the chain origin
+        // (issue #701) so the run-chain timeline can walk the whole chain from any
+        // member. The origin is the predecessor's own `first_exec_id` if it is
+        // itself a successor, else the predecessor's own id.
+        continued_from_exec_id: Some(exec_id.as_uuid()),
+        first_exec_id: Some(execution.first_exec_id.unwrap_or(execution.id)),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);

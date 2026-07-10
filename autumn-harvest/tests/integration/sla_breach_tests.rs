@@ -128,6 +128,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -168,6 +169,8 @@ async fn insert_execution(
     let sla = sla_deadline_at.map(|_| ChronoDuration::hours(2));
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "slow_workflow",
             workflow_id: &format!("wf-sla-{}", Uuid::new_v4()),

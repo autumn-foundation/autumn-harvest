@@ -129,6 +129,8 @@ async fn seed_external_handoff(
         .expect("failed to connect to test database");
 
     let execution = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id,

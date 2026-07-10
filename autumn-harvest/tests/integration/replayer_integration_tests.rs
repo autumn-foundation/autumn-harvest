@@ -115,6 +115,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -149,6 +150,8 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 /// Insert a minimal workflow execution row so `replay_from_db` can look up the name.
 async fn insert_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name: &str) {
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: name,
         workflow_id: "test-wf",

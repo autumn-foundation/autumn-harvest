@@ -197,6 +197,9 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -339,6 +342,8 @@ async fn seed_running_execution(url: &str, shard: i32) -> Uuid {
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

@@ -95,6 +95,14 @@ diesel::table! {
         /// effective set is still the union with any builder-wide defaults,
         /// resolved at enqueue time (not stored on this row).
         completion_callbacks -> Nullable<Jsonb>,
+        /// Predecessor execution in a continue-as-new chain (issue #701). NULL for
+        /// the first run in a chain and for all non-continued runs. Back-link set at
+        /// the successor's insert time.
+        continued_from_exec_id -> Nullable<Uuid>,
+        /// The first (origin) execution of this continue-as-new chain (issue #701).
+        /// Set on every successor to the chain head so any member resolves the head
+        /// in one lookup. NULL for the origin run and all non-continued runs.
+        first_exec_id -> Nullable<Uuid>,
         /// Wall-clock the per-execution legal hold was placed (issue #747).
         /// NULL = no hold. A hold is ACTIVE when this is non-NULL and
         /// `legal_hold_until` is NULL or in the future; an active hold exempts

@@ -36,7 +36,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
-    include_str!("../../migrations/20260709000000_harvest_legal_hold/up.sql"),
+    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
     "\n",
     include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
     "\n",
@@ -47,6 +47,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
     "\n",
     include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
 /// Capturing metrics recorder — records `(workflow, count)` from
