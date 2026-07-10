@@ -82,9 +82,16 @@ pub struct McpWorkflowDescriptor {
     /// to an ordinary `#[workflow(mcp)]` workflow. Changes two things in the
     /// generated tool set: `start_{wf}` routes through the DAG trigger
     /// contract (admission gates, `max_active_runs`) instead of generic
-    /// workflow start, and `signal_{wf}` is omitted (a DAG run never consumes
-    /// signals).
+    /// workflow start, and `signal_{wf}` is omitted **unless the DAG consumes
+    /// signals** (see [`Self::consumes_signals`]).
     pub is_dag: bool,
+    /// `true` when this DAG contains at least one signal-gate node (issue
+    /// #746) — sourced from [`DagInfo::consumes_signals`]. Only meaningful
+    /// when `is_dag` is `true`; always `false` for an ordinary workflow (whose
+    /// `signal_{wf}` tool is governed by `!is_dag` instead). A signal-capable
+    /// DAG regains its `signal_{dag}` tool so an agent can unblock a gate; an
+    /// activity-only DAG suppresses it.
+    pub consumes_signals: bool,
 }
 
 /// Which member of the per-workflow tool set a [`ToolRouteSpec`] describes.
@@ -206,6 +213,13 @@ pub fn collect_descriptors(
     let dag_names: HashSet<&str> = dags
         .iter()
         .filter(|d| d.workflow_handler.is_some())
+        .map(|d| d.name)
+        .collect();
+    // DAGs that contain at least one signal-gate node (issue #746) keep their
+    // `signal_{dag}` tool, unlike an activity-only DAG which suppresses it.
+    let signal_dag_names: HashSet<&str> = dags
+        .iter()
+        .filter(|d| d.workflow_handler.is_some() && d.consumes_signals())
         .map(|d| d.name)
         .collect();
     let mut name_counts: HashMap<&str, u32> = HashMap::new();
@@ -340,6 +354,7 @@ pub fn collect_descriptors(
             input_schema: info.input_schema.map(|f| f()),
             updates: wf_updates,
             is_dag,
+            consumes_signals: signal_dag_names.contains(info.name),
         };
         // Two differently-named workflows (or a workflow and a sibling's
         // update) can still generate the SAME operation id -- e.g. workflow
@@ -383,10 +398,11 @@ pub fn collect_descriptors(
 fn tool_operation_ids(descriptor: &McpWorkflowDescriptor) -> Vec<String> {
     let wf = &descriptor.name;
     let mut ids = vec![format!("start_{wf}"), format!("{wf}_status")];
-    // A unified DAG run never consumes signals, so its tool set has no
-    // signal_{wf} id (and, by construction in `collect_descriptors`, no
-    // update ids either -- DAGs have no update handlers).
-    if !descriptor.is_dag {
+    // An activity-only DAG has no signal_{wf} id (and, by construction in
+    // `collect_descriptors`, no update ids either -- DAGs have no update
+    // handlers). A DAG with signal-gate nodes (issue #746) keeps signal_{wf},
+    // matching the finer suppression in `tool_route_specs`.
+    if !descriptor.is_dag || descriptor.consumes_signals {
         ids.push(format!("signal_{wf}"));
     }
     ids.extend(
@@ -410,11 +426,11 @@ pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec
         .as_deref()
         .map_or_else(String::new, |d| format!(" {d}"));
 
-    // The full DAG-vs-workflow behavioral difference lives right here: which
-    // handler the start tool routes to (and how it's described), and whether
-    // a signal tool exists at all. A DAG never consumes signals, so
-    // signal_{wf} is entirely absent for it rather than a no-op tool.
-    let (start_kind, start_description, signal_spec) = if descriptor.is_dag {
+    // The DAG-vs-workflow behavioral difference lives right here: which
+    // handler the start tool routes to (and how it's described). A DAG start
+    // always routes through the DAG trigger contract (admission gates,
+    // max_active_runs), regardless of whether the DAG consumes signals.
+    let (start_kind, start_description) = if descriptor.is_dag {
         (
             ToolKind::DagStart,
             format!(
@@ -424,7 +440,6 @@ pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec
                  Correlate follow-up calls ({wf}_status, {wf}_watch) with the \
                  returned execution_id handle."
             ),
-            None,
         )
     } else {
         (
@@ -436,26 +451,33 @@ pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec
                  Correlate follow-up calls ({wf}_status, signal_{wf}, {wf}_watch) \
                  with the returned execution_id handle."
             ),
-            Some(ToolRouteSpec {
-                kind: ToolKind::Signal,
-                method: "POST",
-                path: format!("{prefix}/workflows/{wf}/{{handle}}/signal/{{signal_name}}"),
-                operation_id: format!("signal_{wf}"),
-                summary: format!("Send a signal to a '{wf}' workflow execution"),
-                description: format!(
-                    "Deliver an asynchronous signal to a running '{wf}' execution by \
-                     handle, unblocking any wait_for_signal/receive_signal in the \
-                     workflow body. The JSON body is the signal payload."
-                ),
-                path_params: vec!["handle", "signal_name"],
-                body_component: Some(SIGNAL_PAYLOAD_SCHEMA.to_string()),
-                response_component: Some(SIGNAL_ACK_SCHEMA),
-                stream: false,
-                workflow: wf.clone(),
-                update: None,
-            }),
         )
     };
+
+    // The signal tool exists for an ordinary workflow, and for a DAG that
+    // consumes signals (issue #746 gate nodes). It is suppressed only for an
+    // activity-only DAG, which never consumes a signal -- a no-op tool there
+    // would mislead an agent.
+    let include_signal = !descriptor.is_dag || descriptor.consumes_signals;
+    let signal_spec = include_signal.then(|| ToolRouteSpec {
+        kind: ToolKind::Signal,
+        method: "POST",
+        path: format!("{prefix}/workflows/{wf}/{{handle}}/signal/{{signal_name}}"),
+        operation_id: format!("signal_{wf}"),
+        summary: format!("Send a signal to a '{wf}' workflow execution"),
+        description: format!(
+            "Deliver an asynchronous signal to a running '{wf}' execution by \
+             handle, unblocking any wait_for_signal/receive_signal (or DAG \
+             signal gate) in the workflow body. The JSON body is the signal \
+             payload."
+        ),
+        path_params: vec!["handle", "signal_name"],
+        body_component: Some(SIGNAL_PAYLOAD_SCHEMA.to_string()),
+        response_component: Some(SIGNAL_ACK_SCHEMA),
+        stream: false,
+        workflow: wf.clone(),
+        update: None,
+    });
 
     let mut specs = vec![
         ToolRouteSpec {
@@ -1382,6 +1404,18 @@ mod tests {
         }
     }
 
+    /// A unified DAG containing a signal-gate node (issue #746). Its builder
+    /// registers an `approval` gate, so `DagInfo::consumes_signals()` is true
+    /// and the DAG regains its `signal_{dag}` MCP tool.
+    fn dag_info_with_gate(name: &'static str) -> DagInfo {
+        DagInfo {
+            builder: |dag| {
+                let _ = dag.signal_gate("approval");
+            },
+            ..dag_info(name, true)
+        }
+    }
+
     fn order_input_schema() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -1720,6 +1754,7 @@ mod tests {
                 output_type_hint: "bool".into(),
             }],
             is_dag: false,
+            consumes_signals: false,
         };
         let specs = tool_route_specs("/api/harvest/mcp", &descriptor);
 
@@ -1811,6 +1846,7 @@ mod tests {
             input_schema: None,
             updates: vec![],
             is_dag: false,
+            consumes_signals: false,
         };
         let specs = tool_route_specs("/x", &descriptor);
         assert_eq!(specs.len(), 4, "start/status/signal/watch — no updates");
@@ -1825,6 +1861,7 @@ mod tests {
             input_schema: None,
             updates: vec![],
             is_dag: true,
+            consumes_signals: false,
         };
         let specs = tool_route_specs("/api/harvest/mcp", &descriptor);
 
@@ -1857,6 +1894,7 @@ mod tests {
             input_schema: None,
             updates: vec![],
             is_dag: true,
+            consumes_signals: false,
         };
         assert_eq!(
             tool_operation_ids(&descriptor),
@@ -1887,6 +1925,62 @@ mod tests {
             .find(|d| d.name == "order_flow")
             .expect("order_flow must be exposed");
         assert!(!workflow.is_dag);
+    }
+
+    /// Issue #746: a DAG that consumes signals (has ≥1 signal-gate node)
+    /// regains its `signal_{dag}` MCP tool so an agent can unblock a gate,
+    /// while an activity-only DAG still suppresses it.
+    #[test]
+    fn collect_descriptors_signal_capable_dag_keeps_its_signal_tool() {
+        let descriptors = collect_descriptors(
+            &[wf("gated_pipeline", true), wf("plain_etl", true)],
+            &[],
+            &[
+                dag_info_with_gate("gated_pipeline"),
+                dag_info("plain_etl", true),
+            ],
+        );
+
+        let gated = descriptors
+            .iter()
+            .find(|d| d.name == "gated_pipeline")
+            .expect("gated_pipeline must be exposed");
+        assert!(gated.is_dag, "gated_pipeline is a unified DAG");
+        assert!(
+            gated.consumes_signals,
+            "a DAG with a signal-gate node must be marked consumes_signals"
+        );
+        let gated_ids = tool_operation_ids(gated);
+        assert!(
+            gated_ids.contains(&"signal_gated_pipeline".to_string()),
+            "a signal-capable DAG must keep its signal_{{dag}} tool; got: {gated_ids:?}"
+        );
+        assert!(
+            tool_route_specs("/api/harvest/mcp", gated)
+                .iter()
+                .any(|s| s.kind == ToolKind::Signal),
+            "tool_route_specs must emit a Signal spec for a signal-capable DAG"
+        );
+
+        let plain = descriptors
+            .iter()
+            .find(|d| d.name == "plain_etl")
+            .expect("plain_etl must be exposed");
+        assert!(plain.is_dag);
+        assert!(
+            !plain.consumes_signals,
+            "an activity-only DAG must not be marked consumes_signals"
+        );
+        assert!(
+            !tool_operation_ids(plain).contains(&"signal_plain_etl".to_string()),
+            "an activity-only DAG must still suppress its signal tool"
+        );
+        assert!(
+            tool_route_specs("/api/harvest/mcp", plain)
+                .iter()
+                .all(|s| s.kind != ToolKind::Signal),
+            "tool_route_specs must not emit a Signal spec for an activity-only DAG"
+        );
     }
 
     #[test]

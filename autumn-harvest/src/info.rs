@@ -876,6 +876,23 @@ impl DagInfo {
         self
     }
 
+    /// Whether this DAG contains at least one signal-gate node (issue #746).
+    ///
+    /// A signal-capable DAG pauses on a named signal (`signal_gate` /
+    /// `signal_gate_with_timeout`), so an MCP surface must keep the
+    /// `signal_{dag}` tool available for it (issue #597 follow-up); an
+    /// activity-only DAG never consumes a signal and suppresses that tool.
+    ///
+    /// Returns `false` when the builder produces an invalid graph (the DAG
+    /// would already fail registration elsewhere), erring toward the
+    /// activity-only classification.
+    #[must_use]
+    pub fn consumes_signals(&self) -> bool {
+        self.build_definition().is_ok_and(|def| {
+            def.tasks().iter().any(|task| task.signal.is_some())
+        })
+    }
+
     /// Return a [`WorkflowSchedule`] that fires this DAG on its declared cron
     /// or interval via the unified workflow execution path (issue #256 Step 2).
     ///
