@@ -100,6 +100,12 @@ pub enum NonDeterminismKind {
     /// (issue #687's deploy-3 step taken too early) — and was encountered by
     /// the next command at that cursor position.
     PatchMarkerMismatch,
+    /// A `TimerCancelled` event was left unconsumed — e.g. a
+    /// [`crate::context::WorkflowContext::cancel_timer`] / `TimerHandle::cancel`
+    /// / `TimerHandle::reset` call was removed before all cancel-bearing
+    /// executions drained (issue #768) — and was encountered by the next
+    /// command at that cursor position.
+    TimerCancelMismatch,
     /// The divergence could not be classified into a known category.
     Unknown,
 }
@@ -120,6 +126,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::EarlyCompletion => write!(f, "EarlyCompletion"),
             Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
             Self::PatchMarkerMismatch => write!(f, "PatchMarkerMismatch"),
+            Self::TimerCancelMismatch => write!(f, "TimerCancelMismatch"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -1332,8 +1339,17 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
     if actual.starts_with("MarkerRecorded(patch:") {
         return NonDeterminismKind::PatchMarkerMismatch;
     }
+    // A `TimerCancelled` found where another event was expected means a
+    // `cancel_timer` / `handle.cancel` / `handle.reset` call was removed before
+    // all cancel-bearing executions drained (issue #768) — classify specifically
+    // so the message points at the cancelled timer rather than the command that
+    // first noticed it.
+    if actual.starts_with("TimerCancelled") {
+        return NonDeterminismKind::TimerCancelMismatch;
+    }
     match kind_str {
         "activity" => NonDeterminismKind::ActivityScheduleMismatch,
+        "timer-cancel" => NonDeterminismKind::TimerCancelMismatch,
         "local activity" => NonDeterminismKind::LocalActivityScheduleMismatch,
         "timer" => NonDeterminismKind::TimerMismatch,
         "signal" => NonDeterminismKind::SignalMismatch,
@@ -2158,6 +2174,67 @@ pub struct TestRunOutcome {
     start_time: DateTime<Utc>,
 }
 
+/// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
+/// timers that **actually fired** in `events` (issue #768, Codex P2 rounds 8 and
+/// 16).
+///
+/// Simulates the virtual clock as a monotonic `now`: each `TimerStarted` for an
+/// id is enqueued (FIFO) with the CURRENT `now` as its deadline **anchor**; a
+/// `TimerFired` for that id dequeues the earliest pending arm and advances
+/// `now = max(now, anchor + duration)`; a `TimerCancelled` dequeues (and
+/// discards) the earliest pending arm without advancing. In a valid history an
+/// id has at most one pending arm at a time (arm → fire/cancel → re-arm → …), so
+/// this counts exactly the fired arms and excludes cancelled / reset ones.
+///
+/// The `max`-of-deadlines model (round 16) handles both timer shapes correctly:
+/// - **Sequential** timers (each armed *after* the previous fired) have a later
+///   anchor, so their deadlines chain and the result is the SUM of durations —
+///   including every classic `ctx.timer` (each parks the workflow, so it always
+///   arms after the previous one fired).
+/// - **Concurrently-armed** cancellable timers (one `await_fire` batch /
+///   overlapping arm windows) share an anchor (no fire advanced `now` between
+///   their `TimerStarted`s), so the result is the MAX deadline — matching
+///   production, where all deadlines in one batch start at the same instant.
+///
+/// This is the read-side counterpart to the live-clock advance in
+/// `WorkflowContext::await_timer_fire`; the two must agree at terminal.
+fn fired_timer_duration_secs(events: &[WorkflowEvent]) -> u64 {
+    use std::collections::{HashMap, VecDeque};
+    // Per-id FIFO queue of pending arms, each carrying its deadline anchor
+    // (the `now` at which it was armed).
+    let mut pending: HashMap<&str, VecDeque<u64>> = HashMap::new();
+    let mut now: u64 = 0;
+    for event in events {
+        match event {
+            WorkflowEvent::TimerStarted {
+                timer_id,
+                duration_secs,
+            } => {
+                // Deadline = anchor (now) + duration. Store the deadline directly.
+                pending
+                    .entry(timer_id.as_str())
+                    .or_default()
+                    .push_back(now.saturating_add(*duration_secs));
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                if let Some(deadline) = pending
+                    .get_mut(timer_id.as_str())
+                    .and_then(VecDeque::pop_front)
+                {
+                    now = now.max(deadline);
+                }
+            }
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                if let Some(queue) = pending.get_mut(timer_id.as_str()) {
+                    queue.pop_front();
+                }
+            }
+            _ => {}
+        }
+    }
+    now
+}
+
 impl TestRunOutcome {
     /// Returns a reference to the ordered event log.
     ///
@@ -2170,16 +2247,23 @@ impl TestRunOutcome {
 
     /// The virtual "now" at the end of the run (issue #526).
     ///
-    /// Computed as `start_time + Σ duration_secs` over all `TimerStarted` events
-    /// in the recorded history — the authoritative set of durable timers that
-    /// fired along the taken path.  Signal-preempted timers produce no
-    /// `TimerStarted` event and therefore do not advance this clock.
+    /// Computed as `start_time + max`-of-deadlines over the durable timers that
+    /// **actually fired** along the taken path — each `TimerStarted` anchors a
+    /// deadline (`now-at-arm + duration`) and every matching `TimerFired` (per id,
+    /// FIFO) advances the virtual clock to `max(now, deadline)`. Sequential timers
+    /// therefore SUM (each armed after the previous fired) and concurrently-armed
+    /// cancellable timers take the MAX (they share an anchor, matching production
+    /// where all deadlines in one `await_fire` batch start at the same instant —
+    /// issue #768, Codex P2 round 16). A `TimerStarted` that was cancelled or reset
+    /// never fired, so its deadline is **excluded** — otherwise a cancelled/reset
+    /// arm would advance the virtual clock even though the workflow never observed
+    /// its fire, disagreeing with `ctx.now()` (Codex P2 round 8). Signal-preempted
+    /// timers produce no `TimerStarted` event and likewise do not advance this
+    /// clock. The classic `ctx.timer` path always fires and is always sequential,
+    /// so the sum is unchanged from the pre-round-16 model.
     #[must_use]
     pub fn final_now(&self) -> DateTime<Utc> {
-        let total_secs: u64 = self.events.iter().fold(0u64, |acc, e| match e {
-            WorkflowEvent::TimerStarted { duration_secs, .. } => acc.saturating_add(*duration_secs),
-            _ => acc,
-        });
+        let total_secs: u64 = fired_timer_duration_secs(&self.events);
         self.start_time
             + chrono::Duration::seconds(
                 i64::try_from(total_secs)
@@ -2776,6 +2860,31 @@ impl WorkflowTestEnv {
                         parent_close_policy: *parent_close_policy,
                     });
                 }
+                // Cancellable/renewable timer bookkeeping on a terminal cycle
+                // (issue #768): a sealing run never awaits, so any arm is a fresh
+                // arm (`for_await: false`) that records TimerStarted (idempotent);
+                // a `for_await: true` re-arm cannot reach a terminal cycle (await
+                // parks) and records nothing. Cancel records TimerCancelled. No
+                // fire is deferred — the run is sealing.
+                WorkflowCommand::ArmTimer {
+                    timer_id,
+                    duration_secs,
+                    for_await: false,
+                } => {
+                    if !Self::timer_is_active_in_history(history, timer_id) {
+                        history.push(WorkflowEvent::TimerStarted {
+                            timer_id: timer_id.clone(),
+                            duration_secs: *duration_secs,
+                        });
+                    }
+                }
+                WorkflowCommand::CancelTimer { timer_id } => {
+                    history.push(WorkflowEvent::TimerCancelled {
+                        timer_id: timer_id.clone(),
+                    });
+                }
+                // A `for_await: true` re-arm cannot reach a terminal cycle (await
+                // parks), so it records nothing here.
                 _ => {}
             }
         }
@@ -2834,12 +2943,49 @@ impl WorkflowTestEnv {
             }
         });
 
+        // Whether this batch also carries a genuine non-timer suspension
+        // (activity/signal/child-workflow/classic timer). In production the
+        // worker records an `ArmTimer` and leaves the workflow parked on that
+        // other wait — it only reschedules the armed cancellable timer to fire
+        // on the bookkeeping-only `await_fire` path. When a competing suspension
+        // is present the harness must NOT auto-fire the armed timer, or it would
+        // synthesise impossible history such as
+        // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`
+        // (Codex P2, issue #768).
+        let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
+
+        // Deadline-ordered firing for concurrent awaited cancellable timers
+        // (issue #768, Codex P2 round 15). Production inserts every
+        // `for_await: true` row, reschedules the parked task to the MINIMUM
+        // `fires_at`, and on the next claim ingests only DUE timers in `fires_at`
+        // order. So in a bookkeeping-only batch with multiple awaited arms, only
+        // the arm(s) with the smallest deadline fire this cycle; a strictly-later
+        // timer stays parked and fires on a subsequent cycle when the clock reaches
+        // it. All await arms in one batch are armed at the same instant, so the
+        // minimum `fires_at` is simply the minimum `duration_secs`. Without this,
+        // `tokio::join!(slow.await_fire(), fast.await_fire())` would record
+        // `TimerFired(slow)` before `TimerFired(fast)` in poll order — an ordering
+        // a live worker (deadline-ordered ingest) can never produce.
+        let min_await_deadline_secs = commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::ArmTimer {
+                    duration_secs,
+                    for_await: true,
+                    ..
+                } => Some(*duration_secs),
+                _ => None,
+            })
+            .min();
+
         let mut made_progress = false;
         let mut deferred_events = Vec::new();
         for cmd in commands {
             made_progress |= self.process_command(
                 cmd,
                 signal_will_resolve,
+                batch_has_competing_suspension,
+                min_await_deadline_secs,
                 history,
                 &mut deferred_events,
                 remaining_signals,
@@ -2849,6 +2995,25 @@ impl WorkflowTestEnv {
         }
         history.extend(deferred_events);
         Ok(made_progress)
+    }
+
+    /// Whether a command is a genuine non-timer suspension that would keep the
+    /// workflow parked on an external event (activity result, signal, child
+    /// result, or a classic `ctx.timer` fire) — as opposed to author-controlled
+    /// cancellable-timer bookkeeping (`ArmTimer`/`CancelTimer`) or an inline
+    /// local activity. Used to gate cancellable-timer auto-firing in the harness
+    /// so it only fires on the bookkeeping-only `await_fire` path, matching the
+    /// real worker (Codex P2, issue #768).
+    const fn is_competing_suspension(cmd: &WorkflowCommand) -> bool {
+        matches!(
+            cmd,
+            WorkflowCommand::ScheduleActivity { .. }
+                | WorkflowCommand::WaitForActivity { .. }
+                | WorkflowCommand::ScheduleExternalActivity { .. }
+                | WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::StartChildWorkflow { .. }
+                | WorkflowCommand::StartTimer { .. }
+        )
     }
 
     /// Resolve a single workflow command and append the resulting events.
@@ -2861,6 +3026,8 @@ impl WorkflowTestEnv {
         &self,
         cmd: WorkflowCommand,
         signal_will_resolve: bool,
+        batch_has_competing_suspension: bool,
+        min_await_deadline_secs: Option<u64>,
         history: &mut Vec<WorkflowEvent>,
         deferred_events: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
@@ -3090,6 +3257,76 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
+            // Cancellable/renewable durable timer arm (issue #768, Codex P2
+            // round 4). Two roles by `for_await`, mirroring the real worker's
+            // `plan_timer_lifecycle`:
+            //
+            // - `for_await: false` (fresh arm from `start_timer`/`reset`): record
+            //   `TimerStarted` at this command's position (dedup: skip if already
+            //   active in history) and NEVER fire. A cancellable timer is only
+            //   fire-eligible once awaited, so an armed-but-unawaited timer cannot
+            //   fire while parked on a competing suspension — no impossible history
+            //   such as `[TimerStarted, ActivityScheduled, TimerFired,
+            //   ActivityCompleted]`.
+            // - `for_await: true` (re-arm from `await_fire`): record NO event
+            //   (the arm's `TimerStarted` was already recorded by the fresh arm).
+            //   On a bookkeeping-only `await_fire` batch, fire now (defer
+            //   `TimerFired`, no real sleep); on a competing suspension, stay
+            //   parked and let a later bookkeeping-only cycle fire it.
+            WorkflowCommand::ArmTimer {
+                timer_id,
+                duration_secs,
+                for_await,
+            } => {
+                if for_await {
+                    let fire_already_deferred = deferred_events.iter().any(|e| {
+                        matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id)
+                    });
+                    if fire_already_deferred {
+                        // Another `await_fire` re-arm for this id already deferred
+                        // the fire this batch — idempotent no-op.
+                        return Ok(false);
+                    }
+                    if batch_has_competing_suspension {
+                        // Awaited alongside a genuine non-timer suspension: parked,
+                        // fires on a later bookkeeping-only cycle.
+                        return Ok(false);
+                    }
+                    // Deadline order (round 15): only the minimum-deadline awaited
+                    // timer(s) fire this cycle. A strictly-later awaited timer stays
+                    // parked (no progress from it) and fires when a subsequent
+                    // bookkeeping-only cycle re-arms it against the (now smaller) set
+                    // of remaining awaits — matching production's min-`fires_at`
+                    // reschedule + deadline-ordered ingest.
+                    if min_await_deadline_secs.is_some_and(|min| duration_secs > min) {
+                        return Ok(false);
+                    }
+                    deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                    return Ok(true);
+                }
+                // Fresh arm: record TimerStarted (dedup by active-in-history), never
+                // fire.
+                if Self::timer_is_active_in_history(history, &timer_id) {
+                    return Ok(false);
+                }
+                history.push(WorkflowEvent::TimerStarted {
+                    timer_id,
+                    duration_secs,
+                });
+                Ok(true)
+            }
+
+            // Cancellable/renewable durable timer cancel (issue #768). Record
+            // TimerCancelled and drop the deferred TimerFired for this id so the
+            // timer never fires — the cancelled branch is taken deterministically.
+            WorkflowCommand::CancelTimer { timer_id } => {
+                deferred_events.retain(
+                    |e| !matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
+                );
+                history.push(WorkflowEvent::TimerCancelled { timer_id });
+                Ok(true)
+            }
+
             // WaitForActivity: activity was scheduled in a previous iteration;
             // its terminal event is already in history and will be matched on replay.
             WorkflowCommand::WaitForActivity { .. }
@@ -3101,6 +3338,29 @@ impl WorkflowTestEnv {
             | WorkflowCommand::Fail { .. }
             | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
         }
+    }
+
+    /// Whether `timer_id` has an active (unfired, uncancelled) `TimerStarted`
+    /// in `history` — used by the harness to make cancellable-timer arming
+    /// idempotent (issue #768).
+    fn timer_is_active_in_history(
+        history: &[WorkflowEvent],
+        timer_id: &crate::types::TimerId,
+    ) -> bool {
+        let mut active = false;
+        for event in history {
+            match event {
+                WorkflowEvent::TimerStarted { timer_id: id, .. } if id == timer_id => active = true,
+                WorkflowEvent::TimerFired { timer_id: id }
+                | WorkflowEvent::TimerCancelled { timer_id: id }
+                    if id == timer_id =>
+                {
+                    active = false;
+                }
+                _ => {}
+            }
+        }
+        active
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -3286,9 +3546,94 @@ impl WorkflowTestEnv {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
+    use crate::types::TimerId;
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    fn ts(id: &str, secs: u64) -> WorkflowEvent {
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new(id),
+            duration_secs: secs,
+        }
+    }
+    fn tf(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(id),
+        }
+    }
+    fn tc(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new(id),
+        }
+    }
+
+    #[test]
+    fn fired_timer_duration_counts_only_fired_arms() {
+        // Classic timer: every TimerStarted fires — sum unchanged.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("t1", 30), tf("t1"), ts("t2", 5), tf("t2")]),
+            35
+        );
+        // Reset (cancellable): TS(300)[cancelled], TS(600)[fired] → only 600.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("idle", 300), tc("idle"), ts("idle", 600), tf("idle")]),
+            600
+        );
+        // Reset to same duration: only the fired arm counts (300, not 600).
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("idle", 300), tc("idle"), ts("idle", 300), tf("idle")]),
+            300
+        );
+        // Cancelled, never fired → 0.
+        assert_eq!(fired_timer_duration_secs(&[ts("idle", 300), tc("idle")]), 0);
+        // An older arm fired, a newer arm cancelled → only the fired one.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("a", 300), tf("a"), ts("a", 600), tc("a")]),
+            300
+        );
+        // Signal-preempted timer records no TimerStarted → 0.
+        assert_eq!(fired_timer_duration_secs(&[]), 0);
+        // A lone TimerFired with no matching TimerStarted contributes nothing.
+        assert_eq!(fired_timer_duration_secs(&[tf("ghost")]), 0);
+    }
+
+    #[test]
+    fn concurrently_armed_timers_advance_to_the_max_deadline_not_the_sum() {
+        // Issue #768, Codex P2 round 16. Two cancellable timers armed in one
+        // `await_fire` batch (both `TimerStarted` before either `TimerFired`) share
+        // a deadline anchor of `now = 0`, so the fired result is MAX(10, 1) = 10,
+        // NOT the SUM 11. Round-15 fires the smaller deadline first, so the recorded
+        // order is TS(slow), TS(fast), TF(fast), TF(slow).
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("slow", 10), ts("fast", 1), tf("fast"), tf("slow")]),
+            10,
+            "concurrently-armed timers must advance to the MAX deadline"
+        );
+        // Order of the two TimerFired events is irrelevant to the MAX.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("slow", 10), ts("fast", 1), tf("slow"), tf("fast")]),
+            10
+        );
+        // Sequential timers (each armed after the previous fired) still SUM.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("a", 10), tf("a"), ts("b", 1), tf("b")]),
+            11,
+            "sequential timers must still sum"
+        );
+        // Three concurrent → MAX of the three deadlines.
+        assert_eq!(
+            fired_timer_duration_secs(&[
+                ts("a", 3),
+                ts("b", 7),
+                ts("c", 2),
+                tf("c"),
+                tf("a"),
+                tf("b"),
+            ]),
+            7
+        );
+    }
 
     fn simple_workflow<'a>(
         _ctx: &'a crate::context::WorkflowContext,
@@ -3432,6 +3777,32 @@ mod tests {
         let (kind, _, _) =
             parse_nd_message("timer mismatch: expected TimerStarted(t1), got ActivityScheduled");
         assert_eq!(kind, NonDeterminismKind::TimerMismatch);
+    }
+
+    #[test]
+    fn parse_nd_message_timer_cancel_mismatch() {
+        // The activity matcher trips over an unconsumed TimerCancelled left by a
+        // removed cancel_timer / handle.cancel / handle.reset call (issue #768).
+        let (kind, _, actual) = parse_nd_message(
+            "activity mismatch: expected ActivityScheduled(work), got TimerCancelled",
+        );
+        assert_eq!(kind, NonDeterminismKind::TimerCancelMismatch);
+        assert_eq!(actual, "TimerCancelled");
+    }
+
+    #[test]
+    fn classify_kind_timer_cancel_prefix_and_actual() {
+        // Explicit "timer-cancel" prefix maps to TimerCancelMismatch.
+        assert_eq!(
+            classify_kind("timer-cancel", "TimerStarted(idle)"),
+            NonDeterminismKind::TimerCancelMismatch
+        );
+        // A TimerCancelled `actual` always classifies as TimerCancelMismatch,
+        // regardless of which command noticed it.
+        assert_eq!(
+            classify_kind("activity", "TimerCancelled"),
+            NonDeterminismKind::TimerCancelMismatch
+        );
     }
 
     #[test]

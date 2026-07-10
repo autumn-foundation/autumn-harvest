@@ -104,6 +104,233 @@ fn race_workflow<'a>(
     })
 }
 
+/// (issue #768) Arm a cancellable timer and await its outcome.
+fn cancellable_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!(format!("{outcome:?}")))
+    })
+}
+
+/// (Codex P2 round 5, issue #768 — FIX 1) Arm `idle` at 300s, then call
+/// `start_timer("idle", 600)` again with NO cancel/reset between. The second call
+/// is a duration-preserving idempotent no-op: the returned handle MUST carry the
+/// ORIGINAL 300s, not 600, so the durable row / virtual clock stay consistent with
+/// the single recorded `TimerStarted(idle, 300)`. Emits the armed duration so the
+/// test can assert 300 (before the fix the handle carried 600).
+fn duplicate_active_start_timer_diff_duration_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _first = ctx.start_timer("idle", 300);
+        let handle = ctx.start_timer("idle", 600); // duplicate active — MUST preserve 300
+        let armed = handle.duration_secs();
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({ "armed": armed, "outcome": format!("{outcome:?}") }))
+    })
+}
+
+/// (issue #768) Arm a cancellable timer then cancel it (fire-and-forget) — the
+/// timer must never fire.
+fn cancellable_cancel_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        Ok(json!("cancelled"))
+    })
+}
+
+/// (issue #768) Arm, reset once, then await — the reset re-arms with zero
+/// orphaned firings.
+fn cancellable_reset_once_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut handle = ctx.start_timer("idle", 300);
+        handle.reset(300).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!(format!("{outcome:?}")))
+    })
+}
+
+/// (Codex P2, issue #768) Arm a cancellable timer, then suspend on an activity
+/// in the SAME cycle. The armed timer must NOT fire before the activity
+/// completes — mirrors the real worker, which records the arm and leaves the
+/// workflow parked on the activity.
+fn arm_timer_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"work": result}))
+    })
+}
+
+/// (Codex P2, issue #768) Arm a cancellable timer, suspend on an activity in the
+/// SAME cycle, then `await_fire()` the timer AFTER the activity completes. The
+/// timer's `TimerStarted` is recorded in the mixed batch (competing suspension,
+/// so no fire yet); the later bookkeeping-only `await_fire` reschedules the
+/// already-armed row and it fires — never interleaved before `ActivityCompleted`.
+fn arm_timer_activity_then_await_fire_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({"work": result, "timer": format!("{outcome:?}")}))
+    })
+}
+
+/// (issue #768, matrix #6) Arm a cancellable timer, suspend on an activity, then
+/// `cancel()` and `await_fire()` AFTER the activity completes. The armed timer
+/// must resolve `Cancelled` and never fire.
+fn arm_timer_activity_cancel_then_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        handle.cancel().map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({"work": result, "timer": format!("{outcome:?}")}))
+    })
+}
+
+/// (Codex P2 round 4, issue #768 — FIX A primary flow) Arm a cancellable timer,
+/// suspend on an activity, then `reset()` and `await_fire()` AFTER the activity
+/// completes. Under the round-4 model the armed timer's `harvest_timers` row is
+/// inserted only at `await_fire`, so it can NEVER fire while the workflow is
+/// parked on the activity — no spurious `TimerFired` that would break the
+/// subsequent `reset()` (an unconsumed fire → non-determinism) or diverge replay.
+fn arm_timer_activity_reset_then_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut handle = ctx.start_timer("idle", 300);
+        let result = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        handle.reset(300).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(json!({"work": result, "timer": format!("{outcome:?}")}))
+    })
+}
+
+/// (Codex P2 round 15, issue #768) Arm two cancellable timers with DIFFERENT
+/// durations and `await_fire()` both concurrently via `tokio::join!`. Production
+/// reschedules the parked task to the MINIMUM `fires_at` and ingests due timers in
+/// deadline order, so the FAST timer (dur 1) must fire before the SLOW one (dur
+/// 10) regardless of `join!` poll order (which polls `slow` first).
+fn concurrent_await_two_timers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Capture the virtual-clock start so the test can assert the elapsed after
+        // both concurrent timers fire is the MAX deadline (10s), not the SUM (11s)
+        // — issue #768, Codex P2 round 16.
+        let start = ctx.now();
+        let slow = ctx.start_timer("slow", 10);
+        let fast = ctx.start_timer("fast", 1);
+        let (s, f) = tokio::join!(slow.await_fire(), fast.await_fire());
+        let now_elapsed_secs = (ctx.now() - start).num_seconds();
+        Ok(json!({
+            "slow": format!("{:?}", s.map_err(|e| e.to_string())?),
+            "fast": format!("{:?}", f.map_err(|e| e.to_string())?),
+            "now_elapsed_secs": now_elapsed_secs,
+        }))
+    })
+}
+
+/// (Codex P2 round 16, issue #768 — Finding 2) A sibling/handler-style
+/// `cancel_timer("deadline")` targeting an id the main body uses as a CLASSIC
+/// `ctx.timer` must be a NO-OP: it must NOT emit a `CancelTimer` (whose
+/// worker-side `delete_pending_timer` would delete the classic timer's durable
+/// row and hang its waiter). The classic timer therefore still fires and the run
+/// replays deterministically.
+fn cancel_timer_does_not_kill_a_classic_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // `join!` polls the classic timer FIRST — so `ctx.timer("deadline")` records
+        // "deadline" as a classic id and parks — THEN the sibling branch calls
+        // `cancel_timer("deadline")` on that now-classic id, exactly the Finding-2
+        // "cancel while the classic timer is pending" race. The cancel must be a
+        // no-op (no `CancelTimer`, no row delete), so the classic timer still fires.
+        let (t, _c) = tokio::join!(ctx.timer("deadline", 5), async {
+            ctx.cancel_timer("deadline")
+        });
+        t.map_err(|e| e.to_string())?;
+        Ok(json!("classic_fired"))
+    })
+}
+
+/// (Codex P2 round 4, issue #768 — FIX B) Arm a cancellable timer, cancel it, and
+/// then start a CLASSIC `ctx.timer` with the SAME id in one task. The classic
+/// timer must arm cleanly and fire — the same-batch `CancelTimer` must not leave
+/// the classic timer rescheduled to a deleted row (no hang), and the run must
+/// replay deterministically.
+fn cancel_then_classic_timer_same_id_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        // Classic (suspending) timer, SAME id — replaces the cancelled one.
+        ctx.timer("idle", 60).await.map_err(|e| e.to_string())?;
+        Ok(json!("classic_fired"))
+    })
+}
+
+/// (Codex P2 round 8, issue #768 — FIX A) Arm `idle` at 300s via a handle, then
+/// reset it to 600s through `ctx.reset_timer` (NOT the handle), and await the
+/// original handle. `await_fire()` must use the CURRENT armed duration (600) —
+/// read from the logical state map — for the live deadline AND the virtual
+/// clock, NOT the handle's stale cached 300. Before the fix the handle's cached
+/// 300 armed the live deadline / advanced the clock even though the recorded
+/// `TimerStarted` was 600.
+fn reset_via_ctx_then_await_handle_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        // Reset through the CONTEXT, not the handle — the handle's cached
+        // duration stays 300 while the authoritative armed duration becomes 600.
+        ctx.reset_timer("idle", 600).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        let now = ctx.now().timestamp();
+        Ok(json!({ "outcome": format!("{outcome:?}"), "now": now }))
+    })
+}
+
 /// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
 /// activity. Exercises that the test harness persists the pre-suspension
 /// `SideEffectRecorded` event so the next replay iteration does not see drift.
@@ -437,6 +664,609 @@ async fn test_signal_wins_when_queued() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
         "timer must not fire when signal wins"
+    );
+}
+
+// ──────────── Cancellable / renewable durable timers (issue #768) ────────────
+
+#[tokio::test]
+async fn test_cancellable_timer_fires_when_not_cancelled() {
+    let outcome = WorkflowTestEnv::new()
+        .run(cancellable_await_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("Fired")));
+
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "expected TimerStarted"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "expected TimerFired"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "an uncancelled timer must not record TimerCancelled"
+    );
+
+    let report = outcome.replay_check(cancellable_await_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// (Codex P2 round 15, issue #768) Concurrent awaited cancellable timers fire in
+/// DEADLINE order (min `fires_at` first), matching production's min-deadline
+/// reschedule + deadline-ordered ingest — never in `join!` poll order.
+#[tokio::test]
+async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
+    let outcome = WorkflowTestEnv::new()
+        .run(concurrent_await_two_timers_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    let fired_order: Vec<String> = outcome
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerFired { timer_id } => Some(timer_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fired_order,
+        vec!["fast".to_string(), "slow".to_string()],
+        "concurrent awaited timers must fire in deadline order (fast dur=1 before \
+         slow dur=10), never in join! poll order: {fired_order:?}"
+    );
+
+    // Issue #768, Codex P2 round 16: the two timers are armed concurrently (one
+    // `await_fire` batch), so production starts both deadlines at the same instant
+    // and the workflow-observed elapsed after both fire is the MAX deadline (10s),
+    // NOT the sum (11s). The live `ctx.now()` read inside the workflow, and
+    // `final_now()`/`elapsed()` reconstructed from history, must all agree at 10.
+    let result = outcome.result.as_ref().expect("run ok");
+    assert_eq!(
+        result.get("now_elapsed_secs").and_then(Value::as_i64),
+        Some(10),
+        "ctx.now() after both concurrent timers fire must advance by MAX(10,1)=10, not 11"
+    );
+    assert_eq!(
+        outcome.elapsed().num_seconds(),
+        10,
+        "final_now/elapsed must reconstruct the MAX deadline (10s), not the sum (11s)"
+    );
+
+    let report = outcome
+        .replay_check(concurrent_await_two_timers_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// FIX 1 (Codex P2 round 5, issue #768): a duplicate active `start_timer` with a
+/// DIFFERENT duration preserves the RECORDED duration. The handle carries 300
+/// (not the second call's 600), exactly one `TimerStarted(idle, 300)` is
+/// recorded, the timer fires at the 300s deadline (the virtual clock advances by
+/// 300, not 600 — asserted via the armed duration the handle used), and the run
+/// replays cleanly. Before the fix the handle carried 600.
+#[tokio::test]
+async fn test_duplicate_active_start_timer_preserves_recorded_duration() {
+    let outcome = WorkflowTestEnv::new()
+        .run(
+            duplicate_active_start_timer_diff_duration_workflow,
+            json!(null),
+        )
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({ "armed": 300, "outcome": "Fired" })),
+        "duplicate active start_timer must preserve the recorded 300s duration, \
+         not the second call's 600s"
+    );
+
+    // Exactly ONE TimerStarted, recorded with duration 300 (the second
+    // start_timer emits no event).
+    let timer_starteds: Vec<u64> = outcome
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerStarted { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        timer_starteds,
+        vec![300],
+        "exactly one TimerStarted(idle, 300) must be recorded: {:?}",
+        outcome.events()
+    );
+
+    let report = outcome
+        .replay_check(duplicate_active_start_timer_diff_duration_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_cancellable_timer_does_not_fire_when_cancelled() {
+    let outcome = WorkflowTestEnv::new()
+        .run(cancellable_cancel_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("cancelled")));
+
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "a cancelled timer must record TimerCancelled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "a cancelled timer must never fire"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_then_fire() {
+    let outcome = WorkflowTestEnv::new()
+        .run(cancellable_reset_once_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("Fired")));
+
+    // History: TimerStarted, TimerCancelled, TimerStarted, TimerFired.
+    let all_events = outcome.events();
+    let timer_events: Vec<&WorkflowEvent> = all_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::TimerStarted { .. }
+                    | WorkflowEvent::TimerCancelled { .. }
+                    | WorkflowEvent::TimerFired { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        timer_events.len(),
+        4,
+        "expected 4 timer events: {timer_events:?}"
+    );
+    assert!(matches!(
+        timer_events[0],
+        WorkflowEvent::TimerStarted { .. }
+    ));
+    assert!(matches!(
+        timer_events[1],
+        WorkflowEvent::TimerCancelled { .. }
+    ));
+    assert!(matches!(
+        timer_events[2],
+        WorkflowEvent::TimerStarted { .. }
+    ));
+    assert!(matches!(timer_events[3], WorkflowEvent::TimerFired { .. }));
+
+    let report = outcome.replay_check(cancellable_reset_once_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// (Codex P2 round 8, issue #768 — FIX A) A reset performed through
+/// `ctx.reset_timer` (or another handle) must be honoured by a subsequent
+/// `await_fire()` on the ORIGINAL handle: the live deadline and the virtual
+/// clock must use the CURRENT armed duration (600) from the logical state map,
+/// not the awaiting handle's stale cached 300. Before the fix the clock
+/// advanced by 300 and disagreed with the recorded `TimerStarted(idle, 600)`.
+#[tokio::test]
+async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env
+        .run(reset_via_ctx_then_await_handle_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    // The final recorded TimerStarted(idle) is the reset's 600.
+    let last_ts = outcome.events().iter().rev().find_map(|e| match e {
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs,
+        } if timer_id.as_str() == "idle" => Some(*duration_secs),
+        _ => None,
+    });
+    assert_eq!(
+        last_ts,
+        Some(600),
+        "final TimerStarted(idle) must be the reset's 600: {:?}",
+        outcome.events()
+    );
+
+    // The virtual clock (ctx.now()) advanced by the CURRENT armed 600, not the
+    // stale handle's 300. This is the FIX A behaviour.
+    let v = outcome.result.as_ref().unwrap();
+    let now = v["now"].as_i64().unwrap();
+    assert_eq!(
+        now - start.timestamp(),
+        600,
+        "ctx.now() must advance by the current armed 600, not the stale handle 300"
+    );
+
+    // final_now()/elapsed() (the harness virtual clock) must AGREE with the
+    // workflow-observed ctx.now() and count only the fired 600 — not 300+600.
+    assert_eq!(
+        outcome.final_now().timestamp(),
+        now,
+        "final_now() must match the workflow-observed ctx.now()"
+    );
+    assert_eq!(
+        outcome.elapsed(),
+        chrono::Duration::seconds(600),
+        "elapsed() must be the fired 600, not the cancelled+fired sum (900)"
+    );
+
+    let report = outcome
+        .replay_check(reset_via_ctx_then_await_handle_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+/// (Codex P2 round 8, issue #768 — FIX B) The harness virtual clock
+/// (`final_now`/`elapsed`) must advance ONLY for timers that actually fired.
+/// A reset records `[TimerStarted(300), TimerCancelled, TimerStarted(300),
+/// TimerFired]`; only the second (fired) 300 counts — NOT the cancelled first
+/// arm. Before the fix `final_now` summed every `TimerStarted` → 600.
+#[tokio::test]
+async fn test_final_now_counts_only_fired_arm_not_cancelled_reset_arm() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env.run(cancellable_reset_once_workflow, json!(null)).await;
+    assert_eq!(outcome.result, Ok(json!("Fired")));
+    assert_eq!(
+        outcome.elapsed(),
+        chrono::Duration::seconds(300),
+        "virtual clock must advance only for the FIRED arm (300), not the \
+         cancelled-arm + fired-arm sum (600)"
+    );
+    assert_eq!(outcome.final_now(), start + chrono::Duration::seconds(300));
+}
+
+/// (Codex P2 round 8, issue #768 — FIX B) A cancelled timer never fired, so the
+/// harness virtual clock must not advance for its `TimerStarted` at all. Before
+/// the fix `final_now` counted the cancelled arm's 300.
+#[tokio::test]
+async fn test_final_now_does_not_advance_for_a_cancelled_never_fired_timer() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env.run(cancellable_cancel_workflow, json!(null)).await;
+    assert_eq!(outcome.result, Ok(json!("cancelled")));
+    assert_eq!(
+        outcome.elapsed(),
+        chrono::Duration::zero(),
+        "a cancelled (never-fired) timer must not advance the virtual clock"
+    );
+    assert_eq!(outcome.final_now(), start);
+}
+
+#[tokio::test]
+async fn test_armed_timer_does_not_fire_during_a_mixed_activity_suspension() {
+    // Codex P2 (issue #768): arming a cancellable timer in the same cycle as an
+    // activity suspension must NOT interleave a TimerFired before the activity
+    // completes. The real worker records the arm and parks on the activity;
+    // firing the timer here would synthesise impossible history such as
+    // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_then_activity_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!({"work": "done"})));
+
+    let events = outcome.events();
+    // The timer is armed...
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "expected the arm to record TimerStarted: {events:?}"
+    );
+    // ...but never fires (the workflow parked on the activity, then completed).
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "an armed-but-unawaited timer must not fire during a mixed activity \
+         suspension (impossible history): {events:?}"
+    );
+
+    // No TimerFired ever precedes ActivityCompleted — assert the exact ordering
+    // invariant Codex flagged.
+    let ts = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
+    let tf = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }));
+    assert!(
+        tf.is_none() || tf > ts,
+        "TimerFired must never precede ActivityCompleted: {events:?}"
+    );
+
+    let report = outcome.replay_check(arm_timer_then_activity_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn start_timer_then_activity_then_await_fire_fires() {
+    // Codex P2 (issue #768): an armed timer whose `TimerStarted` was recorded in
+    // an EARLIER mixed (activity) suspension batch must still fire on a later
+    // bookkeeping-only `await_fire` cycle — production reschedules the existing
+    // durable row. Without the fix the harness returns a no-op for the re-arm and
+    // the run stalls ("suspended with no resolvable commands").
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_activity_then_await_fire_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"work": "done", "timer": "Fired"})),
+        "the armed timer must fire after the activity completes: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // Exactly one arm, one fire, no cancel.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            .count(),
+        1,
+        "exactly one TimerStarted: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+            .count(),
+        1,
+        "exactly one TimerFired: {events:?}"
+    );
+
+    // Production-shaped ordering: TimerStarted precedes ActivityCompleted, and
+    // TimerFired comes AFTER ActivityCompleted (never interleaved before it).
+    let ts = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+        .expect("TimerStarted present");
+    let ac = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("ActivityCompleted present");
+    let tf = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        .expect("TimerFired present");
+    assert!(
+        ts < ac,
+        "TimerStarted must precede ActivityCompleted: {events:?}"
+    );
+    assert!(
+        tf > ac,
+        "TimerFired must come AFTER ActivityCompleted, never interleaved before: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(arm_timer_activity_then_await_fire_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
+    // Matrix #6 (issue #768): arm → activity → cancel → await must resolve
+    // Cancelled and never fire, even though the arm was recorded in an earlier
+    // mixed-suspension batch.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_activity_cancel_then_await_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"work": "done", "timer": "Cancelled"})),
+        "the armed timer must resolve Cancelled: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "a cancelled timer records TimerCancelled: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "a cancelled timer must never fire: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(arm_timer_activity_cancel_then_await_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
+    // FIX A primary flow (Codex P2 round 4, issue #768): arm → activity →
+    // reset → await. The armed timer must NOT fire while parked on the
+    // activity — under the round-4 model its durable row is inserted only at
+    // `await_fire`, so a `reset()` after the activity is never confronted with an
+    // already-fired timer (which would leave an unconsumed TimerFired → non-
+    // determinism), and the run replays deterministically to a final `Fired`.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("work", |_| Ok(json!("done")))
+        .run(arm_timer_activity_reset_then_await_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"work": "done", "timer": "Fired"})),
+        "the reset timer must fire after the activity completes: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // No TimerFired may precede ActivityCompleted (the arm-during-activity window
+    // is exactly what round 4 makes non-fire-eligible).
+    let ac = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("ActivityCompleted present");
+    let first_tf = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }));
+    assert!(
+        first_tf.is_none_or(|tf| tf > ac),
+        "no TimerFired may precede ActivityCompleted: {events:?}"
+    );
+    // Exactly one fire (the awaited one), and the reset recorded a cancel + a
+    // fresh arm.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+            .count(),
+        1,
+        "exactly one TimerFired: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "the reset records a TimerCancelled: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(arm_timer_activity_reset_then_await_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_then_classic_timer_same_id_arms_and_fires() {
+    // FIX B (Codex P2 round 4, issue #768): a same-task `start_timer("idle");
+    // cancel(); ctx.timer("idle", n)` must arm the CLASSIC timer cleanly and
+    // fire — the same-batch cancel must not leave the classic timer wedged (no
+    // hang), and the run must replay deterministically.
+    let outcome = WorkflowTestEnv::new()
+        .run(cancel_then_classic_timer_same_id_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!("classic_fired")),
+        "the classic timer must fire after a same-id cancel: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // A cancel is recorded, and the classic timer both starts and fires.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "the cancel records TimerCancelled: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "the classic timer must fire: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(cancel_then_classic_timer_same_id_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_timer_on_a_classic_id_does_not_kill_the_classic_timer() {
+    // Issue #768, Codex P2 round 16 — Finding 2. A `cancel_timer("deadline")`
+    // targeting the classic timer's id must be a pure no-op: it must NOT record a
+    // `TimerCancelled` (whose worker-side `delete_pending_timer` would delete the
+    // classic timer's durable row), so the classic timer still fires — no hang —
+    // and the run replays deterministically.
+    let outcome = WorkflowTestEnv::new()
+        .run(
+            cancel_timer_does_not_kill_a_classic_timer_workflow,
+            json!(null),
+        )
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!("classic_fired")),
+        "the classic timer must fire despite a same-id cancel_timer: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // The cancel is a no-op: NO TimerCancelled corrupts the classic timer.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "cancel_timer on a classic id must record no TimerCancelled: {events:?}"
+    );
+    // The classic timer both starts and fires.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "the classic timer must fire: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(cancel_timer_does_not_kill_a_classic_timer_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
     );
 }
 

@@ -209,7 +209,7 @@ impl WorkflowSimulator {
         }];
 
         loop {
-            let (outcome, _pending, _span) = run_workflow_with_state(
+            let (outcome, pending, _span) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
                 self.handler,
@@ -221,6 +221,14 @@ impl WorkflowSimulator {
 
             match outcome {
                 WorkflowOutcome::Completed { output } => {
+                    // Cancellable/renewable timer bookkeeping (issue #768): a
+                    // workflow that arms/cancels a timer and then COMPLETES in the
+                    // same task emits `ArmTimer`/`CancelTimer` as pending commands
+                    // on this sealing cycle (never as a suspension). Record the
+                    // timer lifecycle events before the terminal marker so the
+                    // simulated history matches the worker's terminal-cycle persist
+                    // (mirrors `WorkflowTestEnv::process_terminal_commands`).
+                    Self::record_terminal_timer_commands(&pending, &mut history);
                     history.push(WorkflowEvent::WorkflowCompleted {
                         output: output.clone(),
                     });
@@ -236,6 +244,7 @@ impl WorkflowSimulator {
                     // `final_output` is the human message, mirroring the worker.
                     // A legacy `Err(String)` decodes to all-`None` typed fields
                     // with `message == error`, preserving legacy semantics.
+                    Self::record_terminal_timer_commands(&pending, &mut history);
                     let decoded = crate::failure::decode_workflow_failure(&error);
                     history.push(WorkflowEvent::workflow_failed_typed(&decoded));
                     return SimulatorResult {
@@ -248,6 +257,7 @@ impl WorkflowSimulator {
                     // terminal marker and feeding the new input back into the
                     // top of the loop. The simulator runs in-process, so this
                     // is a tail call rather than a fresh queue task.
+                    Self::record_terminal_timer_commands(&pending, &mut history);
                     history.push(WorkflowEvent::WorkflowContinuedAsNew {
                         new_exec_id: ExecutionId::new(),
                         input: cont_input.clone(),
@@ -275,6 +285,22 @@ impl WorkflowSimulator {
         history: &mut Vec<WorkflowEvent>,
     ) -> bool {
         let mut advanced = false;
+
+        // Whether this batch also carries a genuine non-timer suspension
+        // (activity/signal/child-workflow/classic timer). The real worker records
+        // an `ArmTimer` and leaves the workflow parked on that other wait — it only
+        // reschedules the armed cancellable timer to fire on the bookkeeping-only
+        // `await_fire` (`for_await: true`) path. When a competing suspension is
+        // present the simulator must NOT auto-fire the armed timer, or it would
+        // synthesise impossible history such as `[TimerStarted, ActivityScheduled,
+        // TimerFired, ActivityCompleted]` (mirrors `WorkflowTestEnv`, Codex P2
+        // issue #768). A later bookkeeping-only cycle fires it.
+        let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
+
+        // Timer ids whose `TimerFired` was already recorded in THIS batch, so a
+        // second `for_await: true` re-arm for the same id (e.g. two `await_fire`
+        // siblings on one handle) is an idempotent no-op.
+        let mut fired_this_batch: Vec<crate::types::TimerId> = Vec::new();
 
         for cmd in commands {
             match cmd {
@@ -473,6 +499,45 @@ impl WorkflowSimulator {
                     }
                     advanced = true;
                 }
+                // Cancellable/renewable durable timer arm (issue #768), mirroring
+                // `WorkflowTestEnv::process_command` and the worker's
+                // `plan_timer_lifecycle`. Two roles by `for_await`:
+                // - `false` (fresh arm from `start_timer`/`reset`): record
+                //   `TimerStarted` (dedup: skip if already active in history) and
+                //   NEVER fire — an armed-but-unawaited timer cannot fire.
+                // - `true` (re-arm from `await_fire`): record NO event (the arm's
+                //   `TimerStarted` was recorded by the fresh arm). On a
+                //   bookkeeping-only `await_fire` batch, fire now (`TimerFired`); on
+                //   a competing suspension, stay parked so a later bookkeeping-only
+                //   cycle fires it.
+                WorkflowCommand::ArmTimer {
+                    timer_id,
+                    duration_secs,
+                    for_await,
+                } => {
+                    if for_await {
+                        if !batch_has_competing_suspension && !fired_this_batch.contains(&timer_id)
+                        {
+                            fired_this_batch.push(timer_id.clone());
+                            history.push(WorkflowEvent::TimerFired { timer_id });
+                            advanced = true;
+                        }
+                    } else if !Self::timer_active_in_history(history, &timer_id) {
+                        history.push(WorkflowEvent::TimerStarted {
+                            timer_id,
+                            duration_secs,
+                        });
+                        advanced = true;
+                    }
+                }
+                // Cancellable timer cancel (issue #768): record `TimerCancelled`.
+                // No `TimerFired` is deferred in the simulator's eager model, so a
+                // cancel simply records its event — the cancelled branch is taken
+                // deterministically on the next replay cycle.
+                WorkflowCommand::CancelTimer { timer_id } => {
+                    history.push(WorkflowEvent::TimerCancelled { timer_id });
+                    advanced = true;
+                }
                 _ => {
                     // Commands like WaitForSignal, StartChildWorkflow are not yet fully supported.
                     // Complete and Fail are handled on the next loop iteration.
@@ -480,6 +545,83 @@ impl WorkflowSimulator {
             }
         }
         advanced
+    }
+
+    /// Whether a command is a genuine non-timer suspension that would keep the
+    /// workflow parked on an external event — as opposed to author-controlled
+    /// cancellable-timer bookkeeping (`ArmTimer`/`CancelTimer`). Used to gate
+    /// cancellable-timer auto-firing so it only fires on the bookkeeping-only
+    /// `await_fire` path, matching the real worker and `WorkflowTestEnv`
+    /// (Codex P2, issue #768).
+    const fn is_competing_suspension(cmd: &WorkflowCommand) -> bool {
+        matches!(
+            cmd,
+            WorkflowCommand::ScheduleActivity { .. }
+                | WorkflowCommand::WaitForActivity { .. }
+                | WorkflowCommand::ScheduleExternalActivity { .. }
+                | WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::StartChildWorkflow { .. }
+                | WorkflowCommand::StartTimer { .. }
+        )
+    }
+
+    /// Whether `timer_id` has an active (unfired, uncancelled) `TimerStarted` in
+    /// `history` — makes a cancellable-timer fresh arm idempotent (issue #768),
+    /// mirroring `WorkflowTestEnv::timer_is_active_in_history`.
+    fn timer_active_in_history(
+        history: &[WorkflowEvent],
+        timer_id: &crate::types::TimerId,
+    ) -> bool {
+        let mut active = false;
+        for event in history {
+            match event {
+                WorkflowEvent::TimerStarted { timer_id: id, .. } if id == timer_id => active = true,
+                WorkflowEvent::TimerFired { timer_id: id }
+                | WorkflowEvent::TimerCancelled { timer_id: id }
+                    if id == timer_id =>
+                {
+                    active = false;
+                }
+                _ => {}
+            }
+        }
+        active
+    }
+
+    /// Record the timer lifecycle events for `ArmTimer`/`CancelTimer` bookkeeping
+    /// commands emitted on a TERMINAL (sealing) cycle — a workflow that
+    /// arms/cancels a timer and then completes/fails/continues in the same task
+    /// (issue #768). A sealing run never awaits, so any arm is a fresh arm
+    /// (`for_await: false`) that records `TimerStarted` (deduped); a `for_await:
+    /// true` re-arm cannot reach a terminal cycle. Cancel records `TimerCancelled`.
+    /// No fire is recorded — the run is sealing. Mirrors
+    /// `WorkflowTestEnv::process_terminal_commands`.
+    fn record_terminal_timer_commands(
+        commands: &[WorkflowCommand],
+        history: &mut Vec<WorkflowEvent>,
+    ) {
+        for cmd in commands {
+            match cmd {
+                WorkflowCommand::ArmTimer {
+                    timer_id,
+                    duration_secs,
+                    for_await: false,
+                } => {
+                    if !Self::timer_active_in_history(history, timer_id) {
+                        history.push(WorkflowEvent::TimerStarted {
+                            timer_id: timer_id.clone(),
+                            duration_secs: *duration_secs,
+                        });
+                    }
+                }
+                WorkflowCommand::CancelTimer { timer_id } => {
+                    history.push(WorkflowEvent::TimerCancelled {
+                        timer_id: timer_id.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1093,5 +1235,100 @@ mod tests {
         assert_eq!(error_type.as_deref(), Some("ChildBad"));
         assert_eq!(details, Some(serde_json::json!({ "x": 1 })));
         assert_eq!(non_retryable, Some(false));
+    }
+
+    // ── Cancellable/renewable timer bookkeeping in the simulator (issue #768,
+    //    Codex P2 round 14) ─────────────────────────────────────────────────
+
+    /// Arm a cancellable timer and await its fire — the workflow must make
+    /// progress (no simulator deadlock) and record the timer lifecycle.
+    fn cancellable_timer_await_workflow(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            let handle = ctx.start_timer("t", 1);
+            let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(format!("{outcome:?}")))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_cancellable_timer_fires() {
+        let sim = WorkflowSimulator::new(cancellable_timer_await_workflow);
+        // Before the fix this deadlocks: the `ArmTimer` bookkeeping commands hit
+        // the wildcard arm, no progress is made, and the deadlock assertion trips.
+        let res = sim.run(Value::Null).await;
+        assert!(
+            res.final_output.is_ok(),
+            "cancellable-timer await must complete: {:?}",
+            res.final_output
+        );
+        let started = res.history.iter().any(
+            |e| matches!(e, WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str() == "t"),
+        );
+        let fired = res.history.iter().any(
+            |e| matches!(e, WorkflowEvent::TimerFired { timer_id } if timer_id.as_str() == "t"),
+        );
+        assert!(
+            started && fired,
+            "simulated history must record TimerStarted then TimerFired: {:?}",
+            res.history
+        );
+        // TimerStarted must precede TimerFired.
+        let started_at = res
+            .history
+            .iter()
+            .position(|e| matches!(e, WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str() == "t"))
+            .unwrap();
+        let fired_at = res
+            .history
+            .iter()
+            .position(
+                |e| matches!(e, WorkflowEvent::TimerFired { timer_id } if timer_id.as_str() == "t"),
+            )
+            .unwrap();
+        assert!(
+            started_at < fired_at,
+            "TimerStarted must precede TimerFired"
+        );
+    }
+
+    /// Arm a cancellable timer, cancel it, then COMPLETE in the same task — the
+    /// simulated history must include both `TimerStarted` and `TimerCancelled`
+    /// (recorded from the terminal-cycle pending commands) and no `TimerFired`.
+    fn arm_cancel_then_complete_workflow(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            let handle = ctx.start_timer("t", 1);
+            handle.cancel().map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("done"))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_timer_cancel_then_complete() {
+        let sim = WorkflowSimulator::new(arm_cancel_then_complete_workflow);
+        let res = sim.run(Value::Null).await;
+        assert_eq!(
+            res.final_output.expect("workflow should complete"),
+            serde_json::json!("done")
+        );
+        let started = res.history.iter().any(
+            |e| matches!(e, WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str() == "t"),
+        );
+        let cancelled = res.history.iter().any(
+            |e| matches!(e, WorkflowEvent::TimerCancelled { timer_id } if timer_id.as_str() == "t"),
+        );
+        let fired = res.history.iter().any(
+            |e| matches!(e, WorkflowEvent::TimerFired { timer_id } if timer_id.as_str() == "t"),
+        );
+        assert!(
+            started && cancelled && !fired,
+            "arm+cancel+complete must record TimerStarted and TimerCancelled but never TimerFired: {:?}",
+            res.history
+        );
     }
 }

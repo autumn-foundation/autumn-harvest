@@ -3729,6 +3729,7 @@ fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str
         "ActivityExternalDeadlineExtended" => "External activity deadline extended".to_string(),
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
+        "TimerCancelled" => "Timer cancelled".to_string(),
         "SignalReceived" => {
             let name = event_data_field(event_data, "signal_name").unwrap_or("?");
             format!("Signal received: {name}")
