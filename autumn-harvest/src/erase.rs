@@ -338,44 +338,73 @@ mod db {
         Ok((children, skipped_children, failures))
     }
 
+    /// The state + legal-hold columns read under the erase gate.
+    type EraseGateRow = (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    );
+
+    /// Load the execution's `state` and legal-hold columns for the erase gates.
+    /// `top_level` acquires a `FOR UPDATE` row lock; child calls rely on the
+    /// outer transaction.
+    async fn load_erase_gate_row(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        top_level: bool,
+    ) -> HarvestResult<EraseGateRow> {
+        let base = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select((
+                harvest_workflow_executions::state,
+                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions::legal_hold_until,
+                harvest_workflow_executions::legal_hold_reason,
+            ));
+        let row = if top_level {
+            base.for_update()
+                .first::<EraseGateRow>(conn)
+                .await
+                .optional()
+        } else {
+            base.first::<EraseGateRow>(conn).await.optional()
+        }
+        .map_err(database_error)?;
+        row.ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
     async fn erase_single_execution_inner(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         top_level: bool,
     ) -> HarvestResult<EraseOutcome> {
-        // ── 1. Load & lock the execution row, check terminal gate ─────────────
-        let (state, _parent_id) = if top_level {
-            harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .select((
-                    harvest_workflow_executions::state,
-                    harvest_workflow_executions::parent_id,
-                ))
-                .for_update()
-                .first::<(String, Option<Uuid>)>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?
-                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?
-        } else {
-            harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .select((
-                    harvest_workflow_executions::state,
-                    harvest_workflow_executions::parent_id,
-                ))
-                .first::<(String, Option<Uuid>)>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?
-                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?
-        };
+        // ── 1. Load & lock the execution row, check terminal + hold gates ─────
+        let (state, legal_hold_set_at, legal_hold_until, legal_hold_reason) =
+            load_erase_gate_row(conn, exec_id, top_level).await?;
 
         if !is_terminal_state(&state) {
             return Err(HarvestError::Config(format!(
                 "workflow execution {exec_id} is not in a terminal state \
                  (current state: {state}); payload erasure is only permitted \
                  for terminal executions"
+            )));
+        }
+
+        // Legal hold gate (issue #747): a held execution's history is exempt
+        // from PII erasure until the hold is released or expires. Rejected with
+        // `HarvestError::Config` (→ HTTP 409 via `conflict_from`) naming the
+        // active hold so the operator knows why it was blocked.
+        if crate::retention::legal_hold_active(
+            legal_hold_set_at,
+            legal_hold_until,
+            chrono::Utc::now(),
+        ) {
+            let reason = legal_hold_reason.as_deref().unwrap_or("no reason recorded");
+            return Err(HarvestError::Config(format!(
+                "workflow execution {exec_id} is under legal hold \
+                 (reason: {reason}); payload erasure rejected until the hold \
+                 is released"
             )));
         }
 

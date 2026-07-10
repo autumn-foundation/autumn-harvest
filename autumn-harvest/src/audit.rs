@@ -115,6 +115,10 @@ pub const OP_GATE_LIFT: &str = "gate.lift";
 /// Audit operation: Erased PII payload fields from a completed workflow
 /// execution (issue #495). Terminal-only, irreversible.
 pub const OP_WORKFLOW_ERASE_PAYLOADS: &str = "workflow.erase_payloads";
+/// Audit operation: Placed a per-execution legal hold (issue #747).
+pub const OP_LEGAL_HOLD_SET: &str = "legal_hold.set";
+/// Audit operation: Released a per-execution legal hold (issue #747).
+pub const OP_LEGAL_HOLD_RELEASE: &str = "legal_hold.release";
 /// Audit operation: Ran the replay compatibility canary.
 pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
 /// Audit operation: Force-retried a backing-off activity task (issue #516).
@@ -434,6 +438,12 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("PATCH /tasks/{id}", RouteClass::Mutating),
     // PII erasure (issue #495): admin-only, irreversible, terminal-only.
     ("POST /workflows/{id}/erase-payloads", RouteClass::Mutating),
+    // Per-execution legal hold (issue #747): admin-only.
+    ("POST /workflows/{id}/legal-hold", RouteClass::Mutating),
+    (
+        "POST /workflows/{id}/legal-hold/release",
+        RouteClass::Mutating,
+    ),
     // Replay canary (issue #512): admin-only.
     ("POST /admin/workflows/replay-canary", RouteClass::Mutating),
     // Force-retry backing-off activity (issue #516): admin-only.
@@ -496,6 +506,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_TASK_REPRIORITIZE,
     // PII erasure (issue #495)
     OP_WORKFLOW_ERASE_PAYLOADS,
+    // Per-execution legal hold (issue #747)
+    OP_LEGAL_HOLD_SET,
+    OP_LEGAL_HOLD_RELEASE,
     OP_WORKFLOW_REPLAY_CANARY,
     // Force-retry backing-off activity (issue #516)
     OP_ACTIVITY_RETRY_NOW,
@@ -739,6 +752,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /workflows/{id}/erase-payloads",
         Some(OP_WORKFLOW_ERASE_PAYLOADS),
+    ),
+    // Per-execution legal hold (issue #747)
+    ("POST /workflows/{id}/legal-hold", Some(OP_LEGAL_HOLD_SET)),
+    (
+        "POST /workflows/{id}/legal-hold/release",
+        Some(OP_LEGAL_HOLD_RELEASE),
     ),
     // Replay canary (issue #512)
     (
@@ -1001,6 +1020,42 @@ mod tests {
                  CLASSIFIED_ROUTES — add it with the correct RouteClass"
             );
         }
+    }
+
+    #[test]
+    fn legal_hold_routes_are_classified_and_audited() {
+        // Per-execution legal hold (issue #747): both routes are admin-only
+        // mutations and must be classified + audited. This dedicated test —
+        // not just the general exhaustiveness guards, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other — is what
+        // catches a route dropped from BOTH lists.
+        for route in [
+            "POST /workflows/{id}/legal-hold",
+            "POST /workflows/{id}/legal-hold/release",
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #747)"
+            );
+        }
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "POST /workflows/{id}/legal-hold"
+                    && *op == Some(OP_LEGAL_HOLD_SET)),
+            "legal-hold set route must map to OP_LEGAL_HOLD_SET (issue #747)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "POST /workflows/{id}/legal-hold/release"
+                    && *op == Some(OP_LEGAL_HOLD_RELEASE)),
+            "legal-hold release route must map to OP_LEGAL_HOLD_RELEASE (issue #747)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_SET));
+        assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_RELEASE));
     }
 
     #[test]

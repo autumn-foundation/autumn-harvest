@@ -112,6 +112,12 @@
           "in": "query",
           "required": false,
           "description": "When 'true', return only RUNNING executions currently blocked on replay non-determinism (issue #603). Each row carries nd_blocked_at / nd_block_reason / nd_block_count plus the structured divergence diagnostic (failure_cause, expected, actual, event_index, workflow_type, build_id) in search_attrs."
+        },
+        {
+          "name": "legal_hold",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', return only executions currently under an active legal hold (issue #747): legal_hold_set_at IS NOT NULL AND (legal_hold_until IS NULL OR legal_hold_until > now)."
         }
       ],
       "request_body": null,
@@ -1151,7 +1157,114 @@
         },
         {
           "status": 409,
-          "description": "Execution is not in a terminal state."
+          "description": "Execution is not in a terminal state, or is under an active legal hold (issue #747) — erasure is rejected until the hold is released or expires."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/legal-hold",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Place (or refresh) a per-execution legal hold (issue #747). An active hold exempts the execution's event history from retention deletion (issue #737) and from PII erasure (issue #495) until the hold is released or auto-expires. Additive nullable columns only; shard-local (routed via the execution UUID). Admin-only, audited under legal_hold.set.",
+      "idempotency": "Idempotent: if an active hold already exists, its provenance is left unchanged and newly_held=false is returned (no write). A previously-set-but-expired hold is refreshed.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Operator-supplied justification for the hold (e.g. litigation hold case number), recorded in legal_hold_reason and the audit log. Truncated to 500 characters."
+          },
+          {
+            "name": "hold_until",
+            "required": false,
+            "description": "Optional RFC3339 auto-expiry. Omit for an indefinite hold released only by an explicit release call."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "held",
+          "legal_hold_reason",
+          "legal_hold_actor",
+          "legal_hold_set_at",
+          "legal_hold_until",
+          "newly_held",
+          "released"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id or hold_until (not RFC3339)."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/legal-hold/release",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Release a per-execution legal hold (issue #747): NULLs all four legal_hold_* columns so the execution becomes eligible for retention and PII erasure again. Admin-only, audited under legal_hold.release.",
+      "idempotency": "Idempotent: releasing an execution with no hold set returns released=false (200 no-op).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "held",
+          "legal_hold_reason",
+          "legal_hold_actor",
+          "legal_hold_set_at",
+          "legal_hold_until",
+          "newly_held",
+          "released"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
         },
         {
           "status": 500,

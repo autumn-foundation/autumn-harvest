@@ -25,6 +25,10 @@ use autumn_harvest::telemetry::NoOpMetrics;
 
 const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
     "\n",
     include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",

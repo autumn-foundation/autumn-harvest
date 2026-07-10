@@ -659,6 +659,13 @@ struct CandidateExecution {
     context_headers: Option<serde_json::Value>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     completed_at: Option<DateTime<Utc>>,
+    /// Legal-hold columns (issue #747), read only for the per-candidate skip
+    /// gate. The SELECT's WHERE clause is intentionally NOT changed — the gate
+    /// is evaluated in Rust so the two-variant bind numbering stays stable.
+    #[diesel(sql_type = Nullable<Timestamptz>) ]
+    legal_hold_set_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = Nullable<Timestamptz>) ]
+    legal_hold_until: Option<DateTime<Utc>>,
 }
 
 #[cfg(feature = "db")]
@@ -833,7 +840,7 @@ async fn run_shard_tick(
                 // is the `'-infinity'` literal and the cursor/limit binds shift
                 // down by one.
                 let sql = if global_fallback.is_some() {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -852,7 +859,7 @@ async fn run_shard_tick(
                      LIMIT $6
                      FOR UPDATE SKIP LOCKED"
                 } else {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -960,6 +967,26 @@ async fn run_shard_tick(
             // or global fallback), then gate on it before any archive/delete.
             // Future policies (#747 legal hold, #752 tiered summary) hook in
             // here.
+            //
+            // Legal hold (issue #747) is the FIRST gate — it precedes archival
+            // (#345 hook below) AND delete, and precedes the metric emission, so
+            // `harvest.retention.deleted` never increments for a held id. An
+            // active hold (`legal_hold_active`) exempts this execution's history
+            // from retention entirely, until the hold is released or expires.
+            // Evaluated against the tick's `now` (the same clock the SELECT cutoff
+            // uses) so the decision is consistent with candidate selection.
+            if legal_hold_active(candidate.legal_hold_set_at, candidate.legal_hold_until, now) {
+                routine_skip_candidate(
+                    &mut conn,
+                    candidate.id,
+                    candidate_cursor,
+                    has_failed,
+                    &mut outcome,
+                    &guard.active_ids,
+                )
+                .await?;
+                continue;
+            }
             //
             // NB (PR #990 review): the candidate SELECT now pushes each row's
             // exact per-type cutoff into SQL, so the two skip branches below
@@ -1472,6 +1499,209 @@ struct CountRow {
     count: i64,
 }
 
+// ── Per-execution legal hold (issue #747) ─────────────────────────────────────
+
+/// Returns `true` when a per-execution legal hold is currently ACTIVE.
+///
+/// This is the **single source of truth** for the active-hold predicate, shared
+/// by the retention-skip gate, the PII-erasure gate (issue #495), the
+/// describe/list surfaces, and the set/release core functions. A hold is active
+/// when it was placed (`set_at IS NOT NULL`) and has not auto-expired
+/// (`until IS NULL`, i.e. indefinite, or `until > now`).
+///
+/// An expired hold (`until <= now`) is treated as inactive: the execution
+/// becomes eligible for retention and erasure again without any explicit
+/// release.
+#[must_use]
+pub fn legal_hold_active(
+    set_at: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    set_at.is_some() && until.is_none_or(|deadline| deadline > now)
+}
+
+/// Result of a [`set_legal_hold`] or [`release_legal_hold`] call.
+///
+/// Modeled on the idempotency shape of `terminate_workflow_execution`: the
+/// operation is idempotent, and `newly_held` / `released` report whether this
+/// call actually changed state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LegalHoldOutcome {
+    /// The execution the hold operation targeted.
+    pub execution_id: String,
+    /// Whether a legal hold is ACTIVE after this operation completed.
+    pub held: bool,
+    /// The active hold's reason, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_reason: Option<String>,
+    /// The active hold's actor (the principal who placed it), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_actor: Option<String>,
+    /// When the active hold was placed, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_set_at: Option<DateTime<Utc>>,
+    /// The active hold's auto-expiry, if any (`None` = indefinite).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_hold_until: Option<DateTime<Utc>>,
+    /// `true` when this `set` call actually placed a fresh hold; `false` when a
+    /// hold was already active (idempotent no-op, provenance preserved).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub newly_held: bool,
+    /// `true` when this `release` call actually cleared a hold; `false` when no
+    /// hold was set (idempotent no-op).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
+}
+
+#[cfg(feature = "db")]
+mod legal_hold_db {
+    use chrono::{DateTime, Utc};
+    use diesel::prelude::*;
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+
+    use crate::error::{HarvestError, HarvestResult, database_error};
+    use crate::schema::harvest_workflow_executions;
+    use crate::types::ExecutionId;
+
+    use super::{LegalHoldOutcome, legal_hold_active};
+
+    /// The four legal-hold columns loaded from a locked execution row.
+    type HoldColumns = (
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn load_hold_for_update(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<HoldColumns> {
+        harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select((
+                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions::legal_hold_until,
+                harvest_workflow_executions::legal_hold_reason,
+                harvest_workflow_executions::legal_hold_actor,
+            ))
+            .for_update()
+            .first::<HoldColumns>(conn)
+            .await
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
+    /// Place (or refresh) a per-execution legal hold (issue #747). Shard-local:
+    /// the caller routes `conn` to the execution's own shard.
+    ///
+    /// Idempotent: if an ACTIVE hold already exists, its provenance is left
+    /// unchanged and `newly_held = false` is returned (no write). If there is no
+    /// hold, or a previously-set hold has expired, the four columns are set and
+    /// `newly_held = true` is returned.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::Database`] on any persistence failure.
+    pub async fn set_legal_hold(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        reason: &str,
+        hold_until: Option<DateTime<Utc>>,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> HarvestResult<LegalHoldOutcome> {
+        let (set_at, until, cur_reason, cur_actor) = load_hold_for_update(conn, exec_id).await?;
+
+        if legal_hold_active(set_at, until, now) {
+            // Idempotent: an active hold already exists. Do NOT overwrite
+            // provenance — return the existing hold unchanged.
+            return Ok(LegalHoldOutcome {
+                execution_id: exec_id.to_string(),
+                held: true,
+                legal_hold_reason: cur_reason,
+                legal_hold_actor: cur_actor,
+                legal_hold_set_at: set_at,
+                legal_hold_until: until,
+                newly_held: false,
+                released: false,
+            });
+        }
+
+        diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+            .set((
+                harvest_workflow_executions::legal_hold_set_at.eq(Some(now)),
+                harvest_workflow_executions::legal_hold_until.eq(hold_until),
+                harvest_workflow_executions::legal_hold_reason.eq(Some(reason)),
+                harvest_workflow_executions::legal_hold_actor.eq(Some(actor)),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+        Ok(LegalHoldOutcome {
+            execution_id: exec_id.to_string(),
+            held: true,
+            legal_hold_reason: Some(reason.to_string()),
+            legal_hold_actor: Some(actor.to_string()),
+            legal_hold_set_at: Some(now),
+            legal_hold_until: hold_until,
+            newly_held: true,
+            released: false,
+        })
+    }
+
+    /// Release a per-execution legal hold (issue #747). Shard-local.
+    ///
+    /// Idempotent: NULLs all four columns. `released = true` when a hold was
+    /// previously set (regardless of whether it had already expired),
+    /// `released = false` when the execution carried no hold at all (no-op).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::Database`] on any persistence failure.
+    pub async fn release_legal_hold(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        _now: DateTime<Utc>,
+    ) -> HarvestResult<LegalHoldOutcome> {
+        let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
+
+        let was_set = set_at.is_some();
+        if was_set {
+            diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                .set((
+                    harvest_workflow_executions::legal_hold_set_at
+                        .eq::<Option<DateTime<Utc>>>(None),
+                    harvest_workflow_executions::legal_hold_until.eq::<Option<DateTime<Utc>>>(None),
+                    harvest_workflow_executions::legal_hold_reason.eq::<Option<String>>(None),
+                    harvest_workflow_executions::legal_hold_actor.eq::<Option<String>>(None),
+                ))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+        }
+
+        Ok(LegalHoldOutcome {
+            execution_id: exec_id.to_string(),
+            held: false,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            newly_held: false,
+            released: was_set,
+        })
+    }
+}
+
+#[cfg(feature = "db")]
+pub use legal_hold_db::{release_legal_hold, set_legal_hold};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1719,6 +1949,8 @@ mod tests {
             state: "COMPLETED".to_string(),
             completed_at: Some(Utc::now() - chrono::Duration::days(10)),
             context_headers: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -1727,6 +1959,8 @@ mod tests {
             state: "COMPLETED".to_string(),
             completed_at: Some(Utc::now() - chrono::Duration::days(9)),
             context_headers: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,
@@ -1755,5 +1989,92 @@ mod tests {
         }
 
         assert_eq!(outcome.next_cursor, Some(cursor1));
+    }
+
+    // ── Legal hold (issue #747) ───────────────────────────────────────────────
+
+    #[test]
+    fn legal_hold_inactive_when_never_set() {
+        let now = Utc::now();
+        assert!(!legal_hold_active(None, None, now));
+        // A stray `until` with no `set_at` is still not a hold.
+        assert!(!legal_hold_active(
+            None,
+            Some(now + chrono::Duration::days(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_active_when_set_and_indefinite() {
+        let now = Utc::now();
+        assert!(legal_hold_active(
+            Some(now - chrono::Duration::hours(1)),
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_active_when_until_in_future() {
+        let now = Utc::now();
+        assert!(legal_hold_active(
+            Some(now - chrono::Duration::hours(1)),
+            Some(now + chrono::Duration::hours(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_inactive_when_expired() {
+        let now = Utc::now();
+        // until == now is expired (strict `>`): a hold whose deadline has been
+        // reached is no longer active.
+        assert!(!legal_hold_active(
+            Some(now - chrono::Duration::hours(2)),
+            Some(now),
+            now
+        ));
+        assert!(!legal_hold_active(
+            Some(now - chrono::Duration::hours(2)),
+            Some(now - chrono::Duration::hours(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn legal_hold_outcome_omits_optional_none_fields() {
+        let released = LegalHoldOutcome {
+            execution_id: "exec-1".into(),
+            held: false,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            newly_held: false,
+            released: true,
+        };
+        let v = serde_json::to_value(&released).unwrap();
+        assert_eq!(v["held"], false);
+        assert_eq!(v["released"], true);
+        assert!(v.get("newly_held").is_none(), "false flag is omitted");
+        assert!(v.get("legal_hold_reason").is_none());
+        assert!(v.get("legal_hold_until").is_none());
+
+        let held = LegalHoldOutcome {
+            execution_id: "exec-2".into(),
+            held: true,
+            legal_hold_reason: Some("subpoena".into()),
+            legal_hold_actor: Some("legal@corp".into()),
+            legal_hold_set_at: Some(Utc::now()),
+            legal_hold_until: None,
+            newly_held: true,
+            released: false,
+        };
+        let v = serde_json::to_value(&held).unwrap();
+        assert_eq!(v["held"], true);
+        assert_eq!(v["newly_held"], true);
+        assert_eq!(v["legal_hold_reason"], "subpoena");
+        assert!(v.get("released").is_none(), "false flag is omitted");
     }
 }
