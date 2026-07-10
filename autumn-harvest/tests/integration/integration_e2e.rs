@@ -156,7 +156,7 @@ const INIT_SQL: &str = concat!(
     // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
     // harvest_workers.
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!("../../migrations/20260710000000_harvest_workflow_continue_chain/up.sql"),
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     "\n",
     // issue #747: per-execution legal hold columns on harvest_workflow_executions.
     include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql")

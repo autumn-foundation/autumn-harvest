@@ -155,7 +155,7 @@ const INIT_SQL: &str = concat!(
     ),
     include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
     include_str!(
-        "../../autumn-harvest/migrations/20260710000000_harvest_workflow_continue_chain/up.sql"
+        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
     ),
 );
 

@@ -148,7 +148,7 @@ mod db_tests {
         "\n",
         // Worker sessions (issue #606) -- the migration under test.
         include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-        include_str!("../../migrations/20260710000000_harvest_workflow_continue_chain/up.sql"),
+        include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
