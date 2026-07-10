@@ -375,14 +375,14 @@ async fn completion_trigger_starts_when_no_gate_cache() {
     assert_eq!(fires[0].outcome, None, "a real fire records NULL outcome");
 }
 
-/// F3: a fail-closed / uninitialized gate cache (the transient gate-DB-blip
-/// sentinel, `Uuid::nil()`) must NOT drop a completion-trigger start. It is
-/// in-flight continuation of already-committed work, so evaluate PROCEEDS: the
-/// target starts, no `admission_blocked` count, and the fires row is a real fire
-/// (NULL outcome), not a block. A real operator gate still blocks (covered by
-/// `completion_trigger_blocked_by_fleet_gate`).
+/// F3: a fail-closed / uninitialized gate cache with NO cached gate matching the
+/// start must NOT drop a completion-trigger start. It is in-flight continuation
+/// of already-committed work, so evaluate PROCEEDS: the target starts, no
+/// `admission_blocked` count, and the fires row is a real fire (NULL outcome),
+/// not a block. (The companion `..._with_cached_gate_blocks` covers the case
+/// where a real gate IS in the last-known snapshot.)
 #[tokio::test]
-async fn completion_trigger_fail_closed_sentinel_proceeds() {
+async fn completion_trigger_fail_closed_no_cached_gate_proceeds() {
     let _guard = TEST_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -396,7 +396,7 @@ async fn completion_trigger_fail_closed_sentinel_proceeds() {
     insert_trigger(&mut conn, trigger_id).await;
     let source_exec_id = start_completed_source(&mut conn, "ag-src-failclosed").await;
 
-    // Install a fail-closed (uninitialized) cache: check() returns the sentinel.
+    // Install a fail-closed cache with an EMPTY snapshot (no cached gate).
     set_global_admission_gate_cache(Some(Arc::new(AdmissionGateCache::new_fail_closed())));
 
     let metrics = CapturingMetrics::default();
@@ -407,7 +407,7 @@ async fn completion_trigger_fail_closed_sentinel_proceeds() {
         Some(&metrics),
     )
     .await
-    .expect("evaluate must proceed under the fail-closed sentinel");
+    .expect("evaluate must proceed under fail-closed when no cached gate matches");
 
     set_global_admission_gate_cache(None);
 
@@ -415,12 +415,12 @@ async fn completion_trigger_fail_closed_sentinel_proceeds() {
     assert_eq!(
         target_exec_count(&mut conn).await,
         1,
-        "the fail-closed sentinel must NOT drop the completion-trigger start"
+        "fail-closed with no cached gate must NOT drop the completion-trigger start"
     );
     // No admission block was counted.
     assert!(
         metrics.blocked().is_empty(),
-        "the fail-closed sentinel must not record an admission_blocked"
+        "fail-closed with no cached gate must not record an admission_blocked"
     );
     // The fires row is a real fire (NULL outcome), not an admission_blocked skip.
     let fires: Vec<OutcomeRow> = diesel::sql_query(
@@ -433,8 +433,68 @@ async fn completion_trigger_fail_closed_sentinel_proceeds() {
     assert_eq!(fires.len(), 1);
     assert_eq!(
         fires[0].outcome, None,
-        "a sentinel-proceed is a real fire (NULL outcome), not admission_blocked"
+        "a proceed is a real fire (NULL outcome), not admission_blocked"
     );
+}
+
+/// Codex P1 (issue #618): under fail-closed, a REAL gate already loaded into the
+/// last-known cached snapshot MUST still block a matching completion-trigger
+/// start (block + drop + count) — otherwise completion triggers would bypass an
+/// active gate uncounted during exactly the incident the gate exists for, while
+/// direct API starts still block. `set_fail_closed()` leaves the snapshot
+/// intact, so the cached gate is available to match against.
+#[tokio::test]
+async fn completion_trigger_fail_closed_with_cached_gate_blocks() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    let trigger_id = Uuid::new_v4();
+    insert_trigger(&mut conn, trigger_id).await;
+    let source_exec_id = start_completed_source(&mut conn, "ag-src-failclosed-cached").await;
+
+    // A real Fleet gate is loaded into the cache, THEN a refresh fails
+    // (set_fail_closed) — the snapshot is retained.
+    let cache = fleet_cache("cached-incident");
+    cache.set_fail_closed();
+    set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+
+    let metrics = CapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .expect("evaluate must not error (block is a clean skip)");
+
+    set_global_admission_gate_cache(None);
+
+    // The known-active cached gate blocks the start even under fail-closed.
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "a real cached gate must block the completion-trigger start under fail-closed"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(blocked.len(), 1, "the block was counted exactly once");
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(blocked[0].1, "cached-incident");
+    let fires: Vec<OutcomeRow> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("load fires");
+    assert_eq!(fires.len(), 1);
+    assert_eq!(fires[0].outcome.as_deref(), Some("admission_blocked"));
 }
 
 /// F4: re-evaluating the SAME (source, trigger) with the gate still active must

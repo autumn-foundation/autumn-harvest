@@ -1039,6 +1039,25 @@ pub fn evaluate_triggers_for_execution<'a>(
             // `admission_blocked` outcome. When no gate cache is installed (the
             // common path / standalone integrations) the check is skipped and
             // resolution below is byte-identical to pre-#618.
+            //
+            // Fail-closed handling (issue #618 F3 + Codex P1): consult the
+            // LAST-KNOWN cached snapshot via `check_cached`, which ignores the
+            // fail-closed/initialized flag and returns only a REAL matching gate
+            // (never the nil sentinel). `set_fail_closed()` retains the snapshot,
+            // so a gate loaded before a transient gate-DB read error still blocks
+            // a matching completion-trigger start (block+drop+count) — otherwise
+            // completion triggers would BYPASS an active gate uncounted during
+            // exactly the incident the gate exists for, while direct API starts
+            // still block. When no cached gate matches (empty snapshot in the boot
+            // window, or a transient blip with no gate targeting this start) we
+            // PROCEED rather than permanently dropping in-flight continuation (a
+            // completion-trigger start cannot retry, unlike an API caller). This
+            // is a deliberate, documented divergence from the API path: when
+            // initialized-and-healthy both see identical gates; under fail-closed
+            // the API blocks everything (caller retries) while triggers honour
+            // only known-cached gates. Bounded caveat: a gate ADDED during a
+            // gate-DB outage (never loaded into the snapshot) won't block triggers
+            // until the next successful refresh.
             // Resolve the target queue at most ONCE per trigger (issue #618, F9):
             // the gate check below and the same-shard start further down both
             // need it. `None` = not yet resolved (no gate cache installed, so the
@@ -1051,67 +1070,45 @@ pub fn evaluate_triggers_for_execution<'a>(
                     resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
                 };
                 resolved_queue = Some(gate_queue.clone());
-                if let Some((gate_id, reason, scope_kind)) = cache.check(
+                if let Some((_gate_id, reason, scope_kind)) = cache.check_cached(
                     &trigger_db.target_workflow_name,
                     &gate_queue,
                     target_shard.as_i32(),
                     target_owner.as_deref(),
                 ) {
-                    // Distinguish a REAL operator gate (gate_id != nil) from the
-                    // fail-closed / uninitialized sentinel (`Uuid::nil()`), which
-                    // `AdmissionGateCache::check()` returns on a transient gate-DB
-                    // read error or before the first refresh (issue #618, F3). A
-                    // completion-trigger start is in-flight continuation of
-                    // already-committed work; permanently DROPPING it on a transient
-                    // infra blip (no operator gate raised) is worse than a ≤1s
-                    // window where triggers aren't gated. So on the sentinel we
-                    // PROCEED (no block, no fires row, no admission_blocked count),
-                    // degrading gracefully to the same "None cache = pre-#618"
-                    // behaviour. A real operator gate still blocks + drops + counts.
-                    if gate_id == crate::admission_gate::sentinel_gate_id() {
-                        tracing::warn!(
-                            trigger_id = %trigger_db.id,
-                            source_exec_id = %exec_id,
-                            target_workflow_name = %trigger_db.target_workflow_name,
-                            "Admission gate cache is fail-closed (transient / uninitialized); \
-                             proceeding with the completion-trigger start rather than dropping \
-                             already-committed in-flight continuation."
-                        );
-                    } else {
-                        tracing::info!(
-                            trigger_id = %trigger_db.id,
-                            source_exec_id = %exec_id,
-                            target_workflow_name = %trigger_db.target_workflow_name,
-                            scope_kind = %scope_kind,
-                            reason = %reason,
-                            "Completion trigger start blocked by an active admission gate; \
-                             dropping the trigger start (recorded once, not retried)."
-                        );
-                        let blocked_inserted =
-                            diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
-                                .values(&NewCompletionTriggerFireDb {
-                                    source_exec_id: exec_id.as_uuid(),
-                                    trigger_id: trigger_db.id,
-                                    outcome: Some("admission_blocked".to_string()),
-                                })
-                                .on_conflict_do_nothing()
-                                .execute(conn)
-                                .await
-                                .map_err(crate::error::database_error)?;
-                        if let Some(m) = metrics {
-                            // Only count the FIRST resolution of this (source, trigger)
-                            // pair (issue #618, F4): cascade re-entry / multi-terminal-
-                            // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
-                            // and must not double-count. Mirrors the sibling
-                            // `condition_unmet` -> `deduped` shape.
-                            if blocked_inserted > 0 {
-                                m.record_admission_blocked(scope_kind, &reason);
-                            } else {
-                                m.record_completion_trigger_fired(&trigger_name, "deduped");
-                            }
+                    tracing::info!(
+                        trigger_id = %trigger_db.id,
+                        source_exec_id = %exec_id,
+                        target_workflow_name = %trigger_db.target_workflow_name,
+                        scope_kind = %scope_kind,
+                        reason = %reason,
+                        "Completion trigger start blocked by a cached admission gate; \
+                         dropping the trigger start (recorded once, not retried)."
+                    );
+                    let blocked_inserted =
+                        diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
+                            .values(&NewCompletionTriggerFireDb {
+                                source_exec_id: exec_id.as_uuid(),
+                                trigger_id: trigger_db.id,
+                                outcome: Some("admission_blocked".to_string()),
+                            })
+                            .on_conflict_do_nothing()
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                    if let Some(m) = metrics {
+                        // Only count the FIRST resolution of this (source, trigger)
+                        // pair (issue #618, F4): cascade re-entry / multi-terminal-
+                        // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
+                        // and must not double-count. Mirrors the sibling
+                        // `condition_unmet` -> `deduped` shape.
+                        if blocked_inserted > 0 {
+                            m.record_admission_blocked(scope_kind, &reason);
+                        } else {
+                            m.record_completion_trigger_fired(&trigger_name, "deduped");
                         }
-                        continue;
                     }
+                    continue;
                 }
             }
 

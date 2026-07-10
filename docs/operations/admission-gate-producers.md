@@ -45,17 +45,34 @@ deferred-row upsert (shared by all deferred-fire producers). A start that slips
 that window is durably deferred and its scanner fire is counted as a bypass, so
 it never produces an **un-counted** admission.
 
-### Fail-closed sentinel (completion triggers)
+### Fail-closed handling (completion triggers)
 
-`AdmissionGateCache::check()` returns a synthetic fail-closed sentinel when the
-gate cache is uninitialized or after a transient gate-DB read error. For a
-completion-trigger start — which is in-flight continuation of already-committed
-work — permanently *dropping* the start on a transient infra blip (no operator
-gate actually raised) is worse than a sub-second window where triggers aren't
-gated. So on the sentinel the completion-trigger path **proceeds** (no block, no
-`admission_blocked` fires row, no count), degrading gracefully to the same
-behaviour as when no gate cache is installed. A **real** operator gate still
-blocks, drops, and counts.
+When the gate cache is uninitialized or a background gate-DB refresh fails, it
+goes **fail-closed**: `AdmissionGateCache::check()` (used by the API and other
+synchronous producers) returns a synthetic block for *every* start, so a caller
+can retry once the cache recovers. A completion-trigger start, however, is
+in-flight continuation of already-committed work and **cannot retry** — blocking
+it under fail-closed would permanently drop it.
+
+So completion triggers consult the **last-known cached gates snapshot** instead,
+via `AdmissionGateCache::check_cached()` (which ignores the fail-closed flag and
+returns only a *real* matching gate, never the synthetic block). `set_fail_closed()`
+retains the snapshot, so:
+
+- **A real gate already in the snapshot matches this start → block + drop + count.**
+  A known-active gate is honoured even under fail-closed — completion triggers do
+  **not** bypass an active gate during exactly the incident the gate exists for.
+- **No cached gate matches → proceed** (no block, no fires row, no count) — the
+  transient-blip / boot-window case, degrading to pre-#618 behaviour rather than
+  permanently dropping the start.
+
+This is a deliberate divergence from the API path: when the cache is
+initialized-and-healthy both see identical gates; only under fail-closed does the
+API block everything (caller retries) while triggers honour only known-cached
+gates. **Bounded caveat:** a gate *added* during a gate-DB outage (never loaded
+into the snapshot) will not block completion triggers until the next successful
+refresh — a narrow, documented degradation, strictly better than either a
+permanent drop or an unconditional bypass.
 
 ## Completion triggers — dropped, not deferred
 

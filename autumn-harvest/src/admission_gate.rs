@@ -402,6 +402,34 @@ impl AdmissionGateCache {
             .map(|g| (g.id.0, g.reason.clone(), g.scope.kind_str()))
     }
 
+    /// Match against the **last-known cached gates snapshot**, ignoring the
+    /// fail-closed / initialized flag (issue #618, Codex P1).
+    ///
+    /// Unlike [`check`](Self::check) — which returns the synthetic
+    /// [`sentinel_gate_id`] block for every start while the cache is
+    /// fail-closed/uninitialized — this returns only a **real** matching gate
+    /// (never the sentinel), or `None` when no cached gate matches (including an
+    /// empty snapshot during the boot window).
+    ///
+    /// `set_fail_closed()` retains the gates snapshot, so a gate loaded before a
+    /// transient gate-DB read error is still honoured here. Used by the
+    /// completion-trigger path: a completion-trigger start is in-flight
+    /// continuation of already-committed work and cannot retry, so it honours
+    /// only the gates the cache last knew about (block+count on a match, proceed
+    /// otherwise) rather than the API path's block-everything-under-fail-closed.
+    #[must_use]
+    pub fn check_cached(
+        &self,
+        workflow_name: &str,
+        queue_name: &str,
+        shard_id: i32,
+        owner: Option<&str>,
+    ) -> Option<(Uuid, String, &'static str)> {
+        let guard = self.gates.read().ok()?;
+        check_admission(&guard, workflow_name, queue_name, shard_id, owner)
+            .map(|g| (g.id.0, g.reason.clone(), g.scope.kind_str()))
+    }
+
     /// Return the number of currently cached active gates.
     #[must_use]
     pub fn active_count(&self) -> usize {
@@ -1033,6 +1061,39 @@ mod tests {
         let (_, reason, scope_kind) = result.unwrap();
         assert_eq!(reason, "incident-42");
         assert_eq!(scope_kind, "fleet");
+    }
+
+    #[test]
+    fn check_cached_honours_snapshot_under_fail_closed() {
+        // issue #618 (Codex P1): a real gate loaded into the snapshot then
+        // fail-closed must still MATCH via check_cached (never the sentinel),
+        // while `check()` returns the block-everything sentinel.
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![fleet_gate("cached-incident")]);
+        cache.set_fail_closed();
+
+        // check() fails closed → synthetic sentinel block.
+        let (sentinel_id, _r, _s) = cache.check("wf", "q", 0, None).expect("fail-closed blocks");
+        assert_eq!(sentinel_id, sentinel_gate_id());
+
+        // check_cached() returns the REAL matched gate (not the sentinel).
+        let (real_id, reason, scope_kind) = cache
+            .check_cached("wf", "q", 0, None)
+            .expect("cached gate matches under fail-closed");
+        assert_ne!(real_id, sentinel_gate_id());
+        assert_eq!(reason, "cached-incident");
+        assert_eq!(scope_kind, "fleet");
+    }
+
+    #[test]
+    fn check_cached_returns_none_on_empty_snapshot() {
+        // An empty snapshot (boot window / never-loaded) matches nothing, so a
+        // completion-trigger start PROCEEDS rather than being dropped.
+        let cache = AdmissionGateCache::new_fail_closed();
+        assert!(cache.check_cached("wf", "q", 0, None).is_none());
+        // And an initialized-but-empty cache also matches nothing.
+        let open = AdmissionGateCache::new();
+        assert!(open.check_cached("wf", "q", 0, None).is_none());
     }
 
     // ── issue #618: StartProducer + producer contract + global cache ──────────
