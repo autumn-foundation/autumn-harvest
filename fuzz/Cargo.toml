@@ -64,3 +64,17 @@ path = "fuzz_targets/fuzz_failure_signature.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_parse_rate"
+path = "fuzz_targets/fuzz_parse_rate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_from_wire"
+path = "fuzz_targets/fuzz_from_wire.rs"
+test = false
+doc = false
+bench = false

@@ -291,3 +291,39 @@ fn session_slot_acquire_release_balances_and_never_underflows() {
         );
     });
 }
+
+/// Model 5: AdmissionGateCache check while refresh is occurring never panics or deadlocks.
+#[test]
+fn admission_gate_cache_concurrent_refresh_and_check() {
+    use autumn_harvest::admission_gate::{AdmissionGate, AdmissionGateCache, GateScope};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    loom::model(|| {
+        let cache = std::sync::Arc::new(AdmissionGateCache::default());
+
+        // Setup some dummy gates
+        let gates = vec![AdmissionGate {
+            id: autumn_harvest::admission_gate::AdmissionGateId(Uuid::nil()),
+            scope: GateScope::Fleet,
+            reason: "dummy".to_string(),
+            created_at: Utc::now(),
+            created_by: "test".to_string(),
+            message: Some("test".to_string()),
+            expires_at: None,
+        }];
+
+        let c1 = std::sync::Arc::clone(&cache);
+        let t1 = loom::thread::spawn(move || {
+            c1.refresh(gates.clone());
+        });
+
+        let c2 = std::sync::Arc::clone(&cache);
+        let t2 = loom::thread::spawn(move || {
+            let _ = c2.check("wf", "q", 0, None);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    });
+}
