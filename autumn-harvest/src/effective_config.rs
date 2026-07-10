@@ -160,30 +160,72 @@ pub struct WorkerConfigView {
     pub notification_channel_configured: bool,
     /// REDACTED: count of per-shard notification channels configured (never the URLs).
     pub shard_notification_channels_configured: usize,
-    /// REDACTED: whether a sharded database pool is configured (never the handle).
+    /// REDACTED: whether the **resolved runtime** database pool is sharded
+    /// (never the handle).
+    ///
+    /// This reflects the pool the runtime *actually* uses — the runner-provided
+    /// [`HarvestRunnerResources::with_sharded_pool`] override, then
+    /// [`WorkerConfig::with_sharded_pool`], then the fallback single pool — not
+    /// solely the `WorkerConfig` knob. The capture site passes the resolved
+    /// value through [`ShardedInfo`]; when no override is supplied (the pure
+    /// no-DB mapping path) it falls back to the `WorkerConfig::sharded_pool`
+    /// field.
     pub sharded_pool_configured: bool,
-    /// REDACTED: number of shards in the configured sharded pool (0 if none).
+    /// REDACTED: number of shards in the resolved runtime sharded pool (0 if not
+    /// sharded). See [`sharded_pool_configured`](Self::sharded_pool_configured).
     pub sharded_pool_shard_count: usize,
 }
 
 impl WorkerConfigView {
-    /// Project a [`WorkerConfig`] into its secret-free view.
+    /// Project a [`WorkerConfig`] into its secret-free view, sourcing the two
+    /// sharded-pool fields solely from the `WorkerConfig::sharded_pool` knob.
+    ///
+    /// This is the **pure, no-DB mapping** used by unit tests. Runtimes call
+    /// [`from_worker_config_with_resolved_sharding`](Self::from_worker_config_with_resolved_sharding)
+    /// with the resolved-pool override so the reported values describe the pool
+    /// the runtime actually uses.
+    #[must_use]
+    pub fn from_worker_config(worker: &WorkerConfig, poll_interval: Duration) -> Self {
+        Self::from_worker_config_with_resolved_sharding(worker, poll_interval, None)
+    }
+
+    /// Project a [`WorkerConfig`] into its secret-free view, preferring an
+    /// optional resolved-runtime-pool override for the two sharded-pool fields.
+    ///
+    /// When `resolved` is `Some`, [`sharded_pool_configured`] and
+    /// [`sharded_pool_shard_count`] take the resolved runtime pool's values —
+    /// covering the runner-provided `HarvestRunnerResources::with_sharded_pool`
+    /// override, `WorkerConfig::with_sharded_pool`, and the fallback single pool
+    /// alike. When `None`, they fall back to the `WorkerConfig::sharded_pool`
+    /// field (keeping the pure no-DB mapping path valid).
     ///
     /// The exhaustive destructure below is the **#695 coverage guard** — do NOT
     /// add `..`. A new [`WorkerConfig`] field must break compilation here until
     /// it is deliberately surfaced (or, for a secret-bearing field, mapped to a
-    /// presence boolean/count).
+    /// presence boolean/count). `sharded_pool` is still bound (as `_`) so the
+    /// guard stays intact even though its reported value prefers the override.
+    ///
+    /// [`sharded_pool_configured`]: Self::sharded_pool_configured
+    /// [`sharded_pool_shard_count`]: Self::sharded_pool_shard_count
     #[must_use]
-    pub fn from_worker_config(worker: &WorkerConfig, poll_interval: Duration) -> Self {
+    pub fn from_worker_config_with_resolved_sharding(
+        worker: &WorkerConfig,
+        poll_interval: Duration,
+        resolved: Option<ShardedInfo>,
+    ) -> Self {
         // Bind the sharded-pool presence/count before the (feature-gated)
         // destructure so both `db` and non-`db` builds produce the same view.
+        // A resolved-runtime override, when supplied, wins over the raw
+        // `WorkerConfig::sharded_pool` knob (issue #695 review).
         #[cfg(feature = "db")]
-        let (sharded_pool_configured, sharded_pool_shard_count) = worker
+        let wc_sharding = worker
             .sharded_pool
             .as_ref()
             .map_or((false, 0), |p| (true, p.iter_shards().count()));
         #[cfg(not(feature = "db"))]
-        let (sharded_pool_configured, sharded_pool_shard_count) = (false, 0usize);
+        let wc_sharding = (false, 0usize);
+        let (sharded_pool_configured, sharded_pool_shard_count) =
+            resolved.map_or(wc_sharding, |info| (info.configured, info.shard_count));
 
         // exhaustive destructure is the #695 coverage guard — do NOT add `..`.
         let WorkerConfig {
@@ -415,6 +457,24 @@ pub struct PoolSizing {
     pub shard_count: usize,
 }
 
+/// Resolved sharded-pool presence + shard count read off the runtime's
+/// *actual* storage pool (issue #695 review).
+///
+/// This is the **DB-free override input** to the [`WorkerConfigView`]
+/// sharded-pool fields: the capture site resolves which pool the runtime
+/// actually uses (runner-provided `HarvestRunnerResources::with_sharded_pool`,
+/// then `WorkerConfig::with_sharded_pool`, then the fallback single pool) and
+/// hands the result here, so the reported values describe the resolved runtime
+/// pool rather than solely the `WorkerConfig` knob — and the pure decision stays
+/// testable without ever constructing a real pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardedInfo {
+    /// Whether the resolved runtime storage pool is a sharded pool.
+    pub configured: bool,
+    /// Number of shards in the resolved sharded pool (0 when not sharded).
+    pub shard_count: usize,
+}
+
 /// Resolve the reported [`PoolConfigView`], mirroring the pool-selection
 /// precedence in `HarvestRunner::start` (issue #695 review).
 ///
@@ -439,6 +499,9 @@ impl EffectiveConfigView {
     /// `poll_interval` is the runtime-resolved worker poll interval; `caps` and
     /// `pool` are built by the caller from the resolved
     /// [`BuiltHarvest`](crate::builder::BuiltHarvest) and database pool.
+    /// `resolved_sharding` is the resolved-runtime-pool override for the two
+    /// [`WorkerConfigView`] sharded-pool fields (`None` = fall back to the
+    /// `WorkerConfig::sharded_pool` knob; the pure no-DB path).
     #[must_use]
     pub fn capture(
         worker: &WorkerConfig,
@@ -446,9 +509,14 @@ impl EffectiveConfigView {
         router: &crate::shard::ShardRouter,
         pool: PoolConfigView,
         poll_interval: Duration,
+        resolved_sharding: Option<ShardedInfo>,
     ) -> Self {
         Self {
-            worker: WorkerConfigView::from_worker_config(worker, poll_interval),
+            worker: WorkerConfigView::from_worker_config_with_resolved_sharding(
+                worker,
+                poll_interval,
+                resolved_sharding,
+            ),
             payload_caps: caps,
             shard_topology: ShardTopologyView::from_router(router),
             features: compiled_feature_flags(),
@@ -700,6 +768,7 @@ mod tests {
                 shard_pool_count: 1,
             },
             Duration::from_millis(500),
+            None,
         );
         let json = serde_json::to_value(&view).expect("serialize");
         for key in [
@@ -734,6 +803,45 @@ mod tests {
         let view = resolve_pool_view(Some(sharded), fallback);
         assert_eq!(view.worker_pool_max_connections, 42);
         assert_eq!(view.shard_pool_count, 3);
+    }
+
+    #[test]
+    fn worker_view_sharded_fields_prefer_resolved_override() {
+        // The two sharded-pool fields must reflect the resolved runtime pool
+        // (e.g. a runner-provided HarvestRunnerResources::with_sharded_pool,
+        // which the WorkerConfig knob cannot see). A default WorkerConfig has no
+        // sharded pool, yet a resolved override must still surface configured=true
+        // with the resolved shard count. Pure, no live pool needed.
+        let worker = WorkerConfig::default();
+
+        let overridden = WorkerConfigView::from_worker_config_with_resolved_sharding(
+            &worker,
+            Duration::from_millis(500),
+            Some(ShardedInfo {
+                configured: true,
+                shard_count: 3,
+            }),
+        );
+        assert!(overridden.sharded_pool_configured);
+        assert_eq!(overridden.sharded_pool_shard_count, 3);
+
+        // A resolved *single* (non-sharded) fallback pool → not configured, 0.
+        let single = WorkerConfigView::from_worker_config_with_resolved_sharding(
+            &worker,
+            Duration::from_millis(500),
+            Some(ShardedInfo {
+                configured: false,
+                shard_count: 0,
+            }),
+        );
+        assert!(!single.sharded_pool_configured);
+        assert_eq!(single.sharded_pool_shard_count, 0);
+
+        // No override (None) → fall back to the WorkerConfig::sharded_pool knob,
+        // which the default config leaves unset.
+        let fallback = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+        assert!(!fallback.sharded_pool_configured);
+        assert_eq!(fallback.sharded_pool_shard_count, 0);
     }
 
     #[test]

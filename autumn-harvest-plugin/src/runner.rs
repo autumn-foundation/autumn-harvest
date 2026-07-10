@@ -7,7 +7,9 @@ use std::sync::Arc;
 use autumn_harvest::BuiltHarvest;
 use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
-use autumn_harvest::effective_config::{EffectiveConfigView, PayloadCapsView, PoolConfigView};
+use autumn_harvest::effective_config::{
+    EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
+};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
@@ -207,6 +209,12 @@ impl PreparedHarvestRuntime {
         // being silently narrowed to a single shard when the runner is started
         // with only `HarvestRunnerResources::new(default_pool)` (the plugin
         // path), which would strand all non-default-shard work.
+        // Capture the runner-provided sharded-pool provenance before the move
+        // below consumes `resources.sharded_pool`. The `WorkerConfig` knob is
+        // still readable afterwards from `built`, but this override is not — and
+        // the effective-config snapshot must report the resolved runtime pool's
+        // sharded-ness, not solely the `WorkerConfig` field (issue #695 review).
+        let resources_sharded_pool = resources.sharded_pool.is_some();
         let storage_pool = if let Some(sp) = resources.sharded_pool {
             HarvestDbPool::sharded(sp)
         } else if let Some(sp) = built.worker_config().sharded_pool.clone() {
@@ -230,7 +238,8 @@ impl PreparedHarvestRuntime {
         }
         // Capture the secret-free effective-config snapshot (issue #695) while
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
-        let effective_config = capture_effective_config(&built, &storage_pool, &shard_router);
+        let effective_config =
+            capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -555,10 +564,19 @@ impl HarvestRunner {
 /// pool the runtime actually uses. `poll_interval` reads the side-effect-free
 /// [`DEFAULT_WORKER_POLL_INTERVAL`] — the single source of truth the
 /// `WorkerRuntimeConfig` conversion also uses — so this stays a pure read.
+///
+/// `resources_sharded_pool` reports whether a runner-provided
+/// [`HarvestRunnerResources::with_sharded_pool`] override was supplied — that
+/// provenance is erased once `storage_pool` is built, so the caller captures it
+/// before the move. It, together with `WorkerConfig::with_sharded_pool` and the
+/// resolved `storage_pool` shard count, drives the two `WorkerConfigView`
+/// sharded-pool fields so they describe the resolved runtime pool, not solely
+/// the `WorkerConfig` knob (issue #695 review).
 fn capture_effective_config(
     built: &BuiltHarvest,
     storage_pool: &HarvestDbPool,
     router: &ShardRouter,
+    resources_sharded_pool: bool,
 ) -> EffectiveConfigView {
     let (payload_offload_enabled, payload_offload_threshold_bytes) = built
         .payload_offloader()
@@ -579,9 +597,24 @@ fn capture_effective_config(
         payload_offload_enabled,
         payload_offload_threshold_bytes,
     );
+    let shard_count = storage_pool.iter_shards().count();
     let pool_view = PoolConfigView {
         worker_pool_max_connections: storage_pool.default_pool().status().max_size,
-        shard_pool_count: storage_pool.iter_shards().count(),
+        shard_pool_count: shard_count,
+    };
+    // The runtime uses a sharded pool when either the runner supplied one or the
+    // WorkerConfig carried one; the fallback single pool (a 1-shard wrapper of
+    // `harvest_pool`) is not "sharded_pool_configured". Report the resolved
+    // pool's actual shard count when sharded, else 0.
+    let sharded_pool_configured =
+        resources_sharded_pool || built.worker_config().sharded_pool.is_some();
+    let resolved_sharding = ShardedInfo {
+        configured: sharded_pool_configured,
+        shard_count: if sharded_pool_configured {
+            shard_count
+        } else {
+            0
+        },
     };
     EffectiveConfigView::capture(
         built.worker_config(),
@@ -589,6 +622,7 @@ fn capture_effective_config(
         router,
         pool_view,
         DEFAULT_WORKER_POLL_INTERVAL,
+        Some(resolved_sharding),
     )
 }
 

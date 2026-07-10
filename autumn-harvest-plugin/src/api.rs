@@ -197,6 +197,7 @@ fn placeholder_effective_config(
             shard_pool_count: 0,
         },
         autumn_harvest::worker::DEFAULT_WORKER_POLL_INTERVAL,
+        None,
     )
 }
 

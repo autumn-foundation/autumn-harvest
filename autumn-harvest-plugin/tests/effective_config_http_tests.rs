@@ -96,6 +96,7 @@ fn sample_view() -> EffectiveConfigView {
             shard_pool_count: 1,
         },
         Duration::from_millis(500),
+        None,
     )
 }
 
