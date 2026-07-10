@@ -455,3 +455,61 @@ Both fixes: no new `WorkflowEvent` variant, no migration. Full `autumn-harvest`
 lib suite (1370 tests) and the no-DB `testing` integration suite (798 tests)
 complete with no skips, no hangs, and all prior reorder/matrix/reset-loop tests
 green.
+
+**Post-review hardening round 16 (Codex 3× P2).** Three findings, two of them
+genuine correctness bugs sharing one root cause: the cancellable timer API
+(`start_timer`/`cancel_timer`/`reset_timer`) and the classic timer API
+(`ctx.timer`/`sleep_until`) share the `harvest_timers` table and `timer_id`
+namespace with no type discriminator, and the round-15 collision guard was only
+one-directional.
+
+- **Findings 1 & 2 — comprehensive bidirectional, order-independent namespace
+  disjointness (enforced at the source in `WorkflowContext`).** A given `timer_id`
+  now belongs to at most ONE timer API per run. `WorkflowContext` gains a per-run
+  `classic_timer_ids` set populated by `ctx.timer`/`sleep_until`. `start_timer(id)`
+  records a deterministic deferred nd error (→ #603 nd-block; it returns a handle,
+  not a `Result`) when `id` is already a classic timer id — the reverse of round
+  15's cancellable-first `Config` rejection, so a collision is now caught in
+  **either** registration order and independent of poll/command order (Finding 1).
+  The worker-side backstop `same_batch_uncancelled_arm_start_collision` now scans
+  the WHOLE batch (a same-id cancellable `ArmTimer` before **or** after a classic
+  `StartTimer` is flagged), not just the prefix before each `StartTimer`.
+  `cancel_timer(id)`/`reset_timer(id)` are pure NO-OPs when `id` is a classic timer
+  id — they push no `CancelTimer`, so the worker's `delete_pending_timer` can never
+  delete a classic `ctx.timer` row out from under its parked waiter and hang it
+  (Finding 2's exact scenario: a signal/update handler calling
+  `cancel_timer("deadline")` while the main body is parked in
+  `ctx.timer("deadline")`). The guard is on the CLASSIC-id set, **not** on the
+  `Armed` state, precisely so a reordered cancel of a genuinely cancellable id is
+  still detected as non-determinism (the round-10 reorder-detection contract is not
+  weakened). No silent event-drop, no classic-row deletion, no hang, no replay
+  divergence. Docs on `start_timer`/`cancel_timer` state the disjoint-namespace
+  constraint. Tests:
+  `cancellable_start_timer_after_classic_timer_same_id_fails_fast` (Finding 1
+  reverse order), `cancellable_first_then_classic_same_id_still_fails_fast` (round
+  15 direction still green), `cancel_timer_on_a_classic_timer_id_is_a_no_op` /
+  `reset_timer_on_a_classic_timer_id_is_a_no_op` and the end-to-end
+  `cancel_timer_on_a_classic_id_does_not_kill_the_classic_timer` (Finding 2, a
+  `join!` runs the cancel while the classic timer is pending),
+  `start_before_uncancelled_arm_collision_is_detected` (worker pure, order-
+  independent batch detection).
+
+- **Finding 3 — concurrently-armed timers advance the test clock to the MAX
+  deadline, not the SUM (test-harness fidelity only).** When multiple cancellable
+  timers are armed in one `await_fire` batch (overlapping arm windows), production
+  starts every deadline at the same instant, so the workflow-observed elapsed after
+  they all fire is the MAX deadline. The `WorkflowTestEnv`/replay virtual clock was
+  summing each fired timer's full duration, so `join!(slow(10), fast(1))` advanced
+  `ctx.now()` by 11s instead of 10s. Each cancellable arm now records a deadline
+  anchor (`TimerLogicalState::Armed { anchor_secs }` = the virtual-clock elapsed at
+  arm time), and `await_timer_fire` advances the live clock to `anchor + duration`
+  via a monotonic `fetch_max`; `TestRunOutcome::final_now`/`elapsed` reconstruct the
+  same MAX-of-deadlines model from history. Concurrently-armed timers share an
+  anchor → MAX; sequential timers (each armed after the previous fired) have a later
+  anchor → still SUM (every classic `ctx.timer` is sequential, so its sum is
+  unchanged). No production replay/data-path change. Tests:
+  `concurrently_armed_timers_advance_to_the_max_deadline_not_the_sum` (pure) and the
+  extended `test_concurrent_awaited_timers_fire_in_deadline_order` (asserts
+  `ctx.now()` and `elapsed()` are 10s, not 11s).
+
+All three fixes: no new `WorkflowEvent` variant, no migration.

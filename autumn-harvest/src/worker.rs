@@ -6706,9 +6706,17 @@ fn same_batch_uncancelled_arm_start_collision(commands: &[WorkflowCommand]) -> O
             continue;
         };
         let id = timer_id.as_str();
-        // Walk the prefix before this StartTimer: an ArmTimer(id) marks the arm
-        // live; a CancelTimer(id) clears it. If the arm is still live when we reach
-        // the StartTimer, it's an uncancelled collision.
+        // Order-independent detection (issue #768, Codex P2 round 16). The ONLY
+        // legit same-id `StartTimer` + `ArmTimer` combo is the cancel-then-classic
+        // pattern `[ArmTimer(X,false), CancelTimer(X), StartTimer(X)]` — the arm is
+        // dead before the classic start. Any other interleaving is a collision:
+        //   (a) an arm is still LIVE at the StartTimer's position (cancellable-first
+        //       — `[ArmTimer(X), StartTimer(X)]`), OR
+        //   (b) there is ANY `ArmTimer(X)` AFTER the StartTimer (classic-first —
+        //       `[StartTimer(X), ArmTimer(X)]`).
+        // Scanning both directions makes the guard bidirectional and independent of
+        // the batch's command order (the source-level check in `WorkflowContext`
+        // already prevents both, so this is a defensive backstop).
         let mut arm_live = false;
         for prior in &commands[..start_idx] {
             match prior {
@@ -6724,6 +6732,14 @@ fn same_batch_uncancelled_arm_start_collision(commands: &[WorkflowCommand]) -> O
             }
         }
         if arm_live {
+            return Some(id.to_string());
+        }
+        // (b) A cancellable arm placed AFTER the classic start of the same id is a
+        // collision regardless of any preceding cancel.
+        let arm_after = commands[start_idx + 1..].iter().any(|c| {
+            matches!(c, WorkflowCommand::ArmTimer { timer_id: arm_id, .. } if arm_id.as_str() == id)
+        });
+        if arm_after {
             return Some(id.to_string());
         }
     }
@@ -7010,6 +7026,12 @@ async fn plan_timer_lifecycle(
     // pure planner encodes. An await-raced-by-cancel and an await-then-reset id are
     // both excluded from `armed_indices` (the later same-id cancel supersedes the
     // await arm), so only their delete runs and the row ends absent.
+    //
+    // Invariant (issue #768, Codex P2 round 16): a `CancelTimer` here can only name
+    // a CANCELLABLE timer's id. `WorkflowContext::cancel_timer`/`reset_timer` no-op
+    // (emit no `CancelTimer`) unless the id is a live cancellable arm / not a
+    // classic timer id, so `delete_pending_timer` can never delete a classic
+    // `ctx.timer`/`sleep_until` row out from under its parked waiter.
     for cmd in commands {
         if let WorkflowCommand::CancelTimer { timer_id } = cmd {
             queue::delete_pending_timer(conn, exec_id, timer_id).await?;
@@ -14039,6 +14061,30 @@ mod tests {
             same_batch_uncancelled_arm_start_collision(&commands).as_deref(),
             Some("x"),
             "uncancelled same-id arm + classic start must be flagged"
+        );
+    }
+
+    /// Order-independence (issue #768, Codex P2 round 16): a classic `StartTimer(x)`
+    /// placed BEFORE a same-id cancellable `ArmTimer(x)` in the batch is the reverse
+    /// order of the prefix-only check, and must still be flagged.
+    #[test]
+    fn start_before_uncancelled_arm_collision_is_detected() {
+        let commands = vec![
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 30,
+                for_await: false,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands).as_deref(),
+            Some("x"),
+            "classic-first then same-id cancellable arm must be flagged regardless of order"
         );
     }
 

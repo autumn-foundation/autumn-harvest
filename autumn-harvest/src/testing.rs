@@ -2174,37 +2174,54 @@ pub struct TestRunOutcome {
     start_time: DateTime<Utc>,
 }
 
-/// Sum the durations of durable timers that **actually fired** in `events`
-/// (issue #768, Codex P2 round 8).
+/// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
+/// timers that **actually fired** in `events` (issue #768, Codex P2 rounds 8 and
+/// 16).
 ///
-/// Each `TimerStarted` for an id is enqueued (FIFO); a `TimerFired` for that id
-/// dequeues the earliest pending arm and adds its duration; a `TimerCancelled`
-/// dequeues (and discards) the earliest pending arm without counting it. In a
-/// valid history an id has at most one pending arm at a time (arm → fire/cancel
-/// → re-arm → …), so this exactly counts the fired arms and excludes cancelled /
-/// reset ones. The classic `ctx.timer` path always fires, so its every
-/// `TimerStarted` pairs with a `TimerFired` and the total is unchanged.
+/// Simulates the virtual clock as a monotonic `now`: each `TimerStarted` for an
+/// id is enqueued (FIFO) with the CURRENT `now` as its deadline **anchor**; a
+/// `TimerFired` for that id dequeues the earliest pending arm and advances
+/// `now = max(now, anchor + duration)`; a `TimerCancelled` dequeues (and
+/// discards) the earliest pending arm without advancing. In a valid history an
+/// id has at most one pending arm at a time (arm → fire/cancel → re-arm → …), so
+/// this counts exactly the fired arms and excludes cancelled / reset ones.
+///
+/// The `max`-of-deadlines model (round 16) handles both timer shapes correctly:
+/// - **Sequential** timers (each armed *after* the previous fired) have a later
+///   anchor, so their deadlines chain and the result is the SUM of durations —
+///   including every classic `ctx.timer` (each parks the workflow, so it always
+///   arms after the previous one fired).
+/// - **Concurrently-armed** cancellable timers (one `await_fire` batch /
+///   overlapping arm windows) share an anchor (no fire advanced `now` between
+///   their `TimerStarted`s), so the result is the MAX deadline — matching
+///   production, where all deadlines in one batch start at the same instant.
+///
+/// This is the read-side counterpart to the live-clock advance in
+/// `WorkflowContext::await_timer_fire`; the two must agree at terminal.
 fn fired_timer_duration_secs(events: &[WorkflowEvent]) -> u64 {
     use std::collections::{HashMap, VecDeque};
+    // Per-id FIFO queue of pending arms, each carrying its deadline anchor
+    // (the `now` at which it was armed).
     let mut pending: HashMap<&str, VecDeque<u64>> = HashMap::new();
-    let mut total: u64 = 0;
+    let mut now: u64 = 0;
     for event in events {
         match event {
             WorkflowEvent::TimerStarted {
                 timer_id,
                 duration_secs,
             } => {
+                // Deadline = anchor (now) + duration. Store the deadline directly.
                 pending
                     .entry(timer_id.as_str())
                     .or_default()
-                    .push_back(*duration_secs);
+                    .push_back(now.saturating_add(*duration_secs));
             }
             WorkflowEvent::TimerFired { timer_id } => {
-                if let Some(secs) = pending
+                if let Some(deadline) = pending
                     .get_mut(timer_id.as_str())
                     .and_then(VecDeque::pop_front)
                 {
-                    total = total.saturating_add(secs);
+                    now = now.max(deadline);
                 }
             }
             WorkflowEvent::TimerCancelled { timer_id } => {
@@ -2215,7 +2232,7 @@ fn fired_timer_duration_secs(events: &[WorkflowEvent]) -> u64 {
             _ => {}
         }
     }
-    total
+    now
 }
 
 impl TestRunOutcome {
@@ -2230,16 +2247,20 @@ impl TestRunOutcome {
 
     /// The virtual "now" at the end of the run (issue #526).
     ///
-    /// Computed as `start_time + Σ duration_secs` over the durable timers that
-    /// **actually fired** along the taken path — every `TimerStarted` paired with
-    /// a matching `TimerFired` (per id, FIFO). A `TimerStarted` that was cancelled
-    /// or reset (a cancellable timer, issue #768) never fired, so its duration is
-    /// **excluded** — otherwise a cancelled/reset arm would advance the virtual
-    /// clock even though the workflow never observed its fire, disagreeing with
-    /// `ctx.now()` (Codex P2 round 8). Signal-preempted timers produce no
-    /// `TimerStarted` event and likewise do not advance this clock. The classic
-    /// `ctx.timer` path always fires, so every one of its `TimerStarted` events
-    /// pairs with a `TimerFired` and the sum is unchanged.
+    /// Computed as `start_time + max`-of-deadlines over the durable timers that
+    /// **actually fired** along the taken path — each `TimerStarted` anchors a
+    /// deadline (`now-at-arm + duration`) and every matching `TimerFired` (per id,
+    /// FIFO) advances the virtual clock to `max(now, deadline)`. Sequential timers
+    /// therefore SUM (each armed after the previous fired) and concurrently-armed
+    /// cancellable timers take the MAX (they share an anchor, matching production
+    /// where all deadlines in one `await_fire` batch start at the same instant —
+    /// issue #768, Codex P2 round 16). A `TimerStarted` that was cancelled or reset
+    /// never fired, so its deadline is **excluded** — otherwise a cancelled/reset
+    /// arm would advance the virtual clock even though the workflow never observed
+    /// its fire, disagreeing with `ctx.now()` (Codex P2 round 8). Signal-preempted
+    /// timers produce no `TimerStarted` event and likewise do not advance this
+    /// clock. The classic `ctx.timer` path always fires and is always sequential,
+    /// so the sum is unchanged from the pre-round-16 model.
     #[must_use]
     pub fn final_now(&self) -> DateTime<Utc> {
         let total_secs: u64 = fired_timer_duration_secs(&self.events);
@@ -3575,6 +3596,43 @@ mod tests {
         assert_eq!(fired_timer_duration_secs(&[]), 0);
         // A lone TimerFired with no matching TimerStarted contributes nothing.
         assert_eq!(fired_timer_duration_secs(&[tf("ghost")]), 0);
+    }
+
+    #[test]
+    fn concurrently_armed_timers_advance_to_the_max_deadline_not_the_sum() {
+        // Issue #768, Codex P2 round 16. Two cancellable timers armed in one
+        // `await_fire` batch (both `TimerStarted` before either `TimerFired`) share
+        // a deadline anchor of `now = 0`, so the fired result is MAX(10, 1) = 10,
+        // NOT the SUM 11. Round-15 fires the smaller deadline first, so the recorded
+        // order is TS(slow), TS(fast), TF(fast), TF(slow).
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("slow", 10), ts("fast", 1), tf("fast"), tf("slow")]),
+            10,
+            "concurrently-armed timers must advance to the MAX deadline"
+        );
+        // Order of the two TimerFired events is irrelevant to the MAX.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("slow", 10), ts("fast", 1), tf("slow"), tf("fast")]),
+            10
+        );
+        // Sequential timers (each armed after the previous fired) still SUM.
+        assert_eq!(
+            fired_timer_duration_secs(&[ts("a", 10), tf("a"), ts("b", 1), tf("b")]),
+            11,
+            "sequential timers must still sum"
+        );
+        // Three concurrent → MAX of the three deadlines.
+        assert_eq!(
+            fired_timer_duration_secs(&[
+                ts("a", 3),
+                ts("b", 7),
+                ts("c", 2),
+                tf("c"),
+                tf("a"),
+                tf("b"),
+            ]),
+            7
+        );
     }
 
     fn simple_workflow<'a>(

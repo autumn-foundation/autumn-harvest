@@ -251,13 +251,43 @@ fn concurrent_await_two_timers_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
+        // Capture the virtual-clock start so the test can assert the elapsed after
+        // both concurrent timers fire is the MAX deadline (10s), not the SUM (11s)
+        // — issue #768, Codex P2 round 16.
+        let start = ctx.now();
         let slow = ctx.start_timer("slow", 10);
         let fast = ctx.start_timer("fast", 1);
         let (s, f) = tokio::join!(slow.await_fire(), fast.await_fire());
+        let now_elapsed_secs = (ctx.now() - start).num_seconds();
         Ok(json!({
             "slow": format!("{:?}", s.map_err(|e| e.to_string())?),
             "fast": format!("{:?}", f.map_err(|e| e.to_string())?),
+            "now_elapsed_secs": now_elapsed_secs,
         }))
+    })
+}
+
+/// (Codex P2 round 16, issue #768 — Finding 2) A sibling/handler-style
+/// `cancel_timer("deadline")` targeting an id the main body uses as a CLASSIC
+/// `ctx.timer` must be a NO-OP: it must NOT emit a `CancelTimer` (whose
+/// worker-side `delete_pending_timer` would delete the classic timer's durable
+/// row and hang its waiter). The classic timer therefore still fires and the run
+/// replays deterministically.
+fn cancel_timer_does_not_kill_a_classic_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // `join!` polls the classic timer FIRST — so `ctx.timer("deadline")` records
+        // "deadline" as a classic id and parks — THEN the sibling branch calls
+        // `cancel_timer("deadline")` on that now-classic id, exactly the Finding-2
+        // "cancel while the classic timer is pending" race. The cancel must be a
+        // no-op (no `CancelTimer`, no row delete), so the classic timer still fires.
+        let (t, _c) = tokio::join!(ctx.timer("deadline", 5), async {
+            ctx.cancel_timer("deadline")
+        });
+        t.map_err(|e| e.to_string())?;
+        Ok(json!("classic_fired"))
     })
 }
 
@@ -696,6 +726,23 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
         vec!["fast".to_string(), "slow".to_string()],
         "concurrent awaited timers must fire in deadline order (fast dur=1 before \
          slow dur=10), never in join! poll order: {fired_order:?}"
+    );
+
+    // Issue #768, Codex P2 round 16: the two timers are armed concurrently (one
+    // `await_fire` batch), so production starts both deadlines at the same instant
+    // and the workflow-observed elapsed after both fire is the MAX deadline (10s),
+    // NOT the sum (11s). The live `ctx.now()` read inside the workflow, and
+    // `final_now()`/`elapsed()` reconstructed from history, must all agree at 10.
+    let result = outcome.result.as_ref().expect("run ok");
+    assert_eq!(
+        result.get("now_elapsed_secs").and_then(Value::as_i64),
+        Some(10),
+        "ctx.now() after both concurrent timers fire must advance by MAX(10,1)=10, not 11"
+    );
+    assert_eq!(
+        outcome.elapsed().num_seconds(),
+        10,
+        "final_now/elapsed must reconstruct the MAX deadline (10s), not the sum (11s)"
     );
 
     let report = outcome
@@ -1171,6 +1218,51 @@ async fn cancel_then_classic_timer_same_id_arms_and_fires() {
 
     let report = outcome
         .replay_check(cancel_then_classic_timer_same_id_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_timer_on_a_classic_id_does_not_kill_the_classic_timer() {
+    // Issue #768, Codex P2 round 16 — Finding 2. A `cancel_timer("deadline")`
+    // targeting the classic timer's id must be a pure no-op: it must NOT record a
+    // `TimerCancelled` (whose worker-side `delete_pending_timer` would delete the
+    // classic timer's durable row), so the classic timer still fires — no hang —
+    // and the run replays deterministically.
+    let outcome = WorkflowTestEnv::new()
+        .run(
+            cancel_timer_does_not_kill_a_classic_timer_workflow,
+            json!(null),
+        )
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!("classic_fired")),
+        "the classic timer must fire despite a same-id cancel_timer: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // The cancel is a no-op: NO TimerCancelled corrupts the classic timer.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerCancelled { .. })),
+        "cancel_timer on a classic id must record no TimerCancelled: {events:?}"
+    );
+    // The classic timer both starts and fires.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "the classic timer must fire: {events:?}"
+    );
+
+    let report = outcome
+        .replay_check(cancel_timer_does_not_kill_a_classic_timer_workflow)
         .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
