@@ -935,6 +935,7 @@ fn current_details_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
+#[allow(clippy::too_many_lines)] // merge of trunk + branch register_fn lists
 fn build_replayer() -> WorkflowReplayer {
     WorkflowReplayer::new()
         .register_fn("canonical_workflow", canonical_workflow)
