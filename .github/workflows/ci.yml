@@ -204,28 +204,28 @@ jobs:
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --test legal_hold_integration --test workflow_summaries_integration --test run_chain_integration --no-run
       - name: Run Docker-backed integration tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- integration_e2e --test-threads=1
       - name: Run Docker-backed force-fail integration tests (issue #765)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- force_fail -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- force_fail --test-threads=1
       - name: Run Docker-backed panic containment integration tests (issue #782)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- panic_containment_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- panic_containment_tests --test-threads=1
       - name: Run Docker-backed activity interceptor integration tests (issue #680)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- activity_interceptor_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- activity_interceptor_tests --test-threads=1
       - name: Run retention override integration tests (issue #737)
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests --test-threads=1
       - name: Run retention summary integration tests (issue #752)
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-harvest --test integration -- retention_summary_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- retention_summary_tests --test-threads=1
       - name: Run Docker-backed typed workflow failure integration tests (issue #767)
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests --test-threads=1
       - name: Run Docker-backed typed workflow-failure retry-gate tests (issue #767 FIX B)
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests::workflow_typed -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests::workflow_typed --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
@@ -252,13 +252,13 @@ jobs:
         run: cargo test -p autumn-harvest-plugin --test dag_run_graph_integration -- --test-threads=1
       - name: Run core schedule run-history integration tests (issue #762)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- schedule_runs_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- schedule_runs_tests --test-threads=1
       - name: Run plugin schedule run-history integration tests (issue #762)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test schedule_runs_integration -- --test-threads=1
       - name: Run core start-idempotency integration tests (issue #808)
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-harvest --test integration -- start_idempotency_tests -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- start_idempotency_tests --test-threads=1
       - name: Run plugin start-idempotency integration tests (issue #808)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test start_idempotency_integration -- --test-threads=1
