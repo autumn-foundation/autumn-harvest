@@ -595,7 +595,7 @@ mod unified {
         );
     }
 
-    /// **AC5 — bounded gate, timer wins (FailRun) → deterministic failure.**
+    /// **AC5 — bounded gate, timer wins (`FailRun`) → deterministic failure.**
     ///
     /// The existing `gate_timeout_failrun_branch_fails_the_dag` only asserts a
     /// one-shot `is_err()`. This replays the timer-first history and asserts the
