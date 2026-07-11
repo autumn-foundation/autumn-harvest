@@ -114,6 +114,9 @@ pub mod handle;
 pub mod handle_typed;
 pub mod history_export;
 pub mod info;
+/// Activity execution interceptors (issue #680): an ordered middleware chain
+/// wrapping every activity execution on the worker (regular + local).
+pub mod interceptor;
 /// `cfg(loom)` synchronization-primitive shim (std under normal builds).
 ///
 /// Contained to the modules that opt into loom model checking; see
@@ -316,6 +319,9 @@ pub use history_export::{
 pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
     UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
+};
+pub use interceptor::{
+    ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
 pub use payload_codec::{
     CodecError, IdentityCodec, LossyDecodeOutcome, PayloadCodec, PayloadCodecs,

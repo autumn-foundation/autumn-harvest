@@ -378,6 +378,10 @@ pub struct HandlerRegistry {
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Ordered activity execution interceptor chain (issue #680). Index 0 is
+    /// the OUTERMOST wrapper. Empty (the default) = no interceptors, and the
+    /// dispatch path takes a zero-overhead direct handler call.
+    activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
 }
 
 impl HandlerRegistry {
@@ -515,6 +519,7 @@ impl HandlerRegistry {
             )),
             max_workflow_attempts_ceiling: None,
             payload_offloader: None,
+            activity_interceptors: Vec::new(),
         }
     }
 
@@ -610,6 +615,26 @@ impl HandlerRegistry {
     #[must_use]
     pub fn payload_offloader_arc(&self) -> Option<Arc<crate::payload_store::PayloadOffloader>> {
         self.payload_offloader.clone()
+    }
+
+    /// Install the ordered activity execution interceptor chain (issue #680).
+    ///
+    /// Index 0 is the OUTERMOST wrapper; the activity handler is innermost.
+    /// Applies to every activity execution on the worker — regular and local.
+    #[must_use]
+    pub fn with_activity_interceptors(
+        mut self,
+        interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
+    ) -> Self {
+        self.activity_interceptors = interceptors;
+        self
+    }
+
+    /// Borrow the configured activity interceptor chain (issue #680). Empty when
+    /// none are registered.
+    #[must_use]
+    pub fn activity_interceptors(&self) -> &[Arc<dyn crate::interceptor::ActivityInterceptor>] {
+        &self.activity_interceptors
     }
 
     /// Clone the shared state reference for runtime contexts.
@@ -1933,6 +1958,15 @@ async fn run_local_activity_inline(
         None
     };
 
+    // Issue #680: the activity interceptor chain wraps local activities too.
+    // The invocation is `is_local = true`; the queue label is the owning
+    // workflow task's queue. When no interceptors are registered
+    // `dispatch_with_interceptors` is a zero-overhead direct handler call. NOTE:
+    // for local activities the chain runs INSIDE the per-attempt local timeout
+    // below, so interceptor time counts against the effective start_to_close.
+    let interceptors = registry.activity_interceptors();
+    let invocation = crate::interceptor::ActivityInvocation::new(&run.name, true, queue_name);
+
     for attempt in start_attempt..=max_attempts {
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
@@ -1954,7 +1988,15 @@ async fn run_local_activity_inline(
         // escape the poll-time `catch_unwind` below. Both a construction panic and
         // a poll panic converge on the same retryable typed HandlerPanic Err and
         // emit `record_activity_panic` exactly once per panicking attempt.
-        let result = match crate::error::catch_construct(|| (handler)(&ctx, run.input.clone())) {
+        let result = match crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                interceptors,
+                &invocation,
+                &ctx,
+                run.input.clone(),
+                |input| (handler)(&ctx, input),
+            )
+        }) {
             Err(message) => {
                 registry
                     .telemetry()
@@ -6321,9 +6363,31 @@ async fn process_activity_task(
     // emits `record_activity_panic` once by inspecting the envelope's error type,
     // so neither the metric nor the circuit-breaker treatment differs from a
     // poll-phase panic.
+    // Issue #680: build the activity execution future through the configured
+    // interceptor chain. When no interceptors are registered
+    // `dispatch_with_interceptors` is a zero-overhead direct call to the same
+    // `(activity.handler)(&ctx, input)` terminal as before, so the dispatch path
+    // is byte-for-byte unchanged for the default (no-interceptor) case. The
+    // whole chain — interceptors and handler alike — is constructed inside
+    // `catch_construct` and polled inside `catch_unwind`, so a panic in either
+    // an interceptor or the handler is contained on the identical retryable
+    // HandlerPanic path (issue #782). Interceptors run AFTER the circuit-breaker
+    // admit gate above, so a circuit-open short-circuit never reaches here.
+    let activity_interceptors = registry.activity_interceptors();
+    let invocation =
+        crate::interceptor::ActivityInvocation::new(activity_name, false, &task.queue_name);
+    let activity_handler = activity.handler;
     let mut activity_future = {
         use futures::FutureExt as _;
-        match crate::error::catch_construct(|| (activity.handler)(&ctx, task.input.clone())) {
+        match crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                activity_interceptors,
+                &invocation,
+                &ctx,
+                task.input.clone(),
+                |input| (activity_handler)(&ctx, input),
+            )
+        }) {
             Ok(fut) => std::panic::AssertUnwindSafe(fut)
                 .catch_unwind()
                 .map(|caught| match caught {
