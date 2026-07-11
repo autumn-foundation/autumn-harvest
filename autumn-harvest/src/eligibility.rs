@@ -1,3 +1,9 @@
+//! Worker capability requirements parsing and matching.
+//!
+//! This module provides parsing for string-based worker capability requirements
+//! (e.g. `gpu = true, region in [eu-west-1, eu-central-1]`) and matches them
+//! against a worker's provided capability labels.
+
 use std::collections::HashMap;
 
 /// A single capability requirement for task execution.

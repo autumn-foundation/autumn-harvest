@@ -1,3 +1,9 @@
+//! Declarative triggers for workflow completion.
+//!
+//! This module contains data structures and evaluation logic for declarative triggers
+//! that fire when a source workflow reaches a terminal state, potentially initiating
+//! a target workflow if conditions are met.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;

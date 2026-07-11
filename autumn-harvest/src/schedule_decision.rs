@@ -1,3 +1,8 @@
+//! Persistence for schedule firing decisions.
+//!
+//! This module handles the recording and lifecycle (purging) of decisions made
+//! by the scheduler regarding when and why schedules are fired or skipped.
+
 use crate::models::NewScheduleDecision;
 use crate::schema::harvest_schedule_decisions;
 use crate::telemetry::MetricsRecorder;

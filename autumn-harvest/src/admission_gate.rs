@@ -395,6 +395,7 @@ impl AdmissionGateCache {
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
 
 #[cfg(feature = "db")]
+/// Database operations for `AdmissionGate`s.
 pub mod db {
     use super::{AdmissionGate, AdmissionGateId, DateTime, GateScope, MAX_ACTIVE_GATES, Utc, Uuid};
     use crate::error::{HarvestResult, database_error};
