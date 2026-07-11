@@ -2342,6 +2342,16 @@ impl WorkflowContext {
 
     // ── Accessors ─────────────────────────────────────────────────────
 
+    /// The task queue this workflow execution runs on.
+    ///
+    /// Set by the executor from `WorkflowExecuteSpanMeta.queue_name` (the
+    /// counterpart of [`with_queue_name`](Self::with_queue_name)); empty for
+    /// bare `new_test()` contexts that never went through the executor.
+    #[must_use]
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
+    }
+
     /// Deterministic "wall clock" — returns the `WorkflowStarted` timestamp
     /// so that all replays produce the same result.
     ///

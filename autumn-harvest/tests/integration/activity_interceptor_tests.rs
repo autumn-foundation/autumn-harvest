@@ -28,9 +28,13 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
-//! `INIT_SQL`. Each test uses a unique `ExecutionId` and its own per-registry
-//! recorder captured by the interceptor instance, so no process-global state or
-//! cross-test scrubbing is required.
+//! `INIT_SQL`. Each test uses a unique `ExecutionId`, a **unique task queue**
+//! (its worker polls only that queue, and its workflow + activity tasks all land
+//! on it — activities are dispatched onto `ctx.queue_name()`, never a shared
+//! `"default"`), and its own per-registry recorder captured by the interceptor
+//! instance. That makes the suite robust to a shared `HARVEST_TEST_DATABASE_URL`
+//! run in parallel: no worker can cross-claim another test's tasks (FIX 5 / S3),
+//! and no process-global state or cross-test scrubbing is required.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -322,9 +326,15 @@ fn echo_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) 
 }
 
 /// Workflow: run one regular activity, return its (interceptor-transformed) result.
+///
+/// Activities are dispatched onto the workflow's own task queue
+/// (`ctx.queue_name()`) rather than a hardcoded `"default"`, so a per-test
+/// unique queue (FIX 5 / S3) isolates every task this run produces and the suite
+/// is robust to a shared `HARVEST_TEST_DATABASE_URL` run in parallel.
 fn wf_one_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
-        ctx.execute_activity_raw("echo", input, "default")
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw("echo", input, &queue)
             .await
             .map_err(|e| e.to_string())
     })
@@ -333,12 +343,13 @@ fn wf_one_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_
 /// Workflow: run two regular activities sequentially, return the second result.
 fn wf_two_activities(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
         let a = ctx
-            .execute_activity_raw("echo", input.clone(), "default")
+            .execute_activity_raw("echo", input.clone(), &queue)
             .await
             .map_err(|e| e.to_string())?;
         let b = ctx
-            .execute_activity_raw("echo2", a, "default")
+            .execute_activity_raw("echo2", a, &queue)
             .await
             .map_err(|e| e.to_string())?;
         Ok(b)
@@ -362,8 +373,9 @@ fn wf_one_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
 /// Workflow: run a regular then a local activity (control for zero-interceptor).
 fn wf_regular_and_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
         let r = ctx
-            .execute_activity_raw("echo", input.clone(), "default")
+            .execute_activity_raw("echo", input.clone(), &queue)
             .await
             .map_err(|e| e.to_string())?;
         let l = ctx
@@ -400,12 +412,12 @@ fn build_registry(
     )
 }
 
-fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
+fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
                 worker_id: worker_id.to_string(),
-                queues: vec!["default".to_string()],
+                queues: vec![queue.to_string()],
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
@@ -447,6 +459,7 @@ async fn seed_workflow(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
     input: serde_json::Value,
+    queue: &str,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
     let row = NewWorkflowExecution {
@@ -457,7 +470,7 @@ async fn seed_workflow(
         shard_id: 0,
         input: input.clone(),
         parent_id: None,
-        queue_name: "default",
+        queue_name: queue,
         execution_timeout: None,
         deadline_at: None,
         memo: None,
@@ -501,7 +514,7 @@ async fn seed_workflow(
     .await
     .expect("append WorkflowStarted");
 
-    let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
     queue::enqueue(conn, &params)
@@ -670,8 +683,10 @@ fn workflow_completed_output(history: &[WorkflowEvent]) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interceptor_wraps_regular_activity_and_records_transformed_value() {
     let (url, _container) = setup_db().await;
+    let queue = "q-wrap-regular";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1})).await;
+    let exec_id =
+        seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1}), queue).await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let interceptor = Arc::new(CountingTransformInterceptor { seen: seen.clone() });
@@ -680,7 +695,7 @@ async fn interceptor_wraps_regular_activity_and_records_transformed_value() {
         vec![act_info("echo", echo_activity, false, None)],
         vec![interceptor],
     );
-    let worker = build_worker("worker-wrap-regular", Arc::clone(&registry));
+    let worker = build_worker("worker-wrap-regular", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     run_to_state(
@@ -722,8 +737,10 @@ async fn interceptor_wraps_regular_activity_and_records_transformed_value() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interceptor_not_reinvoked_on_replay() {
     let (url, _container) = setup_db().await;
+    let queue = "q-no-replay";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_two_activities", serde_json::json!({"v": 2})).await;
+    let exec_id =
+        seed_workflow(&mut conn, "wf_two_activities", serde_json::json!({"v": 2}), queue).await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let interceptor = Arc::new(CountingTransformInterceptor { seen: seen.clone() });
@@ -735,7 +752,7 @@ async fn interceptor_not_reinvoked_on_replay() {
         ],
         vec![interceptor],
     );
-    let worker = build_worker("worker-no-replay-reinvoke", Arc::clone(&registry));
+    let worker = build_worker("worker-no-replay-reinvoke", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     run_to_state(
@@ -768,8 +785,10 @@ async fn interceptor_not_reinvoked_on_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interceptor_wraps_local_activity() {
     let (url, _container) = setup_db().await;
+    let queue = "q-wrap-local";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_one_local", serde_json::json!({"v": 3})).await;
+    let exec_id =
+        seed_workflow(&mut conn, "wf_one_local", serde_json::json!({"v": 3}), queue).await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let interceptor = Arc::new(CountingTransformInterceptor { seen: seen.clone() });
@@ -778,7 +797,7 @@ async fn interceptor_wraps_local_activity() {
         vec![act_info("echo_local", echo_local, true, None)],
         vec![interceptor],
     );
-    let worker = build_worker("worker-wrap-local", Arc::clone(&registry));
+    let worker = build_worker("worker-wrap-local", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     run_to_state(
@@ -819,8 +838,10 @@ async fn interceptor_wraps_local_activity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn panicking_interceptor_becomes_activity_failed_and_worker_survives() {
     let (url, _container) = setup_db().await;
+    let queue = "q-panic-int";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_panic_int", serde_json::json!({"v": 4})).await;
+    let exec_id =
+        seed_workflow(&mut conn, "wf_panic_int", serde_json::json!({"v": 4}), queue).await;
 
     let registry = build_registry(
         vec![wf_info("wf_panic_int", wf_one_activity)],
@@ -833,7 +854,7 @@ async fn panicking_interceptor_becomes_activity_failed_and_worker_survives() {
         )],
         vec![Arc::new(PanicInterceptor)],
     );
-    let worker = build_worker("worker-panic-int", Arc::clone(&registry));
+    let worker = build_worker("worker-panic-int", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     // Reaching FAILED at all proves the worker process survived the panic.
@@ -901,8 +922,9 @@ async fn panicking_interceptor_becomes_activity_failed_and_worker_survives() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interceptor_error_participates_in_retry_then_terminal() {
     let (url, _container) = setup_db().await;
+    let queue = "q-err-int";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_err_int", serde_json::json!({"v": 5})).await;
+    let exec_id = seed_workflow(&mut conn, "wf_err_int", serde_json::json!({"v": 5}), queue).await;
 
     let attempts = Arc::new(Mutex::new(0usize));
     let registry = build_registry(
@@ -918,7 +940,7 @@ async fn interceptor_error_participates_in_retry_then_terminal() {
             attempts: attempts.clone(),
         })],
     );
-    let worker = build_worker("worker-err-int", Arc::clone(&registry));
+    let worker = build_worker("worker-err-int", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     let execution = run_to_state(
@@ -976,11 +998,13 @@ async fn interceptor_error_participates_in_retry_then_terminal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_interceptor_execution_is_unchanged() {
     let (url, _container) = setup_db().await;
+    let queue = "q-zero-int";
     let mut conn = connect(&url).await;
     let exec_id = seed_workflow(
         &mut conn,
         "wf_regular_and_local",
         serde_json::json!({"v": 6}),
+        queue,
     )
     .await;
 
@@ -993,7 +1017,7 @@ async fn zero_interceptor_execution_is_unchanged() {
         // No interceptors registered — the default path.
         Vec::new(),
     );
-    let worker = build_worker("worker-zero-int", Arc::clone(&registry));
+    let worker = build_worker("worker-zero-int", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     run_to_state(
@@ -1027,8 +1051,9 @@ async fn zero_interceptor_execution_is_unchanged() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registration_order_is_outermost_first_end_to_end() {
     let (url, _container) = setup_db().await;
+    let queue = "q-order";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_order", serde_json::json!({"v": 7})).await;
+    let exec_id = seed_workflow(&mut conn, "wf_order", serde_json::json!({"v": 7}), queue).await;
 
     let log = Arc::new(Mutex::new(Vec::new()));
     // Handler logs "handler" via a bespoke activity so the ordering is complete.
@@ -1055,7 +1080,7 @@ async fn registration_order_is_outermost_first_end_to_end() {
             }),
         ],
     );
-    let worker = build_worker("worker-order", Arc::clone(&registry));
+    let worker = build_worker("worker-order", queue, Arc::clone(&registry));
     let pool = build_pool(&url);
 
     run_to_state(
