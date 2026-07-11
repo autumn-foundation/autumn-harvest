@@ -6365,9 +6365,11 @@ async fn process_activity_task(
     // poll-phase panic.
     // Issue #680: build the activity execution future through the configured
     // interceptor chain. When no interceptors are registered
-    // `dispatch_with_interceptors` is a zero-overhead direct call to the same
-    // `(activity.handler)(&ctx, input)` terminal as before, so the dispatch path
-    // is byte-for-byte unchanged for the default (no-interceptor) case. The
+    // `dispatch_with_interceptors` is a zero-allocation direct call to the same
+    // `(activity.handler)(&ctx, input)` terminal as before (it constructs a
+    // stack `ActivityInvocation` + slice borrow but boxes nothing extra), so the
+    // dispatch path is functionally unchanged for the default (no-interceptor)
+    // case. The
     // whole chain — interceptors and handler alike — is constructed inside
     // `catch_construct` and polled inside `catch_unwind`, so a panic in either
     // an interceptor or the handler is contained on the identical retryable

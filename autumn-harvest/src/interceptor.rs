@@ -56,6 +56,12 @@
 //! back; interceptors are never re-invoked during replay of a completed
 //! activity.
 //!
+//! Transforming the `input` an interceptor passes to the handler changes only
+//! what the handler *computes*; it does **not** change the `ActivityScheduled`
+//! event, whose `input` is fixed by workflow code at schedule time and recorded
+//! before dispatch ever reaches the interceptor. An input transform therefore
+//! cannot diverge replay — the scheduled input on the record is unaffected.
+//!
 //! # Input is plaintext
 //!
 //! The `input` passed to an interceptor is the activity's already-decoded
@@ -71,6 +77,12 @@
 //! effective `start_to_close` (capped by
 //! [`WorkerConfig::max_local_activity_start_to_close`](crate::builder::WorkerConfig)).
 //! Regular activities have no such inline timeout wrapping on the dispatch path.
+//!
+//! An interceptor sees the same [`ActivityContext`] capabilities the handler
+//! does. On a local activity that means no functioning heartbeat channel:
+//! `ctx.heartbeat(..)` returns a `Config` error and no checkpoint is available —
+//! this is the pre-existing local-activity contract, inherited by interceptors,
+//! not introduced by them.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -110,8 +122,12 @@ impl<'a> ActivityInvocation<'a> {
     }
 
     /// The registered activity name.
+    ///
+    /// Returns a borrow tied to the invocation's own lifetime (`'a`), not to
+    /// `&self`, so an interceptor may hold the name for the full invocation
+    /// (e.g. into the `next.run(..).await` continuation) without cloning.
     #[must_use]
-    pub const fn name(&self) -> &str {
+    pub const fn name(&self) -> &'a str {
         self.name
     }
 
@@ -123,8 +139,12 @@ impl<'a> ActivityInvocation<'a> {
 
     /// The task queue this activity runs on. For a local activity this is the
     /// owning workflow task's queue.
+    ///
+    /// Returns a borrow tied to the invocation's own lifetime (`'a`), not to
+    /// `&self`, so an interceptor may hold the queue name for the full
+    /// invocation without cloning.
     #[must_use]
-    pub const fn queue_name(&self) -> &str {
+    pub const fn queue_name(&self) -> &'a str {
         self.queue_name
     }
 
