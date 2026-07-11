@@ -1020,7 +1020,17 @@ impl WorkflowHandle {
         let waker = futures::task::waker_ref(&waker_arc);
         let mut poll_cx = std::task::Context::from_waker(&waker);
 
-        let handler_fut = (workflow_info.handler)(&ctx, execution.input.clone());
+        // Issue #782 (PR #1012 review): contain a panic during future
+        // *construction* (a hand-written handler doing synchronous work before
+        // returning its boxed future), mirroring the poll-time containment below.
+        // Query replays emit no commands and append no events — map the caught
+        // construction panic to a clean `QueryHandlerPanicked` (503).
+        let handler_fut = match crate::error::catch_construct(|| {
+            (workflow_info.handler)(&ctx, execution.input.clone())
+        }) {
+            Ok(fut) => fut,
+            Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
+        };
         tokio::pin!(handler_fut);
 
         let mut replay_result = None;
@@ -1034,7 +1044,24 @@ impl WorkflowHandle {
                 });
             }
             flag.store(false, std::sync::atomic::Ordering::Release);
-            match handler_fut.as_mut().poll(&mut poll_cx) {
+            // Issue #782: contain a workflow-handler panic during the in-process
+            // read-only replay drive, mirroring `executor::drive_query_replay`
+            // exactly. Without this, a panicking query handler on a code-changed
+            // in-flight run unwinds through the in-process
+            // `TypedWorkflowHandle`/`WorkflowHandle` caller. Query replays emit no
+            // commands and append no events, so there is nothing to roll back —
+            // map the caught panic to a clean `QueryHandlerPanicked` (503).
+            let poll = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler_fut.as_mut().poll(&mut poll_cx)
+            })) {
+                Ok(poll) => poll,
+                Err(panic_payload) => {
+                    return Err(HarvestError::QueryHandlerPanicked(
+                        crate::error::panic_message(panic_payload),
+                    ));
+                }
+            };
+            match poll {
                 std::task::Poll::Ready(res) => {
                     replay_result = Some(res);
                     break;

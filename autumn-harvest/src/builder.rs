@@ -2191,6 +2191,25 @@ pub struct WorkerConfig {
     /// (workflow tasks run without a wall-clock budget — the behaviour before
     /// this field was added). Protection is **on by default**.
     pub workflow_task_timeout: Duration,
+    /// Maximum number of times a workflow whose handler **panics** (unwinds) is
+    /// re-dispatched with backoff before the run is failed terminally with a
+    /// typed `HandlerPanic` error (issue #782).
+    ///
+    /// A caught workflow-body panic is treated as a recoverable, non-terminal
+    /// condition for the first `workflow_panic_max_attempts` strikes so a bad
+    /// deploy can be hotfixed-and-redeployed before in-flight runs fail. Once
+    /// the budget is exhausted (a permanent panic bug) the run fails terminally,
+    /// bounding the re-dispatch churn.
+    ///
+    /// The strike counter is **in-process and per-worker-instance**, so it
+    /// resets on worker restart/redeploy. This is intentional: a redeploy of
+    /// fixed code gets a fresh budget (exactly the "buy time to hotfix" goal),
+    /// while a single long-lived worker still terminates a permanently-panicking
+    /// run after this many consecutive strikes.
+    ///
+    /// Defaults to **3**. Set to `0` to fail terminally on the **first** panic
+    /// (no panic-retry).
+    pub workflow_panic_max_attempts: u32,
     /// Maximum wall-clock time a workflow execution may stay paused before the
     /// bounded-pause auto-resume scanner force-resumes it with
     /// `actor = "auto-resume(timeout)"` (issue #383).
@@ -2274,6 +2293,7 @@ impl Default for WorkerConfig {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             workflow_task_timeout: Duration::from_secs(10),
+            workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
@@ -2502,6 +2522,30 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_workflow_task_timeout(mut self, timeout: Duration) -> Self {
         self.workflow_task_timeout = timeout;
+        self
+    }
+
+    /// Override the maximum number of panic re-dispatches before a
+    /// panicking-workflow run fails terminally (issue #782).
+    ///
+    /// See [`workflow_panic_max_attempts`](Self::workflow_panic_max_attempts).
+    /// Defaults to **3**; `0` fails terminally on the first panic.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_workflow_panic_max_attempts(5);
+    /// assert_eq!(config.workflow_panic_max_attempts, 5);
+    ///
+    /// // Fail terminally on the first panic.
+    /// let config = WorkerConfig::default().with_workflow_panic_max_attempts(0);
+    /// assert_eq!(config.workflow_panic_max_attempts, 0);
+    /// ```
+    #[must_use]
+    pub const fn with_workflow_panic_max_attempts(mut self, attempts: u32) -> Self {
+        self.workflow_panic_max_attempts = attempts;
         self
     }
 
@@ -3433,6 +3477,36 @@ mod tests {
     fn worker_config_poison_pill_threshold_zero_disables() {
         let config = WorkerConfig::default().with_poison_pill_threshold(0);
         assert_eq!(config.poison_pill_threshold, 0);
+    }
+
+    // ── Workflow panic-retry budget tests (issue #782) ────────────────────
+
+    #[test]
+    fn worker_config_workflow_panic_max_attempts_defaults_to_3() {
+        assert_eq!(WorkerConfig::default().workflow_panic_max_attempts, 3);
+    }
+
+    #[test]
+    fn worker_config_with_workflow_panic_max_attempts_overrides() {
+        let config = WorkerConfig::default().with_workflow_panic_max_attempts(5);
+        assert_eq!(config.workflow_panic_max_attempts, 5);
+    }
+
+    #[test]
+    fn worker_config_workflow_panic_max_attempts_zero_is_terminal_on_first_panic() {
+        let config = WorkerConfig::default().with_workflow_panic_max_attempts(0);
+        assert_eq!(config.workflow_panic_max_attempts, 0);
+    }
+
+    // `WorkerRuntimeConfig` lives in the `db`-gated `worker` module, so this
+    // threading assertion is only compiled under the `db` feature.
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_runtime_config_threads_workflow_panic_max_attempts() {
+        use crate::worker::WorkerRuntimeConfig;
+        let cfg = WorkerConfig::default().with_workflow_panic_max_attempts(7);
+        let runtime: WorkerRuntimeConfig = cfg.into();
+        assert_eq!(runtime.workflow_panic_max_attempts, 7);
     }
 
     #[test]

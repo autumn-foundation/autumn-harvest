@@ -886,6 +886,7 @@ mod db_tests {
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,
                         workflow_task_timeout: Duration::from_secs(20),
+                        workflow_panic_max_attempts: 3,
                         labels: std::collections::HashMap::new(),
                         queue_weights: std::collections::HashMap::new(),
                         max_workflow_pause_duration: Duration::from_secs(24 * 3600),

@@ -142,6 +142,9 @@ pub struct WorkerRuntimeConfig {
     /// the worker reclaims the concurrency slot (issue #494).
     /// `Duration::ZERO` disables the timeout (unbounded dispatch time).
     pub workflow_task_timeout: Duration,
+    /// Maximum panic re-dispatches before a panicking-workflow run fails
+    /// terminally (issue #782). `0` fails terminally on the first panic.
+    pub workflow_panic_max_attempts: u32,
     /// Bounded-pause ceiling before the auto-resume scanner force-resumes a
     /// paused execution (issue #383). Default 24 hours.
     pub max_workflow_pause_duration: Duration,
@@ -269,6 +272,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
             workflow_task_timeout: cfg.workflow_task_timeout,
+            workflow_panic_max_attempts: cfg.workflow_panic_max_attempts,
             max_workflow_pause_duration: cfg.max_workflow_pause_duration,
             labels: cfg.labels,
             #[cfg(feature = "db")]
@@ -1834,6 +1838,9 @@ async fn run_local_activity_inline(
     max_start_to_close: Duration,
     next_event_id: &mut i32,
     context_headers: std::sync::Arc<std::collections::HashMap<String, String>>,
+    // Owning workflow task queue, used only as the `queue` label on the
+    // contained-local-activity-panic metric (issue #782).
+    queue_name: &str,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -1935,14 +1942,51 @@ async fn run_local_activity_inline(
                 .with_attempt(attempt)
                 .with_max_attempts(max_attempts)
                 .with_previous_failure(previous_failure.clone());
-        let result = tokio::time::timeout(per_attempt_timeout, (handler)(&ctx, run.input.clone()))
-            .await
-            .unwrap_or_else(|_| {
-                Err(format!(
-                    "local activity '{}' timed out after {:?}",
-                    run.name, per_attempt_timeout
-                ))
-            });
+        // Issue #782: contain a local-activity handler panic. Local activities
+        // run inline in the workflow task, so an uncaught panic here would
+        // unwind the whole workflow-task dispatch. Catch it and flatten into a
+        // retryable typed HandlerPanic Err so it flows through the existing
+        // Err branch (LocalActivityFailed retry path), honouring the retry
+        // policy exactly like `Err(String)`.
+        // Issue #782 (PR #1012 review): contain a panic during future
+        // *construction* too — a hand-written local-activity handler may do
+        // synchronous work before returning its boxed future, and that would
+        // escape the poll-time `catch_unwind` below. Both a construction panic and
+        // a poll panic converge on the same retryable typed HandlerPanic Err and
+        // emit `record_activity_panic` exactly once per panicking attempt.
+        let result = match crate::error::catch_construct(|| (handler)(&ctx, run.input.clone())) {
+            Err(message) => {
+                registry
+                    .telemetry()
+                    .metrics
+                    .record_activity_panic(&run.name, queue_name);
+                Err(handler_panic_activity_envelope(message))
+            }
+            Ok(fut) => {
+                use futures::FutureExt as _;
+                let caught = tokio::time::timeout(
+                    per_attempt_timeout,
+                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                )
+                .await;
+                match caught {
+                    Ok(Ok(inner)) => inner,
+                    Ok(Err(panic_payload)) => {
+                        registry
+                            .telemetry()
+                            .metrics
+                            .record_activity_panic(&run.name, queue_name);
+                        Err(handler_panic_activity_envelope(
+                            crate::error::panic_message(panic_payload),
+                        ))
+                    }
+                    Err(_elapsed) => Err(format!(
+                        "local activity '{}' timed out after {:?}",
+                        run.name, per_attempt_timeout
+                    )),
+                }
+            }
+        };
 
         match result {
             Ok(output) => {
@@ -2554,6 +2598,111 @@ fn nd_block_backoff(block_count: i32) -> Duration {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Contained workflow handler-panic retry (issue #782)
+// ---------------------------------------------------------------------------
+
+/// Base delay before the first panic re-dispatch (issue #782). A short floor
+/// (>0) prevents a fast, deterministic panic from hot-looping worker slots
+/// while the operator hotfixes-and-redeploys.
+const PANIC_RETRY_BACKOFF_BASE_SECS: u64 = 1;
+
+/// Ceiling on the panic re-dispatch delay (issue #782). The panic budget is
+/// small (default 3), so this cap is only reached with a deliberately-raised
+/// `workflow_panic_max_attempts`.
+const PANIC_RETRY_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Capped exponential backoff for a workflow panic re-dispatch: `1s * 2^(n-1)`,
+/// capped at 30s (issue #782).
+///
+/// `strikes` is the panic-strike count **after** this cycle's increment (1-based),
+/// so the first re-dispatch (`strikes == 1`) waits the base delay. Thin wrapper
+/// over the shared [`crate::policy::compute_retry_delay`] (`attempt` is 1-based
+/// there), so `strikes` maps directly to `attempt`; a `0` is clamped to `1`.
+fn panic_retry_backoff(strikes: u32) -> Duration {
+    crate::policy::compute_retry_delay(
+        Duration::from_secs(PANIC_RETRY_BACKOFF_BASE_SECS),
+        2.0,
+        Duration::from_secs(PANIC_RETRY_BACKOFF_CAP_SECS),
+        strikes.max(1),
+    )
+}
+
+/// Whether a contained workflow panic should be re-dispatched or failed
+/// terminally (issue #782). Pure decision, mirroring the poison-pill
+/// `quarantine_decision` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanicRetryDecision {
+    /// Re-dispatch the workflow task with backoff (non-terminal).
+    Requeue,
+    /// Fail the run terminally with a typed `HandlerPanic` error.
+    Terminal,
+}
+
+/// Decide retry-vs-terminal for a contained workflow panic given the
+/// **post-increment** strike count and the configured budget (issue #782).
+///
+/// - `max == 0` disables panic-retry entirely: the first panic is terminal.
+/// - Otherwise a strike **below** the budget re-dispatches; reaching the budget
+///   (`strikes >= max`) fails terminally. With the default `max == 3`, panics
+///   1 and 2 re-dispatch and panic 3 is terminal — i.e. exactly `max` panic
+///   *entries* total, of which `max - 1` are re-dispatches.
+const fn panic_retry_decision(strikes_after_increment: u32, max: u32) -> PanicRetryDecision {
+    if max == 0 || strikes_after_increment >= max {
+        PanicRetryDecision::Terminal
+    } else {
+        PanicRetryDecision::Requeue
+    }
+}
+
+/// Increment (and return) the consecutive-panic strike count for `exec_id`
+/// (issue #782). The mutex guard is scoped to this function so it is never held
+/// across an `.await` or a DB call in the caller.
+fn increment_panic_strike(
+    strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    exec_id: uuid::Uuid,
+) -> u32 {
+    let mut guard = strikes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = guard.entry(exec_id).or_insert(0);
+    *count = count.saturating_add(1);
+    let result = *count;
+    // Explicit early drop mirrors the sibling `workflow_task_timeout_strikes`
+    // pattern and satisfies clippy::significant_drop_tightening (the guard must
+    // outlive the `entry`/increment borrow, so it cannot be inlined).
+    drop(guard);
+    result
+}
+
+/// Clear the consecutive-panic strike entry for `exec_id` (issue #782), so a
+/// non-panic cycle resets the count and the map does not grow unbounded. The
+/// guard is scoped to this function.
+fn clear_panic_strike(
+    strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    exec_id: uuid::Uuid,
+) {
+    strikes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&exec_id);
+}
+
+/// Encode a contained **activity** handler-panic message as the typed
+/// `harvest_activity_failure_v1` envelope carrying the engine-reserved
+/// [`ERROR_TYPE_HANDLER_PANIC`](crate::failure::ERROR_TYPE_HANDLER_PANIC)
+/// class (issue #782).
+///
+/// The failure is **retryable** — a caught activity panic follows the same
+/// path as `Err(String)`, honouring the activity's retry policy — so it flows
+/// through `handle_activity_result`'s existing `Err` branch and, on exhaustion,
+/// dead-letters as ordinary retry-exhaustion rather than a poison-pill.
+fn handler_panic_activity_envelope(message: String) -> String {
+    use crate::failure::{ERROR_TYPE_HANDLER_PANIC, IntoActivityErrorString as _};
+    crate::failure::ActivityFailure::retryable(ERROR_TYPE_HANDLER_PANIC, message)
+        .into_error_payload()
+}
+
 /// Build the search-attrs diagnostic patch stamped on an execution when the
 /// engine records a replay divergence (issues #480/#603): `failure_cause`
 /// plus whichever of `event_index`/`expected`/`actual`/`workflow_type`/
@@ -3006,7 +3155,14 @@ async fn persist_workflow_failure(
 
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
     let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
-        if nd_details.is_none() {
+        // Issue #782: a contained handler-panic terminal must NOT also spawn a
+        // #523 fresh-execution retry — the panic-retry budget WAS the retry.
+        // Engine-reserved guard (independent of operator config): skip the retry
+        // plan when the decoded error type is HandlerPanic. Belt-and-braces
+        // alongside the `nd_details.is_none()` gate.
+        if nd_details.is_none()
+            && decoded.error_type.as_deref() != Some(crate::failure::ERROR_TYPE_HANDLER_PANIC)
+        {
             execution.and_then(|exec| {
                 let policy: RetryPolicy = exec
                     .workflow_retry_policy
@@ -5462,6 +5618,15 @@ async fn handle_activity_result(
             finalize_activity_completion(conn, task, exec_id, activity_id, output, offloader).await
         }
         Err(error) => {
+            // Issue #782: emit the panic counter once per panicking attempt
+            // (before the retry/terminal split). A contained activity panic is
+            // classified by the typed HandlerPanic error type in the envelope;
+            // it otherwise flows through the ordinary retryable-failure path.
+            if crate::failure::parse_error_payload_full(&error).error_type
+                == crate::failure::ERROR_TYPE_HANDLER_PANIC
+            {
+                metrics.record_activity_panic(activity_name_for_cap, &task.queue_name);
+            }
             let delay_result = next_retry_delay(task, &error, retry_policy);
             let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
 
@@ -6139,7 +6304,40 @@ async fn process_activity_task(
     );
     let started_at = std::time::Instant::now();
 
-    let mut activity_future = (activity.handler)(&ctx, task.input.clone());
+    // Issue #782: wrap the activity handler in a panic-containing value adapter.
+    // A caught panic is flattened into the existing `Result<Value, String>` Err
+    // channel as a *retryable* typed HandlerPanic failure, preserving the exact
+    // Output type + cancellation/grace-window semantics of
+    // `execute_activity_future_with_cancellation` (the adapter wraps the whole
+    // future object, so every poll — including the grace re-poll — is contained).
+    // Without this the panic unwinds past the DB state-transition boundary and
+    // leaves the task row stuck RUNNING on a live worker.
+    // Issue #782 (PR #1012 review): also contain a panic during future
+    // *construction* — a hand-written activity handler may do synchronous work
+    // before returning its boxed future, and that would escape the poll-time
+    // `catch_unwind`. On a construction panic, resolve immediately to the same
+    // retryable typed HandlerPanic envelope; it flows through the identical
+    // downstream path (cancellation adapter → `handle_activity_result`), which
+    // emits `record_activity_panic` once by inspecting the envelope's error type,
+    // so neither the metric nor the circuit-breaker treatment differs from a
+    // poll-phase panic.
+    let mut activity_future = {
+        use futures::FutureExt as _;
+        match crate::error::catch_construct(|| (activity.handler)(&ctx, task.input.clone())) {
+            Ok(fut) => std::panic::AssertUnwindSafe(fut)
+                .catch_unwind()
+                .map(|caught| match caught {
+                    Ok(inner) => inner,
+                    Err(panic_payload) => Err(handler_panic_activity_envelope(
+                        crate::error::panic_message(panic_payload),
+                    )),
+                })
+                .left_future(),
+            Err(message) => {
+                futures::future::ready(Err(handler_panic_activity_envelope(message))).right_future()
+            }
+        }
+    };
     let cancellation_observer = observe_task_cancellation(pool, task.id);
     tokio::pin!(cancellation_observer);
 
@@ -7286,6 +7484,30 @@ async fn fail_execution_on_error<T>(
     Err(error)
 }
 
+/// Terminal-fail wrapper for the `process_workflow_task` drive loop that also
+/// clears the execution's consecutive-panic strike entry (issue #782).
+///
+/// An early terminal-fail inside the drive loop (a transient error from an
+/// inline persist/local-activity DB call) ends the execution permanently
+/// *before* reaching the panic gate that would otherwise clear the strike. Any
+/// strike entry left by a prior contained-panic re-dispatch must be cleared
+/// here or it leaks one `u32` per such execution. The panic re-dispatch path
+/// returns `Ok(())` and is never routed through this wrapper, so its
+/// just-incremented strike is preserved (mirrors `workflow_task_timeout_strikes`).
+async fn fail_workflow_execution_clearing_strikes<T>(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    result: HarvestResult<T>,
+    workflow_panic_strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    exec_id: uuid::Uuid,
+) -> HarvestResult<T> {
+    if result.is_err() {
+        clear_panic_strike(workflow_panic_strikes, exec_id);
+    }
+    fail_execution_on_error(conn, task, worker_id, result).await
+}
+
 async fn load_task_execution(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -7744,6 +7966,7 @@ async fn persist_workflow_outcome(
             WorkflowOutcome::Failed {
                 error,
                 non_deterministic_details,
+                ..
             },
             Some(parent_id),
         ) if !is_detached_child => {
@@ -7776,6 +7999,7 @@ async fn persist_workflow_outcome(
             WorkflowOutcome::Failed {
                 error,
                 non_deterministic_details,
+                ..
             },
             _,
         ) => {
@@ -8400,6 +8624,10 @@ async fn process_workflow_task(
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
     dispatched_at: std::time::Instant,
+    // Issue #782: in-process contained-handler-panic strike map (per
+    // execution) and the configured re-dispatch budget.
+    workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    workflow_panic_max_attempts: u32,
 ) -> HarvestResult<()> {
     let mut prepared = prepare_workflow_task_with_cache(
         conn,
@@ -8655,11 +8883,13 @@ async fn process_workflow_task(
                         {
                             Ok(events) => events,
                             Err(e) => {
-                                return fail_execution_on_error(
+                                return fail_workflow_execution_clearing_strikes(
                                     conn,
                                     task,
                                     worker_id,
                                     Err::<(), _>(e),
+                                    workflow_panic_strikes,
+                                    prepared.exec_id.as_uuid(),
                                 )
                                 .await;
                             }
@@ -8709,13 +8939,21 @@ async fn process_workflow_task(
                     max_local_activity_start_to_close,
                     &mut next_event_id,
                     local_context_headers,
+                    &task.queue_name,
                 )
                 .await
                 {
                     Ok(outcome) => outcome,
                     Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
+                        return fail_workflow_execution_clearing_strikes(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
+                            workflow_panic_strikes,
+                            prepared.exec_id.as_uuid(),
+                        )
+                        .await;
                     }
                 };
                 let new_events = match inline_outcome {
@@ -8807,17 +9045,41 @@ async fn process_workflow_task(
                 )
                 .await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
@@ -8837,8 +9099,15 @@ async fn process_workflow_task(
                 {
                     Ok(events) => events,
                     Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
+                        return fail_workflow_execution_clearing_strikes(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
+                            workflow_panic_strikes,
+                            prepared.exec_id.as_uuid(),
+                        )
+                        .await;
                     }
                 };
                 history_events.extend(new_events.clone());
@@ -8971,17 +9240,41 @@ async fn process_workflow_task(
                 )
                 .await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
                 {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
                 }
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
@@ -9000,8 +9293,15 @@ async fn process_workflow_task(
                 {
                     Ok(events) => events,
                     Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
+                        return fail_workflow_execution_clearing_strikes(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
+                            workflow_panic_strikes,
+                            prepared.exec_id.as_uuid(),
+                        )
+                        .await;
                     }
                 };
                 let remaining_commands_with_unresolved = remaining_commands;
@@ -9045,7 +9345,7 @@ async fn process_workflow_task(
         }
     };
 
-    let (outcome, pending_cmds, execute_span) = loop_result;
+    let (outcome, mut pending_cmds, execute_span) = loop_result;
 
     // Issue #383: an operator may have paused this execution while this
     // workflow decision task was running. Pause is enforced at the claim layer
@@ -9122,8 +9422,16 @@ async fn process_workflow_task(
     if let WorkflowOutcome::Failed {
         error,
         non_deterministic_details: Some(details),
+        ..
     } = &outcome
     {
+        // An ND-block is a NON-panic outcome (handler_panic is always false when
+        // non_deterministic_details is Some — see the executor's mutually
+        // exclusive Failed constructions), so clear the consecutive-panic strike
+        // like every other non-panic path (issue #782, Codex review). The panic
+        // budget counts CONSECUTIVE panics; a stale strike surviving an ND-block
+        // interlude would exhaust the budget early after a rollback.
+        clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
         drop(execute_span);
         return block_workflow_for_non_determinism(
             conn,
@@ -9138,6 +9446,79 @@ async fn process_workflow_task(
             details,
         )
         .await;
+    }
+
+    // Issue #782: a **contained handler panic** must NOT fail the workflow on
+    // the first strike — buy time for a hotfix/redeploy by re-dispatching with
+    // capped backoff up to `workflow_panic_max_attempts`, then fail terminally
+    // with the typed HandlerPanic error. Placed here, beside the ND-block gate,
+    // before ANY terminal side effect: the panicked cycle's `pending_cmds` are
+    // untrustworthy and are discarded on both the retry and terminal paths (R5).
+    // The `handler_panic` flag is set only by the executor's caught-panic arm,
+    // so an author `Err(...)` (even one whose error type happens to be
+    // "HandlerPanic") never reaches this gate.
+    if let WorkflowOutcome::Failed {
+        handler_panic: true,
+        error,
+        ..
+    } = &outcome
+    {
+        // Emit on every panic entry (each retry AND the terminal), so the
+        // counter reflects the true panic rate.
+        telemetry
+            .metrics
+            .record_workflow_panic(&prepared.execution.workflow_name, &task.queue_name);
+
+        let strikes = increment_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
+
+        match panic_retry_decision(strikes, workflow_panic_max_attempts) {
+            PanicRetryDecision::Requeue => {
+                // `panic_retry_backoff` is bounded by PANIC_RETRY_BACKOFF_CAP_SECS
+                // (30s), always representable as a chrono::Duration; the fallback
+                // is defensive and still non-zero so it can never hot-loop.
+                let backoff = chrono::Duration::from_std(panic_retry_backoff(strikes))
+                    .unwrap_or_else(|_| chrono::Duration::seconds(30));
+                tracing::warn!(
+                    execution_id = %prepared.exec_id,
+                    workflow = %prepared.execution.workflow_name,
+                    queue = %task.queue_name,
+                    strikes,
+                    max_attempts = workflow_panic_max_attempts,
+                    backoff_secs = backoff.num_seconds(),
+                    "harvest: workflow handler panicked; containing as a non-terminal \
+                     re-dispatch (issue #782) — roll back or fix the panicking build"
+                );
+                drop(execute_span);
+                // Discard the panicked cycle's pending commands (R5) and re-pend
+                // the task with backoff. State stays RUNNING; no event appended.
+                return queue::requeue_workflow_task_after_panic(conn, task.id, backoff, error)
+                    .await;
+            }
+            PanicRetryDecision::Terminal => {
+                // Budget exhausted (or disabled): clear the strike entry and
+                // fall through to a CLEAN terminal WorkflowFailed carrying the
+                // typed HandlerPanic error, discarding the panicked cycle's
+                // pending commands.
+                clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
+                pending_cmds = Vec::new();
+                tracing::error!(
+                    execution_id = %prepared.exec_id,
+                    workflow = %prepared.execution.workflow_name,
+                    queue = %task.queue_name,
+                    strikes,
+                    max_attempts = workflow_panic_max_attempts,
+                    "harvest: workflow handler panic budget exhausted; failing the \
+                     execution terminally with a typed HandlerPanic error (issue #782)"
+                );
+            }
+        }
+    } else {
+        // Any non-panic workflow-task outcome (completed / suspended /
+        // continued-as-new / author-Err failed) clears the consecutive-panic
+        // strike counter so a later transient panic starts fresh and the map
+        // does not grow unbounded (mirrors the timeout-strike clear discipline).
+        // ND-blocked outcomes returned above and never reach here.
+        clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
     }
 
     let terminal_parent_close_cascade_events = if matches!(
@@ -9510,6 +9891,10 @@ async fn process_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    // Issue #782: contained-handler-panic strike map + retry budget, consulted
+    // only on the workflow path.
+    workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    workflow_panic_max_attempts: u32,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -9525,6 +9910,8 @@ async fn process_task(
                 max_local_activity_start_to_close,
                 workflow_cache,
                 dispatched_at,
+                &workflow_panic_strikes,
+                workflow_panic_max_attempts,
             )
             .await
         }
@@ -10257,6 +10644,31 @@ pub struct Worker {
     /// the same execution accumulate toward the same threshold.
     workflow_task_timeout_strikes:
         Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, i32>>>,
+    /// In-process consecutive-panic strike counter per workflow execution
+    /// (issue #782).
+    ///
+    /// Each contained workflow-handler panic increments the counter for that
+    /// execution ID; once it reaches `workflow_panic_max_attempts` the run is
+    /// failed terminally rather than re-dispatched. The counter is cleared on
+    /// **any completed non-panic decision cycle** for that execution (completed
+    /// / suspended / continued-as-new / author-Err failed / ND-blocked) AND on
+    /// an **early terminal-fail** inside the drive loop (a transient error that
+    /// takes the execution terminal FAILED before reaching the panic gate — see
+    /// `fail_workflow_execution_clearing_strikes`), so a strike entry never
+    /// outlives its execution. Only the panic **re-dispatch** path deliberately
+    /// leaves the just-incremented strike in place (it returns `Ok(())` and is
+    /// never routed through the clear); clearing there would reset the budget on
+    /// every panic and hot-loop forever.
+    ///
+    /// Keyed by `workflow_exec_id` (not `task.id`) so re-dispatched tasks from
+    /// the same execution accumulate toward the same budget. In-process and
+    /// per-worker-instance: it resets on worker restart, intentionally granting
+    /// a fresh budget to a hotfix redeploy while still bounding churn on a
+    /// single long-lived worker. An out-of-band cancel/terminate/reset that
+    /// takes the execution terminal without ever re-entering
+    /// `process_workflow_task` may leak one bounded entry until worker restart —
+    /// identical precedent to `workflow_task_timeout_strikes` (issue #494).
+    workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     /// In-process registry of worker sessions currently hosted by this
     /// worker (issue #606), bounded against `config.max_concurrent_sessions`
     /// via [`crate::sessions::try_acquire_session_slot`]. `0` (the default
@@ -10590,6 +11002,9 @@ impl Worker {
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            workflow_panic_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
@@ -12101,6 +12516,9 @@ impl Worker {
         };
         let poison_pill_threshold = self.config.poison_pill_threshold;
         let timeout_strikes = Arc::clone(&self.workflow_task_timeout_strikes);
+        // Issue #782: contained-handler-panic retry budget + strike map.
+        let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
+        let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
 
@@ -12162,6 +12580,8 @@ impl Worker {
                         dispatched_at,
                         max_concurrent_sessions,
                         &session_slots_in_use,
+                        Arc::clone(&panic_strikes),
+                        workflow_panic_max_attempts,
                     ),
                 )
                 .await
@@ -12299,6 +12719,8 @@ impl Worker {
                     dispatched_at,
                     max_concurrent_sessions,
                     &session_slots_in_use,
+                    panic_strikes,
+                    workflow_panic_max_attempts,
                 )
                 .await
                 {
@@ -12891,6 +13313,7 @@ mod tests {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             workflow_task_timeout: Duration::from_secs(10),
+            workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             max_workflow_history_events: None,
             labels: std::collections::HashMap::new(),
@@ -13403,6 +13826,7 @@ mod tests {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             workflow_task_timeout: Duration::from_secs(10),
+            workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             default_debounce_max_wait: Duration::from_secs(3600),
             labels: std::collections::HashMap::new(),
@@ -14669,6 +15093,93 @@ mod tests {
         assert_eq!(nd_block_backoff(i32::MAX), Duration::from_secs(300));
     }
 
+    // -----------------------------------------------------------------------
+    // Contained workflow handler-panic retry (issue #782)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn panic_retry_backoff_starts_at_base_and_doubles() {
+        assert_eq!(panic_retry_backoff(1), Duration::from_secs(1));
+        assert_eq!(panic_retry_backoff(2), Duration::from_secs(2));
+        assert_eq!(panic_retry_backoff(3), Duration::from_secs(4));
+        assert_eq!(panic_retry_backoff(4), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn panic_retry_backoff_caps_and_clamps() {
+        // 1 * 2^5 = 32 > 30 — first strike that hits the cap.
+        assert_eq!(panic_retry_backoff(6), Duration::from_secs(30));
+        assert_eq!(panic_retry_backoff(u32::MAX), Duration::from_secs(30));
+        // A degenerate `0` clamps to attempt 1 (base delay), not a zero-length
+        // hot-loop.
+        assert_eq!(panic_retry_backoff(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn panic_retry_decision_truth_table() {
+        // Default budget of 3: panics 1 and 2 re-dispatch, panic 3 is terminal.
+        assert_eq!(panic_retry_decision(1, 3), PanicRetryDecision::Requeue);
+        assert_eq!(panic_retry_decision(2, 3), PanicRetryDecision::Requeue);
+        assert_eq!(panic_retry_decision(3, 3), PanicRetryDecision::Terminal);
+        assert_eq!(panic_retry_decision(4, 3), PanicRetryDecision::Terminal);
+        // max == 0 disables panic-retry: the first panic is terminal.
+        assert_eq!(panic_retry_decision(1, 0), PanicRetryDecision::Terminal);
+        // max == 1 is terminal on the first strike.
+        assert_eq!(panic_retry_decision(1, 1), PanicRetryDecision::Terminal);
+    }
+
+    #[test]
+    fn handler_panic_activity_envelope_is_retryable_handler_panic() {
+        // A contained activity panic must encode as a *retryable* typed
+        // HandlerPanic failure so it follows the retry policy (issue #782 AC1).
+        let payload = handler_panic_activity_envelope("boom".to_string());
+        let failure = crate::failure::parse_error_payload_full(&payload);
+        assert_eq!(failure.error_type, crate::failure::ERROR_TYPE_HANDLER_PANIC);
+        assert_eq!(failure.message, "boom");
+        assert!(!failure.non_retryable);
+    }
+
+    #[test]
+    fn activity_handler_construction_panic_is_contained_as_retryable_handler_panic() {
+        // Issue #782 / PR #1012 review: a hand-written activity handler `fn` (the
+        // supported public surface) that panics while *constructing* its future —
+        // synchronous work before returning `Box::pin(...)` — is caught by the
+        // dispatch sites' `catch_construct` guard, which the poll-time
+        // `catch_unwind` cannot reach. Both the regular- and local-activity paths
+        // then feed the extracted message into `handler_panic_activity_envelope`,
+        // so a construction panic and a poll panic are byte-identical downstream:
+        // the same retryable typed HandlerPanic failure (which
+        // `handle_activity_result` counts once via the error-type check).
+        fn constructing_panic_activity(
+            _ctx: &crate::context::ActivityContext,
+            _input: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+        > {
+            panic!("boom during activity future construction");
+        }
+
+        let handler: crate::info::ActivityHandlerFn = constructing_panic_activity;
+        let ctx = crate::context::ActivityContext::new_test();
+        // Match rather than `.expect_err()`: the `Ok` future variant is not
+        // `Debug`, so `.expect_err()` would not compile.
+        let message = match crate::error::catch_construct(|| handler(&ctx, serde_json::Value::Null))
+        {
+            Ok(_fut) => panic!("a construction-phase panic must be caught, not produce a future"),
+            Err(message) => message,
+        };
+        assert_eq!(message, "boom during activity future construction");
+
+        let payload = handler_panic_activity_envelope(message);
+        let failure = crate::failure::parse_error_payload_full(&payload);
+        assert_eq!(failure.error_type, crate::failure::ERROR_TYPE_HANDLER_PANIC);
+        assert_eq!(failure.message, "boom during activity future construction");
+        assert!(
+            !failure.non_retryable,
+            "a contained construction panic remains retryable, like a poll panic"
+        );
+    }
+
     /// Property tests for the private [`nd_block_backoff`] helper (issue #603).
     /// Kept in-crate because the fn is private and `worker` is `db`-gated, so it
     /// cannot be reached from `tests/property/`. `nd_block_backoff` is a thin
@@ -14849,6 +15360,7 @@ mod tests {
         // returning None.
         let outcome = WorkflowOutcome::Failed {
             error: "non-deterministic replay: test".to_string(),
+            handler_panic: false,
             non_deterministic_details: Some(crate::error::NonDeterministicDetails {
                 event_index: Some(0),
                 expected: None,

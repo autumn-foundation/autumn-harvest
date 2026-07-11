@@ -114,6 +114,17 @@ fn continue_as_new_workflow<'a>(
     })
 }
 
+/// A workflow whose handler panics **during future construction** — the panic
+/// unwinds synchronously before the `Box::pin(...)` future is produced (issue
+/// #782 / PR #1012 review). Driving it must contain the panic as
+/// `QueryReplayOutcome::Panicked` rather than unwind the read-only query caller.
+fn construction_panicking_query_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    panic!("boom constructing query workflow future");
+}
+
 // ── History builders ──────────────────────────────────────────────────────
 
 fn workflow_input(items: &[&str], should_fail: bool) -> Value {
@@ -265,6 +276,30 @@ fn completed_history_drives_to_terminal_and_query_reports_final_count() {
         result,
         json!(3),
         "query reports the final reconstructed count"
+    );
+}
+
+#[test]
+fn construction_phase_panic_during_query_replay_is_contained() {
+    // Issue #782 / PR #1012 review: a hand-written handler that panics while
+    // *constructing* its future (before returning the boxed future) must be
+    // contained by the read-only query driver as `Panicked`, not unwind the
+    // caller (the plugin's query handler / axum request task). The poll-time
+    // `catch_unwind` cannot reach a construction panic — the construction call is
+    // wrapped too.
+    let (exec_id, input, events) = complete_history(&["a"], false);
+    let ctx = build_ctx(exec_id, events);
+
+    let outcome = drive_query_replay(
+        &ctx,
+        construction_panicking_query_workflow,
+        input,
+        QUERY_BUDGET,
+    );
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::Panicked,
+        "a construction-phase panic must be contained as Panicked, not escape the caller"
     );
 }
 

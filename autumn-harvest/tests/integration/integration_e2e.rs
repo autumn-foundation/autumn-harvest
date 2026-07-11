@@ -852,6 +852,7 @@ fn build_runtime_worker_with_task_timeout(
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout,
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -1630,6 +1631,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -1762,6 +1764,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -1927,6 +1930,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -2157,6 +2161,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -2414,6 +2419,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -2580,6 +2586,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -6002,6 +6009,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -6129,6 +6137,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -6245,6 +6254,7 @@ async fn workflow_schedule_pause_and_resume() {
                 poison_pill_threshold: 3,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),

@@ -39,6 +39,16 @@ pub enum WorkflowOutcome {
         error: String,
         /// Structured details if the error is a non-determinism divergence.
         non_deterministic_details: Option<crate::error::NonDeterministicDetails>,
+        /// `true` only when this failure is a **contained handler panic** the
+        /// engine caught at the dispatch boundary (issue #782), as opposed to an
+        /// author-returned `Err`. This drives the worker's non-terminal
+        /// panic-retry gate; it is executor-internal state and is never
+        /// persisted. `error` already carries the typed `HandlerPanic` envelope
+        /// in that case, so the string channel alone is deliberately **not**
+        /// used to gate retry (an author who fabricates a `HandlerPanic`
+        /// error-type string reaches this variant with `handler_panic == false`
+        /// and never triggers the panic-retry loop).
+        handler_panic: bool,
     },
     /// The workflow suspended awaiting activity results or timer firings.
     /// The accumulated commands describe what the worker needs to schedule.
@@ -59,6 +69,79 @@ pub enum WorkflowOutcome {
 /// Default timeout for detecting suspension -- if the workflow hasn't completed
 /// within this window, it's blocked on a oneshot channel (suspended).
 const SUSPENSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Outcome of running a workflow handler future for one executor cycle with
+/// panic containment (issue #782).
+///
+/// Every executor entry point runs the handler through
+/// [`run_workflow_handler_cycle`], which wraps it in `catch_unwind` **inside**
+/// the [`SUSPENSION_TIMEOUT`] so a handler that unwinds (panics) is contained
+/// rather than crashing the spawned worker task and leaving its
+/// `harvest_task_queue` row stuck `RUNNING`.
+enum HandlerCycleResult {
+    /// The handler returned within the suspension timeout (`Ok`/`Err`).
+    Returned(Result<Value, String>),
+    /// The suspension timeout elapsed — the handler is parked on a oneshot
+    /// (this is the normal suspension signal, not an error).
+    Suspended,
+    /// The handler panicked; the payload was caught and extracted to a message.
+    Panicked(String),
+}
+
+/// Run a workflow handler future for one executor cycle, containing any panic.
+///
+/// Mirrors the pre-#782 `tokio::time::timeout(SUSPENSION_TIMEOUT, handler(...))`
+/// call exactly for the non-panic paths (`Returned`/`Suspended`), but a panic
+/// during any poll — including a poll during the post-await tail — is caught and
+/// returned as [`HandlerCycleResult::Panicked`] instead of unwinding the caller.
+///
+/// `catch_unwind` requires `AssertUnwindSafe` because `&WorkflowContext` is not
+/// `UnwindSafe`; this is sound here because the context is discarded after the
+/// cycle (the same assertion the synchronous query/update dispatch sites already
+/// make).
+async fn run_workflow_handler_cycle(
+    ctx: &WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> HandlerCycleResult {
+    use futures::FutureExt as _;
+    // Issue #782 (PR #1012 review): contain a panic during future *construction*.
+    // The `catch_unwind` below wraps only the future's poll; a hand-written
+    // handler that does synchronous work before returning its boxed future would
+    // panic here, before the future exists, and escape the poll-time guard.
+    let handler_fut = match crate::error::catch_construct(|| handler(ctx, input)) {
+        Ok(fut) => fut,
+        Err(message) => return HandlerCycleResult::Panicked(message),
+    };
+    match tokio::time::timeout(
+        SUSPENSION_TIMEOUT,
+        std::panic::AssertUnwindSafe(handler_fut).catch_unwind(),
+    )
+    .await
+    {
+        Ok(Ok(result)) => HandlerCycleResult::Returned(result),
+        Ok(Err(panic_payload)) => {
+            HandlerCycleResult::Panicked(crate::error::panic_message(panic_payload))
+        }
+        Err(_elapsed) => HandlerCycleResult::Suspended,
+    }
+}
+
+/// Encode a contained workflow-handler panic message as the typed
+/// `harvest_workflow_failure_v1` envelope carrying the engine-reserved
+/// [`ERROR_TYPE_HANDLER_PANIC`](crate::failure::ERROR_TYPE_HANDLER_PANIC)
+/// class (issue #782).
+///
+/// The resulting string is what the terminal `WorkflowFailed` event and the
+/// worker's `HarvestError::WorkflowFailed` surface carry, so operators and
+/// result-awaiting callers can classify a panic without parsing the message,
+/// and the worker's #523 exclusion guard can key on the error type.
+fn encode_workflow_panic(message: String) -> String {
+    use crate::failure::{ERROR_TYPE_HANDLER_PANIC, IntoWorkflowErrorString as _, WorkflowFailure};
+    WorkflowFailure::new(ERROR_TYPE_HANDLER_PANIC, message)
+        .non_retryable()
+        .into_workflow_error_payload()
+}
 
 /// Caller-supplied metadata recorded onto the `harvest.workflow.execute` span.
 pub struct WorkflowExecuteSpanMeta {
@@ -103,6 +186,11 @@ pub enum QueryReplayOutcome {
     Suspended,
     /// The drive exceeded the supplied deadline.
     TimedOut,
+    /// The workflow handler **panicked** (unwound) during the replay drive
+    /// (issue #782). The panic is contained here — the process/request survives
+    /// — but the reconstructed context state is untrustworthy, so a query
+    /// cannot be safely served against it.
+    Panicked,
 }
 
 /// Waker used by [`drive_query_replay`] to detect immediate re-wakes (e.g. a
@@ -148,7 +236,21 @@ pub fn drive_query_replay(
     let flag = std::sync::Arc::new(QueryReplayWaker(std::sync::atomic::AtomicBool::new(false)));
     let waker = futures::task::waker_ref(&flag);
     let mut poll_cx = std::task::Context::from_waker(&waker);
-    let handler_fut = handler(ctx, input);
+    // Issue #782 (PR #1012 review): contain a panic during future *construction*
+    // (a hand-written handler doing synchronous work before returning its boxed
+    // future), mirroring the poll-time containment below. Query replays emit no
+    // commands and append no events, so there is nothing to roll back.
+    let handler_fut = match crate::error::catch_construct(|| handler(ctx, input)) {
+        Ok(fut) => fut,
+        Err(message) => {
+            tracing::warn!(
+                panic = %message,
+                "harvest: workflow handler panicked constructing the query replay drive; \
+                 containing as a query error (issue #782)"
+            );
+            return QueryReplayOutcome::Panicked;
+        }
+    };
     tokio::pin!(handler_fut);
 
     // `checked_add` guards against a pathologically large `timeout` overflowing
@@ -171,7 +273,27 @@ pub fn drive_query_replay(
             return QueryReplayOutcome::TimedOut;
         }
         flag.0.store(false, Ordering::Release);
-        match handler_fut.as_mut().poll(&mut poll_cx) {
+        // Issue #782: contain a workflow-handler panic during the read-only
+        // replay drive. Without this, a panicking handler unwinds through the
+        // caller (the plugin's query handler / axum request task) — the process
+        // survives but the request 500s ungracefully. Catch it here and report
+        // `Panicked` so the caller returns a clean query error instead. Query
+        // replays never emit workflow commands or append events, so there is
+        // nothing to roll back.
+        let poll = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler_fut.as_mut().poll(&mut poll_cx)
+        })) {
+            Ok(poll) => poll,
+            Err(panic_payload) => {
+                tracing::warn!(
+                    panic = %crate::error::panic_message(panic_payload),
+                    "harvest: workflow handler panicked during query replay drive; \
+                     containing as a query error (issue #782)"
+                );
+                return QueryReplayOutcome::Panicked;
+            }
+        };
+        match poll {
             Poll::Ready(_) => {
                 // Issue #612 (Codex P2, PR #993): mirror the executor's
                 // completion-time signal-handler flush (see the `run_workflow`
@@ -326,6 +448,12 @@ pub const fn classify_terminal_query(
                 TerminalQueryDecision::HistoryUnavailable
             }
         }
+        // Issue #782: a workflow handler that panics during the replay drive
+        // cannot reconstruct trustworthy state, so the reconstructed context
+        // must never be served. Classified as `HistoryUnavailable` (410 Gone,
+        // permanent) rather than `TimedOut` (408, retryable): a deterministic
+        // handler panic recurs on every retry, so retrying is pointless.
+        QueryReplayOutcome::Panicked => TerminalQueryDecision::HistoryUnavailable,
     }
 }
 
@@ -419,7 +547,22 @@ async fn run_strict_with_ctx(
     );
 
     async {
-        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        // Issue #782: run the handler with panic containment. A contained panic
+        // short-circuits to a typed HandlerPanic `Failed` outcome, discarding
+        // the panicked cycle's commands (there are none to drain here). The
+        // Returned/Suspended arms are byte-equivalent to the pre-#782
+        // `timeout(SUSPENSION_TIMEOUT, handler(...))` call.
+        let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
+            HandlerCycleResult::Returned(result) => Ok(result),
+            HandlerCycleResult::Suspended => Err(()),
+            HandlerCycleResult::Panicked(message) => {
+                return WorkflowOutcome::Failed {
+                    error: encode_workflow_panic(message),
+                    non_deterministic_details: None,
+                    handler_panic: true,
+                };
+            }
+        };
         match timeout_result {
             // An infallible built-in primitive (system_now/new_uuid/random_*) may
             // have absorbed a divergence and returned a fallback value (issue #384);
@@ -448,6 +591,7 @@ async fn run_strict_with_ctx(
                                     expected <end of history>, got <workflow returned early>"
                                 .to_string(),
                             non_deterministic_details: nd,
+                            handler_panic: false,
                         }
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
                         // UpsertSearchAttributes and SetCurrentDetails are pure metadata
@@ -481,6 +625,7 @@ async fn run_strict_with_ctx(
                                     recorded history"
                                 .to_string(),
                             non_deterministic_details: nd,
+                            handler_panic: false,
                         }
                     } else {
                         WorkflowOutcome::Completed { output }
@@ -491,6 +636,7 @@ async fn run_strict_with_ctx(
                     WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     }
                 },
             ),
@@ -504,10 +650,12 @@ async fn run_strict_with_ctx(
                     WorkflowOutcome::Failed {
                         error,
                         non_deterministic_details: details.clone(),
+                        handler_panic: false,
                     },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     },
                 )
             }
@@ -521,6 +669,7 @@ async fn run_strict_with_ctx(
                     return WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     };
                 }
                 let mut commands = ctx.drain_commands();
@@ -567,7 +716,20 @@ pub(crate) async fn run_workflow_canary(
     );
 
     async {
-        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        // Issue #782: run the handler with panic containment (see
+        // `run_strict_with_ctx` for rationale). A contained panic short-circuits
+        // to a typed HandlerPanic `Failed` outcome.
+        let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
+            HandlerCycleResult::Returned(result) => Ok(result),
+            HandlerCycleResult::Suspended => Err(()),
+            HandlerCycleResult::Panicked(message) => {
+                return WorkflowOutcome::Failed {
+                    error: encode_workflow_panic(message),
+                    non_deterministic_details: None,
+                    handler_panic: true,
+                };
+            }
+        };
         match timeout_result {
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
@@ -593,6 +755,7 @@ pub(crate) async fn run_workflow_canary(
                                     expected <end of history>, got <workflow returned early>"
                                 .to_string(),
                             non_deterministic_details: nd,
+                            handler_panic: false,
                         }
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
                         !matches!(
@@ -616,6 +779,7 @@ pub(crate) async fn run_workflow_canary(
                                     recorded history"
                                 .to_string(),
                             non_deterministic_details: nd,
+                            handler_panic: false,
                         }
                     } else {
                         WorkflowOutcome::Completed { output }
@@ -626,6 +790,7 @@ pub(crate) async fn run_workflow_canary(
                     WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     }
                 },
             ),
@@ -637,10 +802,12 @@ pub(crate) async fn run_workflow_canary(
                     WorkflowOutcome::Failed {
                         error,
                         non_deterministic_details: details.clone(),
+                        handler_panic: false,
                     },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     },
                 )
             }
@@ -650,6 +817,7 @@ pub(crate) async fn run_workflow_canary(
                     return WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     };
                 }
 
@@ -667,6 +835,7 @@ pub(crate) async fn run_workflow_canary(
                     return WorkflowOutcome::Failed {
                         error: "non-deterministic replay: workflow suspended before all history events were replayed".to_string(),
                         non_deterministic_details: nd,
+                        handler_panic: false,
                     };
                 }
 
@@ -899,7 +1068,25 @@ async fn drive_workflow(
         // Run the handler with a timeout. If it completes, we get the result.
         // If it blocks on a oneshot (suspended), the timeout fires and we drain
         // the accumulated commands.
-        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        //
+        // Issue #782: run with panic containment. A contained panic short-circuits
+        // to a typed HandlerPanic `Failed` outcome with NO pending commands — the
+        // panicked cycle's commands are untrustworthy and are discarded (R5), so
+        // `ctx.drain_commands()` is deliberately not called on this path.
+        let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
+            HandlerCycleResult::Returned(result) => Ok(result),
+            HandlerCycleResult::Suspended => Err(()),
+            HandlerCycleResult::Panicked(message) => {
+                return (
+                    WorkflowOutcome::Failed {
+                        error: encode_workflow_panic(message),
+                        non_deterministic_details: None,
+                        handler_panic: true,
+                    },
+                    Vec::new(),
+                );
+            }
+        };
 
         match timeout_result {
             // Handler completed within the timeout window.  Drain any commands
@@ -923,6 +1110,7 @@ async fn drive_workflow(
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     },
                 );
                 (outcome, ctx.drain_commands())
@@ -937,10 +1125,12 @@ async fn drive_workflow(
                     WorkflowOutcome::Failed {
                         error,
                         non_deterministic_details: details.clone(),
+                        handler_panic: false,
                     },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
                     },
                 );
                 (outcome, ctx.drain_commands())
@@ -961,6 +1151,7 @@ async fn drive_workflow(
                         WorkflowOutcome::Failed {
                             error: format!("non-deterministic replay: {nd}"),
                             non_deterministic_details: details,
+                            handler_panic: false,
                         },
                         ctx.drain_commands(),
                     );
@@ -1015,6 +1206,46 @@ mod tests {
         _input: Value,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
         Box::pin(async move { Err("something went wrong".to_string()) })
+    }
+
+    /// A workflow whose handler **panics** (unwinds) instead of returning an
+    /// `Err` (issue #782 fixture).
+    fn panicking_workflow<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            panic!("boom from workflow handler");
+        })
+    }
+
+    /// A workflow whose handler panics **during future construction** — the panic
+    /// unwinds synchronously *before* the `Box::pin(...)` future is ever produced
+    /// (issue #782 / PR #1012 review). A hand-written `WorkflowInfo::handler` may
+    /// do synchronous work before returning its boxed future; this exercises the
+    /// construction-phase `catch_construct` guard, which the poll-time
+    /// `catch_unwind` cannot reach.
+    fn construction_panicking_workflow<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        panic!("boom during workflow future construction");
+    }
+
+    /// A workflow that returns an author `Err` whose error type *happens* to be
+    /// the engine-reserved `HandlerPanic` string. This must NOT be treated as a
+    /// contained panic (issue #782 false-positive guard).
+    fn fake_handler_panic_error_workflow<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::failure::{
+                ERROR_TYPE_HANDLER_PANIC, IntoWorkflowErrorString as _, WorkflowFailure,
+            };
+            Err(WorkflowFailure::new(ERROR_TYPE_HANDLER_PANIC, "fabricated")
+                .into_workflow_error_payload())
+        })
     }
 
     /// A workflow that captures a side-effect (drifts against history) and then
@@ -1159,6 +1390,163 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Contained handler-panic conversion (issue #782)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn panicking_workflow_produces_failed_with_handler_panic_flag() {
+        // AC2 core (issue #782): a workflow handler panic is caught and returned
+        // as WorkflowOutcome::Failed { handler_panic: true, .. } carrying the
+        // typed HandlerPanic envelope with the extracted panic message.
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(exec_id, history, panicking_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                handler_panic,
+            } => {
+                assert!(
+                    handler_panic,
+                    "a caught panic must set handler_panic = true"
+                );
+                assert!(
+                    non_deterministic_details.is_none(),
+                    "a handler panic is not an engine non-determinism divergence"
+                );
+                let decoded = crate::failure::decode_workflow_failure(&error);
+                assert_eq!(
+                    decoded.error_type.as_deref(),
+                    Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                    "the contained panic must carry the reserved HandlerPanic error type"
+                );
+                assert_eq!(decoded.message, "boom from workflow handler");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn construction_phase_panicking_workflow_is_contained_as_handler_panic() {
+        // Issue #782 / PR #1012 review: a hand-written handler that panics while
+        // *constructing* its future (before returning the boxed future) must be
+        // contained identically to a poll-phase panic — the poll-time
+        // `catch_unwind` cannot cover it, so the construction call itself is
+        // wrapped. Proves the construction-phase containment path.
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(
+            exec_id,
+            history,
+            construction_panicking_workflow,
+            Value::Null,
+        )
+        .await;
+
+        match outcome {
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                handler_panic,
+            } => {
+                assert!(
+                    handler_panic,
+                    "a construction-phase panic must set handler_panic = true"
+                );
+                assert!(
+                    non_deterministic_details.is_none(),
+                    "a construction-phase panic is not an engine non-determinism divergence"
+                );
+                let decoded = crate::failure::decode_workflow_failure(&error);
+                assert_eq!(
+                    decoded.error_type.as_deref(),
+                    Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                    "the contained construction panic must carry the reserved HandlerPanic error type"
+                );
+                assert_eq!(decoded.message, "boom during workflow future construction");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn author_error_produces_failed_without_handler_panic_flag() {
+        // AC3 pin (issue #782): a workflow body's own Err(...) must NOT set the
+        // handler_panic flag, so the worker never routes it into the
+        // panic-retry loop.
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(exec_id, history, failing_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed { handler_panic, .. } => {
+                assert!(
+                    !handler_panic,
+                    "an author Err must not be classified as a contained handler panic"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fabricated_handler_panic_error_type_does_not_set_handler_panic_flag() {
+        // AC3 false-positive guard (issue #782 / Q11): an author who returns
+        // Err(WorkflowFailure::new("HandlerPanic", ...)) reaches the normal
+        // Ok(Err(_)) arm with handler_panic = false, so it can never manufacture
+        // a panic-retry via the error-type string.
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(
+            exec_id,
+            history,
+            fake_handler_panic_error_workflow,
+            Value::Null,
+        )
+        .await;
+
+        match outcome {
+            WorkflowOutcome::Failed { handler_panic, .. } => {
+                assert!(
+                    !handler_panic,
+                    "a fabricated HandlerPanic error string must not set the caught-panic flag"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn engine_divergence_produces_failed_with_nd_details() {
         // AC3 pin (issue #603): an engine-detected replay divergence must carry
@@ -1187,6 +1575,7 @@ mod tests {
             WorkflowOutcome::Failed {
                 error,
                 non_deterministic_details,
+                ..
             } => {
                 assert!(
                     error.contains("non-deterministic replay"),
