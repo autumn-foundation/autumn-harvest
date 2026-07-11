@@ -88,9 +88,35 @@ later. The refusal is:
   the start.
 
 The source workflow's terminal commit is **never** rolled back by a gate block —
-the block is a clean skip. When no gate is active (or the plugin has not yet
-published its gate cache at boot) the completion-trigger path behaves
-byte-identically to before this change.
+the block is a clean skip. When no gate is active the completion-trigger path
+behaves byte-identically to before this change.
+
+### Startup ordering — persisted gates are loaded before workers spawn
+
+The plugin populates the gate-cache snapshot with the **persisted active gates**
+(the boot-time `load_active_gates` → `refresh`) *before* it publishes the cache
+Arc to the process-global static and *before* `HarvestRunner::start` spawns the
+worker poll loops and the timeout scanner. So a completion trigger (or a
+deferred-fire scanner tick) firing in the boot window consults a snapshot that
+already contains the persisted gates, rather than an empty one. The only residual
+boot-window gap is a genuine gate-DB outage at startup: if the boot load itself
+fails, the snapshot stays empty and completion triggers proceed (the same bounded
+caveat as a mid-run fail-closed with no cached match) — the boot-load failure is
+never converted into a permanent block-drop, and the direct HTTP start path still
+fails closed via `check()`.
+
+### Cross-shard target queue resolution
+
+For a **cross-shard** completion trigger (the target workflow hashes to a shard
+other than the source's, with no explicit trigger queue), the inline gate check
+resolves the target queue on the **target shard's** connection — the exact queue
+the outbox relay will use when it fires the start — via
+`completion_trigger::resolve_cross_shard_target_queue`. Resolving on the source
+transaction connection instead would query the source shard's `harvest_schedules`
+(which has no row for the target workflow) and fall back to the default queue,
+missing a `Queue(q)` gate scoped to the real target queue. Same-shard targets are
+unaffected: the source connection *is* the target shard's connection, so they
+keep the single-connection (no extra DB read) path.
 
 ## Outbox — exempt, but observable
 

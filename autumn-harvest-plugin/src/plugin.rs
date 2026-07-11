@@ -747,6 +747,37 @@ async fn start_harvest_runtime(
 
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
+
+    // issue #618 (F1 re-review): populate the gate-cache snapshot with the
+    // persisted active gates BEFORE the cache Arc is published to the global
+    // static and BEFORE `HarvestRunner::start` spawns the worker poll loops and
+    // the timeout scanner (which fire completion-trigger / debounce / throttle /
+    // event-batch starts). Otherwise a scanner tick or a completion trigger
+    // firing in the boot window would run `check_cached()` against an EMPTY
+    // snapshot and PROCEED, bypassing persisted Fleet/queue/name gates uncounted
+    // at startup. This runs on `harvest_pool` because it must complete before
+    // that pool is moved into `runner_resources` on the next line. The runner's
+    // own storage pool (`harvest_db_pool` below) wraps the very same underlying
+    // pool, so the snapshot loaded here is the one workers see.
+    //
+    // Boot-load-FAILS case (a genuine gate-DB outage at boot): the snapshot
+    // stays empty and `check_cached()` proceeds — the same documented bounded
+    // caveat as a mid-run fail-closed with no cached match. We deliberately do
+    // NOT block-drop on boot-load failure (that reintroduces the permanent-drop
+    // fixed in F3); the direct HTTP start path still fails closed via `check()`.
+    if let Ok(mut boot_conn) = acquire_conn(&harvest_pool).await {
+        match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
+            Ok(gates) => {
+                api_state.gate_cache().refresh(gates);
+                tracing::debug!("admission gate cache populated at startup (before workers spawn)");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not load admission gates at startup; cache stays empty until first refresh"
+            ),
+        }
+    }
+
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
         .with_app_state(runtime_state.clone())
         .with_shard_router(router);
@@ -781,17 +812,14 @@ async fn start_harvest_runtime(
             )));
         }
     }
-    // issue #618 (F11): publish the SAME gate-cache Arc the management API uses
-    // into the process-global static BEFORE HarvestRunner::start spawns the
-    // worker poll loops and the timeout scanner (which fires completion-trigger /
-    // debounce / throttle / event-batch starts). Otherwise a scanner tick or a
-    // completion trigger firing in the boot window would run with the gate check
-    // skipped entirely. The cache starts fail-closed (uninitialized); a
-    // completion trigger firing before the boot-time gate load below sees the
-    // fail-closed sentinel and PROCEEDS (issue #618, F3) rather than dropping
-    // already-committed in-flight continuation, so publishing this early is safe.
-    // The background refresh loop mutates this same shared Arc in place, so a
-    // single publish is sufficient — no re-publish per refresh.
+    // issue #618 (F11 + F1 re-review): publish the SAME gate-cache Arc the
+    // management API uses into the process-global static BEFORE
+    // HarvestRunner::start spawns the worker poll loops and the timeout scanner
+    // (which fire completion-trigger / debounce / throttle / event-batch starts).
+    // The snapshot was already populated with persisted gates just above (before
+    // `harvest_pool` was moved), so the Arc published here — and mutated in place
+    // by the background refresh loop — already carries the boot-time gates. A
+    // single publish is sufficient; no re-publish per refresh.
     autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(api_state.gate_cache()));
 
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
@@ -943,19 +971,11 @@ async fn start_harvest_runtime(
 
     api_state.install_storage_pool(harvest_db_pool.clone());
 
-    // issue #618: the process-global gate cache was published above, BEFORE
-    // HarvestRunner::start spawned the workers/scanners (F11).
-
-    // issue #377: boot-time gate load — populate the cache before any traffic hits.
-    if let Ok(mut boot_conn) = acquire_conn(harvest_db_pool.default_pool()).await {
-        match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
-            Ok(gates) => {
-                api_state.gate_cache().refresh(gates);
-                tracing::debug!("admission gate cache populated at startup");
-            }
-            Err(e) => tracing::warn!(error = %e, "could not load admission gates at startup"),
-        }
-    }
+    // issue #618 (F11 + F1 re-review): the process-global gate cache was
+    // published above with its snapshot already populated from persisted gates,
+    // BEFORE HarvestRunner::start spawned the workers/scanners — so a
+    // completion trigger firing in the boot window sees the real gates rather
+    // than an empty snapshot.
 
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
     let gate_refresh = {

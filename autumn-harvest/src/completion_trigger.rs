@@ -672,6 +672,43 @@ pub async fn resolve_target_queue(
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Resolve the start queue for a **cross-shard** completion-trigger target.
+///
+/// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
+/// time: on a fresh connection to the target shard's own pool, so the inline
+/// admission-gate check (issue #618, F2 re-review) evaluates the exact queue the
+/// deferred start will use. Falls back to `source_conn` when the target-shard
+/// pool is unavailable — Fleet/name gates do not depend on the queue and still
+/// match; only a Queue(q) gate could be missed in that unreachable-pool edge,
+/// no worse than pre-fix.
+#[cfg(feature = "db")]
+pub async fn resolve_cross_shard_target_queue(
+    source_conn: &mut diesel_async::AsyncPgConnection,
+    target_workflow_name: &str,
+    target_shard: crate::types::ShardId,
+) -> String {
+    let target_pool = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+        .and_then(|sp| sp.exact_pool_for(target_shard).cloned());
+    if let Some(tp) = target_pool {
+        match tp.get().await {
+            Ok(mut target_conn) => {
+                return resolve_target_queue(&mut target_conn, target_workflow_name, target_shard)
+                    .await;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                target_shard = target_shard.as_i32(),
+                "could not acquire target-shard connection for cross-shard admission-gate \
+                 queue resolution; falling back to source connection"
+            ),
+        }
+    }
+    resolve_target_queue(source_conn, target_workflow_name, target_shard).await
+}
+
 #[cfg(feature = "db")]
 #[derive(Debug, Clone)]
 pub struct DeferredTriggerStart {
@@ -1066,8 +1103,33 @@ pub fn evaluate_triggers_for_execution<'a>(
             if let Some(cache) = crate::admission_gate::global_admission_gate_cache() {
                 let gate_queue = if let Some(ref q) = trigger_db.queue_name {
                     q.clone()
-                } else {
+                } else if target_shard == source_shard {
+                    // Same-shard target: the source transaction connection IS the
+                    // target shard's connection, so resolve directly — no extra
+                    // DB round-trip (preserves the no-gate/same-shard common-case
+                    // property; F9's single-resolution reuse below still applies).
                     resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
+                } else {
+                    // Cross-shard target (issue #618, F2 re-review): the outbox
+                    // relay resolves the ACTUAL start queue on the TARGET
+                    // connection at fire time (see
+                    // `enforce_completion_triggers_outbox`). Resolve identically
+                    // here — on a fresh target-shard connection — so the inline
+                    // gate check evaluates the SAME queue the start will use.
+                    // Passing the source `conn` would make `resolve_target_queue`
+                    // query `harvest_schedules` on the wrong shard for a target
+                    // that hashes to shard 0, missing a Queue(q) gate scoped to
+                    // the real target queue (the outbox is exempt-with-counter,
+                    // so nothing catches it downstream). If the target-shard pool
+                    // is unavailable, fall back to the source connection: Fleet
+                    // and name gates do not depend on the queue and still match;
+                    // only a Queue gate would be missed, no worse than pre-fix.
+                    resolve_cross_shard_target_queue(
+                        conn,
+                        &trigger_db.target_workflow_name,
+                        target_shard,
+                    )
+                    .await
                 };
                 resolved_queue = Some(gate_queue.clone());
                 if let Some((_gate_id, reason, scope_kind)) = cache.check_cached(

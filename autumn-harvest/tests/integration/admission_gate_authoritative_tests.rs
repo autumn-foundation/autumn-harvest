@@ -18,6 +18,7 @@
 //! single-threaded execution; each test scrubs first). Otherwise a fresh
 //! testcontainers Postgres is booted with `INIT_SQL`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::admission_gate::{
@@ -63,6 +64,12 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260706000001_harvest_start_throttle/up.sql"),
 );
+
+/// Per-workflow schedule columns the cross-shard test's fresh DBs need beyond
+/// `INIT_SQL` (`resolve_target_queue` selects `queue_name WHERE workflow_name`).
+const SCHED_COLS: &str = "ALTER TABLE harvest_schedules ALTER COLUMN dag_name DROP NOT NULL; \
+     ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS workflow_name TEXT; \
+     ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS queue_name TEXT;";
 
 /// Capturing metrics recorder — records `record_admission_blocked` calls
 /// (`scope_kind`, reason) so a test can assert a completion-trigger block is
@@ -128,6 +135,16 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool build failed")
 }
 
+/// Replace the database-name path segment of a Postgres URL (no query params in
+/// the test URLs). Used by the cross-shard test to derive per-shard DB URLs on
+/// the same cluster.
+fn swap_db_name(url: &str, new_db: &str) -> String {
+    url.rfind('/').map_or_else(
+        || format!("{url}/{new_db}"),
+        |i| format!("{}/{}", &url[..i], new_db),
+    )
+}
+
 async fn scrub(conn: &mut AsyncPgConnection) {
     for stmt in [
         "DELETE FROM harvest_completion_trigger_fires",
@@ -176,6 +193,17 @@ async fn insert_trigger(conn: &mut AsyncPgConnection, trigger_id: Uuid) {
 /// COMPLETED with an output, returning its exec id.
 async fn start_completed_source(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_source_completed_on(conn, exec_id, workflow_id).await;
+    exec_id
+}
+
+/// Starts an `ag_source_wf` execution with an explicit `exec_id` (so a caller
+/// can pin it to a specific shard) and transitions it to COMPLETED.
+async fn start_source_completed_on(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    workflow_id: &str,
+) {
     start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
@@ -225,7 +253,6 @@ async fn start_completed_source(conn: &mut AsyncPgConnection, workflow_id: &str)
     .execute(conn)
     .await
     .expect("complete source");
-    exec_id
 }
 
 async fn target_exec_count(conn: &mut AsyncPgConnection) -> i64 {
@@ -762,4 +789,232 @@ async fn completion_trigger_scoped_gate_matches_and_misses() {
     );
     assert_eq!(metrics.blocked().len(), 1);
     assert_eq!(metrics.blocked()[0].0, "workflow_name");
+}
+
+/// F1 (Codex re-review, issue #618): a persisted admission gate loaded at
+/// startup via the REAL `load_active_gates` boot-load path — the one the plugin
+/// now runs BEFORE spawning workers/scanners — must block a completion trigger
+/// that fires in the boot window. This exercises the boot-load → cache →
+/// trigger-block chain end-to-end (persist a gate row, load it with the exact
+/// boot-load call, refresh + publish the cache, evaluate a matching trigger).
+///
+/// The plugin boot ORDERING itself (`load_active_gates` + `refresh` BEFORE
+/// `HarvestRunner::start`) is verified by code reading: `start_harvest_runtime`
+/// is a private `async fn` that needs a fully-spawned runner, so a true
+/// startup-race test is impractical. This test proves the behavioural guarantee
+/// that reordering exists to provide — a persisted gate, once loaded into the
+/// cache, blocks a completion trigger rather than being bypassed against an
+/// empty snapshot.
+#[tokio::test]
+async fn boot_load_of_persisted_gate_blocks_completion_trigger() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    let trigger_id = Uuid::new_v4();
+    insert_trigger(&mut conn, trigger_id).await;
+    let source_exec_id = start_completed_source(&mut conn, "ag-src-bootload").await;
+
+    // Persist a Fleet gate row, then run the EXACT boot-load path the plugin
+    // runs before workers spawn: load_active_gates -> refresh.
+    autumn_harvest::admission_gate::db::create_gate(
+        &mut conn,
+        &GateScope::Fleet,
+        "boot-incident",
+        None,
+        "test",
+        None,
+    )
+    .await
+    .expect("persist gate");
+    let cache = Arc::new(AdmissionGateCache::new());
+    let gates = autumn_harvest::admission_gate::db::load_active_gates(&mut conn)
+        .await
+        .expect("boot-load gates");
+    assert_eq!(gates.len(), 1, "the persisted gate is loaded at boot");
+    cache.refresh(gates);
+    set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+
+    let metrics = CapturingMetrics::default();
+    let deferred = evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .expect("evaluate must not error (block is a clean skip)");
+
+    set_global_admission_gate_cache(None);
+    // Remove the persisted gate so it can't leak into a sibling test even if an
+    // assertion below panics (the next test's `scrub` also clears it).
+    diesel::sql_query("DELETE FROM harvest_admission_gates")
+        .execute(&mut conn)
+        .await
+        .expect("scrub gates");
+
+    assert!(
+        deferred.is_empty(),
+        "a boot-loaded gate blocks the trigger start (no deferred outbox row)"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "a persisted gate loaded at boot must block the completion-trigger target"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the boot-loaded gate block is counted once"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(blocked[0].1, "boot-incident");
+    let fires: Vec<OutcomeRow> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("load fires");
+    assert_eq!(fires.len(), 1);
+    assert_eq!(fires[0].outcome.as_deref(), Some("admission_blocked"));
+}
+
+/// F2 (Codex re-review, issue #618): for a CROSS-SHARD completion trigger
+/// (target hashing to shard 0, source on a nonzero shard, no explicit trigger
+/// queue), the inline admission-gate check must resolve the target queue on the
+/// TARGET shard — the same queue the outbox relay uses at fire time — NOT on the
+/// source transaction connection. This focuses on the exact function the fix
+/// introduces, `resolve_cross_shard_target_queue`, and proves it resolves the
+/// queue on the target shard where the pre-fix `resolve_target_queue(source_conn,
+/// …, shard 0)` path resolved it on the WRONG (source) connection and missed it.
+///
+/// Genuine two-database multi-shard setup: shard 0 (target) owns the schedule
+/// mapping `ag_target_wf -> ag_priority_q`; shard 1 (source) has NO such
+/// schedule. Only `harvest_schedules` is needed (no workflow start), so it RUNS
+/// against a real cluster (local Postgres or testcontainers) via two fresh
+/// databases. The full evaluate → gate → block chain for a cross-shard target
+/// additionally needs `start_or_load_workflow_execution` (which reads
+/// `harvest_build_policies`, not in this suite's `INIT_SQL`), so it is verified
+/// by this focused resolver test plus the same-shard block tests above.
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
+    use diesel_async::SimpleAsyncConnection;
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base_url, _c) = setup_db().await;
+
+    // Two fresh databases on the same cluster: s0 = shard 0 (target), s1 =
+    // shard 1 (source). Unique names so repeated local runs never collide.
+    let s0_name = format!("ag618_s0_{}", Uuid::new_v4().simple());
+    let s1_name = format!("ag618_s1_{}", Uuid::new_v4().simple());
+    {
+        let base_pool = build_pool(&base_url);
+        let mut admin = base_pool.get().await.unwrap();
+        for name in [&s0_name, &s1_name] {
+            diesel::sql_query(format!("CREATE DATABASE {name}"))
+                .execute(&mut admin)
+                .await
+                .expect("create shard db");
+        }
+    }
+    let s0_url = swap_db_name(&base_url, &s0_name);
+    let s1_url = swap_db_name(&base_url, &s1_name);
+
+    // Migrate both fresh DBs and add the per-workflow schedule columns.
+    for u in [&s0_url, &s1_url] {
+        let p = build_pool(u);
+        let mut c = p.get().await.unwrap();
+        c.batch_execute(INIT_SQL)
+            .await
+            .expect("migrate fresh shard db");
+        c.batch_execute(SCHED_COLS)
+            .await
+            .expect("add schedule columns");
+    }
+
+    let pool0 = build_pool(&s0_url);
+    let pool1 = build_pool(&s1_url);
+
+    // writable = [0] so the target always hashes to shard 0; readable = [0, 1].
+    install_global_router(ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    ));
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool0.clone());
+    pools.insert(ShardId::new(1), pool1.clone());
+    let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // shard 0 (target): the schedule mapping ag_target_wf -> ag_priority_q.
+    {
+        let mut c0 = pool0.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_schedules (id, workflow_name, queue_name, schedule_expr) \
+             VALUES (gen_random_uuid(), 'ag_target_wf', 'ag_priority_q', '@daily')",
+        )
+        .execute(&mut c0)
+        .await
+        .expect("insert target schedule");
+    }
+
+    // A source (shard 1) connection — the connection the inline gate check holds.
+    let mut src_conn = pool1.get().await.unwrap();
+
+    // FIX: resolve on the TARGET shard (0) → finds the target's real queue.
+    let resolved = autumn_harvest::completion_trigger::resolve_cross_shard_target_queue(
+        &mut src_conn,
+        "ag_target_wf",
+        ShardId::new(0),
+    )
+    .await;
+
+    // PRE-FIX behaviour: `resolve_target_queue(source_conn, …, shard 0)` treats
+    // shard 0 as directly queryable on the connection it holds — the SOURCE
+    // connection (shard 1), which has no ag_target_wf schedule — so it misses it.
+    let buggy = autumn_harvest::completion_trigger::resolve_target_queue(
+        &mut src_conn,
+        "ag_target_wf",
+        ShardId::new(0),
+    )
+    .await;
+
+    // Restore single-shard globals for sibling tests, then best-effort drop the
+    // per-shard databases (unique names → a leaked DB on failure never collides).
+    install_global_router(ShardRouter::default());
+    let _ = ShardedDbPool::single(build_pool(&base_url));
+    drop(src_conn);
+    drop(sharded);
+    drop(pool0);
+    drop(pool1);
+    {
+        let base_pool = build_pool(&base_url);
+        if let Ok(mut admin) = base_pool.get().await {
+            for name in [&s0_name, &s1_name] {
+                let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&mut admin)
+                    .await;
+            }
+        }
+    }
+
+    assert_eq!(
+        resolved, "ag_priority_q",
+        "the fix must resolve the target queue on the TARGET shard (0), not the \
+         source connection"
+    );
+    assert_ne!(
+        buggy, "ag_priority_q",
+        "the pre-fix source-connection resolution must NOT find the target queue \
+         (it queries the source shard's schedules, missing the gate)"
+    );
 }
