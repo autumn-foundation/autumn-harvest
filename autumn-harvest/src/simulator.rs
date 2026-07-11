@@ -71,9 +71,10 @@ pub struct WorkflowSimulator {
     child_workflow_mocks: HashMap<String, ActivityMockFn>,
     /// Signals queued for delivery, in true cross-name queued order (mirrors
     /// `WorkflowTestEnv::queued_signals`). A single `Vec` — rather than a
-    /// per-name `HashMap<String, VecDeque<_>>` — is required so batch promotion
-    /// at a `WaitForSignal` wake preserves the order signals were enqueued
-    /// across different names, matching production `load_pending_signals`.
+    /// per-name `HashMap<String, VecDeque<_>>` — is required so the task-prep
+    /// ingest (drained into history before each handler dispatch, mirroring
+    /// production `worker::ingest_due_timers_and_signals`/`load_pending_signals`)
+    /// preserves the order signals were enqueued across different names.
     signals_to_send: Vec<(String, Value)>,
 }
 
@@ -211,6 +212,24 @@ impl WorkflowSimulator {
         }];
 
         loop {
+            // Task-prep ingest (issue #775, Codex P2): mirror production's
+            // `worker::ingest_due_timers_and_signals`, which appends every
+            // pending signal into history *before* the workflow handler runs for
+            // this task pickup — NOT gated on the workflow emitting a
+            // `WaitForSignal`. Draining all currently-queued signals here (in
+            // queued order) makes a workflow that *starts* by non-blockingly
+            // draining/polling a pending signal (`drain_signals_raw` /
+            // `try_receive_signal`, with no prior blocking `wait_for_signal`)
+            // observe it, matching production. Signals are queued up front via
+            // `send_signal`, so this drains on the first iteration and is a no-op
+            // on every resume cycle thereafter.
+            for (name, payload) in self.signals_to_send.drain(..) {
+                history.push(WorkflowEvent::SignalReceived {
+                    signal_name: name,
+                    payload,
+                });
+            }
+
             let (outcome, pending, _span) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
@@ -282,7 +301,7 @@ impl WorkflowSimulator {
 
     #[allow(clippy::too_many_lines)]
     fn process_simulator_commands(
-        &mut self,
+        &self,
         commands: Vec<WorkflowCommand>,
         history: &mut Vec<WorkflowEvent>,
     ) -> bool {
@@ -453,27 +472,6 @@ impl WorkflowSimulator {
                     }
                     advanced = true;
                 }
-                WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                    // Simulate a production wake: the workflow only makes progress
-                    // on this wait when a signal of the awaited name is actually
-                    // queued. On that wake, promote EVERY currently-queued signal
-                    // (ALL names) into history in queued order, mirroring production
-                    // `load_pending_signals`/`ingest_pending_signals` batch promotion
-                    // (issue #775) and matching `WorkflowTestEnv`. The matcher's
-                    // `match_signal` then consumes the first awaited-name signal for
-                    // this wait, leaving the rest buffered for a following
-                    // non-blocking `drain_signals` / `try_receive_signal` call in the
-                    // same task.
-                    if self.signals_to_send.iter().any(|(n, _)| n == &signal_name) {
-                        for (name, payload) in self.signals_to_send.drain(..) {
-                            history.push(WorkflowEvent::SignalReceived {
-                                signal_name: name,
-                                payload,
-                            });
-                        }
-                        advanced = true;
-                    }
-                }
                 WorkflowCommand::RecordMarker { name, details } => {
                     history.push(WorkflowEvent::MarkerRecorded { name, details });
                     advanced = true;
@@ -549,8 +547,17 @@ impl WorkflowSimulator {
                     advanced = true;
                 }
                 _ => {
-                    // Commands like WaitForSignal, StartChildWorkflow are not yet fully supported.
-                    // Complete and Fail are handled on the next loop iteration.
+                    // `WaitForSignal` is a no-op here: signals are ingested into
+                    // history at task-prep (see the pre-dispatch drain in `run`,
+                    // issue #775 Codex P2, mirroring production's
+                    // `worker::ingest_due_timers_and_signals`), so an available
+                    // signal resolves the wait synchronously and the command is
+                    // never emitted. A `WaitForSignal` reaching here means the
+                    // awaited signal was never queued (blocked) — no progress. The
+                    // old WaitForSignal-gated batch promotion is removed (it would
+                    // double-append signals already ingested at task-prep, and it
+                    // never fired for a drain-first workflow that emits no wait).
+                    // Complete/Fail are handled on the next loop iteration.
                 }
             }
         }
@@ -808,6 +815,62 @@ mod tests {
             .final_output
             .expect("workflow should complete successfully");
         assert_eq!(final_output, serde_json::json!(["a", "b"]));
+    }
+
+    /// Drain-first (issue #775, Codex P2): the workflow's FIRST action is a
+    /// non-blocking `drain_signals_raw`, with NO prior blocking `wait_for_signal`.
+    /// Production ingests pending signals at task-prep before the handler runs,
+    /// so the simulator must too. Before the task-prep ingest fix — when signals
+    /// were only promoted at a `WaitForSignal` wake — this returned empty.
+    fn dummy_workflow_drain_first_no_wait(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            let all = ctx.drain_signals_raw("event").map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(all))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_drain_first_no_prior_wait_returns_all_queued() {
+        let sim = WorkflowSimulator::new(dummy_workflow_drain_first_no_wait)
+            .send_signal("event", serde_json::json!("a"))
+            .send_signal("event", serde_json::json!("b"))
+            .send_signal("event", serde_json::json!("c"));
+
+        let res = sim.run(serde_json::json!("init")).await;
+        let final_output = res
+            .final_output
+            .expect("workflow should complete successfully");
+        assert_eq!(final_output, serde_json::json!(["a", "b", "c"]));
+    }
+
+    /// try_receive-first (issue #775, Codex P2): FIRST action is a non-blocking
+    /// `try_wait_for_signal` with signals pre-queued and NO prior blocking wait.
+    fn dummy_workflow_try_receive_first_no_wait(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            let got: Option<Value> = ctx
+                .try_wait_for_signal("event")
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(got))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_try_receive_first_no_prior_wait_returns_oldest() {
+        let sim = WorkflowSimulator::new(dummy_workflow_try_receive_first_no_wait)
+            .send_signal("event", serde_json::json!("a"))
+            .send_signal("event", serde_json::json!("b"));
+
+        let res = sim.run(serde_json::json!("init")).await;
+        let final_output = res
+            .final_output
+            .expect("workflow should complete successfully");
+        assert_eq!(final_output, serde_json::json!("a"));
     }
 
     // -----------------------------------------------------------------

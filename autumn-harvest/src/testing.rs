@@ -2125,14 +2125,26 @@ async fn replay_fixture_file(
 //
 // Execution order
 // ───────────────
+// Signals are ingested first, at task-prep: before each handler dispatch cycle
+// every currently-queued signal is appended to history in queued order,
+// mirroring production's `worker::ingest_due_timers_and_signals` (which ingests
+// pending signals BEFORE the handler runs, NOT gated on a `WaitForSignal`). This
+// makes a workflow that immediately drains/polls a pending signal
+// (`drain_signals_raw` / `try_receive_signal`, with no prior blocking
+// `wait_for_signal`) observe it (issue #775). A signal in history resolves a
+// blocking `wait_for_signal` / signal-or-timer race synchronously, so it never
+// emits a `WaitForSignal` command.
+//
 // On each suspension:
 //   1. Regular and local activities are resolved immediately via registered
 //      mocks (either per-call-count or general fallback).
 //   2. Child-workflow spawns are resolved via registered child mocks.
-//   3. Signals are injected from the pre-queued queue when a `WaitForSignal`
-//      command is outstanding.
-//   4. Timers auto-fire *unless* a signal is also being resolved in the same
-//      suspension batch (signal takes priority in concurrent select! branches).
+//   3. A `WaitForSignal` command means the workflow is blocked on a signal that
+//      was never queued (an available signal is already in history from
+//      task-prep, so no command is emitted) — no progress is made for it.
+//   4. Timers auto-fire when they suspend — a classic-timer select! branch only
+//      suspends when its competing signal branch was not resolvable (the signal
+//      already won the race synchronously from history otherwise).
 //
 // The loop terminates when the workflow returns `Completed` or `Failed`, or
 // when no commands can be resolved (workflow stuck) or the iteration cap is
@@ -2664,9 +2676,11 @@ impl WorkflowTestEnv {
     ///    child workflows) and append events to history.
     /// 3. Repeat until `Completed`, `Failed`, or stuck.
     ///
-    /// Timers auto-fire unless a signal is being resolved in the same
-    /// suspension batch (signal takes priority in concurrent `tokio::select!`
-    /// branches).
+    /// Pending signals are ingested into history at task-prep (before each
+    /// handler dispatch), so a signal wins a `tokio::select!` race by resolving
+    /// its branch synchronously from history; a classic timer only fires when it
+    /// genuinely suspends (the no-signal, timer-wins case).
+    #[allow(clippy::too_many_lines)]
     pub async fn run(&self, handler: WorkflowHandlerFn, input: Value) -> TestRunOutcome {
         let exec_id = ExecutionId::new();
 
@@ -2708,6 +2722,24 @@ impl WorkflowTestEnv {
         };
 
         for _iter in 0..MAX_TEST_ITERATIONS {
+            // Task-prep ingest (issue #775, Codex P2): mirror production's
+            // `worker::ingest_due_timers_and_signals`, which appends every
+            // pending signal into history *before* the workflow handler runs
+            // for this task pickup — NOT gated on the workflow emitting a
+            // `WaitForSignal`. Draining all currently-queued signals here (in
+            // queued order) makes a workflow that *starts* by non-blockingly
+            // draining/polling a pending signal (`drain_signals_raw` /
+            // `try_receive_signal`, with no prior blocking `wait_for_signal`)
+            // observe it, matching production. All signals are queued up front
+            // via `queue_signal`, so this drains on the first iteration and is a
+            // no-op on every resume cycle thereafter.
+            for (name, payload) in std::mem::take(&mut remaining_signals) {
+                history.push(WorkflowEvent::SignalReceived {
+                    signal_name: name,
+                    payload,
+                });
+            }
+
             let (outcome, pending_cmds, _span) = run_workflow_with_state_advancing_clock(
                 exec_id,
                 history.clone(),
@@ -2724,7 +2756,6 @@ impl WorkflowTestEnv {
                     let made_progress = match self.process_suspension(
                         commands,
                         &mut history,
-                        &mut remaining_signals,
                         &mut call_counts,
                         &mut retry_sequences,
                     ) {
@@ -2929,21 +2960,12 @@ impl WorkflowTestEnv {
         &self,
         commands: Vec<WorkflowCommand>,
         history: &mut Vec<WorkflowEvent>,
-        remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
         retry_sequences: &mut HashMap<
             String,
             std::collections::VecDeque<Vec<Result<Value, String>>>,
         >,
     ) -> Result<bool, String> {
-        let signal_will_resolve = commands.iter().any(|cmd| {
-            if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
-                remaining_signals.iter().any(|(n, _)| n == signal_name)
-            } else {
-                false
-            }
-        });
-
         // Whether this batch also carries a genuine non-timer suspension
         // (activity/signal/child-workflow/classic timer). In production the
         // worker records an `ArmTimer` and leaves the workflow parked on that
@@ -2984,12 +3006,10 @@ impl WorkflowTestEnv {
         for cmd in commands {
             made_progress |= self.process_command(
                 cmd,
-                signal_will_resolve,
                 batch_has_competing_suspension,
                 min_await_deadline_secs,
                 history,
                 &mut deferred_events,
-                remaining_signals,
                 call_counts,
                 retry_sequences,
             )?;
@@ -3026,12 +3046,10 @@ impl WorkflowTestEnv {
     fn process_command(
         &self,
         cmd: WorkflowCommand,
-        signal_will_resolve: bool,
         batch_has_competing_suspension: bool,
         min_await_deadline_secs: Option<u64>,
         history: &mut Vec<WorkflowEvent>,
         deferred_events: &mut Vec<WorkflowEvent>,
-        remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
         retry_sequences: &mut HashMap<
             String,
@@ -3090,11 +3108,12 @@ impl WorkflowTestEnv {
                 duration_secs,
                 ..
             } => {
-                if signal_will_resolve {
-                    // Skip firing the timer — a concurrent signal takes priority
-                    // so the workflow takes the signal branch in select!.
-                    return Ok(false);
-                }
+                // A classic-timer suspension in a select! only reaches here when
+                // its competing signal branch is NOT resolvable — a queued signal
+                // is now ingested into history at task-prep (see `run`, issue
+                // #775 Codex P2), so a signal that should win the race already
+                // resolved the select synchronously without ever suspending. When
+                // the timer genuinely suspends, it fires (timer wins).
                 history.push(WorkflowEvent::TimerStarted {
                     timer_id: timer_id.clone(),
                     duration_secs,
@@ -3103,27 +3122,19 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
-            WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                // Simulate a production wake: the workflow only makes progress on
-                // this wait when a signal of the awaited name is actually queued.
-                // On that wake, promote EVERY currently-queued signal (ALL names)
-                // into history in queued order, mirroring production
-                // `load_pending_signals`/`ingest_pending_signals` batch promotion
-                // (issue #775) — so cross-name "block on X, drain Y" patterns are
-                // faithfully testable. The matcher's `match_signal` then consumes
-                // the first awaited-name signal for this wait, leaving the rest
-                // buffered for a following non-blocking `drain_signals` /
-                // `try_receive_signal` call in the same task.
-                if !remaining_signals.iter().any(|(n, _)| n == &signal_name) {
-                    return Ok(false);
-                }
-                for (name, payload) in remaining_signals.drain(..) {
-                    deferred_events.push(WorkflowEvent::SignalReceived {
-                        signal_name: name,
-                        payload,
-                    });
-                }
-                Ok(true)
+            WorkflowCommand::WaitForSignal { .. } => {
+                // Signals are now ingested into history at task-prep (see the
+                // pre-dispatch drain in `run`, issue #775 Codex P2), mirroring
+                // production's `worker::ingest_due_timers_and_signals`. A
+                // `WaitForSignal` command therefore only reaches here when the
+                // awaited signal was NOT queued (it is already in history and
+                // resolved by the matcher otherwise, so the workflow never emits
+                // the command). This is the "blocked on an unavailable signal"
+                // case: no progress. The old WaitForSignal-gated batch promotion
+                // is removed — draining queued signals here would double-append
+                // signals already ingested at task-prep, and it never fired for a
+                // drain-first workflow that emits no `WaitForSignal`.
+                Ok(false)
             }
 
             WorkflowCommand::StartChildWorkflow {

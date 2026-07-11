@@ -2961,3 +2961,61 @@ async fn test_single_wait_with_extras_queued_returns_first_signal() {
         "a single wait_for_signal must return the first queued signal despite batch promotion"
     );
 }
+
+/// Drain-first (issue #775, Codex P2): the workflow's FIRST action is a
+/// non-blocking `drain_signals_raw`, with NO prior blocking `wait_for_signal`.
+/// Production ingests pending signals at task-prep (before the handler runs), so
+/// a drain-first workflow must observe every pre-queued signal. Before the
+/// task-prep ingest fix — when the harness only promoted signals at a
+/// `WaitForSignal` wake — this returned an empty `collected`.
+fn drain_first_no_wait_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let collected = ctx.drain_signals_raw("event").map_err(|e| e.to_string())?;
+        Ok(json!({ "collected": collected }))
+    })
+}
+
+#[tokio::test]
+async fn test_drain_first_no_prior_wait_returns_all_queued() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .queue_signal("event", json!({"seq": 3}))
+        .run(drain_first_no_wait_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"collected": [{"seq": 1}, {"seq": 2}, {"seq": 3}]})),
+        "a drain with NO prior wait_for_signal must still observe every pre-queued signal \
+         (task-prep ingest, mirroring production `ingest_due_timers_and_signals`)"
+    );
+}
+
+/// try_receive-first (issue #775, Codex P2): FIRST action is a non-blocking
+/// `try_receive_signal` with a signal pre-queued and NO prior blocking wait.
+fn try_receive_first_no_wait_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let got: Option<Value> = ctx.try_receive_signal("event").map_err(|e| e.to_string())?;
+        Ok(json!({ "got": got }))
+    })
+}
+
+#[tokio::test]
+async fn test_try_receive_first_no_prior_wait_returns_oldest() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .run(try_receive_first_no_wait_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"got": {"seq": 1}})),
+        "a try_receive_signal with NO prior wait must return the oldest pre-queued signal"
+    );
+}
