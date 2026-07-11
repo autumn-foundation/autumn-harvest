@@ -746,14 +746,21 @@ pub async fn run_unified_dag(
         // ── Signal/timer gate (issue #746) ──────────────────────────────────
         // A gate is always alone in its level (guaranteed by DagBuilder::build),
         // so it is handled inline: it awaits a signal, not an activity, and must
-        // never be batched into `activity_futs`.
-        let gate_opt = if level.len() == 1 {
-            tasks[level[0]].signal.clone()
-        } else {
-            None
-        };
-        if let Some(gate) = gate_opt {
-            let task_idx = level[0];
+        // never be batched into `activity_futs`. Detect a gate by
+        // `signal.is_some()` regardless of level size (NOT `level.len() == 1`):
+        // if a future refactor ever broke the singleton-isolation invariant, the
+        // `debug_assert!` below fails LOUDLY here instead of silently routing the
+        // gate through `activity_futs` and dispatching a phantom activity named
+        // after the signal.
+        let gate_opt = level
+            .iter()
+            .find_map(|&i| tasks[i].signal.clone().map(|gate| (i, gate)));
+        if let Some((task_idx, gate)) = gate_opt {
+            debug_assert_eq!(
+                level.len(),
+                1,
+                "signal gate node must occupy its own singleton execution level, got {level:?}"
+            );
             let activity_name = tasks[task_idx].activity_name.clone();
             let upstreams = tasks[task_idx].upstreams.clone();
 

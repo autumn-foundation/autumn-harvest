@@ -280,6 +280,21 @@ mod unified {
             .condition(|ups| ups[0].get("approved") == Some(&json!(true)));
     }
 
+    /// `extract → {load (activity), go (gate)} → process` — the sibling activity
+    /// `load` and the gate `go` share a Kahn level (both depend only on
+    /// `extract`). Level isolation must split them so the gate's `WaitForSignal`
+    /// is never batched with `load`'s `ScheduleActivity`.
+    #[dag(default_queue = "gate-q")]
+    fn mixed_level_gate_dag(dag: &mut DagBuilder) {
+        let root = dag.activity(extract_users);
+        let sibling = dag.activity(load_users).upstream(&root);
+        let gate = dag.signal_gate("go").upstream(&root);
+        let _join = dag
+            .activity(process_item)
+            .upstream(&sibling)
+            .upstream(&gate);
+    }
+
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
@@ -621,5 +636,146 @@ mod unified {
                  a non-determinism divergence, got: {report}"
             );
         }
+    }
+
+    // ── Cluster 4: payload binding, defensive walker, edge coverage ──────────
+
+    fn scheduled(events: &[WorkflowEvent], name: &str) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { name: n, .. } if n == name))
+    }
+
+    /// **AC1 direct payload binding.** `gate_signal_payload_dag`'s downstream
+    /// `load` is `.condition`-gated on the gate's stored output, so whether it
+    /// dispatches is a direct, live-run function of the *signal payload* — not a
+    /// null sentinel. A matching payload dispatches `load`; a non-matching one
+    /// skips it. (This is the live-run twin of the both-events replay money
+    /// fixture above.)
+    ///
+    /// **AC3 note.** The gate lowers onto `wait_for_signal`, which consumes a
+    /// `SignalReceived` event regardless of how it was delivered — the standalone
+    /// signal route, `signal_with_start` (#244), or in-workflow
+    /// `signal_external_workflow` all append the same `SignalReceived`. Delivery
+    /// is therefore route-agnostic at the gate, so a payload delivered via
+    /// signal-with-start binds identically to the queued signal here; the
+    /// both-events replay fixtures replay exactly such a `SignalReceived`.
+    #[tokio::test]
+    async fn gate_signal_payload_binds_into_downstream_condition() {
+        // Matching payload → condition true → load dispatched.
+        let approved = WorkflowTestEnv::new()
+            .mock_activity("extract_users", |_| Ok(json!("extracted")))
+            .mock_activity("load_users", |_| Ok(json!("loaded")))
+            .queue_signal("approval", json!({ "approved": true }))
+            .run(
+                __autumn_workflow_info_gate_signal_payload_dag().handler,
+                Value::Null,
+            )
+            .await;
+        assert!(approved.result.is_ok(), "{:?}", approved.result);
+        assert!(
+            scheduled(approved.events(), "load_users"),
+            "a matching signal payload must bind into the gate output and \
+             dispatch the conditioned downstream"
+        );
+
+        // Non-matching payload → condition false → load skipped. (A null gate
+        // output would also skip it, which is exactly why the matching case
+        // above — where load DOES run — proves the real payload, not a sentinel,
+        // is bound.)
+        let rejected = WorkflowTestEnv::new()
+            .mock_activity("extract_users", |_| Ok(json!("extracted")))
+            .mock_activity("load_users", |_| Ok(json!("loaded")))
+            .queue_signal("approval", json!({ "approved": false }))
+            .run(
+                __autumn_workflow_info_gate_signal_payload_dag().handler,
+                Value::Null,
+            )
+            .await;
+        assert!(rejected.result.is_ok(), "{:?}", rejected.result);
+        assert!(
+            !scheduled(rejected.events(), "load_users"),
+            "a non-matching signal payload must skip the conditioned downstream"
+        );
+    }
+
+    /// **Level isolation, end-to-end.** The builder-level
+    /// `signal_gate_is_isolated_into_its_own_singleton_level` proves the split;
+    /// this proves it *matters*: a DAG whose Kahn topology co-locates an activity
+    /// and a gate in one level runs cleanly (the gate's `WaitForSignal` is never
+    /// batched with the sibling's `ScheduleActivity`, which the worker rejects).
+    #[tokio::test]
+    async fn mixed_level_gate_and_activity_run_cleanly_end_to_end() {
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("extract_users", |_| Ok(json!("extracted")))
+            .mock_activity("load_users", |_| Ok(json!("loaded")))
+            .mock_activity("process_item", |_| Ok(json!("processed")))
+            .queue_signal("go", json!({ "ok": true }))
+            .run(
+                __autumn_workflow_info_mixed_level_gate_dag().handler,
+                Value::Null,
+            )
+            .await;
+        assert!(
+            outcome.result.is_ok(),
+            "a co-located gate+activity level must run cleanly, got: {:?}",
+            outcome.result
+        );
+        let events = outcome.events();
+        assert!(
+            scheduled(events, "load_users"),
+            "the sibling activity must run"
+        );
+        assert!(
+            scheduled(events, "process_item"),
+            "the join must run after both the sibling and the gate resolve"
+        );
+    }
+
+    /// A gate feeding `.map` must fail cleanly (not panic) when the signal
+    /// payload is not a JSON array.
+    #[tokio::test]
+    async fn gate_map_over_non_array_payload_errors_cleanly() {
+        for payload in [json!("not-an-array"), Value::Null, json!(7)] {
+            let outcome = WorkflowTestEnv::new()
+                .mock_activity("extract_users", |_| Ok(json!("extracted")))
+                .mock_activity("process_item", |_| Ok(json!("processed")))
+                .queue_signal("items", payload.clone())
+                .run(__autumn_workflow_info_gate_map_dag().handler, Value::Null)
+                .await;
+            let err = outcome
+                .result
+                .expect_err(&format!("map over non-array {payload} must error"));
+            assert!(
+                err.contains("not a JSON array"),
+                "map over a non-array payload must fail cleanly, got: {err}"
+            );
+        }
+    }
+
+    /// A gate feeding `.map` over an EMPTY-array payload succeeds with zero
+    /// fanned-out instances.
+    #[tokio::test]
+    async fn gate_map_over_empty_array_succeeds_with_no_instances() {
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("extract_users", |_| Ok(json!("extracted")))
+            .mock_activity("process_item", |_| Ok(json!("processed")))
+            .queue_signal("items", json!([]))
+            .run(__autumn_workflow_info_gate_map_dag().handler, Value::Null)
+            .await;
+        assert!(
+            outcome.result.is_ok(),
+            "map over an empty array must succeed, got: {:?}",
+            outcome.result
+        );
+        let mapped = outcome
+            .events()
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "process_item"))
+            .count();
+        assert_eq!(
+            mapped, 0,
+            "an empty-array gate payload must fan out zero instances, got {mapped}"
+        );
     }
 }
