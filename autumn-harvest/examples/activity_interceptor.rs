@@ -222,4 +222,59 @@ mod tests {
         // The duration metric is recorded regardless of Ok/Err.
         assert_eq!(metrics.histograms.lock().unwrap().len(), 1);
     }
+
+    /// An interceptor that captures the `CORRELATION_HEADER` value it read from
+    /// the `ActivityContext`, so the test can assert the interceptor genuinely
+    /// observes a propagated context header (issue #481).
+    struct CaptureHeaderInterceptor {
+        observed: Arc<Mutex<Option<String>>>,
+    }
+    impl ActivityInterceptor for CaptureHeaderInterceptor {
+        fn intercept<'a>(
+            &'a self,
+            _invocation: &'a ActivityInvocation<'a>,
+            ctx: &'a ActivityContext,
+            input: serde_json::Value,
+            next: ActivityInterceptorNext<'a>,
+        ) -> ActivityInterceptorFuture<'a> {
+            let observed = self.observed.clone();
+            let value = ctx.header(CORRELATION_HEADER).map(str::to_string);
+            Box::pin(async move {
+                *observed.lock().unwrap() = value;
+                next.run(input).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn interceptor_reads_correlation_header_from_ctx() {
+        // Build an ActivityContext carrying the correlation header, as the worker
+        // does at dispatch time from the execution's propagated context_headers.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(CORRELATION_HEADER.to_string(), "corr-abc".to_string());
+        let ctx = ActivityContext::new_test().with_context_headers(Arc::new(headers));
+
+        let observed = Arc::new(Mutex::new(None));
+        let interceptors: Vec<Arc<dyn ActivityInterceptor>> =
+            vec![Arc::new(CaptureHeaderInterceptor {
+                observed: observed.clone(),
+            })];
+        let invocation = ActivityInvocation::for_test("charge_card", false, "default");
+
+        run_interceptor_chain_for_test(
+            &interceptors,
+            &invocation,
+            &ctx,
+            serde_json::json!(null),
+            |input| Box::pin(async move { Ok(input) }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().as_deref(),
+            Some("corr-abc"),
+            "the interceptor must read the propagated correlation header from ctx"
+        );
+    }
 }

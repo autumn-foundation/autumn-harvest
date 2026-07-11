@@ -42,12 +42,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC;
+use autumn_harvest::failure::{ERROR_TYPE_CIRCUIT_OPEN, ERROR_TYPE_HANDLER_PANIC};
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
+use autumn_harvest::policy::CircuitBreakerPolicy;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_task_queue, harvest_workflow_executions,
@@ -305,6 +306,54 @@ impl ActivityInterceptor for OrderInterceptor {
     }
 }
 
+/// Reads a named context header (issue #481) from the live `ActivityContext`
+/// and records the observed value, proving header propagation reaches the
+/// interceptor end-to-end. Passes input/result through unchanged.
+struct HeaderReadingInterceptor {
+    header_key: &'static str,
+    observed: Arc<Mutex<Option<String>>>,
+}
+impl ActivityInterceptor for HeaderReadingInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        _invocation: &'a ActivityInvocation<'a>,
+        ctx: &'a autumn_harvest::ActivityContext,
+        input: serde_json::Value,
+        next: ActivityInterceptorNext<'a>,
+    ) -> ActivityInterceptorFuture<'a> {
+        let observed = self.observed.clone();
+        let value = ctx.header(self.header_key).map(str::to_string);
+        Box::pin(async move {
+            *observed.lock().unwrap() = value;
+            next.run(input).await
+        })
+    }
+}
+
+/// Injects `{"injected_by_interceptor": true}` into the (object) input BEFORE
+/// calling `next`, so a downstream echoing handler genuinely computes over the
+/// transformed input (issue #680 AC2, input-transform end-to-end).
+struct InputInjectInterceptor;
+impl ActivityInterceptor for InputInjectInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        _invocation: &'a ActivityInvocation<'a>,
+        _ctx: &'a autumn_harvest::ActivityContext,
+        mut input: serde_json::Value,
+        next: ActivityInterceptorNext<'a>,
+    ) -> ActivityInterceptorFuture<'a> {
+        Box::pin(async move {
+            if let Some(obj) = input.as_object_mut() {
+                obj.insert(
+                    "injected_by_interceptor".to_string(),
+                    serde_json::json!(true),
+                );
+            }
+            next.run(input).await
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers (benign — interceptors carry the behaviour under test).
 // ---------------------------------------------------------------------------
@@ -461,6 +510,19 @@ async fn seed_workflow(
     input: serde_json::Value,
     queue: &str,
 ) -> ExecutionId {
+    seed_workflow_with_headers(conn, workflow_name, input, queue, None).await
+}
+
+/// Like [`seed_workflow`] but attaches ambient context headers (issue #481) to
+/// the execution row, so the engine propagates them into every activity task's
+/// `context_headers` and an interceptor can read them via `ctx.header(..)`.
+async fn seed_workflow_with_headers(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    input: serde_json::Value,
+    queue: &str,
+    context_headers: Option<serde_json::Value>,
+) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
@@ -480,7 +542,7 @@ async fn seed_workflow(
         owner: None,
         runbook_url: None,
         severity: None,
-        context_headers: None,
+        context_headers,
         sla: None,
         sla_deadline_at: None,
         schedule_id: None,
@@ -632,6 +694,18 @@ fn act_info(
     is_local: bool,
     retry: Option<RetryPolicy>,
 ) -> ActivityInfo {
+    act_info_with_breaker(name, handler, is_local, retry, None)
+}
+
+/// Like [`act_info`] but with an optional per-activity `CircuitBreakerPolicy`
+/// (issue #369), used by the interceptor-vs-circuit-breaker interaction test.
+fn act_info_with_breaker(
+    name: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+    is_local: bool,
+    retry: Option<RetryPolicy>,
+    circuit_breaker: Option<CircuitBreakerPolicy>,
+) -> ActivityInfo {
     ActivityInfo {
         name,
         module: "activity_interceptor_tests",
@@ -646,7 +720,7 @@ fn act_info(
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
-        circuit_breaker: None,
+        circuit_breaker,
         is_local,
         max_input_bytes: None,
         max_result_bytes: None,
@@ -685,8 +759,13 @@ async fn interceptor_wraps_regular_activity_and_records_transformed_value() {
     let (url, _container) = setup_db().await;
     let queue = "q-wrap-regular";
     let mut conn = connect(&url).await;
-    let exec_id =
-        seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let interceptor = Arc::new(CountingTransformInterceptor { seen: seen.clone() });
@@ -739,8 +818,13 @@ async fn interceptor_not_reinvoked_on_replay() {
     let (url, _container) = setup_db().await;
     let queue = "q-no-replay";
     let mut conn = connect(&url).await;
-    let exec_id =
-        seed_workflow(&mut conn, "wf_two_activities", serde_json::json!({"v": 2}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_two_activities",
+        serde_json::json!({"v": 2}),
+        queue,
+    )
+    .await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let interceptor = Arc::new(CountingTransformInterceptor { seen: seen.clone() });
@@ -776,6 +860,43 @@ async fn interceptor_not_reinvoked_on_replay() {
         vec![("echo".to_string(), false), ("echo2".to_string(), false)],
         "interceptor must fire exactly once per LIVE activity execution and never on replay"
     );
+
+    // Independently EVIDENCE the intervening replay from the durable, append-only
+    // history rather than inferring it from the coroutine model. The workflow
+    // suspends after emitting each `ScheduleActivity` command and cannot emit the
+    // NEXT one until it is re-driven (replayed from the top) after the prior
+    // activity completes. So `ActivityScheduled(echo2)` appearing in history
+    // AFTER `ActivityCompleted(echo)` proves the workflow was re-driven in a
+    // second workflow-task cycle — a cycle that necessarily replayed
+    // WorkflowStarted + ActivityScheduled(echo) + ActivityCompleted(echo) before
+    // producing ActivityScheduled(echo2). The interceptor count staying at
+    // exactly 2 (asserted above), across that proven replay of a completed
+    // activity, is the property under test: replay does not re-invoke interceptors.
+    let history = load_history(&url, exec_id).await;
+    let echo_completed_idx = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("echo must have an ActivityCompleted event");
+    let echo2_scheduled_idx = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "echo2"))
+        .expect("echo2 must have an ActivityScheduled event");
+    assert!(
+        echo_completed_idx < echo2_scheduled_idx,
+        "echo2 must be scheduled only after echo completed, evidencing the intervening \
+         replay cycle in which the interceptor was NOT re-invoked; history={history:?}"
+    );
+
+    // Structural note (AC4): the deterministic replay engine — WorkflowReplayer
+    // in `src/testing.rs` — has NO way to invoke an interceptor at all. It never
+    // executes activity handlers (it reads recorded ActivityCompleted/Failed
+    // events; see the module doc there), and interceptors live exclusively on the
+    // worker dispatch path (`process_activity_task` / `run_local_activity_inline`
+    // in `worker.rs`), reachable only through a HandlerRegistry the replayer never
+    // constructs. A pure-replayer fixture therefore cannot even register an
+    // interceptor to count zero invocations — the property is guaranteed by
+    // construction, and this DB test additionally proves a real worker replay
+    // cycle does not re-invoke one.
 }
 
 // ---------------------------------------------------------------------------
@@ -787,8 +908,13 @@ async fn interceptor_wraps_local_activity() {
     let (url, _container) = setup_db().await;
     let queue = "q-wrap-local";
     let mut conn = connect(&url).await;
-    let exec_id =
-        seed_workflow(&mut conn, "wf_one_local", serde_json::json!({"v": 3}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_local",
+        serde_json::json!({"v": 3}),
+        queue,
+    )
+    .await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let interceptor = Arc::new(CountingTransformInterceptor { seen: seen.clone() });
@@ -840,8 +966,13 @@ async fn panicking_interceptor_becomes_activity_failed_and_worker_survives() {
     let (url, _container) = setup_db().await;
     let queue = "q-panic-int";
     let mut conn = connect(&url).await;
-    let exec_id =
-        seed_workflow(&mut conn, "wf_panic_int", serde_json::json!({"v": 4}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_panic_int",
+        serde_json::json!({"v": 4}),
+        queue,
+    )
+    .await;
 
     let registry = build_registry(
         vec![wf_info("wf_panic_int", wf_one_activity)],
@@ -1097,5 +1228,206 @@ async fn registration_order_is_outermost_first_end_to_end() {
         *log.lock().unwrap(),
         vec!["i1-before", "i2-before", "i2-after", "i1-after"],
         "the first-registered interceptor (i1) must be the OUTERMOST wrapper"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 (FIX 2 / AC6) — an interceptor's retryable Err feeds the per-activity
+// circuit breaker EXACTLY like a handler error, with no special-casing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_error_feeds_circuit_breaker_like_a_handler_error() {
+    let (url, _container) = setup_db().await;
+    let queue = "q-cb-int";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, "wf_cb_int", serde_json::json!({"v": 8}), queue).await;
+
+    // failure_threshold = 2: two retryable failures trip the breaker. A generous
+    // retry budget (5) lets a THIRD dispatch attempt occur — which the now-open
+    // breaker short-circuits BEFORE the interceptor chain runs, terminating the
+    // activity with the typed CircuitOpen failure. The ONLY source of failures
+    // feeding the breaker is the interceptor (it returns Err without calling
+    // `next`, so the handler never runs), so a trip proves interceptor errors
+    // flow through `handle_activity_result` -> CircuitBreaker::on_result
+    // identically to a handler error.
+    let attempts = Arc::new(Mutex::new(0usize));
+    let registry = build_registry(
+        vec![wf_info("wf_cb_int", wf_one_activity)],
+        vec![act_info_with_breaker(
+            "echo",
+            echo_activity,
+            false,
+            Some(RetryPolicy::fixed(5, Duration::from_millis(30))),
+            Some(CircuitBreakerPolicy::new(
+                2,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )),
+        )],
+        vec![Arc::new(ErrorInterceptor {
+            attempts: attempts.clone(),
+        })],
+    );
+    let worker = build_worker("worker-cb-int", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    let execution = run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(execution.state, "FAILED");
+
+    // The breaker trips solely from interceptor errors: threshold=2 ⇒ the
+    // interceptor is invoked on exactly the first two attempts. The third
+    // dispatch is short-circuited by the open breaker BEFORE the chain runs
+    // (interceptors sit after the circuit-breaker admit gate), so the count is
+    // never inflated to 3.
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        2,
+        "interceptor runs on the two tripping attempts only; the open-circuit \
+         short-circuit runs before the interceptor chain"
+    );
+
+    // Terminal failure is the typed CircuitOpen — proof the interceptor errors
+    // opened the breaker, identical to a handler error opening it.
+    let history = load_history(&url, exec_id).await;
+    let terminal_error_type = history
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            WorkflowEvent::ActivityFailed { error_type, .. } => Some(error_type.clone()),
+            _ => None,
+        })
+        .expect("a terminal ActivityFailed must exist");
+    assert_eq!(
+        terminal_error_type, ERROR_TYPE_CIRCUIT_OPEN,
+        "the breaker must trip from the interceptor's retryable errors and short-circuit \
+         a later dispatch with the typed CircuitOpen failure; history={history:?}"
+    );
+
+    // And the breaker is observably open on the shared registry the worker used.
+    let snap = registry
+        .circuit_breakers()
+        .snapshot("echo", std::time::Instant::now())
+        .expect("the breaker must be tracked");
+    assert_eq!(
+        snap.state, "open",
+        "the interceptor errors must leave the breaker open"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 (FIX 3 / AC8) — an interceptor reads a context header (#481)
+// propagated end-to-end into the activity's ActivityContext.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_reads_propagated_context_header() {
+    let (url, _container) = setup_db().await;
+    let queue = "q-header-int";
+    let mut conn = connect(&url).await;
+    // Seed the execution with an ambient context header; the engine propagates
+    // it into every activity task's context_headers, so the interceptor's
+    // `ctx.header(..)` observes it without any per-activity plumbing.
+    let exec_id = seed_workflow_with_headers(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 9}),
+        queue,
+        Some(serde_json::json!({ "x-correlation-id": "corr-99" })),
+    )
+    .await;
+
+    let observed = Arc::new(Mutex::new(None));
+    let interceptor = Arc::new(HeaderReadingInterceptor {
+        header_key: "x-correlation-id",
+        observed: observed.clone(),
+    });
+    let registry = build_registry(
+        vec![wf_info("wf_one_activity", wf_one_activity)],
+        vec![act_info("echo", echo_activity, false, None)],
+        vec![interceptor],
+    );
+    let worker = build_worker("worker-header-int", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        observed.lock().unwrap().as_deref(),
+        Some("corr-99"),
+        "the interceptor must read the propagated x-correlation-id context header \
+         from the activity ctx (issue #481 propagation, end-to-end)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 (FIX 6 / AC2) — an interceptor INPUT transform is genuinely seen by
+// the handler through the real worker path (recorded ActivityCompleted output).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_input_transform_reaches_handler_end_to_end() {
+    let (url, _container) = setup_db().await;
+    let queue = "q-input-int";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 10}),
+        queue,
+    )
+    .await;
+
+    // The interceptor injects a field into the input BEFORE calling next; the
+    // echo handler returns whatever input it received. So the recorded
+    // ActivityCompleted.output reflecting the injected field proves the handler
+    // genuinely computed over the interceptor-transformed input through the real
+    // worker dispatch path (not merely a result transform).
+    let registry = build_registry(
+        vec![wf_info("wf_one_activity", wf_one_activity)],
+        vec![act_info("echo", echo_activity, false, None)],
+        vec![Arc::new(InputInjectInterceptor)],
+    );
+    let worker = build_worker("worker-input-int", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    let expected = serde_json::json!({ "v": 10, "injected_by_interceptor": true });
+    assert_eq!(
+        activity_completed_output(&history),
+        expected,
+        "the handler must echo the interceptor-transformed input, so the recorded \
+         ActivityCompleted output carries the injected field"
+    );
+    assert_eq!(
+        workflow_completed_output(&history),
+        expected,
+        "the workflow must observe the handler's output over the transformed input"
     );
 }
