@@ -12,6 +12,8 @@ mod cache_delta_load_tests;
 mod cancellation_tests;
 mod child_fanout_tests;
 mod child_policy_tests;
+#[cfg(feature = "db")]
+mod child_timeout_tests;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
 mod completion_callback_tests;

@@ -4887,6 +4887,191 @@ async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeede
 }
 
 // ---------------------------------------------------------------------------
+// execute_child_workflow_timeout — child-or-deadline race (issue #779)
+// ---------------------------------------------------------------------------
+
+/// Awaits a child workflow with a deadline, then branches on the outcome. A
+/// child failure before the deadline propagates as an Err (mapped to a String).
+fn child_or_deadline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+fn child_timeout_started() -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+/// Child completed before the deadline fired.
+fn child_win_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"ok": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"child": {"ok": true}}),
+        },
+    ]
+}
+
+/// Deadline timer fired first; the loser child was then cancelled (a synthetic
+/// ChildWorkflowFailed terminal recorded after the fire).
+fn timer_win_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 300,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+        WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: "lost race to a sibling branch".to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"timed_out": true}),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn child_timeout_child_win_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(child_win_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "child-win branch must replay:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn child_timeout_timer_win_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(timer_win_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "timer-win branch (with the sealed loser child terminal) must replay:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn child_timeout_both_branches_replay_succeeded_across_randomized_orderings() {
+    // Issue #779 success metric (parallel to #476): a fixture exercising both
+    // branches replays with ReplaySucceeded 100% of the time across 1,000
+    // randomized orderings. Winner is decided strictly by recorded history
+    // index, never wall-clock — so a deterministic pick per iteration must
+    // always replay clean.
+    let mut seed: u64 = 0x5DEE_CE66;
+    for i in 0..1_000 {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let events = if seed & 1 == 0 {
+            child_win_fixture()
+        } else {
+            timer_win_fixture()
+        };
+
+        let report = WorkflowReplayer::new()
+            .register_fn("child_or_deadline", child_or_deadline_workflow)
+            .replay_from_events(events)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "iteration {i} must replay:\n{report}"
+        );
+    }
+}
+
+/// A child that FAILED before the deadline replays deterministically to the
+/// Err branch (the workflow maps the typed failure to a String and returns it
+/// via `?`, which the replayer records as a WorkflowFailed terminal).
+#[tokio::test]
+async fn child_timeout_child_fails_before_deadline_replays_succeeded() {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: "child-workflow:process_order: downstream 503".to_string(),
+            error_type: Some("UpstreamUnavailable".to_string()),
+            details: None,
+            non_retryable: Some(true),
+        },
+        WorkflowEvent::WorkflowFailed {
+            error: "child-workflow:process_order: downstream 503".to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a child failure before the deadline must replay deterministically:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Push-based signal handlers (issue #546)
 // ---------------------------------------------------------------------------
 

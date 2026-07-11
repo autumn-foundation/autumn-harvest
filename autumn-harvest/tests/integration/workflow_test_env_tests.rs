@@ -1997,6 +1997,100 @@ async fn test_receive_signal_timeout_timeout_branch() {
     );
 }
 
+// ─────────── execute_child_workflow_timeout — child-or-deadline (issue #779) ───────────
+
+/// Awaits a child workflow with a deadline; on the deadline, escalates to a
+/// default outcome without ever consuming the (never-produced) child result.
+fn child_with_timeout_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let outcome: Option<Value> = ctx
+            .spawn_child_workflow_timeout(
+                "child_processing",
+                json!({"id": 42}),
+                std::time::Duration::from_secs(3600),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || json!({"outcome": "timed_out"}),
+            |output| json!({"outcome": "child_done", "output": output}),
+        ))
+    })
+}
+
+#[tokio::test]
+async fn test_child_timeout_child_branch() {
+    // A registered child mock resolves before the (stubbed) deadline — the
+    // success branch, no real sleeping.
+    let outcome = WorkflowTestEnv::new()
+        .mock_child_workflow("child_processing", |input| {
+            let id = input["id"].as_i64().unwrap_or(0);
+            Ok(json!({"processed": id}))
+        })
+        .run(child_with_timeout_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"outcome": "child_done", "output": {"processed": 42}}))
+    );
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. })),
+        "expected ChildWorkflowStarted"
+    );
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. })),
+        "expected ChildWorkflowCompleted on the child-win branch"
+    );
+
+    let report = outcome.replay_check(child_with_timeout_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "child branch must replay deterministically:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_child_timeout_deadline_branch() {
+    // No child mock queued — the stubbed deadline timer fires immediately (no
+    // real sleeping) and the workflow takes the timeout/escalation branch.
+    // Parity with `test_receive_signal_timeout_timeout_branch`.
+    let outcome = WorkflowTestEnv::new()
+        .run(child_with_timeout_workflow, json!(null))
+        .await;
+
+    assert_eq!(outcome.result, Ok(json!({"outcome": "timed_out"})));
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "expected TimerFired for the deadline timer"
+    );
+    assert!(
+        !outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. })),
+        "no child completion must be recorded on the deadline branch"
+    );
+
+    let report = outcome.replay_check(child_with_timeout_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "deadline branch must replay deterministically:\n{report}"
+    );
+}
+
 // ── issue #488: last_completion_result / last_error carryover (unit) ─────────
 
 fn carryover_reader_workflow<'a>(

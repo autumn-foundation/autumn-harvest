@@ -14008,6 +14008,433 @@ mod tests {
         assert_eq!(b, serde_json::json!({"b":"done"}));
     }
 
+    // ── execute_child_workflow_timeout / spawn_child_workflow_timeout (issue #779) ──
+    //
+    // Deadline-bounded child-workflow awaits: a single mixed
+    // `StartChildWorkflow + StartTimer` suspension batch races the child's
+    // terminal against the deadline timer. RED PHASE: the two context methods
+    // do not exist yet.
+
+    fn child_timeout_started_event() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    /// Live first cycle (NoMatch): the primitive pushes exactly one
+    /// `StartChildWorkflow` and one `StartTimer` in a SINGLE suspension batch
+    /// (the two-phase spawn-then-arm design was refuted — it hangs). Sending
+    /// the child result resolves the race to `Ok(Some(output))`.
+    #[tokio::test]
+    async fn child_timeout_live_pushes_child_and_timer_in_one_batch() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_task = Arc::clone(&ctx);
+        let join = tokio::spawn(async move {
+            ctx_task
+                .spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"id": 42}),
+                    std::time::Duration::from_secs(300),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            2,
+            "the race must suspend on a single mixed batch: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::StartChildWorkflow { .. })),
+            "batch must contain the child spawn"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::StartTimer { .. })),
+            "batch must contain the deadline timer (armed AT spawn, not in a later cycle)"
+        );
+
+        // Resolve the child so the spawned task can finish and join cleanly.
+        let child_tx = commands
+            .into_iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { result_tx, .. } => Some(result_tx),
+                _ => None,
+            })
+            .expect("StartChildWorkflow result channel");
+        child_tx
+            .send(Ok(serde_json::json!({"processed": true})))
+            .expect("receiver must be alive");
+
+        let result = join.await.expect("join").expect("child call ok");
+        assert_eq!(result, Some(serde_json::json!({"processed": true})));
+    }
+
+    /// Live batch carries the deterministic `__child_timeout:{seq}:{name}`
+    /// timer id from a per-context counter distinct from the signal one.
+    #[tokio::test]
+    async fn child_timeout_live_timer_id_uses_child_timeout_prefix() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_task = Arc::clone(&ctx);
+        let join = tokio::spawn(async move {
+            ctx_task
+                .spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"id": 1}),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let commands = ctx.drain_commands();
+        let timer_id = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str().to_string()),
+                _ => None,
+            })
+            .expect("StartTimer in batch");
+        assert_eq!(timer_id, "__child_timeout:1:process_order");
+
+        let child_tx = commands
+            .into_iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { result_tx, .. } => Some(result_tx),
+                _ => None,
+            })
+            .expect("child channel");
+        child_tx.send(Ok(serde_json::json!(null))).ok();
+        let _ = join.await;
+    }
+
+    /// Sub-second timeouts round the duration UP so a durable timer is still armed.
+    #[tokio::test]
+    async fn child_timeout_sub_second_timeout_rounds_up() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_task = Arc::clone(&ctx);
+        let join = tokio::spawn(async move {
+            ctx_task
+                .spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"id": 1}),
+                    std::time::Duration::from_millis(500),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let commands = ctx.drain_commands();
+        let duration_secs = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartTimer { duration_secs, .. } => Some(*duration_secs),
+                _ => None,
+            })
+            .expect("StartTimer in batch");
+        assert_eq!(duration_secs, 1, "500ms must round up to a 1s durable timer");
+
+        let child_tx = commands
+            .into_iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { result_tx, .. } => Some(result_tx),
+                _ => None,
+            })
+            .expect("child channel");
+        child_tx.send(Ok(serde_json::json!(null))).ok();
+        let _ = join.await;
+    }
+
+    /// Replay with the child's terminal recorded before the timer fired:
+    /// resolves to `Ok(Some(output))` synchronously with NO new commands.
+    #[tokio::test]
+    async fn child_timeout_replay_child_completed_returns_some_with_no_commands() {
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect("replay resolves");
+        assert_eq!(result, Some(serde_json::json!({"processed": true})));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a fully resolved replay must emit no new commands"
+        );
+    }
+
+    /// Replay with the deadline timer fired first while the child is still
+    /// running (no loser terminal yet): resolves to `Ok(None)` AND pushes
+    /// exactly one `CancelRaceLosers { children: [child_id] }`.
+    #[tokio::test]
+    async fn child_timeout_replay_timer_won_child_running_pushes_cancel_race_losers() {
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect("replay resolves");
+        assert_eq!(result, None, "deadline fired first → None");
+
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "exactly one CancelRaceLosers must be pushed on the resolving cycle: {commands:?}"
+        );
+        let WorkflowCommand::CancelRaceLosers {
+            activities,
+            children,
+            timers,
+        } = &commands[0]
+        else {
+            panic!("expected CancelRaceLosers, got {:?}", commands[0]);
+        };
+        assert!(activities.is_empty());
+        assert!(timers.is_empty());
+        assert_eq!(
+            children,
+            &vec![child_id],
+            "the still-running loser child must be targeted for cancellation"
+        );
+    }
+
+    /// Replay with the deadline timer fired AND the loser child already sealed
+    /// (its synthetic terminal recorded): resolves to `Ok(None)` and pushes NO
+    /// CancelRaceLosers — the child_already_terminal gate suppresses the
+    /// bookkeeping command (avoids a spurious command in strict replay).
+    #[tokio::test]
+    async fn child_timeout_replay_timer_won_child_sealed_pushes_no_cancel() {
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "lost race to a sibling branch".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect("replay resolves");
+        assert_eq!(result, None);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "an already-sealed loser child must NOT re-push CancelRaceLosers"
+        );
+    }
+
+    /// Replay with the child FAILED before the deadline: surfaces a typed
+    /// `HarvestError::WorkflowFailed` carrying error_type/details/non_retryable
+    /// (issue #767 parity with spawn_child_workflow_raw).
+    #[tokio::test]
+    async fn child_timeout_replay_child_failed_surfaces_typed_error() {
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "downstream 503".into(),
+                error_type: Some("UpstreamUnavailable".into()),
+                details: Some(serde_json::json!({"retry_after": 30})),
+                non_retryable: Some(true),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let err = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect_err("a failed child before the deadline must surface an Err");
+        match err {
+            HarvestError::WorkflowFailed {
+                error_type,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error_type.as_deref(), Some("UpstreamUnavailable"));
+                assert_eq!(non_retryable, Some(true));
+            }
+            other => panic!("expected typed WorkflowFailed, got {other:?}"),
+        }
+    }
+
+    /// Two concurrent child-timeouts draw distinct `__child_timeout:{seq}` ids
+    /// from the per-context counter.
+    #[tokio::test]
+    async fn child_timeout_two_concurrent_races_use_distinct_timer_ids() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_task = Arc::clone(&ctx);
+        let join = tokio::spawn(async move {
+            tokio::join!(
+                ctx_task.spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"n": 1}),
+                    std::time::Duration::from_secs(30),
+                ),
+                ctx_task.spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"n": 2}),
+                    std::time::Duration::from_secs(30),
+                ),
+            )
+        });
+        tokio::task::yield_now().await;
+
+        let commands = ctx.drain_commands();
+        let mut timer_ids: Vec<String> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        timer_ids.sort();
+        assert_eq!(
+            timer_ids,
+            vec![
+                "__child_timeout:1:process_order".to_string(),
+                "__child_timeout:2:process_order".to_string(),
+            ],
+            "each concurrent race must carry a distinct deterministic timer id"
+        );
+
+        // Unblock both children so the joined task can finish.
+        for c in commands {
+            if let WorkflowCommand::StartChildWorkflow { result_tx, .. } = c {
+                result_tx.send(Ok(serde_json::json!(null))).ok();
+            }
+        }
+        let _ = join.await;
+    }
+
+    /// The typed `execute_child_workflow_timeout::<O>` deserializes the winning
+    /// child output into `O`, returning `Some(O)`; a fired deadline yields `None`.
+    #[tokio::test]
+    async fn child_timeout_typed_returns_deserialized_some() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Report {
+            processed: bool,
+        }
+        let info = make_workflow_info("process_order");
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 7}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result: Option<Report> = ctx
+            .execute_child_workflow_timeout(
+                &info,
+                serde_json::json!({"id": 7}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect("typed replay resolves");
+        assert_eq!(result, Some(Report { processed: true }));
+    }
+
     // ── upsert_search_attrs tests ─────────────────────────────────────
 
     #[test]

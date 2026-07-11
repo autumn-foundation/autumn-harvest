@@ -120,6 +120,9 @@ required-features = ["testing"]
 name = "dag_approval_gate"
 required-features = ["unified-dag-execution"]
 
+[[example]]
+name = "child_with_timeout"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

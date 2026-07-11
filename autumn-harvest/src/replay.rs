@@ -9033,6 +9033,545 @@ mod tests {
         }
     }
 
+    // ── match_child_or_timer (issue #779) ─────────────────────────────────
+    //
+    // Deadline-bounded child-workflow awaits, mirroring match_signal_or_timer.
+    // The race composes ChildWorkflowStarted/Completed/Failed with
+    // TimerStarted/TimerFired — no new event variant. Winner = earliest
+    // recorded history index. RED PHASE: ChildOrTimerMatch and
+    // HistoryMatcher::match_child_or_timer do not exist yet.
+
+    fn child_timer_id() -> TimerId {
+        TimerId::new("__child_timeout:1:process_order")
+    }
+
+    fn child_started_event(child_id: ExecutionId) -> WorkflowEvent {
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".into(),
+            input: serde_json::json!({"id": 42}),
+        }
+    }
+
+    #[test]
+    fn child_or_timer_child_completes_before_timer_fired_wins() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_win_consumes_stray_timer_fired() {
+        // The durable deadline timer fires after the child already won. The
+        // stray TimerFired must be consumed so subsequent matches do not
+        // diverge and the strict unconsumed check passes.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "stray deadline TimerFired must be consumed after the child wins"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_terminal_only_wins() {
+        // A completed child with no timer ever fired resolves to ChildCompleted.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!("done"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!("done")
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_timer_wins_when_fired_before_child_terminal() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal: false,
+            },
+            "timer wins and the still-running child is not yet terminal, so the \
+             caller must push CancelRaceLosers on this cycle"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_timer_win_consumes_loser_child_terminal() {
+        // Timer fired first, then the losing child's terminal (a synthetic
+        // ChildWorkflowFailed from the race-loser cancellation) was recorded.
+        // The matcher must genuinely consume that loser terminal (it is
+        // deliverable to nobody) and report child_already_terminal = true so
+        // the caller does NOT re-push CancelRaceLosers.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "lost race to a sibling branch".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal: true,
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "the losing child terminal must be genuinely consumed on timer-win"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_late_child_terminal_after_timer_win_is_preserved_not_corrupted() {
+        // The timer wins; a child terminal recorded AFTER the fire is the
+        // losing child being sealed. It is consumed (transparent), and the
+        // race still resolves to TimerFired — the late terminal must not flip
+        // the winner or trip a divergence.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!("raced-but-lost"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal: true,
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "a late losing child terminal after timer-win must be consumed, not left dangling"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_fails_before_deadline_returns_typed_fields() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "downstream 503".into(),
+                error_type: Some("UpstreamUnavailable".into()),
+                details: Some(serde_json::json!({"retry_after": 30})),
+                non_retryable: Some(true),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildFailed {
+                error: "downstream 503".into(),
+                error_type: "UpstreamUnavailable".into(),
+                details: Some(serde_json::json!({"retry_after": 30})),
+                non_retryable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_legacy_child_failure_maps_error_type_sentinel() {
+        // A pre-#767 / untyped child failure decodes to the "Error" sentinel
+        // with no details and not non-retryable, mirroring match_child_workflow.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "boom".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildFailed {
+                error: "boom".into(),
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_no_match_on_empty_history() {
+        // Child not started yet — first live execution of the race.
+        let mut matcher = HistoryMatcher::new(vec![]);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            "__child_timeout:1:process_order",
+            Some(300),
+        );
+        assert_eq!(result, ChildOrTimerMatch::NoMatch);
+    }
+
+    #[test]
+    fn child_or_timer_in_progress_when_both_started_but_neither_resolved() {
+        // ChildWorkflowStarted + TimerStarted recorded, but no terminal and no
+        // TimerFired yet: the caller must re-park. InProgress carries the
+        // recorded child_id so the re-emitted StartChildWorkflow reuses it.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::InProgress { child_id },
+            "InProgress must return the recorded child_id for the re-park"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_wrong_child_start() {
+        let events = vec![WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "send_email".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            "__child_timeout:1:process_order",
+            Some(300),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_wrong_timer_id() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__child_timeout:99:process_order"),
+                duration_secs: 300,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            "__child_timeout:1:process_order",
+            Some(300),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_duration_change() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(600),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_wrong_child_input() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 999}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_child_win_across_interleaved_sibling_activity() {
+        // A concurrent sibling activity's events are interleaved between the
+        // child/timer start pair and the child's terminal. The scan must skip
+        // them (transparent) instead of reporting the race in progress, and
+        // rewind to the interleaved command so the sibling's own matcher runs.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "audit_log".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("logged"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        // The interleaved sibling activity must still be matchable afterwards.
+        let activity = matcher.match_activity("audit_log");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!("logged")
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_replays_same_branch_when_both_events_exist() {
+        // Whichever resolution event was recorded first wins on every replay,
+        // regardless of wall-clock timing (R4: deterministic by history index).
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+
+        for _ in 0..3 {
+            let mut matcher = HistoryMatcher::new(events.clone());
+            let result = matcher.match_child_or_timer(
+                "process_order",
+                &serde_json::json!({"id": 42}),
+                timer_id.as_str(),
+                Some(300),
+            );
+            assert_eq!(
+                result,
+                ChildOrTimerMatch::ChildCompleted {
+                    output: serde_json::json!({"processed": true})
+                }
+            );
+        }
+    }
+
     // ── ctx.race() marker matcher (issue #600) ──────────────────────────────
 
     #[test]

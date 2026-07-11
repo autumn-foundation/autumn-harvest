@@ -283,7 +283,7 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 
 /// Start a Postgres container with the harvest schema applied and return
 /// the database URL plus the live container handle.
-async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
+pub(crate) async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
         .with_tag("16")
@@ -499,7 +499,7 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
     );
 }
 
-fn build_test_pool(database_url: &str) -> DbPool {
+pub(crate) fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
         // Must comfortably exceed the largest `max_concurrent_workflows` any
@@ -536,7 +536,10 @@ async fn load_task_from_url(database_url: &str, task_id: Uuid) -> TaskQueueItem 
         .expect("failed to reload task queue row")
 }
 
-async fn load_history_from_url(database_url: &str, exec_id: ExecutionId) -> store::EventHistory {
+pub(crate) async fn load_history_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+) -> store::EventHistory {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect fresh Postgres client for history query");
@@ -577,7 +580,7 @@ async fn load_timers_for_execution_from_url(
         .expect("failed to reload timer rows")
 }
 
-async fn load_child_executions_from_url(
+pub(crate) async fn load_child_executions_from_url(
     database_url: &str,
     parent_exec_id: ExecutionId,
 ) -> Vec<WorkflowExecution> {
@@ -594,7 +597,7 @@ async fn load_child_executions_from_url(
 }
 
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
-async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
+pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
@@ -763,7 +766,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     );
 }
 
-async fn enqueue_started_workflow_task(
+pub(crate) async fn enqueue_started_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     workflow_input: serde_json::Value,
@@ -792,7 +795,7 @@ async fn enqueue_started_workflow_task(
         .expect("enqueue workflow task failed");
 }
 
-fn build_runtime_worker(
+pub(crate) fn build_runtime_worker(
     worker_id: &str,
     max_concurrent_workflows: usize,
     max_concurrent_activities: usize,
@@ -868,13 +871,13 @@ fn build_runtime_worker_with_task_timeout(
     )
 }
 
-fn spawn_test_worker(worker: Arc<Worker>, pool: DbPool) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_test_worker(worker: Arc<Worker>, pool: DbPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         worker.run(&pool).await;
     })
 }
 
-async fn wait_for_execution_state(
+pub(crate) async fn wait_for_execution_state(
     database_url: &str,
     exec_id: ExecutionId,
     expected_state: &str,
