@@ -8842,14 +8842,19 @@ async fn get_workflow_stack(
         .fold(
             std::collections::BTreeMap::<String, PendingLocalActivity>::new(),
             |mut acc, (event_type, event_data, ts)| {
+                // `harvest_events.event_data` stores the full adjacently-tagged
+                // envelope `{"type": ..., "data": {...}}`, so the event's own
+                // fields live under `.data`, not at the top level (#773).
                 let activity_id = event_data
-                    .get("activity_id")
+                    .get("data")
+                    .and_then(|d| d.get("activity_id"))
                     .and_then(serde_json::Value::as_str)
                     .map(ToOwned::to_owned);
                 match (event_type.as_str(), activity_id) {
                     ("LocalActivityScheduled", Some(activity_exec_id)) => {
                         let activity_name = event_data
-                            .get("name")
+                            .get("data")
+                            .and_then(|d| d.get("name"))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_string();
