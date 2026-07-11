@@ -67,7 +67,11 @@ fn signal_gate_with_timeout_stores_timeout_and_action() {
     let mut builder = DagBuilder::new();
     let extract = builder.activity(a);
     let gate = builder
-        .signal_gate_with_timeout("approval", Duration::from_secs(3600), GateTimeoutAction::Continue)
+        .signal_gate_with_timeout(
+            "approval",
+            Duration::from_secs(3600),
+            GateTimeoutAction::Continue,
+        )
         .upstream(&extract);
 
     let def = builder.build().expect("gate DAG builds");
@@ -174,13 +178,75 @@ fn classic_dag_with_gate_is_rejected_at_build_time() {
         mcp: false,
     };
 
-    let result = HarvestBuilder::new().dags(vec![classic_gate_dag]).try_build();
+    let result = HarvestBuilder::new()
+        .dags(vec![classic_gate_dag])
+        .try_build();
     let err = result.expect_err("a classic DAG with a signal gate must be rejected");
     let msg = err.to_string();
     assert!(
         msg.contains("classic_gate_dag") && msg.contains("approval"),
         "AC6 rejection must name the DAG and the signal, got: {msg}"
     );
+}
+
+/// Codex round-2 (#746): a gate stores its signal name in `activity_name`, so
+/// the local-activity validator (`validate_dags_do_not_use_local_activities`)
+/// must skip gate tasks — a gate never dispatches that activity. Registering a
+/// LOCAL activity named `approval` alongside a unified DAG `signal_gate("approval")`
+/// must therefore still build; before the fix it false-rejected with
+/// `HarvestBuilderError::LocalActivityInDag`.
+mod gate_signal_name_is_not_a_local_activity {
+    use super::a;
+    use autumn_harvest::builder::HarvestBuilder;
+    use autumn_harvest::dag::DagBuilder;
+    use autumn_harvest::prelude::*;
+    use autumn_harvest::{DagInfo, OverlapPolicy};
+    use serde_json::Value;
+    use std::time::Duration;
+
+    // A LOCAL activity whose name collides with the gate's signal name.
+    #[activity(local = true, start_to_close = "5s")]
+    async fn approval(_ctx: &ActivityContext) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+
+    #[test]
+    fn unified_gate_and_same_named_local_activity_builds() {
+        // A *unified* DagInfo (workflow_handler: Some) whose gate awaits signal
+        // `approval`, upstream of an activity node. The gate task's
+        // `activity_name` is "approval" — the same string as the local activity.
+        let gate_dag = DagInfo {
+            name: "gate_flow",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let root = dag.activity(a);
+                let _gate = dag.signal_gate("approval").upstream(&root);
+            },
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: Duration::ZERO,
+            overlap_policy: OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+        };
+
+        let result = HarvestBuilder::new()
+            .dags(vec![gate_dag])
+            .activities(vec![approval_info()])
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "a gate's signal name must not be validated as a local-activity dispatch: {:?}",
+            result.err()
+        );
+    }
 }
 
 // ── Walker / replay tests (require the #[dag] macro's unified handler) ────────
@@ -356,7 +422,10 @@ mod unified {
             .mock_activity("extract_users", |_| Ok(json!("extracted")))
             .mock_activity("load_users", |_| Ok(json!("loaded")))
             .queue_signal("approval", json!({"approved": true}))
-            .run(__autumn_workflow_info_approval_gate_dag().handler, Value::Null)
+            .run(
+                __autumn_workflow_info_approval_gate_dag().handler,
+                Value::Null,
+            )
             .await;
 
         assert!(

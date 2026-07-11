@@ -496,12 +496,21 @@ pub fn build_run_graph(
 
 /// Classify a signal/timer gate node (issue #746) from recorded history.
 ///
-/// Resolution wins over reachability (a resolved gate was, by definition,
-/// reached):
+/// Reachability is checked BEFORE resolution (issue #746 review, Codex): the
+/// unified walker only awaits a gate's signal *after* `dispatch_decision`
+/// passes, so a matching `SignalReceived` / gate race-timer fire merely present
+/// in history does not prove the gate ran (it may be a signal buffered to the
+/// execution while an upstream was still in flight or later failed). The order
+/// is therefore:
 ///
 /// 1. A `dag_skip:{task_index}` marker (a #482 data-dependent `.condition(...)`
 ///    on the gate that was not taken) → [`DagNodeStatus::Skipped`].
-/// 2. A resolved gate — classified by **recorded history order**, mirroring the
+/// 2. Reachability (via [`task_reach`], mirroring the walker's own
+///    `dispatch_decision` trigger-rule check over the gate's upstream outcomes):
+///    an upstream still running / never reached, or a trigger rule that skips
+///    the gate → [`DagNodeStatus::Pending`] (the walker never awaited the gate),
+///    regardless of any stray matching signal in history.
+/// 3. Reached → classify by **recorded history order**, mirroring the
 ///    `match_signal_or_timer` (#476) replay contract, via [`gate_resolution`]:
 ///    * a matching `SignalReceived` recorded before any matching gate race-timer
 ///      `TimerFired` → [`DagNodeStatus::Succeeded`];
@@ -515,14 +524,8 @@ pub fn build_run_graph(
 ///      run fails) both report `timed_out` here — the gate's own outcome *was* a
 ///      timeout; whether the run continued or failed is visible on the
 ///      downstream / run state, not a separate gate status.
-/// 3. else the gate is unresolved — was it even reached?
-///    * The walker reached and dispatched it (all upstreams resolved and its
-///      trigger rule passed) → [`DagNodeStatus::Waiting`] while the run is live,
+///    * neither resolved yet → [`DagNodeStatus::Waiting`] while the run is live,
 ///      else [`DagNodeStatus::Pending`].
-///    * An upstream is still running, was never attempted, or a sibling failed
-///      under the gate's trigger rule (so the walker never reached / will never
-///      reach the gate) → [`DagNodeStatus::Pending`] rather than a misleading
-///      `waiting`.
 ///
 /// ### v1 limitation: two gates on the same signal name
 ///
@@ -550,24 +553,32 @@ fn gate_status(
     if has_skip_marker(events, task_index, &task.activity_name, &task.upstreams) {
         return DagNodeStatus::Skipped;
     }
-    // Resolved gates are classified by recorded history order (#476 contract),
-    // not by mere existence of a matching event.
-    match gate_resolution(events, signal_name) {
-        GateResolution::SignalWon => return DagNodeStatus::Succeeded,
-        GateResolution::TimerWon => return DagNodeStatus::TimedOut,
-        GateResolution::Unresolved => {}
+    // Reachability FIRST (issue #746 review, Codex). The unified walker only
+    // calls `wait_for_signal(_timeout)` AFTER `dispatch_decision` passes, so a
+    // matching `SignalReceived` (or gate race-timer fire) merely *present* in
+    // history — e.g. a signal buffered to the execution while an upstream is
+    // still in flight or later failed — does NOT prove the gate ran. Classify a
+    // gate by its recorded resolution ONLY once its upstreams' outcomes show the
+    // walker would have reached it; an unreached (or trigger-rule-skipped) gate
+    // is `pending`, never `succeeded`/`timed_out` from a stray event.
+    match task_reach(events, task, tasks, tasks.len()) {
+        TaskReach::NotReached | TaskReach::SkippedByTrigger => return DagNodeStatus::Pending,
+        TaskReach::Reached => {}
     }
-    // Unresolved: distinguish a genuinely-waiting reached gate from one the
-    // walker has not (or will never) reach.
-    match gate_reach(events, task, tasks) {
-        GateReach::Reached => {
+    // Reached → classify by recorded history order (#476 contract), not by mere
+    // existence of a matching event.
+    match gate_resolution(events, signal_name) {
+        GateResolution::SignalWon => DagNodeStatus::Succeeded,
+        GateResolution::TimerWon => DagNodeStatus::TimedOut,
+        // Reached but neither the signal nor the deadline has resolved yet: a
+        // genuinely-waiting gate on a live run, else `pending`.
+        GateResolution::Unresolved => {
             if is_live_state(exec_state) {
                 DagNodeStatus::Waiting
             } else {
                 DagNodeStatus::Pending
             }
         }
-        GateReach::NotReached | GateReach::SkippedByTrigger => DagNodeStatus::Pending,
     }
 }
 
@@ -624,74 +635,110 @@ fn timer_id_matches_gate(timer_id: &str, signal_name: &str) -> bool {
     !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) && name == signal_name
 }
 
-/// Whether the walker reached (and dispatched) a gate, inferred from its
-/// upstreams' recorded outcomes (mirrors the walker's own trigger-rule check).
-enum GateReach {
-    /// Every upstream resolved and the gate's trigger rule passed — the walker
-    /// reached the gate's level and awaited its signal.
+/// Whether the walker reached (and dispatched) a task, inferred from its
+/// upstreams' recorded outcomes (mirrors the walker's own `dispatch_decision`
+/// trigger-rule check). Used both to classify a gate node's own status and,
+/// recursively, to infer whether a markerless upstream was trigger-rule-skipped.
+enum TaskReach {
+    /// Every upstream resolved and the task's trigger rule passed — the walker
+    /// reached and dispatched (or, for a gate, awaited) it.
     Reached,
-    /// An upstream is still in flight or was never attempted, so the walker has
-    /// not reached the gate yet.
+    /// An upstream is still in flight or was never reached, so the walker has
+    /// not reached this task yet.
     NotReached,
-    /// Every upstream resolved but the gate's trigger rule skipped it.
+    /// Every upstream resolved but the task's trigger rule skipped it.
     SkippedByTrigger,
 }
 
-/// Infer whether a gate was reached from its upstreams' recorded outcomes.
-fn gate_reach(events: &[WorkflowEvent], task: &DagTask, tasks: &[DagTask]) -> GateReach {
+/// Infer whether a task was reached from its upstreams' recorded outcomes.
+///
+/// `depth` bounds the mutual recursion with [`resolved_upstream_status`] — a
+/// defensive backstop against a malformed cyclic definition. A validated DAG is
+/// acyclic, so any upstream chain is at most `tasks.len()` deep.
+fn task_reach(
+    events: &[WorkflowEvent],
+    task: &DagTask,
+    tasks: &[DagTask],
+    depth: usize,
+) -> TaskReach {
     let mut statuses: Vec<TaskStatus> = Vec::with_capacity(task.upstreams.len());
     for &up in &task.upstreams {
-        match resolved_upstream_status(events, up, tasks) {
+        match resolved_upstream_status(events, up, tasks, depth) {
             Some(status) => statuses.push(status),
-            None => return GateReach::NotReached,
+            None => return TaskReach::NotReached,
         }
     }
     if task.trigger_rule.should_run(&statuses) {
-        GateReach::Reached
+        TaskReach::Reached
     } else {
-        GateReach::SkippedByTrigger
+        TaskReach::SkippedByTrigger
     }
 }
 
 /// Resolve an upstream node's terminal [`TaskStatus`] from history, or `None`
 /// when it has not resolved (still in flight, or never reached) — which the
-/// caller treats as "the gate has not been reached yet".
+/// caller treats as "this task has not been reached yet".
+///
+/// Mirrors the walker's own skip bookkeeping so downstream reachability is
+/// faithful (issue #746 review, Codex):
+///   * a `.condition(...)`-skipped upstream (activity **or** gate) records a
+///     #482 `dag_skip` marker → [`TaskStatus::Skipped`] (a "done" outcome);
+///   * a **trigger-rule**-skipped upstream records NO marker and no events — the
+///     walker just sets its status to `Skipped` — so it is inferred by
+///     recursively evaluating that upstream's own [`task_reach`]
+///     ([`TaskReach::SkippedByTrigger`] → `Skipped`).
 fn resolved_upstream_status(
     events: &[WorkflowEvent],
     idx: usize,
     tasks: &[DagTask],
+    depth: usize,
 ) -> Option<TaskStatus> {
+    // Defensive: recursion deeper than the DAG size ⇒ a malformed cyclic
+    // definition. Treat as not-yet-resolved rather than looping forever.
+    let depth = depth.checked_sub(1)?;
     let up = tasks.get(idx)?;
-    // A gate upstream resolves via its own signal / timer, not activity events —
-    // and by recorded history order (#476 contract), so a timer that fired
-    // before a late signal resolves as a timeout, cascading correctly to
-    // downstream reachability.
+    // A gate upstream resolves via its own signal / timer (by recorded history
+    // order, #476 contract), a #482 condition-skip marker, or an inferred
+    // trigger-rule skip.
     if let Some(gate) = &up.signal {
-        match gate_resolution(events, &gate.signal_name) {
-            GateResolution::SignalWon => return Some(TaskStatus::Succeeded),
-            GateResolution::TimerWon => {
-                return Some(match gate.on_timeout {
-                    GateTimeoutAction::FailRun => TaskStatus::Failed,
-                    GateTimeoutAction::Continue => TaskStatus::Succeeded,
-                });
-            }
-            GateResolution::Unresolved => return None,
+        // A condition-skipped gate records a `dag_skip` marker, exactly like a
+        // skipped activity — it is resolved (Skipped), a "done" outcome.
+        if has_skip_marker(events, idx, &up.activity_name, &up.upstreams) {
+            return Some(TaskStatus::Skipped);
         }
+        return match gate_resolution(events, &gate.signal_name) {
+            GateResolution::SignalWon => Some(TaskStatus::Succeeded),
+            GateResolution::TimerWon => Some(match gate.on_timeout {
+                GateTimeoutAction::FailRun => TaskStatus::Failed,
+                GateTimeoutAction::Continue => TaskStatus::Succeeded,
+            }),
+            // Not yet signalled/timed: resolved only if the walker never reached
+            // it (its own trigger rule skipped it). A still-waiting or unreached
+            // gate is not "done" → None.
+            GateResolution::Unresolved => match task_reach(events, up, tasks, depth) {
+                TaskReach::SkippedByTrigger => Some(TaskStatus::Skipped),
+                TaskReach::Reached | TaskReach::NotReached => None,
+            },
+        };
     }
     match node_outcome(events, &up.activity_name) {
         NodeOutcome::Succeeded => Some(TaskStatus::Succeeded),
         NodeOutcome::Failed | NodeOutcome::TimedOut => Some(TaskStatus::Failed),
         // Scheduled-no-terminal: in flight (or the run died while it ran). The
-        // gate has not been reached.
+        // task has not been reached.
         NodeOutcome::Cancelled => None,
         NodeOutcome::NotAttempted => {
-            // A condition-skipped upstream is resolved (Skipped); otherwise it
-            // was never reached / skipped-by-trigger (no marker) — treat as
-            // not-yet-resolved so the downstream gate is Pending, not Waiting.
+            // A condition-skipped upstream is resolved (Skipped, #482 marker).
             if has_skip_marker(events, idx, &up.activity_name, &up.upstreams) {
-                Some(TaskStatus::Skipped)
-            } else {
-                None
+                return Some(TaskStatus::Skipped);
+            }
+            // No marker: either trigger-rule-skipped (the walker records no
+            // marker — infer it from this upstream's own upstream outcomes) or
+            // genuinely not-yet-run. A trigger-rule skip is a "done" outcome
+            // (Skipped); a not-yet-reached / still-runnable node is not resolved.
+            match task_reach(events, up, tasks, depth) {
+                TaskReach::SkippedByTrigger => Some(TaskStatus::Skipped),
+                TaskReach::Reached | TaskReach::NotReached => None,
             }
         }
     }
@@ -1753,8 +1800,14 @@ mod tests {
     fn gate_timer_id_false_positive_is_not_matched() {
         // The old `ends_with(":approval")` matched an unrelated race timer for a
         // *different* signal that happened to end in `approval`.
-        assert!(timer_id_matches_gate("__signal_timeout:1:approval", "approval"));
-        assert!(timer_id_matches_gate("__signal_timeout:42:approval", "approval"));
+        assert!(timer_id_matches_gate(
+            "__signal_timeout:1:approval",
+            "approval"
+        ));
+        assert!(timer_id_matches_gate(
+            "__signal_timeout:42:approval",
+            "approval"
+        ));
         // False positive the old suffix match accepted — a different signal
         // whose race id ends in `:approval`.
         assert!(!timer_id_matches_gate(
@@ -1766,7 +1819,10 @@ mod tests {
         assert!(!timer_id_matches_gate("__signal_timeout:1:a", "a:b"));
         // Non-race timers and malformed ids never match.
         assert!(!timer_id_matches_gate("cooldown", "approval"));
-        assert!(!timer_id_matches_gate("__signal_timeout::approval", "approval"));
+        assert!(!timer_id_matches_gate(
+            "__signal_timeout::approval",
+            "approval"
+        ));
         assert!(!timer_id_matches_gate("__signal_timeout:1", "1"));
     }
 
@@ -1888,6 +1944,107 @@ mod tests {
             DagNodeStatus::Pending,
             "gate1 resolved FAILED (timer won), so the downstream AllSuccess gate \
              is unreachable → pending, not waiting"
+        );
+    }
+
+    // ── Issue #746 Codex round-2 P2: reachability BEFORE resolution, and
+    // trigger-rule / condition skips of upstreams count as resolved for a
+    // downstream gate's reachability. ────────────────────────────────────────
+
+    #[test]
+    fn gate_unreached_with_a_stray_matching_signal_reports_pending_not_succeeded() {
+        // The unified walker only calls `wait_for_signal` AFTER `dispatch_decision`
+        // passes. Here the gate's `AllSuccess` upstream `a` FAILED, so the walker
+        // never reached the gate — yet a matching `SignalReceived("approval")` is
+        // recorded (buffered to the execution). An existence-only classifier would
+        // report `succeeded`; the gate must be classified by reachability FIRST and
+        // report `pending` (the walker never awaited it).
+        let def = gate_dag(); // a -> gate("approval") -> b
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            // Stray matching signal recorded BEFORE the upstream's terminal.
+            (ts(2), signal_received("approval")),
+            (ts(3), failed(ia, "boom")),
+        ];
+        let nodes = build_run_graph(&def, &events, "FAILED");
+        assert_eq!(
+            node(&nodes, "approval").status,
+            DagNodeStatus::Pending,
+            "an unreached gate must not be classified `succeeded` by a stray buffered signal"
+        );
+    }
+
+    #[test]
+    fn downstream_alldone_gate_reached_when_upstream_gate_condition_skipped() {
+        // Upstream gate1 is skipped by a #482 `.condition(...)` (records a
+        // `dag_skip:1` marker → Skipped). A downstream `AllDone` gate2 is then
+        // reached by the walker and awaits its signal. The reachability inference
+        // must treat the condition-skipped upstream GATE as resolved (Skipped),
+        // so gate2 reports `waiting`, not `pending`.
+        use autumn_harvest::policy::TriggerRule;
+        let mut builder = DagBuilder::new();
+        let extract = builder.activity(a);
+        let gate1 = builder
+            .signal_gate("approval")
+            .upstream(&extract)
+            .condition(|_| false);
+        let _gate2 = builder
+            .signal_gate("second")
+            .upstream(&gate1)
+            .trigger_rule(TriggerRule::AllDone);
+        let def = builder
+            .build()
+            .expect("chained conditional gate dag builds");
+
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            // gate1 (task index 1) condition-skipped.
+            (ts(3), skip_marker(1, "approval")),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(node(&nodes, "approval").status, DagNodeStatus::Skipped);
+        assert_eq!(
+            node(&nodes, "second").status,
+            DagNodeStatus::Waiting,
+            "a downstream AllDone gate is reached when its upstream gate was condition-skipped"
+        );
+    }
+
+    #[test]
+    fn downstream_alldone_gate_reached_when_upstream_activity_trigger_skipped() {
+        // Upstream activity `b` is skipped by its `AllSuccess` trigger rule
+        // (because `a` failed): the walker records NO events and NO marker for it,
+        // just sets its status to Skipped. A downstream `AllDone` gate is then
+        // reached. The reachability inference must DERIVE the trigger-rule skip
+        // from `b`'s own upstream outcomes (mirroring `dispatch_decision`), so the
+        // gate reports `waiting`, not `pending`.
+        use autumn_harvest::policy::TriggerRule;
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a);
+        let nb = builder.activity(b).upstream(&na); // AllSuccess (default)
+        let _gate = builder
+            .signal_gate("approval")
+            .upstream(&nb)
+            .trigger_rule(TriggerRule::AllDone);
+        let def = builder.build().expect("trigger-skip gate dag builds");
+
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), failed(ia, "boom")),
+            // `b` skipped by trigger rule — no events, no marker.
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(
+            node(&nodes, "approval").status,
+            DagNodeStatus::Waiting,
+            "a downstream AllDone gate is reached when its upstream activity was trigger-rule-skipped"
         );
     }
 }

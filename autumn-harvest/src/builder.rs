@@ -1644,6 +1644,14 @@ fn validate_dags_do_not_use_local_activities(
             continue;
         };
         for task in definition.tasks() {
+            // A signal/timer gate (issue #746) stores its *signal* name in
+            // `activity_name` but never dispatches an activity, so its name must
+            // not be validated against registered local activities — otherwise a
+            // gate and a local activity sharing a name (e.g. both `approval`)
+            // would false-reject the build.
+            if task.signal.is_some() {
+                continue;
+            }
             if local_activities.contains(task.activity_name.as_str()) {
                 return Err(HarvestBuilderError::LocalActivityInDag {
                     dag: dag.name.to_string(),
@@ -1663,9 +1671,7 @@ fn validate_dags_do_not_use_local_activities(
 /// (`ctx.wait_for_signal`); the classic DAG executor cannot suspend on a
 /// signal, so the gate would silently never fire. A gate on a unified DAG
 /// (`workflow_handler.is_some()`, the default `#[dag]` output) is allowed.
-fn validate_classic_dags_have_no_signal_gates(
-    dags: &[DagInfo],
-) -> Result<(), HarvestBuilderError> {
+fn validate_classic_dags_have_no_signal_gates(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
     for dag in dags {
         if dag.workflow_handler.is_some() {
             continue;

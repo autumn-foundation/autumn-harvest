@@ -979,9 +979,9 @@ pub async fn run_unified_dag(
                         .await
                     {
                         Ok(v) => (TaskStatus::Succeeded, v),
-                        Err(
-                            HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. },
-                        ) => (TaskStatus::Failed, Value::Null),
+                        Err(HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }) => {
+                            (TaskStatus::Failed, Value::Null)
+                        }
                         Err(error) => return Err(error.to_string()),
                     };
                     Ok::<_, String>((task_idx, status, val))

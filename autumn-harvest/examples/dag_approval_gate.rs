@@ -65,7 +65,7 @@
 //!   cargo run --example dag_approval_gate --features unified-dag-execution
 
 use autumn_harvest::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 // DAG activities take only `&ActivityContext`; the unified walker feeds each
@@ -175,7 +175,10 @@ mod tests {
             })
             .mock_activity("load_order", |_| Ok(json!("fulfilled")))
             .queue_signal("approval", json!({ "approved": true, "reviewer": "alice" }))
-            .run(__autumn_workflow_info_order_approval_pipeline().handler, Value::Null)
+            .run(
+                __autumn_workflow_info_order_approval_pipeline().handler,
+                Value::Null,
+            )
             .await;
 
         assert!(
@@ -211,7 +214,10 @@ mod tests {
             .mock_activity("extract_order", |_| {
                 Ok(json!({ "order_id": "ord_42", "amount_cents": 250_000 }))
             })
-            .run(__autumn_workflow_info_order_approval_pipeline().handler, Value::Null)
+            .run(
+                __autumn_workflow_info_order_approval_pipeline().handler,
+                Value::Null,
+            )
             .await;
 
         assert!(

@@ -888,9 +888,8 @@ impl DagInfo {
     /// activity-only classification.
     #[must_use]
     pub fn consumes_signals(&self) -> bool {
-        self.build_definition().is_ok_and(|def| {
-            def.tasks().iter().any(|task| task.signal.is_some())
-        })
+        self.build_definition()
+            .is_ok_and(|def| def.tasks().iter().any(|task| task.signal.is_some()))
     }
 
     /// Return a [`WorkflowSchedule`] that fires this DAG on its declared cron
