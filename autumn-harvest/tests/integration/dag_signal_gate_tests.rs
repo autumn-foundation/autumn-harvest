@@ -192,7 +192,7 @@ mod unified {
     use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
     use autumn_harvest::prelude::*;
     use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
-    use autumn_harvest::types::ExecutionId;
+    use autumn_harvest::types::{ExecutionId, TimerId};
     use chrono::Utc;
     use serde_json::{Value, json};
     use std::time::Duration;
@@ -253,6 +253,31 @@ mod unified {
         let source = dag.activity(extract_users);
         let gate = dag.signal_gate("items").upstream(&source);
         let _mapped = dag.map_activity(process_item).over(&gate);
+    }
+
+    /// `extract → signal_gate(timeout, Continue) → load[.condition(payload)]`.
+    ///
+    /// The downstream `load` is gated on the *signal payload* — it dispatches
+    /// only when the gate's stored output is `{"approved": true}`. This makes the
+    /// gate's payload binding **observable in history**: a bug that stored
+    /// `Value::Null` for a signal-win (instead of the real payload) flips the
+    /// condition to `false`, so `load` records a `dag_skip` marker instead of an
+    /// `ActivityScheduled` — a replay divergence. Used by the AC5 "both-events,
+    /// signal wins" money fixture below.
+    #[dag(default_queue = "gate-q")]
+    fn gate_signal_payload_dag(dag: &mut DagBuilder) {
+        let extract = dag.activity(extract_users);
+        let gate = dag
+            .signal_gate_with_timeout(
+                "approval",
+                Duration::from_secs(3600),
+                GateTimeoutAction::Continue,
+            )
+            .upstream(&extract);
+        let _load = dag
+            .activity(load_users)
+            .upstream(&gate)
+            .condition(|ups| ups[0].get("approved") == Some(&json!(true)));
     }
 
     fn started(input: Value) -> WorkflowEvent {
@@ -429,5 +454,172 @@ mod unified {
             mapped, 3,
             "map node must fan out one instance per signal-array element, got {mapped}"
         );
+    }
+
+    // ── AC5: both-events replay fixtures (issue #746 review, mutation-proven) ──
+    //
+    // The `WorkflowTestEnv`-generated money tests above deliberately do NOT
+    // arm the timer when a signal will win (see the harness): the signal-branch
+    // test has a *no-timeout* gate (no timer in history) and the timeout tests
+    // queue *no signal*. So a BOUNDED gate that RECEIVES its signal — the
+    // production-realistic "approval-with-SLA that gets approved" shape, where
+    // both a `TimerStarted` (the armed deadline) AND a `SignalReceived` sit in
+    // history — had ZERO replay coverage. A bug storing `Value::Null` instead of
+    // the signal payload on a bounded-gate signal-win passed every generated
+    // test. These hand-built fixtures feed the exact both-events history and
+    // replay the DAG's own generated handler against it.
+
+    /// The conf-wrapped input the unified DAG walker synthesizes for a plain
+    /// (non-mapped) activity node: `{"conf": <dag input>, "dag_task": <name>}`.
+    fn conf_input(dag_task: &str) -> Value {
+        json!({ "conf": Value::Null, "dag_task": dag_task })
+    }
+
+    fn sched(name: &str, id: ActivityExecId, input: Value) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: name.into(),
+            input,
+            queue: "gate-q".into(),
+        }
+    }
+
+    fn completed(id: ActivityExecId, output: Value) -> WorkflowEvent {
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output,
+        }
+    }
+
+    /// **AC5 money fixture — bounded gate, both events present, signal wins.**
+    ///
+    /// History: `extract` completes, the gate's deadline timer is armed
+    /// (`TimerStarted`), then the `approval` signal arrives (`SignalReceived`)
+    /// before any `TimerFired`, so the signal wins the race. Its payload
+    /// `{"approved": true}` is bound into the gate's output slot, satisfying the
+    /// downstream `load`'s `.condition(...)` and scheduling `load`.
+    ///
+    /// This is the fixture that a `Value::Null`-for-signal-win bug MUST fail: a
+    /// null gate output flips the condition to `false`, so the walker would
+    /// record a `dag_skip` marker where history has `ActivityScheduled(load)` —
+    /// a replay divergence. (Verified falsifiable by temporarily applying that
+    /// mutation during review.)
+    #[tokio::test]
+    async fn gate_bounded_signal_win_both_events_replays_and_binds_payload() {
+        let id_e = ActivityExecId::new();
+        let id_l = ActivityExecId::new();
+        let history = vec![
+            started(Value::Null),
+            sched("extract_users", id_e, conf_input("extract_users")),
+            completed(id_e, json!("extracted")),
+            // The gate's armed deadline timer (issue #476 race id convention).
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 3600,
+            },
+            // Signal arrives FIRST (before any TimerFired) → signal wins.
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: json!({ "approved": true }),
+            },
+            // The payload satisfied load's condition → load was dispatched.
+            sched("load_users", id_l, conf_input("load_users")),
+            completed(id_l, json!("loaded")),
+        ];
+
+        let report = WorkflowReplayer::new()
+            .register_fn(
+                "gate_signal_payload_dag",
+                __autumn_workflow_info_gate_signal_payload_dag().handler,
+            )
+            .replay_from_events(history)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "AC5: a bounded gate whose signal wins (armed timer + SignalReceived \
+             both in history) must replay deterministically down the signal \
+             branch with the payload bound, got: {report}"
+        );
+    }
+
+    /// **AC5 — bounded gate, both timer events present, timer wins (Continue).**
+    ///
+    /// History has `TimerStarted` then `TimerFired` and NO signal, so the
+    /// deadline wins; `on_timeout = Continue` proceeds past the gate (null gate
+    /// output) and the unconditional downstream `load` still runs.
+    #[tokio::test]
+    async fn gate_bounded_timer_win_continue_replays_downstream() {
+        let id_e = ActivityExecId::new();
+        let id_l = ActivityExecId::new();
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            started(Value::Null),
+            sched("extract_users", id_e, conf_input("extract_users")),
+            completed(id_e, json!("extracted")),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 3600,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+            // Continue → load runs even though the gate timed out.
+            sched("load_users", id_l, conf_input("load_users")),
+            completed(id_l, json!("loaded")),
+        ];
+
+        let report = WorkflowReplayer::new()
+            .register_fn(
+                "approval_timeout_continue_dag",
+                __autumn_workflow_info_approval_timeout_continue_dag().handler,
+            )
+            .replay_from_events(history)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "AC5: a bounded gate whose deadline wins with Continue must replay \
+             deterministically and still run the downstream, got: {report}"
+        );
+    }
+
+    /// **AC5 — bounded gate, timer wins (FailRun) → deterministic failure.**
+    ///
+    /// The existing `gate_timeout_failrun_branch_fails_the_dag` only asserts a
+    /// one-shot `is_err()`. This replays the timer-first history and asserts the
+    /// run reaches the SAME failed outcome deterministically across repeated
+    /// replays — a clean `WorkflowFailed`, never a `NonDeterminismDetected`.
+    #[tokio::test]
+    async fn gate_bounded_timer_win_failrun_replays_to_failed_outcome() {
+        let id_e = ActivityExecId::new();
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            started(Value::Null),
+            sched("extract_users", id_e, conf_input("extract_users")),
+            completed(id_e, json!("extracted")),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 3600,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+
+        // Deterministic across repeated replays: same failed outcome every time.
+        for _ in 0..3 {
+            let report = WorkflowReplayer::new()
+                .register_fn(
+                    "approval_timeout_failrun_dag",
+                    __autumn_workflow_info_approval_timeout_failrun_dag().handler,
+                )
+                .replay_from_events(history.clone())
+                .await;
+            assert!(
+                matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
+                "AC5: a FailRun gate whose deadline fires must replay to the same \
+                 deterministic FAILED outcome, got: {report}"
+            );
+            assert!(
+                !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+                "the FailRun timeout must be a clean deterministic failure, never \
+                 a non-determinism divergence, got: {report}"
+            );
+        }
     }
 }
