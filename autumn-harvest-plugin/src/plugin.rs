@@ -972,19 +972,50 @@ async fn start_harvest_runtime(
                         client.pick_shard_for_new_workflow("webhook_delivery", &workflow_id);
                     let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard);
 
-                    // Issue #618, Finding A: the OUTBOUND webhook-delivery producer is a
-                    // fresh in-process workflow start, so an active admission gate must
-                    // HALT it (block, not exempt) — the same authority the API path
-                    // enforces. Consult the last-known cached gate snapshot
-                    // (`check_cached` honours the snapshot even under a transient
-                    // fail-closed blip and never returns the sentinel); a matching gate
-                    // blocks the start and records the same `record_admission_blocked`
-                    // outcome the API path records.
-                    if let Some(cache) =
-                        autumn_harvest::admission_gate::global_admission_gate_cache()
-                        && let Some((reason, scope_kind)) =
-                            webhook_delivery_admission_block(&cache, shard, owner)
-                    {
+                    // Acquire the target-shard connection first: the admission
+                    // decision below needs a read-only existence check, and
+                    // `start_or_load` reuses the same connection.
+                    let Some(harvest_db) = harvest_db else {
+                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                            "HarvestDbPool not found on AppState extensions",
+                        ));
+                    };
+                    let pool = harvest_db.pool_for(shard).clone();
+                    let mut conn = pool.get().await.map_err(|e| {
+                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
+                    })?;
+
+                    // Issue #618, Finding A (round 9): the OUTBOUND webhook-delivery
+                    // producer is gated as a FRESH in-process start — but an idempotent
+                    // RETRY for the same webhook log (deterministic workflow id
+                    // `webhook-delivery-{log.id}`, `AllowDuplicate` reuse) does NOT admit
+                    // a fresh run: `start_or_load` just LOADS the existing execution.
+                    // Gating that retry would wrongly block a non-admission and inflate
+                    // the block counter. So we mirror the #808 HTTP path: a read-only
+                    // existence check on the target shard (the exact `(workflow_name,
+                    // workflow_id)` key `start_or_load` reuses — `try_load_by_key`
+                    // excludes only the sealed CONTINUED_AS_NEW/TERMINATED states that
+                    // would themselves force a fresh start) decides whether this is a
+                    // committed replay (skip the gate) or a genuinely fresh delivery
+                    // (apply the gate — a matching gate blocks+counts; a fail-closed
+                    // sentinel blocks a fresh start, per round 5).
+                    let already_exists = autumn_harvest::execution::try_load_by_key(
+                        &mut conn,
+                        "webhook_delivery",
+                        &workflow_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
+                    })?
+                    .is_some();
+
+                    if let Some((reason, scope_kind)) = webhook_delivery_gate_decision(
+                        already_exists,
+                        autumn_harvest::admission_gate::global_admission_gate_cache().as_deref(),
+                        shard,
+                        owner,
+                    ) {
                         if let Some(m) = &metrics {
                             m.record_admission_blocked(scope_kind, &reason);
                         }
@@ -1038,16 +1069,6 @@ async fn start_harvest_runtime(
                         origin: None,
                         completion_callbacks: None,
                     };
-
-                    let Some(harvest_db) = harvest_db else {
-                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
-                            "HarvestDbPool not found on AppState extensions",
-                        ));
-                    };
-                    let pool = harvest_db.pool_for(shard).clone();
-                    let mut conn = pool.get().await.map_err(|e| {
-                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
-                    })?;
 
                     client
                         .start_or_load(&mut conn, start_params)
@@ -1200,36 +1221,34 @@ fn harvest_database_url(
 }
 
 async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: HarvestApiState) {
-    // issue #618 (F5): clear the process-global gate cache so a stopped plugin's
-    // cache (whose refresh loop is about to be cancelled and will go stale) never
-    // leaks into a sibling plugin's completion-trigger gate check. Only clear it
-    // if the installed cache is OURS (ptr-eq), so stopping one plugin cannot
-    // clobber a concurrently-live sibling's cache. Mirrors #921's teardown of
-    // GLOBAL_CALLBACK_CONFIG.
-    if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-        && Arc::ptr_eq(&installed, &api_state.gate_cache())
-    {
-        autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
-    }
     let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
 
     let Some(runtime) = runtime else {
+        // No runtime to stop (never started, or already stopped by a prior call).
+        // No worker/scanner can be evaluating a completion trigger, so clearing the
+        // global gate cache now is safe. Ptr-eq guarded (F5) so tearing down this
+        // plugin never clobbers a concurrently-live sibling's cache. The metrics
+        // recorder is not cleared here: without a runtime we have no recorder Arc to
+        // ptr-eq against (it was either never published by us or already cleared).
+        if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
+            && Arc::ptr_eq(&installed, &api_state.gate_cache())
+        {
+            autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+        }
         api_state.clear();
         return;
     };
 
-    // Clear the global admission metrics recorder (issue #618, F-round5), but only
-    // if the installed recorder is THIS runtime's — ptr-eq guarded like the gate
-    // cache above so a stopping plugin never clobbers a concurrently-live sibling's
-    // recorder (which would silently uncount that sibling's blocks).
-    if let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
-        && Arc::ptr_eq(
-            &installed,
-            &runtime.runner.api_runtime().registry().telemetry().metrics,
-        )
-    {
-        autumn_harvest::admission_gate::set_global_admission_metrics(None);
-    }
+    // Capture this runtime's metrics recorder Arc BEFORE `HarvestRunner::stop(self)`
+    // consumes the runner, so we can ptr-eq against it when clearing the global
+    // recorder after the runner has stopped.
+    let stopped_metrics = runtime
+        .runner
+        .api_runtime()
+        .registry()
+        .telemetry()
+        .metrics
+        .clone();
 
     if let Some(gate_refresh) = runtime.gate_refresh {
         gate_refresh.shutdown.cancel();
@@ -1243,7 +1262,32 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
             tracing::warn!(error = %error, "harvest outbox relay failed during shutdown");
         }
     }
+
+    // issue #618 (F-round9): stop the runner — all worker + timeout-scanner tasks —
+    // BEFORE clearing the process-global admission gate cache / metrics recorder. A
+    // worker or timeout scanner evaluating a completion trigger reads
+    // `global_admission_gate_cache()` in that window; clearing the globals while those
+    // tasks are still alive would let a trigger start its target unblocked +
+    // uncounted under an active gate during shutdown/restart. Once `stop()` returns,
+    // no task can evaluate a trigger, so it is safe to clear the globals.
     runtime.runner.stop().await;
+
+    // issue #618 (F5, reordered by F-round9): clear the process-global gate cache and
+    // metrics recorder so a stopped plugin's cache (whose refresh loop is now
+    // cancelled and would go stale) never leaks into a sibling plugin's
+    // completion-trigger gate check. Each clear is ptr-eq guarded so tearing down one
+    // plugin never clobbers a concurrently-live sibling's cache/recorder. Mirrors
+    // #921's teardown of GLOBAL_CALLBACK_CONFIG.
+    if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
+        && Arc::ptr_eq(&installed, &api_state.gate_cache())
+    {
+        autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    }
+    if let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
+        && Arc::ptr_eq(&installed, &stopped_metrics)
+    {
+        autumn_harvest::admission_gate::set_global_admission_metrics(None);
+    }
     api_state.clear();
 }
 
@@ -1353,6 +1397,35 @@ fn webhook_delivery_admission_block(
     cache
         .check("webhook_delivery", "webhooks", shard.as_i32(), owner)
         .map(|(_id, reason, scope_kind)| (reason, scope_kind))
+}
+
+/// Admission decision for an outbound `webhook_delivery` start (issue #618,
+/// Finding A round 9).
+///
+/// `already_exists` is `true` when a `webhook_delivery` execution for this
+/// webhook log's deterministic `(workflow_name, workflow_id)` key already exists
+/// (per `try_load_by_key`, which excludes only the sealed `CONTINUED_AS_NEW` /
+/// `TERMINATED` states that would force a fresh start). In that case the delivery
+/// attempt is an idempotent RETRY — `start_or_load` will LOAD the existing run,
+/// not admit a fresh one — so the admission gate does NOT apply (mirrors the #808
+/// HTTP path's bypass for a committed replay): returns `None`, no block, no count.
+///
+/// Only when this is a genuinely FRESH delivery (`already_exists == false`) is the
+/// gate consulted via [`webhook_delivery_admission_block`]: a matching gate → block
+/// (`Some`), a fail-closed (uninitialized) cache → block via the synthetic
+/// sentinel (round 5), an initialized cache with no matching gate → proceed
+/// (`None`). An absent cache (`None`) never blocks.
+#[cfg(feature = "webhooks")]
+fn webhook_delivery_gate_decision(
+    already_exists: bool,
+    cache: Option<&autumn_harvest::admission_gate::AdmissionGateCache>,
+    shard: autumn_harvest::types::ShardId,
+    owner: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if already_exists {
+        return None;
+    }
+    cache.and_then(|c| webhook_delivery_admission_block(c, shard, owner))
 }
 
 #[cfg(all(test, feature = "webhooks"))]
@@ -1466,6 +1539,77 @@ mod webhook_admission_tests {
         assert!(
             super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
             "a cache reverted to fail-closed must block the outbound webhook_delivery start"
+        );
+    }
+
+    // ── webhook_delivery_gate_decision: idempotent-retry bypass (Finding A r9) ──
+
+    #[test]
+    fn existing_execution_skips_the_gate_even_under_a_fleet_gate() {
+        // (a) An idempotent RETRY (the webhook_delivery execution already exists):
+        // start_or_load will LOAD it, not admit a fresh run, so an active Fleet gate
+        // must NOT block it and must NOT count a block.
+        let cache = cache_with(GateScope::Fleet);
+        assert!(
+            super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None)
+                .is_none(),
+            "an already-existing webhook_delivery is an idempotent retry — the gate is skipped"
+        );
+    }
+
+    #[test]
+    fn fresh_delivery_is_blocked_under_a_matching_gate() {
+        // (b) A genuinely FRESH delivery (no existing execution) under a matching
+        // gate is blocked (and the caller counts the block).
+        let cache = cache_with(GateScope::Fleet);
+        assert!(
+            matches!(
+                super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None),
+                Some((_, "fleet"))
+            ),
+            "a fresh webhook_delivery start under a Fleet gate must be blocked"
+        );
+    }
+
+    #[test]
+    fn existing_execution_skips_the_gate_even_when_fail_closed() {
+        // A retry is never a fresh admission, so it proceeds even against a
+        // fail-closed cache (the round-5 fresh-start fail-closed rule does not
+        // apply to an idempotent load).
+        let cache = AdmissionGateCache::new_fail_closed();
+        assert!(
+            super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None)
+                .is_none(),
+            "an idempotent retry proceeds even under a fail-closed cache"
+        );
+    }
+
+    #[test]
+    fn fresh_delivery_fails_closed_on_an_uninitialized_cache() {
+        // Round-5 behavior intact: a FRESH start against a fail-closed (uninitialized)
+        // cache is blocked via the synthetic sentinel.
+        let cache = AdmissionGateCache::new_fail_closed();
+        assert!(
+            matches!(
+                super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None),
+                Some((_, "fleet"))
+            ),
+            "a fresh webhook_delivery start against a fail-closed cache must block (round 5)"
+        );
+    }
+
+    #[test]
+    fn fresh_delivery_with_no_matching_gate_or_no_cache_proceeds() {
+        // A fresh start proceeds when no gate matches, or when no cache is published.
+        let cache = cache_with(GateScope::WorkflowName("some_other_wf".into()));
+        assert!(
+            super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None)
+                .is_none(),
+            "a fresh start with a non-matching gate proceeds"
+        );
+        assert!(
+            super::webhook_delivery_gate_decision(false, None, ShardId::new(0), None).is_none(),
+            "a fresh start with no published cache proceeds"
         );
     }
 }
