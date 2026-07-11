@@ -2699,6 +2699,37 @@ pub async fn try_load_by_key(
         .map_err(database_error)
 }
 
+/// Any-state existence check keyed on `(workflow_name, workflow_id)`.
+///
+/// Returns `true` when a row exists in ANY state, including the sealed
+/// `CONTINUED_AS_NEW`/`TERMINATED` states that both [`try_load_by_key`] and
+/// [`try_load_active_execution_for_update`] deliberately exclude, and the
+/// terminal `COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT` states that the
+/// active-only lock excludes.
+///
+/// The completion-trigger cross-shard relay (issue #618, F-round15) uses this to
+/// recognise a stale one-shot outbox row whose deterministic target already ran:
+/// a target sealed or completed since it was first started must be treated as
+/// DELIVERED, never as a fresh (gated) admission. Read-only, unlocked (the
+/// relay's exactly-one-path-per-row invariant makes it stable — see
+/// `completion_trigger::relay_gate_checked_start`); do NOT use this as a
+/// create/attach existence lock — that is [`try_load_active_execution_for_update`]'s
+/// job and it must stay active-only for the webhook and fresh-create paths.
+pub async fn execution_exists_by_key(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::workflow_id.eq(workflow_id)),
+    ))
+    .get_result::<bool>(conn)
+    .await
+    .map_err(database_error)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SignalWithStart (issue #244)
 // ─────────────────────────────────────────────────────────────────────────────

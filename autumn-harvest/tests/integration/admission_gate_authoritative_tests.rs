@@ -2096,6 +2096,319 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
     );
 }
 
+/// Observations from one stale-sealed-target relay case.
+struct SealedCaseOutcome {
+    relayed: usize,
+    target_count: i64,
+    outbox_remaining: i64,
+    blocked_empty: bool,
+    bypassed: Vec<String>,
+    fires_outcome: Option<String>,
+}
+
+/// Drive the cross-shard completion-trigger scanner against a stale outbox row
+/// whose deterministic target `W` was pre-created and then transitioned to
+/// `seal_state` (a state the active-only existence lock excludes). Optionally
+/// raise a fleet gate that WOULD block a fresh start. Creates + tears down a fresh
+/// source/target DB pair. F-round15.
+#[allow(clippy::too_many_lines)]
+async fn run_stale_sealed_delivered_case(
+    base_url: &str,
+    seal_state: &str,
+    with_gate: bool,
+) -> SealedCaseOutcome {
+    use diesel_async::SimpleAsyncConnection;
+
+    let s0_name = format!("ag618_selsrc_{}", Uuid::new_v4().simple());
+    let s1_name = format!("ag618_seltgt_{}", Uuid::new_v4().simple());
+    {
+        let base_pool = build_pool(base_url);
+        let mut admin = base_pool.get().await.unwrap();
+        for name in [&s0_name, &s1_name] {
+            diesel::sql_query(format!("CREATE DATABASE {name}"))
+                .execute(&mut admin)
+                .await
+                .expect("create shard db");
+        }
+    }
+    let s0_url = swap_db_name(base_url, &s0_name);
+    let s1_url = swap_db_name(base_url, &s1_name);
+    for u in [&s0_url, &s1_url] {
+        let p = build_pool(u);
+        let mut c = p.get().await.unwrap();
+        c.batch_execute(INIT_SQL)
+            .await
+            .expect("migrate fresh shard db");
+    }
+
+    let src_pool = build_pool(&s0_url);
+    let tgt_pool = build_pool(&s1_url);
+    install_global_router(ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    ));
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), src_pool.clone());
+    pools.insert(ShardId::new(1), tgt_pool.clone());
+    let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // Pre-create the target run on shard 1 (as if the immediate relay started it),
+    // then SEAL it — the state the active-only existence lock excludes, simulating a
+    // target that finished before the stale row was retried.
+    {
+        let mut tgt_conn = tgt_pool.get().await.unwrap();
+        start_or_load_workflow_execution(
+            &mut tgt_conn,
+            StartWorkflowParams {
+                workflow_name: "ag_target_wf",
+                workflow_id: "ct-stale-sealed",
+                exec_id: ExecutionId::new_for_shard(ShardId::new(1)),
+                input: json!({}),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: autumn_harvest::types::Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+            },
+        )
+        .await
+        .expect("pre-create the already-started target run");
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET state = $1, completed_at = NOW() \
+             WHERE workflow_name = 'ag_target_wf' AND workflow_id = 'ct-stale-sealed'",
+        )
+        .bind::<diesel::sql_types::Text, _>(seal_state)
+        .execute(&mut tgt_conn)
+        .await
+        .expect("seal the pre-created target run");
+    }
+
+    // The stale outbox row + its fires row (outcome NULL = fired) on the SOURCE.
+    let outbox_id = Uuid::new_v4();
+    let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
+    let trigger_key_id = Uuid::new_v4();
+    {
+        let mut src_conn = src_pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_fires
+                (source_exec_id, trigger_id, fired_at, outcome)
+             VALUES ($1, $2, NOW(), NULL)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+        .execute(&mut src_conn)
+        .await
+        .expect("insert fires row");
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_outbox
+                (id, source_exec_id, trigger_id, target_shard, target_workflow_name,
+                 target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes)
+             VALUES ($1, $2, $3, 1, 'ag_target_wf', 'ct-stale-sealed', '{}'::jsonb,
+                     'default', '0'::jsonb, 1048576)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+        .execute(&mut src_conn)
+        .await
+        .expect("insert stale outbox row");
+    }
+
+    if with_gate {
+        let cache = fleet_cache("stale-sealed-incident");
+        set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+    } else {
+        set_global_admission_gate_cache(None);
+    }
+
+    let recorder = Arc::new(CapturingMetrics::default());
+    let scanner_metrics: &(dyn MetricsRecorder + Send + Sync) = &*recorder;
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut src_pool.get().await.unwrap(),
+        scanner_metrics,
+        &Some(sharded.clone()),
+        &[ShardId::new(1)],
+    )
+    .await
+    .unwrap();
+
+    let target_count: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = 'ag_target_wf'",
+    )
+    .get_result::<CountRow>(&mut tgt_pool.get().await.unwrap())
+    .await
+    .expect("count target")
+    .n;
+    let outbox_remaining: i64 =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_outbox")
+            .get_result::<CountRow>(&mut src_pool.get().await.unwrap())
+            .await
+            .expect("count outbox")
+            .n;
+    let fires_outcome: Option<String> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires
+         WHERE source_exec_id = $1 AND trigger_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+    .get_result::<OutcomeRow>(&mut src_pool.get().await.unwrap())
+    .await
+    .expect("read fires outcome")
+    .outcome;
+
+    // Cleanup globals + drop the per-shard databases.
+    set_global_admission_gate_cache(None);
+    install_global_router(ShardRouter::default());
+    let _ = ShardedDbPool::single(build_pool(base_url));
+    drop(sharded);
+    drop(src_pool);
+    drop(tgt_pool);
+    {
+        let base_pool = build_pool(base_url);
+        if let Ok(mut admin) = base_pool.get().await {
+            for name in [&s0_name, &s1_name] {
+                let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&mut admin)
+                    .await;
+            }
+        }
+    }
+
+    SealedCaseOutcome {
+        relayed,
+        target_count,
+        outbox_remaining,
+        blocked_empty: recorder.blocked().is_empty(),
+        bypassed: recorder.bypassed(),
+        fires_outcome,
+    }
+}
+
+/// F-round15: a stale cross-shard outbox row is a ONE-SHOT delivery marker. If its
+/// deterministic target already ran and has since SEALED
+/// (`TERMINATED`/`CONTINUED_AS_NEW`), the fire was already DELIVERED — the scanner
+/// must treat it as delivered, NOT as a fresh (gated) admission. The round-13 fix
+/// routed the relay through `gate_checked_start_or_load`, whose existence lock is
+/// active-only, so a sealed target was invisible to it: under a matching gate it
+/// BLOCKED (marking the fires row `admission_blocked`) and with no gate a sealed
+/// target let `start_or_load` create a SECOND target run — both re-doing an
+/// already-delivered fire. The any-state existence check in
+/// `relay_gate_checked_start` closes this.
+///
+/// Two-DB multi-shard, three cases: `TERMINATED` + active gate, `TERMINATED` + no
+/// gate, `CONTINUED_AS_NEW` + active gate. Confirmed red first: against the
+/// pre-F-round15 code the gate cases mark the fires row `admission_blocked`/count a
+/// block, and the no-gate case creates a second target run (`target_count == 2`).
+#[tokio::test]
+#[allow(clippy::similar_names)]
+async fn scanner_delivers_a_stale_row_whose_target_has_sealed() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base_url, _c) = setup_db().await;
+
+    // Case 1: TERMINATED target under an active matching gate → delivered, not blocked.
+    let terminated_gated = run_stale_sealed_delivered_case(&base_url, "TERMINATED", true).await;
+    assert_eq!(
+        terminated_gated.relayed, 1,
+        "TERMINATED+gate: the scanner processes the stale row (delivered + dropped)"
+    );
+    assert_eq!(
+        terminated_gated.target_count, 1,
+        "TERMINATED+gate: the target already ran — no second run is created"
+    );
+    assert_eq!(
+        terminated_gated.outbox_remaining, 0,
+        "TERMINATED+gate: the delivered stale row's outbox row is dropped"
+    );
+    assert!(
+        terminated_gated.blocked_empty,
+        "TERMINATED+gate: a delivered (already-sealed) target must NOT be counted as a block"
+    );
+    assert_eq!(
+        terminated_gated.bypassed,
+        vec!["completion_trigger_outbox".to_string()],
+        "TERMINATED+gate: a delivered stale row counts the bypass exactly once"
+    );
+    assert_eq!(
+        terminated_gated.fires_outcome, None,
+        "TERMINATED+gate: the fires row stays a real fire (NULL), never 'admission_blocked'"
+    );
+
+    // Case 2: TERMINATED target with NO gate → delivered, no second run (the RED
+    // signal here is a SECOND target run created by start_or_load on a released
+    // sealed key).
+    let terminated_nogate = run_stale_sealed_delivered_case(&base_url, "TERMINATED", false).await;
+    assert_eq!(
+        terminated_nogate.relayed, 1,
+        "TERMINATED+no-gate: the scanner processes the stale row"
+    );
+    assert_eq!(
+        terminated_nogate.target_count, 1,
+        "TERMINATED+no-gate: a sealed target must NOT be re-started — no second run"
+    );
+    assert_eq!(
+        terminated_nogate.outbox_remaining, 0,
+        "TERMINATED+no-gate: the delivered stale row's outbox row is dropped"
+    );
+    assert!(
+        terminated_nogate.blocked_empty,
+        "TERMINATED+no-gate: no gate, no block"
+    );
+    assert_eq!(
+        terminated_nogate.bypassed,
+        vec!["completion_trigger_outbox".to_string()],
+        "TERMINATED+no-gate: a delivered stale row counts the bypass exactly once"
+    );
+    assert_eq!(terminated_nogate.fires_outcome, None);
+
+    // Case 3: CONTINUED_AS_NEW target under an active matching gate → delivered.
+    let can_gated = run_stale_sealed_delivered_case(&base_url, "CONTINUED_AS_NEW", true).await;
+    assert_eq!(can_gated.relayed, 1, "CONTINUED_AS_NEW+gate: processed");
+    assert_eq!(
+        can_gated.target_count, 1,
+        "CONTINUED_AS_NEW+gate: the target already ran — no second run"
+    );
+    assert_eq!(can_gated.outbox_remaining, 0);
+    assert!(
+        can_gated.blocked_empty,
+        "CONTINUED_AS_NEW+gate: a delivered (already-sealed) target must NOT be counted as a block"
+    );
+    assert_eq!(
+        can_gated.bypassed,
+        vec!["completion_trigger_outbox".to_string()],
+        "CONTINUED_AS_NEW+gate: bypass counted exactly once"
+    );
+    assert_eq!(
+        can_gated.fires_outcome, None,
+        "CONTINUED_AS_NEW+gate: the fires row stays a real fire (NULL)"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // F-round12: gate_checked_start_or_load — close the webhook idempotent-retry
 // TOCTOU (an existing run sealing between an unlocked existence check and the

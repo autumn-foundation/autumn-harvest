@@ -779,6 +779,34 @@ async fn relay_block_drop_outbox(
         .await
 }
 
+/// Mark a cross-shard completion-trigger outbox row DELIVERED: delete the source
+/// outbox row and, only if it was actually removed, count the
+/// `completion_trigger_outbox` bypass (issue #618). The fires row is left as a real
+/// fire (`NULL`) — a delivered target is a fire that ran, never a block. Shared by
+/// the round-15 any-state short-circuit and the round-13 `Started` arm so the two
+/// deliveries account identically.
+#[cfg(feature = "db")]
+async fn relay_mark_delivered(
+    source_conn: &mut diesel_async::AsyncPgConnection,
+    outbox_id: Uuid,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let deleted = diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
+        .filter(crate::schema::harvest_completion_trigger_outbox::dsl::id.eq(outbox_id))
+        .execute(source_conn)
+        .await;
+    if matches!(deleted, Ok(n) if n >= 1)
+        && let Some(m) = metrics
+    {
+        m.record_admission_bypassed(
+            crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
+        );
+    }
+}
+
 /// Run the cross-shard completion-trigger relay's start/block decision through the
 /// existence-aware round-12 [`crate::execution::gate_checked_start_or_load`]
 /// primitive (issue #618, F-round13), then apply the source-shard bookkeeping.
@@ -815,8 +843,46 @@ async fn relay_gate_checked_start(
     trigger_id: Uuid,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> crate::error::HarvestResult<()> {
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
+    // F-round15: any-state existence = already DELIVERED (one-shot outbox row).
+    //
+    // A completion-trigger outbox row is a one-shot delivery marker: "trigger T
+    // fired; start deterministic target W exactly once, then delete the row." The
+    // scanner only re-sees a stale row after the immediate relay STARTED W but then
+    // failed to delete the source row — so a stale row implies W was created. If W
+    // has since sealed (`TERMINATED`/`CONTINUED_AS_NEW`) or completed
+    // (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`), the round-13 path below is
+    // WRONG: `gate_checked_start_or_load`'s existence lock is active-only, so it
+    // sees no live run → under a matching gate it BLOCKS and marks the fires row
+    // `admission_blocked`, and with no gate a *sealed* target lets
+    // `start_or_load` create a SECOND W — both re-doing an already-delivered fire.
+    //
+    // Guard it here, in the completion-trigger relay ONLY (NOT the webhook delegate,
+    // whose sealed-prior re-delivery is a legitimate fresh gated start): an
+    // any-state existence check on the target shard. Exists in ANY state → the fire
+    // was delivered → delete the source outbox row + count the bypass, leaving the
+    // fires row a real fire (`NULL`). Stable without a lock because exactly one
+    // relay path runs per outbox row (rounds 6/7) — the only creator of THIS
+    // deterministic W is THIS relay, so a `false` here cannot race a concurrent
+    // create, and `gate_checked_start_or_load` below then owns the fresh
+    // create-or-block. Does NOT touch `try_load_active_execution_for_update` /
+    // `gate_checked_start_or_load` (correct as-is for the webhook + fresh-create
+    // cases).
+    if crate::execution::execution_exists_by_key(
+        target_conn,
+        params.workflow_name,
+        params.workflow_id,
+    )
+    .await?
+    {
+        tracing::debug!(
+            outbox_id = %outbox_id,
+            workflow_name = %params.workflow_name,
+            workflow_id = %params.workflow_id,
+            "[completion_trigger] cross-shard relay: deterministic target already exists (any state); treating the stale outbox row as delivered"
+        );
+        relay_mark_delivered(source_conn, outbox_id, metrics).await;
+        return Ok(());
+    }
 
     // The relay-time gate decision, existence-aware: a LOCKED live target already
     // exists → this is a delivery/idempotent-load, NOT a fresh admission → skip the
@@ -864,20 +930,12 @@ async fn relay_gate_checked_start(
             }
         }
         crate::execution::GateCheckedStart::Started(_started) => {
-            // Fresh start OR the target already exists (stale-row delivered / attach):
-            // either way the target IS started, so this is a DELIVERY — delete the
-            // source outbox row and count the bypass (never a block). Fires stays NULL.
-            let deleted = diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
-                .filter(crate::schema::harvest_completion_trigger_outbox::dsl::id.eq(outbox_id))
-                .execute(source_conn)
-                .await;
-            if matches!(deleted, Ok(n) if n >= 1)
-                && let Some(m) = metrics
-            {
-                m.record_admission_bypassed(
-                    crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
-                );
-            }
+            // Fresh start OR an idempotent attach to a still-active run: either way the
+            // target IS started, so this is a DELIVERY — delete the source outbox row
+            // and count the bypass (never a block). Fires stays NULL. (A sealed /
+            // completed target was already short-circuited by the any-state check
+            // above, so it never reaches this arm.)
+            relay_mark_delivered(source_conn, outbox_id, metrics).await;
         }
     }
     Ok(())
