@@ -418,7 +418,7 @@ mod db_handle_surface {
                 .result_raw()
                 .await
                 .expect_err("FAILED execution must return an Err");
-            assert!(matches!(err, HarvestError::WorkflowFailed { .. }));
+            assert!(matches!(err, HarvestError::WorkflowFailed { .. }), "expected WorkflowFailed, got: {err:?}");
             assert_eq!(err.workflow_error_type(), Some(cat));
             assert!(err.is_workflow_non_retryable());
             assert_eq!(
@@ -502,7 +502,7 @@ mod db_handle_surface {
             .result_raw()
             .await
             .expect_err("a fully-failed retry chain must return an Err");
-        assert!(matches!(err, HarvestError::WorkflowFailed { .. }));
+        assert!(matches!(err, HarvestError::WorkflowFailed { .. }), "expected WorkflowFailed, got: {err:?}");
         assert_eq!(
             err.workflow_error_type(),
             Some("FinalClass"),
