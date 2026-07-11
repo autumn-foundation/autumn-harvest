@@ -394,7 +394,7 @@ pub use timeline::{
     derive_timeline,
 };
 #[cfg(any(test, feature = "testing"))]
-pub use trace_export::export_chrome_trace;
+pub use trace_export::{export_chrome_trace, export_timeline_chrome_trace};
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
     ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, TimerId, UpdateId, WorkerId,

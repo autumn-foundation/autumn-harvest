@@ -828,6 +828,11 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Export a workflow execution's timeline to Chrome Trace Event Format.
+    Trace {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
     /// Reconstruct the ordered continue-as-new run chain a workflow execution
     /// belongs to, resolvable from any member (origin, middle, or tail).
     RunChain {
@@ -2234,6 +2239,23 @@ pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliE
 }
 
 fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
+    if let Commands::Workflow {
+        command: WorkflowCommand::Trace { .. },
+    } = &cli.command
+    {
+        let timeline: autumn_harvest::timeline::Timeline = serde_json::from_value(value.clone())
+            .map_err(|e| CliError::ReadJson {
+                label: "parse timeline",
+                path: "api response".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+            })?;
+        let trace = autumn_harvest::export_timeline_chrome_trace(&timeline);
+        return serde_json::to_string_pretty(&trace).map_err(|e| CliError::ReadJson {
+            label: "serialize trace",
+            path: "in-memory".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+        });
+    }
     let state_filtered = completion_delivery_list_state_filter(cli)
         .map(|state| filter_completion_deliveries_by_state(value, state));
     let value = state_filtered.as_ref().unwrap_or(value);
@@ -3961,10 +3983,12 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/stack",
             path_segment(execution_id)
         ))),
-        WorkflowCommand::Timeline { execution_id } => Ok(ApiRequest::get(format!(
-            "/workflows/{}/timeline",
-            path_segment(execution_id)
-        ))),
+        WorkflowCommand::Timeline { execution_id } | WorkflowCommand::Trace { execution_id } => {
+            Ok(ApiRequest::get(format!(
+                "/workflows/{}/timeline",
+                path_segment(execution_id)
+            )))
+        }
         WorkflowCommand::RunChain {
             execution_id,
             json: _,
