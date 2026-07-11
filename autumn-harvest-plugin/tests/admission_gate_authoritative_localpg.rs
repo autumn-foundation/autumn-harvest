@@ -300,12 +300,13 @@ async fn admin_gates_exposes_producer_contract() {
             "{split} must be gated_at_admission"
         );
     }
-    // The cross-shard completion-trigger relay is exempt-by-design.
+    // The cross-shard completion-trigger relay is gated authoritatively at relay
+    // time on the target shard (issue #618, F-round7).
     assert_eq!(
         by_name("completion_trigger_outbox")
             .get("status")
             .and_then(Value::as_str),
-        Some("exempt_by_design")
+        Some("gated_at_relay")
     );
 }
 
@@ -613,10 +614,11 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     let delivered = flush_workflow_start_outbox(&state).await.unwrap();
     assert_eq!(delivered, 1);
 
-    // ── Producer 4: completion-trigger CROSS-SHARD relay — EXEMPT + counted. ──
-    // Seed a persisted outbox row (the gate was checked at evaluate time before
-    // this row was written); the scanner relays it despite the now-active gate
-    // and counts the bypass. Direct analog of the workflow-start outbox.
+    // ── Producer 4: completion-trigger CROSS-SHARD relay — BLOCKED + counted. ──
+    // The relay materializes a *new* pre-committed start on the target shard, so
+    // (Finding B, F-round7) it is gated AUTHORITATIVELY at relay time: under this
+    // Fleet gate the scanner drops the row + records admission_blocked instead of
+    // starting the target. It still "processes" the row (returns 1), but as a BLOCK.
     let sharded = ShardedDbPool::single(pool.clone());
     diesel::sql_query(
         "INSERT INTO harvest_completion_trigger_outbox
@@ -638,7 +640,10 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     )
     .await
     .unwrap();
-    assert_eq!(relayed, 1, "CT cross-shard relay fires despite the gate");
+    assert_eq!(
+        relayed, 1,
+        "CT cross-shard relay processes the row (blocked + dropped) under the gate"
+    );
 
     // ── Producer 5: debounce scanner — EXEMPT + counted. ──
     // A row admitted before the gate was raised, fired after (the leak F1 closes).
@@ -710,16 +715,19 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     let blocked = metrics.blocked();
     let mut bypassed = metrics.bypassed();
     bypassed.sort();
-    // Both the API start and the completion trigger were blocked-and-counted.
+    // Three producers were blocked-and-counted: the API start, the completion
+    // trigger (evaluate-time), and the completion-trigger cross-shard relay
+    // (relay-time, Finding B). Block-vs-bypass never double-counts: each of these
+    // rows was dropped, so it is counted as a block exactly once and never bypassed.
     assert!(
-        blocked.len() >= 2,
-        "API start + completion trigger must both be counted as blocks: {blocked:?}"
+        blocked.len() >= 3,
+        "API start + completion trigger + CT cross-shard relay must all be counted as blocks: {blocked:?}"
     );
     assert!(blocked.iter().all(|(scope, _)| scope == "fleet"));
     // Every exempt / deferred-scanner producer that fired under the gate counted
-    // its bypass — zero un-counted admissions.
+    // its bypass — zero un-counted admissions. The CT cross-shard relay is NOT
+    // here: it is gated at relay time and blocked.
     let mut expected = vec![
-        "completion_trigger_outbox".to_string(),
         "debounce".to_string(),
         "event_batch".to_string(),
         "outbox".to_string(),
@@ -728,13 +736,13 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     expected.sort();
     assert_eq!(
         bypassed, expected,
-        "every producer that started a target under an active gate must count a bypass"
+        "every exempt producer that started a target under an active gate must count a bypass"
     );
-    // Five exempt producers each started their own target; neither the API start
-    // nor the completion trigger (both blocked) slipped through.
+    // Four exempt producers each started their own target; the API start, the
+    // completion trigger, and the CT cross-shard relay were all blocked.
     assert_eq!(
         target_exec_count(&mut conn).await,
-        5,
+        4,
         "only the exempt producers started targets; nothing gated slipped the gate"
     );
 }

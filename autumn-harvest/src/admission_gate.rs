@@ -26,7 +26,7 @@
 //! | [`Debounce`](StartProducer::Debounce) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
 //! | [`Throttle`](StartProducer::Throttle) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
 //! | [`EventBatch`](StartProducer::EventBatch) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
-//! | [`CompletionTriggerOutbox`](StartProducer::CompletionTriggerOutbox) | exempt-by-design | cross-shard relay of an already-gate-checked start; increments the bypass counter |
+//! | [`CompletionTriggerOutbox`](StartProducer::CompletionTriggerOutbox) | gated-at-relay | cross-shard relay, gated authoritatively at relay time on the target shard's real queue: blocks a matching gate (drops the row + counts blocked), else starts + counts the bypass |
 //! | [`Outbox`](StartProducer::Outbox) | exempt-by-design | relays already-committed in-flight work; increments the bypass counter |
 //!
 //! **Out of scope — in-flight continuation, not new admission.** The gate governs
@@ -543,6 +543,16 @@ pub enum ProducerGateStatus {
     /// relayed start increments [`crate::telemetry::METRIC_ADMISSION_BYPASSED`]
     /// so the exemption is observable.
     ExemptByDesign,
+    /// **Gated authoritatively at relay time** on the target shard, where the
+    /// real target queue is always known. The cross-shard completion-trigger
+    /// relay re-checks the gate on the resolved queue immediately before starting
+    /// (`check_cached`): a matching gate blocks + drops the outbox row +
+    /// increments [`crate::telemetry::METRIC_ADMISSION_BLOCKED`]; when no gate
+    /// matches the relay starts and increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] (relay of pre-committed
+    /// in-flight-continuation work). The source-side inline check is only a
+    /// best-effort fast path — the relay-time check is authoritative.
+    GatedAtRelay,
 }
 
 /// One discoverable entry in the start-producer contract (issue #618, AC5).
@@ -565,7 +575,7 @@ pub struct ProducerContractEntry {
 /// which are exempt-by-design without reading source.
 #[must_use]
 pub fn producer_contract() -> Vec<ProducerContractEntry> {
-    use ProducerGateStatus::{ExemptByDesign, Gated, GatedAtAdmission};
+    use ProducerGateStatus::{ExemptByDesign, Gated, GatedAtAdmission, GatedAtRelay};
     vec![
         ProducerContractEntry {
             producer: StartProducer::Api.as_str(),
@@ -623,12 +633,15 @@ pub fn producer_contract() -> Vec<ProducerContractEntry> {
         },
         ProducerContractEntry {
             producer: StartProducer::CompletionTriggerOutbox.as_str(),
-            status: ExemptByDesign,
-            rationale: "Cross-shard completion-trigger relay. The gate was checked at \
-                        evaluate time (in the source terminal commit) before the outbox \
-                        row was written; the scanner relays that already-accepted work \
-                        and is exempt-with-bypass-counter \
-                        (harvest.admission.bypassed{producer=\"completion_trigger_outbox\"}).",
+            status: GatedAtRelay,
+            rationale: "Cross-shard completion-trigger relay, gated AUTHORITATIVELY at \
+                        relay time on the target shard (both the immediate spawn relay and \
+                        the scanner). The real target queue is resolved on the target shard \
+                        and re-checked against the gate (check_cached) immediately before \
+                        starting: a matching gate BLOCKS + drops the outbox row + counts \
+                        harvest.admission.blocked; when no gate matches the relay starts and \
+                        counts harvest.admission.bypassed{producer=\"completion_trigger_outbox\"}. \
+                        The source-side inline check is only a best-effort fast path.",
         },
         ProducerContractEntry {
             producer: StartProducer::Outbox.as_str(),
@@ -1208,12 +1221,13 @@ mod tests {
             );
             assert!(!e.rationale.is_empty());
         }
-        // The cross-shard completion-trigger relay is exempt-by-design.
+        // The cross-shard completion-trigger relay is gated authoritatively at
+        // relay time (issue #618, F-round7).
         let cto = contract
             .iter()
             .find(|e| e.producer == "completion_trigger_outbox")
             .expect("completion_trigger_outbox entry");
-        assert_eq!(cto.status, ProducerGateStatus::ExemptByDesign);
+        assert_eq!(cto.status, ProducerGateStatus::GatedAtRelay);
         assert!(!cto.rationale.is_empty());
     }
 

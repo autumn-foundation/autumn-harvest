@@ -612,6 +612,61 @@ impl Plugin for HarvestPlugin {
     }
 }
 
+/// RAII guard (issue #618, F-round7) that clears the process-global admission
+/// gate cache and metrics recorder if `start_harvest_runtime` returns early with
+/// an error AFTER publishing them — so a failed startup never leaves the globals
+/// pointing at a dead runtime's stale cache/recorder. Defused with `.commit()`
+/// only once startup fully succeeds. Each clear is ptr-eq-guarded against THIS
+/// runtime's `Arc`s (mirroring `stop_harvest_runtime`) so a concurrently-live
+/// sibling runtime's globals are never clobbered.
+struct AdmissionGlobalsGuard {
+    gate_cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>,
+    metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
+    committed: bool,
+}
+
+impl AdmissionGlobalsGuard {
+    /// Publish the gate cache to the global static and begin guarding it.
+    fn publish_gate_cache(cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>) -> Self {
+        autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(cache.clone()));
+        Self {
+            gate_cache: cache,
+            metrics: None,
+            committed: false,
+        }
+    }
+
+    /// Publish the metrics recorder to the global static and begin guarding it.
+    fn publish_metrics(&mut self, recorder: Arc<dyn autumn_harvest::telemetry::MetricsRecorder>) {
+        autumn_harvest::admission_gate::set_global_admission_metrics(Some(recorder.clone()));
+        self.metrics = Some(recorder);
+    }
+
+    /// Defuse the guard: startup succeeded, keep the published globals.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AdmissionGlobalsGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
+            && Arc::ptr_eq(&installed, &self.gate_cache)
+        {
+            autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+        }
+        if let Some(ref m) = self.metrics
+            && let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
+            && Arc::ptr_eq(&installed, m)
+        {
+            autumn_harvest::admission_gate::set_global_admission_metrics(None);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::unused_async)]
 async fn start_harvest_runtime(
     state: &AppState,
@@ -820,15 +875,18 @@ async fn start_harvest_runtime(
     // `harvest_pool` was moved), so the Arc published here — and mutated in place
     // by the background refresh loop — already carries the boot-time gates. A
     // single publish is sufficient; no re-publish per refresh.
-    autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(api_state.gate_cache()));
+    // issue #618 (F-round7): publish via an RAII guard so any early-return error
+    // AFTER this point clears the globals rather than leaving them pointing at a
+    // failed startup's stale cache/recorder. Defused with `.commit()` on success.
+    let mut admission_guard = AdmissionGlobalsGuard::publish_gate_cache(api_state.gate_cache());
 
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     // issue #618 (F-round5): publish the SAME metrics recorder the workers/scanners
     // use so the completion-trigger block path counts a block even when its caller
     // passes `metrics: None` (the cancel / terminate / parent-close-cascade paths).
-    autumn_harvest::admission_gate::set_global_admission_metrics(Some(std::sync::Arc::clone(
+    admission_guard.publish_metrics(std::sync::Arc::clone(
         &runner.api_runtime().registry().telemetry().metrics,
-    )));
+    ));
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -1093,6 +1151,9 @@ async fn start_harvest_runtime(
         });
     }
 
+    // Startup succeeded — keep the published admission globals (issue #618,
+    // F-round7); `stop_harvest_runtime` clears them (ptr-eq guarded) on shutdown.
+    admission_guard.commit();
     Ok(())
 }
 
@@ -1406,6 +1467,122 @@ mod webhook_admission_tests {
             super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
             "a cache reverted to fail-closed must block the outbound webhook_delivery start"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_globals_guard_tests {
+    use super::AdmissionGlobalsGuard;
+    use autumn_harvest::admission_gate::{
+        AdmissionGateCache, global_admission_gate_cache, global_admission_metrics,
+        set_global_admission_gate_cache, set_global_admission_metrics,
+    };
+    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+    use std::sync::Arc;
+
+    // The guard mutates the process-global admission statics; serialize the tests.
+    static GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn recorder() -> Arc<dyn MetricsRecorder> {
+        Arc::new(NoOpMetrics)
+    }
+
+    /// F-round7: an early-return error path (guard dropped without `commit()`)
+    /// clears BOTH published globals.
+    #[test]
+    fn guard_drop_clears_both_globals() {
+        let _g = GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+        {
+            let mut guard =
+                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
+            guard.publish_metrics(recorder());
+            assert!(global_admission_gate_cache().is_some());
+            assert!(global_admission_metrics().is_some());
+            // dropped here WITHOUT commit -> simulates a startup error after publish
+        }
+        assert!(
+            global_admission_gate_cache().is_none(),
+            "guard drop clears the gate cache"
+        );
+        assert!(
+            global_admission_metrics().is_none(),
+            "guard drop clears the metrics recorder"
+        );
+    }
+
+    /// F-round7: an error BEFORE the metrics publish (e.g. `HarvestRunner::start`
+    /// fails) still clears the gate cache.
+    #[test]
+    fn guard_drop_before_metrics_publish_clears_the_gate_cache() {
+        let _g = GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+        {
+            let _guard =
+                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
+            // dropped before publish_metrics
+        }
+        assert!(
+            global_admission_gate_cache().is_none(),
+            "early drop (pre-metrics-publish) clears the gate cache"
+        );
+        assert!(global_admission_metrics().is_none());
+    }
+
+    /// F-round7: `commit()` (successful startup) keeps both globals published.
+    #[test]
+    fn guard_commit_keeps_both_globals() {
+        let _g = GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+        {
+            let mut guard =
+                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
+            guard.publish_metrics(recorder());
+            guard.commit();
+        }
+        assert!(
+            global_admission_gate_cache().is_some(),
+            "commit keeps the gate cache"
+        );
+        assert!(
+            global_admission_metrics().is_some(),
+            "commit keeps the metrics recorder"
+        );
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+    }
+
+    /// F-round7: a stopping guard must NOT clobber a concurrently-live sibling's
+    /// globals — the clear is ptr-eq-guarded against THIS guard's Arcs.
+    #[test]
+    fn guard_drop_does_not_clobber_a_sibling_cache() {
+        let _g = GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+        let sibling = Arc::new(AdmissionGateCache::new());
+        {
+            let _guard =
+                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
+            // A sibling runtime overwrites the global with its OWN cache.
+            set_global_admission_gate_cache(Some(Arc::clone(&sibling)));
+            // our guard drops here -> ptr-eq(our cache, sibling) is false -> no clear
+        }
+        assert!(
+            global_admission_gate_cache().is_some_and(|c| Arc::ptr_eq(&c, &sibling)),
+            "guard drop must not clobber a sibling's installed cache"
+        );
+        set_global_admission_gate_cache(None);
     }
 }
 

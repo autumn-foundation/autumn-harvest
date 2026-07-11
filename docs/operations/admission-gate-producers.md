@@ -26,7 +26,7 @@ with a one-line rationale.
 | `debounce` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
 | `throttle` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
 | `event_batch` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
-| `completion_trigger_outbox` | exempt-by-design | Cross-shard completion-trigger relay. The gate was checked at evaluate time before the outbox row was written; the scanner relays that already-accepted work and counts the bypass. |
+| `completion_trigger_outbox` | gated-at-relay | Cross-shard completion-trigger relay, gated authoritatively at relay time on the target shard's real queue: a matching gate blocks + drops the row + counts `harvest.admission.blocked`; when no gate matches the relay starts + counts `harvest.admission.bypassed`. |
 | `outbox` | exempt-by-design | Relays workflow-start requests durably committed before the gate was raised. |
 
 ### `gated-at-admission` (deferred-fire producers)
@@ -105,18 +105,40 @@ caveat as a mid-run fail-closed with no cached match) — the boot-load failure 
 never converted into a permanent block-drop, and the direct HTTP start path still
 fails closed via `check()`.
 
-### Cross-shard target queue resolution
+### Cross-shard relay — gated authoritatively at relay time
 
 For a **cross-shard** completion trigger (the target workflow hashes to a shard
-other than the source's, with no explicit trigger queue), the inline gate check
-resolves the target queue on the **target shard's** connection — the exact queue
-the outbox relay will use when it fires the start — via
-`completion_trigger::resolve_cross_shard_target_queue`. Resolving on the source
-transaction connection instead would query the source shard's `harvest_schedules`
-(which has no row for the target workflow) and fall back to the default queue,
-missing a `Queue(q)` gate scoped to the real target queue. Same-shard targets are
-unaffected: the source connection *is* the target shard's connection, so they
-keep the single-connection (no extra DB read) path.
+other than the source's), the authoritative gate check runs at **relay time on
+the target shard**, at BOTH relay points — the immediate `DeferredTriggerStart::spawn()`
+and the scanner `enforce_completion_triggers_outbox`. Each relay resolves the
+**real** target queue on the target shard (including any schedule-level
+`queue_name` override) and, immediately before starting, re-checks the gate on
+that queue via `check_cached`:
+
+- **A gate matches the real queue → BLOCK:** the relay drops the outbox row
+  (deletes it) and records `harvest.admission.blocked` — the completion-trigger
+  "block = drop" semantic, now authoritative on the real queue. It does not
+  start.
+- **No gate matches → start + count the bypass** on `harvest.admission.bypassed{producer="completion_trigger_outbox"}`.
+
+Both are **gated on the outbox-row delete** for exactly-once: a row is processed
+by exactly one relay path (the immediate spawn deletes on block/start; the
+scanner only picks up rows the immediate spawn didn't delete), and a row is
+counted **either** blocked **or** bypass, never both.
+
+`check_cached` (the last-known snapshot, honoured even under a transient
+fail-closed blip) is used at relay time — not the fail-closed `check()` — because
+the relay materializes **pre-committed in-flight-continuation** work, so the same
+no-permanent-drop rationale as the completion-trigger inline path applies.
+
+The **source-side inline check** in `evaluate_triggers_for_execution`
+(`resolve_cross_shard_target_queue`) remains as a **best-effort fast path** — it
+resolves the target queue on the target shard's connection when reachable — but
+it is no longer relied on for correctness: when the target pool is transiently
+unavailable it falls back to the shard-independent default queue and could miss a
+`Queue(real-q)` gate, which the authoritative relay-time check then catches.
+Same-shard targets are gated inline at evaluate time (the source connection *is*
+the target shard's connection) and never take the cross-shard relay path.
 
 ## Outbox — exempt, but observable
 

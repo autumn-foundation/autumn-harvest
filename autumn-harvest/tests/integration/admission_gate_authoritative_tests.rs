@@ -859,8 +859,13 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
     scrub(&mut conn).await;
     install_global_router(ShardRouter::default());
 
-    // Raise a Fleet gate: it must NOT stop these deferred-fire scanners (their
-    // start was already admitted before the gate), but each fire is counted.
+    // Raise a Fleet gate. The pure deferred-fire scanners (debounce, throttle,
+    // event-batch) are exempt — their start was already admitted before the gate,
+    // so each fire is counted as a bypass. The completion-trigger CROSS-SHARD
+    // relay is the exception (Finding B, F-round7): it materializes a *new*
+    // pre-committed start on the target shard, so it is gated AUTHORITATIVELY at
+    // relay time — under this Fleet gate it BLOCKS (drops the row, records
+    // admission_blocked) rather than bypassing.
     let cache = fleet_cache("scanner-incident");
     set_global_admission_gate_cache(Some(Arc::clone(&cache)));
 
@@ -891,7 +896,14 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
     )
     .await
     .unwrap();
-    assert_eq!(relayed, 1, "CT cross-shard relay fires despite the gate");
+    // Finding B (F-round7): the CT cross-shard relay is now gated AUTHORITATIVELY
+    // at relay time, so under the Fleet gate it BLOCKS (drops the row + records
+    // admission_blocked) rather than bypassing. It still "processes" the row (it
+    // was dropped), so processed_count is 1 — but it is a BLOCK, not a bypass.
+    assert_eq!(
+        relayed, 1,
+        "CT cross-shard relay processes the row (blocked + dropped) under the gate"
+    );
 
     // ── debounce scanner ──
     diesel::sql_query(
@@ -957,24 +969,34 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
 
     set_global_admission_gate_cache(None);
 
-    // Each deferred-fire producer counted its bypass — zero un-counted admissions.
+    // The pure deferred-fire producers counted their bypass — zero un-counted
+    // admissions. The completion-trigger relay is NOT here: it is gated at relay
+    // time and blocked under the Fleet gate.
     let mut bypassed = metrics.bypassed();
     bypassed.sort();
     let mut expected = vec![
-        "completion_trigger_outbox".to_string(),
         "debounce".to_string(),
         "event_batch".to_string(),
         "throttle".to_string(),
     ];
     expected.sort();
-    assert_eq!(bypassed, expected, "every scanner fire must count a bypass");
-    // No admission was blocked (the scanners are exempt, not gated).
-    assert!(
-        metrics.blocked().is_empty(),
-        "deferred-fire scanners are exempt, not blocked"
+    assert_eq!(
+        bypassed, expected,
+        "each exempt scanner fire counts a bypass; the CT relay does not"
     );
-    // All four targets started under the active gate.
-    assert_eq!(target_exec_count(&mut conn).await, 4);
+    // Exactly one admission was blocked: the completion-trigger cross-shard relay,
+    // which is authoritatively gated at relay time. The relay row was dropped, so
+    // the block is counted exactly once (block-vs-bypass never double-counts).
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "only the CT cross-shard relay is gated at relay time"
+    );
+    assert_eq!(blocked[0].0, "fleet", "the block came from the Fleet gate");
+    // Three targets started (debounce, throttle, event-batch); the CT relay was
+    // blocked, so its target never started.
+    assert_eq!(target_exec_count(&mut conn).await, 3);
 }
 
 /// AC2 semantics at the trigger layer: a scoped gate that does NOT match the
@@ -1487,5 +1509,204 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
         vec!["completion_trigger_outbox".to_string()],
         "the immediate relay counts the completion_trigger_outbox bypass exactly once, \
          and the scanner does not double-count it"
+    );
+}
+
+/// Finding B (F-round7): the cross-shard relay must gate AUTHORITATIVELY at relay
+/// time on the REAL target queue. A schedule sets `queue_name = 'real-q'` for
+/// `ag_target_wf` on the default shard (where the relay resolves a nonzero
+/// target's queue), the `DeferredTriggerStart` carries NO explicit queue (so the
+/// relay resolves `'real-q'`), and an active `Queue('real-q')` gate exists. The
+/// immediate `spawn()` relay must BLOCK: target NOT started, `admission_blocked`
+/// counted once, outbox row DROPPED, and the scanner afterward relays 0 (no
+/// double-processing). Against pre-F-round7 code the relay had no gate check and
+/// started on `'real-q'` uncounted, so this fails first.
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
+    use diesel_async::SimpleAsyncConnection;
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base_url, _c) = setup_db().await;
+
+    let s0_name = format!("ag618_bsrc_{}", Uuid::new_v4().simple());
+    let s1_name = format!("ag618_btgt_{}", Uuid::new_v4().simple());
+    {
+        let base_pool = build_pool(&base_url);
+        let mut admin = base_pool.get().await.unwrap();
+        for name in [&s0_name, &s1_name] {
+            diesel::sql_query(format!("CREATE DATABASE {name}"))
+                .execute(&mut admin)
+                .await
+                .expect("create shard db");
+        }
+    }
+    let s0_url = swap_db_name(&base_url, &s0_name);
+    let s1_url = swap_db_name(&base_url, &s1_name);
+    for u in [&s0_url, &s1_url] {
+        let p = build_pool(u);
+        let mut c = p.get().await.unwrap();
+        c.batch_execute(INIT_SQL)
+            .await
+            .expect("migrate fresh shard db");
+    }
+
+    let src_pool = build_pool(&s0_url);
+    let tgt_pool = build_pool(&s1_url);
+    install_global_router(ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    ));
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), src_pool.clone());
+    pools.insert(ShardId::new(1), tgt_pool.clone());
+    let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // The relay resolves the queue for a nonzero target shard on the DEFAULT
+    // shard's schedules (schedules live on the default shard) — here shard 0.
+    // Insert ag_target_wf -> 'real-q' there so the relay resolves 'real-q'.
+    {
+        let mut c0 = src_pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_schedules (id, workflow_name, queue_name, schedule_expr) \
+             VALUES (gen_random_uuid(), 'ag_target_wf', 'real-q', '@daily')",
+        )
+        .execute(&mut c0)
+        .await
+        .expect("insert default-shard schedule");
+    }
+
+    // SOURCE shard: the outbox row (NULL queue → relay resolves 'real-q').
+    let outbox_id = Uuid::new_v4();
+    {
+        let mut src_conn = src_pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_outbox
+                (id, source_exec_id, trigger_id, target_shard, target_workflow_name,
+                 target_workflow_id, target_input, priority, max_workflow_input_bytes)
+             VALUES ($1, $2, $3, 1, 'ag_target_wf', 'ct-relay-block', '{}'::jsonb,
+                     '0'::jsonb, 1048576)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+        .bind::<diesel::sql_types::Uuid, _>(ExecutionId::new_for_shard(ShardId::new(0)).as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .execute(&mut src_conn)
+        .await
+        .expect("insert outbox row");
+    }
+
+    // Raise a Queue('real-q') gate + publish the recorder via the global.
+    set_global_admission_gate_cache(Some(scoped_cache(GateScope::Queue("real-q".to_string()))));
+    let recorder = Arc::new(CapturingMetrics::default());
+    set_global_admission_metrics(Some(
+        Arc::clone(&recorder) as Arc<dyn autumn_harvest::telemetry::MetricsRecorder>
+    ));
+
+    // Fire the immediate relay with NO explicit queue → it resolves 'real-q'.
+    let deferred = autumn_harvest::completion_trigger::DeferredTriggerStart {
+        outbox_id,
+        source_shard: ShardId::new(0),
+        target_shard: ShardId::new(1),
+        target_workflow_name: "ag_target_wf".to_string(),
+        target_workflow_id: "ct-relay-block".to_string(),
+        target_input: json!({}),
+        queue_name: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 1_048_576,
+        trigger_name: "ct_relay_block".to_string(),
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla: None,
+        retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+    };
+    deferred.spawn();
+
+    // Poll for the block (gated on the delete, so a non-empty blocked list means
+    // the block + row-drop + count all completed).
+    let mut settled = false;
+    for _ in 0..200 {
+        if !recorder.blocked().is_empty() {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Scanner over the source shard: the row was dropped by the immediate relay,
+    // so it processes nothing (no double-block, no bypass).
+    let scanner_metrics: &(dyn MetricsRecorder + Send + Sync) = &*recorder;
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut src_pool.get().await.unwrap(),
+        scanner_metrics,
+        &Some(sharded.clone()),
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+
+    let target_count: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = 'ag_target_wf'",
+    )
+    .get_result::<CountRow>(&mut tgt_pool.get().await.unwrap())
+    .await
+    .expect("count target")
+    .n;
+    let outbox_remaining: i64 =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_outbox")
+            .get_result::<CountRow>(&mut src_pool.get().await.unwrap())
+            .await
+            .expect("count outbox")
+            .n;
+
+    set_global_admission_gate_cache(None);
+    set_global_admission_metrics(None);
+    install_global_router(ShardRouter::default());
+    let _ = ShardedDbPool::single(build_pool(&base_url));
+    drop(sharded);
+    drop(src_pool);
+    drop(tgt_pool);
+    {
+        let base_pool = build_pool(&base_url);
+        if let Ok(mut admin) = base_pool.get().await {
+            for name in [&s0_name, &s1_name] {
+                let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&mut admin)
+                    .await;
+            }
+        }
+    }
+
+    assert!(
+        settled,
+        "the relay-time gate block did not complete within the poll window"
+    );
+    assert_eq!(
+        target_count, 0,
+        "the relay must BLOCK on the real-queue gate — the target is NOT started"
+    );
+    assert_eq!(
+        outbox_remaining, 0,
+        "the blocked relay dropped the outbox row"
+    );
+    assert_eq!(
+        relayed, 0,
+        "the scanner had nothing to relay (row already dropped)"
+    );
+    let blocked = recorder.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the relay-time block is counted exactly once"
+    );
+    assert_eq!(blocked[0].0, "queue");
+    assert!(
+        recorder.bypassed().is_empty(),
+        "a blocked relay must NOT also count a bypass"
     );
 }

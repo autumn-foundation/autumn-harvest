@@ -726,6 +726,37 @@ pub async fn resolve_cross_shard_target_queue(
     default_workflow_queue()
 }
 
+/// Relay-time AUTHORITATIVE admission-gate check for a cross-shard
+/// completion-trigger start (issue #618, F-round7).
+///
+/// Called at BOTH relay points (`DeferredTriggerStart::spawn()` and the scanner
+/// `enforce_completion_triggers_outbox`) once the REAL target queue has been
+/// resolved on the target shard, immediately before starting the workflow. This
+/// is the authoritative gate check: the source-side inline check in
+/// `evaluate_triggers_for_execution` is only a best-effort fast path (it cannot
+/// always resolve the target's schedule-level queue override — e.g. when the
+/// target pool is transiently unavailable it falls back to the default queue and
+/// could miss a `Queue(real-q)` gate). Returns `Some((reason, scope_kind))` when
+/// a gate blocks the start on the real resolved queue, else `None`.
+///
+/// Uses `check_cached` (the last-known snapshot, honoured even under a transient
+/// fail-closed blip, never the sentinel) — NOT `check()` — because the relay
+/// materializes pre-committed in-flight-continuation work, so the same
+/// no-permanent-drop rationale as the completion-trigger inline path applies.
+#[cfg(feature = "db")]
+fn relay_gate_block(
+    workflow_name: &str,
+    resolved_queue: &str,
+    target_shard: crate::types::ShardId,
+    owner: Option<&str>,
+) -> Option<(String, &'static str)> {
+    crate::admission_gate::global_admission_gate_cache().and_then(|cache| {
+        cache
+            .check_cached(workflow_name, resolved_queue, target_shard.as_i32(), owner)
+            .map(|(_id, reason, scope_kind)| (reason, scope_kind))
+    })
+}
+
 #[cfg(feature = "db")]
 #[derive(Debug, Clone)]
 pub struct DeferredTriggerStart {
@@ -793,6 +824,54 @@ impl DeferredTriggerStart {
                 )
                 .await
             };
+
+            // Relay-time AUTHORITATIVE gate check (issue #618, F-round7): the real
+            // target queue is now known. If a gate matches on it, DROP the outbox
+            // row and record the block (completion-trigger "block = drop"), and do
+            // NOT start — the authoritative safety net regardless of what the
+            // source-side inline approximation resolved. Exactly-once: the block
+            // count is gated on the delete actually removing the row, so the
+            // scanner can never re-process a dropped row (and a row is EITHER
+            // blocked OR bypass-counted, never both).
+            if let Some((reason, scope_kind)) = relay_gate_block(
+                &self.target_workflow_name,
+                &queue_name,
+                self.target_shard,
+                self.owner.as_deref(),
+            ) {
+                tracing::info!(
+                    target_workflow = %self.target_workflow_name,
+                    queue = %queue_name,
+                    scope_kind,
+                    reason = %reason,
+                    "[completion_trigger] immediate cross-shard relay blocked by an admission gate on the real target queue; dropping the outbox row"
+                );
+                if let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
+                    .read()
+                    .ok()
+                    .and_then(|p| p.clone())
+                    .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
+                    && let Ok(mut source_conn) = source_pool.get().await
+                {
+                    use diesel::prelude::*;
+                    use diesel_async::RunQueryDsl;
+                    let deleted =
+                        diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
+                            .filter(
+                                crate::schema::harvest_completion_trigger_outbox::dsl::id
+                                    .eq(self.outbox_id),
+                            )
+                            .execute(&mut source_conn)
+                            .await;
+                    if matches!(deleted, Ok(n) if n >= 1)
+                        && let Some(m) = crate::admission_gate::global_admission_metrics()
+                    {
+                        m.record_admission_blocked(scope_kind, &reason);
+                    }
+                }
+                return;
+            }
+
             let start_res = crate::execution::start_or_load_workflow_execution(
                 &mut target_conn,
                 crate::execution::StartWorkflowParams {
@@ -1512,6 +1591,36 @@ pub async fn enforce_completion_triggers_outbox(
             .read()
             .ok()
             .and_then(|g| *g);
+
+        // Relay-time AUTHORITATIVE gate check (issue #618, F-round7): identical to
+        // the immediate `spawn()` relay. If a gate matches on the real resolved
+        // queue, DROP the outbox row and record the block; do NOT start. Gated on
+        // the delete for exactly-once (a row is EITHER blocked OR bypass-counted,
+        // never both).
+        if let Some((reason, scope_kind)) = relay_gate_block(
+            &task.target_workflow_name,
+            &queue_name,
+            target_shard,
+            target_owner.as_deref(),
+        ) {
+            tracing::info!(
+                target_workflow = %task.target_workflow_name,
+                queue = %queue_name,
+                scope_kind,
+                reason = %reason,
+                "[completion_trigger outbox] scanner relay blocked by an admission gate on the real target queue; dropping the outbox row"
+            );
+            let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                .filter(outbox_dsl::id.eq(task.id))
+                .execute(conn)
+                .await;
+            processed_count += 1;
+            if matches!(deleted, Ok(n) if n >= 1) {
+                metrics.record_admission_blocked(scope_kind, &reason);
+            }
+            continue;
+        }
+
         let start_res = crate::execution::start_or_load_workflow_execution(
             &mut target_conn,
             crate::execution::StartWorkflowParams {
@@ -1559,21 +1668,25 @@ pub async fn enforce_completion_triggers_outbox(
 
         match start_res {
             Ok(_) => {
-                // Delete task from outbox on successful start
-                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                // Delete task from outbox on successful start.
+                let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
                     .filter(outbox_dsl::id.eq(task.id))
                     .execute(conn)
                     .await;
                 processed_count += 1;
-                // issue #618, F1: the cross-shard completion-trigger relay is
-                // EXEMPT-BY-DESIGN. The gate was checked at evaluate time (in the
-                // source terminal commit) before this outbox row was written; the
-                // scanner relays that already-accepted work. Count it so an
-                // operator can see it never slips a gate that was raised after the
-                // row was persisted. See `admission_gate::producer_contract`.
-                metrics.record_admission_bypassed(
-                    crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
-                );
+                // issue #618: the cross-shard completion-trigger relay is
+                // EXEMPT-BY-DESIGN when no gate matches the real queue (the
+                // relay-time block above is authoritative). Count the bypass so an
+                // operator sees it never slips a gate raised after the row was
+                // persisted. Gated on the delete actually removing the row so the
+                // immediate `spawn()` relay can never also count the same row
+                // (exactly-once across the two relay paths). See
+                // `admission_gate::producer_contract`.
+                if matches!(deleted, Ok(n) if n >= 1) {
+                    metrics.record_admission_bypassed(
+                        crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
+                    );
+                }
             }
             Err(crate::error::HarvestError::PayloadTooLarge {
                 kind,
