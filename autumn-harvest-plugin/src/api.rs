@@ -8822,7 +8822,7 @@ async fn get_workflow_stack(
     let inputs_truncated_for_budget = decoder
         .as_ref()
         .map(|_| apply_input_response_budget(&mut pending_activities, default_input_cap));
-    let pending_local_activities = harvest_events::table
+    let mut pending_local_activities = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any([
             "LocalActivityScheduled",
@@ -8863,20 +8863,15 @@ async fn get_workflow_stack(
                         // string on the event, which is what
                         // `LocalActivityFailed.activity_id` (and hence the
                         // failure map key) also carries — parse it to look up
-                        // the most-recent failure (issue #773). Decode the
-                        // error inline (issue #608) so the read-path decode is
-                        // scoped to the SURFACED local activities only (P3), and
-                        // fold it into `decode_outcome` for the audit row.
+                        // the most-recent failure (issue #773). Attach the RAW
+                        // (undecoded) failure here; decoding is deferred until
+                        // after the fold so an entry a later terminal event
+                        // removes is never decoded or audited, keeping the #608
+                        // read-path decode scoped to the local activities
+                        // actually surfaced (Codex P2, PR #1022).
                         let last_failure = uuid::Uuid::parse_str(&activity_exec_id)
                             .ok()
-                            .and_then(|aid| failures_by_activity.get(&aid).cloned())
-                            .map(|mut failure| {
-                                if let Some(codecs) = decoder.as_ref() {
-                                    decode_outcome = decode_outcome
-                                        .merged(decode_error_field(codecs, &mut failure.error));
-                                }
-                                failure
-                            });
+                            .and_then(|aid| failures_by_activity.get(&aid).cloned());
                         acc.insert(
                             activity_exec_id.clone(),
                             PendingLocalActivity {
@@ -8916,6 +8911,22 @@ async fn get_workflow_stack(
         )
         .into_values()
         .collect::<Vec<_>>();
+    // Decode each SURVIVING pending local activity's `last_failure` error inline
+    // (issue #608), folding into `decode_outcome` for the audit row. Deferred to
+    // here — rather than inside the fold's `LocalActivityScheduled` arm — so a
+    // failure whose pending entry a later `LocalActivityCompleted`/`Exhausted`
+    // event removed is never decoded or audited (a removed entry is not
+    // surfaced, so touching `decode_outcome` for it would write a spurious
+    // `payload.decode_read` audit row for data that never left the handler —
+    // Codex P2, PR #1022).
+    if let Some(codecs) = decoder.as_ref() {
+        for pla in &mut pending_local_activities {
+            if let Some(failure) = pla.last_failure.as_mut() {
+                decode_outcome =
+                    decode_outcome.merged(decode_error_field(codecs, &mut failure.error));
+            }
+        }
+    }
     let pending_timers = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_timers::fired.eq(false))
