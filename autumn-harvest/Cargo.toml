@@ -109,6 +109,9 @@ name = "sleep_until_renewal_reminder"
 [[example]]
 name = "cancellable_timer_sla"
 
+[[example]]
+name = "signal_aggregator"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

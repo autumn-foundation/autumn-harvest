@@ -5231,6 +5231,11 @@ impl WorkflowContext {
     ///
     /// This is the typed alternative to [`wait_for_signal`](Self::wait_for_signal).
     ///
+    /// See also the non-blocking siblings
+    /// [`try_receive_signal`](Self::try_receive_signal) /
+    /// [`drain_signals`](Self::drain_signals) for the aggregator pattern (block
+    /// once, then sweep up the rest without extra tasks).
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Serialization`] if the signal payload cannot be
@@ -5275,6 +5280,22 @@ impl WorkflowContext {
     /// order is authoritative, consistent with
     /// [`match_signal_or_timer`](crate::replay::HistoryMatcher::match_signal_or_timer).
     ///
+    /// # Interaction with push signal handlers
+    ///
+    /// This routes through `match_history`, whose `pump_signal_handlers`
+    /// post-hook runs *after* the call. So if you also register a push signal
+    /// handler (issue #546) for the same name, a single `try_receive_signal`
+    /// call's post-hook will dispatch the *remaining* buffered same-name signals
+    /// to that handler. Don't mix a manual drain and a push handler on one
+    /// signal name — pick one consumption style per name.
+    ///
+    /// # Performance
+    ///
+    /// A loop of `try_receive_signal` calls is O(N²) — each call removes from
+    /// the front of the pending-signal `VecDeque`. To consume a whole buffered
+    /// burst, prefer a single [`drain_signals`](Self::drain_signals) /
+    /// [`drain_signals_raw`](Self::drain_signals_raw) call.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Serialization`] if the buffered payload cannot be
@@ -5311,9 +5332,12 @@ impl WorkflowContext {
     /// buffered payload that cannot be deserialized into `O`. Earlier payloads
     /// in the same drain have already been consumed from history when this
     /// happens, so treat a deserialization error as a hard workflow error
-    /// (do not retry the drain expecting the bad payload to reappear). Use the
-    /// untyped [`drain_signals_raw`](Self::drain_signals_raw) if payloads are
-    /// heterogeneous.
+    /// (do not retry the drain expecting the bad payload to reappear). A
+    /// poison payload therefore discards every **good** signal in the same
+    /// batch — use the per-slot [`drain_signals_collect`](Self::drain_signals_collect)
+    /// if a single undeserializable payload must not lose its good siblings, or
+    /// the untyped [`drain_signals_raw`](Self::drain_signals_raw) if payloads
+    /// are heterogeneous.
     ///
     /// # Panics
     ///
@@ -5326,6 +5350,46 @@ impl WorkflowContext {
             .into_iter()
             .map(|raw| serde_json::from_value(raw).map_err(HarvestError::from))
             .collect()
+    }
+
+    /// Non-blocking, poison-tolerant consume of **all** currently-buffered,
+    /// not-yet-consumed signals of `signal_name`, each independently
+    /// deserialized into `O`, in FIFO recorded-history order.
+    ///
+    /// Returns a per-slot `Result<O, String>` — `Ok(payload)` for a signal that
+    /// deserialized, `Err(error_string)` for one that did not. Unlike the
+    /// fail-fast [`drain_signals`](Self::drain_signals), a single bad payload
+    /// mid-batch **never discards its good siblings**: every buffered signal is
+    /// consumed once (via [`drain_signals_raw`](Self::drain_signals_raw)) and
+    /// reported in its own slot. This mirrors the fan-out fail-fast/collect
+    /// pair ([`execute_activity_fan_out`](Self::execute_activity_fan_out) /
+    /// [`execute_activity_fan_out_collect`](Self::execute_activity_fan_out_collect)).
+    ///
+    /// **Never suspends.** See [`try_receive_signal`](Self::try_receive_signal)
+    /// for the full determinism, no-double-delivery, and race-safety contract;
+    /// they share it exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an outer `Err` only if the untyped drain itself fails (infallible
+    /// in practice); a payload that cannot be deserialized surfaces as a per-slot
+    /// `Err(String)`, never an outer error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn drain_signals_collect<O>(
+        &self,
+        signal_name: &str,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        Ok(self
+            .drain_signals_raw(signal_name)?
+            .into_iter()
+            .map(|raw| serde_json::from_value(raw).map_err(|e: serde_json::Error| e.to_string()))
+            .collect())
     }
 
     /// Untyped sibling of [`try_receive_signal`](Self::try_receive_signal):
@@ -5398,6 +5462,11 @@ impl WorkflowContext {
     }
 
     /// Wait for the next delivered signal with the given name.
+    ///
+    /// See also the non-blocking siblings
+    /// [`try_wait_for_signal`](Self::try_wait_for_signal) /
+    /// [`drain_signals_raw`](Self::drain_signals_raw) for the aggregator pattern
+    /// (block once, then sweep up the rest without extra tasks).
     ///
     /// # Errors
     ///
@@ -9910,6 +9979,40 @@ mod tests {
     }
 
     #[test]
+    fn drain_signals_collect_returns_per_slot_results() {
+        // The poison-tolerant collect variant (issue #775 review): a single bad
+        // payload mid-batch must NOT discard its good siblings. Mirrors the
+        // fan-out fail-fast/collect pair (`execute_activity_fan_out_collect`).
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Item {
+            id: u64,
+        }
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 10}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                // Poison payload sandwiched between two good ones.
+                payload: serde_json::json!("not-an-object"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 30}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let per_slot: Vec<Result<Item, String>> = ctx.drain_signals_collect("item").unwrap();
+        assert_eq!(per_slot.len(), 3);
+        // Crucially: both GOOD payloads survive the poison one — no data loss.
+        assert_eq!(per_slot[0], Ok(Item { id: 10 }));
+        assert!(per_slot[1].is_err(), "the poison slot is Err, not dropped");
+        assert_eq!(per_slot[2], Ok(Item { id: 30 }));
+    }
+
+    #[test]
     fn try_receive_signal_returns_oldest_then_none() {
         let events = vec![
             started_event(),
@@ -9934,6 +10037,26 @@ mod tests {
     #[test]
     fn try_wait_for_signal_none_when_empty() {
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()]);
+        assert_eq!(ctx.try_wait_for_signal("event").unwrap(), None);
+    }
+
+    #[test]
+    fn try_wait_for_signal_returns_some_when_buffered() {
+        // Direct coverage of the untyped `Some` path (previously only exercised
+        // transitively through `try_receive_signal`).
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(
+            ctx.try_wait_for_signal("event").unwrap(),
+            Some(serde_json::json!({"seq": 1}))
+        );
+        // Consumed — a following call sees nothing.
         assert_eq!(ctx.try_wait_for_signal("event").unwrap(), None);
     }
 
@@ -10034,6 +10157,86 @@ mod tests {
         assert!(
             received.lock().unwrap().is_empty(),
             "a drain that already claimed the event leaves nothing for a push handler"
+        );
+    }
+
+    #[test]
+    fn push_handler_first_claim_leaves_nothing_for_a_later_drain() {
+        // The reverse direction of `drain_and_push_handler_first_claim_wins`:
+        // a push handler that already claimed the event via dispatch leaves
+        // nothing for a subsequent drain — no double delivery either way.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // The push handler runs first and claims the event.
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("event", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        ctx.flush_pending_signal_handlers();
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![serde_json::json!({"seq": 1})],
+            "the push handler must receive the signal"
+        );
+
+        // A drain afterwards sees nothing — the handler already claimed it.
+        assert!(
+            ctx.drain_signals_raw("event").unwrap().is_empty(),
+            "a push handler that already claimed the event leaves nothing for a drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_after_a_drain_is_observable_by_a_subsequent_drain() {
+        // AC6b made explicit: a signal recorded AFTER an activity the workflow
+        // has not yet reached is invisible to an early drain, but becomes
+        // observable to a SUBSEQUENT drain once the workflow's own code advances
+        // the cursor past that activity.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // First drain: the signal sits behind an unconsumed activity → invisible.
+        assert!(
+            ctx.drain_signals_raw("event").unwrap().is_empty(),
+            "a signal behind an unconsumed activity is not observable to an early drain"
+        );
+
+        // The workflow's own code replays the activity, advancing the cursor.
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+        assert_eq!(result.unwrap(), serde_json::json!("sent"));
+
+        // Subsequent drain: the now-reachable signal is returned.
+        assert_eq!(
+            ctx.drain_signals_raw("event").unwrap(),
+            vec![serde_json::json!({"seq": 1})],
+            "a signal after the drain point is observable by a subsequent drain"
         );
     }
 

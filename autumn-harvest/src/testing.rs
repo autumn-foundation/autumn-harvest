@@ -3104,27 +3104,26 @@ impl WorkflowTestEnv {
             }
 
             WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                // Promote EVERY currently-queued signal matching `signal_name`
+                // Simulate a production wake: the workflow only makes progress on
+                // this wait when a signal of the awaited name is actually queued.
+                // On that wake, promote EVERY currently-queued signal (ALL names)
                 // into history in queued order, mirroring production
-                // `ingest_pending_signals` batch promotion (issue #775). The
-                // matcher's `match_signal` consumes the first for this wait,
-                // leaving the rest buffered for a following non-blocking
-                // `drain_signals`/`try_receive_signal` call in the same task.
-                let mut delivered = false;
-                let mut i = 0;
-                while i < remaining_signals.len() {
-                    if remaining_signals[i].0 == signal_name {
-                        let (_, payload) = remaining_signals.remove(i);
-                        deferred_events.push(WorkflowEvent::SignalReceived {
-                            signal_name: signal_name.clone(),
-                            payload,
-                        });
-                        delivered = true;
-                    } else {
-                        i += 1;
-                    }
+                // `load_pending_signals`/`ingest_pending_signals` batch promotion
+                // (issue #775) — so cross-name "block on X, drain Y" patterns are
+                // faithfully testable. The matcher's `match_signal` then consumes
+                // the first awaited-name signal for this wait, leaving the rest
+                // buffered for a following non-blocking `drain_signals` /
+                // `try_receive_signal` call in the same task.
+                if !remaining_signals.iter().any(|(n, _)| n == &signal_name) {
+                    return Ok(false);
                 }
-                Ok(delivered)
+                for (name, payload) in remaining_signals.drain(..) {
+                    deferred_events.push(WorkflowEvent::SignalReceived {
+                        signal_name: name,
+                        payload,
+                    });
+                }
+                Ok(true)
             }
 
             WorkflowCommand::StartChildWorkflow {

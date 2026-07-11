@@ -32,16 +32,22 @@
 //! }
 //! ```
 //!
-//! ## The four drain methods
+//! ## The drain methods
 //!
 //! | Method | Returns | Blocks? |
 //! |--------|---------|---------|
 //! | `try_receive_signal::<O>(name)`  | `Option<O>`  (oldest buffered) | never |
-//! | `drain_signals::<O>(name)`       | `Vec<O>`     (all buffered)    | never |
+//! | `drain_signals::<O>(name)`       | `Vec<O>`     (all, fail-fast)  | never |
+//! | `drain_signals_collect::<O>(name)` | `Vec<Result<O, String>>` (all, per-slot) | never |
 //! | `try_wait_for_signal(name)`      | `Option<Value>` (oldest)      | never |
 //! | `drain_signals_raw(name)`        | `Vec<Value>` (all)            | never |
 //!
-//! All four consume already-recorded `SignalReceived` events in FIFO
+//! `drain_signals` is fail-fast (a single undeserializable payload aborts the
+//! whole batch, discarding its good siblings); `drain_signals_collect` returns
+//! a per-slot `Result` so a poison payload never loses the good ones — mirroring
+//! the fan-out fail-fast/collect pair.
+//!
+//! All consume already-recorded `SignalReceived` events in FIFO
 //! recorded-history order and NEVER suspend. They never double-deliver an event
 //! already consumed by `receive_signal`/`wait_for_signal` or a push handler, and
 //! they never resolve a signal reserved for an open `receive_signal_timeout`
@@ -57,6 +63,20 @@ struct LineItem {
 
 /// Collect a batch of `line_item` signals: block for the first, then drain the
 /// rest without suspending. Returns the total quantity across the batch.
+///
+/// This runnable version is deliberately **single-shot**: it collects one batch
+/// and returns, so the embedded `WorkflowTestEnv` tests terminate. A real
+/// long-lived aggregator would loop — after processing `batch`, call
+/// `ctx.continue_as_new(...)` (where the `Ok(total_qty)` return is below) to
+/// fork a fresh execution with bounded history and go back to blocking on the
+/// next `receive_signal("line_item")`.
+///
+/// Aggregator race caveat: a `line_item` signal delivered *after* this drain
+/// but *before* a `continue_as_new` commit belongs to the **old** execution's
+/// signal stream — `continue_as_new` mints a new `exec_id`, and a new exec_id is
+/// a new signal stream. Such a straggler is still visible to a final drain on
+/// the current execution (drain again right before continuing), but is not
+/// carried forward into the successor.
 #[workflow]
 async fn aggregate_order(ctx: &WorkflowContext, _input: ()) -> Result<u32, String> {
     // Block until the first line item arrives.
@@ -73,6 +93,8 @@ async fn aggregate_order(ctx: &WorkflowContext, _input: ()) -> Result<u32, Strin
     );
 
     let total_qty: u32 = batch.iter().map(|i| i.qty).sum();
+    // A long-lived aggregator would `ctx.continue_as_new(...)` here instead of
+    // returning, to keep history bounded across batches.
     Ok(total_qty)
 }
 

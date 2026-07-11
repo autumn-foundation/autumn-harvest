@@ -7102,6 +7102,50 @@ mod tests {
     }
 
     #[test]
+    fn try_claim_pending_signal_drains_a_signal_that_lost_a_resolved_timer_race() {
+        // The AC7 "already lost a resolved TimerWon race is fair game" claim,
+        // made concrete for the non-blocking drain. A signal recorded AFTER its
+        // race timer FIRED (TimerStarted, TimerFired, then SignalReceived) never
+        // reserved the occurrence — the timer resolved the race before the
+        // signal arrived — so it is drainable once the workflow's own code has
+        // driven the cursor past the resolved race.
+        let timer_id = "__signal_timeout:0:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer_id),
+            },
+            // The late loser: recorded after the race already resolved TimerWon.
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true, "late": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        // The reservation index build never reserved this occurrence — the
+        // resolved timer isn't in `open_race_timers` when the signal is seen.
+        assert!(
+            matcher.race_reserved_signal_events.is_empty(),
+            "a signal recorded after its race timer fired must not be reserved"
+        );
+
+        // Resolve the race exactly as the workflow's own code would (TimerWon).
+        let result = matcher.match_signal_or_timer("approval", timer_id, Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        // The late loser is now drainable via the non-blocking try-claim.
+        assert_eq!(
+            matcher.try_claim_pending_signal("approval"),
+            Some(serde_json::json!({"approved": true, "late": true})),
+            "a signal that lost a resolved TimerWon race is fair game for a drain"
+        );
+    }
+
+    #[test]
     fn matcher_allows_non_signal_command_after_out_of_order_signal_match() {
         let timer_id = TimerId::new("cooldown");
         let events = vec![

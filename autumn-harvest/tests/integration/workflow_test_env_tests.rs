@@ -2892,3 +2892,72 @@ async fn test_try_receive_signal_none_when_nothing_queued() {
         "try_receive_signal must return None (and never suspend) when nothing is buffered"
     );
 }
+
+/// Aggregator that returns the COUNT of signals collected (block for the first,
+/// then drain the rest) — for the N-at-scale success-metric assertion.
+fn drain_n_env_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx
+            .wait_for_signal("event")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut all = vec![first];
+        all.extend(ctx.drain_signals_raw("event").map_err(|e| e.to_string())?);
+        Ok(json!({ "count": all.len() }))
+    })
+}
+
+#[tokio::test]
+async fn test_drain_1000_signals_returns_all_in_one_task() {
+    // Success-metric (issue #775, AC8): a wait + drain in ONE task execution
+    // must RETURN all N buffered same-name signals — not merely consume them.
+    // A `.take(k)` truncation regression would fail this returned-count check.
+    let mut env = WorkflowTestEnv::new();
+    for i in 0..1000 {
+        env = env.queue_signal("event", json!({ "seq": i }));
+    }
+    let outcome = env.run(drain_n_env_workflow, json!(null)).await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({ "count": 1000 })),
+        "all 1000 buffered same-name signals must be returned in a single task"
+    );
+}
+
+/// Does exactly ONE `wait_for_signal("event")` and returns it WITHOUT draining —
+/// proves the test-env batch-promotion of the queued extras did not corrupt the
+/// single-wait return path.
+fn single_wait_no_drain_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx
+            .wait_for_signal("event")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "first": first }))
+    })
+}
+
+#[tokio::test]
+async fn test_single_wait_with_extras_queued_returns_first_signal() {
+    // Regression guard for the `WaitForSignal` batch-promotion change: with
+    // multiple same-name signals queued, a workflow doing a single
+    // `wait_for_signal` (no drain) must still return the FIRST queued signal —
+    // promoting the extras into history must not corrupt the single-wait return.
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .queue_signal("event", json!({"seq": 3}))
+        .run(single_wait_no_drain_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({ "first": {"seq": 1} })),
+        "a single wait_for_signal must return the first queued signal despite batch promotion"
+    );
+}
