@@ -1214,6 +1214,129 @@ async fn stack_pending_local_activity_surfaces_last_failure() {
     );
 }
 
+/// A local activity whose retry budget is exhausted closes with a terminal
+/// `LocalActivityExhausted` event. If the workflow catches that failure and
+/// keeps running, `/stack` must NOT report the exhausted activity as pending
+/// (Codex review, PR #1022; issue #773). Before the fix the fold never
+/// consumed `LocalActivityExhausted`, so the entry stayed pending forever.
+#[tokio::test]
+async fn stack_exhausted_local_activity_is_not_pending() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_plain_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "stack-local-exhausted", json!({})).await;
+    let activity_id = ActivityExecId::new();
+    // Catch-and-continue: the local activity retried, exhausted its budget
+    // (terminal `LocalActivityExhausted`), and the workflow is still RUNNING.
+    append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "compute_checksum".to_string(),
+                input: json!({"blob": "abc"}),
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error: "checksum mismatch".to_string(),
+                attempt: 1,
+            },
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id,
+                error: "checksum mismatch".to_string(),
+                attempt: 2,
+            },
+        ],
+    )
+    .await;
+
+    let (status, stack) = get_json(&app, &format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK, "body: {stack}");
+    let pending = stack["pending_local_activities"]
+        .as_array()
+        .expect("pending_local_activities must be an array");
+    assert!(
+        pending.is_empty(),
+        "an exhausted (terminally failed) local activity must not be reported \
+         as pending: {stack}"
+    );
+}
+
+/// #608 audit fidelity (Codex P2, PR #1022): a local activity that failed with
+/// a stringified codec envelope and then EXHAUSTED (terminal) is removed from
+/// the pending panel. Its `last_failure` must therefore NOT be decoded — and
+/// so must never touch `decode_outcome` and never write a spurious
+/// `payload.decode_read` audit row for data that never left the handler. Before
+/// the fix the fold decoded `last_failure` inside the `LocalActivityScheduled`
+/// arm, before the terminal `LocalActivityExhausted` arm removed the entry, so
+/// the removed entry's envelope was decoded and audited.
+#[tokio::test]
+async fn stack_removed_local_activity_failure_is_not_decoded_or_audited() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // Decode-enabled admin app: the read-path decoder is active for this request.
+    let app = build_decode_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "stack-local-removed-no-audit", json!({})).await;
+    let activity_id = ActivityExecId::new();
+    // The failure error is a codec envelope that WOULD decode if surfaced, but
+    // the following terminal `LocalActivityExhausted` removes the pending entry
+    // (catch-and-continue; the workflow is still RUNNING).
+    append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "compute_checksum".to_string(),
+                input: json!({"blob": "abc"}),
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error: stringified_envelope(&json!({"secret": "pii-alpha"})),
+                attempt: 1,
+            },
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id,
+                error: stringified_envelope(&json!({"secret": "pii-alpha"})),
+                attempt: 2,
+            },
+        ],
+    )
+    .await;
+
+    let (status, stack) = get_json(&app, &format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK, "body: {stack}");
+    // (a) The exhausted local activity is not surfaced.
+    let pending = stack["pending_local_activities"]
+        .as_array()
+        .expect("pending_local_activities must be an array");
+    assert!(
+        pending.is_empty(),
+        "an exhausted (terminally failed) local activity must not be reported \
+         as pending: {stack}"
+    );
+    // (b) No decode of the removed entry ⇒ no plaintext leak on the surface …
+    let stack_str = serde_json::to_string(&stack).unwrap();
+    assert!(
+        !stack_str.contains("pii-alpha") && !stack_str.contains("_harvest_codec_envelope"),
+        "the removed entry's failure must neither be surfaced nor decoded: {stack_str}"
+    );
+    // … and, crucially, NO payload.decode_read audit row for a request that
+    // surfaced nothing decodable (audit_decoded_read no-ops on an untouched
+    // outcome, so a row means the removed entry's failure was decoded).
+    let audit = decode_audit_rows(&mut conn).await;
+    assert!(
+        audit.is_empty(),
+        "a stack read whose only envelope belongs to a REMOVED local activity \
+         must not write a payload.decode_read audit row: {audit:?}"
+    );
+}
+
 /// AC5: `GET /dead-letters` decodes the failed task's input (JSONB) and
 /// error (TEXT).
 #[tokio::test]

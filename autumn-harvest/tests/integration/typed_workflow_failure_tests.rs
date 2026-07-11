@@ -284,6 +284,8 @@ mod db_handle_surface {
         "\n",
         include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
         include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+        // issue #747: per-execution legal hold columns.
+        include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
         include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     );
 
