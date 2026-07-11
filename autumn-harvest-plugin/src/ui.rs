@@ -8215,6 +8215,10 @@ mod tests {
             nd_block_reason: None,
             nd_block_count: 0,
             completion_callbacks: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
         }
     }
 

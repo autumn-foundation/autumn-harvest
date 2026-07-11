@@ -80,6 +80,14 @@ pub mod debounce;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
+/// Effective runtime-configuration introspection (issue #695).
+///
+/// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free
+/// snapshot served from `GET /api/harvest/admin/config`. The
+/// [`effective_config::WorkerConfigView::from_worker_config`] mapping
+/// destructures [`builder::WorkerConfig`] exhaustively (no `..`) so a new
+/// tunable is a compile error until it is surfaced.
+pub mod effective_config;
 pub mod eligibility;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
@@ -106,6 +114,11 @@ pub mod handle;
 pub mod handle_typed;
 pub mod history_export;
 pub mod info;
+/// `cfg(loom)` synchronization-primitive shim (std under normal builds).
+///
+/// Contained to the modules that opt into loom model checking; see
+/// `docs/testing/loom.md`. Internal — not part of the public API.
+mod loom_sync;
 /// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
 ///
 /// Bridges every `record_*` call to the global [`metrics`] registry so
@@ -326,9 +339,14 @@ pub use reset::{
     WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
-pub use retention::{ArchiverFuture, HistoryArchiver, RetentionConfig};
+pub use retention::{
+    ArchiverFuture, HistoryArchiver, LegalHoldOutcome, RetentionConfig, legal_hold_active,
+};
 #[cfg(feature = "db")]
-pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
+pub use retention::{
+    RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
+    set_legal_hold,
+};
 pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use schedule_decision::record_decision_graceful;

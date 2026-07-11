@@ -95,6 +95,18 @@ diesel::table! {
         /// effective set is still the union with any builder-wide defaults,
         /// resolved at enqueue time (not stored on this row).
         completion_callbacks -> Nullable<Jsonb>,
+        /// Wall-clock the per-execution legal hold was placed (issue #747).
+        /// NULL = no hold. A hold is ACTIVE when this is non-NULL and
+        /// `legal_hold_until` is NULL or in the future; an active hold exempts
+        /// this execution's history from retention deletion and PII erasure.
+        legal_hold_set_at -> Nullable<Timestamptz>,
+        /// Optional auto-expiry for the legal hold (issue #747). NULL =
+        /// indefinite; a past value means the hold is inactive again.
+        legal_hold_until -> Nullable<Timestamptz>,
+        /// Operator-supplied justification for the legal hold (issue #747).
+        legal_hold_reason -> Nullable<Text>,
+        /// Principal that placed the legal hold (issue #747, audit trail).
+        legal_hold_actor -> Nullable<Text>,
     }
 }
 

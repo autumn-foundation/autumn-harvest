@@ -155,7 +155,10 @@ const INIT_SQL: &str = concat!(
     // issue #606: harvest_sessions table + session_id column on
     // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
     // harvest_workers.
-    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql")
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
+    // issue #747: per-execution legal hold columns on harvest_workflow_executions.
+    include_str!("../../migrations/20260709000000_harvest_legal_hold/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -234,7 +237,13 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n",
     // issue #605: the modern start path's full-row insert touches
     // completion_callbacks even for a workflow with no configured callback.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n",
+    // issue #747: WorkflowExecution::as_select() (and thus the modern start
+    // path's read-back) references the four legal_hold_* columns.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

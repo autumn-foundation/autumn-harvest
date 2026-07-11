@@ -738,6 +738,13 @@ async fn start_harvest_runtime(
         built.set_audit_retention_days(days);
     }
 
+    // The resolved effective runtime configuration (issue #695) served by
+    // `GET /admin/config` is captured inside `PreparedHarvestRuntime::build`
+    // (in `HarvestRunner::start` below) and rides on the resulting
+    // `HarvestApiRuntime`, so it is populated on any deployment that installs
+    // that runtime — the plugin web-app path here and the standalone runner
+    // alike — without a separate `set_effective_config` call to remember.
+
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
