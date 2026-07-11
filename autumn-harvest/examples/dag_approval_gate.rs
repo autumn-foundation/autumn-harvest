@@ -203,7 +203,8 @@ mod tests {
     }
 
     /// AC2a: no approval arrives, the deadline fires, and a `FailRun` gate fails
-    /// the whole DAG run.
+    /// the whole DAG run — and the timer-first history replays deterministically
+    /// to that same FAILED outcome (never a non-determinism divergence).
     #[tokio::test]
     async fn missing_approval_fails_the_run() {
         let outcome = WorkflowTestEnv::new()
@@ -217,6 +218,26 @@ mod tests {
             outcome.result.is_err(),
             "a FailRun gate must fail the run when the SLA deadline fires first, got: {:?}",
             outcome.result
+        );
+
+        // The FailRun timeout is a deterministic outcome, not a bug: the
+        // timer-first history replays to the same clean WorkflowFailed on every
+        // pass, never a NonDeterminismDetected.
+        let report = WorkflowReplayer::new()
+            .register_fn(
+                "order_approval_pipeline",
+                __autumn_workflow_info_order_approval_pipeline().handler,
+            )
+            .replay_from_events(outcome.events().to_vec())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
+            "AC5: a FailRun timeout must replay to the same deterministic FAILED \
+             outcome, got: {report}"
+        );
+        assert!(
+            !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "the FailRun timeout must be a clean deterministic failure, got: {report}"
         );
     }
 

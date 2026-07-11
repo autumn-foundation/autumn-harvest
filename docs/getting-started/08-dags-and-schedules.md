@@ -431,6 +431,31 @@ in history wins on every replay. See `examples/dag_approval_gate.rs` for a
 complete, tested walkthrough (signal branch, timeout-fail, and
 timeout-escalate, each with a `WorkflowReplayer` self-check).
 
+### Edge traps
+
+- **A JSON `null` payload looks like a timeout.** Under a `Continue` gate the
+  timed-out output is `Value::Null`, so a downstream `.condition(|ups|
+  ups[0].is_null())` cannot distinguish a timeout from an *approval whose signal
+  body was literally `null`*. If your signal payload can legitimately be `null`,
+  branch on a field instead (e.g. `.condition(|ups| ups[0].get("approved") ==
+  Some(&serde_json::json!(true)))`), not on `.is_null()`.
+- **A `Continue` gate cannot feed `.map` directly.** The null timeout output is
+  not a JSON array, so `.map_activity(f).over(&gate)` fails at runtime with
+  `mapped upstream output is not a JSON array`. Guard the map behind a
+  `.condition(|ups| ups[0].is_array())` (or only map over gates whose signal
+  payload is always an array — an unbounded `signal_gate` or a `FailRun` gate,
+  which never emit the null sentinel).
+- **Independent gates in one level are serialized, not concurrent.** Level
+  isolation splits every gate into its own singleton execution level, so two
+  gates that Kahn-levelling would place together run *sequentially* (the first
+  gate resolves, then the second is reached) — they are **not** two overlapping
+  wait windows. Gate nodes do not model concurrent signal waits.
+- **Only `.upstream()` / `.condition()` / `.trigger_rule()` affect a gate.** A
+  gate dispatches no activity, so the activity-only chained setters
+  `.retry(...)`, `.start_to_close(...)`, `.queue(...)`, and
+  `.map_failure_policy(...)` are accepted by the fluent builder but **silently
+  ignored** on a gate node.
+
 ### MCP exposure
 
 A `#[dag(mcp)]` DAG that contains a gate keeps its `signal_{dag}` MCP tool, so

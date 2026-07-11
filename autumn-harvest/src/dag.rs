@@ -575,6 +575,23 @@ impl DagBuilder {
     /// [`GateTimeoutAction::Continue`] proceeds past the gate with a
     /// `Value::Null` output (so downstream nodes can branch on null-vs-payload
     /// via a `.condition(...)` / trigger rule).
+    ///
+    /// # Edge traps
+    ///
+    /// * Under `Continue` the timed-out output is `Value::Null`, so a
+    ///   `.condition(|ups| ups[0].is_null())` cannot tell a timeout apart from an
+    ///   *approval whose signal body was literally `null`* — branch on a field
+    ///   instead when a null payload is possible.
+    /// * A `Continue` gate cannot feed `.map_activity(...).over(&gate)` directly:
+    ///   the null output is not a JSON array (runtime error `mapped upstream
+    ///   output is not a JSON array`) — guard the map with a
+    ///   `.condition(|ups| ups[0].is_array())`.
+    /// * Independent gates that Kahn-levelling would co-locate run **serially**
+    ///   (level isolation splits each gate into its own singleton level), not as
+    ///   overlapping wait windows.
+    /// * A gate dispatches no activity, so `.retry()`, `.start_to_close()`,
+    ///   `.queue()`, and `.map_failure_policy()` are silently ignored on a gate;
+    ///   only `.upstream()`, `.condition()`, and `.trigger_rule()` apply.
     #[must_use]
     pub fn signal_gate_with_timeout(
         &mut self,
