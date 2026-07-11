@@ -757,10 +757,69 @@ fn relay_gate_block(
     })
 }
 
+/// Relay-time block: atomically DROP the outbox row and mark the existing fires
+/// row `admission_blocked`, on the source-shard connection (issue #618, F-round10).
+///
+/// Both the outbox row (keyed by `outbox_id`) and the fires row (keyed by
+/// `(source_exec_id, trigger_id)`) live on the source shard, so a single
+/// source-shard transaction keeps the durable audit record and the row removal
+/// consistent — there is no window where the outbox row is dropped but the fires
+/// row still reports a successful fire.
+///
+/// Returns the number of outbox rows deleted (>= 1 iff THIS relay path owned the
+/// row). The fires-row UPDATE is applied **only when the delete removed the row**,
+/// so a row already claimed by the sibling relay path (immediate xor scanner) is
+/// neither re-counted nor has its fires outcome clobbered — the DELETE gates both
+/// the count (in the caller) and the fires-row UPDATE, giving exactly-once
+/// block accounting and audit consistency across the two relay paths.
+#[cfg(feature = "db")]
+async fn relay_block_drop_outbox(
+    source_conn: &mut diesel_async::AsyncPgConnection,
+    outbox_id: Uuid,
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+) -> Result<usize, diesel::result::Error> {
+    use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use diesel::prelude::*;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    source_conn
+        .transaction(|tx| {
+            Box::pin(async move {
+                let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                    .filter(outbox_dsl::id.eq(outbox_id))
+                    .execute(tx)
+                    .await?;
+                // Only mark the fires row blocked when this path actually removed the
+                // outbox row; otherwise the sibling relay path already owns it (and may
+                // have started the target, leaving the fires row correctly `NULL`).
+                if deleted >= 1 {
+                    diesel::update(
+                        fires_dsl::harvest_completion_trigger_fires
+                            .filter(fires_dsl::source_exec_id.eq(source_exec_id))
+                            .filter(fires_dsl::trigger_id.eq(trigger_id)),
+                    )
+                    .set(fires_dsl::outcome.eq(Some("admission_blocked")))
+                    .execute(tx)
+                    .await?;
+                }
+                Ok(deleted)
+            })
+        })
+        .await
+}
+
 #[cfg(feature = "db")]
 #[derive(Debug, Clone)]
 pub struct DeferredTriggerStart {
     pub outbox_id: Uuid,
+    /// Source execution id — the fires-row key `(source_exec_id, trigger_id)` so a
+    /// relay-time block can mark the existing fires row `admission_blocked`
+    /// (issue #618, F-round10).
+    pub source_exec_id: Uuid,
+    /// Trigger id — the other half of the fires-row key.
+    pub trigger_id: Uuid,
     pub source_shard: crate::types::ShardId,
     pub target_shard: crate::types::ShardId,
     pub target_workflow_name: String,
@@ -853,20 +912,30 @@ impl DeferredTriggerStart {
                     .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
                     && let Ok(mut source_conn) = source_pool.get().await
                 {
-                    use diesel::prelude::*;
-                    use diesel_async::RunQueryDsl;
-                    let deleted =
-                        diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
-                            .filter(
-                                crate::schema::harvest_completion_trigger_outbox::dsl::id
-                                    .eq(self.outbox_id),
-                            )
-                            .execute(&mut source_conn)
-                            .await;
-                    if matches!(deleted, Ok(n) if n >= 1)
-                        && let Some(m) = crate::admission_gate::global_admission_metrics()
-                    {
-                        m.record_admission_blocked(scope_kind, &reason);
+                    // Atomically drop the outbox row and mark the fires row
+                    // `admission_blocked` (issue #618, F-round10) so the durable audit
+                    // never reports a fired target that was actually dropped. The block
+                    // count is gated on the delete removing the row (exactly-once vs
+                    // the scanner path).
+                    let dropped = relay_block_drop_outbox(
+                        &mut source_conn,
+                        self.outbox_id,
+                        self.source_exec_id,
+                        self.trigger_id,
+                    )
+                    .await;
+                    match dropped {
+                        Ok(n) if n >= 1 => {
+                            if let Some(m) = crate::admission_gate::global_admission_metrics() {
+                                m.record_admission_blocked(scope_kind, &reason);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            outbox_id = %self.outbox_id,
+                            "[completion_trigger] immediate relay-block drop failed; leaving the outbox row for the scanner"
+                        ),
                     }
                 }
                 return;
@@ -1479,6 +1548,8 @@ pub fn evaluate_triggers_for_execution<'a>(
 
                 deferred_starts.push(DeferredTriggerStart {
                     outbox_id: outbox_row.id,
+                    source_exec_id: exec_id.as_uuid(),
+                    trigger_id: trigger_db.id,
                     source_shard,
                     target_shard,
                     target_workflow_name: trigger_db.target_workflow_name.clone(),
@@ -1610,13 +1681,22 @@ pub async fn enforce_completion_triggers_outbox(
                 reason = %reason,
                 "[completion_trigger outbox] scanner relay blocked by an admission gate on the real target queue; dropping the outbox row"
             );
-            let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                .filter(outbox_dsl::id.eq(task.id))
-                .execute(conn)
-                .await;
+            // Atomically drop the outbox row and mark the fires row
+            // `admission_blocked` (issue #618, F-round10) so the durable audit never
+            // reports a fired target that was actually dropped. The block count is
+            // gated on the delete removing the row (exactly-once vs the immediate
+            // `spawn()` path).
+            let dropped =
+                relay_block_drop_outbox(conn, task.id, task.source_exec_id, task.trigger_id).await;
             processed_count += 1;
-            if matches!(deleted, Ok(n) if n >= 1) {
-                metrics.record_admission_blocked(scope_kind, &reason);
+            match dropped {
+                Ok(n) if n >= 1 => metrics.record_admission_blocked(scope_kind, &reason),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    outbox_id = %task.id,
+                    "[completion_trigger outbox] scanner relay-block drop failed; leaving the outbox row"
+                ),
             }
             continue;
         }

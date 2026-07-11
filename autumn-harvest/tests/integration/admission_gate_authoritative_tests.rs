@@ -1382,8 +1382,10 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
     pools.insert(ShardId::new(1), tgt_pool.clone());
     let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
 
-    // Insert the outbox row on the SOURCE shard; capture its id.
+    // Insert the outbox row on the SOURCE shard; capture its id + fires-row key.
     let outbox_id = Uuid::new_v4();
+    let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
+    let trigger_key_id = Uuid::new_v4();
     {
         let mut src_conn = src_pool.get().await.unwrap();
         diesel::sql_query(
@@ -1394,8 +1396,8 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
                      'default', '0'::jsonb, 1048576)",
         )
         .bind::<diesel::sql_types::Uuid, _>(outbox_id)
-        .bind::<diesel::sql_types::Uuid, _>(ExecutionId::new_for_shard(ShardId::new(0)).as_uuid())
-        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
         .execute(&mut src_conn)
         .await
         .expect("insert outbox row");
@@ -1410,6 +1412,8 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
     // Fire the IMMEDIATE relay (fire-and-forget).
     let deferred = autumn_harvest::completion_trigger::DeferredTriggerStart {
         outbox_id,
+        source_exec_id: src_exec_id,
+        trigger_id: trigger_key_id,
         source_shard: ShardId::new(0),
         target_shard: ShardId::new(1),
         target_workflow_name: "ag_target_wf".to_string(),
@@ -1578,10 +1582,25 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
         .expect("insert default-shard schedule");
     }
 
-    // SOURCE shard: the outbox row (NULL queue → relay resolves 'real-q').
+    // SOURCE shard: the outbox row (NULL queue → relay resolves 'real-q') PLUS the
+    // fires row inserted at inline evaluate time with outcome NULL (= "fired"). The
+    // relay-time block must UPDATE this fires row to 'admission_blocked' so the
+    // durable audit does not wrongly report a successful fire (issue #618, F-round10).
     let outbox_id = Uuid::new_v4();
+    let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
+    let trigger_key_id = Uuid::new_v4();
     {
         let mut src_conn = src_pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_fires
+                (source_exec_id, trigger_id, fired_at, outcome)
+             VALUES ($1, $2, NOW(), NULL)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+        .execute(&mut src_conn)
+        .await
+        .expect("insert fires row (outcome NULL = fired)");
         diesel::sql_query(
             "INSERT INTO harvest_completion_trigger_outbox
                 (id, source_exec_id, trigger_id, target_shard, target_workflow_name,
@@ -1590,8 +1609,8 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
                      '0'::jsonb, 1048576)",
         )
         .bind::<diesel::sql_types::Uuid, _>(outbox_id)
-        .bind::<diesel::sql_types::Uuid, _>(ExecutionId::new_for_shard(ShardId::new(0)).as_uuid())
-        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
         .execute(&mut src_conn)
         .await
         .expect("insert outbox row");
@@ -1607,6 +1626,8 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
     // Fire the immediate relay with NO explicit queue → it resolves 'real-q'.
     let deferred = autumn_harvest::completion_trigger::DeferredTriggerStart {
         outbox_id,
+        source_exec_id: src_exec_id,
+        trigger_id: trigger_key_id,
         source_shard: ShardId::new(0),
         target_shard: ShardId::new(1),
         target_workflow_name: "ag_target_wf".to_string(),
@@ -1663,6 +1684,19 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
             .await
             .expect("count outbox")
             .n;
+    // The fires row's outcome must have been flipped to 'admission_blocked' by the
+    // relay-time block (issue #618, F-round10) — atomically with dropping the outbox
+    // row. It was inserted with NULL (= fired); a NULL here would be a wrong audit.
+    let fires_outcome: Option<String> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires
+         WHERE source_exec_id = $1 AND trigger_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+    .get_result::<OutcomeRow>(&mut src_pool.get().await.unwrap())
+    .await
+    .expect("read fires outcome")
+    .outcome;
 
     set_global_admission_gate_cache(None);
     set_global_admission_metrics(None);
@@ -1708,5 +1742,127 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
     assert!(
         recorder.bypassed().is_empty(),
         "a blocked relay must NOT also count a bypass"
+    );
+    assert_eq!(
+        fires_outcome.as_deref(),
+        Some("admission_blocked"),
+        "the relay-time block must flip the fires row from NULL (fired) to \
+         'admission_blocked' so the durable audit matches what actually happened"
+    );
+}
+
+/// Issue #618, F-round10: the SCANNER relay-block path
+/// (`enforce_completion_triggers_outbox`) must, like the immediate `spawn()` path,
+/// flip the existing fires row from NULL (= fired) to `admission_blocked` when it
+/// drops the outbox row under an active gate — atomically with the delete — so the
+/// durable audit never reports a fired target that was actually dropped. Confirmed
+/// red first: before F-round10 the scanner deleted the outbox row but left the
+/// fires row NULL.
+#[tokio::test]
+async fn scanner_relay_block_marks_fires_row_admission_blocked() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    // A Fleet gate raised AFTER the outbox + fires rows were written (the classic
+    // "gate raised while the relay is in flight" race).
+    let cache = fleet_cache("scanner-block-incident");
+    set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+
+    let metrics = CapturingMetrics::default();
+    let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
+
+    let trigger_id = Uuid::new_v4();
+    insert_trigger(&mut conn, trigger_id).await;
+    let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
+
+    // Inline evaluate wrote both rows on the source shard: the fires row (outcome
+    // NULL = fired) and the outbox row keyed by the same (source_exec_id, trigger_id).
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires
+            (source_exec_id, trigger_id, fired_at, outcome)
+         VALUES ($1, $2, NOW(), NULL)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox
+            (source_exec_id, trigger_id, target_shard, target_workflow_name,
+             target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes)
+         VALUES ($1, $2, 0, 'ag_target_wf', 'ct-scanner-block', '{}'::jsonb, 'default',
+                 '0'::jsonb, 1048576)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let sharded = ShardedDbPool::single(pool.clone());
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut conn,
+        metrics_ref,
+        &Some(sharded),
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+
+    set_global_admission_gate_cache(None);
+
+    // The scanner processed the row (dropped it) — a BLOCK, not a bypass.
+    assert_eq!(
+        relayed, 1,
+        "the scanner processes the row (blocked + dropped)"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "the blocked scanner relay must NOT start the target"
+    );
+    let outbox_remaining: i64 =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_outbox")
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .unwrap()
+            .n;
+    assert_eq!(
+        outbox_remaining, 0,
+        "the blocked scanner relay dropped the outbox row"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the scanner block is counted exactly once"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert!(
+        metrics.bypassed().is_empty(),
+        "a blocked scanner relay must NOT also count a bypass"
+    );
+    let fires_outcome: Option<String> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires
+         WHERE source_exec_id = $1 AND trigger_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .get_result::<OutcomeRow>(&mut conn)
+    .await
+    .expect("read fires outcome")
+    .outcome;
+    assert_eq!(
+        fires_outcome.as_deref(),
+        Some("admission_blocked"),
+        "the scanner relay-time block must flip the fires row from NULL (fired) to \
+         'admission_blocked' — atomically with dropping the outbox row"
     );
 }
