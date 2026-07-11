@@ -1867,6 +1867,235 @@ async fn scanner_relay_block_marks_fires_row_admission_blocked() {
     );
 }
 
+/// Issue #618, F-round13: an existence race mirroring F-round12, for the
+/// completion-trigger cross-shard relay. A STALE outbox row — the immediate
+/// `spawn()` relay started the target on the target shard but then failed to
+/// delete the source outbox row — is retried by the scanner. If an admission gate
+/// is raised in the meantime, the pre-F-round13 relay-time block branch would drop
+/// the row, mark the fires row `admission_blocked`, and count a block WITHOUT
+/// checking that the target ALREADY exists — reporting a successfully-started
+/// target as dropped by the gate.
+///
+/// After F-round13 the relay routes through `gate_checked_start_or_load`, which
+/// locks the target's existence on the target shard: the locked-live target →
+/// `Started { created: false }` → DELIVERED (delete outbox + count bypass), NOT
+/// blocked. The fires row stays NULL (a real fire), no block is counted, and no
+/// second target run is created.
+///
+/// Two-DB multi-shard (source shard 0 owns the outbox row; target shard 1 owns the
+/// already-started run). Confirmed red first: against pre-F-round13 code the
+/// scanner blocks the stale row (target reported dropped) instead of delivering it.
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
+    use diesel_async::SimpleAsyncConnection;
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base_url, _c) = setup_db().await;
+
+    // source shard 0 (owns the outbox + fires rows), target shard 1 (already has
+    // the started run).
+    let s0_name = format!("ag618_stsrc_{}", Uuid::new_v4().simple());
+    let s1_name = format!("ag618_sttgt_{}", Uuid::new_v4().simple());
+    {
+        let base_pool = build_pool(&base_url);
+        let mut admin = base_pool.get().await.unwrap();
+        for name in [&s0_name, &s1_name] {
+            diesel::sql_query(format!("CREATE DATABASE {name}"))
+                .execute(&mut admin)
+                .await
+                .expect("create shard db");
+        }
+    }
+    let s0_url = swap_db_name(&base_url, &s0_name);
+    let s1_url = swap_db_name(&base_url, &s1_name);
+    for u in [&s0_url, &s1_url] {
+        let p = build_pool(u);
+        let mut c = p.get().await.unwrap();
+        c.batch_execute(INIT_SQL)
+            .await
+            .expect("migrate fresh shard db");
+    }
+
+    let src_pool = build_pool(&s0_url);
+    let tgt_pool = build_pool(&s1_url);
+    install_global_router(ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    ));
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), src_pool.clone());
+    pools.insert(ShardId::new(1), tgt_pool.clone());
+    let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // The target ALREADY exists on shard 1 (a live RUNNING run) — as if the
+    // immediate relay started it but failed to delete the source outbox row.
+    {
+        let mut tgt_conn = tgt_pool.get().await.unwrap();
+        start_or_load_workflow_execution(
+            &mut tgt_conn,
+            StartWorkflowParams {
+                workflow_name: "ag_target_wf",
+                workflow_id: "ct-stale-delivered",
+                exec_id: ExecutionId::new_for_shard(ShardId::new(1)),
+                input: json!({}),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: autumn_harvest::types::Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+            },
+        )
+        .await
+        .expect("pre-create the already-started target run");
+    }
+
+    // The stale outbox row + its fires row (outcome NULL = fired) on the SOURCE.
+    let outbox_id = Uuid::new_v4();
+    let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
+    let trigger_key_id = Uuid::new_v4();
+    {
+        let mut src_conn = src_pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_fires
+                (source_exec_id, trigger_id, fired_at, outcome)
+             VALUES ($1, $2, NOW(), NULL)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+        .execute(&mut src_conn)
+        .await
+        .expect("insert fires row");
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_outbox
+                (id, source_exec_id, trigger_id, target_shard, target_workflow_name,
+                 target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes)
+             VALUES ($1, $2, $3, 1, 'ag_target_wf', 'ct-stale-delivered', '{}'::jsonb,
+                     'default', '0'::jsonb, 1048576)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+        .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+        .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+        .execute(&mut src_conn)
+        .await
+        .expect("insert stale outbox row");
+    }
+
+    // A Fleet gate that WOULD block a fresh start — raised while the stale row was
+    // waiting to be retried.
+    let cache = fleet_cache("stale-delivered-incident");
+    set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+
+    let recorder = Arc::new(CapturingMetrics::default());
+    let scanner_metrics: &(dyn MetricsRecorder + Send + Sync) = &*recorder;
+    // The scanner reads the outbox on the SOURCE shard's connection and filters by
+    // `target_shard IN assignments`; the stale row targets shard 1, so the worker
+    // assignments must include shard 1 for it to be picked up.
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut src_pool.get().await.unwrap(),
+        scanner_metrics,
+        &Some(sharded.clone()),
+        &[ShardId::new(1)],
+    )
+    .await
+    .unwrap();
+
+    // Read final state before tearing down.
+    let target_count: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = 'ag_target_wf'",
+    )
+    .get_result::<CountRow>(&mut tgt_pool.get().await.unwrap())
+    .await
+    .expect("count target")
+    .n;
+    let outbox_remaining: i64 =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_outbox")
+            .get_result::<CountRow>(&mut src_pool.get().await.unwrap())
+            .await
+            .expect("count outbox")
+            .n;
+    let fires_outcome: Option<String> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires
+         WHERE source_exec_id = $1 AND trigger_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+    .get_result::<OutcomeRow>(&mut src_pool.get().await.unwrap())
+    .await
+    .expect("read fires outcome")
+    .outcome;
+
+    // Cleanup globals + drop the per-shard databases.
+    set_global_admission_gate_cache(None);
+    install_global_router(ShardRouter::default());
+    let _ = ShardedDbPool::single(build_pool(&base_url));
+    drop(sharded);
+    drop(src_pool);
+    drop(tgt_pool);
+    {
+        let base_pool = build_pool(&base_url);
+        if let Ok(mut admin) = base_pool.get().await {
+            for name in [&s0_name, &s1_name] {
+                let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&mut admin)
+                    .await;
+            }
+        }
+    }
+
+    assert_eq!(
+        relayed, 1,
+        "the scanner processes the stale row (delivered + dropped)"
+    );
+    assert_eq!(
+        target_count, 1,
+        "the target already existed and must NOT be started a second time"
+    );
+    assert_eq!(
+        outbox_remaining, 0,
+        "the delivered stale row's outbox row is dropped on the source shard"
+    );
+    assert!(
+        recorder.blocked().is_empty(),
+        "a stale row whose target ALREADY exists must NOT be counted as a block"
+    );
+    assert_eq!(
+        recorder.bypassed(),
+        vec!["completion_trigger_outbox".to_string()],
+        "a delivered stale row counts the completion_trigger_outbox bypass exactly once"
+    );
+    assert_eq!(
+        fires_outcome, None,
+        "a delivered stale row leaves the fires row a real fire (NULL), never \
+         'admission_blocked'"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // F-round12: gate_checked_start_or_load — close the webhook idempotent-retry
 // TOCTOU (an existing run sealing between an unlocked existence check and the

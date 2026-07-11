@@ -726,37 +726,6 @@ pub async fn resolve_cross_shard_target_queue(
     default_workflow_queue()
 }
 
-/// Relay-time AUTHORITATIVE admission-gate check for a cross-shard
-/// completion-trigger start (issue #618, F-round7).
-///
-/// Called at BOTH relay points (`DeferredTriggerStart::spawn()` and the scanner
-/// `enforce_completion_triggers_outbox`) once the REAL target queue has been
-/// resolved on the target shard, immediately before starting the workflow. This
-/// is the authoritative gate check: the source-side inline check in
-/// `evaluate_triggers_for_execution` is only a best-effort fast path (it cannot
-/// always resolve the target's schedule-level queue override — e.g. when the
-/// target pool is transiently unavailable it falls back to the default queue and
-/// could miss a `Queue(real-q)` gate). Returns `Some((reason, scope_kind))` when
-/// a gate blocks the start on the real resolved queue, else `None`.
-///
-/// Uses `check_cached` (the last-known snapshot, honoured even under a transient
-/// fail-closed blip, never the sentinel) — NOT `check()` — because the relay
-/// materializes pre-committed in-flight-continuation work, so the same
-/// no-permanent-drop rationale as the completion-trigger inline path applies.
-#[cfg(feature = "db")]
-fn relay_gate_block(
-    workflow_name: &str,
-    resolved_queue: &str,
-    target_shard: crate::types::ShardId,
-    owner: Option<&str>,
-) -> Option<(String, &'static str)> {
-    crate::admission_gate::global_admission_gate_cache().and_then(|cache| {
-        cache
-            .check_cached(workflow_name, resolved_queue, target_shard.as_i32(), owner)
-            .map(|(_id, reason, scope_kind)| (reason, scope_kind))
-    })
-}
-
 /// Relay-time block: atomically DROP the outbox row and mark the existing fires
 /// row `admission_blocked`, on the source-shard connection (issue #618, F-round10).
 ///
@@ -808,6 +777,110 @@ async fn relay_block_drop_outbox(
             })
         })
         .await
+}
+
+/// Run the cross-shard completion-trigger relay's start/block decision through the
+/// existence-aware round-12 [`crate::execution::gate_checked_start_or_load`]
+/// primitive (issue #618, F-round13), then apply the source-shard bookkeeping.
+///
+/// Closes the stale-row existence race: a row whose deterministic target execution
+/// ALREADY exists (the immediate relay started the target but then FAILED to delete
+/// the source outbox row, and the scanner retries it under a now-active gate) must
+/// be treated as DELIVERED — not blocked. `gate_checked_start_or_load` locks the
+/// target's existence through the gate/start decision on the target shard:
+///
+/// - target already exists (`Started { created: false }`) → DELIVERED: delete the
+///   source outbox row + count the `completion_trigger_outbox` bypass, leaving the
+///   fires row `NULL`/fired. NOT blocked, NOT marked `admission_blocked`.
+/// - fresh + matching gate (`Blocked`) → [`relay_block_drop_outbox`] on the source
+///   shard (delete outbox row + mark fires `admission_blocked`) + count the block.
+/// - fresh + no gate (`Started { created: true }`) → delete outbox + count bypass.
+///
+/// Two-shard split: `gate_checked_start_or_load` handles the target-shard
+/// existence-lock + gate + start atomically; the source outbox delete (+ fires mark
+/// on block) is on the SOURCE shard. Exactly-once: the block XOR bypass count is
+/// gated on the source-shard delete actually removing the row.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+async fn relay_gate_checked_start(
+    target_conn: &mut diesel_async::AsyncPgConnection,
+    source_conn: &mut diesel_async::AsyncPgConnection,
+    params: crate::execution::StartWorkflowParams<'_>,
+    gate_workflow_name: String,
+    gate_resolved_queue: String,
+    gate_owner: Option<String>,
+    target_shard: crate::types::ShardId,
+    outbox_id: Uuid,
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> crate::error::HarvestResult<()> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    // The relay-time gate decision, existence-aware: a LOCKED live target already
+    // exists → this is a delivery/idempotent-load, NOT a fresh admission → skip the
+    // gate; else re-check the gate on the real resolved queue. Uses `check_cached`
+    // (the last-known snapshot, honoured even under a transient fail-closed blip,
+    // never the sentinel) — NOT `check()` — because the relay materializes
+    // pre-committed in-flight-continuation work, so the same no-permanent-drop
+    // rationale as the completion-trigger inline path applies.
+    let gate = move |locked_live: bool| -> Option<(String, &'static str)> {
+        if locked_live {
+            return None;
+        }
+        crate::admission_gate::global_admission_gate_cache().and_then(|cache| {
+            cache
+                .check_cached(
+                    &gate_workflow_name,
+                    &gate_resolved_queue,
+                    target_shard.as_i32(),
+                    gate_owner.as_deref(),
+                )
+                .map(|(_id, reason, scope_kind)| (reason, scope_kind))
+        })
+    };
+
+    match crate::execution::gate_checked_start_or_load(target_conn, params, metrics, gate).await? {
+        crate::execution::GateCheckedStart::Blocked { reason, scope_kind } => {
+            tracing::info!(
+                scope_kind,
+                reason = %reason,
+                "[completion_trigger] cross-shard relay blocked by an admission gate on the real target queue; dropping the outbox row"
+            );
+            match relay_block_drop_outbox(source_conn, outbox_id, source_exec_id, trigger_id).await
+            {
+                Ok(n) if n >= 1 => {
+                    if let Some(m) = metrics {
+                        m.record_admission_blocked(scope_kind, &reason);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    outbox_id = %outbox_id,
+                    "[completion_trigger] relay-block drop failed; leaving the outbox row"
+                ),
+            }
+        }
+        crate::execution::GateCheckedStart::Started(_started) => {
+            // Fresh start OR the target already exists (stale-row delivered / attach):
+            // either way the target IS started, so this is a DELIVERY — delete the
+            // source outbox row and count the bypass (never a block). Fires stays NULL.
+            let deleted = diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
+                .filter(crate::schema::harvest_completion_trigger_outbox::dsl::id.eq(outbox_id))
+                .execute(source_conn)
+                .await;
+            if matches!(deleted, Ok(n) if n >= 1)
+                && let Some(m) = metrics
+            {
+                m.record_admission_bypassed(
+                    crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "db")]
@@ -884,151 +957,100 @@ impl DeferredTriggerStart {
                 .await
             };
 
-            // Relay-time AUTHORITATIVE gate check (issue #618, F-round7): the real
-            // target queue is now known. If a gate matches on it, DROP the outbox
-            // row and record the block (completion-trigger "block = drop"), and do
-            // NOT start — the authoritative safety net regardless of what the
-            // source-side inline approximation resolved. Exactly-once: the block
-            // count is gated on the delete actually removing the row, so the
-            // scanner can never re-process a dropped row (and a row is EITHER
-            // blocked OR bypass-counted, never both).
-            if let Some((reason, scope_kind)) = relay_gate_block(
-                &self.target_workflow_name,
-                &queue_name,
-                self.target_shard,
-                self.owner.as_deref(),
-            ) {
-                tracing::info!(
-                    target_workflow = %self.target_workflow_name,
-                    queue = %queue_name,
-                    scope_kind,
-                    reason = %reason,
-                    "[completion_trigger] immediate cross-shard relay blocked by an admission gate on the real target queue; dropping the outbox row"
+            // Existence-aware relay-time start/block via the round-12
+            // `gate_checked_start_or_load` (issue #618, F-round13): the target-shard
+            // existence-lock + gate + start are atomic, so a stale outbox row whose
+            // target ALREADY exists (this relay started the target but then failed to
+            // delete the source outbox row) is treated as DELIVERED on retry rather
+            // than wrongly blocked. Uses the process-global recorder (spawn has no
+            // explicit metrics param), mirroring the scanner path.
+            let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
+                .read()
+                .ok()
+                .and_then(|p| p.clone())
+                .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
+            else {
+                tracing::error!(
+                    "[completion_trigger] GLOBAL_SHARDED_POOL missing source shard {:?}; leaving the outbox row for the scanner",
+                    self.source_shard
                 );
-                if let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
-                    .read()
-                    .ok()
-                    .and_then(|p| p.clone())
-                    .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
-                    && let Ok(mut source_conn) = source_pool.get().await
-                {
-                    // Atomically drop the outbox row and mark the fires row
-                    // `admission_blocked` (issue #618, F-round10) so the durable audit
-                    // never reports a fired target that was actually dropped. The block
-                    // count is gated on the delete removing the row (exactly-once vs
-                    // the scanner path).
-                    let dropped = relay_block_drop_outbox(
-                        &mut source_conn,
-                        self.outbox_id,
-                        self.source_exec_id,
-                        self.trigger_id,
-                    )
-                    .await;
-                    match dropped {
-                        Ok(n) if n >= 1 => {
-                            if let Some(m) = crate::admission_gate::global_admission_metrics() {
-                                m.record_admission_blocked(scope_kind, &reason);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            outbox_id = %self.outbox_id,
-                            "[completion_trigger] immediate relay-block drop failed; leaving the outbox row for the scanner"
-                        ),
-                    }
-                }
                 return;
-            }
-
-            let start_res = crate::execution::start_or_load_workflow_execution(
-                &mut target_conn,
-                crate::execution::StartWorkflowParams {
-                    workflow_name: &self.target_workflow_name,
-                    workflow_id: &self.target_workflow_id,
-                    exec_id: crate::types::ExecutionId::new_for_shard(self.target_shard),
-                    input: self.target_input,
-                    parent_id: None,
-                    queue_name: &queue_name,
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: None,
-                    reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                    trace_context: None,
-                    max_execution_timeout_ceiling: None,
-                    concurrency_key: self.concurrency_key,
-                    concurrency_limit: self.concurrency_limit,
-                    priority: self.priority,
-                    max_workflow_input_bytes: self.max_workflow_input_bytes,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner: self.owner.as_deref(),
-                    runbook_url: self.runbook_url.as_deref(),
-                    severity: self.severity.as_deref(),
-                    context_headers: None,
-                    sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: self.retry_policy.clone(),
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
-                    origin: None,
-                    completion_callbacks: None,
-                },
-            )
-            .await;
-            match start_res {
-                Ok(_) => {
-                    // Delete task from outbox on successful start, and count the
-                    // IMMEDIATE-relay bypass here (issue #618, F-round6). The
-                    // immediate `spawn()` is the COMMON successful cross-shard
-                    // path — counting only in the scanner
-                    // (`enforce_completion_triggers_outbox`) left it uncounted,
-                    // breaking the "zero un-counted bypass" contract when a gate
-                    // is raised after the source commit but before this relay.
-                    // Exactly-once: the count is gated on the delete actually
-                    // removing the row (`Ok(n) if n >= 1`), so the scanner can
-                    // never re-process and re-count the same relay. If the start
-                    // failed (Err arm) or the delete did not remove the row, this
-                    // path does NOT count — the row persists and the scanner
-                    // counts it once instead. Uses the process-global recorder
-                    // (spawn has no explicit metrics param), mirroring the
-                    // scanner's `record_admission_bypassed(CompletionTriggerOutbox)`.
-                    if let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
-                        .read()
-                        .ok()
-                        .and_then(|p| p.clone())
-                        .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
-                        && let Ok(mut source_conn) = source_pool.get().await
-                    {
-                        use diesel::prelude::*;
-                        use diesel_async::RunQueryDsl;
-                        let deleted =
-                            diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
-                                .filter(
-                                    crate::schema::harvest_completion_trigger_outbox::dsl::id
-                                        .eq(self.outbox_id),
-                                )
-                                .execute(&mut source_conn)
-                                .await;
-                        if matches!(deleted, Ok(n) if n >= 1)
-                            && let Some(m) = crate::admission_gate::global_admission_metrics()
-                        {
-                            m.record_admission_bypassed(
-                                crate::admission_gate::StartProducer::CompletionTriggerOutbox
-                                    .as_str(),
-                            );
-                        }
-                    }
-                }
+            };
+            let mut source_conn = match source_pool.get().await {
+                Ok(c) => c,
                 Err(e) => {
                     tracing::error!(
-                        "[completion_trigger] Failed to start workflow execution cross-shard: {:?}",
+                        "[completion_trigger] Failed to get source-shard connection: {:?}; leaving the outbox row for the scanner",
                         e
                     );
+                    return;
                 }
+            };
+
+            let global_metrics = crate::admission_gate::global_admission_metrics();
+            let metrics_ref = global_metrics
+                .as_ref()
+                .map(|m| m.as_ref() as &(dyn crate::telemetry::MetricsRecorder + Send + Sync));
+
+            let gate_workflow_name = self.target_workflow_name.clone();
+            let gate_resolved_queue = queue_name.clone();
+            let gate_owner = self.owner.clone();
+            let params = crate::execution::StartWorkflowParams {
+                workflow_name: &self.target_workflow_name,
+                workflow_id: &self.target_workflow_id,
+                exec_id: crate::types::ExecutionId::new_for_shard(self.target_shard),
+                input: self.target_input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: self.concurrency_key,
+                concurrency_limit: self.concurrency_limit,
+                priority: self.priority,
+                max_workflow_input_bytes: self.max_workflow_input_bytes,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: self.owner.as_deref(),
+                runbook_url: self.runbook_url.as_deref(),
+                severity: self.severity.as_deref(),
+                context_headers: None,
+                sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: self.retry_policy.clone(),
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
+                origin: None,
+                completion_callbacks: None,
+            };
+
+            if let Err(e) = relay_gate_checked_start(
+                &mut target_conn,
+                &mut source_conn,
+                params,
+                gate_workflow_name,
+                gate_resolved_queue,
+                gate_owner,
+                self.target_shard,
+                self.outbox_id,
+                self.source_exec_id,
+                self.trigger_id,
+                metrics_ref,
+            )
+            .await
+            {
+                // A start error (e.g. PayloadTooLarge) leaves the outbox row for the
+                // scanner to handle (which deletes an oversized-payload row).
+                tracing::error!(
+                    "[completion_trigger] Failed to start workflow execution cross-shard: {:?}",
+                    e
+                );
             }
         });
     }
@@ -1663,111 +1685,76 @@ pub async fn enforce_completion_triggers_outbox(
             .ok()
             .and_then(|g| *g);
 
-        // Relay-time AUTHORITATIVE gate check (issue #618, F-round7): identical to
-        // the immediate `spawn()` relay. If a gate matches on the real resolved
-        // queue, DROP the outbox row and record the block; do NOT start. Gated on
-        // the delete for exactly-once (a row is EITHER blocked OR bypass-counted,
-        // never both).
-        if let Some((reason, scope_kind)) = relay_gate_block(
-            &task.target_workflow_name,
-            &queue_name,
-            target_shard,
-            target_owner.as_deref(),
-        ) {
-            tracing::info!(
-                target_workflow = %task.target_workflow_name,
-                queue = %queue_name,
-                scope_kind,
-                reason = %reason,
-                "[completion_trigger outbox] scanner relay blocked by an admission gate on the real target queue; dropping the outbox row"
-            );
-            // Atomically drop the outbox row and mark the fires row
-            // `admission_blocked` (issue #618, F-round10) so the durable audit never
-            // reports a fired target that was actually dropped. The block count is
-            // gated on the delete removing the row (exactly-once vs the immediate
-            // `spawn()` path).
-            let dropped =
-                relay_block_drop_outbox(conn, task.id, task.source_exec_id, task.trigger_id).await;
-            processed_count += 1;
-            match dropped {
-                Ok(n) if n >= 1 => metrics.record_admission_blocked(scope_kind, &reason),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    outbox_id = %task.id,
-                    "[completion_trigger outbox] scanner relay-block drop failed; leaving the outbox row"
-                ),
-            }
-            continue;
-        }
+        let gate_workflow_name = task.target_workflow_name.clone();
+        let gate_resolved_queue = queue_name.clone();
+        let gate_owner = target_owner.clone();
+        let params = crate::execution::StartWorkflowParams {
+            workflow_name: &task.target_workflow_name,
+            workflow_id: &task.target_workflow_id,
+            exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
+            input: task.target_input,
+            parent_id: None,
+            queue_name: &queue_name,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: task.concurrency_key,
+            concurrency_limit: task
+                .concurrency_limit
+                .map(|l| u32::try_from(l).unwrap_or(0)),
+            priority,
+            max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: target_owner.as_deref(),
+            runbook_url: target_runbook_url.as_deref(),
+            severity: target_severity.as_deref(),
+            context_headers: None,
+            sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: target_retry_policy,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling,
+            // Completion-trigger start is not a schedule fire (issue #534).
+            origin: None,
+            // Internal start: only builder-wide default callback targets apply
+            // (issue #605); a completion-trigger target has no per-execution
+            // callback option of its own.
+            completion_callbacks: None,
+        };
 
-        let start_res = crate::execution::start_or_load_workflow_execution(
+        // Existence-aware relay-time start/block via `gate_checked_start_or_load`
+        // (issue #618, F-round13): identical to the immediate `spawn()` relay, and
+        // now robust to a STALE outbox row whose target ALREADY exists (the
+        // immediate relay started the target but then failed to delete the source
+        // row). On this retry the locked-live target is treated as DELIVERED (delete
+        // outbox + count bypass), never wrongly blocked/dropped. A fresh target with
+        // a matching gate is blocked (drop outbox + mark fires `admission_blocked` +
+        // count block); a fresh target with no gate is a counted bypass. All gated on
+        // the source-shard delete for exactly-once vs the immediate relay. `conn` is
+        // the source shard.
+        match relay_gate_checked_start(
             &mut target_conn,
-            crate::execution::StartWorkflowParams {
-                workflow_name: &task.target_workflow_name,
-                workflow_id: &task.target_workflow_id,
-                exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
-                input: task.target_input,
-                parent_id: None,
-                queue_name: &queue_name,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                trace_context: None,
-                max_execution_timeout_ceiling: None,
-                concurrency_key: task.concurrency_key,
-                concurrency_limit: task
-                    .concurrency_limit
-                    .map(|l| u32::try_from(l).unwrap_or(0)),
-                priority,
-                max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
-                owner: target_owner.as_deref(),
-                runbook_url: target_runbook_url.as_deref(),
-                severity: target_severity.as_deref(),
-                context_headers: None,
-                sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: target_retry_policy,
-                retry_of_exec_id: None,
-                max_workflow_attempts_ceiling,
-                // Completion-trigger start is not a schedule fire (issue #534).
-                origin: None,
-                // Internal start: only builder-wide default callback targets
-                // apply (issue #605); a completion-trigger target has no
-                // per-execution callback option of its own.
-                completion_callbacks: None,
-            },
+            conn,
+            params,
+            gate_workflow_name,
+            gate_resolved_queue,
+            gate_owner,
+            target_shard,
+            task.id,
+            task.source_exec_id,
+            task.trigger_id,
+            Some(metrics),
         )
-        .await;
-
-        match start_res {
-            Ok(_) => {
-                // Delete task from outbox on successful start.
-                let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                    .filter(outbox_dsl::id.eq(task.id))
-                    .execute(conn)
-                    .await;
-                processed_count += 1;
-                // issue #618: the cross-shard completion-trigger relay is
-                // EXEMPT-BY-DESIGN when no gate matches the real queue (the
-                // relay-time block above is authoritative). Count the bypass so an
-                // operator sees it never slips a gate raised after the row was
-                // persisted. Gated on the delete actually removing the row so the
-                // immediate `spawn()` relay can never also count the same row
-                // (exactly-once across the two relay paths). See
-                // `admission_gate::producer_contract`.
-                if matches!(deleted, Ok(n) if n >= 1) {
-                    metrics.record_admission_bypassed(
-                        crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
-                    );
-                }
-            }
+        .await
+        {
+            Ok(()) => processed_count += 1,
             Err(crate::error::HarvestError::PayloadTooLarge {
                 kind,
                 observed_bytes,
