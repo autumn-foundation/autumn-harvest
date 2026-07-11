@@ -3158,3 +3158,149 @@ async fn gate_skips_allow_duplicate_attach_to_a_completed_prior() {
     // Still exactly one execution (the COMPLETED prior) — no fresh run created.
     assert_eq!(target_exec_count(&mut conn).await, 1);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-round19: the immediate spawn() relay and the scanner (and multi-replica
+// scanners) must be MUTUALLY EXCLUSIVE on a source outbox row. Without a claim
+// they could reach DIVERGENT decisions about the same row — one starts the target,
+// the other (under a just-raised gate, the first's target start not yet visible)
+// blocks it — durably recording an `admission_blocked` fire for a target that ran.
+// The fix claims the source row FOR UPDATE SKIP LOCKED, held across the whole relay.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Deterministic race reproduction with the repo's lock-holding harness: a holder
+/// connection holds `FOR UPDATE` on the source outbox row (simulating the immediate
+/// relay having CLAIMED it and being mid-flight starting the target). Under a
+/// newly-raised Fleet gate, the scanner must SKIP the claimed row — NOT block it and
+/// NOT mark the fires row `admission_blocked`.
+///
+/// Pre-fix (RED): the scanner reads the row with a plain SELECT (no claim), decides
+/// `Blocked`, and its DELETE hangs on the holder's `FOR UPDATE` lock → the scanner
+/// never completes (the bounded timeout fires). Fixed (GREEN): the scanner's own
+/// `FOR UPDATE SKIP LOCKED` claim skips the held row immediately → completes, with no
+/// block counted, the fires row left NULL, and the outbox row still present (owned by
+/// the concurrent relay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[allow(clippy::too_many_lines)]
+async fn scanner_skips_a_source_row_claimed_by_a_concurrent_relay() {
+    use diesel_async::SimpleAsyncConnection;
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    // A pending source outbox row (target shard 0) + its fires row (NULL = fired).
+    let outbox_id = Uuid::new_v4();
+    let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
+    let trigger_key_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires
+            (source_exec_id, trigger_id, fired_at, outcome)
+         VALUES ($1, $2, NOW(), NULL)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox
+            (id, source_exec_id, trigger_id, target_shard, target_workflow_name,
+             target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes)
+         VALUES ($1, $2, $3, 0, 'ag_target_wf', 'ct-claimed-race', '{}'::jsonb,
+                 'default', '0'::jsonb, 1048576)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // A Fleet gate that WOULD block a fresh start.
+    set_global_admission_gate_cache(Some(fleet_cache("claimed-race-incident")));
+
+    // Holder: claim the source outbox row FOR UPDATE (the concurrent relay owns it,
+    // mid-flight). The scanner must SKIP it (SKIP LOCKED), never block it.
+    let mut holder = pool.get().await.unwrap();
+    holder.batch_execute("BEGIN").await.unwrap();
+    diesel::sql_query("SELECT id FROM harvest_completion_trigger_outbox WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    let sharded = ShardedDbPool::single(pool.clone());
+    let recorder = Arc::new(CapturingMetrics::default());
+
+    // Run the scanner in a task with a bounded timeout.
+    let scan_pool = pool.clone();
+    let scan_sharded = sharded.clone();
+    let scan_recorder = Arc::clone(&recorder);
+    let scan = tokio::spawn(async move {
+        let mut scan_conn = scan_pool.get().await.unwrap();
+        let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &*scan_recorder;
+        autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+            &mut scan_conn,
+            metrics_ref,
+            &Some(scan_sharded),
+            &[ShardId::new(0)],
+        )
+        .await
+    });
+    let scan_result = tokio::time::timeout(std::time::Duration::from_secs(8), scan).await;
+
+    // Read state WHILE the holder still owns the row (a plain SELECT does not block on
+    // FOR UPDATE): the fixed scanner has skipped; the pre-fix scanner would be hung on
+    // its DELETE with the row still present and the fires row still NULL.
+    let fires_outcome: Option<String> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires
+         WHERE source_exec_id = $1 AND trigger_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(src_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(trigger_key_id)
+    .get_result::<OutcomeRow>(&mut conn)
+    .await
+    .unwrap()
+    .outcome;
+    let outbox_remaining: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_completion_trigger_outbox WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .unwrap()
+    .n;
+
+    // Release the holder (the concurrent relay finishes).
+    holder.batch_execute("COMMIT").await.unwrap();
+    set_global_admission_gate_cache(None);
+
+    // The fixed scanner completed (skipped the claimed row) within the timeout.
+    let joined = scan_result.expect(
+        "the scanner must COMPLETE within the timeout — pre-fix code (no claim) decides \
+         Blocked and hangs on the claimed row's DELETE, which is the race this closes",
+    );
+    joined
+        .expect("scan task join")
+        .expect("scanner returned Ok");
+
+    assert!(
+        recorder.blocked().is_empty(),
+        "the scanner must NOT count a block for a source row a concurrent relay owns \
+         (the target is being delivered)"
+    );
+    assert_eq!(
+        fires_outcome, None,
+        "the fires row stays a real fire (NULL) — never 'admission_blocked' for a \
+         claimed/delivered target"
+    );
+    assert_eq!(
+        outbox_remaining, 1,
+        "the scanner must NOT delete a row owned by the concurrent relay — it skips it"
+    );
+}
