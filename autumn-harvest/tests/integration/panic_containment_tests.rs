@@ -171,6 +171,15 @@ const INIT_SQL: &str = concat!(
     CREATE INDEX IF NOT EXISTS idx_harvest_executions_legal_hold
         ON harvest_workflow_executions (legal_hold_set_at)
         WHERE legal_hold_set_at IS NOT NULL;",
+    "\n",
+    // issue #701: continue-as-new run-chain back-links
+    // (continued_from_exec_id, first_exec_id) on harvest_workflow_executions.
+    // `NewWorkflowExecution` sets these two fields, so the seed INSERT names
+    // them — without this migration the INSERT fails at runtime with
+    // `column "continued_from_exec_id" ... does not exist`. include_str'd like
+    // every other sibling test's INIT_SQL (the directory is stable; only the
+    // renamed legal_hold migration above is inlined).
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
 /// Returns a live URL to a migrated Postgres, keeping the container (if any)
