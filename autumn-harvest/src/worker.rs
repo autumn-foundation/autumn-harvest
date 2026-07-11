@@ -8811,6 +8811,13 @@ async fn process_workflow_task(
         ..
     } = &outcome
     {
+        // An ND-block is a NON-panic outcome (handler_panic is always false when
+        // non_deterministic_details is Some — see the executor's mutually
+        // exclusive Failed constructions), so clear the consecutive-panic strike
+        // like every other non-panic path (issue #782, Codex review). The panic
+        // budget counts CONSECUTIVE panics; a stale strike surviving an ND-block
+        // interlude would exhaust the budget early after a rollback.
+        clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
         drop(execute_span);
         return block_workflow_for_non_determinism(
             conn,

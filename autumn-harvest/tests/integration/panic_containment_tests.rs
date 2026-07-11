@@ -157,7 +157,20 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
     "\n",
     // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000000_harvest_legal_hold/up.sql"),
+    // Inlined verbatim from the 20260709000001_harvest_legal_hold migration
+    // (formerly 20260709000000; renamed on trunk-dev) so this test's schema is
+    // self-contained and immune to any future migration directory rename — a
+    // path `include_str!` breaks the CI merge build (PR-head ⊕ trunk-dev) the
+    // moment the referenced directory is renamed.
+    "\n",
+    "ALTER TABLE harvest_workflow_executions
+        ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL,
+        ADD COLUMN IF NOT EXISTS legal_hold_until  TIMESTAMPTZ NULL,
+        ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL,
+        ADD COLUMN IF NOT EXISTS legal_hold_actor  TEXT NULL;
+    CREATE INDEX IF NOT EXISTS idx_harvest_executions_legal_hold
+        ON harvest_workflow_executions (legal_hold_set_at)
+        WHERE legal_hold_set_at IS NOT NULL;",
 );
 
 /// Returns a live URL to a migrated Postgres, keeping the container (if any)
