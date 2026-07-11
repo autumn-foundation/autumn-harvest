@@ -1625,6 +1625,11 @@ pub struct WorkflowContext {
     /// (issue #476). Each `wait_for_signal_timeout` call increments this once
     /// so each race has a stable, unique timer ID across replays.
     signal_timeout_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming child-workflow-timeout race
+    /// timers (issue #779). Each `spawn_child_workflow_timeout` call increments
+    /// this once so each race has a stable, unique `__child_timeout:{seq}:{name}`
+    /// timer ID across replays, distinct from `signal_timeout_seq`.
+    child_timeout_seq: Mutex<u32>,
     /// Monotonically increasing counter for naming `ctx.race()` markers
     /// (issue #600). Each `race()` call increments this once so each race has
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
@@ -1992,6 +1997,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
+            child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             saga_seq: Mutex::new(0),
@@ -2130,6 +2136,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
+            child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             saga_seq: Mutex::new(0),
@@ -2183,6 +2190,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
+            child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             saga_seq: Mutex::new(0),
@@ -5257,6 +5265,228 @@ impl WorkflowContext {
         let json_input = serde_json::to_value(input)?;
         let raw = self.spawn_child_workflow_raw(info.name, json_input).await?;
         Ok(serde_json::from_value(raw)?)
+    }
+
+    /// Spawn a child workflow and await its result with a deadline (issue #779).
+    ///
+    /// Resolves to `Ok(Some(output))` when the child completes before the
+    /// deadline, and `Ok(None)` when the deadline fires first — in which case
+    /// the still-running child is durably request-cancelled (it never leaks).
+    /// A child that *fails* before the deadline surfaces as a typed
+    /// [`HarvestError::WorkflowFailed`] carrying the child's
+    /// `error_type`/`details`/`non_retryable` (issue #767 parity with
+    /// [`spawn_child_workflow_raw`](Self::spawn_child_workflow_raw)).
+    ///
+    /// # Determinism contract
+    ///
+    /// The race composes the existing
+    /// `ChildWorkflowStarted`/`ChildWorkflowCompleted`/`ChildWorkflowFailed` and
+    /// `TimerStarted`/`TimerFired` events — **no new event variant, no
+    /// migration**. The winner is decided by **recorded history order**:
+    /// whichever of the child terminal or `TimerFired` appears first wins on
+    /// every replay, regardless of wall-clock timing on the replaying worker.
+    ///
+    /// The child spawn and the deadline timer are armed together in a **single**
+    /// mixed suspension batch, so the timer is always ticking even if the child
+    /// hangs. Like [`spawn_child_workflow_raw`](Self::spawn_child_workflow_raw)
+    /// and [`wait_for_signal_timeout`](Self::wait_for_signal_timeout), this call
+    /// cannot share a suspension batch with a *new* activity/child-workflow
+    /// command — the child is spawned by this call and no other command may ride
+    /// the same batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::WorkflowFailed`] if the child fails before the
+    /// deadline, [`HarvestError::PayloadTooLarge`] if the child input exceeds
+    /// the configured cap, or [`HarvestError::NonDeterministic`] on replay
+    /// divergence.
+    pub async fn spawn_child_workflow_timeout(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        timeout: std::time::Duration,
+    ) -> HarvestResult<Option<Value>> {
+        use crate::replay::ChildOrTimerMatch;
+
+        // Deterministic timer ID: the counter increments on every call (live and
+        // replay alike), so the Nth race in workflow code always carries the same
+        // ID as the Nth recorded race timer. Distinct from the signal-timeout
+        // counter and prefix so the two race families never collide.
+        let seq = {
+            let mut seq = self
+                .child_timeout_seq
+                .lock()
+                .expect("child_timeout_seq lock poisoned");
+            *seq += 1;
+            *seq
+        };
+        let timer_id = format!("__child_timeout:{seq}:{workflow_name}");
+        // Round up so a sub-second timeout still arms a durable timer.
+        let duration_secs = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0));
+
+        let history_match = self.match_history(|m| {
+            m.match_child_or_timer(workflow_name, &input, &timer_id, Some(duration_secs))
+        });
+
+        match history_match {
+            ChildOrTimerMatch::ChildCompleted { output } => Ok(Some(output)),
+            ChildOrTimerMatch::ChildFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                // Mirror the typed decode of `spawn_child_workflow_raw`'s replay
+                // path (issue #767): the `"Error"` sentinel maps back to `None`
+                // typed fields so a legacy child failure surfaces as untyped.
+                let was_typed = error_type != "Error" || details.is_some() || non_retryable;
+                Err(HarvestError::WorkflowFailed {
+                    name: format!("child-workflow:{workflow_name}"),
+                    reason: error,
+                    error_type: (error_type != "Error").then_some(error_type),
+                    details,
+                    non_retryable: was_typed.then_some(non_retryable),
+                })
+            }
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal,
+            } => {
+                // Deadline won. On the one live cycle the child is still running
+                // (loser terminal not yet recorded), durably request-cancel it so
+                // every future replay resolves that branch to a terminal instead
+                // of looping on `ChildInProgress`. When the loser terminal is
+                // already recorded (`child_already_terminal`), suppress the
+                // re-push so strict replay sees no spurious bookkeeping command.
+                if !child_already_terminal {
+                    self.push_command(WorkflowCommand::CancelRaceLosers {
+                        activities: Vec::new(),
+                        children: vec![child_id],
+                        timers: Vec::new(),
+                    });
+                }
+                // Advance the virtual clock (same coupling as timer()).
+                #[cfg(any(test, feature = "testing"))]
+                self.advance_timer_clock(duration_secs);
+                Ok(None)
+            }
+            ChildOrTimerMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!("child-or-timeout mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            outcome @ (ChildOrTimerMatch::NoMatch | ChildOrTimerMatch::InProgress { .. }) => {
+                let recorded_child_id = match outcome {
+                    ChildOrTimerMatch::InProgress { child_id } => {
+                        if self.strict_replay {
+                            // Strict replay (WorkflowReplayer) always gets complete
+                            // histories — an unresolved race is a fixture problem.
+                            return Err(self.nd_error(
+                                format!(
+                                    "child-or-timeout race '{workflow_name}' started but \
+                                     unresolved in history"
+                                ),
+                                self.match_history(|m| i32::try_from(m.position()).ok()),
+                                Some("ChildOrTimerResolved".to_string()),
+                                Some("ChildOrTimerInProgress".to_string()),
+                            ));
+                        }
+                        Some(child_id)
+                    }
+                    _ => {
+                        self.check_strict_replay_no_match(&format!(
+                            "ChildOrTimer({workflow_name}, {timer_id})"
+                        ))?;
+                        None
+                    }
+                };
+
+                // Enforce the child-workflow input payload cap before scheduling
+                // a fresh child (a re-park reuses the already-recorded input).
+                if recorded_child_id.is_none() {
+                    let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                    if self.payload_max_workflow_input > 0
+                        && observed > self.payload_max_workflow_input
+                    {
+                        return Err(HarvestError::PayloadTooLarge {
+                            kind: PayloadKind::ChildWorkflowInput,
+                            observed_bytes: observed,
+                            cap_bytes: self.payload_max_workflow_input,
+                            workflow_type: self.workflow_name.clone(),
+                            activity_name: None,
+                        });
+                    }
+                }
+
+                // First live run (NoMatch) or re-park after a spurious wake
+                // (InProgress): spawn the child and arm the deadline timer in a
+                // SINGLE mixed batch, then park on both. The worker dedupes the
+                // child row by `child_id` and the timer row by `timer_id`, so
+                // re-emitting on a re-park is safe.
+                let child_id = recorded_child_id.unwrap_or_else(ExecutionId::new);
+                let (child_tx, child_rx) = oneshot::channel();
+                let (timer_tx, timer_rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::StartChildWorkflow {
+                    child_id,
+                    workflow_name: workflow_name.to_string(),
+                    input,
+                    result_tx: child_tx,
+                });
+                self.push_command(WorkflowCommand::StartTimer {
+                    timer_id: TimerId::new(&timer_id),
+                    duration_secs,
+                    result_tx: timer_tx,
+                });
+
+                ChildOrTimerRaceFut {
+                    workflow_name: workflow_name.to_string(),
+                    child_rx,
+                    timer_rx,
+                    child_gone: false,
+                    timer_gone: false,
+                }
+                .await
+            }
+        }
+    }
+
+    /// Spawn a child workflow and await its result with a deadline, deserializing
+    /// the winning output into `O` (issue #779).
+    ///
+    /// The typed alternative to
+    /// [`spawn_child_workflow_timeout`](Self::spawn_child_workflow_timeout).
+    /// Resolves to `Ok(Some(output))` when the child completes before the
+    /// deadline and `Ok(None)` when the deadline fires first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the input cannot be serialized
+    /// or the child output cannot be deserialized. Propagates all errors from
+    /// [`spawn_child_workflow_timeout`](Self::spawn_child_workflow_timeout).
+    pub async fn execute_child_workflow_timeout<O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: impl serde::Serialize,
+        timeout: std::time::Duration,
+    ) -> HarvestResult<Option<O>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        let json_input = serde_json::to_value(input)?;
+        match self
+            .spawn_child_workflow_timeout(info.name, json_input, timeout)
+            .await?
+        {
+            Some(raw) => Ok(Some(serde_json::from_value(raw)?)),
+            None => Ok(None),
+        }
     }
 
     /// Wait for a signal and deserialize its payload into `O`.
@@ -8653,6 +8883,69 @@ impl std::future::Future for SignalOrTimerRaceFut {
             return std::task::Poll::Ready(Err(HarvestError::Cancelled(format!(
                 "signal-or-timeout race '{}' cancelled: result channels dropped",
                 this.signal_name
+            ))));
+        }
+
+        std::task::Poll::Pending
+    }
+}
+
+/// Poll-both future for the child-workflow-vs-deadline race (issue #779).
+///
+/// Mirrors [`SignalOrTimerRaceFut`]: resolves to `Ok(Some(output))` when the
+/// child result arrives first and `Ok(None)` when the deadline timer fires
+/// first. The child branch is polled first so that if both channels resolve in
+/// the same wake, the child's output wins (matching the recorded-history-order
+/// contract, where an already-resolved child terminal precedes its stray timer
+/// fire).
+struct ChildOrTimerRaceFut {
+    workflow_name: String,
+    child_rx: oneshot::Receiver<Result<Value, String>>,
+    timer_rx: oneshot::Receiver<()>,
+    child_gone: bool,
+    timer_gone: bool,
+}
+
+impl std::future::Future for ChildOrTimerRaceFut {
+    type Output = HarvestResult<Option<Value>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if !this.child_gone {
+            match std::pin::Pin::new(&mut this.child_rx).poll(cx) {
+                std::task::Poll::Ready(Ok(Ok(output))) => {
+                    return std::task::Poll::Ready(Ok(Some(output)));
+                }
+                // Live child failure: decode the typed envelope so the parent
+                // observes a typed `HarvestError::WorkflowFailed` (issue #767),
+                // consistent with the replay path.
+                std::task::Poll::Ready(Ok(Err(error))) => {
+                    return std::task::Poll::Ready(Err(HarvestError::workflow_failed(
+                        format!("child-workflow:{}", this.workflow_name),
+                        &error,
+                    )));
+                }
+                std::task::Poll::Ready(Err(_)) => this.child_gone = true,
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        if !this.timer_gone {
+            match std::pin::Pin::new(&mut this.timer_rx).poll(cx) {
+                std::task::Poll::Ready(Ok(())) => return std::task::Poll::Ready(Ok(None)),
+                std::task::Poll::Ready(Err(_)) => this.timer_gone = true,
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        if this.child_gone && this.timer_gone {
+            return std::task::Poll::Ready(Err(HarvestError::Cancelled(format!(
+                "child-or-timeout race '{}' cancelled: result channels dropped",
+                this.workflow_name
             ))));
         }
 
@@ -14141,7 +14434,10 @@ mod tests {
                 _ => None,
             })
             .expect("StartTimer in batch");
-        assert_eq!(duration_secs, 1, "500ms must round up to a 1s durable timer");
+        assert_eq!(
+            duration_secs, 1,
+            "500ms must round up to a 1s durable timer"
+        );
 
         let child_tx = commands
             .into_iter()

@@ -2915,6 +2915,35 @@ impl WorkflowTestEnv {
                         timer_id: timer_id.clone(),
                     });
                 }
+                // Durably cancel the losing branches of a resolved race
+                // (issue #600 / #779) that resolved on the terminal cycle: append
+                // a synthetic terminal for each still-open loser so a subsequent
+                // replay resolves it to a terminal instead of looping on
+                // `ActivityInProgress`/`ChildInProgress`. Mirrors the suspension
+                // path's `CancelRaceLosers` handling in `process_command`. Timers
+                // carry no history footprint in the harness.
+                WorkflowCommand::CancelRaceLosers {
+                    activities,
+                    children,
+                    timers: _,
+                } => {
+                    for activity_id in activities {
+                        history.push(WorkflowEvent::ActivityFailed {
+                            activity_id: *activity_id,
+                            error: "lost race to a sibling branch".to_string(),
+                            attempt: 1,
+                            error_type: "Error".to_string(),
+                            non_retryable: true,
+                            details: None,
+                        });
+                    }
+                    for child_id in children {
+                        history.push(WorkflowEvent::child_workflow_failed(
+                            *child_id,
+                            "lost race to a sibling branch".to_string(),
+                        ));
+                    }
+                }
                 // A `for_await: true` re-arm cannot reach a terminal cycle (await
                 // parks), so it records nothing here.
                 _ => {}
@@ -3001,12 +3030,28 @@ impl WorkflowTestEnv {
             })
             .min();
 
+        // A child-workflow-vs-deadline race (issue #779) suspends on a single
+        // mixed `StartChildWorkflow + StartTimer` batch whose timer id carries
+        // the `__child_timeout:` prefix. When no child mock is registered the
+        // child "hangs" and the deadline timer fires (the timeout branch),
+        // exactly like an unqueued `receive_signal_timeout`; the harness must
+        // record the child start with no terminal instead of erroring on the
+        // missing mock.
+        let batch_is_child_timeout_race = commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                WorkflowCommand::StartTimer { timer_id, .. }
+                    if timer_id.as_str().starts_with("__child_timeout:")
+            )
+        });
+
         let mut made_progress = false;
         let mut deferred_events = Vec::new();
         for cmd in commands {
             made_progress |= self.process_command(
                 cmd,
                 batch_has_competing_suspension,
+                batch_is_child_timeout_race,
                 min_await_deadline_secs,
                 history,
                 &mut deferred_events,
@@ -3047,6 +3092,7 @@ impl WorkflowTestEnv {
         &self,
         cmd: WorkflowCommand,
         batch_has_competing_suspension: bool,
+        batch_is_child_timeout_race: bool,
         min_await_deadline_secs: Option<u64>,
         history: &mut Vec<WorkflowEvent>,
         deferred_events: &mut Vec<WorkflowEvent>,
@@ -3143,7 +3189,25 @@ impl WorkflowTestEnv {
                 input: child_input,
                 ..
             } => {
-                let result = self.resolve_child(&workflow_name, child_input.clone())?;
+                let result = match self.resolve_child(&workflow_name, child_input.clone()) {
+                    Ok(result) => result,
+                    // A child-timeout race (issue #779) with no registered mock:
+                    // the child "hangs", the deadline timer wins. Record the
+                    // start with no terminal so `match_child_or_timer` resolves
+                    // to the timeout branch instead of failing on the missing
+                    // mock. The `StartTimer` in the same batch supplies progress.
+                    Err(harness_err) => {
+                        if batch_is_child_timeout_race {
+                            history.push(WorkflowEvent::ChildWorkflowStarted {
+                                child_id,
+                                workflow_name,
+                                input: child_input,
+                            });
+                            return Ok(false);
+                        }
+                        return Err(harness_err);
+                    }
+                };
                 history.push(WorkflowEvent::ChildWorkflowStarted {
                     child_id,
                     workflow_name,

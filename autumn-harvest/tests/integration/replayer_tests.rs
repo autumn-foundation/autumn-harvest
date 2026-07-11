@@ -5029,10 +5029,13 @@ async fn child_timeout_both_branches_replay_succeeded_across_randomized_ordering
 }
 
 /// A child that FAILED before the deadline replays deterministically to the
-/// Err branch (the workflow maps the typed failure to a String and returns it
-/// via `?`, which the replayer records as a WorkflowFailed terminal).
+/// Err branch: the workflow maps the typed failure to a String and returns it
+/// via `?`, so — like every self-failing workflow — it surfaces as
+/// `ReplayStatus::WorkflowFailed` (it did not complete successfully), mirroring
+/// `replay_typed_workflow_failed_round_trips_with_identical_typed_fields`. The
+/// *determinism* is the point: the same failure is reproduced on every cycle.
 #[tokio::test]
-async fn child_timeout_child_fails_before_deadline_replays_succeeded() {
+async fn child_timeout_child_fails_before_deadline_replays_deterministically() {
     let child_id = ExecutionId::new();
     let timer_id = TimerId::new("__child_timeout:1:process_order");
     let events = vec![
@@ -5061,13 +5064,20 @@ async fn child_timeout_child_fails_before_deadline_replays_succeeded() {
         },
     ];
 
-    let report = WorkflowReplayer::new()
-        .register_fn("child_or_deadline", child_or_deadline_workflow)
-        .replay_from_events(events)
-        .await;
-    assert!(
-        matches!(report.status, ReplayStatus::ReplaySucceeded),
-        "a child failure before the deadline must replay deterministically:\n{report}"
+    let mut reproduced = Vec::new();
+    for _ in 0..2 {
+        let report = WorkflowReplayer::new()
+            .register_fn("child_or_deadline", child_or_deadline_workflow)
+            .replay_from_events(events.clone())
+            .await;
+        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
+            panic!("a child failure before the deadline surfaces as WorkflowFailed:\n{report}");
+        };
+        reproduced.push(error);
+    }
+    assert_eq!(
+        reproduced[0], reproduced[1],
+        "the child failure must reproduce byte-identically across replay cycles"
     );
 }
 

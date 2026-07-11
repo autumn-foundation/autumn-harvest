@@ -208,6 +208,72 @@ pub enum SignalOrTimerMatch {
     },
 }
 
+/// Result of observing a child-workflow-vs-deadline race against recorded
+/// history (issue #779: `ctx.execute_child_workflow_timeout`).
+///
+/// The race composes the existing
+/// `ChildWorkflowStarted`/`ChildWorkflowCompleted`/`ChildWorkflowFailed` and
+/// `TimerStarted`/`TimerFired` events — no new event variant. The winner is the
+/// resolution event that appears **first in recorded history**, so the outcome
+/// is deterministic across replays regardless of wall-clock timing on the
+/// replaying worker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildOrTimerMatch {
+    /// The child workflow completed before the deadline timer fired. Carries the
+    /// recorded child output.
+    ChildCompleted {
+        /// The JSON output from the winning `ChildWorkflowCompleted` event.
+        output: Value,
+    },
+    /// The child workflow failed before the deadline timer fired. Carries the
+    /// child's typed failure fields (issue #767); a legacy / untyped child
+    /// failure decodes to the `"Error"` sentinel with no details and
+    /// `non_retryable = false`.
+    ChildFailed {
+        /// Human-readable failure message from `ChildWorkflowFailed`.
+        error: String,
+        /// Stable error-type name; `"Error"` for a legacy / untyped failure.
+        error_type: String,
+        /// Structured details from a typed failure, if any.
+        details: Option<Value>,
+        /// Advisory non-retryable classification hint.
+        non_retryable: bool,
+    },
+    /// The deadline timer fired before the child terminated. Carries the losing
+    /// child's `ExecutionId` (so the caller can durably request-cancel it) and
+    /// `child_already_terminal`, which is `true` iff the loser child's terminal
+    /// is already recorded in history (the caller then suppresses re-pushing
+    /// `CancelRaceLosers`).
+    TimerFired {
+        /// The `ExecutionId` of the losing child workflow.
+        child_id: ExecutionId,
+        /// Whether the loser child's terminal is already recorded.
+        child_already_terminal: bool,
+    },
+    /// `ChildWorkflowStarted` and `TimerStarted` are both recorded but neither a
+    /// child terminal nor `TimerFired` exists yet. The caller re-emits the race
+    /// commands (the worker dedupes the child by `child_id` and the timer row by
+    /// `timer_id`) and suspends again. Carries the recorded `child_id` so the
+    /// re-emitted `StartChildWorkflow` reuses it.
+    InProgress {
+        /// The `ExecutionId` recorded in `ChildWorkflowStarted`.
+        child_id: ExecutionId,
+    },
+    /// Cursor is past the end of history — this is the first live execution of
+    /// the race.
+    NoMatch,
+    /// The recorded history does not match the requested race, indicating
+    /// non-determinism in the workflow code.
+    Diverged {
+        /// What the history matcher expected to find based on recorded events.
+        expected: String,
+        /// What the workflow actually requested.
+        actual: String,
+        /// The event index where the divergence occurred.
+        event_index: Option<i32>,
+    },
+}
+
 /// Result of observing a cancellable durable timer's outcome against recorded
 /// history (issue #768: `TimerHandle::await_fire`).
 ///
@@ -3936,6 +4002,362 @@ impl HistoryMatcher {
         self.cursor = start_cursor + 1;
         self.advance_to_next_unconsumed_event();
         HistoryMatch::ChildInProgress { child_id }
+    }
+
+    /// Settle a child-vs-deadline race won by the child (issue #779).
+    ///
+    /// Marks the winning child terminal consumed (it is matched out of order),
+    /// strays the race's deadline `TimerFired` if it was recorded after the
+    /// child won (so a subsequent match does not diverge against it and the
+    /// strict unconsumed check passes), and advances the cursor. Mirrors
+    /// [`Self::settle_race_signal_won`] with the winner role swapped from a
+    /// signal to a child terminal.
+    fn settle_race_child_won(
+        &mut self,
+        terminal_pos: usize,
+        resume_pos: usize,
+        first_interleaved_command: Option<usize>,
+        timer_id: &str,
+    ) {
+        self.consumed_out_of_order_events.insert(terminal_pos);
+        let mut fired_scan = terminal_pos + 1;
+        while fired_scan < self.events.len() {
+            if !self.is_consumed(fired_scan)
+                && let WorkflowEvent::TimerFired { timer_id: id } = &self.events[fired_scan]
+                && id.as_str() == timer_id
+            {
+                self.consumed_out_of_order_events.insert(fired_scan);
+                break;
+            }
+            fired_scan += 1;
+        }
+        self.cursor = first_interleaved_command.unwrap_or(resume_pos);
+        self.advance_to_next_unconsumed_event();
+    }
+
+    /// Scan forward from `from` for the losing child's terminal
+    /// (`ChildWorkflowCompleted`/`ChildWorkflowFailed` with `child_id`) after a
+    /// deadline timer won the race (issue #779). Marks it consumed (a losing
+    /// child terminal is deliverable to nobody, so it must be transparent to
+    /// [`Self::has_non_lifecycle_unconsumed`]) and returns whether it was found.
+    fn consume_loser_child_terminal(&mut self, from: usize, child_id: ExecutionId) -> bool {
+        let mut scan = from;
+        while scan < self.events.len() {
+            if !self.is_consumed(scan)
+                && matches!(
+                    &self.events[scan],
+                    WorkflowEvent::ChildWorkflowCompleted { child_id: id, .. }
+                        | WorkflowEvent::ChildWorkflowFailed { child_id: id, .. }
+                        if *id == child_id
+                )
+            {
+                self.consumed_out_of_order_events.insert(scan);
+                return true;
+            }
+            scan += 1;
+        }
+        false
+    }
+
+    /// Match a child-workflow-vs-deadline race against history (issue #779).
+    ///
+    /// Mirrors [`Self::match_signal_or_timer`] with the winner/loser roles
+    /// swapped: a child terminal (`ChildWorkflowCompleted`/`ChildWorkflowFailed`)
+    /// is the winner and `TimerFired` is the loser, or vice versa. The race
+    /// composes the existing child-workflow and timer events — no new event
+    /// variant. The winner is the resolution event that appears **first in
+    /// recorded history**.
+    ///
+    /// Positional invariant: the worker persists `ChildWorkflowStarted`
+    /// immediately followed by `TimerStarted` in one transaction, so both are
+    /// matched positionally (Diverge on mismatch) before the forward scan for
+    /// the first resolution event. Interleaved concurrent-sibling events are
+    /// stashed / rewound exactly as in [`Self::match_signal_or_timer`].
+    #[allow(clippy::too_many_lines)]
+    pub fn match_child_or_timer(
+        &mut self,
+        workflow_name: &str,
+        input: &Value,
+        timer_id: &str,
+        expected_duration: Option<u64>,
+    ) -> ChildOrTimerMatch {
+        if !self.prepare_match() {
+            return ChildOrTimerMatch::NoMatch;
+        }
+
+        let child_pos = self.cursor;
+        let WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: recorded_name,
+            input: recorded_input,
+        } = &self.events[self.cursor]
+        else {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        };
+        let child_id = *child_id;
+        if recorded_name != workflow_name {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: format!("ChildWorkflowStarted({recorded_name})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+        if recorded_input != input {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("ChildWorkflowInput({input})"),
+                actual: format!("ChildWorkflowInput({recorded_input})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+
+        // The deadline timer must be recorded immediately after the child start
+        // (both appended in one worker transaction).
+        let timer_pos = child_pos + 1;
+        let Some(WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            duration_secs: recorded_duration,
+        }) = self.events.get(timer_pos)
+        else {
+            let actual = self
+                .events
+                .get(timer_pos)
+                .map_or_else(|| "<end of history>".to_string(), Self::actual_event_name);
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual,
+                event_index: i32::try_from(timer_pos).ok(),
+            };
+        };
+        if recorded_id.as_str() != timer_id {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: format!("TimerStarted({recorded_id})"),
+                event_index: i32::try_from(timer_pos).ok(),
+            };
+        }
+        if let Some(expected) = expected_duration
+            && *recorded_duration != expected
+        {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
+                actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
+                event_index: i32::try_from(timer_pos).ok(),
+            };
+        }
+
+        // Advance past the started pair, then scan for the first resolution.
+        let resume_pos = timer_pos + 1;
+        let mut scan_cursor = resume_pos;
+        let mut first_interleaved_command = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                // Child wins: its terminal was recorded before the deadline fired.
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: id,
+                    output,
+                } if *id == child_id => {
+                    let output = output.clone();
+                    self.settle_race_child_won(
+                        scan_cursor,
+                        resume_pos,
+                        first_interleaved_command,
+                        timer_id,
+                    );
+                    return ChildOrTimerMatch::ChildCompleted { output };
+                }
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: id,
+                    error,
+                    error_type,
+                    details,
+                    non_retryable,
+                } if *id == child_id => {
+                    // Carry the child's typed failure fields (issue #767); a
+                    // legacy / untyped child failure decodes to the `"Error"`
+                    // sentinel — identical to `match_child_workflow`.
+                    let error = error.clone();
+                    let error_type = error_type.clone().unwrap_or_else(|| "Error".to_string());
+                    let details = details.clone();
+                    let non_retryable = non_retryable.unwrap_or(false);
+                    self.settle_race_child_won(
+                        scan_cursor,
+                        resume_pos,
+                        first_interleaved_command,
+                        timer_id,
+                    );
+                    return ChildOrTimerMatch::ChildFailed {
+                        error,
+                        error_type,
+                        details,
+                        non_retryable,
+                    };
+                }
+
+                // Timer wins: the deadline fired before the child terminated.
+                WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
+                    // A loser child terminal recorded after the fire (the
+                    // synthetic `ChildWorkflowFailed` from the race-loser
+                    // cancellation) is deliverable to nobody, so consume it and
+                    // report `child_already_terminal` so the caller pushes
+                    // `CancelRaceLosers` only on the one live cycle the child is
+                    // still running.
+                    let child_already_terminal =
+                        self.consume_loser_child_terminal(scan_cursor + 1, child_id);
+                    if let Some(command_cursor) = first_interleaved_command {
+                        self.consumed_out_of_order_events.insert(scan_cursor);
+                        self.cursor = command_cursor;
+                    } else {
+                        self.cursor = scan_cursor + 1;
+                    }
+                    self.advance_to_next_unconsumed_event();
+                    return ChildOrTimerMatch::TimerFired {
+                        child_id,
+                        child_already_terminal,
+                    };
+                }
+
+                // Concurrent sibling commands (tokio::join!) can interleave with
+                // the pending race. Keep the first as the next replay cursor and
+                // scan past it so a resolution recorded later is still found.
+                WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                // Signals arriving while the race is pending are stashed for
+                // later signal waits.
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+
+                // Progress and terminal events of concurrent siblings (foreign
+                // timer fires, terminals of other children) are transparent to
+                // the race scan — their own matchers consume them after a rewind.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
+                    scan_cursor += 1;
+                }
+
+                // ExternalSignal event triplets can be interleaved; stash them
+                // for later match_external_signal.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target,
+                    signal_name: sn,
+                    payload,
+                    idempotency_key,
+                } => {
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        sn.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Delivered,
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Failed(reason_code.clone()),
+                    );
+                    scan_cursor += 1;
+                }
+
+                // ExternalCancel events are transparent to the race scan (#492).
+                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                    self.pending_external_cancels.push(StashedExternalCancel {
+                        cancel_id: *cancel_id,
+                        target: *target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                    if let Some(s) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|s| s.cancel_id == *cancel_id)
+                    {
+                        s.terminal = Some(StashedCancelTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalCancelFailed {
+                    cancel_id,
+                    reason_code,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|s| s.cancel_id == *cancel_id)
+                    {
+                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                _ => break,
+            }
+        }
+
+        // Both started but neither resolution event is recorded yet. Rewind to
+        // the first interleaved command so a concurrent sibling's matcher still
+        // finds its own events.
+        self.cursor = first_interleaved_command.unwrap_or(resume_pos);
+        self.advance_to_next_unconsumed_event();
+        ChildOrTimerMatch::InProgress { child_id }
     }
 
     /// Match a detached child workflow spawn against history.

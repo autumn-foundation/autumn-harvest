@@ -18,11 +18,11 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use autumn_harvest::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
-use autumn_harvest::WorkflowContext;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use serde_json::Value;
@@ -106,7 +106,10 @@ fn fast_child<'a>(_ctx: &'a WorkflowContext, input: Value) -> WfFuture<'a> {
 /// A child that hangs forever waiting for a signal that never arrives.
 fn hanging_child<'a>(ctx: &'a WorkflowContext, _input: Value) -> WfFuture<'a> {
     Box::pin(async move {
-        let _ = ctx.wait_for_signal("never").await.map_err(|e| e.to_string())?;
+        let _ = ctx
+            .wait_for_signal("never")
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"unreachable": true}))
     })
 }

@@ -64,7 +64,9 @@ fn main() {
     println!();
     println!("Deadline-bounded child await in two lines:");
     println!("  let enriched: Option<EnrichResult> = ctx");
-    println!("      .execute_child_workflow_timeout(&enrich_order_info(), order_id, Duration::from_secs(5))");
+    println!(
+        "      .execute_child_workflow_timeout(&enrich_order_info(), order_id, Duration::from_secs(5))"
+    );
     println!("      .await?;");
     println!();
     println!("  Some(result) — the child completed before the deadline");
