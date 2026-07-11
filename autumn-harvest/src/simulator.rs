@@ -69,7 +69,12 @@ pub struct WorkflowSimulator {
     /// [`ActivityInfo`](crate::info::ActivityInfo)'s `default_retry_policy`.
     activity_info_retry_policies: HashMap<String, RetryPolicy>,
     child_workflow_mocks: HashMap<String, ActivityMockFn>,
-    signals_to_send: HashMap<String, std::collections::VecDeque<Value>>,
+    /// Signals queued for delivery, in true cross-name queued order (mirrors
+    /// `WorkflowTestEnv::queued_signals`). A single `Vec` — rather than a
+    /// per-name `HashMap<String, VecDeque<_>>` — is required so batch promotion
+    /// at a `WaitForSignal` wake preserves the order signals were enqueued
+    /// across different names, matching production `load_pending_signals`.
+    signals_to_send: Vec<(String, Value)>,
 }
 
 impl WorkflowSimulator {
@@ -83,7 +88,7 @@ impl WorkflowSimulator {
             retry_policy_overrides: HashMap::new(),
             activity_info_retry_policies: HashMap::new(),
             child_workflow_mocks: HashMap::new(),
-            signals_to_send: HashMap::new(),
+            signals_to_send: Vec::new(),
         }
     }
 
@@ -184,10 +189,7 @@ impl WorkflowSimulator {
     /// Register a signal to send when requested by `wait_for_signal`.
     #[must_use]
     pub fn send_signal(mut self, name: &str, payload: Value) -> Self {
-        self.signals_to_send
-            .entry(name.to_string())
-            .or_default()
-            .push_back(payload);
+        self.signals_to_send.push((name.to_string(), payload));
         self
     }
 
@@ -452,15 +454,23 @@ impl WorkflowSimulator {
                     advanced = true;
                 }
                 WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                    if let Some(payload) = self
-                        .signals_to_send
-                        .get_mut(&signal_name)
-                        .and_then(std::collections::VecDeque::pop_front)
-                    {
-                        history.push(WorkflowEvent::SignalReceived {
-                            signal_name: signal_name.clone(),
-                            payload: payload.clone(),
-                        });
+                    // Simulate a production wake: the workflow only makes progress
+                    // on this wait when a signal of the awaited name is actually
+                    // queued. On that wake, promote EVERY currently-queued signal
+                    // (ALL names) into history in queued order, mirroring production
+                    // `load_pending_signals`/`ingest_pending_signals` batch promotion
+                    // (issue #775) and matching `WorkflowTestEnv`. The matcher's
+                    // `match_signal` then consumes the first awaited-name signal for
+                    // this wait, leaving the rest buffered for a following
+                    // non-blocking `drain_signals` / `try_receive_signal` call in the
+                    // same task.
+                    if self.signals_to_send.iter().any(|(n, _)| n == &signal_name) {
+                        for (name, payload) in self.signals_to_send.drain(..) {
+                            history.push(WorkflowEvent::SignalReceived {
+                                signal_name: name,
+                                payload,
+                            });
+                        }
                         advanced = true;
                     }
                 }
@@ -727,6 +737,77 @@ mod tests {
             .final_output
             .expect("workflow should complete successfully");
         assert_eq!(final_output, serde_json::json!(["sig1", "sig2"]));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #775: non-blocking signal drain must work under WorkflowSimulator
+    // (parity with production `load_pending_signals` batch promotion and with
+    // `WorkflowTestEnv`). A single `wait_for_signal` followed by
+    // `drain_signals_raw` in the same task must surface EVERY queued signal.
+    // -----------------------------------------------------------------
+
+    fn dummy_workflow_wait_then_drain(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            let first = ctx
+                .wait_for_signal("event")
+                .await
+                .map_err(|e| e.to_string())?;
+            let rest = ctx.drain_signals_raw("event").map_err(|e| e.to_string())?;
+            let mut all = vec![first];
+            all.extend(rest);
+            Ok(serde_json::json!(all))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_wait_then_drain_returns_all_queued_signals() {
+        let sim = WorkflowSimulator::new(dummy_workflow_wait_then_drain)
+            .send_signal("event", serde_json::json!("a"))
+            .send_signal("event", serde_json::json!("b"))
+            .send_signal("event", serde_json::json!("c"));
+
+        let res = sim.run(serde_json::json!("init")).await;
+        let final_output = res
+            .final_output
+            .expect("workflow should complete successfully");
+        // The wait yields the first signal; the drain yields the rest. Before the
+        // batch-promotion fix, only "a" was promoted at the suspension so the
+        // drain returned empty and this asserted just ["a"].
+        assert_eq!(final_output, serde_json::json!(["a", "b", "c"]));
+    }
+
+    fn dummy_workflow_try_receive(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            // First wait promotes every queued signal into history.
+            let first = ctx
+                .wait_for_signal("event")
+                .await
+                .map_err(|e| e.to_string())?;
+            // Non-blocking single-claim of the next buffered one.
+            let second: Option<Value> = ctx
+                .try_wait_for_signal("event")
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!([first, second]))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_try_wait_for_signal_after_wait() {
+        let sim = WorkflowSimulator::new(dummy_workflow_try_receive)
+            .send_signal("event", serde_json::json!("a"))
+            .send_signal("event", serde_json::json!("b"));
+
+        let res = sim.run(serde_json::json!("init")).await;
+        let final_output = res
+            .final_output
+            .expect("workflow should complete successfully");
+        assert_eq!(final_output, serde_json::json!(["a", "b"]));
     }
 
     // -----------------------------------------------------------------
