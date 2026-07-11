@@ -27,6 +27,35 @@
 //! to include the siblings. Widening moves the cut to the clean boundary before
 //! the whole level, re-executing the failed node and its same-level siblings
 //! together. Upstream nodes are always carried over.
+//!
+//! ## v1 interaction: signal/timer gate nodes (issue #746)
+//!
+//! A signal/timer gate ([`DagBuilder::signal_gate`](autumn_harvest::dag::DagBuilder::signal_gate))
+//! has **no activity dispatch**, so it records no `ActivityScheduled` /
+//! `ActivityCompleted` events. From this resolver's activity-name-keyed
+//! perspective a gate is therefore always `NotAttempted`
+//! ([`node_outcome`]), with three consequences the resolver handles safely but
+//! imperfectly:
+//!
+//! * **Retrying a gate node directly is rejected** with
+//!   [`DagRetryResolveError::NotAttempted`] (a gate has no activity to re-run;
+//!   retry a downstream *activity* instead). This is a deliberately conservative
+//!   rejection, not a bug.
+//! * **A downstream/crossing retry computes a correct reset point.** The cut is
+//!   derived purely from activity schedule events ([`earliest_schedule_index`]),
+//!   and a gate contributes none, so it never moves the cut. On replay the gate
+//!   re-resolves from carried-over history (its recorded `SignalReceived` /
+//!   race-`TimerFired`) when the cut lands after it. A gate in the re-execute
+//!   closure appears in `nodes_to_re_execute` (never `nodes_carried_over`, since
+//!   it has no schedule event to be "carried") — a benign enumeration quirk that
+//!   does not affect the reset point.
+//! * **A gate whose signal name equals an activity name rejects the whole DAG.**
+//!   Because a gate's node identity is its signal name, a gate named `approval`
+//!   alongside an activity `approval` is a genuine name collision that
+//!   name-based matching cannot disambiguate, so the resolver returns
+//!   [`DagRetryResolveError::AmbiguousNodes`] for the whole DAG (same treatment
+//!   as any duplicate activity name). Give gates signal names distinct from
+//!   activity names to keep a DAG retryable.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -788,6 +817,110 @@ mod tests {
             err,
             DagRetryResolveError::AlreadySucceeded {
                 nodes: vec!["b".to_string()]
+            }
+        );
+    }
+
+    // ---- resolve: signal/timer gate interaction (issue #746) -------------
+
+    /// `a -> validate(c) -> signal_gate("approval") -> b`, gate name distinct
+    /// from every activity name.
+    fn gate_dag() -> DagDefinition {
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a);
+        let nc = builder.activity(c).upstream(&na);
+        let gate = builder.signal_gate("approval").upstream(&nc);
+        let _nb = builder.activity(b).upstream(&gate);
+        builder.build().expect("gate dag builds")
+    }
+
+    fn signal_received(name: &str) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: name.to_string(),
+            payload: Value::Null,
+        }
+    }
+
+    #[test]
+    fn resolve_gate_node_directly_is_rejected_as_not_attempted() {
+        // A gate records no activity events, so retrying it directly is rejected
+        // as NotAttempted (documented v1: retry a downstream activity instead).
+        let def = gate_dag();
+        let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("c", ic),
+            completed(ic),
+            signal_received("approval"),
+        ];
+        let err = resolve_retry_plan(&def, &events, &["approval".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            DagRetryResolveError::NotAttempted {
+                nodes: vec!["approval".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_upstream_retry_crossing_a_gate_computes_cut_from_activity_schedules() {
+        // Retry from `c`, whose downstream closure crosses the gate ("approval")
+        // and reaches `b`. `c` failed, so the gate/`b` never ran. The reset point
+        // is derived purely from activity schedules — the gate contributes no
+        // schedule event and does not move the cut — and the gate appears in
+        // nodes_to_re_execute (never carried_over), a benign enumeration quirk.
+        let def = gate_dag();
+        let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
+        // 0 started, 1 schedA, 2 compA, 3 schedC, 4 failC (gate & b never reached)
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("c", ic),
+            failed(ic),
+        ];
+        let plan = resolve_retry_plan(&def, &events, &["c".to_string()]).expect("plan");
+        // earliest reexecute schedule among {c, approval, b} = schedC at index 3
+        // (the gate and b have no schedule) -> reset to 2 (compA).
+        assert_eq!(plan.reset_to_event_id, 2);
+        assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
+        // The gate node "approval" is in the re-execute closure of `c`.
+        assert!(
+            plan.nodes_to_re_execute.contains(&"approval".to_string()),
+            "gate crossed by the retry closure must be listed for re-execution: {:?}",
+            plan.nodes_to_re_execute
+        );
+        assert!(plan.nodes_to_re_execute.contains(&"c".to_string()));
+        assert!(plan.nodes_to_re_execute.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn resolve_rejects_gate_signal_name_colliding_with_an_activity_name() {
+        // A gate whose signal name equals an activity name is a genuine node-name
+        // collision the resolver cannot disambiguate → AmbiguousNodes for the
+        // whole DAG, even when retrying an unrelated node.
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a);
+        // Gate signal "a" collides with the activity `a`'s node name "a".
+        let _gate = builder.signal_gate("a").upstream(&na);
+        let _nc = builder.activity(c).upstream(&na);
+        let def = builder.build().expect("colliding-name dag builds");
+
+        let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("c", ic),
+            failed(ic),
+        ];
+        let err = resolve_retry_plan(&def, &events, &["c".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            DagRetryResolveError::AmbiguousNodes {
+                nodes: vec!["a".to_string()]
             }
         );
     }

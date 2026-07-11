@@ -86,6 +86,15 @@ pub enum GateTimeoutAction {
 /// The received signal payload becomes the gate node's output, addressable by
 /// downstream nodes (including a `.map_activity(...).over(&gate)` fan-out when
 /// the payload is a JSON array).
+///
+/// # Retry-from-node interaction (issue #366)
+///
+/// A gate records no activity events, so the `#[366]` retry resolver treats it
+/// as `NotAttempted`: retrying a gate node *directly* is rejected, but a
+/// downstream/crossing retry computes a correct reset point (a gate never moves
+/// the cut) and the gate re-resolves from carried-over history. Give a gate a
+/// signal name **distinct from every activity name** — a collision makes the
+/// whole DAG un-retryable (ambiguous node names).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DagSignalGate {
     /// The name of the signal the gate waits on. This is also the gate node's
