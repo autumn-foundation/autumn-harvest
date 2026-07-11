@@ -646,6 +646,36 @@ fn cancel_then_start_no_activity_workflow<'a>(
     })
 }
 
+/// Non-blocking signal drain (issue #775): run one activity, then drain every
+/// buffered "event" signal in the same task execution. `SignalReceived` events
+/// interleaved with the activity events in history must replay deterministically.
+fn drain_after_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let drained = ctx.drain_signals_raw("event").map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "drained": drained }))
+    })
+}
+
+/// Drains every buffered "event" signal in ONE task execution and returns the
+/// count — the falsifiable success-metric workflow (issue #775). If the drain
+/// failed to consume all buffered signals, the leftover unconsumed history
+/// would flag the replay as non-deterministic rather than `ReplaySucceeded`.
+fn drain_n_signals_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let drained = ctx.drain_signals_raw("event").map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "count": drained.len() }))
+    })
+}
+
 /// Workflow that derives a timer duration from deterministic retry-jitter math.
 fn jitter_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1040,6 +1070,11 @@ fn build_replayer() -> WorkflowReplayer {
             "cancel_then_start_no_activity_workflow",
             cancel_then_start_no_activity_workflow,
         )
+        .register_fn(
+            "drain_after_activity_workflow",
+            drain_after_activity_workflow,
+        )
+        .register_fn("drain_n_signals_workflow", drain_n_signals_workflow)
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -1269,6 +1304,104 @@ async fn replay_handler_panic_activity_takes_compensation_branch_deterministical
             "cycle {cycle}: events_replayed must be positive"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// (a0.5) Non-blocking signal drain (issue #775) replays deterministically, and
+//        the falsifiable success metric: N buffered signals drained in ONE task.
+// ---------------------------------------------------------------------------
+
+/// History with `SignalReceived` events interleaved with the activity events —
+/// one before the activity is scheduled, one after it completes.
+fn drain_interleaved_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let step_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        // Signal ingested before the workflow reaches the activity call.
+        WorkflowEvent::SignalReceived {
+            signal_name: "event".into(),
+            payload: serde_json::json!({"seq": 1}),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: step_id,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: step_id,
+            output: serde_json::json!("done"),
+        },
+        // Signal ingested after the activity completed but before the drain.
+        WorkflowEvent::SignalReceived {
+            signal_name: "event".into(),
+            payload: serde_json::json!({"seq": 2}),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replay_drain_signals_interleaved_with_activity_is_deterministic() {
+    let (exec_id, events) = drain_interleaved_history();
+    let replayer = build_replayer();
+
+    // Replay the same history multiple times: the interleaved signals must be
+    // drained identically every cycle.
+    for cycle in 0..3 {
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "drain_after_activity_workflow",
+                exec_id,
+                events.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "cycle {cycle}: a history with SignalReceived interleaved with activity \
+             events plus a drain_signals call must replay deterministically, got: {report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_drain_n_signals_in_one_task_consumes_all() {
+    // Falsifiable success metric (issue #775): N buffered signals drained in a
+    // SINGLE task execution. If the drain left any of the N unconsumed, the
+    // replay would fail the strict-mode unconsumed-history check rather than
+    // report ReplaySucceeded.
+    let exec_id = ExecutionId::new();
+    let n = 1000usize;
+    let mut events = vec![WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+    for i in 0..n {
+        events.push(WorkflowEvent::SignalReceived {
+            signal_name: "event".into(),
+            payload: serde_json::json!({ "seq": i }),
+        });
+    }
+
+    let replayer = build_replayer();
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("drain_n_signals_workflow", exec_id, events))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{n} buffered signals must be drained in one task execution (else leftover \
+         unconsumed history flags non-determinism), got: {report}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -2832,3 +2832,190 @@ async fn test_env_root_typed_failure_records_typed_fields_and_human_message() {
     assert_eq!(non_retryable, Some(true));
     assert_eq!(details, Some(json!({ "cap": 5 })));
 }
+
+// ─────────── Non-blocking signal drain (issue #775) ───────────
+
+/// Aggregator pattern: block for the first "event" signal, then non-blockingly
+/// drain every remaining buffered "event" signal in one task execution.
+fn drain_aggregator_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Block until the batch of "event" signals is promoted into history.
+        let first = ctx
+            .wait_for_signal("event")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut collected = vec![first];
+        // Non-blocking: consume the rest already buffered.
+        collected.extend(ctx.drain_signals_raw("event").map_err(|e| e.to_string())?);
+        Ok(json!({ "collected": collected }))
+    })
+}
+
+#[tokio::test]
+async fn test_drain_signals_returns_all_queued_in_order() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .queue_signal("event", json!({"seq": 3}))
+        .run(drain_aggregator_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"collected": [{"seq": 1}, {"seq": 2}, {"seq": 3}]})),
+        "all queued same-name signals must be returned by the wait+drain in queued order"
+    );
+}
+
+/// Returns whether a non-blocking `try_receive_signal` saw anything.
+fn try_receive_none_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let got: Option<Value> = ctx.try_receive_signal("event").map_err(|e| e.to_string())?;
+        Ok(json!({ "got": got }))
+    })
+}
+
+#[tokio::test]
+async fn test_try_receive_signal_none_when_nothing_queued() {
+    let outcome = WorkflowTestEnv::new()
+        .run(try_receive_none_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"got": Value::Null})),
+        "try_receive_signal must return None (and never suspend) when nothing is buffered"
+    );
+}
+
+/// Aggregator that returns the COUNT of signals collected (block for the first,
+/// then drain the rest) — for the N-at-scale success-metric assertion.
+fn drain_n_env_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx
+            .wait_for_signal("event")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut all = vec![first];
+        all.extend(ctx.drain_signals_raw("event").map_err(|e| e.to_string())?);
+        Ok(json!({ "count": all.len() }))
+    })
+}
+
+#[tokio::test]
+async fn test_drain_1000_signals_returns_all_in_one_task() {
+    // Success-metric (issue #775, AC8): a wait + drain in ONE task execution
+    // must RETURN all N buffered same-name signals — not merely consume them.
+    // A `.take(k)` truncation regression would fail this returned-count check.
+    let mut env = WorkflowTestEnv::new();
+    for i in 0..1000 {
+        env = env.queue_signal("event", json!({ "seq": i }));
+    }
+    let outcome = env.run(drain_n_env_workflow, json!(null)).await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({ "count": 1000 })),
+        "all 1000 buffered same-name signals must be returned in a single task"
+    );
+}
+
+/// Does exactly ONE `wait_for_signal("event")` and returns it WITHOUT draining —
+/// proves the test-env batch-promotion of the queued extras did not corrupt the
+/// single-wait return path.
+fn single_wait_no_drain_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx
+            .wait_for_signal("event")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "first": first }))
+    })
+}
+
+#[tokio::test]
+async fn test_single_wait_with_extras_queued_returns_first_signal() {
+    // Regression guard for the `WaitForSignal` batch-promotion change: with
+    // multiple same-name signals queued, a workflow doing a single
+    // `wait_for_signal` (no drain) must still return the FIRST queued signal —
+    // promoting the extras into history must not corrupt the single-wait return.
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .queue_signal("event", json!({"seq": 3}))
+        .run(single_wait_no_drain_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({ "first": {"seq": 1} })),
+        "a single wait_for_signal must return the first queued signal despite batch promotion"
+    );
+}
+
+/// Drain-first (issue #775, Codex P2): the workflow's FIRST action is a
+/// non-blocking `drain_signals_raw`, with NO prior blocking `wait_for_signal`.
+/// Production ingests pending signals at task-prep (before the handler runs), so
+/// a drain-first workflow must observe every pre-queued signal. Before the
+/// task-prep ingest fix — when the harness only promoted signals at a
+/// `WaitForSignal` wake — this returned an empty `collected`.
+fn drain_first_no_wait_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let collected = ctx.drain_signals_raw("event").map_err(|e| e.to_string())?;
+        Ok(json!({ "collected": collected }))
+    })
+}
+
+#[tokio::test]
+async fn test_drain_first_no_prior_wait_returns_all_queued() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .queue_signal("event", json!({"seq": 3}))
+        .run(drain_first_no_wait_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"collected": [{"seq": 1}, {"seq": 2}, {"seq": 3}]})),
+        "a drain with NO prior wait_for_signal must still observe every pre-queued signal \
+         (task-prep ingest, mirroring production `ingest_due_timers_and_signals`)"
+    );
+}
+
+/// try_receive-first (issue #775, Codex P2): FIRST action is a non-blocking
+/// `try_receive_signal` with a signal pre-queued and NO prior blocking wait.
+fn try_receive_first_no_wait_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let got: Option<Value> = ctx.try_receive_signal("event").map_err(|e| e.to_string())?;
+        Ok(json!({ "got": got }))
+    })
+}
+
+#[tokio::test]
+async fn test_try_receive_first_no_prior_wait_returns_oldest() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("event", json!({"seq": 1}))
+        .queue_signal("event", json!({"seq": 2}))
+        .run(try_receive_first_no_wait_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"got": {"seq": 1}})),
+        "a try_receive_signal with NO prior wait must return the oldest pre-queued signal"
+    );
+}

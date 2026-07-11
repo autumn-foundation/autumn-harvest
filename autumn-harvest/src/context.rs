@@ -5231,6 +5231,11 @@ impl WorkflowContext {
     ///
     /// This is the typed alternative to [`wait_for_signal`](Self::wait_for_signal).
     ///
+    /// See also the non-blocking siblings
+    /// [`try_receive_signal`](Self::try_receive_signal) /
+    /// [`drain_signals`](Self::drain_signals) for the aggregator pattern (block
+    /// once, then sweep up the rest without extra tasks).
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Serialization`] if the signal payload cannot be
@@ -5242,6 +5247,191 @@ impl WorkflowContext {
     {
         let raw = self.wait_for_signal(signal_name).await?;
         Ok(serde_json::from_value(raw)?)
+    }
+
+    // ── Non-blocking signal drain (issue #775) ────────────────────────────
+
+    /// Non-blocking receive of the oldest buffered, not-yet-consumed signal of
+    /// `signal_name`, deserialized into `O`.
+    ///
+    /// Returns `Ok(Some(payload))` for the oldest matching `SignalReceived`
+    /// event already recorded in history (FIFO recorded-history order), or
+    /// `Ok(None)` when none is currently buffered. **Never suspends** — unlike
+    /// [`receive_signal`](Self::receive_signal), it does not push a
+    /// `WaitForSignal` command, so it can never park the workflow. This is the
+    /// building block for the aggregator / entity-workflow pattern: block once
+    /// with `receive_signal`, then sweep up the rest without extra tasks.
+    ///
+    /// # Determinism and ordering
+    ///
+    /// A signal recorded *after* an activity/timer/child-workflow the workflow
+    /// has not yet reached in this replay cycle is invisible until the
+    /// workflow's own call for that event advances history past it — exactly
+    /// mirroring `wait_for_signal`'s history-order contract. The claimed event
+    /// is marked consumed, so a later [`receive_signal`](Self::receive_signal),
+    /// [`wait_for_signal`](Self::wait_for_signal), or push signal handler (issue
+    /// #546) for the same name never sees it again (no double delivery in
+    /// either direction). A signal reserved for an in-flight
+    /// [`receive_signal_timeout`](Self::receive_signal_timeout) /
+    /// [`wait_for_signal_timeout`](Self::wait_for_signal_timeout) race (issue
+    /// #476) is never resolved here, so a drain can never silently flip an
+    /// **open** race's outcome; a signal that already *lost* a resolved
+    /// `TimerWon` race is fair game (identical to `wait_for_signal`). History
+    /// order is authoritative, consistent with
+    /// [`match_signal_or_timer`](crate::replay::HistoryMatcher::match_signal_or_timer).
+    ///
+    /// # Interaction with push signal handlers
+    ///
+    /// This routes through `match_history`, whose `pump_signal_handlers`
+    /// post-hook runs *after* the call. So if you also register a push signal
+    /// handler (issue #546) for the same name, a single `try_receive_signal`
+    /// call's post-hook will dispatch the *remaining* buffered same-name signals
+    /// to that handler. Don't mix a manual drain and a push handler on one
+    /// signal name — pick one consumption style per name.
+    ///
+    /// # Performance
+    ///
+    /// A loop of `try_receive_signal` calls is O(N²) — each call removes from
+    /// the front of the pending-signal `VecDeque`. To consume a whole buffered
+    /// burst, prefer a single [`drain_signals`](Self::drain_signals) /
+    /// [`drain_signals_raw`](Self::drain_signals_raw) call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the buffered payload cannot be
+    /// deserialized into `O`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn try_receive_signal<O>(&self, signal_name: &str) -> HarvestResult<Option<O>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        match self.try_wait_for_signal(signal_name)? {
+            Some(raw) => Ok(Some(serde_json::from_value(raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Non-blocking consume of **all** currently-buffered, not-yet-consumed
+    /// signals of `signal_name`, each deserialized into `O`, in FIFO
+    /// recorded-history order.
+    ///
+    /// Returns an empty `Vec` when none is buffered. **Never suspends.** This is
+    /// the batch form of [`try_receive_signal`](Self::try_receive_signal) —
+    /// collect the whole burst of same-name signals in one workflow task
+    /// instead of one blocking `receive_signal` per signal (O(N) tasks and
+    /// O(N²) replay). See [`try_receive_signal`](Self::try_receive_signal) for
+    /// the full determinism, no-double-delivery, and race-safety contract; they
+    /// share it exactly.
+    ///
+    /// # Errors
+    ///
+    /// Fail-fast: returns [`HarvestError::Serialization`] on the **first**
+    /// buffered payload that cannot be deserialized into `O`. Earlier payloads
+    /// in the same drain have already been consumed from history when this
+    /// happens, so treat a deserialization error as a hard workflow error
+    /// (do not retry the drain expecting the bad payload to reappear). A
+    /// poison payload therefore discards every **good** signal in the same
+    /// batch — use the per-slot [`drain_signals_collect`](Self::drain_signals_collect)
+    /// if a single undeserializable payload must not lose its good siblings, or
+    /// the untyped [`drain_signals_raw`](Self::drain_signals_raw) if payloads
+    /// are heterogeneous.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn drain_signals<O>(&self, signal_name: &str) -> HarvestResult<Vec<O>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        self.drain_signals_raw(signal_name)?
+            .into_iter()
+            .map(|raw| serde_json::from_value(raw).map_err(HarvestError::from))
+            .collect()
+    }
+
+    /// Non-blocking, poison-tolerant consume of **all** currently-buffered,
+    /// not-yet-consumed signals of `signal_name`, each independently
+    /// deserialized into `O`, in FIFO recorded-history order.
+    ///
+    /// Returns a per-slot `Result<O, String>` — `Ok(payload)` for a signal that
+    /// deserialized, `Err(error_string)` for one that did not. Unlike the
+    /// fail-fast [`drain_signals`](Self::drain_signals), a single bad payload
+    /// mid-batch **never discards its good siblings**: every buffered signal is
+    /// consumed once (via [`drain_signals_raw`](Self::drain_signals_raw)) and
+    /// reported in its own slot. This mirrors the fan-out fail-fast/collect
+    /// pair ([`execute_activity_fan_out`](Self::execute_activity_fan_out) /
+    /// [`execute_activity_fan_out_collect`](Self::execute_activity_fan_out_collect)).
+    ///
+    /// **Never suspends.** See [`try_receive_signal`](Self::try_receive_signal)
+    /// for the full determinism, no-double-delivery, and race-safety contract;
+    /// they share it exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an outer `Err` only if the untyped drain itself fails (infallible
+    /// in practice); a payload that cannot be deserialized surfaces as a per-slot
+    /// `Err(String)`, never an outer error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn drain_signals_collect<O>(
+        &self,
+        signal_name: &str,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        Ok(self
+            .drain_signals_raw(signal_name)?
+            .into_iter()
+            .map(|raw| serde_json::from_value(raw).map_err(|e: serde_json::Error| e.to_string()))
+            .collect())
+    }
+
+    /// Untyped sibling of [`try_receive_signal`](Self::try_receive_signal):
+    /// non-blocking receive of the oldest buffered signal of `signal_name` as a
+    /// raw [`serde_json::Value`].
+    ///
+    /// Returns `Ok(Some(payload))` (oldest buffered) or `Ok(None)`. **Never
+    /// suspends.** See [`try_receive_signal`](Self::try_receive_signal) for the
+    /// full determinism, no-double-delivery, and race-safety contract.
+    ///
+    /// # Errors
+    ///
+    /// Infallible in practice — the `HarvestResult` wrapper mirrors the typed
+    /// sibling's signature so the two compose uniformly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn try_wait_for_signal(&self, signal_name: &str) -> HarvestResult<Option<Value>> {
+        Ok(self.match_history(|m| m.try_claim_pending_signal(signal_name)))
+    }
+
+    /// Untyped sibling of [`drain_signals`](Self::drain_signals): non-blocking
+    /// consume of **all** currently-buffered signals of `signal_name` as raw
+    /// [`serde_json::Value`]s, in FIFO recorded-history order.
+    ///
+    /// Returns an empty `Vec` when none is buffered. **Never suspends.** See
+    /// [`try_receive_signal`](Self::try_receive_signal) for the full
+    /// determinism, no-double-delivery, and race-safety contract.
+    ///
+    /// # Errors
+    ///
+    /// Infallible in practice — the `HarvestResult` wrapper mirrors
+    /// [`drain_signals`](Self::drain_signals)'s signature so the two compose
+    /// uniformly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn drain_signals_raw(&self, signal_name: &str) -> HarvestResult<Vec<Value>> {
+        let claimed = self.match_history(|m| m.claim_pending_signal(signal_name));
+        Ok(claimed.into_iter().map(|(_idx, payload)| payload).collect())
     }
 
     /// Block until a predicate over workflow local state evaluates to true.
@@ -5272,6 +5462,11 @@ impl WorkflowContext {
     }
 
     /// Wait for the next delivered signal with the given name.
+    ///
+    /// See also the non-blocking siblings
+    /// [`try_wait_for_signal`](Self::try_wait_for_signal) /
+    /// [`drain_signals_raw`](Self::drain_signals_raw) for the aggregator pattern
+    /// (block once, then sweep up the rest without extra tasks).
     ///
     /// # Errors
     ///
@@ -9699,6 +9894,350 @@ mod tests {
         ctx.register_signal_handler("cancel", |_req: CancelRequest| {
             panic!("handler must never run on a deserialization failure");
         });
+    }
+
+    // ── Non-blocking signal drain (issue #775) ────────────────────────────
+
+    #[test]
+    fn drain_signals_raw_returns_all_buffered_in_order() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 3}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let drained = ctx.drain_signals_raw("event").unwrap();
+        assert_eq!(
+            drained,
+            vec![
+                serde_json::json!({"seq": 1}),
+                serde_json::json!({"seq": 2}),
+                serde_json::json!({"seq": 3}),
+            ]
+        );
+        // A second drain sees nothing (no double delivery).
+        assert!(ctx.drain_signals_raw("event").unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_signals_typed_deserializes_each() {
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Item {
+            id: u64,
+        }
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 10}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 20}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let drained: Vec<Item> = ctx.drain_signals("item").unwrap();
+        assert_eq!(drained, vec![Item { id: 10 }, Item { id: 20 }]);
+    }
+
+    #[test]
+    fn drain_signals_fail_fast_on_bad_payload() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Item {
+            id: u64,
+        }
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 10}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                // Wrong shape: cannot deserialize into Item.
+                payload: serde_json::json!("not-an-object"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.drain_signals::<Item>("item");
+        assert!(
+            matches!(result, Err(HarvestError::Serialization(_))),
+            "a bad payload must abort the drain with a Serialization error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn drain_signals_collect_returns_per_slot_results() {
+        // The poison-tolerant collect variant (issue #775 review): a single bad
+        // payload mid-batch must NOT discard its good siblings. Mirrors the
+        // fan-out fail-fast/collect pair (`execute_activity_fan_out_collect`).
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Item {
+            id: u64,
+        }
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 10}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                // Poison payload sandwiched between two good ones.
+                payload: serde_json::json!("not-an-object"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "item".into(),
+                payload: serde_json::json!({"id": 30}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let per_slot: Vec<Result<Item, String>> = ctx.drain_signals_collect("item").unwrap();
+        assert_eq!(per_slot.len(), 3);
+        // Crucially: both GOOD payloads survive the poison one — no data loss.
+        assert_eq!(per_slot[0], Ok(Item { id: 10 }));
+        assert!(per_slot[1].is_err(), "the poison slot is Err, not dropped");
+        assert_eq!(per_slot[2], Ok(Item { id: 30 }));
+    }
+
+    #[test]
+    fn try_receive_signal_returns_oldest_then_none() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let first: Option<Value> = ctx.try_receive_signal("event").unwrap();
+        assert_eq!(first, Some(serde_json::json!({"seq": 1})));
+        let second: Option<Value> = ctx.try_receive_signal("event").unwrap();
+        assert_eq!(second, Some(serde_json::json!({"seq": 2})));
+        let third: Option<Value> = ctx.try_receive_signal("event").unwrap();
+        assert_eq!(third, None);
+    }
+
+    #[test]
+    fn try_wait_for_signal_none_when_empty() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()]);
+        assert_eq!(ctx.try_wait_for_signal("event").unwrap(), None);
+    }
+
+    #[test]
+    fn try_wait_for_signal_returns_some_when_buffered() {
+        // Direct coverage of the untyped `Some` path (previously only exercised
+        // transitively through `try_receive_signal`).
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(
+            ctx.try_wait_for_signal("event").unwrap(),
+            Some(serde_json::json!({"seq": 1}))
+        );
+        // Consumed — a following call sees nothing.
+        assert_eq!(ctx.try_wait_for_signal("event").unwrap(), None);
+    }
+
+    #[test]
+    fn try_receive_signal_emits_no_commands() {
+        // The non-blocking drain must NEVER push a WaitForSignal command (or
+        // any command) — proving it can never suspend the workflow.
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()]);
+        let got: Option<Value> = ctx.try_receive_signal("event").unwrap();
+        assert_eq!(got, None);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "try_receive_signal must not emit any command"
+        );
+
+        // Same for drain_signals over an empty buffer.
+        let drained = ctx.drain_signals_raw("event").unwrap();
+        assert!(drained.is_empty());
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "drain_signals must not emit any command"
+        );
+    }
+
+    #[test]
+    fn drain_then_wait_for_signal_no_double_delivery() {
+        // A pull-based match_signal (via wait_for_signal's fast path) must not
+        // re-see an event a prior drain already consumed.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let drained = ctx.drain_signals_raw("event").unwrap();
+        assert_eq!(drained, vec![serde_json::json!({"seq": 1})]);
+
+        // The pull path now sees nothing recorded → it would suspend live.
+        // We assert the matcher-level effect: no buffered signal remains.
+        assert_eq!(ctx.try_wait_for_signal("event").unwrap(), None);
+    }
+
+    #[test]
+    fn drain_skips_race_reserved_signal() {
+        // A signal reserved for an open signal-or-deadline race (issue #476)
+        // must not be drained out from under the race.
+        let timer_id = "__signal_timeout:1:approval";
+        let events = vec![
+            started_event(),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer_id),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(
+            ctx.drain_signals_raw("approval").unwrap().is_empty(),
+            "the racing signal must not be drained"
+        );
+        assert_eq!(ctx.try_wait_for_signal("approval").unwrap(), None);
+    }
+
+    #[test]
+    fn drain_and_push_handler_first_claim_wins() {
+        // Precedence: a push handler and a drain both consume from the same
+        // buffered-signal pool; whichever runs first (in code-execution order)
+        // claims the event, and the other sees nothing for that occurrence —
+        // no double delivery in either direction.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // The drain runs first and claims the event.
+        let drained = ctx.drain_signals_raw("event").unwrap();
+        assert_eq!(drained, vec![serde_json::json!({"seq": 1})]);
+
+        // A push handler registered afterwards sees nothing for that event.
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("event", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        ctx.flush_pending_signal_handlers();
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "a drain that already claimed the event leaves nothing for a push handler"
+        );
+    }
+
+    #[test]
+    fn push_handler_first_claim_leaves_nothing_for_a_later_drain() {
+        // The reverse direction of `drain_and_push_handler_first_claim_wins`:
+        // a push handler that already claimed the event via dispatch leaves
+        // nothing for a subsequent drain — no double delivery either way.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // The push handler runs first and claims the event.
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("event", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        ctx.flush_pending_signal_handlers();
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![serde_json::json!({"seq": 1})],
+            "the push handler must receive the signal"
+        );
+
+        // A drain afterwards sees nothing — the handler already claimed it.
+        assert!(
+            ctx.drain_signals_raw("event").unwrap().is_empty(),
+            "a push handler that already claimed the event leaves nothing for a drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_after_a_drain_is_observable_by_a_subsequent_drain() {
+        // AC6b made explicit: a signal recorded AFTER an activity the workflow
+        // has not yet reached is invisible to an early drain, but becomes
+        // observable to a SUBSEQUENT drain once the workflow's own code advances
+        // the cursor past that activity.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "event".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // First drain: the signal sits behind an unconsumed activity → invisible.
+        assert!(
+            ctx.drain_signals_raw("event").unwrap().is_empty(),
+            "a signal behind an unconsumed activity is not observable to an early drain"
+        );
+
+        // The workflow's own code replays the activity, advancing the cursor.
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+        assert_eq!(result.unwrap(), serde_json::json!("sent"));
+
+        // Subsequent drain: the now-reachable signal is returned.
+        assert_eq!(
+            ctx.drain_signals_raw("event").unwrap(),
+            vec![serde_json::json!({"seq": 1})],
+            "a signal after the drain point is observable by a subsequent drain"
+        );
     }
 
     #[test]
