@@ -26,11 +26,15 @@ use autumn_harvest::admission_gate::{
     set_global_admission_metrics,
 };
 use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
+use autumn_harvest::context::SharedStateMap;
+use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
-use autumn_harvest::telemetry::MetricsRecorder;
+use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
-use autumn_harvest::worker::DbPool;
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::{
+    DagCatalog, SchedulerMonitor, StartWorkflowParams, start_or_load_workflow_execution, tick_once,
+};
 use chrono::Utc;
 use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -219,6 +223,7 @@ struct CapturingMetrics {
     blocked: Mutex<Vec<(String, String)>>,
     fired: Mutex<Vec<(String, String)>>,
     bypassed: Mutex<Vec<String>>,
+    skipped: Mutex<Vec<(String, String, String)>>,
 }
 
 impl CapturingMetrics {
@@ -230,6 +235,9 @@ impl CapturingMetrics {
     }
     fn bypassed(&self) -> Vec<String> {
         self.bypassed.lock().unwrap().clone()
+    }
+    fn skipped(&self) -> Vec<(String, String, String)> {
+        self.skipped.lock().unwrap().clone()
     }
 }
 
@@ -248,6 +256,12 @@ impl MetricsRecorder for CapturingMetrics {
     }
     fn record_admission_bypassed(&self, producer: &str) {
         self.bypassed.lock().unwrap().push(producer.to_string());
+    }
+    fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
+        self.skipped
+            .lock()
+            .unwrap()
+            .push((kind.to_string(), name.to_string(), reason.to_string()));
     }
 }
 
@@ -403,6 +417,26 @@ async fn target_exec_count(conn: &mut AsyncPgConnection) -> i64 {
     .await
     .expect("count target")
     .n
+}
+
+async fn target_exec_count_named(conn: &mut AsyncPgConnection, workflow_name: &str) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = $1",
+    )
+    .bind::<Text, _>(workflow_name)
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("count named target")
+    .n
+}
+
+fn sched_noop_handler<'a>(
+    _ctx: &'a autumn_harvest::WorkflowContext,
+    input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+> {
+    Box::pin(async move { Ok(input) })
 }
 
 fn fleet_cache(reason: &str) -> Arc<AdmissionGateCache> {
@@ -997,6 +1031,243 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
     // Three targets started (debounce, throttle, event-batch); the CT relay was
     // blocked, so its target never started.
     assert_eq!(target_exec_count(&mut conn).await, 3);
+}
+
+/// F-round17 (Finding A): the event-batch IMMEDIATE (max_size-reached) flush starts
+/// the workflow synchronously in the request path, so it must count an
+/// `event_batch` bypass exactly like the scanner's deferred fire. A deferred
+/// (not-yet-full) admission counts nothing until its flush, and an
+/// immediately-flushed batch is never also fired (or counted) by the scanner —
+/// exactly-once, immediate XOR scanner.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn immediate_max_size_flush_counts_bypass_exactly_once() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    // A Fleet gate is raised (as if during an incident, after the HTTP pre-check).
+    // The event-batch producer is exempt-with-bypass-counter, so the immediate flush
+    // proceeds and is COUNTED (never silently slips the gate).
+    let cache = fleet_cache("immediate-flush-incident");
+    set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+
+    // ── Phase A: max_size = 1 → the single admission flushes immediately. ──
+    let recorder_a = Arc::new(CapturingMetrics::default());
+    let ref_a: &(dyn MetricsRecorder + Send + Sync) = recorder_a.as_ref();
+    let (outcome_a, _deferred) = autumn_harvest::event_batch::admit_batched_start(
+        &mut conn,
+        autumn_harvest::event_batch::AdmitBatchParams {
+            workflow_name: "ag_target_wf".to_string(),
+            batch_key: "k-immediate".to_string(),
+            workflow_id: "batch-immediate".to_string(),
+            queue_name: "default".to_string(),
+            payload: json!({}),
+            start_options: autumn_harvest::debounce::DebounceStartOptions::default(),
+            max_wait: std::time::Duration::from_secs(3600),
+            max_size: 1,
+            shard_id: 0,
+        },
+        Some(ref_a),
+    )
+    .await
+    .expect("admit_batched_start must not error")
+    .expect("admit returns an outcome");
+    assert!(
+        outcome_a.is_flushed,
+        "max_size = 1 flushes the batch immediately in the request path"
+    );
+    assert!(
+        outcome_a.flushed_execution_id.is_some(),
+        "the immediate flush started a workflow"
+    );
+    assert_eq!(
+        recorder_a.bypassed(),
+        vec!["event_batch".to_string()],
+        "the immediate max_size flush counts the event_batch bypass exactly once"
+    );
+
+    // The scanner must NOT re-fire (or re-count) the flushed batch — the immediate
+    // flush DELETEd the row inside its transaction, so immediate XOR scanner holds.
+    let scanner_fired =
+        autumn_harvest::event_batch::fire_due_event_batches(&mut conn, &None, &[], ref_a)
+            .await
+            .expect("scanner");
+    assert_eq!(
+        scanner_fired, 0,
+        "an immediately-flushed batch is not re-fired by the scanner"
+    );
+    assert_eq!(
+        recorder_a.bypassed(),
+        vec!["event_batch".to_string()],
+        "no double-count: the scanner did not add a second bypass"
+    );
+
+    // ── Phase B: max_size = 2, one admission → DEFERRED, counts nothing yet. ──
+    let recorder_b = Arc::new(CapturingMetrics::default());
+    let ref_b: &(dyn MetricsRecorder + Send + Sync) = recorder_b.as_ref();
+    let (outcome_b, _deferred_b) = autumn_harvest::event_batch::admit_batched_start(
+        &mut conn,
+        autumn_harvest::event_batch::AdmitBatchParams {
+            workflow_name: "ag_target_wf".to_string(),
+            batch_key: "k-deferred".to_string(),
+            workflow_id: "batch-deferred".to_string(),
+            queue_name: "default".to_string(),
+            payload: json!({}),
+            start_options: autumn_harvest::debounce::DebounceStartOptions::default(),
+            max_wait: std::time::Duration::from_secs(3600),
+            max_size: 2,
+            shard_id: 0,
+        },
+        Some(ref_b),
+    )
+    .await
+    .expect("admit_batched_start must not error")
+    .expect("admit returns an outcome");
+    assert!(
+        !outcome_b.is_flushed,
+        "a single admission into a max_size = 2 batch defers (no immediate flush)"
+    );
+    assert!(
+        recorder_b.bypassed().is_empty(),
+        "a deferred (not-yet-full) admission counts no bypass until it flushes"
+    );
+
+    set_global_admission_gate_cache(None);
+}
+
+/// F-round17 (Finding B): the scheduler is a *gated* producer. A due schedule
+/// blocked by an active gate must appear in `harvest.admission.blocked` (via
+/// `record_admission_blocked`) in addition to the schedule-domain
+/// `record_schedule_skipped(..., "admission_blocked")` signal — so a scheduled
+/// start blocked during an incident is not missing from the "zero-uncounted gated
+/// producer" contract.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn scheduled_start_blocked_by_gate_records_admission_blocked() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    diesel::sql_query("DELETE FROM harvest_schedules")
+        .execute(&mut conn)
+        .await
+        .expect("scrub schedules");
+    install_global_router(ShardRouter::default());
+
+    let wf_name = "ag_sched_wf";
+
+    // A due schedule (next_run_at in the past).
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules
+            (id, workflow_name, schedule_expr, timezone, catchup, max_active_runs,
+             is_paused, next_run_at, jitter_secs, overlap_policy, buffered_runs,
+             buffer_all_max, skip_policy)
+         VALUES (gen_random_uuid(), $1, 'interval:60', 'UTC', false, 10, false,
+                 NOW() - INTERVAL '5 seconds', 0, 'skip', '[]'::jsonb, 100, 'skip')",
+    )
+    .bind::<Text, _>(wf_name)
+    .execute(&mut conn)
+    .await
+    .expect("insert due schedule");
+
+    // A matching Fleet gate persisted in the DB — the scheduler loads gates from the
+    // central store at tick time (not the global cache).
+    autumn_harvest::admission_gate::db::create_gate(
+        &mut conn,
+        &GateScope::Fleet,
+        "sched-incident",
+        None,
+        "test",
+        None,
+    )
+    .await
+    .expect("persist gate");
+
+    // Build a registry whose telemetry recorder is our capturing recorder, so the
+    // tick's block/skip metric calls are observable.
+    let recorder = Arc::new(CapturingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recorder) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: wf_name,
+            module: "admission_gate_authoritative_tests",
+            handler: sched_noop_handler,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        Arc::new(SharedStateMap::default()),
+        telemetry,
+    ));
+
+    tick_once(
+        pool.clone(),
+        registry,
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick_once");
+
+    // Cleanup persisted gate/schedule before asserting.
+    diesel::sql_query("DELETE FROM harvest_admission_gates")
+        .execute(&mut conn)
+        .await
+        .expect("scrub gates");
+    diesel::sql_query("DELETE FROM harvest_schedules")
+        .execute(&mut conn)
+        .await
+        .expect("scrub schedules");
+
+    // The block appears in harvest.admission.blocked with the Fleet scope kind…
+    let blocked = recorder.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "a due schedule blocked by a gate records exactly one admission block"
+    );
+    assert_eq!(
+        blocked[0].0, "fleet",
+        "the admission block carries the matched gate's scope kind"
+    );
+    // …AND the schedule-domain skip signal is still emitted.
+    let skipped = recorder.skipped();
+    assert!(
+        skipped.iter().any(|(kind, name, reason)| kind == "workflow"
+            && name == wf_name
+            && reason == "admission_blocked"),
+        "the schedule-skip signal is still recorded alongside the admission block: {skipped:?}"
+    );
+    // The blocked schedule started no workflow.
+    assert_eq!(target_exec_count_named(&mut conn, wf_name).await, 0);
 }
 
 /// AC2 semantics at the trigger layer: a scoped gate that does NOT match the

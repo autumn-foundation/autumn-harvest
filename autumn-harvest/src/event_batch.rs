@@ -346,6 +346,20 @@ pub async fn admit_batched_start(
     }
 
     if let Some(m) = metrics {
+        // issue #618, F-round17: the IMMEDIATE (max_size-reached) flush starts the
+        // workflow SYNCHRONOUSLY in this request path — mirror the scanner's
+        // deferred-fire bypass count (`fire_due_on_conn` above) so a max_size flush
+        // that fires after a gate is raised (post the HTTP admission pre-check)
+        // never slips the gate silently. Gated on `is_flushed` (this call actually
+        // consumed the batch and started the workflow — the branch that ran
+        // start_or_load + DELETEd the row). A not-yet-full admission has
+        // `is_flushed == false` and is counted only at its later scanner flush, so a
+        // given batch is counted on EXACTLY ONE path: immediate XOR scanner. The two
+        // are mutually exclusive because the immediate flush DELETEs the row inside
+        // the same transaction as the start, so the scanner can never claim it.
+        if outcome.is_flushed {
+            m.record_admission_bypassed(crate::admission_gate::StartProducer::EventBatch.as_str());
+        }
         for (wf_name, q_name) in cancel_metrics {
             m.record_workflow_terminal(
                 &wf_name,
