@@ -175,6 +175,13 @@ async fn drain_workflow_start_outbox_batch(
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
 
+    // issue #618, F-round8: the metrics recorder for the exempt-with-bypass-counter
+    // "outbox" producer. Fetched once; the bypass is counted per row only AFTER the
+    // app outbox row is durably marked delivered (see below).
+    let outbox_metrics = state
+        .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+        .map(|registry| std::sync::Arc::clone(&registry.telemetry().metrics));
+
     let claimed = rows.len();
     let mut delivered = 0usize;
     for row in rows {
@@ -184,6 +191,19 @@ async fn drain_workflow_start_outbox_batch(
                     .await
                     .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
                 delivered += 1;
+                // issue #618, F-round8: count the "outbox" bypass EXACTLY ONCE, gated
+                // on the durable mark-delivered above succeeding. If the start
+                // succeeded but this mark had failed, we would have `?`-returned above
+                // WITHOUT counting; the row stays eligible and the retry re-enters
+                // dispatch (start_or_load returns the same existing execution) and
+                // marks delivered — counting only then. So exactly one bypass per
+                // committed outbox start across any number of mark retries. Mirrors
+                // round 6's "gate the count on the row delete actually removing the row".
+                if let Some(metrics) = outbox_metrics.as_ref() {
+                    metrics.record_admission_bypassed(
+                        autumn_harvest::admission_gate::StartProducer::Outbox.as_str(),
+                    );
+                }
             }
             Err(error) => {
                 mark_outbox_row_failed(&mut app_conn, &row, &claimant, &config, &error.to_string())
@@ -353,16 +373,17 @@ pub(crate) async fn dispatch_workflow_start_request(
     // It replays workflow-start requests that were durably committed to the
     // outbox before any gate was raised; gating them would drop already-accepted
     // in-flight work, which is the opposite of the gate contract ("halt NEW
-    // starts while in-flight work drains"). We count every relayed start on
-    // `harvest.admission.bypassed{producer="outbox"}` so the exemption is
-    // observable — an operator can see in real time whether anything is slipping
-    // an active gate. See `admission_gate::producer_contract`.
-    if let Some(registry) = registry_ext.as_ref() {
-        registry.telemetry().metrics.record_admission_bypassed(
-            autumn_harvest::admission_gate::StartProducer::Outbox.as_str(),
-        );
-    }
-
+    // starts while in-flight work drains").
+    //
+    // The `harvest.admission.bypassed{producer="outbox"}` count is recorded by the
+    // CALLER (`drain_workflow_start_outbox_batch`), gated on the app outbox row
+    // being DURABLY marked delivered (issue #618, F-round8) — NOT here. The start
+    // succeeding is not the exactly-once boundary: if `mark_outbox_row_delivered`
+    // then fails, the row stays eligible past its claim TTL and the retry re-enters
+    // this path (`start_or_load` returns the SAME existing execution), so counting
+    // here would report one committed start as multiple bypasses. Counting only
+    // once the mark succeeds mirrors round 6's "gate the count on the row delete
+    // actually removing the row". See `admission_gate::producer_contract`.
     Ok(start.exec_id)
 }
 

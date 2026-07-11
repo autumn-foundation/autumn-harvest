@@ -395,6 +395,93 @@ async fn outbox_relay_is_exempt_and_counts_the_bypass() {
     );
 }
 
+/// F-round8 (issue #618): the workflow-start outbox bypass is counted EXACTLY
+/// ONCE per committed start, gated on the app outbox row being durably marked
+/// delivered — not on the Harvest start succeeding. This test drives the
+/// observable half of that guarantee: a single relay counts once and marks the
+/// row delivered, and a SECOND flush (the delivered row is now ineligible) never
+/// re-counts. The start-ok/mark-Err retry path — where the OLD code counted at
+/// start time and would count AGAIN on the retry (`start_or_load` returning the
+/// same existing execution) — is closed by moving the count strictly AFTER the
+/// `?`-guarded `mark_outbox_row_delivered`; a genuine mark-DB-error cannot be
+/// injected through the public flush path, so that specific window is covered by
+/// the count's placement (verified by reading) rather than a fault-injection test.
+#[tokio::test]
+async fn outbox_bypass_counted_exactly_once_across_reflush() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    // Installing the runtime also installs the global shard router.
+    let _api_state = build_api_state(&pool, Arc::clone(&registry));
+
+    let state = AppState::for_test().with_pool(build_web_pool(&url));
+    state.insert_extension(HarvestDbPool::from(pool.clone()));
+    state.insert_extension(ShardRouter::default());
+    state.insert_extension(registry);
+    state.insert_extension(HarvestOutboxConfig {
+        enabled: true,
+        ..HarvestOutboxConfig::default()
+    });
+
+    enqueue_workflow_start_outbox(
+        &mut conn,
+        &WorkflowStartRequest {
+            workflow_name: "ag_target_wf".to_string(),
+            workflow_id: "outbox-once".to_string(),
+            queue_name: "default".to_string(),
+            input: json!({"from": "outbox"}),
+            memo: None,
+            search_attrs: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // First flush: relays the row, marks it delivered, and counts the bypass ONCE.
+    let delivered = flush_workflow_start_outbox(&state).await.unwrap();
+    assert_eq!(delivered, 1, "the relay delivers the one queued row");
+    assert_eq!(
+        metrics.bypassed(),
+        vec!["outbox".to_string()],
+        "one committed outbox start counts exactly one bypass"
+    );
+    // The count is observably tied to the durable mark: the row is delivered.
+    let undelivered: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_outbox WHERE delivered_at IS NULL",
+    )
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .unwrap()
+    .n;
+    assert_eq!(
+        undelivered, 0,
+        "the relayed row is durably marked delivered"
+    );
+
+    // Second flush: the delivered row is no longer eligible, so nothing is
+    // re-dispatched and the bypass is NOT counted again (exactly-once holds).
+    let delivered_again = flush_workflow_start_outbox(&state).await.unwrap();
+    assert_eq!(delivered_again, 0, "a delivered row is never re-relayed");
+    assert_eq!(
+        metrics.bypassed(),
+        vec!["outbox".to_string()],
+        "a delivered row is never re-counted — exactly one bypass per committed start"
+    );
+    // Exactly one execution started (start_or_load would return the same one on a
+    // retry, so this also guards the re-dispatch double-count from the exec side).
+    assert_eq!(target_exec_count(&mut conn).await, 1);
+}
+
 /// AC2: a scoped gate blocks a start that matches its scope and lets a
 /// non-matching start proceed. The inbound webhook receiver (issue #344)
 /// delegates `Starts` / `SignalsWithStart` straight to `api::start_workflow` /
