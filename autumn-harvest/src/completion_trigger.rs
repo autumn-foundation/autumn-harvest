@@ -628,11 +628,7 @@ pub async fn resolve_target_queue(
         {
             return q;
         }
-        return GLOBAL_DEFAULT_WORKFLOW_QUEUE
-            .read()
-            .ok()
-            .and_then(|lock| lock.clone())
-            .unwrap_or_else(|| "default".to_string());
+        return default_workflow_queue();
     }
 
     // Otherwise, acquire a connection to the configured default shard to query
@@ -665,6 +661,17 @@ pub async fn resolve_target_queue(
         }
     }
 
+    default_workflow_queue()
+}
+
+/// The shard-independent default start queue: the process-global registered
+/// default (`GLOBAL_DEFAULT_WORKFLOW_QUEUE`), else the literal `"default"`.
+///
+/// This is the correct answer whenever a schedule-level queue override cannot be
+/// read — it depends on no shard's `harvest_schedules` and so can never return a
+/// wrong-shard queue.
+#[cfg(feature = "db")]
+fn default_workflow_queue() -> String {
     GLOBAL_DEFAULT_WORKFLOW_QUEUE
         .read()
         .ok()
@@ -677,13 +684,23 @@ pub async fn resolve_target_queue(
 /// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
 /// time: on a fresh connection to the target shard's own pool, so the inline
 /// admission-gate check (issue #618, F2 re-review) evaluates the exact queue the
-/// deferred start will use. Falls back to `source_conn` when the target-shard
-/// pool is unavailable — Fleet/name gates do not depend on the queue and still
-/// match; only a Queue(q) gate could be missed in that unreachable-pool edge,
-/// no worse than pre-fix.
+/// deferred start will use.
+///
+/// The source transaction connection is **deliberately not a parameter** (issue
+/// #618, F2 re-review round 2): the schedule-level queue override lives only on
+/// the target shard, and resolving it on the source connection would query the
+/// WRONG shard's `harvest_schedules` — for a target hashing to shard 0,
+/// `resolve_target_queue`'s directly-queryable branch would read the source
+/// connection and could return a wrong queue, silently mis-evaluating a Queue(q)
+/// gate (the exact bug F2 fixed, reintroduced in the connection-failure edge).
+/// When the target-shard pool/connection is unavailable we therefore fall back to
+/// the shard-INDEPENDENT `default_workflow_queue()`, never to the source
+/// connection. Fleet/name/owner/shard gates do not depend on the queue and still
+/// evaluate correctly in the fallback. Bounded double-fault edge (documented): a
+/// `Queue(schedule-override)` gate can be missed only while the target shard is
+/// unreachable — strictly better than returning a wrong-shard queue.
 #[cfg(feature = "db")]
 pub async fn resolve_cross_shard_target_queue(
-    source_conn: &mut diesel_async::AsyncPgConnection,
     target_workflow_name: &str,
     target_shard: crate::types::ShardId,
 ) -> String {
@@ -702,11 +719,11 @@ pub async fn resolve_cross_shard_target_queue(
                 error = %e,
                 target_shard = target_shard.as_i32(),
                 "could not acquire target-shard connection for cross-shard admission-gate \
-                 queue resolution; falling back to source connection"
+                 queue resolution; falling back to the shard-independent default queue"
             ),
         }
     }
-    resolve_target_queue(source_conn, target_workflow_name, target_shard).await
+    default_workflow_queue()
 }
 
 #[cfg(feature = "db")]
@@ -1116,20 +1133,17 @@ pub fn evaluate_triggers_for_execution<'a>(
                     // `enforce_completion_triggers_outbox`). Resolve identically
                     // here — on a fresh target-shard connection — so the inline
                     // gate check evaluates the SAME queue the start will use.
-                    // Passing the source `conn` would make `resolve_target_queue`
-                    // query `harvest_schedules` on the wrong shard for a target
-                    // that hashes to shard 0, missing a Queue(q) gate scoped to
-                    // the real target queue (the outbox is exempt-with-counter,
-                    // so nothing catches it downstream). If the target-shard pool
-                    // is unavailable, fall back to the source connection: Fleet
-                    // and name gates do not depend on the queue and still match;
-                    // only a Queue gate would be missed, no worse than pre-fix.
-                    resolve_cross_shard_target_queue(
-                        conn,
-                        &trigger_db.target_workflow_name,
-                        target_shard,
-                    )
-                    .await
+                    // `resolve_cross_shard_target_queue` deliberately takes NO
+                    // source connection: for a target hashing to shard 0, querying
+                    // `harvest_schedules` on the source `conn` would read the wrong
+                    // shard and could miss a Queue(q) gate scoped to the real
+                    // target queue. If the target-shard pool is unavailable it
+                    // falls back to the shard-independent default queue (never the
+                    // source connection); Fleet/name gates still match — only a
+                    // schedule-override Queue gate could be missed in that
+                    // double-fault edge.
+                    resolve_cross_shard_target_queue(&trigger_db.target_workflow_name, target_shard)
+                        .await
                 };
                 resolved_queue = Some(gate_queue.clone());
                 if let Some((_gate_id, reason, scope_kind)) = cache.check_cached(

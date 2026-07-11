@@ -44,29 +44,168 @@ use uuid::Uuid;
 /// Serialises the process-global gate cache + shard router across tests.
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
+// The COMPLETE migration set, in timestamp order (identical to `diesel migration
+// run`). The CI Docker step boots a fresh Postgres seeded from ONLY this const, so
+// every table/column `start_or_load_workflow_execution` and the completion-trigger
+// path read MUST be present here. A hand-picked subset silently rots as the start
+// path gains column reads (issue #618: `harvest_build_policies` from build_routing
+// AND `legal_hold_set_at` from a much later migration were both missing from an
+// earlier subset), so this suite uses the full set to be drift-proof by
+// construction — the applied superset never over-constrains a test. When a new
+// migration lands, regenerate this block from `ls migrations/*/` in sorted order.
 const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../../migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql"),
     "\n",
-    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    include_str!("../../migrations/20260424000000_harvest_sticky_routing/up.sql"),
     "\n",
-    include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
+    include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260428000000_harvest_retention_scan_index/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260501010000_harvest_batch_jobs/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260501020000_harvest_batch_processed_ids/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260503000000_harvest_workflow_reset/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260504000000_harvest_workflow_parent_children/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260510000000_harvest_backfill_log/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260514000000_drop_harvest_dag_runs/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
     "\n",
     include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
     "\n",
-    // Scanner tables for the deferred-fire-producer bypass-counter test (F1/F6).
-    include_str!("../../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    include_str!("../../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260611000001_harvest_stalled_workflow_index/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260618000000_harvest_workflow_list_keyset_index/up.sql"),
     "\n",
     include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
     "\n",
+    include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
+    "\n",
     include_str!("../../migrations/20260624000000_harvest_event_batches/up.sql"),
     "\n",
+    include_str!("../../migrations/20260624000001_harvest_non_terminal_reachability_index/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260627000001_harvest_payload_refs/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260628000000_harvest_events_history_page_index/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260628000001_harvest_execution_origin/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260702000000_harvest_usage_report_indexes/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    "\n",
     include_str!("../../migrations/20260706000001_harvest_start_throttle/up.sql"),
+    "\n",
+    include_str!(
+        "../../migrations/20260707000000_harvest_start_throttle_bucket_deferred_idx/up.sql"
+    ),
+    "\n",
+    include_str!("../../migrations/20260708000000_harvest_start_throttle_workflow_id_idx/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260708000002_harvest_schedule_runs_slot_index/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260709000000_harvest_start_idempotency/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
+    "\n",
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
-/// Per-workflow schedule columns the cross-shard test's fresh DBs need beyond
-/// `INIT_SQL` (`resolve_target_queue` selects `queue_name WHERE workflow_name`).
+/// Per-workflow schedule columns the cross-shard test's fresh DBs need. These are
+/// already present in `INIT_SQL` (the full `harvest_schedules`/`schedule_id`
+/// migrations add `workflow_name`/`queue_name`), so the `ADD COLUMN IF NOT EXISTS`
+/// clauses are idempotent no-ops kept for defensive clarity; `resolve_target_queue`
+/// selects `queue_name WHERE workflow_name`.
 const SCHED_COLS: &str = "ALTER TABLE harvest_schedules ALTER COLUMN dag_name DROP NOT NULL; \
      ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS workflow_name TEXT; \
      ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS queue_name TEXT;";
@@ -897,12 +1036,12 @@ async fn boot_load_of_persisted_gate_blocks_completion_trigger() {
 ///
 /// Genuine two-database multi-shard setup: shard 0 (target) owns the schedule
 /// mapping `ag_target_wf -> ag_priority_q`; shard 1 (source) has NO such
-/// schedule. Only `harvest_schedules` is needed (no workflow start), so it RUNS
+/// schedule. It focuses on `harvest_schedules` (no workflow start), so it RUNS
 /// against a real cluster (local Postgres or testcontainers) via two fresh
-/// databases. The full evaluate → gate → block chain for a cross-shard target
-/// additionally needs `start_or_load_workflow_execution` (which reads
-/// `harvest_build_policies`, not in this suite's `INIT_SQL`), so it is verified
-/// by this focused resolver test plus the same-shard block tests above.
+/// databases seeded from `INIT_SQL`. The full evaluate → gate → block chain for a
+/// cross-shard target additionally needs `start_or_load_workflow_execution`; that
+/// path is covered by the same-shard block tests above (all now backed by the
+/// full start-path `INIT_SQL`, which includes `harvest_build_policies`).
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
@@ -971,18 +1110,45 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     let mut src_conn = pool1.get().await.unwrap();
 
     // FIX: resolve on the TARGET shard (0) → finds the target's real queue.
+    // No source connection is passed — the resolver goes to the target shard's
+    // own pool (installed in `sharded`), so it reads shard 0's schedules.
     let resolved = autumn_harvest::completion_trigger::resolve_cross_shard_target_queue(
+        "ag_target_wf",
+        ShardId::new(0),
+    )
+    .await;
+
+    // PRE-FIX behaviour, for contrast: `resolve_target_queue(source_conn, …,
+    // shard 0)` treats shard 0 as directly queryable on the connection it holds —
+    // the SOURCE connection (shard 1), which has no ag_target_wf schedule — so it
+    // misses it. The fixed cross-shard resolver never takes a source connection,
+    // so this wrong-shard read is now structurally impossible from it.
+    let buggy = autumn_harvest::completion_trigger::resolve_target_queue(
         &mut src_conn,
         "ag_target_wf",
         ShardId::new(0),
     )
     .await;
 
-    // PRE-FIX behaviour: `resolve_target_queue(source_conn, …, shard 0)` treats
-    // shard 0 as directly queryable on the connection it holds — the SOURCE
-    // connection (shard 1), which has no ag_target_wf schedule — so it misses it.
-    let buggy = autumn_harvest::completion_trigger::resolve_target_queue(
-        &mut src_conn,
+    // FALLBACK path (F2 re-review round 2): the target-shard (0) pool is
+    // UNAVAILABLE. Seed shard 1 (source) with a WRONG queue for ag_target_wf and
+    // install a sharded pool that maps ONLY shard 1 — so `exact_pool_for(0)` is
+    // None and the resolver takes the fallback. It must return the shard-
+    // independent default queue, NEVER the source shard's `ag_source_wrong_q`
+    // (which would prove it wrongly queried the source connection's schedules).
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules (id, workflow_name, queue_name, schedule_expr) \
+         VALUES (gen_random_uuid(), 'ag_target_wf', 'ag_source_wrong_q', '@daily')",
+    )
+    .execute(&mut src_conn)
+    .await
+    .expect("seed source-shard wrong schedule");
+    let mut only_src = BTreeMap::new();
+    only_src.insert(ShardId::new(1), pool1.clone());
+    // `from_map` self-installs into GLOBAL_SHARDED_POOL; it maps only shard 1,
+    // so `exact_pool_for(0)` is None and the resolver takes the fallback.
+    let sharded_no_target = ShardedDbPool::from_map(only_src, ShardId::new(1));
+    let fallback = autumn_harvest::completion_trigger::resolve_cross_shard_target_queue(
         "ag_target_wf",
         ShardId::new(0),
     )
@@ -994,6 +1160,7 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     let _ = ShardedDbPool::single(build_pool(&base_url));
     drop(src_conn);
     drop(sharded);
+    drop(sharded_no_target);
     drop(pool0);
     drop(pool1);
     {
@@ -1016,5 +1183,21 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
         buggy, "ag_priority_q",
         "the pre-fix source-connection resolution must NOT find the target queue \
          (it queries the source shard's schedules, missing the gate)"
+    );
+    // F2 re-review round 2: with the target-shard pool unavailable, the fallback
+    // must NOT read the source shard's schedules — so it returns neither the
+    // source's wrong queue nor the (unreachable) target's queue.
+    assert_ne!(
+        fallback, "ag_source_wrong_q",
+        "the target-shard-unavailable fallback must NOT resolve against the source \
+         connection's harvest_schedules (that is the wrong-shard bug F2 fixed)"
+    );
+    assert_ne!(
+        fallback, "ag_priority_q",
+        "the fallback cannot reach the unavailable target shard's schedules either"
+    );
+    assert_eq!(
+        fallback, "default",
+        "the fallback returns the shard-independent default queue"
     );
 }

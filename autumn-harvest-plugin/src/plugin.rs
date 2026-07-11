@@ -878,8 +878,15 @@ async fn start_harvest_runtime(
                 let client = client.clone();
                 let harvest_db = state.extension::<crate::state::HarvestDbPool>();
 
-                let (owner, runbook_url, severity, info_sla, info_retry_policy) = state
-                    .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+                let registry =
+                    state.extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>();
+                // Metrics recorder for the admission-gate block counter (issue #618,
+                // Finding A). Best-effort: absent only in a degenerate boot window
+                // where the registry extension isn't installed yet.
+                let metrics = registry
+                    .as_ref()
+                    .map(|r| std::sync::Arc::clone(&r.telemetry().metrics));
+                let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry
                     .and_then(|registry| {
                         registry.workflows.get("webhook_delivery").map(|wf| {
                             (
@@ -900,6 +907,34 @@ async fn start_harvest_runtime(
                     let shard =
                         client.pick_shard_for_new_workflow("webhook_delivery", &workflow_id);
                     let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard);
+
+                    // Issue #618, Finding A: the OUTBOUND webhook-delivery producer is a
+                    // fresh in-process workflow start, so an active admission gate must
+                    // HALT it (block, not exempt) — the same authority the API path
+                    // enforces. Consult the last-known cached gate snapshot
+                    // (`check_cached` honours the snapshot even under a transient
+                    // fail-closed blip and never returns the sentinel); a matching gate
+                    // blocks the start and records the same `record_admission_blocked`
+                    // outcome the API path records.
+                    if let Some(cache) =
+                        autumn_harvest::admission_gate::global_admission_gate_cache()
+                        && let Some((reason, scope_kind)) =
+                            webhook_delivery_admission_block(&cache, shard, owner)
+                    {
+                        if let Some(m) = &metrics {
+                            m.record_admission_blocked(scope_kind, &reason);
+                        }
+                        tracing::info!(
+                            scope_kind,
+                            reason = %reason,
+                            "admission gate active; blocking outbound webhook_delivery start"
+                        );
+                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                            format!(
+                                "admission gate active ({scope_kind}); webhook_delivery start blocked"
+                            ),
+                        ));
+                    }
 
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
                         workflow_name: "webhook_delivery",
@@ -1209,6 +1244,110 @@ fn apply_migrations_for_profile(
     }
 
     Ok(())
+}
+
+/// Decide whether an active admission gate blocks an OUTBOUND webhook-delivery
+/// start (issue #618, Finding A).
+///
+/// The outbound `WebhookDelegateExt` starts the `webhook_delivery` workflow on
+/// the `webhooks` queue; those are the fixed match inputs (kept here, in the
+/// tested helper, so a regression is caught). Returns `Some((reason, scope_kind))`
+/// when a cached gate matches — the caller blocks the start and records an
+/// admission block — or `None` when no gate matches (proceed). `check_cached`
+/// honours the last-known snapshot even under a transient fail-closed blip and
+/// never returns the fail-closed sentinel.
+#[cfg(feature = "webhooks")]
+fn webhook_delivery_admission_block(
+    cache: &autumn_harvest::admission_gate::AdmissionGateCache,
+    shard: autumn_harvest::types::ShardId,
+    owner: Option<&str>,
+) -> Option<(String, &'static str)> {
+    cache
+        .check_cached("webhook_delivery", "webhooks", shard.as_i32(), owner)
+        .map(|(_id, reason, scope_kind)| (reason, scope_kind))
+}
+
+#[cfg(all(test, feature = "webhooks"))]
+mod webhook_admission_tests {
+    use autumn_harvest::admission_gate::{
+        AdmissionGate, AdmissionGateCache, AdmissionGateId, GateScope,
+    };
+    use autumn_harvest::types::ShardId;
+    use uuid::Uuid;
+
+    fn cache_with(scope: GateScope) -> AdmissionGateCache {
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![AdmissionGate {
+            id: AdmissionGateId(Uuid::new_v4()),
+            scope,
+            reason: "incident".to_string(),
+            message: None,
+            created_by: "test".to_string(),
+            created_at: autumn_harvest::chrono::Utc::now(),
+            expires_at: None,
+        }]);
+        cache
+    }
+
+    #[test]
+    fn fleet_gate_blocks_the_outbound_webhook_delivery_start() {
+        let cache = cache_with(GateScope::Fleet);
+        let decision = super::webhook_delivery_admission_block(&cache, ShardId::new(0), None);
+        assert!(
+            matches!(decision, Some((_, "fleet"))),
+            "a Fleet gate must block the outbound webhook_delivery start"
+        );
+    }
+
+    #[test]
+    fn gate_scoped_to_webhook_delivery_blocks() {
+        let cache = cache_with(GateScope::WorkflowName("webhook_delivery".into()));
+        assert!(
+            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
+            "a WorkflowName(webhook_delivery) gate must block"
+        );
+    }
+
+    #[test]
+    fn gate_scoped_to_the_webhooks_queue_blocks() {
+        let cache = cache_with(GateScope::Queue("webhooks".into()));
+        assert!(
+            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
+            "a Queue(webhooks) gate must block (the outbound start uses the webhooks queue)"
+        );
+    }
+
+    #[test]
+    fn non_matching_gate_lets_the_outbound_start_proceed() {
+        // A gate scoped to a DIFFERENT workflow / queue must NOT block.
+        assert!(
+            super::webhook_delivery_admission_block(
+                &cache_with(GateScope::WorkflowName("some_other_wf".into())),
+                ShardId::new(0),
+                None,
+            )
+            .is_none(),
+            "a gate for a different workflow must not block webhook_delivery"
+        );
+        assert!(
+            super::webhook_delivery_admission_block(
+                &cache_with(GateScope::Queue("other_queue".into())),
+                ShardId::new(0),
+                None,
+            )
+            .is_none(),
+            "a gate for a different queue must not block webhook_delivery"
+        );
+    }
+
+    #[test]
+    fn empty_cache_lets_the_outbound_start_proceed() {
+        let cache = AdmissionGateCache::new();
+        assert!(
+            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_none(),
+            "no gates → the outbound webhook_delivery start proceeds"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@
 //! | [`Api`](StartProducer::Api) | gated | HTTP start route checks the gate before any DB write |
 //! | [`BatchStart`](StartProducer::BatchStart) | gated | each item checks the gate with its resolved target shard |
 //! | [`CompletionTrigger`](StartProducer::CompletionTrigger) | gated | checks the gate inside the source terminal commit before starting the target; fail-closed sentinel proceeds |
-//! | [`WebhookDelegate`](StartProducer::WebhookDelegate) | gated | delegates to the gated HTTP start / signal-with-start route |
+//! | [`WebhookDelegate`](StartProducer::WebhookDelegate) | gated | inbound receiver delegates to the gated HTTP start route; outbound webhook-delivery producer consults the cached gate and blocks on a match |
 //! | [`Scheduler`](StartProducer::Scheduler) | gated | each due schedule slot checks the gate before firing |
 //! | [`Debounce`](StartProducer::Debounce) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
 //! | [`Throttle`](StartProducer::Throttle) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
@@ -589,7 +589,11 @@ pub fn producer_contract() -> Vec<ProducerContractEntry> {
         ProducerContractEntry {
             producer: StartProducer::WebhookDelegate.as_str(),
             status: Gated,
-            rationale: "Delegates to the gated HTTP start / signal-with-start route.",
+            rationale: "Two webhook producers, both gated: the INBOUND webhook receiver \
+                        delegates to the gated HTTP start / signal-with-start route; the \
+                        OUTBOUND webhook-delivery producer consults the cached gate \
+                        snapshot before starting `webhook_delivery` and blocks (recording \
+                        an admission block) when a gate matches.",
         },
         ProducerContractEntry {
             producer: StartProducer::Scheduler.as_str(),
