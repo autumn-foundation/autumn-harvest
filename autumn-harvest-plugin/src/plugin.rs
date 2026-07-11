@@ -879,14 +879,25 @@ async fn start_harvest_runtime(
     // AFTER this point clears the globals rather than leaving them pointing at a
     // failed startup's stale cache/recorder. Defused with `.commit()` on success.
     let mut admission_guard = AdmissionGlobalsGuard::publish_gate_cache(api_state.gate_cache());
+    // issue #618 (F-round5, F-round14): publish the SAME metrics recorder the
+    // workers/scanners use so the completion-trigger block path counts a block even
+    // when its caller passes `metrics: None` (the cancel / terminate /
+    // parent-close-cascade paths, which rely on the process-global recorder). Publish
+    // it BEFORE `HarvestRunner::start` spawns the worker poll loops and the timeout
+    // scanner — symmetric with the gate cache above (F-round14). Otherwise, in the
+    // boot window between the runner spawning those background tasks and a later
+    // metrics publish, a completion-trigger block on one of those paths would find
+    // `global_admission_metrics() == None` and silently drop the
+    // `harvest.admission.blocked` count. `built.telemetry().metrics` is the very same
+    // `Arc<dyn MetricsRecorder>` the registry hands the workers — both come from
+    // `built.telemetry` via `into_worker_parts_with_extra_state` — so this counts
+    // through the identical sink the runner-derived accessor would have, while
+    // `built` is still owned here (consumed by `HarvestRunner::start` on the next
+    // line). The RAII guard keeps clearing BOTH globals on any early-return error and
+    // keeping both only on `.commit()`.
+    admission_guard.publish_metrics(std::sync::Arc::clone(&built.telemetry().metrics));
 
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
-    // issue #618 (F-round5): publish the SAME metrics recorder the workers/scanners
-    // use so the completion-trigger block path counts a block even when its caller
-    // passes `metrics: None` (the cancel / terminate / parent-close-cascade paths).
-    admission_guard.publish_metrics(std::sync::Arc::clone(
-        &runner.api_runtime().registry().telemetry().metrics,
-    ));
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -1676,8 +1687,11 @@ mod admission_globals_guard_tests {
         );
     }
 
-    /// F-round7: an error BEFORE the metrics publish (e.g. `HarvestRunner::start`
-    /// fails) still clears the gate cache.
+    /// F-round7: an error while only the gate cache has been published (before the
+    /// adjacent `publish_metrics` call runs) still clears the gate cache. As of
+    /// F-round14 both publishes happen back-to-back BEFORE `HarvestRunner::start`, so
+    /// this guards the guard's own Drop semantics in isolation rather than a specific
+    /// `start_harvest_runtime` error site.
     #[test]
     fn guard_drop_before_metrics_publish_clears_the_gate_cache() {
         let _g = GUARD_TEST_LOCK
@@ -1719,6 +1733,38 @@ mod admission_globals_guard_tests {
             global_admission_metrics().is_some(),
             "commit keeps the metrics recorder"
         );
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+    }
+
+    /// F-round14: both globals are visible after the two publishes run back-to-back,
+    /// BEFORE any consumer (the worker poll loops / timeout scanner spawned by
+    /// `HarvestRunner::start`) could observe them. In `start_harvest_runtime` both
+    /// `publish_gate_cache` and `publish_metrics` now run before the runner starts, so
+    /// a cancel / terminate / parent-close-cascade completion-trigger block firing in
+    /// the boot window finds a live `global_admission_metrics()` and counts the block
+    /// rather than dropping it.
+    #[test]
+    fn guard_publishes_both_globals_before_any_consumer_runs() {
+        let _g = GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
+        let mut guard =
+            AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
+        guard.publish_metrics(recorder());
+        // Both must be live at this point — this is the state the runner (and its
+        // workers/scanner) is started against in `start_harvest_runtime`.
+        assert!(
+            global_admission_gate_cache().is_some(),
+            "gate cache is published before the runner starts"
+        );
+        assert!(
+            global_admission_metrics().is_some(),
+            "metrics recorder is published before the runner starts (F-round14)"
+        );
+        drop(guard);
         set_global_admission_gate_cache(None);
         set_global_admission_metrics(None);
     }
