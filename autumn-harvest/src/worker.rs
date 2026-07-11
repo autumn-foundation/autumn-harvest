@@ -733,6 +733,10 @@ impl std::fmt::Debug for HandlerRegistry {
                 &self.max_workflow_attempts_ceiling,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
+            .field(
+                "activity_interceptor_count",
+                &self.activity_interceptors.len(),
+            )
             .finish()
     }
 }

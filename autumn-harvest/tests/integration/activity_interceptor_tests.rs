@@ -1187,19 +1187,13 @@ async fn registration_order_is_outermost_first_end_to_end() {
     let exec_id = seed_workflow(&mut conn, "wf_order", serde_json::json!({"v": 7}), queue).await;
 
     let log = Arc::new(Mutex::new(Vec::new()));
-    // Handler logs "handler" via a bespoke activity so the ordering is complete.
-    fn logging_handler(
-        _ctx: &autumn_harvest::ActivityContext,
-        input: serde_json::Value,
-    ) -> BoxFut<'_> {
-        Box::pin(async move { Ok(input) })
-    }
-    // We can't inject the "handler" marker through the fn pointer easily, so the
-    // ordering is asserted purely on the before/after markers, which is
+    // The handler just echoes (the module-level `echo_activity`). We can't inject
+    // a "handler" marker through the fn pointer easily, so the ordering is
+    // asserted purely on the interceptors' before/after markers, which is
     // sufficient to prove i1 is OUTERMOST (its before is first, after is last).
     let registry = build_registry(
         vec![wf_info("wf_order", wf_one_activity)],
-        vec![act_info("echo", logging_handler, false, None)],
+        vec![act_info("echo", echo_activity, false, None)],
         vec![
             Arc::new(OrderInterceptor {
                 tag: "i1",
