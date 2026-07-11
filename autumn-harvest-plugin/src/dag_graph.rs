@@ -501,15 +501,21 @@ pub fn build_run_graph(
 ///
 /// 1. A `dag_skip:{task_index}` marker (a #482 data-dependent `.condition(...)`
 ///    on the gate that was not taken) → [`DagNodeStatus::Skipped`].
-/// 2. `SignalReceived` for the gate's signal → [`DagNodeStatus::Succeeded`].
-/// 3. else a matching gate race-timer `TimerFired` (a bounded
-///    `wait_for_signal_timeout` deadline fired first) → [`DagNodeStatus::TimedOut`].
-///    This collapses the `on_timeout` choice: a `Continue` timeout (gate
-///    succeeds with a null output) and a `FailRun` timeout (the run fails) both
-///    report `timed_out` here — the gate's own outcome *was* a timeout; whether
-///    the run continued or failed is visible on the downstream / run state, not
-///    a separate gate status.
-/// 4. else the gate is unresolved — was it even reached?
+/// 2. A resolved gate — classified by **recorded history order**, mirroring the
+///    `match_signal_or_timer` (#476) replay contract, via [`gate_resolution`]:
+///    * a matching `SignalReceived` recorded before any matching gate race-timer
+///      `TimerFired` → [`DagNodeStatus::Succeeded`];
+///    * a matching gate race-timer `TimerFired` recorded first (a bounded
+///      `wait_for_signal_timeout` deadline fired before the signal arrived) →
+///      [`DagNodeStatus::TimedOut`]. Order matters, not mere existence: a
+///      deadline that fires first and then has a late matching signal recorded
+///      in the same wake batch replays to a timeout, so the graph view must
+///      agree. `timed_out` collapses the `on_timeout` choice: a `Continue`
+///      timeout (gate succeeds with a null output) and a `FailRun` timeout (the
+///      run fails) both report `timed_out` here — the gate's own outcome *was* a
+///      timeout; whether the run continued or failed is visible on the
+///      downstream / run state, not a separate gate status.
+/// 3. else the gate is unresolved — was it even reached?
 ///    * The walker reached and dispatched it (all upstreams resolved and its
 ///      trigger rule passed) → [`DagNodeStatus::Waiting`] while the run is live,
 ///      else [`DagNodeStatus::Pending`].
@@ -544,11 +550,12 @@ fn gate_status(
     if has_skip_marker(events, task_index, &task.activity_name, &task.upstreams) {
         return DagNodeStatus::Skipped;
     }
-    if signal_received(events, signal_name) {
-        return DagNodeStatus::Succeeded;
-    }
-    if gate_timer_fired(events, signal_name) {
-        return DagNodeStatus::TimedOut;
+    // Resolved gates are classified by recorded history order (#476 contract),
+    // not by mere existence of a matching event.
+    match gate_resolution(events, signal_name) {
+        GateResolution::SignalWon => return DagNodeStatus::Succeeded,
+        GateResolution::TimerWon => return DagNodeStatus::TimedOut,
+        GateResolution::Unresolved => {}
     }
     // Unresolved: distinguish a genuinely-waiting reached gate from one the
     // walker has not (or will never) reach.
@@ -564,29 +571,44 @@ fn gate_status(
     }
 }
 
-/// Whether a `SignalReceived` for `signal_name` is recorded.
-fn signal_received(events: &[WorkflowEvent], signal_name: &str) -> bool {
-    events.iter().any(|e| {
-        matches!(e, WorkflowEvent::SignalReceived { signal_name: s, .. } if s == signal_name)
-    })
+/// The first gate-resolution event in recorded history order (issue #746).
+///
+/// Mirrors the `match_signal_or_timer` (#476) replay contract: the winner of a
+/// bounded signal/timer gate is whichever of the matching `SignalReceived` or
+/// the gate race-timer `TimerFired` appears **first in recorded history**, not
+/// merely whichever exists. So a deadline that fires first and then has a late
+/// matching signal recorded in the same wake batch resolves to a timeout.
+enum GateResolution {
+    /// A matching `SignalReceived` precedes any matching gate race-timer fire.
+    SignalWon,
+    /// A matching gate race-timer `TimerFired` precedes any matching signal.
+    TimerWon,
+    /// Neither a matching signal nor a matching gate race-timer fire is recorded.
+    Unresolved,
 }
 
-/// Whether the gate's race-timer (issue #476, id `__signal_timeout:{seq}:{name}`)
-/// fired.
+/// Resolve a gate by scanning history in order for the first matching
+/// `SignalReceived` or gate race-timer `TimerFired` (issue #746).
 ///
-/// The id is parsed exactly rather than matched with `ends_with(":{name}")`,
-/// which would false-positive: a gate on signal `approval` must not match a
-/// *different* race timer `__signal_timeout:2:x:approval`. The `{seq}` segment is
-/// always a run of decimal digits, so the remainder after `__signal_timeout:` and
-/// the leading `{seq}:` is compared to the signal name in full (correct even when
-/// the signal name itself contains `:`).
-fn gate_timer_fired(events: &[WorkflowEvent], signal_name: &str) -> bool {
-    events.iter().any(|e| match e {
-        WorkflowEvent::TimerFired { timer_id } => {
-            timer_id_matches_gate(timer_id.as_str(), signal_name)
+/// The gate race-timer id (issue #476, `__signal_timeout:{seq}:{name}`) is
+/// parsed exactly via [`timer_id_matches_gate`] rather than matched with
+/// `ends_with(":{name}")`, which would false-positive: a gate on signal
+/// `approval` must not match a *different* race timer `__signal_timeout:2:x:approval`.
+fn gate_resolution(events: &[WorkflowEvent], signal_name: &str) -> GateResolution {
+    for event in events {
+        match event {
+            WorkflowEvent::SignalReceived { signal_name: s, .. } if s == signal_name => {
+                return GateResolution::SignalWon;
+            }
+            WorkflowEvent::TimerFired { timer_id }
+                if timer_id_matches_gate(timer_id.as_str(), signal_name) =>
+            {
+                return GateResolution::TimerWon;
+            }
+            _ => {}
         }
-        _ => false,
-    })
+    }
+    GateResolution::Unresolved
 }
 
 /// Exact match of a race-timer id `__signal_timeout:{seq}:{signal_name}` where
@@ -640,18 +662,21 @@ fn resolved_upstream_status(
     tasks: &[DagTask],
 ) -> Option<TaskStatus> {
     let up = tasks.get(idx)?;
-    // A gate upstream resolves via its own signal / timer, not activity events.
+    // A gate upstream resolves via its own signal / timer, not activity events —
+    // and by recorded history order (#476 contract), so a timer that fired
+    // before a late signal resolves as a timeout, cascading correctly to
+    // downstream reachability.
     if let Some(gate) = &up.signal {
-        if signal_received(events, &gate.signal_name) {
-            return Some(TaskStatus::Succeeded);
+        match gate_resolution(events, &gate.signal_name) {
+            GateResolution::SignalWon => return Some(TaskStatus::Succeeded),
+            GateResolution::TimerWon => {
+                return Some(match gate.on_timeout {
+                    GateTimeoutAction::FailRun => TaskStatus::Failed,
+                    GateTimeoutAction::Continue => TaskStatus::Succeeded,
+                });
+            }
+            GateResolution::Unresolved => return None,
         }
-        if gate_timer_fired(events, &gate.signal_name) {
-            return Some(match gate.on_timeout {
-                GateTimeoutAction::FailRun => TaskStatus::Failed,
-                GateTimeoutAction::Continue => TaskStatus::Succeeded,
-            });
-        }
-        return None;
     }
     match node_outcome(events, &up.activity_name) {
         NodeOutcome::Succeeded => Some(TaskStatus::Succeeded),
@@ -1763,6 +1788,106 @@ mod tests {
             node(&nodes, "approval").status,
             DagNodeStatus::Waiting,
             "a gate must not be timed_out by a different signal's race timer"
+        );
+    }
+
+    // ── Issue #746 Codex P2: classify a resolved gate by history ORDER, not
+    // mere existence, to agree with the `match_signal_or_timer` (#476) replay
+    // contract. When both a matching signal and the gate's race-timer fire are
+    // recorded, whichever appears first in history wins.
+
+    #[test]
+    fn gate_timed_out_when_timer_fires_before_late_signal() {
+        // Bounded gate: the deadline fires first, then a matching signal is
+        // recorded later (same wake batch). Replay makes the timer the winner,
+        // so the graph view must report `timed_out`, not `succeeded`.
+        let def = bounded_gate_dag();
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), timer_started("__signal_timeout:1:approval")),
+            (ts(4), timer_fired("__signal_timeout:1:approval")),
+            // Late matching signal — must NOT flip the outcome to succeeded.
+            (ts(5), signal_received("approval")),
+        ];
+        for state in ["RUNNING", "FAILED", "COMPLETED"] {
+            let nodes = build_run_graph(&def, &events, state);
+            assert_eq!(
+                node(&nodes, "approval").status,
+                DagNodeStatus::TimedOut,
+                "timer fired before the late signal → timed_out (state={state})"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_succeeded_when_signal_precedes_timer_fire() {
+        // Symmetric case: the signal arrives before the gate's race-timer fires,
+        // so the signal wins and the gate reports `succeeded` even though the
+        // timer's stray fire is also recorded.
+        let def = bounded_gate_dag();
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), timer_started("__signal_timeout:1:approval")),
+            (ts(4), signal_received("approval")),
+            // Stray fire of the still-armed race timer, recorded after the win.
+            (ts(5), timer_fired("__signal_timeout:1:approval")),
+        ];
+        for state in ["RUNNING", "COMPLETED"] {
+            let nodes = build_run_graph(&def, &events, state);
+            assert_eq!(
+                node(&nodes, "approval").status,
+                DagNodeStatus::Succeeded,
+                "signal recorded before the stray timer fire → succeeded (state={state})"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_timer_before_late_signal_cascades_failrun_to_downstream_pending() {
+        // The same helper feeds upstream gate reachability (Codex P2). A
+        // FailRun-bounded gate whose timer fires before a late signal resolves
+        // to FAILED (timer won), so a downstream AllSuccess gate is unreachable
+        // and must report `pending` — not `waiting` as an existence-only check
+        // (which would see the signal and treat the upstream as succeeded) would.
+        let mut builder = DagBuilder::new();
+        let extract = builder.activity(a);
+        let gate1 = builder
+            .signal_gate_with_timeout(
+                "approval",
+                std::time::Duration::from_secs(3600),
+                GateTimeoutAction::FailRun,
+            )
+            .upstream(&extract);
+        let _gate2 = builder.signal_gate("second").upstream(&gate1);
+        let def = builder.build().expect("chained gate dag builds");
+
+        let ia = ActivityExecId::new();
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", ia)),
+            (ts(2), completed(ia)),
+            (ts(3), timer_started("__signal_timeout:1:approval")),
+            (ts(4), timer_fired("__signal_timeout:1:approval")),
+            // Late `approval` signal for gate1 — must not un-fail the upstream.
+            (ts(5), signal_received("approval")),
+        ];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(
+            node(&nodes, "approval").status,
+            DagNodeStatus::TimedOut,
+            "gate1's timer fired before the late signal → timed_out"
+        );
+        assert_eq!(
+            node(&nodes, "second").status,
+            DagNodeStatus::Pending,
+            "gate1 resolved FAILED (timer won), so the downstream AllSuccess gate \
+             is unreachable → pending, not waiting"
         );
     }
 }
