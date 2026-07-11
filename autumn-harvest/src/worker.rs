@@ -757,6 +757,8 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
+        WorkflowCommand::ArmTimer { .. } => "ArmTimer",
+        WorkflowCommand::CancelTimer { .. } => "CancelTimer",
     }
 }
 
@@ -811,6 +813,8 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. }
         )
     });
 
@@ -829,6 +833,8 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
+                    | WorkflowCommand::ArmTimer { .. }
+                    | WorkflowCommand::CancelTimer { .. }
             )
         })
 }
@@ -987,6 +993,7 @@ impl DetachedSpawnPersistence<'_> {
 /// that emits the appropriate event for each matching command type.
 fn build_suspension_events<F>(
     commands: &[WorkflowCommand],
+    timer_events: &mut [Option<WorkflowEvent>],
     mut branch_event: F,
 ) -> Vec<WorkflowEvent>
 where
@@ -994,7 +1001,8 @@ where
 {
     commands
         .iter()
-        .filter_map(|cmd| match cmd {
+        .enumerate()
+        .filter_map(|(i, cmd)| match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
                 Some(WorkflowEvent::MarkerRecorded {
                     name: name.clone(),
@@ -1019,16 +1027,32 @@ where
                 input: input.clone(),
                 parent_close_policy: *parent_close_policy,
             }),
+            // Cancellable/renewable timer bookkeeping (issue #768): the
+            // `TimerStarted` / `TimerCancelled` event resolved by the DB-mutation
+            // phase (`plan_timer_lifecycle`) is interleaved here at the
+            // `ArmTimer` / `CancelTimer` command's emission position — exactly
+            // like `ChildWorkflowSpawnedDetached` above — so `replay`'s strictly
+            // positional `match_timer_arm` sees the same order the live cycle
+            // emitted. (Pre-FINDING-1 these were appended at the END of the
+            // batch, nd-blocking a `start_timer` + `side_effect` same-cycle run.)
+            WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. } => {
+                timer_events.get_mut(i).and_then(Option::take)
+            }
             other => branch_event(other),
         })
         .collect()
 }
 
-/// Collects `MarkerRecorded` and `ChildWorkflowSpawnedDetached` events in command
-/// emission order for suspension paths that have no branch-specific events
-/// (signal-wait park, activity-wait park).
-fn pre_suspension_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
-    build_suspension_events(commands, |_| None)
+/// Collects `MarkerRecorded`, `SideEffectRecorded`, `ChildWorkflowSpawnedDetached`,
+/// and (issue #768) interleaved timer-lifecycle events in command emission order
+/// for suspension paths that have no branch-specific events (signal-wait park,
+/// activity-wait park). `timer_events` is the DB-mutation plan from
+/// [`plan_timer_lifecycle`].
+fn pre_suspension_events_from_commands(
+    commands: &[WorkflowCommand],
+    timer_events: &mut [Option<WorkflowEvent>],
+) -> Vec<WorkflowEvent> {
+    build_suspension_events(commands, timer_events, |_| None)
 }
 
 fn extract_single_command<T>(
@@ -1049,6 +1073,8 @@ fn extract_single_command<T>(
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. }
         )
     });
 
@@ -1076,7 +1102,9 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            | WorkflowCommand::CancelRaceLosers { .. } => {}
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -1123,7 +1151,9 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            | WorkflowCommand::CancelRaceLosers { .. } => {}
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -1178,6 +1208,8 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. }
         )
     });
 
@@ -1203,6 +1235,8 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
+                    | WorkflowCommand::ArmTimer { .. }
+                    | WorkflowCommand::CancelTimer { .. }
             )
         })
         .collect();
@@ -3613,8 +3647,6 @@ async fn persist_signal_wait_park(
     commands: &[WorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    let marker_events = pre_suspension_events_from_commands(commands);
-    let events_len = i32::try_from(marker_events.len()).unwrap_or(i32::MAX);
     let registry = detached_spawns.registry;
     // Park the workflow task (state=RUNNING, worker cleared) so it is not
     // confused with a timer-waiting task (state=PENDING). This ensures that
@@ -3634,6 +3666,17 @@ async fn persist_signal_wait_park(
     let (deferred, had_wake_requested) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
+                // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                // the ArmTimer/CancelTimer row mutations FIRST, then interleave
+                // their TimerStarted/TimerCancelled events into the suspension
+                // batch at their command-emission positions (armed timers are
+                // observed on the next wake, so the returned deadline is unused
+                // here).
+                let (mut timer_events, _min_fires_at) =
+                    plan_timer_lifecycle(conn, exec_id, commands).await?;
+                let marker_events =
+                    pre_suspension_events_from_commands(commands, &mut timer_events);
+                let events_len = i32::try_from(marker_events.len()).unwrap_or(i32::MAX);
                 store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
                 detached_spawns.persist(conn, commands).await?;
                 let mut race_next_event_id = next_event_id.saturating_add(events_len);
@@ -3726,7 +3769,6 @@ async fn persist_activity_wait_park(
     activity_ids: &[ActivityExecId],
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    let marker_events = pre_suspension_events_from_commands(commands);
     let registry = detached_spawns.registry;
 
     let deferred = conn
@@ -3744,6 +3786,15 @@ async fn persist_activity_wait_park(
                         HarvestError::NotFound(format!("workflow execution {exec_id}"))
                     })?;
 
+                // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                // the ArmTimer/CancelTimer row mutations FIRST, then interleave
+                // their TimerStarted/TimerCancelled events at their command
+                // positions in the marker batch appended below (armed timers are
+                // observed on the next wake; deadline unused here).
+                let (mut timer_events, _min_fires_at) =
+                    plan_timer_lifecycle(conn, exec_id, commands).await?;
+                let marker_events =
+                    pre_suspension_events_from_commands(commands, &mut timer_events);
                 for event in marker_events {
                     store::append_single_event(conn, exec_id, event).await?;
                 }
@@ -3950,19 +4001,6 @@ async fn persist_scheduled_activities(
         enqueued.push(params);
     }
 
-    // Build the event list in command emission order: markers, detached-spawn events, and
-    // ActivityScheduled events are interleaved at their actual command positions so that
-    // the replay engine's sequential cursor sees the same order as command emission.
-    let mut act_iter = activity_events.into_iter();
-    let events = build_suspension_events(commands, |cmd| {
-        if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
-            act_iter.next()
-        } else {
-            None
-        }
-    });
-
-    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
     let offloader = registry.payload_offloader();
     // `had_wake_requested` closes a race no other check in this function
     // covers (PR #901 review): a signal or admitted update landing while this
@@ -3976,6 +4014,25 @@ async fn persist_scheduled_activities(
     let (deferred, had_wake_requested, synthesized_broken_session_failure) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
+                // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                // the ArmTimer/CancelTimer row mutations FIRST, then build the
+                // event list in command emission order -- markers, detached-spawn
+                // events, interleaved TimerStarted/TimerCancelled, and
+                // ActivityScheduled events all at their actual command positions
+                // so the replay engine's sequential cursor sees the same order as
+                // command emission (armed timers observed on next wake; deadline
+                // unused here).
+                let (mut timer_events, _min_fires_at) =
+                    plan_timer_lifecycle(conn, exec_id, commands).await?;
+                let mut act_iter = activity_events.into_iter();
+                let events = build_suspension_events(commands, &mut timer_events, |cmd| {
+                    if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
+                        act_iter.next()
+                    } else {
+                        None
+                    }
+                });
+                let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
                 store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
                     .await?;
                 detached_spawns.persist(conn, commands).await?;
@@ -4106,43 +4163,6 @@ async fn persist_started_timer(
 ) -> HarvestResult<()> {
     use tracing::Instrument;
 
-    // Check if the timer already exists and is active (unfired) in the database.
-    let existing: Option<HarvestTimer> = harvest_timers::table
-        .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
-        .filter(harvest_timers::fired.eq(false))
-        .first::<HarvestTimer>(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
-
-    let fires_at = if let Some(ref ext) = existing {
-        ext.fires_at
-    } else {
-        let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-        // Anchor the deadline to the database clock: timer due-ness and the
-        // signal `received_at` default both come from Postgres NOW(), so the
-        // chronological wake ingest (merge_wake_events) compares timestamps
-        // from a single clock regardless of worker clock skew.
-        let db_now = db_clock_now(conn).await?;
-        db_now + fire_delay
-    };
-
-    let is_new = existing.is_none();
-    // Build the event list in command emission order. TimerStarted (for new timers) is
-    // interleaved with marker/detached-spawn events at its actual command position.
-    let mut timer_event = is_new.then(|| WorkflowEvent::TimerStarted {
-        timer_id: timer.timer_id.clone(),
-        duration_secs: timer.duration_secs,
-    });
-    let events = build_suspension_events(commands, |cmd| {
-        if matches!(cmd, WorkflowCommand::StartTimer { .. }) {
-            timer_event.take()
-        } else {
-            None
-        }
-    });
-
     // Emit a span for the timer placement (not to be confused with
     // harvest.timer.fire which is emitted when the timer actually fires).
     let span = tracing::info_span!(
@@ -4153,14 +4173,71 @@ async fn persist_started_timer(
         { ATTR_EXECUTION_ID } = %exec_id,
     );
 
-    let has_events = !events.is_empty();
     let registry = detached_spawns.registry;
-    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
 
     let deferred = conn
         .transaction::<_, HarvestError, _>(|conn| {
         async move {
             use crate::schema::harvest_task_queue::dsl as queue_dsl;
+
+            // Cancellable/renewable timer bookkeeping (issue #768) for any
+            // *other* timers' ArmTimer/CancelTimer commands in this batch (the
+            // suspending StartTimer's own id is skipped by plan_timer_lifecycle
+            // for ArmTimer row inserts — its row insert / TimerStarted are owned
+            // here). Build the event list in command emission order: markers,
+            // detached-spawn events, interleaved TimerStarted/TimerCancelled, and
+            // this StartTimer's own TimerStarted all at their actual command
+            // positions.
+            let (mut timer_events, _min_fires_at) =
+                plan_timer_lifecycle(conn, exec_id, commands).await?;
+
+            // FIX B (Codex P2 round 4, issue #768): resolve the classic
+            // StartTimer's OWN row existence AFTER plan_timer_lifecycle, not
+            // before the transaction. plan_timer_lifecycle honours a same-batch
+            // `CancelTimer` for the SAME id by deleting its pending row; computing
+            // `is_new` from a pre-pass snapshot would leave `is_new = false` and
+            // then reschedule the parked task to a row this very batch deleted —
+            // the workflow would hang and replay diverge. Re-querying here reflects
+            // the delete, so a `cancel_timer("x"); ctx.timer("x", n)` in one task
+            // correctly re-inserts a fresh classic-timer row.
+            //
+            // Anchor a fresh deadline to the database clock: timer due-ness and
+            // the signal `received_at` default both come from Postgres NOW(), so
+            // the chronological wake ingest (merge_wake_events) compares timestamps
+            // from a single clock regardless of worker clock skew.
+            let existing: Option<HarvestTimer> = harvest_timers::table
+                .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                .filter(harvest_timers::fired.eq(false))
+                .first::<HarvestTimer>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let fires_at = if let Some(ref ext) = existing {
+                ext.fires_at
+            } else {
+                let fire_delay =
+                    chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+                let db_now = db_clock_now(conn).await?;
+                db_now + fire_delay
+            };
+            let is_new = existing.is_none();
+            // The suspending StartTimer's own TimerStarted (for a new timer) is
+            // emitted at the StartTimer command's position via the branch closure.
+            let mut timer_event = is_new.then(|| WorkflowEvent::TimerStarted {
+                timer_id: timer.timer_id.clone(),
+                duration_secs: timer.duration_secs,
+            });
+
+            let events = build_suspension_events(commands, &mut timer_events, |cmd| {
+                if matches!(cmd, WorkflowCommand::StartTimer { .. }) {
+                    timer_event.take()
+                } else {
+                    None
+                }
+            });
+            let has_events = !events.is_empty();
+            let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
 
             if has_events {
                 store::append_events(conn, exec_id, &events, next_event_id).await?;
@@ -4455,8 +4532,21 @@ async fn persist_all_started_child_workflows(
                         }
                     })
                     .collect();
+                // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                // the ArmTimer/CancelTimer row mutations, then merge their
+                // TimerStarted/TimerCancelled events into the parent event list at
+                // their command-emission positions (armed timers observed on next
+                // wake; deadline unused here).
+                let (timer_events, _min_fires_at) =
+                    plan_timer_lifecycle(conn, parent_exec_id, commands).await?;
+                let mut timer_events_by_pos: Vec<(usize, WorkflowEvent)> = timer_events
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, ev)| ev.map(|e| (i, e)))
+                    .collect();
                 let mut all_events_by_pos = pre_events_by_pos;
                 all_events_by_pos.append(&mut child_events_by_pos);
+                all_events_by_pos.append(&mut timer_events_by_pos);
                 all_events_by_pos.sort_unstable_by_key(|(i, _)| *i);
                 let parent_events: Vec<WorkflowEvent> =
                     all_events_by_pos.into_iter().map(|(_, e)| e).collect();
@@ -4511,6 +4601,8 @@ async fn persist_all_started_child_workflows(
                     let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
                     let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
                     let child_row = NewWorkflowExecution {
+                        continued_from_exec_id: None,
+                        first_exec_id: None,
                         id: child.child_id.as_uuid(),
                         workflow_name: &child.workflow_name,
                         workflow_id: &child_workflow_id,
@@ -5159,6 +5251,8 @@ async fn create_detached_child_executions(
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         let child_row = NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
             workflow_id: &child_workflow_id,
@@ -6405,7 +6499,7 @@ async fn process_activity_task(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn persist_scheduled_external_activity(
     conn: &mut AsyncPgConnection,
     detached_spawns: DetachedSpawnPersistence<'_>,
@@ -6443,7 +6537,16 @@ async fn persist_scheduled_external_activity(
                     // start (when next_event_id was sampled) and here.  Using
                     // append_single_event serialises each append against concurrent
                     // writers via the per-execution FOR UPDATE it acquires.
-                    let marker_events = pre_suspension_events_from_commands(commands);
+                    //
+                    // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                    // ArmTimer/CancelTimer row mutations FIRST, then interleave
+                    // their TimerStarted/TimerCancelled events at their command
+                    // positions in the marker batch (armed timers observed on next
+                    // wake; deadline unused here).
+                    let (mut timer_events, _min_fires_at) =
+                        plan_timer_lifecycle(conn, exec_id, commands).await?;
+                    let marker_events =
+                        pre_suspension_events_from_commands(commands, &mut timer_events);
                     for event in marker_events {
                         store::append_single_event(conn, exec_id, event).await?;
                     }
@@ -6490,25 +6593,6 @@ async fn persist_scheduled_external_activity(
         return Ok(());
     }
 
-    // Build the event list in command emission order so that ScheduleExternalActivity's
-    // ActivityAwaitingExternal event lands at its actual command position relative to any
-    // markers or detached-spawn events in the same batch.
-    let mut awaiting_event = Some(WorkflowEvent::ActivityAwaitingExternal {
-        activity_id: scheduled.activity_id,
-        token: scheduled.token,
-        name: scheduled.name.clone(),
-        input: scheduled.input.clone(),
-        queue: scheduled.queue.clone(),
-        schedule_to_close_secs: scheduled.schedule_to_close_secs,
-    });
-    let events = build_suspension_events(commands, |cmd| {
-        if matches!(cmd, WorkflowCommand::ScheduleExternalActivity { .. }) {
-            awaiting_event.take()
-        } else {
-            None
-        }
-    });
-
     // `had_wake_requested` closes a race no other check in this (new-token)
     // branch covers (PR #901 review): a signal or admitted update landing
     // while this transaction is still recording the external task -- before
@@ -6518,10 +6602,34 @@ async fn persist_scheduled_external_activity(
     // existing-token branch above, which re-checks the external task's own
     // state via `find_by_token_locked`).
     let registry = detached_spawns.registry;
-    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
     let (deferred, had_wake_requested) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
+                // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                // ArmTimer/CancelTimer row mutations FIRST, then build the event
+                // list in command emission order so ScheduleExternalActivity's
+                // ActivityAwaitingExternal event, markers, detached-spawn events,
+                // and interleaved TimerStarted/TimerCancelled all land at their
+                // actual command positions (armed timers observed on next wake;
+                // deadline unused here).
+                let (mut timer_events, _min_fires_at) =
+                    plan_timer_lifecycle(conn, exec_id, commands).await?;
+                let mut awaiting_event = Some(WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: scheduled.activity_id,
+                    token: scheduled.token,
+                    name: scheduled.name.clone(),
+                    input: scheduled.input.clone(),
+                    queue: scheduled.queue.clone(),
+                    schedule_to_close_secs: scheduled.schedule_to_close_secs,
+                });
+                let events = build_suspension_events(commands, &mut timer_events, |cmd| {
+                    if matches!(cmd, WorkflowCommand::ScheduleExternalActivity { .. }) {
+                        awaiting_event.take()
+                    } else {
+                        None
+                    }
+                });
+                let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
                 store::append_events(conn, exec_id, &events, next_event_id).await?;
                 detached_spawns.persist(conn, commands).await?;
                 external_task::record_external_task(
@@ -6568,13 +6676,23 @@ async fn persist_bookkeeping_and_requeue_workflow(
     commands: &[WorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    let events = pre_suspension_events_from_commands(commands);
-    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
     let registry = detached_spawns.registry;
 
     let deferred = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
+                // Cancellable/renewable timer bookkeeping (issue #768): resolve
+                // the ArmTimer/CancelTimer row mutations FIRST, then interleave
+                // their TimerStarted/TimerCancelled events into the suspension
+                // batch at their command-emission positions. When this
+                // bookkeeping-only batch armed a durable timer, `armed_fires_at`
+                // carries that deadline so the parked task can be rescheduled to
+                // it (this is the one path — `await_fire` — that reschedules to
+                // the armed deadline).
+                let (mut timer_events, armed_fires_at) =
+                    plan_timer_lifecycle(conn, exec_id, commands).await?;
+                let events = pre_suspension_events_from_commands(commands, &mut timer_events);
+                let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
                 if !events.is_empty() {
                     store::append_events(conn, exec_id, &events, next_event_id).await?;
                 }
@@ -6588,8 +6706,24 @@ async fn persist_bookkeeping_and_requeue_workflow(
                     registry,
                 )
                 .await?;
-                queue::park_workflow_task(conn, task_id, sticky).await?;
-                queue::wake_workflow_task(conn, exec_id).await?;
+                // FINDING 2 (PR #901 dropped-wake class): honour `had_wake_requested`.
+                // A wake that raced this park (a signal / admitted update /
+                // child-completion landing while the row was still claimed — the
+                // sliding-window "reset the timer on each event" path) is captured
+                // as `wake_requested = TRUE` and read-and-cleared by
+                // `park_workflow_task`. Discarding it would strand the workflow up
+                // to a full timer duration. Waking now is safe: the armed timer
+                // row is durable, so on re-run the workflow re-parks in
+                // `await_fire`, re-arms idempotently, and reschedules to
+                // `fires_at` again.
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+                if had_wake_requested {
+                    queue::wake_workflow_task(conn, exec_id).await?;
+                } else if let Some(fires_at) = armed_fires_at {
+                    queue::reschedule_task(conn, task_id, fires_at).await?;
+                } else {
+                    queue::wake_workflow_task(conn, exec_id).await?;
+                }
                 Ok(deferred)
             }
             .scope_boxed()
@@ -6732,6 +6866,424 @@ async fn apply_race_loser_cancellations(
     }
 
     Ok(deferred)
+}
+
+/// Pure event-emission plan for the **fresh-arm** timer commands
+/// (`ArmTimer { for_await: false }`) in a batch (issue #768, Codex P2 round 4).
+/// DB-independent, so it is unit-testable without a database and runs identically
+/// on every suspension path.
+///
+/// A fresh arm (pushed by `start_timer` / `reset`) records a positional
+/// `TimerStarted` event but inserts **no** `harvest_timers` row — a cancellable
+/// timer becomes fire-eligible only when it is *awaited*
+/// (`ArmTimer { for_await: true }`, resolved by the DB loop in
+/// [`plan_timer_lifecycle`], which inserts the row and emits no event). This
+/// function therefore populates only the fresh-arm indices.
+///
+/// Dedup:
+///
+/// - an `ArmTimer` whose id also has a `StartTimer` in the batch emits nothing
+///   (the suspension path / `persist_started_timer` owns that id); and
+/// - an `ArmTimer` for an id still *active* in this batch (a prior un-cancelled
+///   fresh `ArmTimer` for the same id) emits nothing — a `CancelTimer` clears the
+///   active state so a later re-arm (a same-cycle `reset`) emits again.
+///
+/// Returns a `Vec<Option<WorkflowEvent>>` aligned to `commands`; only fresh
+/// `ArmTimer` indices are ever populated here. `CancelTimer` emission
+/// (`TimerCancelled`) and `for_await: true` row inserts stay with the DB loop in
+/// [`plan_timer_lifecycle`].
+/// Detect a same-batch collision between a LIVE cancellable arm and a classic
+/// `StartTimer` for the same id (issue #768, Codex P2 round 15).
+///
+/// Returns the colliding `timer_id` when the batch holds an `ArmTimer(X)` whose
+/// fresh `TimerStarted` would be dropped by `arm_timer_events`' `StartTimer`-owned
+/// skip **without** having been cancelled first — i.e. a `StartTimer(X)` appears
+/// and there is at least one preceding `ArmTimer(X)` with no `CancelTimer(X)`
+/// between that arm and the `StartTimer(X)`. The legit cancel-then-classic pattern
+/// (`[ArmTimer(X,false), CancelTimer(X), StartTimer(X)]`) is NOT a collision — the
+/// intervening cancel makes the arm dead — so it is not reported.
+fn same_batch_uncancelled_arm_start_collision(commands: &[WorkflowCommand]) -> Option<String> {
+    for (start_idx, cmd) in commands.iter().enumerate() {
+        let WorkflowCommand::StartTimer { timer_id, .. } = cmd else {
+            continue;
+        };
+        let id = timer_id.as_str();
+        // Order-independent detection (issue #768, Codex P2 round 16). The ONLY
+        // legit same-id `StartTimer` + `ArmTimer` combo is the cancel-then-classic
+        // pattern `[ArmTimer(X,false), CancelTimer(X), StartTimer(X)]` — the arm is
+        // dead before the classic start. Any other interleaving is a collision:
+        //   (a) an arm is still LIVE at the StartTimer's position (cancellable-first
+        //       — `[ArmTimer(X), StartTimer(X)]`), OR
+        //   (b) there is ANY `ArmTimer(X)` AFTER the StartTimer (classic-first —
+        //       `[StartTimer(X), ArmTimer(X)]`).
+        // Scanning both directions makes the guard bidirectional and independent of
+        // the batch's command order (the source-level check in `WorkflowContext`
+        // already prevents both, so this is a defensive backstop).
+        let mut arm_live = false;
+        for prior in &commands[..start_idx] {
+            match prior {
+                WorkflowCommand::ArmTimer {
+                    timer_id: arm_id, ..
+                } if arm_id.as_str() == id => arm_live = true,
+                WorkflowCommand::CancelTimer {
+                    timer_id: cancel_id,
+                } if cancel_id.as_str() == id => {
+                    arm_live = false;
+                }
+                _ => {}
+            }
+        }
+        if arm_live {
+            return Some(id.to_string());
+        }
+        // (b) A cancellable arm placed AFTER the classic start of the same id is a
+        // collision regardless of any preceding cancel.
+        let arm_after = commands[start_idx + 1..].iter().any(|c| {
+            matches!(c, WorkflowCommand::ArmTimer { timer_id: arm_id, .. } if arm_id.as_str() == id)
+        });
+        if arm_after {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn arm_timer_events(commands: &[WorkflowCommand]) -> Vec<Option<WorkflowEvent>> {
+    let start_timer_ids: HashSet<&str> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Ids with an un-cancelled fresh `ArmTimer` seen so far in this batch. A
+    // `CancelTimer` removes the id so a same-cycle `reset` (CancelTimer +
+    // ArmTimer) re-emits `TimerStarted`.
+    let mut active: HashSet<&str> = HashSet::new();
+    let mut events: Vec<Option<WorkflowEvent>> = vec![None; commands.len()];
+
+    for (i, cmd) in commands.iter().enumerate() {
+        match cmd {
+            WorkflowCommand::ArmTimer {
+                timer_id,
+                duration_secs,
+                for_await: false,
+            } => {
+                if start_timer_ids.contains(timer_id.as_str()) {
+                    continue;
+                }
+                if active.insert(timer_id.as_str()) {
+                    events[i] = Some(WorkflowEvent::TimerStarted {
+                        timer_id: timer_id.clone(),
+                        duration_secs: *duration_secs,
+                    });
+                }
+            }
+            WorkflowCommand::CancelTimer { timer_id } => {
+                active.remove(timer_id.as_str());
+            }
+            // `for_await: true` re-arms insert a row (DB loop) but emit no event.
+            _ => {}
+        }
+    }
+
+    events
+}
+
+/// Pure core of [`plan_timer_lifecycle`] (issue #768): decides (a) the positional
+/// `TimerStarted`/`TimerCancelled` events for the batch and (b) which
+/// `for_await: true` arm command **indices** contribute a deadline to
+/// `min_fires_at`. DB-independent — the enclosing fn only resolves the actual
+/// `fires_at` timestamps and performs the `harvest_timers` row upserts/deletes —
+/// so it is unit-testable without a database.
+///
+/// A same-batch `CancelTimer(X)` supersedes an `ArmTimer(X)` re-arm in
+/// **batch order** (round 7 fix, refined in rounds 9 and 11): a `for_await: true`
+/// (await) arm for X contributes its deadline iff **no `CancelTimer(X)` appears
+/// after it in the batch**. A `for_await: false` (fresh start/reset) arm never
+/// contributes a firing row on its own. Without this exclusion, an `await_fire`
+/// racing a sibling `cancel_timer(X)` in the same task would reschedule the parked
+/// task to a now-deleted row's deadline instead of waking immediately to consume
+/// the recorded `TimerCancelled`. The per-await-arm order-sensitivity lets a
+/// reset-then-await in one task — `[CancelTimer(X), ArmTimer(X, false),
+/// ArmTimer(X, true)]`, whose await arm is *last* — still arm the durable row in
+/// the transaction that recorded the reset, while an await-then-reset
+/// `[ArmTimer(X, true), CancelTimer(X), ArmTimer(X, false)]` — whose await arm has
+/// a same-id cancel after it — does NOT arm a stale firing row (round 11 fix): the
+/// live run would otherwise fire off the old await duration while replay, seeing
+/// the recorded `TimerCancelled` first, resolves `Cancelled` — a divergence.
+fn plan_timer_lifecycle_pure(
+    commands: &[WorkflowCommand],
+) -> (Vec<Option<WorkflowEvent>>, Vec<usize>) {
+    // Fresh-arm (`for_await: false`) `TimerStarted` events (with in-batch active-set
+    // + `StartTimer`-owned dedup).
+    let mut events_by_index = arm_timer_events(commands);
+
+    // An `ArmTimer` whose id also has a same-batch `StartTimer` (the classic
+    // `ctx.timer` awaited in the same cycle) is owned by `persist_started_timer`.
+    let start_timer_ids: std::collections::HashSet<&str> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Per-await-arm liveness against same-batch cancels, resolved in **batch
+    // order** (rounds 9 + 11). A `for_await: true` (await) arm for id X
+    // contributes its firing-row deadline IFF, evaluated at its own position:
+    //   (forward, round 11) no `CancelTimer(X)` appears AFTER it in the batch —
+    //     a later cancel supersedes the await regardless of any later
+    //     `for_await: false` fresh arm re-establishing X. On replay such an await
+    //     resolves against the recorded `TimerCancelled` that precedes the fresh
+    //     arm's `TimerStarted`, so the live run must not arm a firing row off the
+    //     stale await duration (that would fire live while replay resolves
+    //     `Cancelled` — a divergence). This is the round-11 FINDING fix.
+    //   (backward, round 9) X is not sitting cancelled at the arm — if a
+    //     `CancelTimer(X)` precedes the await with no `ArmTimer(X, for_await:
+    //     false)` fresh arm between that cancel and the await, X is dead and the
+    //     await wakes now (cancel-then-await with no reset). A fresh arm between
+    //     the cancel and the await re-establishes X (reset-then-await → arms).
+    // A `for_await: false` (fresh start/reset) arm never contributes a firing row
+    // itself — it only (re-)establishes the logical Armed state; a firing row is
+    // created solely by a subsequent `await_fire` (`for_await: true`) that
+    // survives BOTH checks (in this batch or a later one).
+    //
+    // The two checks together resolve the shapes an end-of-batch-liveness rule
+    // conflated:
+    //   - reset-then-await `[Cancel, Arm(false), Arm(true)]` → forward clean +
+    //     backward re-established → arms in this transaction (deadline starts
+    //     when the reset was recorded, not one claim later).
+    //   - await-then-reset `[Arm(true, old), Cancel, Arm(false, new)]` → a cancel
+    //     follows the await → does NOT arm (round 11); wake now, so live and
+    //     replay both resolve `Cancelled`.
+    //   - await-then-cancel `[Arm(true), Cancel]` and cancel-then-await
+    //     `[Cancel, Arm(true)]` → forward cancel / backward-dead respectively →
+    //     wake now (round 7 behavior preserved).
+    let await_arm_contributes = |id: &str, at: usize| -> bool {
+        // (forward) a later same-id cancel supersedes the await.
+        let cancelled_after = commands[at + 1..].iter().any(|cmd| {
+            matches!(cmd, WorkflowCommand::CancelTimer { timer_id } if timer_id.as_str() == id)
+        });
+        if cancelled_after {
+            return false;
+        }
+        // (backward) X must not be cancelled-without-reset before this arm.
+        let mut live = true;
+        for cmd in &commands[..at] {
+            match cmd {
+                WorkflowCommand::CancelTimer { timer_id } if timer_id.as_str() == id => {
+                    live = false;
+                }
+                WorkflowCommand::ArmTimer {
+                    timer_id,
+                    for_await: false,
+                    ..
+                } if timer_id.as_str() == id => {
+                    live = true;
+                }
+                _ => {}
+            }
+        }
+        live
+    };
+
+    let mut armed_indices = Vec::new();
+    for (i, cmd) in commands.iter().enumerate() {
+        match cmd {
+            WorkflowCommand::ArmTimer {
+                timer_id,
+                for_await: true,
+                ..
+            } => {
+                if start_timer_ids.contains(timer_id.as_str())
+                    || !await_arm_contributes(timer_id.as_str(), i)
+                {
+                    continue;
+                }
+                armed_indices.push(i);
+            }
+            WorkflowCommand::CancelTimer { timer_id } => {
+                events_by_index[i] = Some(WorkflowEvent::TimerCancelled {
+                    timer_id: timer_id.clone(),
+                });
+            }
+            // Fresh arms (`ArmTimer { for_await: false }`) never insert a row —
+            // their `TimerStarted` is already in `events_by_index`.
+            _ => {}
+        }
+    }
+
+    (events_by_index, armed_indices)
+}
+
+/// DB-mutation phase (issue #768) for the `WorkflowCommand::ArmTimer` /
+/// `WorkflowCommand::CancelTimer` bookkeeping commands: the durable side of
+/// author-controlled cancellable/renewable timers.
+///
+/// Runs inside the caller's transaction (mirroring
+/// [`apply_race_loser_cancellations`] and `DetachedSpawnPersistence::persist`),
+/// **before** the caller appends the suspension event list. It performs only the
+/// `harvest_timers` row upserts/deletes and decides which command position
+/// should emit which `TimerStarted` / `TimerCancelled` event — it does **not**
+/// append any events. The event/deadline plan itself is the pure, unit-tested
+/// [`plan_timer_lifecycle_pure`]; this fn only resolves the actual `fires_at`
+/// timestamps and performs the row upserts/deletes. The caller then merges those
+/// events into the single position-ordered suspension event batch via
+/// [`build_suspension_events`], so a `TimerStarted` lands at its `ArmTimer`
+/// command's emission position instead of being forced to the end of the batch
+/// (the FINDING-1 replay bug).
+///
+/// - `ArmTimer { for_await: false }` (a **fresh arm**, from `start_timer` /
+///   `reset`): emits a positional `TimerStarted` event (resolved purely by
+///   [`arm_timer_events`], with in-batch active-set + `StartTimer`-owned dedup)
+///   but inserts **no** `harvest_timers` row. A cancellable timer becomes
+///   fire-eligible only when it is awaited, so an armed-but-unawaited timer can
+///   never fire spuriously while the workflow is parked on some other wait
+///   (an activity, a signal, a child workflow) — this is the round-4 fix for the
+///   spurious-fire-breaks-reset/replay bug.
+/// - `ArmTimer { for_await: true }` (a **re-arm for firing**, from
+///   `await_timer_fire`): upserts the `harvest_timers` row (`fires_at =
+///   db_clock_now + duration`, dedup by `timer_id` — idempotent on re-park),
+///   contributes its `fires_at` to `min_fires_at`, and emits **no** event (the
+///   arm's `TimerStarted` was already recorded by the fresh arm). An id that also
+///   has a `StartTimer` command in the batch is skipped (owned by
+///   `persist_started_timer`), and an await arm followed by a same-id
+///   `CancelTimer` later in the batch is skipped too (round 7 fix, per-await-arm
+///   order-sensitive in rounds 9/11 — see [`plan_timer_lifecycle_pure`]): it
+///   neither arms a row nor contributes to `min_fires_at`, so an `await_fire`
+///   raced (or reset) by a sibling branch's later `cancel` wakes immediately
+///   instead of rescheduling to the deleted row's deadline — while a
+///   reset-then-await (whose await arm is last, with no cancel after it) still
+///   arms the durable row in this transaction.
+/// - `CancelTimer { id }`: delete the pending (`fired = false`) row via
+///   [`queue::delete_pending_timer`] and resolve `TimerCancelled`. The delete
+///   filters `fired = false`, so a fire that already committed is a no-op and the
+///   recorded-history order (`TimerFired` vs `TimerCancelled`) decides the
+///   observed outcome.
+///
+/// Row inserts are therefore driven entirely by the command's `for_await` field
+/// (and same-batch cancel), not by which persist path runs: a fresh arm never
+/// leaks a `harvest_timers` row on any path (including the terminal seal), and
+/// `for_await: true` re-arms only ever appear in the bookkeeping-only
+/// `await_fire` park.
+///
+/// Returns `(events_by_index, min_fires_at)`:
+/// - `events_by_index` is aligned to `commands` (`len == commands.len()`); a
+///   `Some` at a fresh-`ArmTimer` / `CancelTimer` index carries the event to emit
+///   at that position. The caller passes it to [`build_suspension_events`].
+/// - `min_fires_at` is the **minimum** armed `fires_at` across all contributing
+///   `for_await: true` re-arms (or `None` when none armed a deadline — the case on
+///   every path except `await_fire`, and also when every awaited arm was cancelled
+///   in the same batch), so the bookkeeping-only `await_fire` park can reschedule
+///   the workflow task to that instant.
+async fn plan_timer_lifecycle(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<(
+    Vec<Option<WorkflowEvent>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+)> {
+    use crate::schema::harvest_timers;
+
+    // Fast path: nothing to do when the batch carries no timer bookkeeping.
+    if !commands.iter().any(|c| {
+        matches!(
+            c,
+            WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }
+        )
+    }) {
+        return Ok((vec![None; commands.len()], None));
+    }
+
+    // Defensive guard (issue #768, Codex P2 round 15): a batch must never carry a
+    // LIVE, un-cancelled cancellable arm (`ArmTimer(X)`) alongside a classic
+    // `StartTimer(X)` for the same id. `ctx.timer`/`sleep_until` already reject
+    // that collision at the source (see `WorkflowContext::timer`), so this should
+    // be unreachable — but if a future path ever lets both land in one batch, fail
+    // fast here rather than silently dropping the arm's `TimerStarted`
+    // (`arm_timer_events`' `StartTimer`-owned skip) and corrupting history. The
+    // legit cancel-then-classic pattern — `[ArmTimer(X,false), CancelTimer(X),
+    // StartTimer(X)]` — is NOT a collision (the arm was cancelled before the classic
+    // start), so the check requires the arm to be uncancelled BEFORE the same-id
+    // `StartTimer`.
+    if let Some(id) = same_batch_uncancelled_arm_start_collision(commands) {
+        return Err(HarvestError::Config(format!(
+            "timer id '{id}' has both a live cancellable start_timer arm and a classic \
+             ctx.timer/sleep_until in the same suspension batch — these two timer APIs must use \
+             distinct ids (issue #768)"
+        )));
+    }
+
+    // Pure event plan + the `for_await: true` arm indices that contribute a
+    // deadline (already excludes `StartTimer`-owned and same-batch-cancelled ids).
+    let (events_by_index, armed_indices) = plan_timer_lifecycle_pure(commands);
+
+    // Row deletes for every `CancelTimer` (idempotent; `delete_pending_timer`
+    // filters `fired = false`). Deletes run entirely BEFORE the insert loop below,
+    // so for a reset-then-await id (delete the old row, then arm a fresh await row)
+    // the insert wins and the row ends present — matching the `armed_indices` the
+    // pure planner encodes. An await-raced-by-cancel and an await-then-reset id are
+    // both excluded from `armed_indices` (the later same-id cancel supersedes the
+    // await arm), so only their delete runs and the row ends absent.
+    //
+    // Invariant (issue #768, Codex P2 round 16): a `CancelTimer` here can only name
+    // a CANCELLABLE timer's id. `WorkflowContext::cancel_timer`/`reset_timer` no-op
+    // (emit no `CancelTimer`) unless the id is a live cancellable arm / not a
+    // classic timer id, so `delete_pending_timer` can never delete a classic
+    // `ctx.timer`/`sleep_until` row out from under its parked waiter.
+    for cmd in commands {
+        if let WorkflowCommand::CancelTimer { timer_id } = cmd {
+            queue::delete_pending_timer(conn, exec_id, timer_id).await?;
+        }
+    }
+
+    // Upsert the contributing armed rows and fold each `fires_at` into
+    // `min_fires_at`.
+    let mut min_fires_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    for &i in &armed_indices {
+        let WorkflowCommand::ArmTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = &commands[i]
+        else {
+            continue;
+        };
+        let existing: Option<HarvestTimer> = harvest_timers::table
+            .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(harvest_timers::timer_id.eq(timer_id.as_str()))
+            .filter(harvest_timers::fired.eq(false))
+            .first::<HarvestTimer>(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+
+        let fires_at = if let Some(ref ext) = existing {
+            ext.fires_at
+        } else {
+            let fire_delay = chrono_duration_from_secs(*duration_secs, "timer duration")?;
+            let db_now = db_clock_now(conn).await?;
+            let fires_at = db_now + fire_delay;
+            let new_timer = NewHarvestTimer {
+                workflow_exec_id: exec_id.as_uuid(),
+                timer_id: timer_id.as_str(),
+                fires_at,
+            };
+            diesel::insert_into(harvest_timers::table)
+                .values(&new_timer)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            fires_at
+        };
+        min_fires_at =
+            Some(min_fires_at.map_or(fires_at, |existing_min| existing_min.min(fires_at)));
+    }
+
+    Ok((events_by_index, min_fires_at))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7259,6 +7811,12 @@ async fn persist_workflow_continue_as_new(
         // Continue-as-new is the same logical run forking forward: preserve
         // the predecessor's completion-callback targets (issue #605).
         completion_callbacks: execution.completion_callbacks.clone(),
+        // Back-link this successor to its predecessor and to the chain origin
+        // (issue #701) so the run-chain timeline can walk the whole chain from any
+        // member. The origin is the predecessor's own `first_exec_id` if it is
+        // itself a successor, else the predecessor's own id.
+        continued_from_exec_id: Some(exec_id.as_uuid()),
+        first_exec_id: Some(execution.first_exec_id.unwrap_or(execution.id)),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -7633,7 +8191,18 @@ async fn persist_terminal_outcome_commands(
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
 
-    let pre_terminal = pre_suspension_events_from_commands(pending_cmds);
+    // Cancellable/renewable timer bookkeeping (issue #768) on a terminal cycle.
+    // A sealing execution never awaits, so any `ArmTimer` here is a fresh arm
+    // (`for_await: false`): it records `TimerStarted` (needed for positional
+    // replay of a `start_timer`/`reset` that completes in the same task) but
+    // inserts NO `harvest_timers` row — so no never-firing row leaks. A trailing
+    // `cancel_timer`/`handle.cancel()` cleanup is still honoured (`TimerCancelled`
+    // + row delete). Resolve the row mutations FIRST, then interleave the timer
+    // events into the pre-terminal batch at each command's emission position
+    // (FINDING 1).
+    let (mut timer_events, _armed) =
+        plan_timer_lifecycle(conn, persistence.exec_id, pending_cmds).await?;
+    let pre_terminal = pre_suspension_events_from_commands(pending_cmds, &mut timer_events);
     if !pre_terminal.is_empty() {
         store::append_events(conn, persistence.exec_id, &pre_terminal, next_event_id).await?;
         next_event_id = next_event_id
@@ -7741,7 +8310,52 @@ fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
             _ => None,
         })
         .sum();
-    u64::try_from(simple_events.saturating_add(race_cancel_events)).unwrap_or(u64::MAX)
+    let timer_lifecycle_events = timer_lifecycle_event_count(commands);
+    u64::try_from(
+        simple_events
+            .saturating_add(race_cancel_events)
+            .saturating_add(timer_lifecycle_events),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Conservative upper bound on the durable timer-lifecycle events an
+/// `ArmTimer`/`CancelTimer` batch appends, for the history hard-cap preflight
+/// (Codex P2, issue #768). `plan_timer_lifecycle`/`arm_timer_events`
+/// append one `TimerStarted` per emitting `ArmTimer` and one `TimerCancelled`
+/// per `CancelTimer`; without counting them a near-cap reset batch
+/// (`CancelTimer` + `ArmTimer`) would pass the `>= cap` check as ~one pending
+/// event yet append two, breaching the hard cap instead of failing to the
+/// dead-letter queue first.
+///
+/// Counted **conservatively** — the preflight runs before the DB-dependent
+/// dedup, so an `ArmTimer` whose durable row already exists (an idempotent
+/// re-arm that appends nothing) is still counted `+1`. Over-counting only ever
+/// nudges the cap check earlier (DLQ one event early), never masks an overflow.
+///
+/// An `ArmTimer` whose id also has a `StartTimer` in the same batch is
+/// **excluded**: `plan_timer_lifecycle` skips it (the `StartTimer` suspension
+/// path owns that id's row/event), and its `TimerStarted` is already counted by
+/// the `extract_started_timer_for_suspension` branch — counting it here too
+/// would double-count.
+fn timer_lifecycle_event_count(commands: &[WorkflowCommand]) -> usize {
+    let start_timer_ids: HashSet<&str> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    commands
+        .iter()
+        .filter(|cmd| match cmd {
+            WorkflowCommand::ArmTimer { timer_id, .. } => {
+                !start_timer_ids.contains(timer_id.as_str())
+            }
+            WorkflowCommand::CancelTimer { .. } => true,
+            _ => false,
+        })
+        .count()
 }
 
 fn pending_detached_parent_close_cascade_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -13584,6 +14198,590 @@ mod tests {
             details: serde_json::json!(2),
         }];
         assert!(!should_requeue_signal_wait(&commands));
+    }
+
+    // ── cancellable-timer event interleaving (issue #768, FINDING 1) ────────
+
+    /// Codex P2 round 4 (issue #768): a fresh `ArmTimer { for_await: false }`
+    /// (from `start_timer`/`reset`) emits a `TimerStarted` event for positional
+    /// replay but the pure `arm_timer_events` never signals a `harvest_timers`
+    /// row insert — a cancellable timer becomes fire-eligible only when it is
+    /// awaited (`for_await: true`, resolved by the DB loop). So a `start_timer`
+    /// that arms and then completes/parks in the same task records its arm event
+    /// without leaking a never-firing row.
+    #[test]
+    fn fresh_arm_emits_timer_started_without_signalling_a_row() {
+        let commands = vec![WorkflowCommand::ArmTimer {
+            timer_id: crate::types::TimerId::new("x"),
+            duration_secs: 300,
+            for_await: false,
+        }];
+        let events = arm_timer_events(&commands);
+        assert_eq!(events.len(), 1, "aligned to commands, got {events:?}");
+        assert!(
+            matches!(
+                &events[0],
+                Some(WorkflowEvent::TimerStarted { timer_id, duration_secs })
+                    if timer_id.as_str() == "x" && *duration_secs == 300
+            ),
+            "a fresh ArmTimer must emit TimerStarted for replay, got {events:?}"
+        );
+    }
+
+    /// A `for_await: true` re-arm (the `await_fire` row-insert command) emits
+    /// **no** event from `arm_timer_events` — its `TimerStarted` was already
+    /// recorded by the fresh arm; the DB loop only inserts the row.
+    #[test]
+    fn await_rearm_emits_no_event_from_the_pure_plan() {
+        let commands = vec![WorkflowCommand::ArmTimer {
+            timer_id: crate::types::TimerId::new("x"),
+            duration_secs: 300,
+            for_await: true,
+        }];
+        let events = arm_timer_events(&commands);
+        assert!(
+            events.iter().all(Option::is_none),
+            "a for_await re-arm emits no event (row-only), got {events:?}"
+        );
+    }
+
+    /// Issue #768 round 7: an `await_fire` re-arm (`for_await: true`) followed by a
+    /// same-task sibling branch's `cancel_timer` in the SAME batch must NOT
+    /// contribute a deadline to `min_fires_at` (`armed_indices` empty → the caller's
+    /// `armed_fires_at` is `None` → the parked task wakes NOW instead of being
+    /// rescheduled to the deleted row's deadline), and the cancel must emit
+    /// `TimerCancelled`.
+    #[test]
+    fn plan_timer_lifecycle_pure_excludes_a_same_batch_cancelled_await_arm() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: true,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("x"),
+            },
+        ];
+        let (events, armed) = plan_timer_lifecycle_pure(&commands);
+        assert!(
+            armed.is_empty(),
+            "a same-batch-cancelled await arm must not contribute to min_fires_at, got {armed:?}"
+        );
+        assert!(
+            matches!(&events[1], Some(WorkflowEvent::TimerCancelled { timer_id }) if timer_id.as_str() == "x"),
+            "the cancel must emit TimerCancelled, got {events:?}"
+        );
+        assert!(
+            events[0].is_none(),
+            "the await re-arm records no positional event, got {events:?}"
+        );
+
+        // Cancel-then-await with NO fresh arm in between (a genuine cancellation
+        // racing an await, not a reset): the cancel is the last establish/cancel op
+        // for the id, so the timer is dead at end-of-batch and the await is dropped
+        // (wake now). Distinct from reset-then-await, which interposes a fresh arm —
+        // see `plan_timer_lifecycle_pure_arms_a_reset_then_await_in_one_batch`.
+        let rev = vec![
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("x"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: true,
+            },
+        ];
+        let (_ev, armed_rev) = plan_timer_lifecycle_pure(&rev);
+        assert!(
+            armed_rev.is_empty(),
+            "cancel-then-await with no re-establishing fresh arm must wake now, got {armed_rev:?}"
+        );
+    }
+
+    /// Round 9 FINDING: a reset-then-await in ONE task —
+    /// `[CancelTimer(X), ArmTimer(X, for_await: false), ArmTimer(X, for_await: true)]`
+    /// — must arm the durable row and contribute its deadline in THIS transaction.
+    /// The fresh arm (`for_await: false`, from `reset`) re-establishes X *after* the
+    /// cancel, so X is live at end-of-batch and the `await_fire` re-arm at index 2
+    /// contributes. Before the round-9 fix the order-independent "cancel anywhere
+    /// cancels the arm" rule dropped it, shifting the deadline to the next claim.
+    #[test]
+    fn plan_timer_lifecycle_pure_arms_a_reset_then_await_in_one_batch() {
+        let commands = vec![
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 600,
+                for_await: false,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 600,
+                for_await: true,
+            },
+        ];
+        let (events, armed) = plan_timer_lifecycle_pure(&commands);
+        assert_eq!(
+            armed,
+            vec![2],
+            "reset-then-await must arm the await re-arm at index 2, got {armed:?}"
+        );
+        // The cancel still emits TimerCancelled at its position; the fresh arm emits
+        // TimerStarted; the await re-arm records no positional event.
+        assert!(
+            matches!(&events[0], Some(WorkflowEvent::TimerCancelled { timer_id }) if timer_id.as_str() == "idle"),
+            "the reset's cancel must emit TimerCancelled, got {events:?}"
+        );
+        assert!(
+            matches!(&events[1], Some(WorkflowEvent::TimerStarted { timer_id, .. }) if timer_id.as_str() == "idle"),
+            "the reset's fresh arm must emit TimerStarted, got {events:?}"
+        );
+        assert!(
+            events[2].is_none(),
+            "the await re-arm records no positional event, got {events:?}"
+        );
+    }
+
+    /// Round 11 FINDING: an await arm CANCELLED by a *later* same-batch reset must
+    /// NOT contribute a firing row. Batch `[ArmTimer(X, for_await: true, old),
+    /// CancelTimer(X), ArmTimer(X, for_await: false, new)]` (an `await_fire()`
+    /// polled before a sibling `reset` in the same task): the await arm at index 0
+    /// has a same-id `CancelTimer` after it, so it does NOT arm — the fresh
+    /// `for_await: false` arm at index 2 re-establishes the logical Armed state but
+    /// never contributes a firing row. `armed_indices` is therefore EMPTY → the
+    /// parked task wakes NOW → live and replay both resolve `Cancelled` (replay
+    /// sees the recorded `TimerCancelled` before the fresh arm's `TimerStarted`).
+    /// The round-10 end-of-batch-liveness rule kept the await arm (X is live at
+    /// end-of-batch because the fresh arm re-established it) and armed a firing row
+    /// off the stale await duration → a live-vs-replay divergence.
+    #[test]
+    fn plan_timer_lifecycle_pure_excludes_an_await_arm_cancelled_by_a_later_reset() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: true,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("x"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 600,
+                for_await: false,
+            },
+        ];
+        let (events, armed) = plan_timer_lifecycle_pure(&commands);
+        assert!(
+            armed.is_empty(),
+            "an await arm cancelled by a later same-batch reset must not contribute a \
+             firing row (the fresh arm re-establishes state only), got {armed:?}"
+        );
+        assert!(
+            events[0].is_none(),
+            "the cancelled await re-arm records no positional event, got {events:?}"
+        );
+        assert!(
+            matches!(&events[1], Some(WorkflowEvent::TimerCancelled { timer_id }) if timer_id.as_str() == "x"),
+            "the reset's cancel must emit TimerCancelled, got {events:?}"
+        );
+        assert!(
+            matches!(&events[2], Some(WorkflowEvent::TimerStarted { timer_id, .. }) if timer_id.as_str() == "x"),
+            "the reset's fresh arm must emit TimerStarted, got {events:?}"
+        );
+    }
+
+    /// Per-id order-sensitivity with two ids in one batch: one reset-then-await
+    /// (arms) and one await-then-cancel (wakes now) must be resolved independently.
+    #[test]
+    fn plan_timer_lifecycle_pure_resolves_two_ids_independently_by_order() {
+        let commands = vec![
+            // id "keep": reset then await -> arms.
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("keep"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("keep"),
+                duration_secs: 600,
+                for_await: false,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("keep"),
+                duration_secs: 600,
+                for_await: true,
+            },
+            // id "drop": await then a later sibling cancel -> wakes now.
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("drop"),
+                duration_secs: 300,
+                for_await: true,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("drop"),
+            },
+        ];
+        let (_events, armed) = plan_timer_lifecycle_pure(&commands);
+        assert_eq!(
+            armed,
+            vec![2],
+            "only the reset-then-await id must arm; the await-then-cancel id is dropped, got {armed:?}"
+        );
+    }
+
+    /// A `for_await: true` re-arm with NO same-batch cancel still contributes a
+    /// deadline (the normal `await_fire` re-park path).
+    #[test]
+    fn plan_timer_lifecycle_pure_keeps_an_uncancelled_await_arm() {
+        let commands = vec![WorkflowCommand::ArmTimer {
+            timer_id: crate::types::TimerId::new("x"),
+            duration_secs: 300,
+            for_await: true,
+        }];
+        let (_ev, armed) = plan_timer_lifecycle_pure(&commands);
+        assert_eq!(
+            armed,
+            vec![0],
+            "an uncancelled await arm must contribute a deadline"
+        );
+    }
+
+    /// An `ArmTimer` whose id also carries a `StartTimer` in the batch (the
+    /// arm+`await_fire` same-cycle case) is owned by the suspension path
+    /// (`persist_started_timer`); the arm helper emits nothing for it, or the
+    /// event would be double-recorded.
+    #[test]
+    fn arm_events_skip_start_timer_owned_ids() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        let events = arm_timer_events(&commands);
+        assert!(
+            events.iter().all(Option::is_none),
+            "StartTimer-owned arm must emit nothing, got {events:?}"
+        );
+    }
+
+    /// A LIVE cancellable arm colliding with a same-batch classic `StartTimer`
+    /// for the same id is a hard invariant violation (issue #768, round 15): the
+    /// arm's `TimerStarted` would be silently dropped, corrupting history. The
+    /// persist guard must flag it.
+    #[test]
+    fn uncancelled_arm_start_collision_is_detected() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 30,
+                for_await: false,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands).as_deref(),
+            Some("x"),
+            "uncancelled same-id arm + classic start must be flagged"
+        );
+    }
+
+    /// Order-independence (issue #768, Codex P2 round 16): a classic `StartTimer(x)`
+    /// placed BEFORE a same-id cancellable `ArmTimer(x)` in the batch is the reverse
+    /// order of the prefix-only check, and must still be flagged.
+    #[test]
+    fn start_before_uncancelled_arm_collision_is_detected() {
+        let commands = vec![
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 30,
+                for_await: false,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands).as_deref(),
+            Some("x"),
+            "classic-first then same-id cancellable arm must be flagged regardless of order"
+        );
+    }
+
+    /// The legit cancel-then-classic pattern — `[ArmTimer(X,false),
+    /// CancelTimer(X), StartTimer(X)]` — is NOT a collision: the arm was cancelled
+    /// before the classic start, so the guard must stay silent.
+    #[test]
+    fn cancelled_arm_then_start_is_not_a_collision() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 60,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands),
+            None,
+            "cancel-then-classic reuse must not be flagged as a collision"
+        );
+    }
+
+    /// A classic `StartTimer` whose id has no cancellable arm at all is fine.
+    #[test]
+    fn plain_start_timer_with_distinct_id_is_not_a_collision() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("a"),
+                duration_secs: 30,
+                for_await: false,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("b"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert_eq!(
+            same_batch_uncancelled_arm_start_collision(&commands),
+            None,
+            "distinct-id classic start must not collide with an arm"
+        );
+    }
+
+    /// A same-cycle `reset` (`start_timer` then `handle.reset`) emits
+    /// `[ArmTimer(x), CancelTimer(x), ArmTimer(x)]` (all fresh arms). Dedup:
+    /// `TimerStarted` at BOTH arm positions, because the intervening `CancelTimer`
+    /// clears the active state — a naive first-wins seen-set would wrongly drop the
+    /// second `TimerStarted`. The `CancelTimer`'s `TimerCancelled` is emitted by
+    /// the DB loop, not the pure arm helper, so its index stays `None` here.
+    #[test]
+    fn arm_events_reemit_after_intervening_cancel() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("x"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: false,
+            },
+        ];
+        let events = arm_timer_events(&commands);
+        assert!(
+            matches!(&events[0], Some(WorkflowEvent::TimerStarted { .. })),
+            "first arm emits, got {events:?}"
+        );
+        assert!(
+            events[1].is_none(),
+            "CancelTimer emission stays with the DB loop, not the arm helper: {events:?}"
+        );
+        assert!(
+            matches!(&events[2], Some(WorkflowEvent::TimerStarted { .. })),
+            "re-arm after a cancel must re-emit TimerStarted, got {events:?}"
+        );
+    }
+
+    /// A re-arm of an id still active in the batch (no intervening cancel) emits
+    /// nothing on the second arm — in-batch first-arm dedup.
+    #[test]
+    fn arm_events_dedup_repeat_arm_without_cancel() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: false,
+            },
+        ];
+        let events = arm_timer_events(&commands);
+        assert!(
+            matches!(&events[0], Some(WorkflowEvent::TimerStarted { .. })),
+            "first arm emits, got {events:?}"
+        );
+        assert!(
+            events[1].is_none(),
+            "a repeat arm of an active id emits nothing, got {events:?}"
+        );
+    }
+
+    /// Codex P2 (issue #768): a reset batch (`CancelTimer` + `ArmTimer`) appends
+    /// two durable timer-lifecycle events (`TimerCancelled` + `TimerStarted`), so
+    /// the history hard-cap preflight must count 2 — otherwise a near-cap reset
+    /// slips past the `>= cap` check and breaches the hard cap.
+    #[test]
+    fn timer_lifecycle_count_counts_reset_batch_as_two() {
+        let commands = vec![
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: false,
+            },
+        ];
+        assert_eq!(timer_lifecycle_event_count(&commands), 2);
+        // The shared preflight accessor must reflect it too (no other bookkeeping
+        // in this batch).
+        assert_eq!(pre_suspension_event_count(&commands), 2);
+    }
+
+    /// An `ArmTimer` whose id also carries a `StartTimer` in the batch is owned by
+    /// the suspension path and counted by `extract_started_timer_for_suspension`;
+    /// counting it here too would double-count, so the timer-lifecycle count
+    /// excludes it. A `CancelTimer` for a *different* id still counts.
+    #[test]
+    fn timer_lifecycle_count_excludes_start_timer_owned_arm() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("x"),
+                duration_secs: 300,
+                result_tx: oneshot::channel::<()>().0,
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("other"),
+            },
+        ];
+        // ArmTimer(x) excluded (StartTimer-owned); CancelTimer(other) counts.
+        assert_eq!(timer_lifecycle_event_count(&commands), 1);
+    }
+
+    /// A batch with no timer bookkeeping counts zero timer-lifecycle events
+    /// (backward-compatible: non-timer batches are unaffected).
+    #[test]
+    fn timer_lifecycle_count_is_zero_without_timer_commands() {
+        let commands = vec![WorkflowCommand::RecordMarker {
+            name: "m".to_string(),
+            details: serde_json::Value::Null,
+        }];
+        assert_eq!(timer_lifecycle_event_count(&commands), 0);
+        // But RecordMarker still counts as a pre-suspension event.
+        assert_eq!(pre_suspension_event_count(&commands), 1);
+    }
+
+    /// A `start_timer` immediately followed same-cycle by a `new_uuid`/
+    /// `system_now`/`random_*`/`side_effect` (guardrail-recommended primitives)
+    /// emits `[ArmTimer(id), RecordSideEffect(..)]`. The recorded history MUST
+    /// interleave `TimerStarted` at the `ArmTimer`'s command position — i.e.
+    /// BEFORE `SideEffectRecorded` — because `replay::match_timer_arm` is strictly
+    /// positional and `drain_early_signals` does not skip `SideEffectRecorded`.
+    /// The pre-FINDING-1 worker appended timer-lifecycle events at the END of the
+    /// batch, recording `[SideEffectRecorded, TimerStarted]` and nd-blocking the
+    /// run on first resume.
+    #[test]
+    fn build_suspension_events_interleaves_timer_started_before_side_effect() {
+        let commands = vec![
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: false,
+            },
+            WorkflowCommand::RecordSideEffect {
+                kind: crate::event::SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!("018f-uuid"),
+            },
+        ];
+        // The DB-mutation phase (plan_timer_lifecycle) resolved the ArmTimer at
+        // index 0 to a newly-created row → emit TimerStarted at that position.
+        let mut timer_events = vec![
+            Some(WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+            }),
+            None,
+        ];
+        let events = build_suspension_events(&commands, &mut timer_events, |_| None);
+        assert_eq!(events.len(), 2, "got {events:?}");
+        assert!(
+            matches!(events[0], WorkflowEvent::TimerStarted { .. }),
+            "TimerStarted must be at the ArmTimer position (index 0), got {events:?}"
+        );
+        assert!(
+            matches!(events[1], WorkflowEvent::SideEffectRecorded { .. }),
+            "SideEffectRecorded must follow TimerStarted, got {events:?}"
+        );
+    }
+
+    /// A `reset` in the same cycle as a marker: `[RecordMarker, CancelTimer,
+    /// ArmTimer]` must record `[MarkerRecorded, TimerCancelled, TimerStarted]`
+    /// at each command's position.
+    #[test]
+    fn build_suspension_events_interleaves_reset_cancel_then_arm_in_position() {
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "m".to_string(),
+                details: serde_json::json!(1),
+            },
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: false,
+            },
+        ];
+        let mut timer_events = vec![
+            None,
+            Some(WorkflowEvent::TimerCancelled {
+                timer_id: crate::types::TimerId::new("idle"),
+            }),
+            Some(WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+            }),
+        ];
+        let events = build_suspension_events(&commands, &mut timer_events, |_| None);
+        assert!(
+            matches!(events[0], WorkflowEvent::MarkerRecorded { .. }),
+            "got {events:?}"
+        );
+        assert!(
+            matches!(events[1], WorkflowEvent::TimerCancelled { .. }),
+            "got {events:?}"
+        );
+        assert!(
+            matches!(events[2], WorkflowEvent::TimerStarted { .. }),
+            "got {events:?}"
+        );
     }
 
     // ── ctx.race() bookkeeping ignore-lists (issue #600) ────────────────────

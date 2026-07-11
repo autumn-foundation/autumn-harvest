@@ -284,6 +284,7 @@ mod db_handle_surface {
         "\n",
         include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
         include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+        include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     );
 
     async fn setup() -> (String, ContainerAsync<Postgres>) {
@@ -351,6 +352,8 @@ mod db_handle_surface {
                 retry_of_exec_id: retry_of.map(|e| e.as_uuid()),
                 origin: None,
                 completion_callbacks: None,
+                continued_from_exec_id: None,
+                first_exec_id: None,
             })
             .execute(conn)
             .await

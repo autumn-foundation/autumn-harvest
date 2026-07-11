@@ -704,6 +704,31 @@ pub enum WorkflowEvent {
         /// `Utc::now()` for immediate retries, or `now + backoff` for delayed ones.
         fire_at: DateTime<Utc>,
     },
+
+    // ── Cancellable / renewable durable timers (issue #768) ───────────────────────
+    /// Records that an author-controlled durable timer was cancelled (or reset).
+    ///
+    /// Emitted by the non-suspending [`crate::context::WorkflowCommand::CancelTimer`]
+    /// bookkeeping command (via `handle.cancel()`, `ctx.cancel_timer(id)`, or the
+    /// cancel half of `handle.reset(..)`). The corresponding `harvest_timers` row is
+    /// deleted in the same transaction, so no [`Self::TimerFired`] is ever produced
+    /// for a cancelled timer.
+    ///
+    /// ## Replay determinism
+    ///
+    /// A `TimerCancelled { timer_id }` recorded **before** any `TimerFired` with the
+    /// same id resolves the timer's observed outcome to
+    /// [`crate::context::TimerOutcome::Cancelled`]. It is a command-bearing event
+    /// that may interleave with unrelated activity/timer/child scans, so every
+    /// forward scan loop in [`crate::replay::HistoryMatcher`] skips it out of order
+    /// (mirroring the `TimerFired` / external-cancel skip pattern).
+    ///
+    /// Appended at the END of the enum; pre-#768 histories that never contain this
+    /// variant deserialize unchanged.
+    TimerCancelled {
+        /// The id of the timer that was cancelled.
+        timer_id: TimerId,
+    },
 }
 
 impl WorkflowEvent {
@@ -828,6 +853,7 @@ impl WorkflowEvent {
             Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
             Self::WorkflowRedriven { .. } => "WorkflowRedriven",
             Self::WorkflowRetryScheduled { .. } => "WorkflowRetryScheduled",
+            Self::TimerCancelled { .. } => "TimerCancelled",
         }
     }
 
@@ -1380,11 +1406,57 @@ mod tests {
                 attempt: 2,
                 fire_at: Utc::now(),
             },
+            WorkflowEvent::TimerCancelled {
+                timer_id: TimerId::new("t"),
+            },
         ];
 
-        assert_eq!(events.len(), 45);
+        assert_eq!(events.len(), 46);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 45, "duplicate type names detected");
+        assert_eq!(names.len(), 46, "duplicate type names detected");
+    }
+
+    // ── TimerCancelled tests (issue #768) ─────────────────────────────────────
+
+    #[test]
+    fn timer_cancelled_round_trips() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new("idle-timeout"),
+        };
+        assert_eq!(event.type_name(), "TimerCancelled");
+        let json = serde_json::to_string(&event)?;
+        // Adjacently-tagged serde contract.
+        assert!(
+            json.contains("\"type\":\"TimerCancelled\""),
+            "type tag must be present: {json}"
+        );
+        assert!(
+            json.contains("\"timer_id\":\"idle-timeout\""),
+            "timer_id must be nested under data: {json}"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                assert_eq!(timer_id, TimerId::new("idle-timeout"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pre_cancellation_history_deserializes_unchanged() -> Result<(), serde_json::Error> {
+        // A history captured before issue #768 — a TimerStarted followed by a
+        // TimerFired — must still deserialize into exactly the same variants.
+        let json = r#"[
+            {"type":"TimerStarted","data":{"timer_id":"t","duration_secs":300}},
+            {"type":"TimerFired","data":{"timer_id":"t"}}
+        ]"#;
+        let events: Vec<WorkflowEvent> = serde_json::from_str(json)?;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], WorkflowEvent::TimerStarted { .. }));
+        assert!(matches!(events[1], WorkflowEvent::TimerFired { .. }));
+        Ok(())
     }
 
     // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────

@@ -148,6 +148,7 @@ mod db_tests {
         "\n",
         // Worker sessions (issue #606) -- the migration under test.
         include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+        include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -167,6 +168,8 @@ mod db_tests {
     async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
         let exec_id = ExecutionId::new();
         let row = NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name: "session_test_wf",
             workflow_id: &Uuid::new_v4().to_string(),

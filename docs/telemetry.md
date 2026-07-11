@@ -325,6 +325,7 @@ metric is emitted in the source code.
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `RetentionRuntime` tick, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type so per-type retention overrides are confirmable (issue #737). `sum(harvest.retention.deleted)` equals the aggregate **workflow-history** deletion count for the tick, excluding orphaned `harvest_completion_deliveries` reclaims (issue #921), which have no workflow to attribute. |
+| `harvest.retention.summary_deleted` | Counter | `retention.rs` — summaries deleted by the tiered-retention summary GC pass, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type. A distinct member of the retention metric family from `harvest.retention.deleted` (history rows), so the two tiers are observable independently (issue #752). |
 | `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
 | `harvest.workflow.start_throttled` | Counter | `api.rs` (HTTP/batch) + `scheduler.rs` (scheduled/buffered fires) — once per workflow start deferred by a start throttle because the per-key token bucket was empty (issue #607) |
 | `harvest.webhook.received` | Counter | `webhook_receiver.rs` — every request that reaches an inbound webhook receiver route, regardless of outcome (issue #344) |
@@ -357,6 +358,7 @@ metric is emitted in the source code.
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
 | `harvest.retention.deleted` | `workflow` |
+| `harvest.retention.summary_deleted` | `workflow` |
 | `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
 | `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
 | `harvest.webhook.received` | `path` (registered `#[webhook(path = ...)]` bindings only, closed set), `outcome` (`accepted\|idempotent_replay\|verify_failed\|parse_failed\|missing_idempotency\|internal_error`) |

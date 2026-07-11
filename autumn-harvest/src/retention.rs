@@ -26,11 +26,13 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
+use crate::models::NewExecutionSummary;
+#[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
 use crate::schema::{
-    harvest_completion_deliveries, harvest_dead_letters, harvest_signals, harvest_task_queue,
-    harvest_timers,
+    harvest_completion_deliveries, harvest_dead_letters, harvest_execution_summaries,
+    harvest_signals, harvest_task_queue, harvest_timers,
 };
 #[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
@@ -43,6 +45,204 @@ const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
+
+/// Default byte cap for an opt-in captured summary payload (issue #752).
+///
+/// A `result`/`error` value larger than this is replaced with a typed
+/// `_harvest_omitted` marker rather than stored verbatim, keeping each summary
+/// row small (~< 1 KiB target for the common case).
+pub const DEFAULT_SUMMARY_PAYLOAD_CAP: usize = 4096;
+
+/// JSON key inserted into a summary `result` when the real payload was omitted
+/// (offloaded or over the byte cap) — issue #752.
+///
+/// Distinct from the erasure tombstone (`_harvest_erased`) and the offload
+/// envelope (`_harvest_offload_envelope`) so the three are never confused.
+pub const OMITTED_MARKER_KEY: &str = "_harvest_omitted";
+
+// ── Summary (tiered) retention config (issue #752) ─────────────────────────────
+
+/// How long summarized (demoted) execution rows are retained (issue #752).
+///
+/// Decoupled from the history retention horizon: a deployment may keep
+/// summaries far longer than full histories, or forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryRetention {
+    /// Retain summaries for the given duration (`completed_at`-based), then GC.
+    For(Duration),
+    /// Never GC summaries — keep them forever.
+    Unbounded,
+}
+
+/// Tiered/summary retention policy (issue #752).
+///
+/// When set on [`RetentionConfig`], the history-retention janitor demotes each
+/// hard-deleted terminal execution into a compact `harvest_execution_summaries`
+/// row (written in the same transaction as the delete) instead of losing it
+/// entirely. Captured `result`/`error` payloads are opt-in and byte-bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SummaryPolicy {
+    /// Summary retention horizon (own GC pass; `Unbounded` = keep forever).
+    pub retention: SummaryRetention,
+    /// Whether to capture the run's `result`/`error` payload into the summary.
+    /// Defaults to `false` (identity + timing + search-attrs only).
+    pub capture_payload: bool,
+    /// Byte cap for a captured payload; oversized values become a typed
+    /// `_harvest_omitted` marker. Defaults to [`DEFAULT_SUMMARY_PAYLOAD_CAP`].
+    pub max_payload_bytes: usize,
+}
+
+impl SummaryPolicy {
+    /// Retain summaries for `days` days (payload capture off by default).
+    #[must_use]
+    pub const fn for_days(days: u64) -> Self {
+        Self {
+            // `saturating_mul` guards a huge `days` value from overflowing the
+            // seconds product; the validated horizon range clamps it anyway.
+            retention: SummaryRetention::For(Duration::from_secs(days.saturating_mul(86_400))),
+            capture_payload: false,
+            max_payload_bytes: DEFAULT_SUMMARY_PAYLOAD_CAP,
+        }
+    }
+
+    /// Retain summaries for the given duration (payload capture off by default).
+    #[must_use]
+    pub const fn for_duration(retention: Duration) -> Self {
+        Self {
+            retention: SummaryRetention::For(retention),
+            capture_payload: false,
+            max_payload_bytes: DEFAULT_SUMMARY_PAYLOAD_CAP,
+        }
+    }
+
+    /// Keep summaries forever (payload capture off by default).
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            retention: SummaryRetention::Unbounded,
+            capture_payload: false,
+            max_payload_bytes: DEFAULT_SUMMARY_PAYLOAD_CAP,
+        }
+    }
+
+    /// Opt into capturing the run's `result`/`error` payload (byte-bounded).
+    #[must_use]
+    pub const fn with_payload_capture(mut self) -> Self {
+        self.capture_payload = true;
+        self
+    }
+
+    /// Override the captured-payload byte cap.
+    #[must_use]
+    pub const fn with_max_payload_bytes(mut self, max_payload_bytes: usize) -> Self {
+        self.max_payload_bytes = max_payload_bytes;
+        self
+    }
+
+    /// The summary GC horizon as a [`Duration`], or `None` for `Unbounded`.
+    #[must_use]
+    pub const fn retention_age(&self) -> Option<Duration> {
+        match self.retention {
+            SummaryRetention::For(age) => Some(age),
+            SummaryRetention::Unbounded => None,
+        }
+    }
+
+    /// Whether captured payloads are enabled for this policy.
+    #[must_use]
+    pub const fn capture_payload(&self) -> bool {
+        self.capture_payload
+    }
+
+    /// The captured-payload byte cap.
+    #[must_use]
+    pub const fn max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes
+    }
+}
+
+/// Returns the typed "omitted" marker value for a summary `result` field
+/// (issue #752): `{"_harvest_omitted": true, "reason": "...", "bytes": N?}`.
+///
+/// Used instead of silently truncating an oversized payload or storing an
+/// offload reference envelope (whose blob may be GC'd, #524).
+#[must_use]
+pub fn omitted_marker(reason: &str, bytes: Option<usize>) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        OMITTED_MARKER_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    obj.insert(
+        "reason".to_string(),
+        serde_json::Value::String(reason.to_string()),
+    );
+    if let Some(bytes) = bytes {
+        obj.insert("bytes".to_string(), serde_json::Value::Number(bytes.into()));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Compute the `result` column value for a summary from a run's `output`
+/// (issue #752).
+///
+/// - `None` output → `None` (nothing captured).
+/// - An offload reference envelope (issue #524) → `omitted_marker("offloaded")`
+///   — **never** store the envelope, since its blob may be GC'd out from under
+///   the summary.
+/// - An `output` whose serialized bytes exceed `cap` →
+///   `omitted_marker("too_large", Some(len))` (valid JSON, never a silent
+///   truncation).
+/// - Otherwise the value **verbatim** (codec-encoded form preserved, matching
+///   the history-export Full policy — the summary is not decoded/redacted here).
+///
+/// The `capture_payload` opt-in is applied at the call site (a policy with
+/// capture disabled passes `None`, so the column stays NULL).
+#[must_use]
+pub fn cap_result_payload(
+    output: Option<serde_json::Value>,
+    cap: usize,
+) -> Option<serde_json::Value> {
+    let output = output?;
+    // Never store an offload reference envelope — the blob may be GC'd (#524).
+    //
+    // Offload detection relies on the offloader storing a ROOT envelope
+    // (`extract_offload_ref` inspects the top-level value; `search_attrs` is
+    // never offloadable). A future nested-envelope offload change MUST recurse
+    // this check, or a summary could store a value referencing a blob that
+    // #524's GC later reclaims, leaving a dangling summary→blob reference.
+    if crate::payload_store::extract_offload_ref(&output).is_some() {
+        return Some(omitted_marker("offloaded", None));
+    }
+    // Fail SAFE on a (near-impossible) serialize failure of an already-parsed
+    // JSONB value: emit an omitted marker rather than storing an unmeasured
+    // payload verbatim, consistent with the oversized-payload path below.
+    let len = match serde_json::to_vec(&output) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => return Some(omitted_marker("too_large", None)),
+    };
+    if len > cap {
+        return Some(omitted_marker("too_large", Some(len)));
+    }
+    // Common case: under cap — move the owned value into the return, no clone.
+    Some(output)
+}
+
+/// Compute the `error` column value for a summary from a run's `error` text
+/// (issue #752).
+///
+/// Oversized text becomes a typed marker string rather than a silent
+/// UTF-8-boundary truncation. `None` in → `None` out. Capture opt-in is applied
+/// at the call site.
+#[must_use]
+pub fn cap_error_text(error: Option<&str>, cap: usize) -> Option<String> {
+    let error = error?;
+    if error.len() > cap {
+        return Some(format!("[omitted: too_large, {} bytes]", error.len()));
+    }
+    Some(error.to_string())
+}
 
 /// Future type returned by [`HistoryArchiver::archive`].
 pub type ArchiverFuture<'a> = std::pin::Pin<
@@ -115,6 +315,14 @@ pub struct RetentionConfig {
     /// The timeout in seconds for executing the pre-retention archival hook.
     /// Defaults to 30 seconds.
     pub archival_timeout_secs: u64,
+    /// Tiered/summary retention policy (issue #752).
+    ///
+    /// When `Some`, a terminal execution hard-deleted by the history janitor is
+    /// first demoted into a compact `harvest_execution_summaries` row (written
+    /// in the same transaction as the delete). `None` (the default) is
+    /// byte-for-byte identical to pre-#752 behavior: hard delete, no summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SummaryPolicy>,
 }
 
 impl Default for RetentionConfig {
@@ -128,6 +336,7 @@ impl Default for RetentionConfig {
             audit_retention_days: 90,
             schedule_decision_retention_days: 7,
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
+            summary: None,
         }
     }
 }
@@ -189,6 +398,63 @@ impl RetentionConfig {
     pub const fn with_archival_timeout_secs(mut self, secs: u64) -> Self {
         self.archival_timeout_secs = secs;
         self
+    }
+
+    /// Enable tiered/summary retention with an explicit policy (issue #752).
+    #[must_use]
+    pub const fn with_summary_retention(mut self, policy: SummaryPolicy) -> Self {
+        self.summary = Some(policy);
+        self
+    }
+
+    /// Enable tiered/summary retention with a `days`-day summary horizon
+    /// (payload capture off). Shorthand for
+    /// `with_summary_retention(SummaryPolicy::for_days(days))`.
+    ///
+    /// The summary horizon should **exceed** the history horizon
+    /// ([`with_max_age`](Self::with_max_age)) to be useful: a summary is created
+    /// only when the history is deleted, so a summary window at or below the
+    /// history window means the summary is GC'd almost immediately. A mismatch
+    /// logs a one-time warning at [`RetentionRuntime::spawn`].
+    #[must_use]
+    pub const fn with_summary_retention_days(mut self, days: u64) -> Self {
+        self.summary = Some(SummaryPolicy::for_days(days));
+        self
+    }
+
+    /// Enable tiered/summary retention keeping summaries forever (payload
+    /// capture off).
+    #[must_use]
+    pub const fn with_summary_retention_unbounded(mut self) -> Self {
+        self.summary = Some(SummaryPolicy::unbounded());
+        self
+    }
+
+    /// The summary GC horizon as a [`Duration`], or `None` when summaries are
+    /// disabled OR configured [`SummaryRetention::Unbounded`] (issue #752).
+    #[must_use]
+    pub fn summary_age(&self) -> Option<Duration> {
+        self.summary.and_then(|p| p.retention_age())
+    }
+
+    /// Whether summary (tiered) retention is enabled at all (issue #752).
+    #[must_use]
+    pub const fn summary_enabled(&self) -> bool {
+        self.summary.is_some()
+    }
+
+    /// Whether the summary GC pass should run this tick: a summary policy with a
+    /// bounded (`For(_)`) horizon is set (issue #752). `Unbounded` summaries are
+    /// never GC'd, so this is `false` for them.
+    #[must_use]
+    pub fn summary_gc_active(&self) -> bool {
+        self.summary_age().is_some()
+    }
+
+    /// Read access to the tiered/summary retention policy (issue #752).
+    #[must_use]
+    pub const fn summary_policy(&self) -> Option<SummaryPolicy> {
+        self.summary
     }
 
     /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
@@ -293,6 +559,18 @@ impl RetentionConfig {
                 ));
             }
         }
+        // The summary GC horizon is bounded by the same range as `max_age`
+        // (issue #752). `Unbounded` needs no bound. An out-of-range horizon
+        // fails the build rather than silently clamping.
+        if let Some(age) = self.summary_age()
+            && !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age)
+        {
+            return Err(format!(
+                "summary retention must be between {}s and {}s",
+                MIN_MAX_AGE.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ));
+        }
         Ok(())
     }
 
@@ -308,6 +586,9 @@ impl RetentionConfig {
             || !self.overrides.is_empty()
             || self.audit_retention_days > 0
             || self.schedule_decision_retention_days > 0
+            // A bounded summary policy spawns the janitor so its GC pass runs
+            // even if the history horizon was later removed (issue #752).
+            || self.summary_gc_active()
     }
 }
 
@@ -341,6 +622,10 @@ pub struct RetentionTickResult {
     /// actually deleted. Surfaced via `GET /admin/retention` for per-type
     /// reporting.
     pub deleted_by_workflow: BTreeMap<String, u64>,
+    /// Number of execution summaries created (demoted) during this tick (issue
+    /// #752). Surfaced via `GET /admin/retention` for creation observability.
+    /// Real deletes only — a `dry_run` tick creates no summaries.
+    pub summarized_count: usize,
 }
 
 /// The current overall status of the retention subsystem.
@@ -438,6 +723,22 @@ impl RetentionRuntime {
         if !config.enabled() {
             return None;
         }
+        // Foot-gun warning (issue #752): a BOUNDED summary horizon at or below
+        // the global history horizon means a demoted summary is GC'd almost as
+        // soon as it is created, so tiering buys nothing. Non-fatal — the
+        // operator may genuinely want a tiny summary window — but worth a
+        // one-time startup warning.
+        if let (Some(summary_age), Some(max_age)) = (config.summary_age(), config.max_age())
+            && summary_age <= max_age
+        {
+            tracing::warn!(
+                summary_age_secs = summary_age.as_secs(),
+                history_max_age_secs = max_age.as_secs(),
+                "harvest summary-retention horizon is <= the history-retention horizon; \
+                 summaries will be GC'd almost immediately after creation — set a longer \
+                 summary horizon (or Unbounded) for tiering to be useful"
+            );
+        }
         let monitor = RetentionMonitor::new(config.clone(), pools.shard_ids().into_iter());
         let shutdown = CancellationToken::new();
         let shutdown_task = shutdown.clone();
@@ -520,6 +821,7 @@ impl RetentionRuntime {
                                 result.deleted_count = ok.deleted_count;
                                 result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
                                 result.deleted_by_workflow = ok.deleted_by_workflow.clone();
+                                result.summarized_count = ok.summarized_count;
                                 tracing::info!(
                                     shard = %shard,
                                     candidates = ok.candidate_count,
@@ -589,6 +891,45 @@ impl RetentionRuntime {
                         }
                     }
                 }
+
+                // Summary GC pass (issue #752): garbage-collect execution
+                // summaries older than the summary horizon, once per tick,
+                // best-effort. Only runs for a bounded (`For(_)`) horizon —
+                // `Unbounded` keeps summaries forever. Shard-local (summaries
+                // live on the demoted execution's own shard). The
+                // `harvest.retention.summary_deleted` counter is emitted for
+                // real GC deletes only.
+                if config.summary_gc_active()
+                    && !config.dry_run
+                    && let Some(summary_age) = config.summary_age()
+                {
+                    let now = Utc::now();
+                    for (shard, pool) in pools.iter_shards() {
+                        if let Ok(mut conn) = pool.get().await {
+                            match purge_expired_summaries(
+                                &mut conn,
+                                u16::try_from(shard.as_i32()).unwrap_or(0),
+                                summary_age,
+                                config.batch_size,
+                                false,
+                                now,
+                            )
+                            .await
+                            {
+                                Ok(counts) => {
+                                    for (name, count) in counts {
+                                        if count > 0 {
+                                            metrics.record_summary_deleted(&name, count);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(shard = %shard, error = %err, "harvest execution-summary GC failed");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -642,6 +983,9 @@ struct ShardTickOutcome {
     /// Per-workflow-type deletion counts (real deletes and dry-run
     /// would-deletes). Issue #737.
     deleted_by_workflow: BTreeMap<String, u64>,
+    /// Number of execution summaries created (demoted) this tick (issue #752).
+    /// Real deletes only — dry-run creates no summaries.
+    summarized_count: usize,
 }
 
 #[cfg(feature = "db")]
@@ -1257,7 +1601,9 @@ async fn run_shard_tick(
                 Vec::new()
             };
 
-            match delete_candidate_execution(&mut conn, candidate.id, now).await {
+            match delete_candidate_execution(&mut conn, candidate.id, now, config.summary.as_ref())
+                .await
+            {
                 Err(err) => {
                     has_failed = true;
                     batch_failed = true;
@@ -1282,7 +1628,12 @@ async fn run_shard_tick(
                     .await?;
                     continue;
                 }
-                Ok(CandidateDeleteOutcome::Deleted) => {}
+                Ok(CandidateDeleteOutcome::Deleted { summarized }) => {
+                    // A summary row was written in the delete tx (issue #752).
+                    if summarized {
+                        outcome.summarized_count += 1;
+                    }
+                }
             }
             outcome.deleted_count += 1;
             // Per-type real-delete count (issue #737, AC7/AC8).
@@ -1348,11 +1699,15 @@ async fn run_shard_tick(
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateDeleteOutcome {
-    /// The execution (and its dependent rows) were deleted.
-    Deleted,
+    /// The execution (and its dependent rows) were deleted. `summarized` is
+    /// `true` when a `harvest_execution_summaries` row was written in the same
+    /// transaction (issue #752); `false` when summary retention is disabled or
+    /// the row was already summarized (idempotent ON CONFLICT no-op).
+    Deleted { summarized: bool },
     /// A legal hold was found active under the delete-tx row lock; the delete
     /// was aborted and NOTHING was touched (no `payload_refs`, no blobs, no
-    /// execution row). The caller treats this exactly like a routine skip.
+    /// execution row, no summary). The caller treats this exactly like a
+    /// routine skip.
     SkippedHeld,
 }
 
@@ -1383,13 +1738,18 @@ async fn read_candidate_hold(
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn delete_candidate_execution(
     conn: &mut diesel_async::AsyncPgConnection,
     candidate_id: uuid::Uuid,
     now: DateTime<Utc>,
+    summary: Option<&SummaryPolicy>,
 ) -> HarvestResult<CandidateDeleteOutcome> {
+    // Copy the policy into the transaction closure (it is `Copy`).
+    let summary = summary.copied();
     conn.transaction::<_, HarvestError, _>(|conn| {
         Box::pin(async move {
+            let mut summarized = false;
             // ── Authoritative legal-hold re-check under a row lock (issue #747
             // BLOCKER 1) ─────────────────────────────────────────────────────
             // The candidate SELECT read the hold columns then committed and
@@ -1404,39 +1764,161 @@ async fn delete_candidate_execution(
             // the operator's `set_legal_hold` observes a missing row (404). If
             // the hold is active, abort the delete entirely: do NOT touch
             // payload_refs or blobs.
-            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                ))
-                .for_update()
-                .first::<HoldTimestamps>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-            if let Some((set_at, until)) = hold
-                && legal_hold_active(set_at, until, now)
-            {
-                return Ok(CandidateDeleteOutcome::SkippedHeld);
+            //
+            // Tiered/summary retention (issue #752): when a summary policy is
+            // set, the SAME FOR UPDATE row lock loads the demotion source
+            // columns (identity, timing, shard, search-attrs, and — opt-in —
+            // result/error payload) so the summary INSERT is atomic with the
+            // legal-hold re-check and the delete. There is never a window where
+            // both the execution and its summary are absent, and a rollback
+            // (e.g. a delete error below) discards the summary too, so no
+            // orphan can result. The summary INSERT happens AFTER the hold
+            // re-check (a held row is never summarized) and BEFORE the deletes.
+            if let Some(policy) = summary {
+                let row: Option<SummarySourceRow> = harvest_workflow_executions::table
+                    .find(candidate_id)
+                    .select((
+                        harvest_workflow_executions::legal_hold_set_at,
+                        harvest_workflow_executions::legal_hold_until,
+                        harvest_workflow_executions::workflow_name,
+                        harvest_workflow_executions::workflow_id,
+                        harvest_workflow_executions::state,
+                        harvest_workflow_executions::started_at,
+                        harvest_workflow_executions::completed_at,
+                        harvest_workflow_executions::shard_id,
+                        harvest_workflow_executions::output,
+                        harvest_workflow_executions::error,
+                        harvest_workflow_executions::search_attrs,
+                        harvest_workflow_executions::parent_id,
+                    ))
+                    .for_update()
+                    .first::<SummarySourceRow>(conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?;
+
+                // `None` = row concurrently deleted: nothing to summarize; the
+                // deletes below are harmless no-ops (matches the hold-only
+                // path's missing-row behavior).
+                if let Some((
+                    set_at,
+                    until,
+                    workflow_name,
+                    workflow_id,
+                    state,
+                    started_at,
+                    completed_at,
+                    shard_id,
+                    output,
+                    error,
+                    search_attrs,
+                    parent_id,
+                )) = row
+                {
+                    if legal_hold_active(set_at, until, now) {
+                        return Ok(CandidateDeleteOutcome::SkippedHeld);
+                    }
+                    // completed_at is NOT NULL by the candidate query's WHERE
+                    // clause; fall back to started_at defensively so the NOT
+                    // NULL summary column always has a value.
+                    let completed = completed_at.unwrap_or(started_at);
+                    // Clamp at 0: a `completed_at` before `started_at` (clock
+                    // skew across nodes) must never produce a negative duration.
+                    let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
+                    // Payload capture is opt-in (AC3): a policy with capture
+                    // disabled leaves result/error NULL.
+                    let (result, error_out) = if policy.capture_payload {
+                        (
+                            cap_result_payload(output, policy.max_payload_bytes),
+                            cap_error_text(error.as_deref(), policy.max_payload_bytes),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    // Codec caveat (issue #752): the summary stores the
+                    // `output`/`search_attrs` COLUMNS verbatim — these are
+                    // codec-ENCODED at rest (the same columns #608's
+                    // `decode_workflow_execution_fields` decodes on read). So
+                    // encryption-at-rest is preserved: the longer-retained
+                    // summary tier can never hold plaintext that the event
+                    // history encrypts.
+                    let new_summary = NewExecutionSummary {
+                        execution_id: candidate_id,
+                        workflow_name,
+                        workflow_id,
+                        state,
+                        started_at,
+                        completed_at: completed,
+                        duration_ms,
+                        shard_id,
+                        search_attrs,
+                        result,
+                        error: error_out,
+                        parent_id,
+                    };
+                    // ON CONFLICT DO NOTHING makes the demotion idempotent
+                    // across a retried delete tx.
+                    let inserted = diesel::insert_into(harvest_execution_summaries::table)
+                        .values(&new_summary)
+                        .on_conflict(harvest_execution_summaries::execution_id)
+                        .do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                    summarized = inserted > 0;
+                }
+            } else {
+                // Summary retention disabled: byte-for-byte the pre-#752
+                // hold-only re-check.
+                let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
+                    .find(candidate_id)
+                    .select((
+                        harvest_workflow_executions::legal_hold_set_at,
+                        harvest_workflow_executions::legal_hold_until,
+                    ))
+                    .for_update()
+                    .first::<HoldTimestamps>(conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?;
+                if let Some((set_at, until)) = hold
+                    && legal_hold_active(set_at, until, now)
+                {
+                    return Ok(CandidateDeleteOutcome::SkippedHeld);
+                }
             }
 
-            diesel::update(
-                harvest_workflow_executions::table
-                    .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
-                    .filter(harvest_workflow_executions::state.eq_any([
-                        "COMPLETED",
-                        "FAILED",
-                        "CANCELLED",
-                        "TIMED_OUT",
-                        "CONTINUED_AS_NEW",
-                        "TERMINATED",
-                    ])),
-            )
-            .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // Orphan the deleted parent's terminal children so their `parent_id`
+            // does not dangle to a gone row. Tiered/summary retention (issue
+            // #752): when a summary policy is set, this null-out is SKIPPED so
+            // the child→parent lineage survives deletion. A terminal child is
+            // independently retention-eligible and may be summarized in a LATER
+            // transaction than its parent; if we nulled its `parent_id` here,
+            // its own demotion would capture a NULL parent and the #495 PII-erase
+            // cascade (which reaches a demoted child summary via
+            // `harvest_execution_summaries.parent_id`) could never find it.
+            // Preserving the link makes the cascade order-independent regardless
+            // of whether the parent or child is processed first. The retained
+            // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
+            // `should_skip_candidate` only reads `parent_id` downward).
+            if summary.is_none() {
+                diesel::update(
+                    harvest_workflow_executions::table
+                        .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
+                        .filter(harvest_workflow_executions::state.eq_any([
+                            "COMPLETED",
+                            "FAILED",
+                            "CANCELLED",
+                            "TIMED_OUT",
+                            "CONTINUED_AS_NEW",
+                            "TERMINATED",
+                        ])),
+                )
+                .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            }
 
             // `task_type = 'CALLBACK'` dead letters (issue #605) are
             // excluded here (issue #921 review, Codex P2): a CALLBACK
@@ -1497,10 +1979,221 @@ async fn delete_candidate_execution(
             .execute(conn)
             .await
             .map_err(database_error)?;
-            Ok(CandidateDeleteOutcome::Deleted)
+            Ok(CandidateDeleteOutcome::Deleted { summarized })
         })
     })
     .await
+}
+
+/// Columns loaded FOR UPDATE to build a summary alongside the delete (issue
+/// #752): the two legal-hold columns plus the demotion source columns.
+#[cfg(feature = "db")]
+type SummarySourceRow = (
+    Option<DateTime<Utc>>,     // legal_hold_set_at
+    Option<DateTime<Utc>>,     // legal_hold_until
+    String,                    // workflow_name
+    String,                    // workflow_id
+    String,                    // state
+    DateTime<Utc>,             // started_at
+    Option<DateTime<Utc>>,     // completed_at
+    i32,                       // shard_id
+    Option<serde_json::Value>, // output
+    Option<String>,            // error
+    Option<serde_json::Value>, // search_attrs
+    Option<uuid::Uuid>,        // parent_id
+);
+
+/// Garbage-collect execution summaries older than the summary horizon (issue
+/// #752), returning per-workflow-type deleted counts.
+///
+/// Selection is by `completed_at < now - summary_age` (deterministic;
+/// *not* `summarized_at`), so the summary tier's own horizon anchors on the
+/// original run window exactly like history retention. Batched to bound the
+/// transaction size; deletes only (a `dry_run` tick simulates by counting).
+/// Shard-local: `conn` is already routed to the summary's own shard.
+#[cfg(feature = "db")]
+pub(crate) async fn purge_expired_summaries(
+    conn: &mut diesel_async::AsyncPgConnection,
+    _shard: u16,
+    summary_age: Duration,
+    batch_size: usize,
+    dry_run: bool,
+    now: DateTime<Utc>,
+) -> HarvestResult<BTreeMap<String, u64>> {
+    #[derive(QueryableByName)]
+    struct NameRow {
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+    }
+
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
+        // Unrepresentable age (unreachable for validated horizons, bounded by
+        // MAX_MAX_AGE ≪ chrono's range): fail safe toward RETAINING — GC
+        // nothing this tick rather than deleting everything under a zero cutoff.
+        return Ok(counts);
+    };
+    let cutoff = now - chrono_age;
+    let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
+
+    if dry_run {
+        let rows = diesel::sql_query(
+            "SELECT workflow_name FROM harvest_execution_summaries WHERE completed_at < $1",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .load::<NameRow>(conn)
+        .await
+        .map_err(database_error)?;
+        for r in rows {
+            *counts.entry(r.workflow_name).or_insert(0) += 1;
+        }
+        return Ok(counts);
+    }
+
+    loop {
+        let rows = diesel::sql_query(
+            "DELETE FROM harvest_execution_summaries
+             WHERE execution_id IN (
+                 SELECT execution_id FROM harvest_execution_summaries
+                 WHERE completed_at < $1
+                 ORDER BY completed_at ASC, execution_id ASC
+                 LIMIT $2
+             )
+             RETURNING workflow_name",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<BigInt, _>(batch)
+        .load::<NameRow>(conn)
+        .await
+        .map_err(database_error)?;
+        let n = rows.len();
+        for r in rows {
+            *counts.entry(r.workflow_name).or_insert(0) += 1;
+        }
+        // Terminate when a batch came back short OR empty. Compare against the
+        // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`:
+        // a `batch_size` of 0 makes the LIMIT 1 while `n < 0` is impossible, so
+        // an `n == 0` early break is required or the loop would spin forever.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+    Ok(counts)
+}
+
+/// Filter set for the read-only execution-summary list query (issue #752).
+///
+/// Mirrors the `GET /workflows` filter vocabulary against the summary tier:
+/// `workflow_name`/`workflow_id`/`state`/completed-time-range/search-attr
+/// containment, plus a keyset `cursor` over `(completed_at, execution_id)`.
+/// Every field is optional; an all-default query returns the newest summaries.
+#[derive(Debug, Clone, Default)]
+pub struct SummaryQuery {
+    /// Exact-match `workflow_name` filter.
+    pub workflow_name: Option<String>,
+    /// Exact-match `workflow_id` filter.
+    pub workflow_id: Option<String>,
+    /// Terminal-state filter (`ANY` of the listed states).
+    pub states: Vec<String>,
+    /// Only summaries whose `completed_at` is at/after this instant.
+    pub completed_after: Option<DateTime<Utc>>,
+    /// Only summaries whose `completed_at` is at/before this instant.
+    pub completed_before: Option<DateTime<Utc>>,
+    /// JSONB containment (`@>`) predicates over `search_attrs`; combined with
+    /// `AND`.
+    pub search_attrs: Vec<serde_json::Value>,
+    /// Keyset cursor `(completed_at, execution_id)` — under the default
+    /// descending order, return only rows strictly *older* than this pair; under
+    /// ascending order (`ascending = true`), only rows strictly *newer*.
+    pub cursor: Option<(DateTime<Utc>, uuid::Uuid)>,
+    /// Sort direction (issue #752, AC4 parity with `GET /workflows`). `false`
+    /// (the default) is `(completed_at DESC, execution_id DESC)`; `true` is the
+    /// ascending order. Threaded through both the `ORDER BY` and the keyset
+    /// cursor comparison so a paginated `order=asc` walk is consistent.
+    pub ascending: bool,
+}
+
+/// List execution summaries matching `query`, newest-first, up to `limit` rows
+/// (issue #752).
+///
+/// Ordered by `(completed_at DESC, execution_id DESC)` for a total, stable
+/// keyset order; the caller over-fetches `limit + 1` to detect a further page.
+/// Shard-local: `conn` is already routed to a single shard, and the cross-shard
+/// merge happens in the management layer.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on any persistence failure.
+#[cfg(feature = "db")]
+pub async fn list_execution_summaries(
+    conn: &mut diesel_async::AsyncPgConnection,
+    query: &SummaryQuery,
+    limit: i64,
+) -> HarvestResult<Vec<crate::models::ExecutionSummary>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Jsonb};
+
+    let mut q = harvest_execution_summaries::table.into_boxed();
+    q = if query.ascending {
+        q.order(harvest_execution_summaries::completed_at.asc())
+            .then_order_by(harvest_execution_summaries::execution_id.asc())
+    } else {
+        q.order(harvest_execution_summaries::completed_at.desc())
+            .then_order_by(harvest_execution_summaries::execution_id.desc())
+    };
+    q = q.limit(limit.max(0));
+
+    if let Some(cursor) = &query.cursor {
+        let (ts, id) = (cursor.0, cursor.1);
+        // Row-value keyset comparison: `>` walks forward under ascending order,
+        // `<` under descending — matching the `GET /workflows` contract.
+        q = if query.ascending {
+            q.filter(
+                sql::<Bool>(
+                    "(harvest_execution_summaries.completed_at, \
+                     harvest_execution_summaries.execution_id) > (",
+                )
+                .bind::<Timestamptz, _>(ts)
+                .sql(", ")
+                .bind::<SqlUuid, _>(id)
+                .sql(")"),
+            )
+        } else {
+            q.filter(
+                sql::<Bool>(
+                    "(harvest_execution_summaries.completed_at, \
+                     harvest_execution_summaries.execution_id) < (",
+                )
+                .bind::<Timestamptz, _>(ts)
+                .sql(", ")
+                .bind::<SqlUuid, _>(id)
+                .sql(")"),
+            )
+        };
+    }
+    if !query.states.is_empty() {
+        q = q.filter(harvest_execution_summaries::state.eq_any(query.states.clone()));
+    }
+    if let Some(name) = &query.workflow_name {
+        q = q.filter(harvest_execution_summaries::workflow_name.eq(name.clone()));
+    }
+    if let Some(wid) = &query.workflow_id {
+        q = q.filter(harvest_execution_summaries::workflow_id.eq(wid.clone()));
+    }
+    if let Some(after) = query.completed_after {
+        q = q.filter(harvest_execution_summaries::completed_at.ge(after));
+    }
+    if let Some(before) = query.completed_before {
+        q = q.filter(harvest_execution_summaries::completed_at.le(before));
+    }
+    for attr in &query.search_attrs {
+        q = q.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(attr.clone()));
+    }
+
+    q.select(crate::models::ExecutionSummary::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
 }
 
 /// Common bookkeeping for a "routine skip" of a retention candidate (issue
@@ -2088,6 +2781,159 @@ mod tests {
         }
         .with_workflow_override("wf", Duration::from_secs(3600));
         assert!(config.enabled());
+    }
+
+    // --- Issue #752: tiered / summary retention ---
+
+    #[test]
+    fn summary_policy_builders() {
+        let p = SummaryPolicy::for_days(7);
+        assert_eq!(p.retention_age(), Some(Duration::from_secs(7 * 86_400)));
+        assert!(!p.capture_payload());
+        assert_eq!(p.max_payload_bytes(), DEFAULT_SUMMARY_PAYLOAD_CAP);
+
+        let p = SummaryPolicy::for_duration(Duration::from_secs(500));
+        assert_eq!(p.retention_age(), Some(Duration::from_secs(500)));
+
+        let p = SummaryPolicy::unbounded();
+        assert_eq!(p.retention_age(), None);
+        assert_eq!(p.retention, SummaryRetention::Unbounded);
+
+        let p = SummaryPolicy::for_days(1)
+            .with_payload_capture()
+            .with_max_payload_bytes(2048);
+        assert!(p.capture_payload());
+        assert_eq!(p.max_payload_bytes(), 2048);
+    }
+
+    #[test]
+    fn summary_config_builders_and_predicates() {
+        // Default: summary disabled -> byte-for-byte today's behavior.
+        let config = RetentionConfig::default();
+        assert!(!config.summary_enabled());
+        assert!(!config.summary_gc_active());
+        assert_eq!(config.summary_age(), None);
+        assert!(config.summary_policy().is_none());
+
+        // Bounded summary -> gc active, spawns janitor even without a history
+        // horizon (issue #752).
+        let config = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..RetentionConfig::default()
+        }
+        .with_summary_retention_days(30);
+        assert!(config.summary_enabled());
+        assert!(config.summary_gc_active());
+        assert_eq!(config.summary_age(), Some(Duration::from_secs(30 * 86_400)));
+        assert!(config.enabled(), "bounded summary must enable the janitor");
+
+        // Unbounded summary -> enabled but never GC'd; does NOT by itself spawn
+        // the janitor (no deletes => no summaries to create, nothing to GC).
+        let config = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..RetentionConfig::default()
+        }
+        .with_summary_retention(SummaryPolicy::unbounded());
+        assert!(config.summary_enabled());
+        assert!(!config.summary_gc_active());
+        assert_eq!(config.summary_age(), None);
+        assert!(
+            !config.enabled(),
+            "an unbounded-summary-only config with no history/audit horizon is not enabled"
+        );
+
+        // But a history horizon + unbounded summary IS enabled (via history).
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_summary_retention(SummaryPolicy::unbounded());
+        assert!(config.enabled());
+    }
+
+    #[test]
+    fn summary_validate_bounds_the_horizon() {
+        // below MIN_MAX_AGE
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(0)));
+        assert!(config.validate().is_err());
+
+        // above MAX_MAX_AGE
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(
+                60 * 60 * 24 * 365 * 20,
+            )));
+        assert!(config.validate().is_err());
+
+        // in range
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_summary_retention_days(90);
+        assert!(config.validate().is_ok());
+
+        // Unbounded needs no bound.
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_summary_retention(SummaryPolicy::unbounded());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn omitted_marker_shape() {
+        let m = omitted_marker("too_large", Some(5000));
+        assert_eq!(m[OMITTED_MARKER_KEY], true);
+        assert_eq!(m["reason"], "too_large");
+        assert_eq!(m["bytes"], 5000);
+
+        let m = omitted_marker("offloaded", None);
+        assert_eq!(m[OMITTED_MARKER_KEY], true);
+        assert_eq!(m["reason"], "offloaded");
+        assert!(m.get("bytes").is_none(), "no bytes for offloaded marker");
+    }
+
+    #[test]
+    fn cap_result_payload_none_and_small_and_over_cap() {
+        // None -> None
+        assert!(cap_result_payload(None, 4096).is_none());
+
+        // small inline -> stored verbatim
+        let small = serde_json::json!({"ok": true, "n": 1});
+        assert_eq!(cap_result_payload(Some(small.clone()), 4096), Some(small));
+
+        // over-cap -> too_large marker carrying the observed byte length
+        let big_str = "x".repeat(100);
+        let big = serde_json::json!({"blob": big_str});
+        let len = serde_json::to_vec(&big).unwrap().len();
+        let capped = cap_result_payload(Some(big), 32).expect("some");
+        assert_eq!(capped[OMITTED_MARKER_KEY], true);
+        assert_eq!(capped["reason"], "too_large");
+        assert_eq!(capped["bytes"], len);
+    }
+
+    #[test]
+    fn cap_result_payload_never_stores_an_offload_envelope() {
+        // A synthetic offload reference envelope (issue #524): must become the
+        // "offloaded" marker, NOT the envelope itself (the blob may be GC'd).
+        let envelope = serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3",
+            "key": "blob/abc123",
+            "len": 2_000_000,
+            "checksum": "deadbeef",
+        });
+        let capped = cap_result_payload(Some(envelope), 4096).expect("some");
+        assert_eq!(capped[OMITTED_MARKER_KEY], true);
+        assert_eq!(capped["reason"], "offloaded");
+        assert!(
+            capped.get("key").is_none(),
+            "the blob key/reference must NOT leak into the summary"
+        );
+    }
+
+    #[test]
+    fn cap_error_text_none_small_and_over_cap() {
+        assert!(cap_error_text(None, 4096).is_none());
+        assert_eq!(cap_error_text(Some("boom"), 4096), Some("boom".to_string()));
+        let big = "e".repeat(200);
+        let capped = cap_error_text(Some(&big), 32).expect("some");
+        assert_eq!(capped, "[omitted: too_large, 200 bytes]");
     }
 
     #[test]

@@ -156,9 +156,10 @@ const INIT_SQL: &str = concat!(
     // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
     // harvest_workers.
     include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
+    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     "\n",
     // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000000_harvest_legal_hold/up.sql")
+    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -238,6 +239,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #605: the modern start path's full-row insert touches
     // completion_callbacks even for a workflow with no configured callback.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n",
+    // issue #701: the modern start path's full-row insert touches the
+    // continue-as-new chain back-links even for a fresh (never-continued) run.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS continued_from_exec_id UUID NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS first_exec_id UUID NULL;\n",
     // issue #747: WorkflowExecution::as_select() (and thus the modern start
     // path's read-back) references the four legal_hold_* columns.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
@@ -592,6 +597,8 @@ async fn load_child_executions_from_url(
 async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_test_workflow",
         workflow_id: "e2e-wf-001",
@@ -4474,6 +4481,8 @@ async fn insert_named_workflow_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_sticky_test",
         workflow_id,
@@ -8144,6 +8153,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     let started_at = Utc::now();
     let deadline_at = started_at + execution_timeout;
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "signal_blocked_wf",
         workflow_id: "signal-blocked-timeout-001",

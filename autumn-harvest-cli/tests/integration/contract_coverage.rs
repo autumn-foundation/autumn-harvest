@@ -238,6 +238,19 @@ fn workflow_list_is_covered() {
 }
 
 #[test]
+fn workflow_summaries_is_covered() {
+    assert_covered(&["workflow", "summaries"]);
+    assert_covered(&[
+        "workflow",
+        "summaries",
+        "--workflow-name",
+        "onboarding",
+        "--state",
+        "COMPLETED",
+    ]);
+}
+
+#[test]
 fn workflow_get_is_covered() {
     assert_covered(&["workflow", "get", "00000000-0000-0000-0000-000000000001"]);
 }
@@ -252,6 +265,15 @@ fn workflow_timeline_is_covered() {
     assert_covered(&[
         "workflow",
         "timeline",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
+fn workflow_run_chain_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "run-chain",
         "00000000-0000-0000-0000-000000000001",
     ]);
 }

@@ -62,8 +62,8 @@ use crate::telemetry::{
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_AUTO_PAUSED,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
     METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_SESSION_ACQUISITION, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION,
-    METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
+    METRIC_SESSION_ACQUISITION, METRIC_SUMMARY_DELETED, METRIC_TASK_QUARANTINED,
+    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
     METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
     METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
@@ -399,6 +399,14 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_retention_deleted(&self, workflow: &str, count: u64) {
         counter!(
             METRIC_RETENTION_DELETED,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .increment(count);
+    }
+
+    fn record_summary_deleted(&self, workflow: &str, count: u64) {
+        counter!(
+            METRIC_SUMMARY_DELETED,
             METRIC_LABEL_WORKFLOW => workflow.to_owned(),
         )
         .increment(count);
@@ -926,6 +934,15 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_retention_deleted("onboarding", 5);
         rec.record_retention_deleted("nightly_report", 0);
+    }
+
+    #[test]
+    fn record_summary_deleted_does_not_panic() {
+        // Summary-retention GC deletion counter bridge (issue #752). Must not
+        // panic with no global recorder installed.
+        let rec = MetricsRsRecorder;
+        rec.record_summary_deleted("onboarding", 5);
+        rec.record_summary_deleted("nightly_report", 0);
     }
 
     #[test]

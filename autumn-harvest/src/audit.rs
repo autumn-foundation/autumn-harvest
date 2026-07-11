@@ -274,11 +274,14 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /health", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
     ("GET /workflows/count", RouteClass::ReadOnly),
+    // Tiered/summary retention list (issue #752): read-only, admin-guarded.
+    ("GET /workflows/summaries", RouteClass::ReadOnly),
     ("GET /workflows", RouteClass::ReadOnly),
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
     ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
+    ("GET /workflows/{id}/run-chain", RouteClass::ReadOnly),
     (
         "GET /workflows/{id}/query/{query_name}",
         RouteClass::ReadOnly,
@@ -540,11 +543,13 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
 /// [`ALL_MUTATION_ROUTES`] or this exclusion list.
 pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/count",
+    "GET /workflows/summaries",
     "GET /workflows",
     "GET /workflows/{id}",
     "GET /workflows/{id}/children",
     "GET /workflows/{id}/stack",
     "GET /workflows/{id}/timeline",
+    "GET /workflows/{id}/run-chain",
     "GET /workflows/{id}/query/{query_name}",
     "POST /workflows/{id}/query/{query_name}",
     "GET /workflows/{id}/queries",
@@ -608,11 +613,13 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
 pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // Workflow management
     ("GET /workflows/count", None),
+    ("GET /workflows/summaries", None),
     ("GET /workflows", None),
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
     ("GET /workflows/{id}/stack", None),
     ("GET /workflows/{id}/timeline", None),
+    ("GET /workflows/{id}/run-chain", None),
     (
         "POST /workflows/{workflow_name}/start",
         Some(OP_WORKFLOW_START),

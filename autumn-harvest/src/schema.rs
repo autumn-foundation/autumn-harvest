@@ -95,6 +95,14 @@ diesel::table! {
         /// effective set is still the union with any builder-wide defaults,
         /// resolved at enqueue time (not stored on this row).
         completion_callbacks -> Nullable<Jsonb>,
+        /// Predecessor execution in a continue-as-new chain (issue #701). NULL for
+        /// the first run in a chain and for all non-continued runs. Back-link set at
+        /// the successor's insert time.
+        continued_from_exec_id -> Nullable<Uuid>,
+        /// The first (origin) execution of this continue-as-new chain (issue #701).
+        /// Set on every successor to the chain head so any member resolves the head
+        /// in one lookup. NULL for the origin run and all non-continued runs.
+        first_exec_id -> Nullable<Uuid>,
         /// Wall-clock the per-execution legal hold was placed (issue #747).
         /// NULL = no hold. A hold is ACTIVE when this is non-NULL and
         /// `legal_hold_until` is NULL or in the future; an active hold exempts
@@ -775,6 +783,41 @@ diesel::table! {
 
 diesel::joinable!(harvest_sessions -> harvest_workflow_executions (workflow_exec_id));
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Compact, queryable summaries of terminal executions demoted by the
+    /// history-retention janitor (issue #752). One row per summarized
+    /// execution, written in the same shard-local transaction as the original
+    /// execution row's deletion. Governed by its own retention horizon.
+    harvest_execution_summaries (execution_id) {
+        execution_id  -> Uuid,
+        workflow_name -> Text,
+        workflow_id   -> Text,
+        state         -> Text,
+        started_at    -> Timestamptz,
+        completed_at  -> Timestamptz,
+        /// `completed_at - started_at` in whole milliseconds. NULL if
+        /// unresolvable.
+        duration_ms   -> Nullable<Int8>,
+        shard_id      -> Int4,
+        search_attrs  -> Nullable<Jsonb>,
+        /// OPT-IN captured result payload (verbatim, or a typed
+        /// `_harvest_omitted` marker when offloaded/oversized). NULL when
+        /// payload capture is disabled.
+        result        -> Nullable<Jsonb>,
+        /// OPT-IN captured error text (capped-with-marker). NULL when payload
+        /// capture is disabled.
+        error         -> Nullable<Text>,
+        /// Parent execution UUID for a child-workflow summary, else NULL
+        /// (issue #752). Links a demoted child summary to its parent so the
+        /// #495 PII-erase cascade can reach it after both the child's and the
+        /// parent's execution rows are gone.
+        parent_id     -> Nullable<Uuid>,
+        summarized_at -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -804,4 +847,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_payload_refs,
     harvest_completion_deliveries,
     harvest_sessions,
+    harvest_execution_summaries,
 );

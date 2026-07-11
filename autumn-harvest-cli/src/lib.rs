@@ -772,6 +772,46 @@ enum WorkflowCommand {
         #[arg(long)]
         include_sleeping: bool,
     },
+    /// List tiered/summary-retention execution summaries (issue #752).
+    ///
+    /// Summaries are compact rows the retention janitor demotes a hard-deleted
+    /// terminal execution into instead of losing it entirely. Admin-guarded.
+    Summaries {
+        /// Filter by registered workflow name (exact match).
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by workflow ID (exact match).
+        #[arg(long)]
+        workflow_id: Option<String>,
+        /// Filter by terminal state. Repeat the flag or pass a comma-separated
+        /// list to match any of several states.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Only summaries whose `completed_at` is on or after this RFC 3339
+        /// timestamp (e.g. 2026-01-01T00:00:00Z).
+        #[arg(long)]
+        completed_after: Option<String>,
+        /// Only summaries whose `completed_at` is on or before this RFC 3339
+        /// timestamp.
+        #[arg(long)]
+        completed_before: Option<String>,
+        /// Filter by a `search_attrs` key/value pair (`key=value`). Repeat to
+        /// AND multiple containment predicates together.
+        #[arg(long = "search-attr", value_name = "KEY=VALUE")]
+        search_attr: Vec<String>,
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+        /// Opaque keyset pagination cursor returned by the previous response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Sort direction: `desc` (default, newest-first) or `asc`.
+        #[arg(long, value_parser = ["asc", "desc"])]
+        order: Option<String>,
+        /// Print the raw JSON API payload instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Get one workflow execution and event history.
     Get {
         /// Workflow execution ID.
@@ -787,6 +827,15 @@ enum WorkflowCommand {
     Timeline {
         /// Workflow execution ID.
         execution_id: String,
+    },
+    /// Reconstruct the ordered continue-as-new run chain a workflow execution
+    /// belongs to, resolvable from any member (origin, middle, or tail).
+    RunChain {
+        /// Workflow execution ID of any member of the chain.
+        execution_id: String,
+        /// Emit raw JSON instead of the default table.
+        #[arg(long)]
+        json: bool,
     },
     /// List child workflow executions for a parent execution.
     Children {
@@ -2201,6 +2250,12 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
+    if workflow_summaries_wants_table(cli) {
+        return Ok(format_workflow_summaries_table(value));
+    }
+    if run_chain_wants_table(cli) {
+        return Ok(format_run_chain_table(value));
+    }
     if handoff_wants_table(cli) {
         return Ok(format_handoff_table(value));
     }
@@ -2230,6 +2285,8 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     }
 
     let output = if workflow_children_wants_raw_json(cli)
+        || workflow_summaries_wants_raw_json(cli)
+        || run_chain_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
@@ -3227,6 +3284,42 @@ const fn workflow_children_wants_raw_json(cli: &Cli) -> bool {
     )
 }
 
+fn workflow_summaries_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Summaries { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn workflow_summaries_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Summaries { json: true, .. }
+        }
+    )
+}
+
+fn run_chain_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::RunChain { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn run_chain_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::RunChain { json: true, .. }
+        }
+    )
+}
+
 fn handoff_wants_table(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -3416,6 +3509,126 @@ fn format_workflow_children_table(value: &Value) -> String {
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
         rendered.push_str(cursor);
+    }
+    rendered
+}
+
+fn format_workflow_summaries_table(value: &Value) -> String {
+    let Some(items) = value.get("summaries").and_then(Value::as_array) else {
+        return "No execution summaries found.".to_string();
+    };
+    if items.is_empty() {
+        return "No execution summaries found.".to_string();
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "EXEC ID".to_string(),
+        "WORKFLOW".to_string(),
+        "WORKFLOW ID".to_string(),
+        "STATE".to_string(),
+        "COMPLETED".to_string(),
+        "DURATION_MS".to_string(),
+        "SHARD".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("execution_id")),
+            cell_str(item.get("workflow_name")),
+            cell_str(item.get("workflow_id")),
+            cell_str(item.get("state")),
+            cell_str(item.get("completed_at")),
+            cell_optional_number(item.get("duration_ms")),
+            cell_number(item.get("shard_id")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
+        rendered.push_str("\nnext_cursor: ");
+        rendered.push_str(cursor);
+    }
+    rendered
+}
+
+fn format_run_chain_table(value: &Value) -> String {
+    let Some(runs) = value.get("runs").and_then(Value::as_array) else {
+        return "No run chain found.".to_string();
+    };
+    if runs.is_empty() {
+        return "No run chain found.".to_string();
+    }
+
+    let mut rows = Vec::with_capacity(runs.len() + 1);
+    rows.push(vec![
+        "SEQ".to_string(),
+        "EXEC ID".to_string(),
+        "RUN ID".to_string(),
+        "STATE".to_string(),
+        "OUTCOME".to_string(),
+        "STARTED".to_string(),
+        "COMPLETED".to_string(),
+        "CONTINUED TO".to_string(),
+    ]);
+    for run in runs {
+        rows.push(vec![
+            cell_number(run.get("sequence")),
+            cell_str(run.get("exec_id")),
+            cell_str(run.get("run_id")),
+            cell_str(run.get("state")),
+            cell_str(run.get("outcome")),
+            cell_str(run.get("started_at")),
+            cell_optional_str(run.get("completed_at")),
+            cell_optional_str(run.get("continued_to_exec_id")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if let Some(workflow_id) = value.get("workflow_id").and_then(Value::as_str) {
+        rendered = format!("workflow_id: {workflow_id}\n{rendered}");
+    }
+    if value
+        .get("head_unknown")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        rendered.push_str(
+            "\nnote: head_unknown — the chain participates in continue-as-new but its \
+             true origin could not be proven (legacy rows lacking back-links); the first \
+             run shown is a best-effort head.",
+        );
     }
     rendered
 }
@@ -3718,6 +3931,28 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             *no_progress_minutes,
             *include_sleeping,
         )?)),
+        WorkflowCommand::Summaries {
+            workflow_name,
+            workflow_id,
+            state,
+            completed_after,
+            completed_before,
+            search_attr,
+            limit,
+            cursor,
+            order,
+            json: _,
+        } => Ok(ApiRequest::get(build_summary_list_path(
+            workflow_name.as_deref(),
+            workflow_id.as_deref(),
+            state,
+            completed_after.as_deref(),
+            completed_before.as_deref(),
+            search_attr,
+            *limit,
+            cursor.as_deref(),
+            order.as_deref(),
+        )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
             path_segment(execution_id)
@@ -3728,6 +3963,13 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         ))),
         WorkflowCommand::Timeline { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/timeline",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::RunChain {
+            execution_id,
+            json: _,
+        } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/run-chain",
             path_segment(execution_id)
         ))),
         WorkflowCommand::Children {
@@ -5244,6 +5486,61 @@ fn build_workflow_list_path(
         .collect::<Vec<_>>()
         .join("&");
     Ok(format!("/workflows?{encoded}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_summary_list_path(
+    workflow_name: Option<&str>,
+    workflow_id: Option<&str>,
+    states: &[String],
+    completed_after: Option<&str>,
+    completed_before: Option<&str>,
+    search_attrs: &[String],
+    limit: Option<i64>,
+    cursor: Option<&str>,
+    order: Option<&str>,
+) -> Result<String, CliError> {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    if let Some(name) = workflow_name {
+        params.push(("workflow_name", name.to_string()));
+    }
+    if let Some(wid) = workflow_id {
+        params.push(("workflow_id", wid.to_string()));
+    }
+    if !states.is_empty() {
+        params.push(("state", states.join(",")));
+    }
+    if let Some(after) = completed_after {
+        params.push(("completed_after", after.to_string()));
+    }
+    if let Some(before) = completed_before {
+        params.push(("completed_before", before.to_string()));
+    }
+    for raw in search_attrs {
+        let (key, value) = raw
+            .split_once('=')
+            .ok_or_else(|| CliError::InvalidSearchAttr { value: raw.clone() })?;
+        params.push(("search_attr", format!("{key}:{value}")));
+    }
+    if let Some(value) = limit {
+        params.push(("limit", value.to_string()));
+    }
+    if let Some(value) = cursor {
+        params.push(("cursor", value.to_string()));
+    }
+    if let Some(value) = order {
+        params.push(("order", value.to_string()));
+    }
+
+    if params.is_empty() {
+        return Ok("/workflows/summaries".to_string());
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    Ok(format!("/workflows/summaries?{encoded}"))
 }
 
 fn build_workflow_children_path(

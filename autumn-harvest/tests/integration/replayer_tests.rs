@@ -300,6 +300,352 @@ fn sleep_until_workflow<'a>(
     })
 }
 
+/// Cancellable durable timer (issue #768): arm, then await the outcome.
+fn cancellable_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Arms a cancellable durable timer and then COMPLETES in the same task without
+/// awaiting it (Codex P1, issue #768). The live worker emits `[ArmTimer(idle)]`
+/// and then seals the execution; the terminal-cycle persist path
+/// (`plan_timer_lifecycle` with `skip_arm_inserts = true`) must still record the
+/// `TimerStarted` event (while skipping the never-firing `harvest_timers` row),
+/// or the positional `match_timer_arm` diverges strict replay when `start_timer`
+/// re-runs.
+fn arm_timer_then_complete_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _handle = ctx.start_timer("idle", 300);
+        // Do NOT await the timer — complete in the same task.
+        Ok(serde_json::json!("done"))
+    })
+}
+
+/// Duplicate ACTIVE arm (Codex P2, issue #768): calls `start_timer("idle", 300)`
+/// twice with no intervening cancel/reset, then awaits the fire. The durable row
+/// is deduped, so the recorded history has exactly ONE `TimerStarted("idle")`.
+/// On replay the first `start_timer` consumes it; the second must be an
+/// idempotent no-op that does NOT re-run the positional `match_timer_arm`
+/// (which would diverge against the trailing `TimerFired`).
+fn duplicate_active_start_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _first = ctx.start_timer("idle", 300);
+        let handle = ctx.start_timer("idle", 300); // duplicate active arm — no-op
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Cancellable timer reset loop (issue #768): arm, reset N times, then either
+/// await the fire or cancel. Drives the O(K)-history, zero-orphan reset path.
+fn cancellable_timer_reset_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let reset_count = input["reset_count"].as_u64().unwrap_or(0);
+        let cancel_at_end = input["cancel_at_end"].as_bool().unwrap_or(false);
+        let mut handle = ctx.start_timer("idle", 300);
+        for _ in 0..reset_count {
+            handle.reset(300).map_err(|e| e.to_string())?;
+        }
+        if cancel_at_end {
+            handle.cancel().map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("cancelled_by_workflow"))
+        } else {
+            let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(format!("{outcome:?}")))
+        }
+    })
+}
+
+/// Same-cycle cancel-then-await (Codex P2, issue #768): arm a timer, cancel it,
+/// then await its outcome in the SAME task. Must resolve `Cancelled` and must
+/// NOT re-arm — otherwise the "cancelled" timer re-arms and later fires
+/// (AC2/AC3 violation). Proves the fix is correct on the REPLAY path, not just
+/// live: `cancel()` consumes the recorded `TimerCancelled`, so `await_fire`'s
+/// `match_timer_or_cancel` sees `NoMatch` and must fall back to the per-context
+/// cancelled state rather than re-arming.
+fn cancel_then_await_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Cancel-then-reset-then-await (issue #768): the reset re-arms after the
+/// cancel, so `await_fire` must wait/fire normally — NOT short-circuit to
+/// `Cancelled` from the earlier cancel.
+fn cancel_then_reset_then_await_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        handle.reset(300).map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Arms a timer then runs an activity — never cancels or awaits. Used to prove
+/// that removing a `cancel_timer` call while history still records a
+/// `TimerCancelled` surfaces as `TimerCancelMismatch` (issue #768).
+fn cancellable_timer_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _handle = ctx.start_timer("idle", 300);
+        let out = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Cancellable timer reset loop that ALSO captures a `new_uuid()` side effect in
+/// the SAME cycle as the initial arm and each reset (issue #768, FINDING 1). This
+/// drives the arm/reset + side-effect same-cycle interleaving path — the exact
+/// ordering the pre-fix worker got wrong — across a reset-heavy history.
+fn cancellable_reset_with_uuid_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let reset_count = input["reset_count"].as_u64().unwrap_or(0);
+        let cancel_at_end = input["cancel_at_end"].as_bool().unwrap_or(false);
+        let mut handle = ctx.start_timer("idle", 300);
+        let _sid = ctx.new_uuid(); // side effect in the same cycle as the arm
+        for _ in 0..reset_count {
+            handle.reset(300).map_err(|e| e.to_string())?;
+            let _u = ctx.new_uuid(); // side effect in the same cycle as the reset
+        }
+        if cancel_at_end {
+            handle.cancel().map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("cancelled_by_workflow"))
+        } else {
+            let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(format!("{outcome:?}")))
+        }
+    })
+}
+
+/// Same as `cancellable_timer_workflow` but arms a differently-named timer —
+/// used to prove a renamed timer id surfaces as `TimerMismatch` (issue #768).
+fn cancellable_timer_renamed_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("renamed", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Arms a cancellable timer, then captures a `new_uuid()` side effect in the
+/// SAME cycle, then awaits the fire (issue #768, FINDING 1). The live worker
+/// emits `[ArmTimer(idle), RecordSideEffect(Uuid)]`; the recorded history MUST
+/// interleave `TimerStarted` at the `ArmTimer` position (before
+/// `SideEffectRecorded`), or `match_timer_arm`'s positional check diverges on
+/// resume. This fixture replays the CORRECT emission-order history — the one the
+/// fixed worker produces.
+fn cancellable_timer_then_side_effect_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let _sid = ctx.new_uuid();
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}")))
+    })
+}
+
+/// Duplicate ACTIVE arm with a DIFFERENT duration (Codex P2 round 5, issue
+/// #768): `start_timer("idle", 300)` then `start_timer("idle", 600)` with no
+/// cancel/reset between. The second call is a duration-preserving idempotent
+/// no-op — the returned handle MUST carry the ORIGINAL recorded 300s, not 600,
+/// so the durable row / virtual clock stay consistent with the single recorded
+/// `TimerStarted(idle, 300)`. Emits the armed duration in its result so the test
+/// can assert 300 (before the fix the handle carried 600).
+fn duplicate_active_start_timer_diff_duration_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _first = ctx.start_timer("idle", 300);
+        // Duplicate active arm with a DIFFERENT duration — MUST preserve 300.
+        let handle = ctx.start_timer("idle", 600);
+        let armed = handle.duration_secs();
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "armed": armed, "outcome": format!("{outcome:?}") }))
+    })
+}
+
+/// SOUNDNESS gate (Codex P2 round 5, issue #768): the REORDERED code awaits the
+/// timer BEFORE the activity. Replayed against a history where the activity was
+/// recorded FIRST (`[…, TimerStarted, ActivityScheduled, ActivityCompleted,
+/// TimerFired]`), the `await_fire` outcome scan must STOP at the unconsumed
+/// `ActivityScheduled` (returning `NoMatch`) so strict replay reports a
+/// non-determinism divergence — instead of skipping across the activity to claim
+/// the trailing `TimerFired` and passing (the false-negative the fix closes).
+fn timer_await_before_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        let out = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{outcome:?}:{out}")))
+    })
+}
+
+/// LEGIT flow (Codex P2 round 5, issue #768): arm the timer, run the activity,
+/// THEN await the timer — the order recorded in history. When `await_fire` runs,
+/// the activity events are already CONSUMED, so the outcome scan crosses them via
+/// `is_consumed` and reaches the `TimerFired`. Proves the soundness stop does NOT
+/// break the legitimate `arm→activity→await` flow.
+fn activity_then_timer_await_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let out = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("{out}:{outcome:?}")))
+    })
+}
+
+/// FIX 1 SOUNDNESS GATE (Codex P2 round 6, issue #768): the REORDERED code
+/// CANCELS the timer BEFORE running the activity. Replayed against a history that
+/// recorded the activity FIRST (`[…, TimerStarted, ActivityScheduled,
+/// ActivityCompleted, TimerCancelled, WorkflowCompleted]`), `match_timer_cancel`'s
+/// scan must STOP at the unconsumed `ActivityScheduled` (returning `NoMatch`) so
+/// strict replay reports a non-determinism divergence — instead of skipping across
+/// the activity to claim the trailing `TimerCancelled` and passing (the
+/// false-negative this fix closes; sibling of the round-5 `match_timer_or_cancel`
+/// fix).
+fn cancel_timer_before_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?; // reordered: cancel BEFORE the activity
+        let out = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(format!("cancelled:{out}")))
+    })
+}
+
+/// FIX 1 LEGIT control (Codex P2 round 6, issue #768): arm the timer, run the
+/// activity, THEN cancel — the order recorded in history. When `cancel()` runs,
+/// the activity events are already CONSUMED, so `match_timer_cancel`'s scan crosses
+/// them via `is_consumed` and reaches the `TimerCancelled` at the cursor. Proves
+/// the soundness stop does NOT break the legitimate `arm→activity→cancel` flow.
+fn activity_then_cancel_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let out = ctx
+            .execute_activity_raw("work", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        handle.cancel().map_err(|e| e.to_string())?; // cancel AFTER the activity (as recorded)
+        Ok(serde_json::json!(format!("{out}:cancelled")))
+    })
+}
+
+/// FIX 2 (Codex P2 round 6, issue #768): the core sliding-window / idle-session
+/// LOOP that reuses the SAME timer id — arm; await→Fired; arm again — N times,
+/// with a fresh duration each iteration. Consuming a fire must CLEAR the Armed
+/// logical state so each iteration's `start_timer` records a FRESH `TimerStarted`
+/// (N `TimerStarted` + N `TimerFired`, balanced). Before the fix the stale Armed
+/// state made the second+ `start_timer` a duplicate no-op, leaving the recorded
+/// `TimerStarted`s unconsumed → an early-completion divergence.
+fn cancellable_timer_loop_reuse_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let iterations = input["iterations"].as_u64().unwrap_or(0);
+        let vary = input["vary_duration"].as_bool().unwrap_or(false);
+        for i in 0..iterations {
+            let dur = if vary { 300 + i } else { 300 };
+            let handle = ctx.start_timer("idle", dur);
+            let _outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
+        }
+        Ok(serde_json::json!({ "iterations": iterations }))
+    })
+}
+
+/// Codex P2 round 10 (issue #768) — CANONICAL ORDER: arm the timer, THEN cancel
+/// it (no intervening activity), matching the recorded history
+/// `[TimerStarted(idle), TimerCancelled(idle)]`. Must replay cleanly: `start_timer`
+/// consumes the `TimerStarted` at the cursor, then `match_timer_cancel` claims the
+/// `TimerCancelled` directly at the (now-advanced) cursor.
+fn start_then_cancel_no_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("cancelled"))
+    })
+}
+
+/// Codex P2 round 10 (issue #768) — REORDERED: cancel the timer BEFORE arming it,
+/// replayed against the canonical `[TimerStarted(idle), TimerCancelled(idle)]`
+/// history. `match_timer_cancel("idle")`'s scan must STOP at the unconsumed
+/// SAME-id `TimerStarted` (this id's own command-ordering anchor) rather than
+/// crossing it to claim the trailing `TimerCancelled` — so strict replay reports
+/// `NonDeterminismDetected`. Before the round-10 fix the shared helper crossed a
+/// same-id `TimerStarted` transparently, wrongly passing the reorder.
+fn cancel_then_start_no_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.cancel_timer("idle").map_err(|e| e.to_string())?; // reordered: cancel BEFORE the arm
+        let _handle = ctx.start_timer("idle", 300);
+        Ok(serde_json::json!("cancelled"))
+    })
+}
+
 /// Workflow that derives a timer duration from deterministic retry-jitter math.
 fn jitter_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -623,6 +969,75 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn(
             "handler_panic_compensating_workflow",
             handler_panic_compensating_workflow,
+        )
+        .register_fn("cancellable_timer_workflow", cancellable_timer_workflow)
+        .register_fn(
+            "arm_timer_then_complete_workflow",
+            arm_timer_then_complete_workflow,
+        )
+        .register_fn(
+            "duplicate_active_start_timer_workflow",
+            duplicate_active_start_timer_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_reset_workflow",
+            cancellable_timer_reset_workflow,
+        )
+        .register_fn(
+            "cancel_then_await_timer_workflow",
+            cancel_then_await_timer_workflow,
+        )
+        .register_fn(
+            "cancel_then_reset_then_await_timer_workflow",
+            cancel_then_reset_then_await_timer_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_then_activity_workflow",
+            cancellable_timer_then_activity_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_renamed_workflow",
+            cancellable_timer_renamed_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_then_side_effect_workflow",
+            cancellable_timer_then_side_effect_workflow,
+        )
+        .register_fn(
+            "cancellable_reset_with_uuid_workflow",
+            cancellable_reset_with_uuid_workflow,
+        )
+        .register_fn(
+            "duplicate_active_start_timer_diff_duration_workflow",
+            duplicate_active_start_timer_diff_duration_workflow,
+        )
+        .register_fn(
+            "timer_await_before_activity_workflow",
+            timer_await_before_activity_workflow,
+        )
+        .register_fn(
+            "activity_then_timer_await_workflow",
+            activity_then_timer_await_workflow,
+        )
+        .register_fn(
+            "cancel_timer_before_activity_workflow",
+            cancel_timer_before_activity_workflow,
+        )
+        .register_fn(
+            "activity_then_cancel_timer_workflow",
+            activity_then_cancel_timer_workflow,
+        )
+        .register_fn(
+            "cancellable_timer_loop_reuse_workflow",
+            cancellable_timer_loop_reuse_workflow,
+        )
+        .register_fn(
+            "start_then_cancel_no_activity_workflow",
+            start_then_cancel_no_activity_workflow,
+        )
+        .register_fn(
+            "cancel_then_start_no_activity_workflow",
+            cancel_then_start_no_activity_workflow,
         )
 }
 
@@ -1301,6 +1716,759 @@ async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
             }
         ),
         "dropping the frozen system_now() capture must surface as SideEffectDrift, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cancellable / renewable durable timers (issue #768)
+// ---------------------------------------------------------------------------
+
+fn cancellable_ts() -> WorkflowEvent {
+    WorkflowEvent::TimerStarted {
+        timer_id: TimerId::new("idle"),
+        duration_secs: 300,
+    }
+}
+fn cancellable_tf() -> WorkflowEvent {
+    WorkflowEvent::TimerFired {
+        timer_id: TimerId::new("idle"),
+    }
+}
+fn cancellable_tc() -> WorkflowEvent {
+    WorkflowEvent::TimerCancelled {
+        timer_id: TimerId::new("idle"),
+    }
+}
+fn wf_started() -> WorkflowEvent {
+    wf_started_with_input(Value::Null)
+}
+fn wf_started_with_input(input: Value) -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+#[tokio::test]
+async fn fired_timer_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a fired cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_timer_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tc()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a cancelled cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+/// Codex P2 (issue #768) — determinism gate: a same-task
+/// `start_timer; cancel; await_fire` replays cleanly against the history the
+/// FIXED worker produces (`[WorkflowStarted, TimerStarted, TimerCancelled]`).
+/// On replay `cancel()` consumes the recorded `TimerCancelled`, so `await_fire`
+/// sees `match_timer_or_cancel == NoMatch` and MUST resolve `Cancelled` from the
+/// per-context cancelled state rather than re-arming and parking — a re-arm here
+/// would suspend mid-replay (never reaching completion) and the run would never
+/// resolve, so `ReplaySucceeded` here is the direct proof the fix holds on
+/// replay, not just live.
+#[tokio::test]
+async fn cancel_then_await_same_cycle_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tc()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_then_await_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a same-cycle cancel-then-await cancellable timer replays cleanly, got: {report}"
+    );
+}
+
+/// Codex P2 (issue #768) — determinism gate for reset-after-cancel: a
+/// `cancel(); reset(); await_fire()` re-arms after the cancel, so the timer
+/// fires. Replays cleanly against the FIXED worker history
+/// `[WorkflowStarted, TimerStarted, TimerCancelled, TimerCancelled, TimerStarted,
+/// TimerFired]` and resolves `Fired` — proving the reset flips the per-context
+/// state back to Armed so `await_fire` does NOT short-circuit to `Cancelled`.
+#[tokio::test]
+async fn cancel_then_reset_then_await_replays_fired() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        cancellable_tc(),
+        cancellable_ts(),
+        cancellable_tf(),
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_then_reset_then_await_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a cancel-then-reset-then-await cancellable timer replays cleanly (fires), got: {report}"
+    );
+}
+
+/// Codex P2 (issue #768) — determinism gate for a DUPLICATE ACTIVE arm: calling
+/// `start_timer("idle", 300)` twice with no cancel/reset between records exactly
+/// ONE `TimerStarted` (the durable row is deduped). Replaying the fixed-worker
+/// history `[WorkflowStarted, TimerStarted, TimerFired]` must succeed — the
+/// second `start_timer` must be an idempotent no-op that does NOT re-run the
+/// positional `match_timer_arm` against the trailing `TimerFired`. Without the
+/// fix the second arm diverges (a timer mismatch for history this worker wrote).
+#[tokio::test]
+async fn duplicate_active_start_timer_replays_succeeded() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    // Exactly ONE TimerStarted despite two start_timer calls (row dedup).
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            .count(),
+        1,
+        "the fixed-worker history records exactly one TimerStarted"
+    );
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "duplicate_active_start_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a duplicate active start_timer replays cleanly (idempotent no-op), got: {report}"
+    );
+}
+
+/// FIX 1 (Codex P2 round 5, issue #768) — a duplicate active `start_timer` with a
+/// DIFFERENT duration preserves the RECORDED duration. History records exactly one
+/// `TimerStarted(idle, 300)` (the second `start_timer(idle, 600)` is a no-op), and
+/// on replay the handle must carry 300 — so the timer fires at the 300s deadline
+/// (the virtual clock advances by 300, not 600) and the run resolves `Fired`. The
+/// fixture emits the armed duration in its result; before the fix the handle
+/// carried 600 (the durable row / clock would use 600 while history recorded 300).
+#[tokio::test]
+async fn duplicate_active_start_timer_diff_duration_preserves_recorded_duration() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    // Exactly ONE TimerStarted, and its recorded duration is 300 (not 600).
+    let timer_starteds: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerStarted { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        timer_starteds,
+        vec![300],
+        "the fixed-worker history records exactly one TimerStarted(idle, 300)"
+    );
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "duplicate_active_start_timer_diff_duration_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a duplicate active start_timer with a different duration replays cleanly, got: {report}"
+    );
+}
+
+/// FIX 2 SOUNDNESS GATE (Codex P2 round 5, issue #768): the reordered code awaits
+/// the timer BEFORE the activity, replayed against a history recording the
+/// activity FIRST. The `await_fire` outcome scan must STOP at the unconsumed
+/// `ActivityScheduled` so strict replay reports `NonDeterminismDetected` — NOT
+/// `ReplaySucceeded`. Before the fix the scan skipped across the activity to claim
+/// the trailing `TimerFired`, wrongly passing.
+#[tokio::test]
+async fn await_timer_before_activity_detects_command_reorder() {
+    let work_id = ActivityExecId::new();
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: work_id,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: work_id,
+            output: serde_json::json!("done"),
+        },
+        cancellable_tf(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("x"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "timer_await_before_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "awaiting the timer before an activity recorded first must be caught as \
+         non-determinism (the outcome scan must not claim the trailing TimerFired \
+         across the unconsumed ActivityScheduled), got: {report}"
+    );
+}
+
+/// FIX 2 (Codex P2 round 5, issue #768): the LEGIT `arm→activity→await_fire` flow
+/// still replays cleanly against the SAME history — the activity events are
+/// consumed before `await_fire` runs, so the outcome scan crosses them via
+/// `is_consumed` and reaches the `TimerFired`. Proves the soundness stop does not
+/// break the legitimate ordering.
+#[tokio::test]
+async fn activity_then_await_timer_replays_succeeded() {
+    let work_id = ActivityExecId::new();
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: work_id,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: work_id,
+            output: serde_json::json!("done"),
+        },
+        cancellable_tf(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("x"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "activity_then_timer_await_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the legitimate arm->activity->await_fire flow must still replay cleanly, got: {report}"
+    );
+}
+
+/// FIX 1 SOUNDNESS GATE (Codex P2 round 6, issue #768): the reordered code cancels
+/// the timer BEFORE the activity, replayed against a history recording the activity
+/// FIRST. `match_timer_cancel`'s scan must STOP at the unconsumed
+/// `ActivityScheduled` so strict replay reports `NonDeterminismDetected` — NOT
+/// `ReplaySucceeded`. Before the fix the scan skipped across the activity to claim
+/// the trailing `TimerCancelled`, wrongly passing.
+#[tokio::test]
+async fn cancel_timer_before_activity_detects_command_reorder() {
+    let work_id = ActivityExecId::new();
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: work_id,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: work_id,
+            output: serde_json::json!("done"),
+        },
+        cancellable_tc(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("x"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_timer_before_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "cancelling the timer before an activity recorded first must be caught as \
+         non-determinism (the cancel scan must not claim the trailing TimerCancelled \
+         across the unconsumed ActivityScheduled), got: {report}"
+    );
+}
+
+/// FIX 1 LEGIT control (Codex P2 round 6, issue #768): the `arm→activity→cancel`
+/// flow still replays cleanly against the SAME history — the activity events are
+/// consumed before `cancel()` runs, so `match_timer_cancel`'s scan crosses them via
+/// `is_consumed` and reaches the `TimerCancelled`. Proves the soundness stop does
+/// not break the legitimate ordering.
+#[tokio::test]
+async fn activity_then_cancel_timer_replays_succeeded() {
+    let work_id = ActivityExecId::new();
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: work_id,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: work_id,
+            output: serde_json::json!("done"),
+        },
+        cancellable_tc(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("x"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "activity_then_cancel_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the legitimate arm->activity->cancel flow must still replay cleanly, got: {report}"
+    );
+}
+
+/// Codex P2 round 10 SOUNDNESS GATE (issue #768): the reordered code cancels the
+/// timer BEFORE arming it, replayed against the canonical
+/// `[TimerStarted(idle), TimerCancelled(idle)]` history. `match_timer_cancel`'s
+/// scan must STOP at the unconsumed SAME-id `TimerStarted` (its ordering anchor)
+/// so strict replay reports `NonDeterminismDetected` — NOT `ReplaySucceeded`.
+/// Before the fix the shared helper crossed a same-id `TimerStarted` transparently,
+/// letting the cancel claim the trailing `TimerCancelled` and wrongly passing.
+#[tokio::test]
+async fn cancel_then_start_no_activity_detects_command_reorder() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("cancelled"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancel_then_start_no_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "cancelling a same-id timer before its arm must be caught as non-determinism \
+         (the cancel scan must not claim the trailing TimerCancelled across the \
+         unconsumed same-id TimerStarted anchor), got: {report}"
+    );
+}
+
+/// Codex P2 round 10 LEGIT control (issue #768): the canonical `arm→cancel` order
+/// (no intervening activity) must still replay cleanly against the same history —
+/// `start_timer` consumes the `TimerStarted` at the cursor, then
+/// `match_timer_cancel` claims the `TimerCancelled` directly. Proves the same-id
+/// anchor stop does not break the legitimate ordering.
+#[tokio::test]
+async fn start_then_cancel_no_activity_replays_succeeded() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("cancelled"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "start_then_cancel_no_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the canonical arm->cancel flow (same id, no activity) must still replay \
+         cleanly, got: {report}"
+    );
+}
+
+/// FIX 2 (Codex P2 round 6, issue #768): the sliding-window / idle-session LOOP
+/// that reuses the SAME timer id (arm; await→Fired; arm again — with a DIFFERENT
+/// duration each iteration) must replay cleanly. Consuming a fire clears the Armed
+/// logical state so each iteration records a FRESH `TimerStarted` (N `TimerStarted`
+/// + N `TimerFired`, balanced). Before the fix the stale Armed state made the
+/// second+ `start_timer` a duplicate no-op, leaving the recorded `TimerStarted`s
+/// unconsumed → an early-completion divergence.
+#[tokio::test]
+async fn cancellable_timer_loop_reuse_replays_succeeded() {
+    let iterations = 3u64;
+    let input = serde_json::json!({ "iterations": iterations, "vary_duration": true });
+    let mut events = vec![wf_started_with_input(input)];
+    for i in 0..iterations {
+        events.push(WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("idle"),
+            duration_secs: 300 + i,
+        });
+        events.push(WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("idle"),
+        });
+    }
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_loop_reuse_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a loop reusing the same timer id (arm; await->Fired; re-arm with a fresh \
+         duration) must record and consume a fresh TimerStarted per iteration, got: {report}"
+    );
+}
+
+/// Codex P1 (issue #768): a `start_timer` that arms a timer and then completes in
+/// the SAME task must record the `TimerStarted` event in its terminal history.
+/// The FIXED worker produces `[WorkflowStarted, TimerStarted(idle),
+/// WorkflowCompleted]`; replaying that against the same workflow code must
+/// succeed — `start_timer`'s positional `match_timer_arm` consumes the recorded
+/// `TimerStarted` at the cursor.
+#[tokio::test]
+async fn arm_then_complete_replays_when_timer_started_recorded() {
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("done"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "arm_timer_then_complete_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a fixed-worker terminal history WITH TimerStarted must replay cleanly, got: {report}"
+    );
+}
+
+/// Codex P1 (issue #768): proves the `TimerStarted` event is load-bearing — i.e.
+/// the consequence of the FINDING-6 bug. The BUGGY worker dropped the event,
+/// recording `[WorkflowStarted, WorkflowCompleted]`. Replaying that history
+/// against the same workflow code diverges: `start_timer`'s positional
+/// `match_timer_arm` expects `TimerStarted` at the cursor but finds the terminal
+/// `WorkflowCompleted` instead.
+#[tokio::test]
+async fn arm_then_complete_diverges_without_recorded_timer_started() {
+    let events = vec![
+        wf_started(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("done"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "arm_timer_then_complete_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a terminal history MISSING TimerStarted must diverge (proving the event is \
+         load-bearing), got: {report}"
+    );
+}
+
+/// Builds the history recorded by `cancellable_timer_reset_workflow`: an initial
+/// arm, then two events per reset (cancel + fresh arm), then a terminal
+/// fire-or-cancel. Deliberately O(K) with zero orphaned firings (AC4).
+fn cancellable_reset_history(reset_count: u64, cancel_at_end: bool) -> Vec<WorkflowEvent> {
+    let input = serde_json::json!({
+        "reset_count": reset_count,
+        "cancel_at_end": cancel_at_end,
+    });
+    let mut events = vec![wf_started_with_input(input), cancellable_ts()];
+    for _ in 0..reset_count {
+        events.push(cancellable_tc());
+        events.push(cancellable_ts());
+    }
+    events.push(if cancel_at_end {
+        cancellable_tc()
+    } else {
+        cancellable_tf()
+    });
+    events
+}
+
+/// A distinct `SideEffectRecorded { Uuid }` event seeded from `seed` so every
+/// fixture's history is byte-distinct (a hyphenated UUID string deserialises
+/// back to `uuid::Uuid` on replay).
+fn uuid_side_effect(seed: u64) -> WorkflowEvent {
+    WorkflowEvent::SideEffectRecorded {
+        kind: autumn_harvest::SideEffectKind::Uuid,
+        name: None,
+        value: serde_json::json!(format!("018f0000-0000-7000-8000-{seed:012x}")),
+    }
+}
+
+/// History recorded by `cancellable_reset_with_uuid_workflow`: an initial arm +
+/// its same-cycle side effect, then three events per reset (cancel + fresh arm +
+/// same-cycle side effect — the FINDING-1 interleaving), then a terminal
+/// fire-or-cancel. Bounded and O(K) with zero orphaned firings. `seed` makes the
+/// interleaved side-effect values distinct so the whole fixture is unique.
+fn cancellable_reset_uuid_history(
+    reset_count: u64,
+    cancel_at_end: bool,
+    seed: u64,
+) -> Vec<WorkflowEvent> {
+    let input = serde_json::json!({
+        "reset_count": reset_count,
+        "cancel_at_end": cancel_at_end,
+    });
+    let mut events = vec![
+        wf_started_with_input(input),
+        cancellable_ts(),
+        uuid_side_effect(seed * 1000),
+    ];
+    for i in 0..reset_count {
+        events.push(cancellable_tc());
+        events.push(cancellable_ts());
+        events.push(uuid_side_effect(seed * 1000 + i + 1));
+    }
+    events.push(if cancel_at_end {
+        cancellable_tc()
+    } else {
+        cancellable_tf()
+    });
+    events
+}
+
+/// The falsifiable success-metric bar for issue #768: reset-heavy cancellable
+/// timer histories replay deterministically across N = 1000 GENUINELY DISTINCT
+/// fixtures, each with zero divergences and a bounded, O(K), zero-orphaned-firing
+/// history. Reset cadence spans a wide prime range and terminal outcome varies;
+/// every third fixture also interleaves a `new_uuid()` side effect in the SAME
+/// cycle as the initial arm and each reset — exercising the FINDING-1
+/// timer-lifecycle-event-in-emission-position ordering path (a distinct per-`i`
+/// seed makes those fixtures byte-unique). The plain fixtures pin the exact
+/// 2-events/reset bound; the interleaved fixtures pin the 3-events/reset bound.
+#[tokio::test]
+async fn reset_1000_times_replays_with_bounded_history() {
+    let replayer = build_replayer();
+    for i in 0..1000_u64 {
+        // Wide, prime-modulus spread so shapes are not just ~40 repeats.
+        let reset_count = i % 97;
+        let cancel_at_end = (i / 97) % 2 == 0;
+        let with_side_effect = i % 3 == 0;
+
+        let (workflow_name, events) = if with_side_effect {
+            let events = cancellable_reset_uuid_history(reset_count, cancel_at_end, i);
+            // Bounded: WorkflowStarted + arm + initial side-effect + 3/reset + terminal.
+            assert_eq!(
+                events.len() as u64,
+                3 * reset_count + 4,
+                "uuid-interleaved history must be bounded at 3 events per reset (i={i})"
+            );
+            ("cancellable_reset_with_uuid_workflow", events)
+        } else {
+            let events = cancellable_reset_history(reset_count, cancel_at_end);
+            // Bounded: WorkflowStarted + initial arm + 2 events/reset + terminal.
+            assert_eq!(
+                events.len() as u64,
+                2 * reset_count + 3,
+                "plain reset history must be bounded at 2 events per reset (i={i})"
+            );
+            ("cancellable_timer_reset_workflow", events)
+        };
+
+        // Zero orphaned firings: at most one terminal TimerFired ever.
+        let fired = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+            .count();
+        assert!(
+            fired <= 1,
+            "a reset history must never orphan a TimerFired (i={i}, fired={fired})"
+        );
+
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(workflow_name, ExecutionId::new(), events))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "reset replay pass {i} ({workflow_name}, resets={reset_count}, \
+             cancel={cancel_at_end}, side_effect={with_side_effect}) must succeed with \
+             zero divergences, got: {report}"
+        );
+    }
+}
+
+/// Removing a `cancel_timer` call while history still records the
+/// `TimerCancelled` leaves it unconsumed; the next command trips over it and
+/// the divergence is classified precisely as `TimerCancelMismatch` (AC).
+#[tokio::test]
+async fn removed_cancel_surfaces_as_timer_cancel_mismatch() {
+    let aid = ActivityExecId::new();
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        cancellable_tc(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: aid,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: aid,
+            output: serde_json::json!("done"),
+        },
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_then_activity_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::TimerCancelMismatch,
+                ..
+            }
+        ),
+        "an unconsumed TimerCancelled must classify as TimerCancelMismatch, got: {report}"
+    );
+}
+
+/// Renaming a timer id surfaces as an ordinary `TimerMismatch` (AC).
+#[tokio::test]
+async fn renamed_timer_surfaces_as_timer_mismatch() {
+    let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_renamed_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::TimerMismatch,
+                ..
+            }
+        ),
+        "a renamed timer id must classify as TimerMismatch, got: {report}"
+    );
+}
+
+/// FINDING 1: a `start_timer` followed same-cycle by a `new_uuid()` side effect
+/// records history in emission order `[TimerStarted(idle), SideEffectRecorded]`.
+/// This is the history the FIXED worker produces (timer-lifecycle events
+/// interleaved at their command position, not appended at the end of the batch).
+/// It must replay cleanly.
+#[tokio::test]
+async fn timer_arm_then_side_effect_correct_order_replays_succeeded() {
+    let uuid_value = serde_json::json!("018f0000-0000-7000-8000-000000000000");
+    let events = vec![
+        wf_started(),
+        cancellable_ts(),
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Uuid,
+            name: None,
+            value: uuid_value,
+        },
+        cancellable_tf(),
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_then_side_effect_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "emission-order history (TimerStarted before SideEffectRecorded) must \
+         replay cleanly, got: {report}"
+    );
+}
+
+/// FINDING 1 (bug proof): the PRE-FIX worker appended timer-lifecycle events at
+/// the END of the batch, recording `[SideEffectRecorded, TimerStarted]`. That
+/// wrong-order history nd-blocks the run on first resume — `match_timer_arm` is
+/// positional, `drain_early_signals` does not skip `SideEffectRecorded`, so the
+/// cursor lands on `SideEffectRecorded` and the timer arm diverges. This test
+/// pins that the buggy ordering is genuinely non-replayable.
+#[tokio::test]
+async fn timer_arm_then_side_effect_wrong_order_diverges() {
+    let uuid_value = serde_json::json!("018f0000-0000-7000-8000-000000000000");
+    let events = vec![
+        wf_started(),
+        // Wrong order: side effect recorded before the timer arm.
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Uuid,
+            name: None,
+            value: uuid_value,
+        },
+        cancellable_ts(),
+        cancellable_tf(),
+    ];
+    let report = build_replayer()
+        .replay_from_snapshot(make_snapshot(
+            "cancellable_timer_then_side_effect_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "the pre-fix end-of-batch timer ordering must be non-replayable, got: {report}"
     );
 }
 

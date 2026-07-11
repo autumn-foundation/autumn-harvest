@@ -142,6 +142,8 @@ pub mod replay;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;
+/// Continue-as-new run-chain assembly (issue #701).
+pub mod run_chain;
 pub mod saga;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
@@ -250,7 +252,8 @@ pub use completion_trigger::{
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
     DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder, RaceWinner, Session, SessionOptions,
-    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, is_reserved_session_activity_name,
+    TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy,
+    is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -331,6 +334,7 @@ pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
     HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch, SignalOrTimerMatch,
+    TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{
@@ -346,6 +350,9 @@ pub use retention::{
 pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
+};
+pub use run_chain::{
+    RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };
 pub use saga::Saga;
 #[cfg(feature = "db")]

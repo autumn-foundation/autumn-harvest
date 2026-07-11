@@ -32,14 +32,15 @@
 //! | activity | `activity_id` | `ActivityScheduled` | `ActivityCompleted`/`ActivityFailed`/`ActivityTimedOut` | present ⇔ an `ActivityStarted` was recorded |
 //! | activity (external, issue #92) | `activity_id` | `ActivityAwaitingExternal` | `ActivityCompletedExternally`/`ActivityFailedExternally`/`ActivityTimedOut` | never (no claim/start event) |
 //! | local_activity | `activity_id` | `LocalActivityScheduled` | `LocalActivityCompleted`/`LocalActivityExhausted` | never (no claim event) |
-//! | timer | `timer_id` | `TimerStarted` | `TimerFired` | never |
+//! | timer | `timer_id` | `TimerStarted` | `TimerFired` (or `TimerCancelled`, issue #768) | never |
 //! | child_workflow | `child_id` | `ChildWorkflowStarted` | `ChildWorkflowCompleted`/`ChildWorkflowFailed` | never (parent records no child-start ts) |
 //! | side_effect | — | `SideEffectRecorded` (point) | same event | never |
 //! | signal_wait | — | previous event's ts | `SignalReceived` | never |
 //!
 //! Timers are paired by **occurrence, not id**: a `timer_id` reused across
 //! loop iterations (`ctx.timer("poll", 60)` per iteration) produces one step per
-//! occurrence, each `TimerFired` closing the oldest still-open step for that id.
+//! occurrence, each `TimerFired` (or, for a cancellable timer, `TimerCancelled`)
+//! closing the oldest still-open step for that id.
 //!
 //! External activities (issue #92) are represented **as `activity` steps** — the
 //! step-kind set is bounded and does not gain a seventh kind. A bare
@@ -153,9 +154,9 @@ pub enum StepOutcome {
     Failed,
     /// Exceeded a timeout.
     TimedOut,
-    /// Explicitly cancelled (reserved; the core derivation does not currently
-    /// emit this — no per-step "cancelled" terminal event exists — but the plugin
-    /// may surface it in future).
+    /// Explicitly cancelled — a cancellable/renewable timer (issue #768) closed
+    /// by a `TimerCancelled` event (author `cancel_timer`/`reset`) with no
+    /// preceding `TimerFired`.
     Cancelled,
     /// A timer that elapsed.
     Fired,
@@ -474,6 +475,18 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                     && let Some(idx) = queue.pop_front()
                 {
                     accs[idx].close(ts, StepOutcome::Fired);
+                }
+            }
+            // A cancellable timer's `TimerCancelled` (issue #768: author
+            // `cancel_timer`/`reset`) closes the OLDEST still-open step for that
+            // id as Cancelled — mirroring `TimerFired`'s FIFO-by-id pairing — so a
+            // cancelled/reset timer becomes a closed step instead of dangling open
+            // forever and distorting the wall-clock/wait rollup.
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                if let Some(queue) = timer_open.get_mut(&timer_id.to_string())
+                    && let Some(idx) = queue.pop_front()
+                {
+                    accs[idx].close(ts, StepOutcome::Cancelled);
                 }
             }
 
@@ -1555,6 +1568,102 @@ mod tests {
         assert_eq!(timers[1].outcome, StepOutcome::Pending);
         assert_eq!(timers[1].ended_at, None);
         assert_eq!(timers[1].total_ms, 70); // 100 - 30
+    }
+
+    // ── issue #768: cancellable timers close on TimerCancelled ────────────
+
+    #[test]
+    fn cancelled_timer_closes_as_cancelled_not_left_pending() {
+        // A `cancel_timer()`/`reset()` records `TimerStarted … TimerCancelled`
+        // with NO `TimerFired`. The timer step must CLOSE as Cancelled (with an
+        // ended_at) instead of dangling open — otherwise it stays Pending forever
+        // and distorts the timeline's wait/total rollup.
+        let x = TimerId::new("x");
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::TimerStarted {
+                    timer_id: x.clone(),
+                    duration_secs: 300,
+                },
+            ),
+            row(25, WorkflowEvent::TimerCancelled { timer_id: x }),
+        ];
+        let tl = derive(&rows, Some(30), 30);
+        let timers: Vec<&TimelineStep> = tl
+            .steps
+            .iter()
+            .filter(|s| s.step_kind == StepKind::Timer)
+            .collect();
+        assert_eq!(timers.len(), 1, "one timer step");
+        assert_eq!(
+            timers[0].outcome,
+            StepOutcome::Cancelled,
+            "a cancelled timer closes as Cancelled, not Pending"
+        );
+        assert_eq!(timers[0].ended_at, Some(at(25)), "closed at the cancel ts");
+        assert_eq!(timers[0].total_ms, 15, "10..25, not open to now(30)");
+        // No open/pending timer left → rollup counts the closed step in the timer
+        // wait bucket.
+        assert!(
+            tl.steps
+                .iter()
+                .filter(|s| s.step_kind == StepKind::Timer)
+                .all(|s| s.ended_at.is_some()),
+            "no timer step is left open"
+        );
+    }
+
+    #[test]
+    fn reset_timer_first_cancelled_then_second_fired() {
+        // A reset records `TimerStarted, TimerCancelled, TimerStarted, TimerFired`
+        // for the same id. FIFO-by-id pairing: the first step closes Cancelled, the
+        // second closes Fired.
+        let x = TimerId::new("x");
+        let rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::TimerStarted {
+                    timer_id: x.clone(),
+                    duration_secs: 300,
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::TimerCancelled {
+                    timer_id: x.clone(),
+                },
+            ),
+            row(
+                20,
+                WorkflowEvent::TimerStarted {
+                    timer_id: x.clone(),
+                    duration_secs: 60,
+                },
+            ),
+            row(80, WorkflowEvent::TimerFired { timer_id: x }),
+        ];
+        let tl = derive(&rows, Some(90), 90);
+        let timers: Vec<&TimelineStep> = tl
+            .steps
+            .iter()
+            .filter(|s| s.step_kind == StepKind::Timer)
+            .collect();
+        assert_eq!(timers.len(), 2, "two timer occurrences");
+        assert_eq!(
+            timers[0].outcome,
+            StepOutcome::Cancelled,
+            "first (reset) occurrence is cancelled"
+        );
+        assert_eq!(timers[0].ended_at, Some(at(20)));
+        assert_eq!(
+            timers[1].outcome,
+            StepOutcome::Fired,
+            "second (re-armed) occurrence fires"
+        );
+        assert_eq!(timers[1].ended_at, Some(at(80)));
     }
 
     // ── FIX 3: external activities render as `activity` steps (no split) ──

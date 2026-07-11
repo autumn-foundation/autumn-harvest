@@ -198,7 +198,7 @@ jobs:
         run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Compile plugin integration tests
         if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --test legal_hold_integration --no-run
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --test legal_hold_integration --test workflow_summaries_integration --test run_chain_integration --no-run
       - name: Run Docker-backed integration tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
@@ -208,6 +208,9 @@ jobs:
       - name: Run retention override integration tests (issue #737)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests -- --test-threads=1
+      - name: Run retention summary integration tests (issue #752)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest --test integration -- retention_summary_tests -- --test-threads=1
       - name: Run Docker-backed typed workflow failure integration tests (issue #767)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests -- --test-threads=1
@@ -232,6 +235,9 @@ jobs:
       - name: Run plugin legal-hold integration tests (issue #747)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test legal_hold_integration -- --test-threads=1
+      - name: Run plugin summary-retention integration tests (issue #752)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test workflow_summaries_integration -- --test-threads=1
       - name: Run plugin DAG run graph integration tests (issue #690)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test dag_run_graph_integration -- --test-threads=1
@@ -253,6 +259,9 @@ jobs:
       - name: Run plugin timeline integration tests (issue #739)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test timeline_integration -- --test-threads=1
+      - name: Run plugin run-chain integration tests (issue #701)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --test run_chain_integration -- --test-threads=1
       - name: Run plugin terminal-query integration tests (issue #612)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test query_integration -- --test-threads=1

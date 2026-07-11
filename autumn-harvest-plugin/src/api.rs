@@ -79,9 +79,9 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
 };
 use autumn_harvest::models::{
-    AuditRecord, BackfillLogRow, CompletionTriggerDb, DeadLetter, HarvestCalendar, HarvestSchedule,
-    NewAuditRecord, NewBackfillLogRow, NewCompletionTriggerDb, RateLimitBucket, ScheduleDecision,
-    WorkflowExecution,
+    AuditRecord, BackfillLogRow, CompletionTriggerDb, DeadLetter, ExecutionSummary,
+    HarvestCalendar, HarvestSchedule, NewAuditRecord, NewBackfillLogRow, NewCompletionTriggerDb,
+    RateLimitBucket, ScheduleDecision, WorkflowExecution,
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
@@ -3335,6 +3335,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // issue #544: static /workflows/count must be registered before any
         // /workflows/{param} routes so axum does not capture "count" as a path param.
         .route("/workflows/count", get(count_workflows))
+        // issue #752: static /workflows/summaries must be registered before any
+        // /workflows/{param} routes so axum does not capture "summaries" as a
+        // path param. Admin-guarded (summaries can carry retained payloads).
+        .route(
+            "/workflows/summaries",
+            get(list_workflow_summaries).route_layer(require_admin.clone()),
+        )
         .route(
             "/workflows/{id}/history/export",
             get(export_workflow_history),
@@ -3345,6 +3352,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
+        .route("/workflows/{id}/run-chain", get(get_run_chain))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -3971,6 +3979,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows"),
         ("GET", "/workflows/count"),
+        ("GET", "/workflows/summaries"),
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
         ("GET", "/workflows/{id}"),
@@ -3980,6 +3989,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
+        ("GET", "/workflows/{id}/run-chain"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -4505,6 +4515,8 @@ pub const fn management_api_response_fields()
                 "unavailable_shards",
             ]),
         ),
+        // Free-form envelope { summaries, next_cursor } (issue #752).
+        ("GET", "/workflows/summaries", None),
         (
             "GET",
             "/workflows/{id}",
@@ -4567,6 +4579,11 @@ pub const fn management_api_response_fields()
                 "steps",
                 "rollup",
             ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/run-chain",
+            Some(&["head_unknown", "workflow_id", "runs"]),
         ),
         (
             "POST",
@@ -5922,6 +5939,268 @@ async fn list_workflows(
         // Legacy bare-array response for callers using only limit/state/search_attr.
         Ok(Json(rows).into_response())
     }
+}
+
+// ── Issue #752: tiered/summary retention list route ──────────────────────────
+
+const DEFAULT_SUMMARY_LIMIT: i64 = 50;
+const MAX_SUMMARY_LIMIT: i64 = 500;
+
+/// Parsed query params for `GET /workflows/summaries` (issue #752).
+///
+/// Mirrors the `GET /workflows` filter vocabulary (`workflow_name`,
+/// `workflow_id`, `state`, completed-time-range, `search_attr` containment)
+/// against the summary tier, plus the same keyset-cursor pagination contract
+/// (issue #498) — here keyed on `(completed_at, execution_id)`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SummaryListFilters {
+    pub(crate) limit: i64,
+    pub(crate) states: Vec<String>,
+    pub(crate) workflow_name: Option<String>,
+    pub(crate) workflow_id: Option<String>,
+    pub(crate) search_attrs: Vec<Value>,
+    pub(crate) completed_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) completed_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) cursor: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    /// Sort direction (issue #752, AC4 — parity with `GET /workflows`). Defaults
+    /// to `Desc` (newest-first).
+    pub(crate) order: WorkflowSortOrder,
+}
+
+/// Parse `GET /workflows/summaries` query params (issue #752).
+///
+/// Malformed params return `400` with a JSON error body (never `500`, never a
+/// silent empty match). `limit` clamps to `[1, MAX_SUMMARY_LIMIT]` (default
+/// [`DEFAULT_SUMMARY_LIMIT`]); unknown params are ignored so future additions
+/// stay non-breaking.
+pub(crate) fn parse_summary_filters(
+    pairs: &[(String, String)],
+) -> Result<SummaryListFilters, AutumnError> {
+    let mut limit_raw: Option<i64> = None;
+    let mut filters = SummaryListFilters::default();
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "limit" | "page_size" => {
+                let parsed = value.trim().parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid {key} '{value}'"))
+                })?;
+                limit_raw = Some(parsed);
+            }
+            "state" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !KNOWN_WORKFLOW_STATES.contains(&trimmed) {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "unknown workflow state '{trimmed}'; expected one of {KNOWN_WORKFLOW_STATES:?}"
+                        )));
+                    }
+                    let owned = trimmed.to_string();
+                    if !filters.states.contains(&owned) {
+                        filters.states.push(owned);
+                    }
+                }
+            }
+            "workflow_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "workflow_id" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_id = Some(trimmed.to_string());
+                }
+            }
+            "search_attr" => {
+                let (raw_key, raw_val) = value.split_once(':').ok_or_else(|| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid search_attr '{value}'; expected 'key:value'"
+                    ))
+                })?;
+                let attr_key = raw_key.trim();
+                if attr_key.is_empty() {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "search_attr '{value}' is missing a key"
+                    )));
+                }
+                let mut object = serde_json::Map::with_capacity(1);
+                object.insert(attr_key.to_string(), Value::String(raw_val.to_string()));
+                filters.search_attrs.push(Value::Object(object));
+            }
+            "completed_after" => {
+                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                    .map_err(|_| {
+                        AutumnError::bad_request_msg(format!(
+                            "invalid completed_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                filters.completed_after = Some(dt);
+            }
+            "completed_before" => {
+                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                    .map_err(|_| {
+                        AutumnError::bad_request_msg(format!(
+                            "invalid completed_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                filters.completed_before = Some(dt);
+            }
+            "cursor" => {
+                // Reuse the `<rfc3339>|<uuid>` opaque cursor format (issue #498);
+                // here the timestamp is `completed_at` rather than `created_at`.
+                let decoded = parse_workflow_cursor(value.trim())?;
+                filters.cursor = Some((decoded.created_at, decoded.exec_id));
+            }
+            "order" => {
+                // AC4 parity with `GET /workflows`: accept only `asc`/`desc`,
+                // 400 on anything else (never a silent fallback to desc).
+                filters.order = match value.trim().to_ascii_lowercase().as_str() {
+                    "asc" => WorkflowSortOrder::Asc,
+                    "desc" => WorkflowSortOrder::Desc,
+                    other => {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid order '{other}'; expected 'asc' or 'desc'"
+                        )));
+                    }
+                };
+            }
+            _ => {
+                // Ignore unknown query parameters so future additions stay non-breaking.
+            }
+        }
+    }
+
+    let limit = limit_raw
+        .unwrap_or(DEFAULT_SUMMARY_LIMIT)
+        .clamp(1, MAX_SUMMARY_LIMIT);
+    filters.limit = limit;
+    Ok(filters)
+}
+
+/// One row of `GET /workflows/summaries` (issue #752).
+///
+/// Flattens the [`ExecutionSummary`] columns and adds `summarized: true` +
+/// `history_available: false` so a summary is unambiguously distinguishable
+/// from a live execution returned by `GET /workflows` (AC4).
+#[derive(Debug, Serialize)]
+pub struct SummaryListItem {
+    #[serde(flatten)]
+    summary: ExecutionSummary,
+    /// Always `true` — this row is a retention-demoted summary, not a live run.
+    summarized: bool,
+    /// Always `false` — the full event history was deleted; only the summary
+    /// remains.
+    history_available: bool,
+}
+
+/// Response envelope for `GET /workflows/summaries` (issue #752), mirroring the
+/// paginated `GET /workflows` shape `{ ..., next_cursor }`.
+#[derive(Debug, Serialize)]
+pub struct SummaryListPage {
+    summaries: Vec<SummaryListItem>,
+    next_cursor: Option<String>,
+}
+
+/// `GET /workflows/summaries` — list retention-demoted execution summaries
+/// (issue #752). Admin-guarded (summaries can carry retained/redacted
+/// payloads).
+///
+/// Cross-shard fan-out + merge with the same `(completed_at DESC,
+/// execution_id DESC)` keyset ordering and opaque cursor as `GET /workflows`
+/// (issue #498). Each item carries `summarized: true` / `history_available:
+/// false` so a summary is never mistaken for a live execution.
+async fn list_workflow_summaries(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<SummaryListPage>, AutumnError> {
+    let filters = parse_summary_filters(&pairs)?;
+    let (summaries, next_cursor) = load_summaries_from_shards(&api_state, &filters).await?;
+    let items: Vec<SummaryListItem> = summaries
+        .into_iter()
+        .map(|summary| SummaryListItem {
+            summary,
+            summarized: true,
+            history_available: false,
+        })
+        .collect();
+    Ok(Json(SummaryListPage {
+        summaries: items,
+        next_cursor,
+    }))
+}
+
+/// Load execution summaries from every shard with keyset pagination (issue
+/// #752), mirroring `load_workflows_from_shards`.
+///
+/// Each shard is over-fetched by one probe row; after the cross-shard merge and
+/// truncation a `next_cursor` is derived from the last kept row. An unreachable
+/// shard hard-fails the call (matching `GET /workflows`).
+async fn load_summaries_from_shards(
+    api_state: &HarvestApiState,
+    filters: &SummaryListFilters,
+) -> Result<(Vec<ExecutionSummary>, Option<String>), AutumnError> {
+    use autumn_harvest::retention::{SummaryQuery, list_execution_summaries};
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let ascending = filters.order == WorkflowSortOrder::Asc;
+    let query = SummaryQuery {
+        workflow_name: filters.workflow_name.clone(),
+        workflow_id: filters.workflow_id.clone(),
+        states: filters.states.clone(),
+        completed_after: filters.completed_after,
+        completed_before: filters.completed_before,
+        search_attrs: filters.search_attrs.clone(),
+        cursor: filters.cursor,
+        ascending,
+    };
+    // Over-fetch one extra row per shard so the merge can detect a next page.
+    let probe_limit = filters.limit.saturating_add(1);
+
+    let mut rows: Vec<ExecutionSummary> = Vec::new();
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut shard_rows = list_execution_summaries(&mut conn, &query, probe_limit)
+            .await
+            .map_err(map_error)?;
+        rows.append(&mut shard_rows);
+    }
+
+    // Total order in the requested direction; tie-break on execution_id for
+    // stability across the cross-shard merge.
+    if ascending {
+        rows.sort_by(|left, right| {
+            left.completed_at
+                .cmp(&right.completed_at)
+                .then_with(|| left.execution_id.cmp(&right.execution_id))
+        });
+    } else {
+        rows.sort_by(|left, right| {
+            right
+                .completed_at
+                .cmp(&left.completed_at)
+                .then_with(|| right.execution_id.cmp(&left.execution_id))
+        });
+    }
+
+    let limit = usize::try_from(filters.limit).unwrap_or(usize::MAX);
+    let next_cursor = if limit > 0 && rows.len() > limit {
+        let last_kept = &rows[limit - 1];
+        let cursor =
+            encode_workflow_list_cursor_raw(&last_kept.completed_at, &last_kept.execution_id);
+        rows.truncate(limit);
+        Some(cursor)
+    } else {
+        None
+    };
+
+    Ok((rows, next_cursor))
 }
 
 /// `GET /workflows/count` — grouped execution-count fleet snapshot (issue #544).
@@ -7883,6 +8162,323 @@ async fn get_workflow_timeline(
     );
 
     Ok(Json(timeline))
+}
+
+/// Upper bound on the number of legacy `WorkflowContinuedAsNew` event hops the
+/// run-chain gather will walk forward (issue #701). Bounds the best-effort
+/// legacy path so a corrupt or unusually long chain can never spin.
+const MAX_RUN_CHAIN_HOPS: usize = 128;
+
+/// Upper bound on same-`workflow_id` candidate rows the legacy backward
+/// reconstruction (issue #701, Codex P2) will scan. A pre-feature chain queried
+/// from its tail has no back-link metadata, so reconstruction loads each
+/// candidate's history to read its `WorkflowContinuedAsNew` linkage — bounded by
+/// this cap so a heavily id-reused `workflow_id` can never trigger an unbounded
+/// scan. Above the cap the chain is served best-effort with `head_unknown = true`.
+const MAX_LEGACY_CANDIDATES: usize = 256;
+
+/// Outcome of legacy backward reconstruction (issue #701, Codex P2).
+enum LegacyReconstruction {
+    /// The chain was reconstructed from `WorkflowContinuedAsNew` linkage. `rows`
+    /// are the ordered members and `head` is the resolved origin `exec_id`.
+    Reconstructed {
+        rows: Vec<autumn_harvest::run_chain::RunChainRow>,
+        head: uuid::Uuid,
+    },
+    /// The same-`workflow_id` candidate set exceeded [`MAX_LEGACY_CANDIDATES`];
+    /// reconstruction was skipped. Serve the fast-path rows best-effort but flag
+    /// `head_unknown = true`.
+    Overflowed,
+}
+
+/// Reconstruct a legacy continue-as-new chain by walking `WorkflowContinuedAsNew`
+/// linkage across same-`workflow_id` rows, id-reuse-safe (issue #701, Codex P2).
+///
+/// Triggered only for a run with no back-link metadata (`first_exec_id` and
+/// `continued_from_exec_id` both `NULL`) that the indexed gather could not resolve
+/// into a multi-run chain — i.e. a pre-feature chain queried from its tail or a
+/// middle run, or a genuine standalone run. Post-feature chains never reach here
+/// (their successors carry `first_exec_id`, so the fast indexed gather is
+/// complete).
+///
+/// All members of a continue-as-new chain share the same `(workflow_name,
+/// workflow_id)`, so candidates are gathered by that pair on the caller's already
+/// held, shard-local connection (never a second acquire — the pool-size-1 safety
+/// the whole run-chain gather relies on). Each candidate's history is loaded
+/// (undecoded — only the typed `new_exec_id` is read) to build the CAN linkage,
+/// then [`reconstruct_legacy_chain_order`](autumn_harvest::run_chain::reconstruct_legacy_chain_order)
+/// walks backward to the origin and forward to the tail. A same-`workflow_id` run
+/// reused for an unrelated logical run points its CAN event at a different
+/// successor, so it is excluded by construction.
+///
+/// Cost: up to [`MAX_LEGACY_CANDIDATES`] history loads. This is the degraded
+/// legacy path only; it is never hit for post-feature chains.
+async fn reconstruct_legacy_run_chain(
+    conn: &mut AsyncPgConnection,
+    queried: &WorkflowExecution,
+) -> HarvestResult<LegacyReconstruction> {
+    // Gather same-(workflow_name, workflow_id) candidates on the queried row's
+    // logical shard, capped. The `shard_id` filter is required because multiple
+    // logical shards can share one physical Postgres database, so an unscoped
+    // scan would see same-id rows from other logical shards; since continue-as-new
+    // chains are shard-local, another shard's chain could consume the candidate
+    // cap and wrongly overflow this shard's reconstruction. `shard_id` is
+    // `Int4` (NOT NULL) so a plain equality filter is correct. Fetch one over
+    // the cap so an overflow is detectable.
+    let candidates: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(&queried.workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(&queried.workflow_id))
+        .filter(harvest_workflow_executions::shard_id.eq(queried.shard_id))
+        .select(WorkflowExecution::as_select())
+        .limit(i64::try_from(MAX_LEGACY_CANDIDATES + 1).unwrap_or(i64::MAX))
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    if candidates.len() > MAX_LEGACY_CANDIDATES {
+        return Ok(LegacyReconstruction::Overflowed);
+    }
+
+    let by_id: std::collections::BTreeMap<uuid::Uuid, autumn_harvest::run_chain::RunChainRow> =
+        candidates
+            .iter()
+            .map(|e| (e.id, run_row_from_execution(e)))
+            .collect();
+
+    // Build CAN linkage: (new_exec_id, predecessor_exec_id) for each candidate
+    // that recorded a `WorkflowContinuedAsNew` event.
+    let mut links: Vec<(uuid::Uuid, uuid::Uuid)> = Vec::new();
+    for candidate in &candidates {
+        let successor =
+            continue_as_new_successor_on_conn(conn, ExecutionId::from_uuid(candidate.id)).await?;
+        if let Some(successor_id) = successor {
+            links.push((successor_id.as_uuid(), candidate.id));
+        }
+    }
+
+    let ordered = autumn_harvest::run_chain::reconstruct_legacy_chain_order(
+        queried.id,
+        &links,
+        MAX_RUN_CHAIN_HOPS,
+    );
+
+    // Project ordered member exec_ids back to their loaded rows. A member absent
+    // from the candidate set (e.g. a retention-pruned successor) is skipped —
+    // best-effort, never a 500.
+    let rows: Vec<autumn_harvest::run_chain::RunChainRow> = ordered
+        .iter()
+        .filter_map(|id| by_id.get(id).cloned())
+        .collect();
+    // `rows.as_slice()` avoids the diesel `RunQueryDsl::first` method-resolution
+    // ambiguity that a bare `rows.first()` triggers on a `Vec` of query rows.
+    let head = match rows.as_slice() {
+        [first, ..] => first.exec_id,
+        [] => queried.id,
+    };
+
+    Ok(LegacyReconstruction::Reconstructed { rows, head })
+}
+
+/// Map a loaded `WorkflowExecution` row into the minimal `RunChainRow` the pure
+/// [`autumn_harvest::run_chain::assemble_run_chain`] assembler consumes.
+fn run_row_from_execution(execution: &WorkflowExecution) -> autumn_harvest::run_chain::RunChainRow {
+    autumn_harvest::run_chain::RunChainRow {
+        exec_id: execution.id,
+        run_id: execution.run_id,
+        workflow_id: execution.workflow_id.clone(),
+        state: execution.state.clone(),
+        started_at: execution.started_at,
+        completed_at: execution.completed_at,
+        continued_from_exec_id: execution.continued_from_exec_id,
+        first_exec_id: execution.first_exec_id,
+    }
+}
+
+/// Read the successor execution id from a `WorkflowContinuedAsNew` event in
+/// `exec_id`'s recorded history, reusing the caller's already-held connection.
+///
+/// Deliberately does NOT call [`load_continue_as_new_successor`] (which acquires
+/// its own pool connection): the run-chain gather holds a connection across the
+/// whole walk, so a nested acquire would self-deadlock at pool size 1 (the
+/// issue #601 F4 precedent). Codec-untransformed load — only the typed
+/// `new_exec_id` field is read, never a payload — so an encrypted history's
+/// codec envelopes ride along as opaque values and cannot fail the walk.
+async fn continue_as_new_successor_on_conn(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<ExecutionId>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    Ok(history.events.into_iter().find_map(|event| {
+        if let WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } = event {
+            Some(new_exec_id)
+        } else {
+            None
+        }
+    }))
+}
+
+/// Load every execution in the continue-as-new chain whose origin is
+/// `head_exec_id`, shard-locally (issue #701).
+///
+/// Primary path (post-feature rows): one indexed query selects the origin
+/// (`id = head`) plus every successor (`first_exec_id = head`) — this is
+/// complete for any chain written after the feature landed, and for a
+/// standalone never-continued run it returns just that one row.
+///
+/// Legacy forward-fallback (AC5): rows written before issue #701 carry no
+/// back-links, so a `CONTINUED_AS_NEW` run that no gathered row continues from
+/// is walked forward through its `WorkflowContinuedAsNew` events to pick up the
+/// legacy successors. Each `CONTINUED_AS_NEW` frontier run is walked at most
+/// once (tracked in `walked`), so the walk is linear in chain length and
+/// bounded overall by [`MAX_RUN_CHAIN_HOPS`]; a post-feature chain never enters
+/// the walk (every `CONTINUED_AS_NEW` run already has an in-set back-linked
+/// successor). A mid-chain missing successor is swallowed — the chain is served
+/// best-effort, never a 500.
+async fn gather_run_chain_rows(
+    conn: &mut AsyncPgConnection,
+    head_exec_id: ExecutionId,
+) -> HarvestResult<Vec<autumn_harvest::run_chain::RunChainRow>> {
+    let head_uuid = head_exec_id.as_uuid();
+    let executions: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(
+            harvest_workflow_executions::id
+                .eq(head_uuid)
+                .or(harvest_workflow_executions::first_exec_id.eq(Some(head_uuid))),
+        )
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    let mut rows: std::collections::BTreeMap<uuid::Uuid, autumn_harvest::run_chain::RunChainRow> =
+        executions
+            .into_iter()
+            .map(|e| (e.id, run_row_from_execution(&e)))
+            .collect();
+
+    // Legacy forward-walk. Only a CONTINUED_AS_NEW run with no in-set back-linked
+    // successor is a frontier candidate, and each is walked at most once.
+    let mut walked: std::collections::BTreeSet<uuid::Uuid> = std::collections::BTreeSet::new();
+    for _ in 0..MAX_RUN_CHAIN_HOPS {
+        let next_from = rows
+            .values()
+            .find(|r| {
+                r.state == "CONTINUED_AS_NEW"
+                    && !walked.contains(&r.exec_id)
+                    && !rows
+                        .values()
+                        .any(|other| other.continued_from_exec_id == Some(r.exec_id))
+            })
+            .map(|r| r.exec_id);
+        let Some(from_uuid) = next_from else { break };
+        walked.insert(from_uuid);
+
+        let successor =
+            continue_as_new_successor_on_conn(conn, ExecutionId::from_uuid(from_uuid)).await?;
+        let Some(successor_id) = successor else {
+            continue;
+        };
+        if rows.contains_key(&successor_id.as_uuid()) {
+            continue;
+        }
+        match load_execution(conn, successor_id).await {
+            Ok(execution) => {
+                rows.insert(execution.id, run_row_from_execution(&execution));
+            }
+            // A retention-pruned or otherwise missing mid-chain successor is a
+            // best-effort gap, not an error.
+            Err(HarvestError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(rows.into_values().collect())
+}
+
+/// `GET /workflows/{id}/run-chain` (issue #701): reconstruct the ordered
+/// continue-as-new run chain that `id` belongs to, from any one member. The
+/// whole chain lives on one shard (a successor inherits the predecessor's
+/// shard), so this is a single shard-local gather — never a cross-shard
+/// fan-out. Read-only: no events are appended and no state is mutated.
+async fn get_run_chain(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<autumn_harvest::run_chain::RunChainResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    let queried = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // The chain head is the origin: a successor carries it in `first_exec_id`;
+    // the origin (and any standalone run) is its own head.
+    let head_exec_id = ExecutionId::from_uuid(queried.first_exec_id.unwrap_or(queried.id));
+
+    let rows = gather_run_chain_rows(&mut conn, head_exec_id)
+        .await
+        .map_err(map_error)?;
+
+    // Legacy backward reconstruction (issue #701, Codex P2). A pre-feature chain
+    // queried from its TAIL (or a MIDDLE run) has no back-link metadata, so the
+    // indexed gather above only finds the queried run (plus any legacy successors
+    // reachable via its own forward CAN events) — never its predecessors. Fall
+    // back to `workflow_id`-scoped reconstruction, but only when the queried run
+    // carries no back-link metadata AND the fast gather did not already resolve a
+    // post-feature chain (a post-feature origin's successors carry
+    // `first_exec_id = queried.id`, so it stays on the cheap indexed path).
+    let mut head_uuid = head_exec_id.as_uuid();
+    let mut force_head_unknown = false;
+    let mut rows = rows;
+    let needs_legacy_reconstruction = queried.first_exec_id.is_none()
+        && queried.continued_from_exec_id.is_none()
+        && !rows.iter().any(|r| r.first_exec_id == Some(queried.id));
+    if needs_legacy_reconstruction {
+        match reconstruct_legacy_run_chain(&mut conn, &queried)
+            .await
+            .map_err(map_error)?
+        {
+            LegacyReconstruction::Reconstructed {
+                rows: recon_rows,
+                head,
+            } => {
+                // Merge — never shrink. Reconstruction adds any chain member the
+                // indexed gather could not reach (the predecessors of a tail
+                // query, the whole point of this fallback), while the fast
+                // path's forward-walked successors are kept. When reconstruction
+                // finds nothing new (e.g. a head query the fast path already
+                // resolved) this is a no-op. The resolved origin (`head`) is
+                // never worse than the fast-path head: for a tail it walks back
+                // to the true origin, otherwise it equals the queried run.
+                let existing: std::collections::BTreeSet<uuid::Uuid> =
+                    rows.iter().map(|r| r.exec_id).collect();
+                for r in recon_rows {
+                    if !existing.contains(&r.exec_id) {
+                        rows.push(r);
+                    }
+                }
+                head_uuid = head;
+            }
+            // Too many same-workflow_id candidates to bound safely: keep the
+            // fast-path rows but be honest the head cannot be confirmed.
+            LegacyReconstruction::Overflowed => {
+                force_head_unknown = true;
+            }
+        }
+    }
+
+    let mut response = autumn_harvest::run_chain::assemble_run_chain(rows, head_uuid);
+    if force_head_unknown {
+        response.head_unknown = true;
+    }
+    Ok(Json(response))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -31706,6 +32302,8 @@ mod tests {
             nd_block_reason: None,
             nd_block_count: 0,
             completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
             legal_hold_reason: None,

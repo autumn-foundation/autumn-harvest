@@ -438,6 +438,8 @@ pub async fn start_or_load_workflow_execution_collect(
     let sla_deadline_at = effective_sla.map(|d| target_start_time + d);
 
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
         workflow_id: request.workflow_id,

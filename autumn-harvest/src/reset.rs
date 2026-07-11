@@ -565,7 +565,13 @@ fn apply_event_to_pending(
             Some(timer_id.to_string()),
             event_id,
         ),
-        WorkflowEvent::TimerFired { timer_id } => {
+        // A `TimerFired` resolves the pending arm; a cancellable timer's
+        // `TimerCancelled` (issue #768, from `cancel_timer()`/`reset()`) resolves
+        // it exactly the same way — the `TimerStarted` no longer represents an
+        // unresolved side effect. Without closing on the cancel, a reset point
+        // after a cancel/reset would leave the cancelled arming counted as pending
+        // and reset validation would reject or mis-plan the fork (Codex P2).
+        WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id } => {
             remove_pending(pending, "TimerStarted", &timer_id.to_string());
         }
         WorkflowEvent::ChildWorkflowStarted {
@@ -1244,6 +1250,8 @@ async fn insert_fork_execution(
     });
 
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: new_exec_id.as_uuid(),
         workflow_name: &source.workflow_name,
         workflow_id: &source.workflow_id,
@@ -1539,6 +1547,8 @@ mod tests {
             nd_block_reason: None,
             nd_block_count: 0,
             completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
             legal_hold_reason: None,
@@ -1757,6 +1767,46 @@ mod tests {
         let plan = validate_reset_point(&events, 2).expect("timer has fired");
         assert_eq!(plan.reset_to_event_id, 2);
         assert_eq!(plan.events_carried_over, 3);
+    }
+
+    #[test]
+    fn reset_point_timer_resolved_by_cancel_not_only_fire() {
+        // Codex P2 (issue #768): a cancellable timer's TimerCancelled resolves the
+        // pending TimerStarted arm exactly like a TimerFired. Without treating the
+        // cancel as a closer, any reset point after cancel_timer()/reset() would
+        // count the cancelled arming as an unresolved side effect and reset
+        // validation would reject or mis-plan the fork.
+        let timer_id = TimerId::new("idle");
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerCancelled { timer_id },
+            WorkflowEvent::MarkerRecorded {
+                name: "after-cancel".into(),
+                details: Value::Null,
+            },
+        ];
+
+        // The boundary BEFORE the cancel (index 1) still has the pending arm open.
+        let err = validate_reset_point(&events, 1)
+            .expect_err("the timer arm is still unresolved before its cancel");
+        assert_eq!(err.unresolved_side_effects.len(), 1);
+
+        // The boundary AFTER the cancel (index 2) is clean — the cancel closed
+        // the pending arm, so the fork validates.
+        let plan = validate_reset_point(&events, 2)
+            .expect("a cancelled timer resolves the pending arm, like a fire");
+        assert!(plan.unresolved_side_effects.is_empty());
+        assert_eq!(plan.reset_to_event_id, 2);
     }
 
     #[test]
