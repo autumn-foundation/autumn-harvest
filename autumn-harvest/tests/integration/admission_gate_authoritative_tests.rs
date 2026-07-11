@@ -1866,3 +1866,257 @@ async fn scanner_relay_block_marks_fires_row_admission_blocked() {
          'admission_blocked' — atomically with dropping the outbox row"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-round12: gate_checked_start_or_load — close the webhook idempotent-retry
+// TOCTOU (an existing run sealing between an unlocked existence check and the
+// start would let a fresh replacement slip an active gate uncounted).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Start a `webhook_delivery` run (RUNNING) with the given deterministic id.
+async fn start_webhook_delivery(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: "webhook_delivery",
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "webhooks",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: autumn_harvest::types::Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .expect("start webhook_delivery");
+    exec_id
+}
+
+/// Build `StartWorkflowParams` for a FRESH `webhook_delivery` replacement start
+/// (the params the delegate passes to `gate_checked_start_or_load`).
+fn webhook_replacement_params(workflow_id: &'static str) -> StartWorkflowParams<'static> {
+    StartWorkflowParams {
+        workflow_name: "webhook_delivery",
+        workflow_id,
+        exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+        input: json!({}),
+        parent_id: None,
+        queue_name: "webhooks",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+    }
+}
+
+/// The webhook delegate's gate decision (the equivalent of
+/// `webhook_delivery_gate_decision`, which is plugin-private): a LOCKED live run
+/// present → idempotent attach → skip the gate; else a genuinely fresh admission
+/// → apply the (`webhook_delivery`, `webhooks`, shard 0) gate.
+fn webhook_test_gate(locked_live: bool) -> Option<(String, &'static str)> {
+    if locked_live {
+        return None;
+    }
+    autumn_harvest::admission_gate::global_admission_gate_cache()
+        .and_then(|c| c.check("webhook_delivery", "webhooks", 0, None))
+        .map(|(_id, reason, scope)| (reason, scope))
+}
+
+async fn running_webhook_delivery_count(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions
+         WHERE workflow_name = 'webhook_delivery' AND state = 'RUNNING'",
+    )
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("count running webhook_delivery")
+    .n
+}
+
+/// The idempotent-retry (non-racy) case round 9 handles: a LIVE existing run under
+/// an active gate is ATTACHED (idempotent load), the gate is SKIPPED, and no fresh
+/// run is created — `gate_checked_start_or_load` must not block a non-admission.
+#[tokio::test]
+async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    let original = start_webhook_delivery(&mut conn, "webhook-delivery-live").await;
+    set_global_admission_gate_cache(Some(fleet_cache("attach-incident")));
+
+    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+        &mut conn,
+        webhook_replacement_params("webhook-delivery-live"),
+        None,
+        webhook_test_gate,
+    )
+    .await
+    .expect("gate_checked_start_or_load");
+
+    set_global_admission_gate_cache(None);
+
+    match outcome {
+        autumn_harvest::execution::GateCheckedStart::Started(started) => {
+            assert!(
+                !started.created,
+                "a live existing run must be ATTACHED (created == false), not replaced"
+            );
+            assert_eq!(
+                started.exec_id, original,
+                "the attach must return the original run's exec_id"
+            );
+        }
+        autumn_harvest::execution::GateCheckedStart::Blocked { .. } => {
+            panic!("an idempotent retry of a LIVE run must NOT be blocked by the gate")
+        }
+    }
+    // Still exactly one RUNNING webhook_delivery run (the original) — no fresh start.
+    assert_eq!(running_webhook_delivery_count(&mut conn).await, 1);
+}
+
+/// The TOCTOU the round-9 unlocked check left open, now closed: a run that is LIVE
+/// when the delegate is invoked but SEALS (TERMINATED) before the start decision
+/// commits. `gate_checked_start_or_load` locks the run through the decision, so it
+/// observes the SEALED state and BLOCKS the fresh replacement under the active gate
+/// — never a silent uncounted admission.
+///
+/// Choreography (the repo's `hold_execution_row_lock` pattern): a holder connection
+/// takes `FOR UPDATE` on the RUNNING run (a terminate about to seal it). We spawn
+/// `gate_checked_start_or_load`; its own `FOR UPDATE` existence load queues BEHIND
+/// the holder. The holder then seals the row and commits, releasing the lock; the
+/// spawned start's locked load now observes TERMINATED (excluded from the active
+/// filter) → `locked_live = false` → the gate applies → BLOCK, no fresh start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    let exec_id = start_webhook_delivery(&mut conn, "webhook-delivery-race").await;
+    set_global_admission_gate_cache(Some(fleet_cache("race-incident")));
+
+    // Holder: hold FOR UPDATE on the RUNNING run (a terminate that has locked it).
+    let mut holder = pool.get().await.unwrap();
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("BEGIN").await.unwrap();
+        diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut holder)
+            .await
+            .unwrap();
+    }
+
+    // Spawn the gate-checked start; its locked existence load queues behind holder.
+    let start_pool = pool.clone();
+    let start_task = tokio::spawn(async move {
+        let mut a_conn = start_pool.get().await.unwrap();
+        autumn_harvest::execution::gate_checked_start_or_load(
+            &mut a_conn,
+            webhook_replacement_params("webhook-delivery-race"),
+            None,
+            webhook_test_gate,
+        )
+        .await
+    });
+
+    // Give the spawned start time to reach (and block on) its FOR UPDATE lock load.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Holder seals the run and commits, releasing the lock.
+    {
+        use diesel_async::SimpleAsyncConnection;
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions
+             SET state = 'TERMINATED', completed_at = NOW() WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut holder)
+        .await
+        .unwrap();
+        holder.batch_execute("COMMIT").await.unwrap();
+    }
+
+    let outcome = start_task.await.expect("join start task").expect("start");
+
+    set_global_admission_gate_cache(None);
+
+    // The fresh replacement (which AllowDuplicate WOULD create for a TERMINATED
+    // prior) must be BLOCKED by the gate — the locked decision saw TERMINATED.
+    match outcome {
+        autumn_harvest::execution::GateCheckedStart::Blocked { scope_kind, .. } => {
+            assert_eq!(scope_kind, "fleet", "the block came from the Fleet gate");
+        }
+        autumn_harvest::execution::GateCheckedStart::Started(started) => panic!(
+            "a run sealed under the lock must BLOCK the fresh replacement, not start it \
+             (created = {}, exec = {:?}) — this is the round-9 TOCTOU leaking a fresh \
+             admission past the gate",
+            started.created, started.exec_id
+        ),
+    }
+    // No fresh RUNNING run was created (the original is now TERMINATED).
+    assert_eq!(
+        running_webhook_delivery_count(&mut conn).await,
+        0,
+        "no fresh webhook_delivery run slipped the gate"
+    );
+}

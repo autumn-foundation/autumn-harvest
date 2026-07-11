@@ -985,52 +985,27 @@ async fn start_harvest_runtime(
                         autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
                     })?;
 
-                    // Issue #618, Finding A (round 9): the OUTBOUND webhook-delivery
-                    // producer is gated as a FRESH in-process start — but an idempotent
-                    // RETRY for the same webhook log (deterministic workflow id
-                    // `webhook-delivery-{log.id}`, `AllowDuplicate` reuse) does NOT admit
-                    // a fresh run: `start_or_load` just LOADS the existing execution.
-                    // Gating that retry would wrongly block a non-admission and inflate
-                    // the block counter. So we mirror the #808 HTTP path: a read-only
-                    // existence check on the target shard (the exact `(workflow_name,
-                    // workflow_id)` key `start_or_load` reuses — `try_load_by_key`
-                    // excludes only the sealed CONTINUED_AS_NEW/TERMINATED states that
-                    // would themselves force a fresh start) decides whether this is a
-                    // committed replay (skip the gate) or a genuinely fresh delivery
-                    // (apply the gate — a matching gate blocks+counts; a fail-closed
-                    // sentinel blocks a fresh start, per round 5).
-                    let already_exists = autumn_harvest::execution::try_load_by_key(
-                        &mut conn,
-                        "webhook_delivery",
-                        &workflow_id,
-                    )
-                    .await
-                    .map_err(|e| {
-                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
-                    })?
-                    .is_some();
-
-                    if let Some((reason, scope_kind)) = webhook_delivery_gate_decision(
-                        already_exists,
-                        autumn_harvest::admission_gate::global_admission_gate_cache().as_deref(),
-                        shard,
-                        owner,
-                    ) {
-                        if let Some(m) = &metrics {
-                            m.record_admission_blocked(scope_kind, &reason);
-                        }
-                        tracing::info!(
-                            scope_kind,
-                            reason = %reason,
-                            "admission gate active; blocking outbound webhook_delivery start"
-                        );
-                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
-                            format!(
-                                "admission gate active ({scope_kind}); webhook_delivery start blocked"
-                            ),
-                        ));
-                    }
-
+                    // Issue #618, Finding A (round 9 → round 12): the OUTBOUND
+                    // webhook-delivery producer is gated as a FRESH in-process start —
+                    // but an idempotent RETRY for the same webhook log (deterministic
+                    // workflow id `webhook-delivery-{log.id}`, `AllowDuplicate` reuse)
+                    // does NOT admit a fresh run: `start_or_load` just LOADS the existing
+                    // execution, so gating that retry would wrongly block a non-admission
+                    // and inflate the block counter.
+                    //
+                    // Round 9 decided this with an UNLOCKED `try_load_by_key`, which had a
+                    // TOCTOU: if the existing run sealed (CONTINUED_AS_NEW / TERMINATED)
+                    // between the read-only check and `start_or_load`, the core start path
+                    // (default `AllowDuplicate`) admitted a FRESH replacement — and because
+                    // the unlocked check had already decided to skip the gate, that fresh
+                    // start slipped an active gate uncounted. Round 12 closes the window by
+                    // making the gate-skip decision CONSISTENT with `start_or_load`'s own
+                    // create-vs-attach decision: `gate_checked_start_or_load` locks the
+                    // existing active run (`FOR UPDATE`) so it cannot seal underneath us,
+                    // decides the gate on that LOCKED state, and runs `start_or_load` in the
+                    // SAME transaction — so a live run is attached (gate skipped) and a
+                    // sealed/absent run's fresh create is gated (matching gate → block+count;
+                    // fail-closed sentinel → block a fresh start, per round 5).
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
                         workflow_name: "webhook_delivery",
                         workflow_id: &workflow_id,
@@ -1070,14 +1045,57 @@ async fn start_harvest_runtime(
                         completion_callbacks: None,
                     };
 
-                    client
-                        .start_or_load(&mut conn, start_params)
-                        .await
-                        .map_err(|e| {
-                            autumn_web::error::AutumnError::internal_server_error_msg(format!(
-                                "failed to start Harvest webhook workflow: {e}"
-                            ))
-                        })?;
+                    // The metrics recorder (`Arc<dyn MetricsRecorder>`) coerced to the
+                    // `+ Send + Sync` reference the core start path expects (the trait
+                    // requires both supertraits), mirroring how the outbox relay passes it.
+                    let metrics_ref = metrics.as_ref().map(|m| {
+                        m.as_ref()
+                            as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
+                    });
+
+                    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+                        &mut conn,
+                        start_params,
+                        metrics_ref,
+                        // Decide the gate on the LOCKED existence state: a live run
+                        // present (locked) → idempotent attach → skip the gate; else a
+                        // genuinely fresh admission → apply the gate.
+                        move |locked_live| {
+                            webhook_delivery_gate_decision(
+                                locked_live,
+                                autumn_harvest::admission_gate::global_admission_gate_cache()
+                                    .as_deref(),
+                                shard,
+                                owner,
+                            )
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        autumn_web::error::AutumnError::internal_server_error_msg(format!(
+                            "failed to start Harvest webhook workflow: {e}"
+                        ))
+                    })?;
+
+                    if let autumn_harvest::execution::GateCheckedStart::Blocked {
+                        reason,
+                        scope_kind,
+                    } = outcome
+                    {
+                        if let Some(m) = &metrics {
+                            m.record_admission_blocked(scope_kind, &reason);
+                        }
+                        tracing::info!(
+                            scope_kind,
+                            reason = %reason,
+                            "admission gate active; blocking outbound webhook_delivery start"
+                        );
+                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                            format!(
+                                "admission gate active ({scope_kind}); webhook_delivery start blocked"
+                            ),
+                        ));
+                    }
 
                     Ok(())
                 })
