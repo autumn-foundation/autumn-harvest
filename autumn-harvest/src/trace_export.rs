@@ -17,7 +17,7 @@ use std::collections::HashMap;
 /// A JSON `Value` representing the trace events array.
 #[must_use]
 pub fn export_chrome_trace(profile: &DagProfile) -> Value {
-    let mut events = Vec::new();
+    let mut events = Vec::with_capacity(profile.timeline.len());
     let mut start_times = HashMap::new();
 
     for event in &profile.timeline {
