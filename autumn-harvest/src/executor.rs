@@ -545,7 +545,7 @@ async fn run_strict_with_ctx(
 /// context. If execution reaches the end of the recorded history and suspends,
 /// it returns `WorkflowOutcome::Suspended` rather than a non-determinism error.
 /// If it suspends *before* all events in history are processed, it fails.
-#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
+#[allow(dead_code, clippy::implicit_hasher, clippy::too_many_lines)]
 pub(crate) async fn run_workflow_canary(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
