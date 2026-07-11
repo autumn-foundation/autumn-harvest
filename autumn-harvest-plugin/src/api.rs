@@ -3161,11 +3161,22 @@ async fn create_gate_handler(
 
     match result {
         Ok(gate) => {
-            // Refresh the in-process cache immediately so this replica honours
-            // the gate without waiting for the background refresh cycle.
-            // Fail-closed if the follow-up load fails: the gate was persisted
-            // but we cannot read the updated list, so block all admissions on
-            // this replica rather than leaving it with a stale open snapshot.
+            // Write-through the just-persisted gate into the in-memory snapshot
+            // (issue #618, F-round16) BEFORE the full refresh, so this replica
+            // honours the new gate even if the follow-up load fails. The gate was
+            // persisted to the DB first (create_gate above), so the snapshot is now
+            // accurate for this change regardless of the refresh outcome. This
+            // matters most for the completion-trigger path (check_cached), which
+            // does NOT retry after a synthetic fail-closed block — a stale-open
+            // snapshot here would durably MISS the new gate.
+            api_state.gate_cache().apply_created(gate.clone());
+            // Reconcile any OTHER concurrent changes with a full refresh. On failure
+            // we do NOT arm fail-closed: the write-through delta above already made
+            // the snapshot accurate for our change, and the <=1s background refresh
+            // loop reconciles concurrent changes. Arming fail-closed would instead
+            // block ALL admissions on this replica (a self-healing over-block) until
+            // the next successful refresh, for no correctness benefit now that the
+            // delta is applied.
             match admission_gate_db::load_active_gates(&mut conn).await {
                 Ok(fresh) => {
                     let count = i64::try_from(fresh.len()).unwrap_or(0);
@@ -3180,9 +3191,10 @@ async fn create_gate_handler(
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "admission gate cache refresh failed after create; entering fail-closed mode"
+                        "admission gate cache full refresh failed after create; the \
+                         write-through delta keeps this replica's snapshot accurate for \
+                         the new gate, background refresh reconciles the rest"
                     );
-                    api_state.gate_cache().set_fail_closed();
                 }
             }
 
@@ -3256,9 +3268,20 @@ async fn lift_gate_handler(
     let id_str = id.to_string();
     match admission_gate_db::lift_gate(&mut conn, id, &actor).await {
         Ok(Some(_gate)) => {
-            // Refresh the in-process cache immediately. After a successful
-            // lift the gate is removed; a load failure leaves the replica
-            // fail-closed (blocking) rather than using the pre-lift snapshot.
+            // Write-through the lift into the in-memory snapshot (issue #618,
+            // F-round16) BEFORE the full refresh, so the just-lifted gate stops
+            // matching on this replica even if the follow-up load fails. The lift
+            // was persisted to the DB first (lift_gate above). This is what makes a
+            // lift durable for the completion-trigger path (check_cached): a
+            // stale-open snapshot here would keep dropping targets as
+            // admission_blocked against a gate the operator already lifted.
+            api_state.gate_cache().apply_lifted(id);
+            // Reconcile any OTHER concurrent changes with a full refresh. On failure
+            // we do NOT arm fail-closed: doing so would blanket-block ALL admissions
+            // on this replica via check()'s synthetic sentinel — re-blocking the very
+            // work the operator just unblocked — until the next successful refresh.
+            // The write-through delta already removed the lifted gate; the <=1s
+            // background refresh reconciles the rest.
             match admission_gate_db::load_active_gates(&mut conn).await {
                 Ok(fresh) => {
                     let count = i64::try_from(fresh.len()).unwrap_or(0);
@@ -3273,9 +3296,10 @@ async fn lift_gate_handler(
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "admission gate cache refresh failed after lift; entering fail-closed mode"
+                        "admission gate cache full refresh failed after lift; the \
+                         write-through delta already removed the lifted gate from this \
+                         replica's snapshot, background refresh reconciles the rest"
                     );
-                    api_state.gate_cache().set_fail_closed();
                 }
             }
 

@@ -372,6 +372,48 @@ impl AdmissionGateCache {
         }
     }
 
+    /// Write-through: insert (replacing any entry with the same id) `gate` into the
+    /// cached snapshot under the write lock, independent of any background refresh
+    /// (issue #618, F-round16).
+    ///
+    /// The management create handler persists the gate to the DB **first**, then
+    /// calls this so the in-memory snapshot reflects the just-persisted gate even if
+    /// the follow-up full [`load_active_gates`](db::load_active_gates) refresh fails.
+    /// Without this, a failed post-create refresh left the snapshot stale-open and a
+    /// completion-trigger start (which consults [`check_cached`](Self::check_cached)
+    /// and does **not** retry after a synthetic fail-closed block) would durably
+    /// MISS the new gate.
+    ///
+    /// Replacing by id is idempotent against a concurrent background refresh that may
+    /// have already picked the new gate up (the create persists to the DB before this
+    /// call, so the refresh cannot lose it). Does **not** touch the `initialized`
+    /// flag: applying a *known* delta means the snapshot is not blind, so the handler
+    /// no longer arms fail-closed on a post-mutation refresh failure.
+    pub fn apply_created(&self, gate: AdmissionGate) {
+        if let Ok(mut guard) = self.gates.write() {
+            let id = gate.id.0;
+            guard.retain(|g| g.id.0 != id);
+            guard.push(gate);
+        }
+    }
+
+    /// Write-through: remove any cached gate whose id equals `gate_id` from the
+    /// snapshot under the write lock, independent of any background refresh (issue
+    /// #618, F-round16).
+    ///
+    /// The management lift handler soft-deletes the gate in the DB **first**, then
+    /// calls this so a just-lifted gate stops matching on this replica even if the
+    /// follow-up full [`load_active_gates`](db::load_active_gates) refresh fails.
+    /// Without this, a failed post-lift refresh left the lifted gate in the snapshot
+    /// and a completion-trigger start would keep dropping targets as
+    /// `admission_blocked` against a gate the operator already lifted. No-op when the
+    /// id is absent (idempotent). Does **not** touch the `initialized` flag.
+    pub fn apply_lifted(&self, gate_id: Uuid) {
+        if let Ok(mut guard) = self.gates.write() {
+            guard.retain(|g| g.id.0 != gate_id);
+        }
+    }
+
     /// Acquire a read lock and call `check_admission` against the snapshot.
     ///
     /// Returns `(gate_id, reason, scope_kind)` when a gate matches, where
@@ -1149,6 +1191,109 @@ mod tests {
         // And an initialized-but-empty cache also matches nothing.
         let open = AdmissionGateCache::new();
         assert!(open.check_cached("wf", "q", 0, None).is_none());
+    }
+
+    #[test]
+    fn apply_created_makes_a_new_gate_matchable_even_under_fail_closed() {
+        // issue #618 (F-round16): write-through the just-persisted gate so a
+        // completion-trigger start (which consults check_cached and does NOT retry
+        // after a synthetic fail-closed block) never MISSES a just-created gate,
+        // even if the follow-up full refresh fails and the cache is fail-closed.
+        let cache = AdmissionGateCache::new();
+        // Simulate the pre-write-through state: an open/empty snapshot that a failed
+        // post-create refresh would leave stale.
+        cache.set_fail_closed();
+        // BEFORE the delta: the new gate is invisible — this is the bug the
+        // write-through closes (a stale-open snapshot misses the new gate).
+        assert!(
+            cache.check_cached("wf", "q", 0, None).is_none(),
+            "precondition: an un-written-through snapshot misses the new gate"
+        );
+
+        cache.apply_created(fleet_gate("new-incident"));
+
+        // AFTER the delta: check_cached matches the REAL gate (never the sentinel),
+        // regardless of the fail-closed flag.
+        let (real_id, reason, scope_kind) = cache
+            .check_cached("wf", "q", 0, None)
+            .expect("write-through gate matches under fail-closed");
+        assert_ne!(real_id, sentinel_gate_id());
+        assert_eq!(reason, "new-incident");
+        assert_eq!(scope_kind, "fleet");
+    }
+
+    #[test]
+    fn apply_lifted_stops_a_gate_matching_even_under_fail_closed() {
+        // issue #618 (F-round16): write-through the lift so a just-lifted gate stops
+        // blocking on this replica even if the follow-up refresh fails (fail-closed).
+        let g = fleet_gate("lift-me");
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![g]);
+        cache.set_fail_closed();
+        // BEFORE the delta: the stale snapshot still contains the lifted gate, so
+        // check_cached keeps matching it (the durable false-block bug).
+        assert!(
+            cache.check_cached("wf", "q", 0, None).is_some(),
+            "precondition: an un-written-through snapshot still honours the lifted gate"
+        );
+
+        cache.apply_lifted(gid);
+
+        assert!(
+            cache.check_cached("wf", "q", 0, None).is_none(),
+            "a lifted gate no longer matches via check_cached, even under fail-closed"
+        );
+    }
+
+    #[test]
+    fn apply_lifted_without_fail_closed_stops_check_blocking_the_lifted_target() {
+        // issue #618 (F-round16): the new handler applies the lift delta and does NOT
+        // arm fail-closed on a refresh failure. So check() (the API path) reads the
+        // delta-applied, still-initialized snapshot and does NOT synthetically block
+        // the target the operator just unblocked. (Contrast the old behavior: a
+        // set_fail_closed() here would make check() return the block-everything
+        // sentinel, re-blocking the just-lifted target until the next refresh.)
+        let g = fleet_gate("lift-me");
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![g]); // initialized, gate present
+        assert!(
+            cache.check("wf", "q", 0, None).is_some(),
+            "precondition: the gate blocks via check() before the lift"
+        );
+
+        // Handler's post-lift, refresh-failed path: apply the delta, DON'T fail-closed.
+        cache.apply_lifted(gid);
+
+        assert!(
+            cache.check("wf", "q", 0, None).is_none(),
+            "check() must not block a just-lifted target when the delta is written \
+             through and fail-closed is not armed"
+        );
+    }
+
+    #[test]
+    fn apply_created_is_idempotent_by_id() {
+        // A concurrent background refresh may already have picked up the persisted
+        // gate; applying the same gate again must not duplicate it.
+        let g = fleet_gate("dup");
+        let cache = AdmissionGateCache::new();
+        cache.apply_created(g.clone());
+        cache.apply_created(g);
+        assert_eq!(cache.active_count(), 1, "apply_created dedupes by id");
+    }
+
+    #[test]
+    fn apply_lifted_absent_id_is_a_noop() {
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![fleet_gate("keep")]);
+        cache.apply_lifted(Uuid::new_v4()); // unknown id
+        assert_eq!(
+            cache.active_count(),
+            1,
+            "lifting an absent id leaves the snapshot unchanged"
+        );
     }
 
     // ── issue #618: StartProducer + producer contract + global cache ──────────
