@@ -1214,6 +1214,57 @@ async fn stack_pending_local_activity_surfaces_last_failure() {
     );
 }
 
+/// A local activity whose retry budget is exhausted closes with a terminal
+/// `LocalActivityExhausted` event. If the workflow catches that failure and
+/// keeps running, `/stack` must NOT report the exhausted activity as pending
+/// (Codex review, PR #1022; issue #773). Before the fix the fold never
+/// consumed `LocalActivityExhausted`, so the entry stayed pending forever.
+#[tokio::test]
+async fn stack_exhausted_local_activity_is_not_pending() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_plain_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "stack-local-exhausted", json!({})).await;
+    let activity_id = ActivityExecId::new();
+    // Catch-and-continue: the local activity retried, exhausted its budget
+    // (terminal `LocalActivityExhausted`), and the workflow is still RUNNING.
+    append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "compute_checksum".to_string(),
+                input: json!({"blob": "abc"}),
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error: "checksum mismatch".to_string(),
+                attempt: 1,
+            },
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id,
+                error: "checksum mismatch".to_string(),
+                attempt: 2,
+            },
+        ],
+    )
+    .await;
+
+    let (status, stack) = get_json(&app, &format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK, "body: {stack}");
+    let pending = stack["pending_local_activities"]
+        .as_array()
+        .expect("pending_local_activities must be an array");
+    assert!(
+        pending.is_empty(),
+        "an exhausted (terminally failed) local activity must not be reported \
+         as pending: {stack}"
+    );
+}
+
 /// AC5: `GET /dead-letters` decodes the failed task's input (JSONB) and
 /// error (TEXT).
 #[tokio::test]

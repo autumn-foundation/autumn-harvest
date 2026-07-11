@@ -8828,6 +8828,7 @@ async fn get_workflow_stack(
             "LocalActivityScheduled",
             "LocalActivityCompleted",
             "LocalActivityFailed",
+            "LocalActivityExhausted",
         ]))
         .order(harvest_events::event_id.asc())
         .select((
@@ -8893,7 +8894,19 @@ async fn get_workflow_stack(
                             },
                         );
                     }
-                    ("LocalActivityCompleted", Some(activity_exec_id)) => {
+                    // Both `LocalActivityCompleted` (success) and
+                    // `LocalActivityExhausted` (terminal retry-budget failure,
+                    // issue #773) close the local activity, so remove the
+                    // pending entry for either. A *bare* `LocalActivityFailed`
+                    // (mid-retry, no following `LocalActivityExhausted`) falls
+                    // through and correctly stays pending. Without this, a
+                    // workflow that catches a terminal local-activity failure
+                    // and keeps running would report the exhausted activity as
+                    // pending forever (Codex review, PR #1022).
+                    (
+                        "LocalActivityCompleted" | "LocalActivityExhausted",
+                        Some(activity_exec_id),
+                    ) => {
                         acc.remove(&activity_exec_id);
                     }
                     _ => {}
