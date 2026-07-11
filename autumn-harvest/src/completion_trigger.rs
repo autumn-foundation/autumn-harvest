@@ -1172,7 +1172,32 @@ pub fn evaluate_triggers_for_execution<'a>(
                             .execute(conn)
                             .await
                             .map_err(crate::error::database_error)?;
-                    if let Some(m) = metrics {
+                    // Resolve the recorder: the caller's explicit param when
+                    // supplied (worker / timeout paths), else the process-global
+                    // recorder the plugin publishes at boot (issue #618, F-round5).
+                    // The cancel / terminate / parent-close-cascade paths in
+                    // `execution.rs` all call this with `metrics: None`, so without
+                    // the fallback a completion-trigger start blocked by a gate on
+                    // one of those terminal paths would be dropped-and-recorded but
+                    // NEVER counted — a hole in the "zero un-counted blocks" bar.
+                    let fallback_recorder = if metrics.is_none() {
+                        crate::admission_gate::global_admission_metrics()
+                    } else {
+                        None
+                    };
+                    // A tuple `match` (rather than `if let ... else`) so the
+                    // `&dyn MetricsRecorder` -> annotated `+ Send + Sync` coercion
+                    // still applies at the `Some(g.as_ref())` expression site (the
+                    // trait has both supertraits), matching how the worker passes
+                    // `registry.telemetry().metrics.as_ref()`.
+                    let effective_metrics: Option<
+                        &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+                    > = match (metrics, fallback_recorder.as_ref()) {
+                        (Some(m), _) => Some(m),
+                        (None, Some(g)) => Some(g.as_ref()),
+                        (None, None) => None,
+                    };
+                    if let Some(m) = effective_metrics {
                         // Only count the FIRST resolution of this (source, trigger)
                         // pair (issue #618, F4): cascade re-entry / multi-terminal-
                         // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)

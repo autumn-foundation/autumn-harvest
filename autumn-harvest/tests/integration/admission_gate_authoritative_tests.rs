@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, GateScope, set_global_admission_gate_cache,
+    set_global_admission_metrics,
 };
 use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
@@ -501,6 +502,107 @@ async fn completion_trigger_blocked_by_fleet_gate() {
             .await
             .expect("load source state");
     assert_eq!(src_state[0].outcome.as_deref(), Some("COMPLETED"));
+}
+
+/// Finding B (F-round5): a completion-trigger start blocked by a gate on a
+/// terminal path that passes `metrics: None` (cancel / terminate /
+/// parent-close-cascade in `execution.rs`) is STILL counted on
+/// `harvest.admission.blocked`, via the process-global recorder fallback the
+/// plugin publishes at boot. Without the fallback, `evaluate_triggers_for_execution`
+/// with `metrics: None` drops-and-records the block but never counts it — a hole
+/// in the "zero un-counted blocks" bar. Here the source is CANCELLED and the
+/// recorder is supplied ONLY via the global, never as the `metrics` param.
+#[tokio::test]
+async fn completion_trigger_block_counted_via_global_recorder_on_cancel_path() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    // A trigger that fires on Cancelled (the cancel/terminate terminal path).
+    let trigger_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers
+            (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping)
+         VALUES ($1, 'ag_source_wf', '[\"Cancelled\"]'::jsonb, 'ag_target_wf',
+                 '{\"type\":\"Passthrough\"}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert cancel trigger");
+
+    let source_exec_id = start_completed_source(&mut conn, "ag-src-cancel").await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'CANCELLED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("cancel source");
+
+    // Raise a Fleet gate.
+    let cache = fleet_cache("cancel-incident-618");
+    set_global_admission_gate_cache(Some(Arc::clone(&cache)));
+
+    // Publish the recorder ONLY via the global (never as the `metrics` param) —
+    // exactly how the cancel/terminate paths reach `evaluate_triggers_for_execution`.
+    let recorder = Arc::new(CapturingMetrics::default());
+    set_global_admission_metrics(Some(
+        Arc::clone(&recorder) as Arc<dyn autumn_harvest::telemetry::MetricsRecorder>
+    ));
+
+    let deferred = evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Cancelled,
+        None, // <-- the cancel/terminate path passes None
+    )
+    .await
+    .expect("evaluate must not error (block is a clean skip)");
+
+    // Clean up global state before assertions can panic.
+    set_global_admission_gate_cache(None);
+    set_global_admission_metrics(None);
+
+    assert!(
+        deferred.is_empty(),
+        "a blocked start produces no deferred row"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "the completion-trigger target must NOT start under a Fleet gate"
+    );
+    // The block was counted EXACTLY ONCE via the global recorder fallback.
+    let blocked = recorder.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "a block on the metrics:None cancel path must be counted via the global recorder"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(blocked[0].1, "cancel-incident-618");
+    // Exactly-once resolved-skip fires row.
+    let fires: Vec<OutcomeRow> = diesel::sql_query(
+        "SELECT outcome FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("load fires");
+    assert_eq!(fires.len(), 1, "one fires row recorded");
+    assert_eq!(fires[0].outcome.as_deref(), Some("admission_blocked"));
+    // Source terminal not rolled back.
+    let src_state: Vec<OutcomeRow> =
+        diesel::sql_query("SELECT state AS outcome FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+            .load(&mut conn)
+            .await
+            .expect("load source state");
+    assert_eq!(src_state[0].outcome.as_deref(), Some("CANCELLED"));
 }
 
 /// AC (backward compat): with no gate cache installed, the completion trigger

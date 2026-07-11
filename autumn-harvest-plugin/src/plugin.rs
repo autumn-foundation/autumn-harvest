@@ -823,6 +823,12 @@ async fn start_harvest_runtime(
     autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(api_state.gate_cache()));
 
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
+    // issue #618 (F-round5): publish the SAME metrics recorder the workers/scanners
+    // use so the completion-trigger block path counts a block even when its caller
+    // passes `metrics: None` (the cancel / terminate / parent-close-cascade paths).
+    autumn_harvest::admission_gate::set_global_admission_metrics(Some(std::sync::Arc::clone(
+        &runner.api_runtime().registry().telemetry().metrics,
+    )));
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -1144,13 +1150,25 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     {
         autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
     }
-
     let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
 
     let Some(runtime) = runtime else {
         api_state.clear();
         return;
     };
+
+    // Clear the global admission metrics recorder (issue #618, F-round5), but only
+    // if the installed recorder is THIS runtime's — ptr-eq guarded like the gate
+    // cache above so a stopping plugin never clobbers a concurrently-live sibling's
+    // recorder (which would silently uncount that sibling's blocks).
+    if let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
+        && Arc::ptr_eq(
+            &installed,
+            &runtime.runner.api_runtime().registry().telemetry().metrics,
+        )
+    {
+        autumn_harvest::admission_gate::set_global_admission_metrics(None);
+    }
 
     if let Some(gate_refresh) = runtime.gate_refresh {
         gate_refresh.shutdown.cancel();
@@ -1252,10 +1270,19 @@ fn apply_migrations_for_profile(
 /// The outbound `WebhookDelegateExt` starts the `webhook_delivery` workflow on
 /// the `webhooks` queue; those are the fixed match inputs (kept here, in the
 /// tested helper, so a regression is caught). Returns `Some((reason, scope_kind))`
-/// when a cached gate matches — the caller blocks the start and records an
-/// admission block — or `None` when no gate matches (proceed). `check_cached`
-/// honours the last-known snapshot even under a transient fail-closed blip and
-/// never returns the fail-closed sentinel.
+/// when a gate matches — the caller blocks the start and records an admission
+/// block — or `None` (proceed).
+///
+/// Uses the sentinel-aware `check()` (NOT `check_cached()`), so it **fails
+/// closed**: while the gate cache is uninitialized or reverted to fail-closed (a
+/// boot-time gate-load failure or a refresh outage) `check()` returns the
+/// synthetic block and this producer blocks — consistent with the HTTP start
+/// path. This is correct here (and differs from the completion-trigger path,
+/// which uses `check_cached()`) because a `webhook_delivery` start is a FRESH,
+/// retryable workflow start, equivalent to an HTTP API start — the
+/// permanent-drop concern that justified `check_cached()` for completion triggers
+/// (in-flight continuation of already-committed work that cannot retry) does not
+/// apply, so failing closed cannot permanently drop anything.
 #[cfg(feature = "webhooks")]
 fn webhook_delivery_admission_block(
     cache: &autumn_harvest::admission_gate::AdmissionGateCache,
@@ -1263,7 +1290,7 @@ fn webhook_delivery_admission_block(
     owner: Option<&str>,
 ) -> Option<(String, &'static str)> {
     cache
-        .check_cached("webhook_delivery", "webhooks", shard.as_i32(), owner)
+        .check("webhook_delivery", "webhooks", shard.as_i32(), owner)
         .map(|(_id, reason, scope_kind)| (reason, scope_kind))
 }
 
@@ -1341,11 +1368,43 @@ mod webhook_admission_tests {
     }
 
     #[test]
-    fn empty_cache_lets_the_outbound_start_proceed() {
+    fn initialized_empty_cache_lets_the_outbound_start_proceed() {
+        // `AdmissionGateCache::new()` is initialized (fail-open) with no gates.
         let cache = AdmissionGateCache::new();
         assert!(
             super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_none(),
-            "no gates → the outbound webhook_delivery start proceeds"
+            "an initialized cache with no gates → the outbound webhook_delivery start proceeds"
+        );
+    }
+
+    #[test]
+    fn uninitialized_cache_fails_closed_and_blocks() {
+        // A fail-closed (uninitialized) cache — e.g. a boot-time gate-load
+        // failure — must BLOCK a fresh webhook_delivery start, consistent with
+        // the HTTP start path (issue #618, Finding A). The synthetic sentinel
+        // block carries the "fleet" scope kind.
+        let cache = AdmissionGateCache::new_fail_closed();
+        assert!(
+            matches!(
+                super::webhook_delivery_admission_block(&cache, ShardId::new(0), None),
+                Some((_, "fleet"))
+            ),
+            "an uninitialized (fail-closed) cache must block the outbound webhook_delivery start"
+        );
+    }
+
+    #[test]
+    fn set_fail_closed_reverts_to_blocking() {
+        // Even a previously-populated cache blocks once reverted to fail-closed
+        // (a refresh outage after boot).
+        let cache = cache_with(GateScope::WorkflowName("unrelated_wf".into()));
+        // Before: the unrelated gate does not match → proceed.
+        assert!(super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_none());
+        cache.set_fail_closed();
+        // After: fail-closed → block regardless of the (unrelated) cached gate.
+        assert!(
+            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
+            "a cache reverted to fail-closed must block the outbound webhook_delivery start"
         );
     }
 }

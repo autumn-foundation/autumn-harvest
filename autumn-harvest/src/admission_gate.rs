@@ -695,6 +695,44 @@ pub fn global_admission_gate_cache() -> Option<Arc<AdmissionGateCache>> {
         .clone()
 }
 
+/// Process-global metrics recorder for admission-gate block counting (issue #618).
+///
+/// Published by the plugin at boot alongside [`GLOBAL_ADMISSION_GATE_CACHE`]
+/// (the same `Arc<dyn MetricsRecorder>` the workers/scanners use). The
+/// completion-trigger block path (`evaluate_triggers_for_execution`) falls back
+/// to this recorder when its caller passes `metrics: None` — which the
+/// cancel / terminate / parent-close-cascade paths in `execution.rs` all do — so
+/// a completion-trigger start blocked by an active gate is counted on
+/// `harvest.admission.blocked` regardless of how the source reached terminal.
+/// `None` (standalone integrations, or before boot) means the fallback is
+/// skipped and behaviour is byte-identical to a caller-supplied `None`.
+pub static GLOBAL_ADMISSION_METRICS: std::sync::RwLock<
+    Option<Arc<dyn crate::telemetry::MetricsRecorder>>,
+> = std::sync::RwLock::new(None);
+
+/// Install (or clear, with `None`) the process-global admission metrics recorder.
+///
+/// Called by the plugin at boot with the shared recorder `Arc`, and cleared with
+/// `None` in `stop_harvest_runtime`. Recovers a poisoned lock (`into_inner`)
+/// rather than silently no-op'ing. Mirrors [`set_global_admission_gate_cache`].
+pub fn set_global_admission_metrics(recorder: Option<Arc<dyn crate::telemetry::MetricsRecorder>>) {
+    let mut guard = GLOBAL_ADMISSION_METRICS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = recorder;
+}
+
+/// Read the process-global admission metrics recorder, if installed.
+///
+/// Recovers a poisoned lock (`into_inner`) rather than failing to `None`.
+#[must_use]
+pub fn global_admission_metrics() -> Option<Arc<dyn crate::telemetry::MetricsRecorder>> {
+    GLOBAL_ADMISSION_METRICS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
 
 #[cfg(feature = "db")]
