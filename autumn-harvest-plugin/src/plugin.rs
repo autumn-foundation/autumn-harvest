@@ -1068,12 +1068,13 @@ async fn start_harvest_runtime(
                         &mut conn,
                         start_params,
                         metrics_ref,
-                        // Decide the gate on the LOCKED existence state: a live run
-                        // present (locked) → idempotent attach → skip the gate; else a
-                        // genuinely fresh admission → apply the gate.
-                        move |locked_live| {
+                        // Decide the gate on whether `start_or_load` will CREATE a new
+                        // execution (issue #618, F-round18): an idempotent attach/no-op
+                        // (`will_create == false`) admits nothing → skip the gate; a
+                        // genuinely fresh admission (`will_create == true`) → apply it.
+                        move |will_create| {
                             webhook_delivery_gate_decision(
-                                locked_live,
+                                will_create,
                                 autumn_harvest::admission_gate::global_admission_gate_cache()
                                     .as_deref(),
                                 shard,
@@ -1429,29 +1430,31 @@ fn webhook_delivery_admission_block(
 }
 
 /// Admission decision for an outbound `webhook_delivery` start (issue #618,
-/// Finding A round 9).
+/// Finding A round 9 / round 12 / round 18).
 ///
-/// `already_exists` is `true` when a `webhook_delivery` execution for this
-/// webhook log's deterministic `(workflow_name, workflow_id)` key already exists
-/// (per `try_load_by_key`, which excludes only the sealed `CONTINUED_AS_NEW` /
-/// `TERMINATED` states that would force a fresh start). In that case the delivery
-/// attempt is an idempotent RETRY — `start_or_load` will LOAD the existing run,
-/// not admit a fresh one — so the admission gate does NOT apply (mirrors the #808
-/// HTTP path's bypass for a committed replay): returns `None`, no block, no count.
+/// `will_create` is the value [`autumn_harvest::execution::gate_checked_start_or_load`]
+/// derives from the LOCKED prior-run state + reuse policy via
+/// [`autumn_harvest::execution::start_will_create_new_execution`]: `true` when
+/// `start_or_load` will CREATE a new execution, `false` for an idempotent ATTACH
+/// (`AllowDuplicate` — the webhook's own policy — to a live OR terminal prior) or a
+/// no-op. A `webhook_delivery` retry that attaches to (or reloads) an existing run
+/// admits no fresh work, so the admission gate does NOT apply (`None`, no block, no
+/// count) — this preserves the round-12 idempotent-retry behaviour and mirrors the
+/// #808 HTTP path's bypass for a committed replay.
 ///
-/// Only when this is a genuinely FRESH delivery (`already_exists == false`) is the
-/// gate consulted via [`webhook_delivery_admission_block`]: a matching gate → block
-/// (`Some`), a fail-closed (uninitialized) cache → block via the synthetic
+/// Only when a genuinely FRESH execution WILL be created (`will_create == true`) is
+/// the gate consulted via [`webhook_delivery_admission_block`]: a matching gate →
+/// block (`Some`), a fail-closed (uninitialized) cache → block via the synthetic
 /// sentinel (round 5), an initialized cache with no matching gate → proceed
 /// (`None`). An absent cache (`None`) never blocks.
 #[cfg(feature = "webhooks")]
 fn webhook_delivery_gate_decision(
-    already_exists: bool,
+    will_create: bool,
     cache: Option<&autumn_harvest::admission_gate::AdmissionGateCache>,
     shard: autumn_harvest::types::ShardId,
     owner: Option<&str>,
 ) -> Option<(String, &'static str)> {
-    if already_exists {
+    if !will_create {
         return None;
     }
     cache.and_then(|c| webhook_delivery_admission_block(c, shard, owner))
@@ -1571,59 +1574,62 @@ mod webhook_admission_tests {
         );
     }
 
-    // ── webhook_delivery_gate_decision: idempotent-retry bypass (Finding A r9) ──
+    // ── webhook_delivery_gate_decision: attach/no-op bypass (Finding A r9/r18) ──
+    // The bool argument is `will_create` (issue #618, F-round18): `false` = an
+    // idempotent attach / no-op (skip the gate), `true` = a genuinely fresh create
+    // (apply the gate).
 
     #[test]
-    fn existing_execution_skips_the_gate_even_under_a_fleet_gate() {
-        // (a) An idempotent RETRY (the webhook_delivery execution already exists):
-        // start_or_load will LOAD it, not admit a fresh run, so an active Fleet gate
-        // must NOT block it and must NOT count a block.
+    fn attach_skips_the_gate_even_under_a_fleet_gate() {
+        // (a) An idempotent RETRY that ATTACHES (`will_create == false`):
+        // start_or_load will LOAD/attach, not admit a fresh run, so an active Fleet
+        // gate must NOT block it and must NOT count a block.
         let cache = cache_with(GateScope::Fleet);
         assert!(
-            super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None)
+            super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None)
                 .is_none(),
-            "an already-existing webhook_delivery is an idempotent retry — the gate is skipped"
+            "an attach/no-op webhook_delivery is not a fresh admission — the gate is skipped"
         );
     }
 
     #[test]
-    fn fresh_delivery_is_blocked_under_a_matching_gate() {
-        // (b) A genuinely FRESH delivery (no existing execution) under a matching
-        // gate is blocked (and the caller counts the block).
+    fn fresh_create_is_blocked_under_a_matching_gate() {
+        // (b) A genuinely FRESH create (`will_create == true`) under a matching gate
+        // is blocked (and the caller counts the block).
         let cache = cache_with(GateScope::Fleet);
         assert!(
             matches!(
-                super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None),
+                super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None),
                 Some((_, "fleet"))
             ),
-            "a fresh webhook_delivery start under a Fleet gate must be blocked"
+            "a fresh webhook_delivery create under a Fleet gate must be blocked"
         );
     }
 
     #[test]
-    fn existing_execution_skips_the_gate_even_when_fail_closed() {
-        // A retry is never a fresh admission, so it proceeds even against a
+    fn attach_skips_the_gate_even_when_fail_closed() {
+        // An attach is never a fresh admission, so it proceeds even against a
         // fail-closed cache (the round-5 fresh-start fail-closed rule does not
-        // apply to an idempotent load).
+        // apply to an idempotent load/attach).
         let cache = AdmissionGateCache::new_fail_closed();
         assert!(
-            super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None)
+            super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None)
                 .is_none(),
-            "an idempotent retry proceeds even under a fail-closed cache"
+            "an attach/no-op proceeds even under a fail-closed cache"
         );
     }
 
     #[test]
-    fn fresh_delivery_fails_closed_on_an_uninitialized_cache() {
-        // Round-5 behavior intact: a FRESH start against a fail-closed (uninitialized)
-        // cache is blocked via the synthetic sentinel.
+    fn fresh_create_fails_closed_on_an_uninitialized_cache() {
+        // Round-5 behavior intact: a FRESH create against a fail-closed
+        // (uninitialized) cache is blocked via the synthetic sentinel.
         let cache = AdmissionGateCache::new_fail_closed();
         assert!(
             matches!(
-                super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None),
+                super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None),
                 Some((_, "fleet"))
             ),
-            "a fresh webhook_delivery start against a fail-closed cache must block (round 5)"
+            "a fresh webhook_delivery create against a fail-closed cache must block (round 5)"
         );
     }
 

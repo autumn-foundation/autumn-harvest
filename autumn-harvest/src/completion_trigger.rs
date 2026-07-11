@@ -891,8 +891,14 @@ async fn relay_gate_checked_start(
     // never the sentinel) — NOT `check()` — because the relay materializes
     // pre-committed in-flight-continuation work, so the same no-permanent-drop
     // rationale as the completion-trigger inline path applies.
-    let gate = move |locked_live: bool| -> Option<(String, &'static str)> {
-        if locked_live {
+    // `will_create` (issue #618, F-round18): apply the gate iff `_collect` will
+    // CREATE a new execution; skip it for an idempotent attach/no-op. The relay's
+    // own any-state `execution_exists_by_key` check above already short-circuits a
+    // stale outbox row whose target exists in ANY state to DELIVERED, so by the time
+    // control reaches here NO target exists → `will_create` is trivially `true` and
+    // the gate always applies (a fresh cross-shard delivery is a fresh admission).
+    let gate = move |will_create: bool| -> Option<(String, &'static str)> {
+        if !will_create {
             return None;
         }
         crate::admission_gate::global_admission_gate_cache().and_then(|cache| {

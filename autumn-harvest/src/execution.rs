@@ -956,30 +956,166 @@ pub enum GateCheckedStart {
     },
 }
 
+/// Will `start_or_load_workflow_execution_collect` CREATE a new execution (a new
+/// admission), given the locked prior run's state and the reuse policy? (Issue
+/// #618, F-round18.)
+///
+/// Pure mirror of `start_or_load_workflow_execution_collect`'s attach-vs-create
+/// decision — used by [`gate_checked_start_or_load`] to apply the admission gate
+/// exactly when a NEW execution is created, and skip it only for a genuine
+/// idempotent ATTACH to an existing run.
+///
+/// `prior_state` is the state of the `(workflow_name, workflow_id)` row that
+/// occupies the active-uniqueness index — i.e. the value returned by
+/// [`try_load_active_execution_for_update`] /
+/// [`load_workflow_execution_by_key_for_update`], which BOTH exclude the sealed
+/// `CONTINUED_AS_NEW`/`TERMINATED` states. So `None` means "no non-sealed prior"
+/// (no prior at all, or only a sealed one) — the `INSERT` succeeds and a fresh
+/// execution is created. `Some(state)` means the `INSERT` is a no-op and the
+/// reuse policy decides attach-vs-replace.
+///
+/// The matrix mirrors `_collect` exactly (verified against the code, not the
+/// `SignalWithStart` matrix, which escalates terminal-prior attaches to fresh
+/// starts and is NOT what `_collect` — the path this primitive calls — does):
+///
+/// - `None` (no non-sealed prior) → CREATE.
+/// - `AllowDuplicate` + any non-sealed prior → ATTACH (`from_row(existing, false)`,
+///   unconditional — including a terminal `COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`
+///   prior; no new admission).
+/// - `RejectDuplicate` + any non-sealed prior → `Err(AlreadyExists)`: no start at
+///   all, so no admission — treated as "no create" (the gate is irrelevant since
+///   nothing starts).
+/// - `AllowDuplicateFailedOnly` + prior `FAILED`/`CANCELLED` → CREATE
+///   (`replace_execution`); any other non-sealed state → ATTACH.
+/// - `TerminateIfRunning` + any non-sealed prior → CREATE (`replace_execution`,
+///   always; the live-prior pre-check cancels first, then it replaces).
+#[must_use]
+pub fn start_will_create_new_execution(
+    prior_state: Option<&str>,
+    reuse_policy: WorkflowIdReusePolicy,
+) -> bool {
+    // `None` = no non-sealed prior occupies the uniqueness slot → the INSERT
+    // succeeds → a fresh execution is created (covers "no prior" and "sealed prior").
+    prior_state.is_none_or(|state| match reuse_policy {
+        // AllowDuplicate ATTACHES to the existing run (any non-sealed state);
+        // RejectDuplicate errors AlreadyExists — neither creates a new execution.
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::RejectDuplicate => false,
+        // Replace only a FAILED/CANCELLED prior; otherwise attach.
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly => matches!(state, "FAILED" | "CANCELLED"),
+        // Always replaces (cancel-if-live, then replace) → fresh create.
+        WorkflowIdReusePolicy::TerminateIfRunning => true,
+    })
+}
+
+#[cfg(test)]
+mod start_will_create_tests {
+    use super::start_will_create_new_execution as will_create;
+    use crate::types::WorkflowIdReusePolicy::{
+        AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
+    };
+
+    // The four non-sealed terminal states + the three non-sealed active states that
+    // can occupy the uniqueness index (CONTINUED_AS_NEW/TERMINATED are excluded by
+    // the index, so they surface as `None` here).
+    const TERMINAL: [&str; 4] = ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
+    const ACTIVE: [&str; 3] = ["RUNNING", "SUSPENDED", "PAUSED"];
+
+    #[test]
+    fn no_prior_always_creates() {
+        for policy in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            assert!(
+                will_create(None, policy),
+                "no non-sealed prior → INSERT succeeds → CREATE ({policy:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_duplicate_always_attaches_to_a_non_sealed_prior() {
+        // AllowDuplicate returns the existing run unconditionally (created=false) —
+        // for BOTH live and terminal priors. It is NOT the SignalWithStart matrix
+        // (which escalates a terminal-prior attach to a fresh start); this is the
+        // standalone start_or_load path the primitive actually calls.
+        for state in ACTIVE.iter().chain(TERMINAL.iter()) {
+            assert!(
+                !will_create(Some(state), AllowDuplicate),
+                "AllowDuplicate attaches (no create) for prior state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_duplicate_never_creates_when_a_prior_exists() {
+        // Err(AlreadyExists): nothing starts, so nothing is admitted.
+        for state in ACTIVE.iter().chain(TERMINAL.iter()) {
+            assert!(
+                !will_create(Some(state), RejectDuplicate),
+                "RejectDuplicate errors (no create) for prior state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_duplicate_failed_only_replaces_only_failed_or_cancelled() {
+        assert!(will_create(Some("FAILED"), AllowDuplicateFailedOnly));
+        assert!(will_create(Some("CANCELLED"), AllowDuplicateFailedOnly));
+        // Every other non-sealed state attaches (no create).
+        for state in ["RUNNING", "SUSPENDED", "PAUSED", "COMPLETED", "TIMED_OUT"] {
+            assert!(
+                !will_create(Some(state), AllowDuplicateFailedOnly),
+                "AllowDuplicateFailedOnly attaches (no create) for prior state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminate_if_running_always_replaces_a_non_sealed_prior() {
+        for state in ACTIVE.iter().chain(TERMINAL.iter()) {
+            assert!(
+                will_create(Some(state), TerminateIfRunning),
+                "TerminateIfRunning replaces (create) for prior state {state}"
+            );
+        }
+    }
+}
+
 /// Start-or-attach a workflow with an admission-gate check made consistent with
-/// `start_or_load`'s own create-vs-attach decision (issue #618, F-round12).
+/// `start_or_load`'s own create-vs-attach decision (issue #618, F-round12/F-round18).
 ///
 /// Closes the TOCTOU where an existing run seals between an unlocked existence
 /// check and the start, letting a fresh replacement slip an active gate uncounted.
 ///
 /// Opens a transaction on `conn` and takes a `FOR UPDATE` lock on the existing
-/// active `(workflow_name, workflow_id)` run — if one exists — via
+/// non-sealed `(workflow_name, workflow_id)` run — if one exists — via
 /// [`try_load_active_execution_for_update`] (which, like
 /// [`load_workflow_execution_by_key_for_update`] that `_collect` itself uses,
-/// excludes the sealed `CONTINUED_AS_NEW`/`TERMINATED` states). Whether such a
-/// LOCKED live run exists is passed to `gate`, which returns
-/// `Some((reason, scope_kind))` to BLOCK the start (a genuinely fresh admission a
-/// gate matches) or `None` to proceed. When proceeding,
-/// [`start_or_load_workflow_execution_collect`] runs in the SAME transaction
-/// (`in_outer_transaction = true`) so its create/attach decision observes the
-/// identical locked state: a live run cannot seal under the held lock (so it is
-/// attached, not replaced), and a sealed/absent run cannot gain a live row under
-/// the lock (so a fresh create is correctly gated). Deferred trigger starts,
-/// unfinished-handler checks, and cancellation metrics are dispatched after the
-/// transaction commits, mirroring [`start_or_load_workflow_execution_idempotent`].
+/// excludes the sealed `CONTINUED_AS_NEW`/`TERMINATED` states), and reads its
+/// STATE under that lock. That locked prior state + the reuse policy are fed to
+/// [`start_will_create_new_execution`] to decide whether `_collect` will CREATE a
+/// new execution; that boolean is passed to `gate`, which returns
+/// `Some((reason, scope_kind))` to BLOCK (a genuinely fresh admission a gate
+/// matches) or `None` to proceed. The gate is applied **iff a new execution will
+/// be created** — an idempotent ATTACH to an existing run (e.g. `AllowDuplicate`
+/// to a live or terminal prior) admits no new work and is never gated (this is
+/// what preserves the round-12 webhook idempotent-retry behaviour), while a
+/// REPLACEMENT (`AllowDuplicateFailedOnly` over a FAILED/CANCELLED prior,
+/// `TerminateIfRunning` over any non-sealed prior) is a fresh admission and IS
+/// gated. When proceeding, [`start_or_load_workflow_execution_collect`] runs in
+/// the SAME transaction (`in_outer_transaction = true`) so its create/attach
+/// decision observes the identical locked state the gate decision used. Deferred
+/// trigger starts, unfinished-handler checks, and cancellation metrics are
+/// dispatched after the transaction commits, mirroring
+/// [`start_or_load_workflow_execution_idempotent`].
 ///
 /// `gate` is invoked exactly once, synchronously, inside the transaction; it must
-/// not itself touch the database.
+/// not itself touch the database. Its `bool` argument is `will_create` — `true`
+/// when `_collect` will create a new execution (apply the gate), `false` for an
+/// attach / no-op (skip the gate).
 ///
 /// # Errors
 /// Propagates database / queue / event-store failures (rolling the transaction
@@ -1004,14 +1140,23 @@ pub async fn gate_checked_start_or_load(
             let gate = gate;
             let workflow_id = workflow_id;
             async move {
-                // Lock the existing active run (if any) so it cannot seal between
-                // this check and the start below — the two decisions now share one
-                // stable, locked state.
-                let locked_live =
-                    try_load_active_execution_for_update(conn, workflow_name, &workflow_id)
-                        .await?
-                        .is_some();
-                if let Some((reason, scope_kind)) = gate(locked_live) {
+                // Lock the existing non-sealed run (if any) so it cannot seal or
+                // change state between this check and the start below — the gate
+                // decision and `_collect`'s create/attach decision share one stable,
+                // locked state. Read its STATE (not just existence): the gate must be
+                // applied exactly when `_collect` will CREATE a new execution (issue
+                // #618, F-round18) — a REPLACEMENT (AllowDuplicateFailedOnly over a
+                // FAILED/CANCELLED prior, TerminateIfRunning over any non-sealed
+                // prior) is a fresh admission and must be gated, whereas an idempotent
+                // ATTACH (AllowDuplicate to a live/terminal prior) admits nothing and
+                // must not be.
+                let prior =
+                    try_load_active_execution_for_update(conn, workflow_name, &workflow_id).await?;
+                let will_create = start_will_create_new_execution(
+                    prior.as_ref().map(|e| e.state.as_str()),
+                    request.reuse_policy,
+                );
+                if let Some((reason, scope_kind)) = gate(will_create) {
                     return Ok((
                         GateCheckedStart::Blocked { reason, scope_kind },
                         Vec::new(),
