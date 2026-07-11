@@ -833,7 +833,21 @@ impl DeferredTriggerStart {
             .await;
             match start_res {
                 Ok(_) => {
-                    // Delete task from outbox on successful start
+                    // Delete task from outbox on successful start, and count the
+                    // IMMEDIATE-relay bypass here (issue #618, F-round6). The
+                    // immediate `spawn()` is the COMMON successful cross-shard
+                    // path — counting only in the scanner
+                    // (`enforce_completion_triggers_outbox`) left it uncounted,
+                    // breaking the "zero un-counted bypass" contract when a gate
+                    // is raised after the source commit but before this relay.
+                    // Exactly-once: the count is gated on the delete actually
+                    // removing the row (`Ok(n) if n >= 1`), so the scanner can
+                    // never re-process and re-count the same relay. If the start
+                    // failed (Err arm) or the delete did not remove the row, this
+                    // path does NOT count — the row persists and the scanner
+                    // counts it once instead. Uses the process-global recorder
+                    // (spawn has no explicit metrics param), mirroring the
+                    // scanner's `record_admission_bypassed(CompletionTriggerOutbox)`.
                     if let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
                         .read()
                         .ok()
@@ -843,7 +857,7 @@ impl DeferredTriggerStart {
                     {
                         use diesel::prelude::*;
                         use diesel_async::RunQueryDsl;
-                        let _ =
+                        let deleted =
                             diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
                                 .filter(
                                     crate::schema::harvest_completion_trigger_outbox::dsl::id
@@ -851,6 +865,14 @@ impl DeferredTriggerStart {
                                 )
                                 .execute(&mut source_conn)
                                 .await;
+                        if matches!(deleted, Ok(n) if n >= 1)
+                            && let Some(m) = crate::admission_gate::global_admission_metrics()
+                        {
+                            m.record_admission_bypassed(
+                                crate::admission_gate::StartProducer::CompletionTriggerOutbox
+                                    .as_str(),
+                            );
+                        }
                     }
                 }
                 Err(e) => {

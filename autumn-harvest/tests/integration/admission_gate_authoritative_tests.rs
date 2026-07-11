@@ -1303,3 +1303,189 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
         "the fallback returns the shard-independent default queue"
     );
 }
+
+/// Finding (F-round6): the IMMEDIATE cross-shard completion-trigger relay via
+/// `DeferredTriggerStart::spawn()` — the common successful path — must count the
+/// `completion_trigger_outbox` bypass, not just the later scanner. Round-1 added
+/// the counter only in `enforce_completion_triggers_outbox`, so a gate raised
+/// after the source commit but before the immediate relay left the exempt start
+/// UNCOUNTED. The count is emitted via the process-global recorder (spawn has no
+/// metrics param), gated on the outbox-row delete actually removing the row, so
+/// the scanner can never re-process and re-count the same relay (exactly-once).
+///
+/// Genuine two-database multi-shard test: source shard 0 owns the outbox row,
+/// target shard 1 receives the start. Runs against a real cluster via two fresh
+/// full-schema databases; `spawn()` is fire-and-forget, so we poll for the count.
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
+    use diesel_async::SimpleAsyncConnection;
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base_url, _c) = setup_db().await;
+
+    // source shard 0 (owns the outbox row), target shard 1 (receives the start).
+    let s0_name = format!("ag618_src_{}", Uuid::new_v4().simple());
+    let s1_name = format!("ag618_tgt_{}", Uuid::new_v4().simple());
+    {
+        let base_pool = build_pool(&base_url);
+        let mut admin = base_pool.get().await.unwrap();
+        for name in [&s0_name, &s1_name] {
+            diesel::sql_query(format!("CREATE DATABASE {name}"))
+                .execute(&mut admin)
+                .await
+                .expect("create shard db");
+        }
+    }
+    let s0_url = swap_db_name(&base_url, &s0_name);
+    let s1_url = swap_db_name(&base_url, &s1_name);
+    for u in [&s0_url, &s1_url] {
+        let p = build_pool(u);
+        let mut c = p.get().await.unwrap();
+        c.batch_execute(INIT_SQL)
+            .await
+            .expect("migrate fresh shard db");
+    }
+
+    let src_pool = build_pool(&s0_url);
+    let tgt_pool = build_pool(&s1_url);
+    install_global_router(ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    ));
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), src_pool.clone());
+    pools.insert(ShardId::new(1), tgt_pool.clone());
+    let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // Insert the outbox row on the SOURCE shard; capture its id.
+    let outbox_id = Uuid::new_v4();
+    {
+        let mut src_conn = src_pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_completion_trigger_outbox
+                (id, source_exec_id, trigger_id, target_shard, target_workflow_name,
+                 target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes)
+             VALUES ($1, $2, $3, 1, 'ag_target_wf', 'ct-immediate-relay', '{}'::jsonb,
+                     'default', '0'::jsonb, 1048576)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+        .bind::<diesel::sql_types::Uuid, _>(ExecutionId::new_for_shard(ShardId::new(0)).as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .execute(&mut src_conn)
+        .await
+        .expect("insert outbox row");
+    }
+
+    // Publish the recorder via the global (spawn resolves it there).
+    let recorder = Arc::new(CapturingMetrics::default());
+    set_global_admission_metrics(Some(
+        Arc::clone(&recorder) as Arc<dyn autumn_harvest::telemetry::MetricsRecorder>
+    ));
+
+    // Fire the IMMEDIATE relay (fire-and-forget).
+    let deferred = autumn_harvest::completion_trigger::DeferredTriggerStart {
+        outbox_id,
+        source_shard: ShardId::new(0),
+        target_shard: ShardId::new(1),
+        target_workflow_name: "ag_target_wf".to_string(),
+        target_workflow_id: "ct-immediate-relay".to_string(),
+        target_input: json!({}),
+        queue_name: Some("default".to_string()),
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 1_048_576,
+        trigger_name: "ct_immediate".to_string(),
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla: None,
+        retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+    };
+    deferred.spawn();
+
+    // Poll for the spawned task to finish (count is gated on the delete, so a
+    // non-empty bypassed list means the start + delete + count all completed).
+    let mut settled = false;
+    for _ in 0..200 {
+        if !recorder.bypassed().is_empty() {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Now run the SCANNER over the same source shard: the row was deleted by the
+    // immediate relay, so it processes nothing and MUST NOT re-count.
+    let scanner_metrics: &(dyn MetricsRecorder + Send + Sync) = &*recorder;
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut src_pool.get().await.unwrap(),
+        scanner_metrics,
+        &Some(sharded.clone()),
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+
+    // Verify the target started and the outbox row is gone (on the source).
+    let target_count: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = 'ag_target_wf'",
+    )
+    .get_result::<CountRow>(&mut tgt_pool.get().await.unwrap())
+    .await
+    .expect("count target")
+    .n;
+    let outbox_remaining: i64 =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_outbox")
+            .get_result::<CountRow>(&mut src_pool.get().await.unwrap())
+            .await
+            .expect("count outbox")
+            .n;
+
+    // Cleanup globals + drop the per-shard databases.
+    set_global_admission_metrics(None);
+    install_global_router(ShardRouter::default());
+    let _ = ShardedDbPool::single(build_pool(&base_url));
+    drop(sharded);
+    drop(src_pool);
+    drop(tgt_pool);
+    {
+        let base_pool = build_pool(&base_url);
+        if let Ok(mut admin) = base_pool.get().await {
+            for name in [&s0_name, &s1_name] {
+                let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&mut admin)
+                    .await;
+            }
+        }
+    }
+
+    assert!(
+        settled,
+        "the immediate spawn relay did not complete within the poll window"
+    );
+    assert_eq!(
+        target_count, 1,
+        "the immediate relay started the target on shard 1"
+    );
+    assert_eq!(
+        outbox_remaining, 0,
+        "the immediate relay deleted the outbox row"
+    );
+    assert_eq!(
+        relayed, 0,
+        "the scanner had nothing to relay (row already gone)"
+    );
+    // Exactly ONE bypass count across the immediate relay + the scanner.
+    let bypassed = recorder.bypassed();
+    assert_eq!(
+        bypassed,
+        vec!["completion_trigger_outbox".to_string()],
+        "the immediate relay counts the completion_trigger_outbox bypass exactly once, \
+         and the scanner does not double-count it"
+    );
+}
