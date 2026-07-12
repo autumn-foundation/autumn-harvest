@@ -802,6 +802,7 @@ pub async fn trigger_unified_dag(
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
         },
+        None,
     )
     .await
 }
@@ -3404,6 +3405,7 @@ async fn tick_one_workflow_schedule(
                 origin: Some(crate::execution::ORIGIN_SCHEDULED),
                 completion_callbacks: None,
             },
+            None,
         )
         .await;
         match scheduled_start_outcome(start_result) {
@@ -4461,6 +4463,7 @@ async fn drain_buffered_schedule_runs(
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
                     completion_callbacks: None,
                 },
+                None,
             )
             .await;
 

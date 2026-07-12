@@ -372,6 +372,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             r.telemetry().metrics.as_ref()
                 as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
         }),
+        None,
     )
     .await?;
 

@@ -423,6 +423,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     origin: None,
                     completion_callbacks: None,
                 },
+                None,
             )
             .await
             .expect("start workflow");

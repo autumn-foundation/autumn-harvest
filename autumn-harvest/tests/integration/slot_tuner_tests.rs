@@ -327,6 +327,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start workflow");

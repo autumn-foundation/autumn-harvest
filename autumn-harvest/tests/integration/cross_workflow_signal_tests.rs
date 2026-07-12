@@ -539,7 +539,7 @@ async fn test_same_shard_not_found_retry() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -587,7 +587,7 @@ async fn test_same_shard_not_found_retry() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_target_params)
+    start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
         .unwrap();
 
@@ -735,7 +735,7 @@ async fn test_cross_shard_outbox_delivery() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_target_params)
+    start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
         .unwrap();
 
@@ -776,7 +776,7 @@ async fn test_cross_shard_outbox_delivery() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -896,7 +896,7 @@ async fn test_grace_window_expiration() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -1055,7 +1055,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -1103,7 +1103,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_target_params)
+    start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
         .unwrap();
 

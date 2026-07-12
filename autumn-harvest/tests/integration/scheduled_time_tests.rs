@@ -416,6 +416,7 @@ async fn manual_start_has_no_scheduled_time() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start workflow");

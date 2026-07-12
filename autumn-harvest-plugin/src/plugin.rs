@@ -621,23 +621,38 @@ impl Plugin for HarvestPlugin {
 /// sibling runtime's globals are never clobbered.
 struct AdmissionGlobalsGuard {
     gate_cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>,
+    /// The global gate cache installed BEFORE this guard published its own (a
+    /// concurrently-live sibling runtime's, or `None`). Restored — not cleared to
+    /// `None` — on a drop-without-commit, so a failed second-runtime startup in the
+    /// same process does not wipe a still-running sibling's enforcement (issue #618
+    /// final pass).
+    prev_gate_cache: Option<Arc<autumn_harvest::admission_gate::AdmissionGateCache>>,
     metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
+    /// The global metrics recorder installed before `publish_metrics` ran (restored
+    /// on a drop-without-commit, same rationale as `prev_gate_cache`).
+    prev_metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
     committed: bool,
 }
 
 impl AdmissionGlobalsGuard {
     /// Publish the gate cache to the global static and begin guarding it.
     fn publish_gate_cache(cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>) -> Self {
+        // Capture the previous global BEFORE overwriting it, so a failed startup
+        // restores a live sibling's cache rather than clearing to None.
+        let prev_gate_cache = autumn_harvest::admission_gate::global_admission_gate_cache();
         autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(cache.clone()));
         Self {
             gate_cache: cache,
+            prev_gate_cache,
             metrics: None,
+            prev_metrics: None,
             committed: false,
         }
     }
 
     /// Publish the metrics recorder to the global static and begin guarding it.
     fn publish_metrics(&mut self, recorder: Arc<dyn autumn_harvest::telemetry::MetricsRecorder>) {
+        self.prev_metrics = autumn_harvest::admission_gate::global_admission_metrics();
         autumn_harvest::admission_gate::set_global_admission_metrics(Some(recorder.clone()));
         self.metrics = Some(recorder);
     }
@@ -653,16 +668,24 @@ impl Drop for AdmissionGlobalsGuard {
         if self.committed {
             return;
         }
+        // RESTORE the previous global (a still-running sibling runtime's cache, or
+        // `None` when there was no prior) instead of clearing to `None`: a failed
+        // second-runtime startup in the same process must not wipe a live sibling's
+        // enforcement (issue #618 final pass). Guard on ptr_eq so we only touch the
+        // global while it is still OUR published value (a third party may have
+        // replaced it — then leave it, as before).
         if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
             && Arc::ptr_eq(&installed, &self.gate_cache)
         {
-            autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+            autumn_harvest::admission_gate::set_global_admission_gate_cache(
+                self.prev_gate_cache.take(),
+            );
         }
         if let Some(ref m) = self.metrics
             && let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
             && Arc::ptr_eq(&installed, m)
         {
-            autumn_harvest::admission_gate::set_global_admission_metrics(None);
+            autumn_harvest::admission_gate::set_global_admission_metrics(self.prev_metrics.take());
         }
     }
 }
@@ -1064,52 +1087,43 @@ async fn start_harvest_runtime(
                             as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
                     });
 
-                    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+                    // Issue #618, PR #1014: the gate is now enforced AUTHORITATIVELY
+                    // inside the core start primitive. `Some(GateMode::CheckCached)`
+                    // makes `_collect` apply the gate iff it will CREATE a new
+                    // execution — an idempotent `AllowDuplicate` retry that attaches
+                    // to (or reloads) an existing run admits nothing and is never
+                    // gated, while a genuinely fresh admission (incl. a seal-race
+                    // replacement, now caught under the primitive's `FOR UPDATE` lock)
+                    // is blocked + counted by the primitive itself. `CheckCached`
+                    // (not the fail-closed `Check`) is used because the outbound
+                    // webhook delivery is in-flight continuation of already-committed
+                    // work and must not be permanently dropped by a boot/DB blip it
+                    // cannot retry past.
+                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics(
                         &mut conn,
                         start_params,
                         metrics_ref,
-                        // Decide the gate on whether `start_or_load` will CREATE a new
-                        // execution (issue #618, F-round18): an idempotent attach/no-op
-                        // (`will_create == false`) admits nothing → skip the gate; a
-                        // genuinely fresh admission (`will_create == true`) → apply it.
-                        move |will_create| {
-                            webhook_delivery_gate_decision(
-                                will_create,
-                                autumn_harvest::admission_gate::global_admission_gate_cache()
-                                    .as_deref(),
-                                shard,
-                                owner,
-                            )
-                        },
+                        Some(autumn_harvest::admission_gate::GateMode::CheckCached),
                     )
                     .await
-                    .map_err(|e| {
-                        autumn_web::error::AutumnError::internal_server_error_msg(format!(
-                            "failed to start Harvest webhook workflow: {e}"
-                        ))
-                    })?;
-
-                    if let autumn_harvest::execution::GateCheckedStart::Blocked {
-                        reason,
-                        scope_kind,
-                    } = outcome
                     {
-                        if let Some(m) = &metrics {
-                            m.record_admission_blocked(scope_kind, &reason);
+                        Ok(_started) => Ok(()),
+                        Err(autumn_harvest::HarvestError::AdmissionBlocked { reason, .. }) => {
+                            // The primitive already recorded the block count.
+                            tracing::info!(
+                                reason = %reason,
+                                "admission gate active; blocking outbound webhook_delivery start"
+                            );
+                            Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                                format!(
+                                    "admission gate active; webhook_delivery start blocked ({reason})"
+                                ),
+                            ))
                         }
-                        tracing::info!(
-                            scope_kind,
-                            reason = %reason,
-                            "admission gate active; blocking outbound webhook_delivery start"
-                        );
-                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
-                            format!(
-                                "admission gate active ({scope_kind}); webhook_delivery start blocked"
-                            ),
-                        ));
+                        Err(e) => Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                            format!("failed to start Harvest webhook workflow: {e}"),
+                        )),
                     }
-
-                    Ok(())
                 })
                     as std::pin::Pin<
                         Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send>,
@@ -1399,256 +1413,6 @@ fn apply_migrations_for_profile(
     Ok(())
 }
 
-/// Decide whether an active admission gate blocks an OUTBOUND webhook-delivery
-/// start (issue #618, Finding A).
-///
-/// The outbound `WebhookDelegateExt` starts the `webhook_delivery` workflow on
-/// the `webhooks` queue; those are the fixed match inputs (kept here, in the
-/// tested helper, so a regression is caught). Returns `Some((reason, scope_kind))`
-/// when a gate matches — the caller blocks the start and records an admission
-/// block — or `None` (proceed).
-///
-/// Uses the sentinel-aware `check()` (NOT `check_cached()`), so it **fails
-/// closed**: while the gate cache is uninitialized or reverted to fail-closed (a
-/// boot-time gate-load failure or a refresh outage) `check()` returns the
-/// synthetic block and this producer blocks — consistent with the HTTP start
-/// path. This is correct here (and differs from the completion-trigger path,
-/// which uses `check_cached()`) because a `webhook_delivery` start is a FRESH,
-/// retryable workflow start, equivalent to an HTTP API start — the
-/// permanent-drop concern that justified `check_cached()` for completion triggers
-/// (in-flight continuation of already-committed work that cannot retry) does not
-/// apply, so failing closed cannot permanently drop anything.
-#[cfg(feature = "webhooks")]
-fn webhook_delivery_admission_block(
-    cache: &autumn_harvest::admission_gate::AdmissionGateCache,
-    shard: autumn_harvest::types::ShardId,
-    owner: Option<&str>,
-) -> Option<(String, &'static str)> {
-    cache
-        .check("webhook_delivery", "webhooks", shard.as_i32(), owner)
-        .map(|(_id, reason, scope_kind)| (reason, scope_kind))
-}
-
-/// Admission decision for an outbound `webhook_delivery` start (issue #618,
-/// Finding A round 9 / round 12 / round 18).
-///
-/// `will_create` is the value [`autumn_harvest::execution::gate_checked_start_or_load`]
-/// derives from the LOCKED prior-run state + reuse policy via
-/// [`autumn_harvest::execution::start_will_create_new_execution`]: `true` when
-/// `start_or_load` will CREATE a new execution, `false` for an idempotent ATTACH
-/// (`AllowDuplicate` — the webhook's own policy — to a live OR terminal prior) or a
-/// no-op. A `webhook_delivery` retry that attaches to (or reloads) an existing run
-/// admits no fresh work, so the admission gate does NOT apply (`None`, no block, no
-/// count) — this preserves the round-12 idempotent-retry behaviour and mirrors the
-/// #808 HTTP path's bypass for a committed replay.
-///
-/// Only when a genuinely FRESH execution WILL be created (`will_create == true`) is
-/// the gate consulted via [`webhook_delivery_admission_block`]: a matching gate →
-/// block (`Some`), a fail-closed (uninitialized) cache → block via the synthetic
-/// sentinel (round 5), an initialized cache with no matching gate → proceed
-/// (`None`). An absent cache (`None`) never blocks.
-#[cfg(feature = "webhooks")]
-fn webhook_delivery_gate_decision(
-    will_create: bool,
-    cache: Option<&autumn_harvest::admission_gate::AdmissionGateCache>,
-    shard: autumn_harvest::types::ShardId,
-    owner: Option<&str>,
-) -> Option<(String, &'static str)> {
-    if !will_create {
-        return None;
-    }
-    cache.and_then(|c| webhook_delivery_admission_block(c, shard, owner))
-}
-
-#[cfg(all(test, feature = "webhooks"))]
-mod webhook_admission_tests {
-    use autumn_harvest::admission_gate::{
-        AdmissionGate, AdmissionGateCache, AdmissionGateId, GateScope,
-    };
-    use autumn_harvest::types::ShardId;
-    use uuid::Uuid;
-
-    fn cache_with(scope: GateScope) -> AdmissionGateCache {
-        let cache = AdmissionGateCache::new();
-        cache.refresh(vec![AdmissionGate {
-            id: AdmissionGateId(Uuid::new_v4()),
-            scope,
-            reason: "incident".to_string(),
-            message: None,
-            created_by: "test".to_string(),
-            created_at: autumn_harvest::chrono::Utc::now(),
-            expires_at: None,
-        }]);
-        cache
-    }
-
-    #[test]
-    fn fleet_gate_blocks_the_outbound_webhook_delivery_start() {
-        let cache = cache_with(GateScope::Fleet);
-        let decision = super::webhook_delivery_admission_block(&cache, ShardId::new(0), None);
-        assert!(
-            matches!(decision, Some((_, "fleet"))),
-            "a Fleet gate must block the outbound webhook_delivery start"
-        );
-    }
-
-    #[test]
-    fn gate_scoped_to_webhook_delivery_blocks() {
-        let cache = cache_with(GateScope::WorkflowName("webhook_delivery".into()));
-        assert!(
-            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
-            "a WorkflowName(webhook_delivery) gate must block"
-        );
-    }
-
-    #[test]
-    fn gate_scoped_to_the_webhooks_queue_blocks() {
-        let cache = cache_with(GateScope::Queue("webhooks".into()));
-        assert!(
-            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
-            "a Queue(webhooks) gate must block (the outbound start uses the webhooks queue)"
-        );
-    }
-
-    #[test]
-    fn non_matching_gate_lets_the_outbound_start_proceed() {
-        // A gate scoped to a DIFFERENT workflow / queue must NOT block.
-        assert!(
-            super::webhook_delivery_admission_block(
-                &cache_with(GateScope::WorkflowName("some_other_wf".into())),
-                ShardId::new(0),
-                None,
-            )
-            .is_none(),
-            "a gate for a different workflow must not block webhook_delivery"
-        );
-        assert!(
-            super::webhook_delivery_admission_block(
-                &cache_with(GateScope::Queue("other_queue".into())),
-                ShardId::new(0),
-                None,
-            )
-            .is_none(),
-            "a gate for a different queue must not block webhook_delivery"
-        );
-    }
-
-    #[test]
-    fn initialized_empty_cache_lets_the_outbound_start_proceed() {
-        // `AdmissionGateCache::new()` is initialized (fail-open) with no gates.
-        let cache = AdmissionGateCache::new();
-        assert!(
-            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_none(),
-            "an initialized cache with no gates → the outbound webhook_delivery start proceeds"
-        );
-    }
-
-    #[test]
-    fn uninitialized_cache_fails_closed_and_blocks() {
-        // A fail-closed (uninitialized) cache — e.g. a boot-time gate-load
-        // failure — must BLOCK a fresh webhook_delivery start, consistent with
-        // the HTTP start path (issue #618, Finding A). The synthetic sentinel
-        // block carries the "fleet" scope kind.
-        let cache = AdmissionGateCache::new_fail_closed();
-        assert!(
-            matches!(
-                super::webhook_delivery_admission_block(&cache, ShardId::new(0), None),
-                Some((_, "fleet"))
-            ),
-            "an uninitialized (fail-closed) cache must block the outbound webhook_delivery start"
-        );
-    }
-
-    #[test]
-    fn set_fail_closed_reverts_to_blocking() {
-        // Even a previously-populated cache blocks once reverted to fail-closed
-        // (a refresh outage after boot).
-        let cache = cache_with(GateScope::WorkflowName("unrelated_wf".into()));
-        // Before: the unrelated gate does not match → proceed.
-        assert!(super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_none());
-        cache.set_fail_closed();
-        // After: fail-closed → block regardless of the (unrelated) cached gate.
-        assert!(
-            super::webhook_delivery_admission_block(&cache, ShardId::new(0), None).is_some(),
-            "a cache reverted to fail-closed must block the outbound webhook_delivery start"
-        );
-    }
-
-    // ── webhook_delivery_gate_decision: attach/no-op bypass (Finding A r9/r18) ──
-    // The bool argument is `will_create` (issue #618, F-round18): `false` = an
-    // idempotent attach / no-op (skip the gate), `true` = a genuinely fresh create
-    // (apply the gate).
-
-    #[test]
-    fn attach_skips_the_gate_even_under_a_fleet_gate() {
-        // (a) An idempotent RETRY that ATTACHES (`will_create == false`):
-        // start_or_load will LOAD/attach, not admit a fresh run, so an active Fleet
-        // gate must NOT block it and must NOT count a block.
-        let cache = cache_with(GateScope::Fleet);
-        assert!(
-            super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None)
-                .is_none(),
-            "an attach/no-op webhook_delivery is not a fresh admission — the gate is skipped"
-        );
-    }
-
-    #[test]
-    fn fresh_create_is_blocked_under_a_matching_gate() {
-        // (b) A genuinely FRESH create (`will_create == true`) under a matching gate
-        // is blocked (and the caller counts the block).
-        let cache = cache_with(GateScope::Fleet);
-        assert!(
-            matches!(
-                super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None),
-                Some((_, "fleet"))
-            ),
-            "a fresh webhook_delivery create under a Fleet gate must be blocked"
-        );
-    }
-
-    #[test]
-    fn attach_skips_the_gate_even_when_fail_closed() {
-        // An attach is never a fresh admission, so it proceeds even against a
-        // fail-closed cache (the round-5 fresh-start fail-closed rule does not
-        // apply to an idempotent load/attach).
-        let cache = AdmissionGateCache::new_fail_closed();
-        assert!(
-            super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None)
-                .is_none(),
-            "an attach/no-op proceeds even under a fail-closed cache"
-        );
-    }
-
-    #[test]
-    fn fresh_create_fails_closed_on_an_uninitialized_cache() {
-        // Round-5 behavior intact: a FRESH create against a fail-closed
-        // (uninitialized) cache is blocked via the synthetic sentinel.
-        let cache = AdmissionGateCache::new_fail_closed();
-        assert!(
-            matches!(
-                super::webhook_delivery_gate_decision(true, Some(&cache), ShardId::new(0), None),
-                Some((_, "fleet"))
-            ),
-            "a fresh webhook_delivery create against a fail-closed cache must block (round 5)"
-        );
-    }
-
-    #[test]
-    fn fresh_delivery_with_no_matching_gate_or_no_cache_proceeds() {
-        // A fresh start proceeds when no gate matches, or when no cache is published.
-        let cache = cache_with(GateScope::WorkflowName("some_other_wf".into()));
-        assert!(
-            super::webhook_delivery_gate_decision(false, Some(&cache), ShardId::new(0), None)
-                .is_none(),
-            "a fresh start with a non-matching gate proceeds"
-        );
-        assert!(
-            super::webhook_delivery_gate_decision(false, None, ShardId::new(0), None).is_none(),
-            "a fresh start with no published cache proceeds"
-        );
-    }
-}
-
 #[cfg(test)]
 mod admission_globals_guard_tests {
     use super::AdmissionGlobalsGuard;
@@ -1797,6 +1561,47 @@ mod admission_globals_guard_tests {
             "guard drop must not clobber a sibling's installed cache"
         );
         set_global_admission_gate_cache(None);
+    }
+
+    /// issue #618 (final pass): when THIS guard published its cache OVER a
+    /// still-running sibling's (the sibling was installed first), a
+    /// drop-without-commit must RESTORE the sibling's cache — not clear the global
+    /// to `None`, which would wipe the live sibling's gate enforcement. Same for
+    /// the metrics recorder.
+    #[test]
+    fn guard_drop_restores_the_previous_sibling_globals_not_none() {
+        let _g = GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Sibling runtime A is already live with its own cache + metrics.
+        let sibling_cache = Arc::new(AdmissionGateCache::new());
+        let sibling_metrics: Arc<dyn MetricsRecorder> = recorder();
+        set_global_admission_gate_cache(Some(Arc::clone(&sibling_cache)));
+        set_global_admission_metrics(Some(Arc::clone(&sibling_metrics)));
+        {
+            // Second runtime B publishes its OWN globals over A's, then fails
+            // (dropped without commit).
+            let mut guard =
+                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
+            guard.publish_metrics(recorder());
+            // Sanity: B's globals are installed now (not A's).
+            assert!(
+                global_admission_gate_cache().is_some_and(|c| !Arc::ptr_eq(&c, &sibling_cache)),
+                "B's cache is installed over A's before the failure"
+            );
+        }
+        // B's guard dropped without commit -> A's cache + metrics must be restored,
+        // NOT cleared to None (the live sibling keeps its enforcement).
+        assert!(
+            global_admission_gate_cache().is_some_and(|c| Arc::ptr_eq(&c, &sibling_cache)),
+            "a failed second-runtime startup must RESTORE the sibling's cache, not clear it"
+        );
+        assert!(
+            global_admission_metrics().is_some_and(|m| Arc::ptr_eq(&m, &sibling_metrics)),
+            "a failed second-runtime startup must RESTORE the sibling's metrics recorder"
+        );
+        set_global_admission_gate_cache(None);
+        set_global_admission_metrics(None);
     }
 }
 

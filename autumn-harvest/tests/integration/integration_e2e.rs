@@ -701,7 +701,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     // uniqueness anywhere, so the first start succeeds — but the schema
     // alone does not yet enforce idempotency. The point of the upgrade
     // migration is to add that enforcement.
-    let initial_start = start_or_load_workflow_execution(&mut conn, request.clone())
+    let initial_start = start_or_load_workflow_execution(&mut conn, request.clone(), None)
         .await
         .expect("first start should succeed even on legacy schema");
     assert!(
@@ -723,7 +723,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
 
     // After the start-uniqueness upgrade, repeated starts must collapse onto
     // the originally-created row.
-    let after_uniqueness = start_or_load_workflow_execution(&mut conn, request.clone())
+    let after_uniqueness = start_or_load_workflow_execution(&mut conn, request.clone(), None)
         .await
         .expect("post-upgrade start should reuse the legacy row idempotently");
     assert!(
@@ -750,7 +750,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         .await
         .expect("failed to apply continue-as-new migration");
 
-    let after_continue_as_new = start_or_load_workflow_execution(&mut conn, request)
+    let after_continue_as_new = start_or_load_workflow_execution(&mut conn, request, None)
         .await
         .expect("start should remain idempotent after the continue-as-new migration");
     assert!(
@@ -5192,7 +5192,7 @@ async fn reuse_policy_allow_duplicate_no_prior_creates() {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-allow-none", exec_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
-    let result = start_or_load_workflow_execution(&mut conn, params)
+    let result = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicate with no prior should succeed");
     assert!(result.created, "should create when no prior exists");
@@ -5205,14 +5205,14 @@ async fn reuse_policy_allow_duplicate_running_returns_existing() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-allow-run", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     assert!(first.created);
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicate on RUNNING should return existing");
     assert!(!second.created);
@@ -5229,13 +5229,13 @@ async fn reuse_policy_allow_duplicate_completed_returns_existing() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-allow-cmp", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicate on COMPLETED should return existing");
     assert!(!second.created);
@@ -5248,13 +5248,13 @@ async fn reuse_policy_allow_duplicate_failed_returns_existing() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-allow-fail", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicate on FAILED should return existing");
     assert!(!second.created);
@@ -5267,7 +5267,7 @@ async fn reuse_policy_allow_duplicate_cancelled_returns_existing() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-allow-can", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     cancel_workflow_execution(
@@ -5280,7 +5280,7 @@ async fn reuse_policy_allow_duplicate_cancelled_returns_existing() {
     .expect("cancel should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicate on CANCELLED should return existing");
     assert!(!second.created);
@@ -5294,7 +5294,7 @@ async fn reuse_policy_reject_duplicate_no_prior_creates() {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-reject-none", exec_id);
     params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
-    let result = start_or_load_workflow_execution(&mut conn, params)
+    let result = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("RejectDuplicate with no prior should succeed");
     assert!(result.created);
@@ -5306,12 +5306,12 @@ async fn reuse_policy_reject_duplicate_running_errors() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-reject-run", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let err = start_or_load_workflow_execution(&mut conn, params)
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect_err("RejectDuplicate on RUNNING must error");
     match err {
@@ -5332,13 +5332,13 @@ async fn reuse_policy_reject_duplicate_completed_errors() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-reject-cmp", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let err = start_or_load_workflow_execution(&mut conn, params)
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect_err("RejectDuplicate on COMPLETED must error");
     assert!(matches!(err, HarvestError::AlreadyExists { .. }));
@@ -5350,13 +5350,13 @@ async fn reuse_policy_reject_duplicate_failed_errors() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-reject-fail", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let err = start_or_load_workflow_execution(&mut conn, params)
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect_err("RejectDuplicate on FAILED must error");
     assert!(matches!(err, HarvestError::AlreadyExists { .. }));
@@ -5368,7 +5368,7 @@ async fn reuse_policy_reject_duplicate_cancelled_errors() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-reject-can", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     cancel_workflow_execution(
@@ -5381,7 +5381,7 @@ async fn reuse_policy_reject_duplicate_cancelled_errors() {
     .expect("cancel should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let err = start_or_load_workflow_execution(&mut conn, params)
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect_err("RejectDuplicate on CANCELLED must error");
     assert!(matches!(err, HarvestError::AlreadyExists { .. }));
@@ -5393,7 +5393,7 @@ async fn reuse_policy_allow_failed_only_no_prior_creates() {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-afo-none", exec_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
-    let result = start_or_load_workflow_execution(&mut conn, params)
+    let result = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicateFailedOnly with no prior should create");
     assert!(result.created);
@@ -5405,12 +5405,12 @@ async fn reuse_policy_allow_failed_only_running_returns_existing() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-afo-run", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicateFailedOnly on RUNNING should return existing");
     assert!(!second.created);
@@ -5423,13 +5423,13 @@ async fn reuse_policy_allow_failed_only_completed_returns_existing() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-afo-cmp", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicateFailedOnly on COMPLETED should return existing");
     assert!(!second.created);
@@ -5442,14 +5442,14 @@ async fn reuse_policy_allow_failed_only_failed_starts_fresh() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-afo-fail", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicateFailedOnly on FAILED should start fresh");
     assert!(second.created, "must mint a new execution");
@@ -5463,7 +5463,7 @@ async fn reuse_policy_allow_failed_only_cancelled_starts_fresh() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-afo-can", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     cancel_workflow_execution(
@@ -5477,7 +5477,7 @@ async fn reuse_policy_allow_failed_only_cancelled_starts_fresh() {
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("AllowDuplicateFailedOnly on CANCELLED should start fresh");
     assert!(second.created, "must mint a new execution");
@@ -5491,7 +5491,7 @@ async fn reuse_policy_terminate_if_running_no_prior_creates() {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-tir-none", exec_id);
     params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
-    let result = start_or_load_workflow_execution(&mut conn, params)
+    let result = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("TerminateIfRunning with no prior should create");
     assert!(result.created);
@@ -5504,14 +5504,14 @@ async fn reuse_policy_terminate_if_running_running_cancels_and_starts_fresh() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-tir-run", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     assert_eq!(first.state, "RUNNING");
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("TerminateIfRunning on RUNNING should cancel and start fresh");
     assert!(second.created, "must mint a new execution");
@@ -5538,14 +5538,14 @@ async fn reuse_policy_terminate_if_running_completed_starts_fresh() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-tir-cmp", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("TerminateIfRunning on COMPLETED should start fresh");
     assert!(second.created, "must mint a new execution");
@@ -5559,14 +5559,14 @@ async fn reuse_policy_terminate_if_running_failed_starts_fresh() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-tir-fail", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("TerminateIfRunning on FAILED should start fresh");
     assert!(second.created, "must mint a new execution");
@@ -5580,7 +5580,7 @@ async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("rp-tir-can", first_id);
     params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("first start should succeed");
     cancel_workflow_execution(
@@ -5594,7 +5594,7 @@ async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("TerminateIfRunning on CANCELLED should start fresh");
     assert!(second.created, "must mint a new execution");
@@ -5614,7 +5614,7 @@ async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempo
     // Simulate transaction 1 completing (cancel) but transaction 2 failing
     // by manually cancelling the first run and then not starting a new one.
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
-    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
         .expect("initial start should succeed");
     cancel_workflow_execution(
@@ -5630,7 +5630,7 @@ async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempo
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
     params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
-    let second = start_or_load_workflow_execution(&mut conn, params)
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("retry with TerminateIfRunning on CANCELLED should start fresh");
     assert!(second.created, "retry must mint a fresh execution");
@@ -6482,6 +6482,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start_or_load_workflow_execution failed");
@@ -6653,6 +6654,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start_or_load_workflow_execution failed");

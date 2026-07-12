@@ -202,6 +202,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow start should succeed")
@@ -619,6 +620,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow start should succeed")
@@ -843,6 +845,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow start should succeed")
@@ -1003,6 +1006,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow start should succeed")
@@ -1160,6 +1164,7 @@ async fn activity_without_cancellation_check_completes_normally() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow start should succeed")

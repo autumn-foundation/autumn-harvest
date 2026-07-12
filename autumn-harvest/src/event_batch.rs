@@ -300,7 +300,7 @@ pub async fn admit_batched_start(
 
                         let (started, deferred_starts, deferred_checks, cancel_metrics) =
                             crate::execution::start_or_load_workflow_execution_collect(
-                                conn, params, true, false, None,
+                                conn, params, true, false, None, None,
                             )
                             .await?;
 
@@ -583,9 +583,10 @@ async fn fire_claimed_batch_row(
         completion_callbacks: opts.completion_callbacks,
     };
 
-    let start_res =
-        crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false, None)
-            .await;
+    let start_res = crate::execution::start_or_load_workflow_execution_collect(
+        conn, params, true, false, None, None,
+    )
+    .await;
 
     match start_res {
         Ok((started, deferred_starts, deferred_checks, cancel_metrics)) => {

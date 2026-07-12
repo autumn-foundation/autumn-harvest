@@ -743,11 +743,10 @@ enum RelayOutcome {
     /// `completion_trigger_outbox` bypass.
     Delivered,
     /// A genuinely fresh admission the gate blocked → the outbox row was deleted and
-    /// the fires row marked `admission_blocked`; count an admission block.
-    Blocked {
-        scope_kind: &'static str,
-        reason: String,
-    },
+    /// the fires row marked `admission_blocked`. The core start primitive already
+    /// recorded the `harvest.admission.blocked` count (issue #618, PR #1014), so the
+    /// relay does NOT re-record it — `reason` is kept only for the tracing log.
+    Blocked { reason: String },
 }
 
 /// Run the cross-shard completion-trigger relay's start/block decision through the
@@ -791,10 +790,6 @@ async fn relay_gate_checked_start(
     target_conn: &mut diesel_async::AsyncPgConnection,
     source_conn: &mut diesel_async::AsyncPgConnection,
     params: crate::execution::StartWorkflowParams<'_>,
-    gate_workflow_name: String,
-    gate_resolved_queue: String,
-    gate_owner: Option<String>,
-    target_shard: crate::types::ShardId,
     outbox_id: Uuid,
     source_exec_id: Uuid,
     trigger_id: Uuid,
@@ -813,31 +808,19 @@ async fn relay_gate_checked_start(
         id: Uuid,
     }
 
-    // The relay-time gate decision (issue #618, F-round18): apply the gate iff
-    // `_collect` will CREATE a new execution; skip it for an idempotent attach/no-op.
-    // The any-state `execution_exists_by_key` check below already short-circuits a
-    // target that exists in ANY state to DELIVERED, so by the time control reaches
-    // `gate_checked_start_or_load` no target exists → `will_create` is trivially
-    // `true` and the gate always applies to a fresh cross-shard delivery. Uses
-    // `check_cached` (last-known snapshot, honoured even under a transient
-    // fail-closed blip, never the sentinel) — the relay materializes pre-committed
-    // in-flight-continuation work, so the same no-permanent-drop rationale as the
-    // inline path applies.
-    let gate = move |will_create: bool| -> Option<(String, &'static str)> {
-        if !will_create {
-            return None;
-        }
-        crate::admission_gate::global_admission_gate_cache().and_then(|cache| {
-            cache
-                .check_cached(
-                    &gate_workflow_name,
-                    &gate_resolved_queue,
-                    target_shard.as_i32(),
-                    gate_owner.as_deref(),
-                )
-                .map(|(_id, reason, scope_kind)| (reason, scope_kind))
-        })
-    };
+    // The relay-time gate decision (issue #618, PR #1014) is now enforced
+    // AUTHORITATIVELY inside the core start primitive: the `Some(GateMode::CheckCached)`
+    // argument to `start_or_load_workflow_execution_with_metrics` below makes
+    // `_collect` apply the gate iff it will CREATE a new execution (issue #618,
+    // F-round18). The any-state `execution_exists_by_key` check first short-circuits
+    // a target that exists in ANY state to DELIVERED, so by the time control reaches
+    // the start no target exists → `will_create` is trivially `true` and the gate
+    // always applies to a fresh cross-shard delivery. `CheckCached` honours the
+    // last-known snapshot (never the fail-closed sentinel) — the relay materializes
+    // pre-committed in-flight-continuation work, so the same no-permanent-drop
+    // rationale as the inline path applies. The primitive records the
+    // `harvest.admission.blocked` count itself, so the relay only performs the
+    // fires-row `admission_blocked` bookkeeping + outbox-row drop on a block.
 
     // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
     // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
@@ -886,15 +869,17 @@ async fn relay_gate_checked_start(
                     return Ok(RelayOutcome::Delivered);
                 }
 
-                match crate::execution::gate_checked_start_or_load(
+                match crate::execution::start_or_load_workflow_execution_with_metrics(
                     target_conn,
                     params,
                     metrics,
-                    gate,
+                    Some(crate::admission_gate::GateMode::CheckCached),
                 )
-                .await?
+                .await
                 {
-                    crate::execution::GateCheckedStart::Blocked { reason, scope_kind } => {
+                    Err(crate::error::HarvestError::AdmissionBlocked { reason, .. }) => {
+                        // The primitive already recorded the block count; the relay
+                        // only drops the outbox row + marks the fires row.
                         diesel::delete(
                             outbox_dsl::harvest_completion_trigger_outbox
                                 .filter(outbox_dsl::id.eq(outbox_id)),
@@ -911,9 +896,10 @@ async fn relay_gate_checked_start(
                         .execute(source_tx)
                         .await
                         .map_err(crate::error::database_error)?;
-                        Ok(RelayOutcome::Blocked { scope_kind, reason })
+                        Ok(RelayOutcome::Blocked { reason })
                     }
-                    crate::execution::GateCheckedStart::Started(_started) => {
+                    Err(e) => Err(e),
+                    Ok(_started) => {
                         // Fresh start OR an idempotent attach to a still-active run:
                         // either way the target IS started → DELIVERY. Delete the row,
                         // leave fires `NULL`, count a bypass.
@@ -948,12 +934,11 @@ async fn relay_gate_checked_start(
                 );
             }
         }
-        RelayOutcome::Blocked { scope_kind, reason } => {
-            if let Some(m) = metrics {
-                m.record_admission_blocked(scope_kind, &reason);
-            }
+        RelayOutcome::Blocked { reason } => {
+            // The block count was already recorded by the core start primitive
+            // (`record_start_gate_block` inside `_collect`), so the relay does NOT
+            // re-record it here — that would double-count (issue #618, PR #1014).
             tracing::info!(
-                scope_kind,
                 reason = %reason,
                 "[completion_trigger] cross-shard relay blocked by an admission gate on the real target queue; dropped the outbox row"
             );
@@ -1071,9 +1056,6 @@ impl DeferredTriggerStart {
                 .as_ref()
                 .map(|m| m.as_ref() as &(dyn crate::telemetry::MetricsRecorder + Send + Sync));
 
-            let gate_workflow_name = self.target_workflow_name.clone();
-            let gate_resolved_queue = queue_name.clone();
-            let gate_owner = self.owner.clone();
             let params = crate::execution::StartWorkflowParams {
                 workflow_name: &self.target_workflow_name,
                 workflow_id: &self.target_workflow_id,
@@ -1113,10 +1095,6 @@ impl DeferredTriggerStart {
                 &mut target_conn,
                 &mut source_conn,
                 params,
-                gate_workflow_name,
-                gate_resolved_queue,
-                gate_owner,
-                self.target_shard,
                 self.outbox_id,
                 self.source_exec_id,
                 self.trigger_id,
@@ -1580,6 +1558,12 @@ pub fn evaluate_triggers_for_execution<'a>(
                         origin: None,
                         completion_callbacks: None,
                     },
+                    // The inline same-shard completion-trigger start keeps its own
+                    // unlocked pre-check gate above (it also performs the fires-row
+                    // `admission_blocked` bookkeeping and the first-time-only block
+                    // counting that the primitive cannot), so it is not gated again
+                    // here — pass `None` to avoid double-counting (issue #618).
+                    None,
                 )
                 .await
                 {
@@ -1764,9 +1748,6 @@ pub async fn enforce_completion_triggers_outbox(
             .ok()
             .and_then(|g| *g);
 
-        let gate_workflow_name = task.target_workflow_name.clone();
-        let gate_resolved_queue = queue_name.clone();
-        let gate_owner = target_owner.clone();
         let params = crate::execution::StartWorkflowParams {
             workflow_name: &task.target_workflow_name,
             workflow_id: &task.target_workflow_id,
@@ -1822,10 +1803,6 @@ pub async fn enforce_completion_triggers_outbox(
             &mut target_conn,
             conn,
             params,
-            gate_workflow_name,
-            gate_resolved_queue,
-            gate_owner,
-            target_shard,
             task.id,
             task.source_exec_id,
             task.trigger_id,

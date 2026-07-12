@@ -267,6 +267,7 @@ async fn start(conn: &mut AsyncPgConnection, name: &str, id: &str) -> ExecutionI
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow start should succeed")

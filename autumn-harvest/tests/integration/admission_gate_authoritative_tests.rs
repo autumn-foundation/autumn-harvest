@@ -394,6 +394,7 @@ async fn start_source_completed_on(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start source");
@@ -2241,6 +2242,7 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
         )
         .await
         .expect("pre-create the already-started target run");
@@ -2465,6 +2467,7 @@ async fn run_stale_sealed_delivered_case(
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
         )
         .await
         .expect("pre-create the already-started target run");
@@ -2725,6 +2728,7 @@ async fn start_webhook_delivery(conn: &mut AsyncPgConnection, workflow_id: &str)
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start webhook_delivery");
@@ -2770,20 +2774,6 @@ fn webhook_replacement_params(workflow_id: &'static str) -> StartWorkflowParams<
     }
 }
 
-/// The webhook delegate's gate decision (the equivalent of
-/// `webhook_delivery_gate_decision`, which is plugin-private): the `bool` is
-/// `will_create` (issue #618, F-round18) — a genuine attach/no-op
-/// (`will_create == false`) skips the gate; a fresh create (`will_create == true`)
-/// applies the (`webhook_delivery`, `webhooks`, shard 0) gate.
-fn webhook_test_gate(will_create: bool) -> Option<(String, &'static str)> {
-    if !will_create {
-        return None;
-    }
-    autumn_harvest::admission_gate::global_admission_gate_cache()
-        .and_then(|c| c.check("webhook_delivery", "webhooks", 0, None))
-        .map(|(_id, reason, scope)| (reason, scope))
-}
-
 async fn running_webhook_delivery_count(conn: &mut AsyncPgConnection) -> i64 {
     diesel::sql_query(
         "SELECT COUNT(*) AS n FROM harvest_workflow_executions
@@ -2812,19 +2802,18 @@ async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
     let original = start_webhook_delivery(&mut conn, "webhook-delivery-live").await;
     set_global_admission_gate_cache(Some(fleet_cache("attach-incident")));
 
-    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
         &mut conn,
         webhook_replacement_params("webhook-delivery-live"),
         None,
-        webhook_test_gate,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
-    .await
-    .expect("gate_checked_start_or_load");
+    .await;
 
     set_global_admission_gate_cache(None);
 
     match outcome {
-        autumn_harvest::execution::GateCheckedStart::Started(started) => {
+        Ok(started) => {
             assert!(
                 !started.created,
                 "a live existing run must be ATTACHED (created == false), not replaced"
@@ -2834,9 +2823,10 @@ async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
                 "the attach must return the original run's exec_id"
             );
         }
-        autumn_harvest::execution::GateCheckedStart::Blocked { .. } => {
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => {
             panic!("an idempotent retry of a LIVE run must NOT be blocked by the gate")
         }
+        Err(e) => panic!("unexpected start error: {e}"),
     }
     // Still exactly one RUNNING webhook_delivery run (the original) — no fresh start.
     assert_eq!(running_webhook_delivery_count(&mut conn).await, 1);
@@ -2884,11 +2874,11 @@ async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
     let start_pool = pool.clone();
     let start_task = tokio::spawn(async move {
         let mut a_conn = start_pool.get().await.unwrap();
-        autumn_harvest::execution::gate_checked_start_or_load(
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
             &mut a_conn,
             webhook_replacement_params("webhook-delivery-race"),
             None,
-            webhook_test_gate,
+            Some(autumn_harvest::admission_gate::GateMode::Check),
         )
         .await
     });
@@ -2910,22 +2900,26 @@ async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
         holder.batch_execute("COMMIT").await.unwrap();
     }
 
-    let outcome = start_task.await.expect("join start task").expect("start");
+    let outcome = start_task.await.expect("join start task");
 
     set_global_admission_gate_cache(None);
 
     // The fresh replacement (which AllowDuplicate WOULD create for a TERMINATED
     // prior) must be BLOCKED by the gate — the locked decision saw TERMINATED.
     match outcome {
-        autumn_harvest::execution::GateCheckedStart::Blocked { scope_kind, .. } => {
-            assert_eq!(scope_kind, "fleet", "the block came from the Fleet gate");
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { reason, .. }) => {
+            assert!(
+                reason.contains("race-incident"),
+                "the block came from the Fleet gate (reason = {reason})"
+            );
         }
-        autumn_harvest::execution::GateCheckedStart::Started(started) => panic!(
+        Ok(started) => panic!(
             "a run sealed under the lock must BLOCK the fresh replacement, not start it \
              (created = {}, exec = {:?}) — this is the round-9 TOCTOU leaking a fresh \
              admission past the gate",
             started.created, started.exec_id
         ),
+        Err(e) => panic!("unexpected start error: {e}"),
     }
     // No fresh RUNNING run was created (the original is now TERMINATED).
     assert_eq!(
@@ -2945,18 +2939,6 @@ async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
 // returned `Some` for these replacement priors and (as `locked_live`) wrongly
 // skipped the gate, leaking a fresh execution past an active gate uncounted.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// A Fleet-gate decision keyed on `will_create` (the value `gate_checked_start_or_load`
-/// computes from the locked prior state + reuse policy): apply the gate iff a fresh
-/// execution will be created. A Fleet gate matches any (workflow, queue, shard).
-fn ag_fleet_gate(will_create: bool) -> Option<(String, &'static str)> {
-    if !will_create {
-        return None;
-    }
-    autumn_harvest::admission_gate::global_admission_gate_cache()
-        .and_then(|c| c.check("ag_target_wf", "default", 0, None))
-        .map(|(_id, reason, scope)| (reason, scope))
-}
 
 fn ag_target_params(
     workflow_id: &'static str,
@@ -3007,6 +2989,7 @@ async fn seed_prior_ag_target(
     start_or_load_workflow_execution(
         conn,
         ag_target_params(workflow_id, WorkflowIdReusePolicy::AllowDuplicate),
+        None,
     )
     .await
     .expect("seed prior");
@@ -3040,29 +3023,27 @@ async fn gate_blocks_allow_duplicate_failed_only_replacement_of_a_failed_prior()
     seed_prior_ag_target(&mut conn, "adfo-failed", "FAILED").await;
     set_global_admission_gate_cache(Some(fleet_cache("replacement-incident")));
 
-    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
         &mut conn,
         ag_target_params(
             "adfo-failed",
             WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
         ),
         None,
-        ag_fleet_gate,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
-    .await
-    .expect("gate_checked_start_or_load");
+    .await;
 
     set_global_admission_gate_cache(None);
 
     match outcome {
-        autumn_harvest::execution::GateCheckedStart::Blocked { scope_kind, .. } => {
-            assert_eq!(scope_kind, "fleet", "the block came from the Fleet gate");
-        }
-        autumn_harvest::execution::GateCheckedStart::Started(s) => panic!(
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => {}
+        Ok(s) => panic!(
             "AllowDuplicateFailedOnly over a FAILED prior REPLACES (fresh create) — it must be \
              gated, not skipped as an attach (created = {}, exec = {:?})",
             s.created, s.exec_id
         ),
+        Err(e) => panic!("unexpected start error: {e}"),
     }
     // Exactly the one seeded (FAILED) prior remains — no fresh replacement created.
     assert_eq!(target_exec_count(&mut conn).await, 1);
@@ -3085,26 +3066,24 @@ async fn gate_blocks_terminate_if_running_replacement_of_a_live_prior() {
     seed_prior_ag_target(&mut conn, "tir-live", "RUNNING").await;
     set_global_admission_gate_cache(Some(fleet_cache("terminate-incident")));
 
-    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
         &mut conn,
         ag_target_params("tir-live", WorkflowIdReusePolicy::TerminateIfRunning),
         None,
-        ag_fleet_gate,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
-    .await
-    .expect("gate_checked_start_or_load");
+    .await;
 
     set_global_admission_gate_cache(None);
 
     match outcome {
-        autumn_harvest::execution::GateCheckedStart::Blocked { scope_kind, .. } => {
-            assert_eq!(scope_kind, "fleet");
-        }
-        autumn_harvest::execution::GateCheckedStart::Started(s) => panic!(
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => {}
+        Ok(s) => panic!(
             "TerminateIfRunning always REPLACES (fresh create) — it must be gated \
              (created = {}, exec = {:?})",
             s.created, s.exec_id
         ),
+        Err(e) => panic!("unexpected start error: {e}"),
     }
     // The gate blocked before any replacement; exactly the one seeded run remains.
     assert_eq!(target_exec_count(&mut conn).await, 1);
@@ -3132,28 +3111,28 @@ async fn gate_skips_allow_duplicate_attach_to_a_completed_prior() {
     seed_prior_ag_target(&mut conn, "ad-completed", "COMPLETED").await;
     set_global_admission_gate_cache(Some(fleet_cache("attach-terminal-incident")));
 
-    let outcome = autumn_harvest::execution::gate_checked_start_or_load(
+    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
         &mut conn,
         ag_target_params("ad-completed", WorkflowIdReusePolicy::AllowDuplicate),
         None,
-        ag_fleet_gate,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
-    .await
-    .expect("gate_checked_start_or_load");
+    .await;
 
     set_global_admission_gate_cache(None);
 
     match outcome {
-        autumn_harvest::execution::GateCheckedStart::Started(s) => {
+        Ok(s) => {
             assert!(
                 !s.created,
                 "AllowDuplicate over a terminal prior ATTACHES (created == false), not a fresh create"
             );
         }
-        autumn_harvest::execution::GateCheckedStart::Blocked { .. } => panic!(
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => panic!(
             "an AllowDuplicate attach to a terminal prior admits nothing — the gate must be \
              SKIPPED, not block the idempotent retry"
         ),
+        Err(e) => panic!("unexpected start error: {e}"),
     }
     // Still exactly one execution (the COMPLETED prior) — no fresh run created.
     assert_eq!(target_exec_count(&mut conn).await, 1);

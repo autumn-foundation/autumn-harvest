@@ -6428,6 +6428,7 @@ async fn execute_schedule_trigger_ui(
             completion_callbacks: None,
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
+        None,
     )
     .await;
     let (status, outcome) = if result.is_ok() {

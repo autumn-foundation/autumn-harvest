@@ -123,6 +123,19 @@ fn wf_info(name: &'static str) -> WorkflowInfo {
     }
 }
 
+/// A workflow carrying a start throttle (issue #607) so a fresh start reserves a
+/// token and falls through to the gated plain start path (issue #618, PR #1014).
+fn wf_info_throttled(name: &'static str) -> WorkflowInfo {
+    let mut info = wf_info(name);
+    info.throttle = Some(autumn_harvest::throttle::ThrottlePolicy {
+        refill_per_sec: 0.0,
+        burst: 10.0,
+        key_expr: None,
+        schedule_to_start: None,
+    });
+    info
+}
+
 fn build_registry(metrics: Arc<CapturingMetrics>) -> Arc<HandlerRegistry> {
     let telemetry = Arc::new(
         TelemetryConfig::builder()
@@ -130,7 +143,11 @@ fn build_registry(metrics: Arc<CapturingMetrics>) -> Arc<HandlerRegistry> {
             .build(),
     );
     Arc::new(HandlerRegistry::with_state_and_telemetry(
-        vec![wf_info("ag_source_wf"), wf_info("ag_target_wf")],
+        vec![
+            wf_info("ag_source_wf"),
+            wf_info("ag_target_wf"),
+            wf_info_throttled("ag_throttled_wf"),
+        ],
         vec![],
         autumn_harvest::context::empty_shared_state(),
         telemetry,
@@ -178,10 +195,27 @@ struct CountRow {
     n: i64,
 }
 
+#[derive(diesel::QueryableByName)]
+struct TokenRow {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    t: f64,
+}
+
 async fn target_exec_count(conn: &mut AsyncPgConnection) -> i64 {
     diesel::sql_query(
         "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = 'ag_target_wf'",
     )
+    .get_result::<CountRow>(conn)
+    .await
+    .unwrap()
+    .n
+}
+
+async fn target_exec_count_named(conn: &mut AsyncPgConnection, name: &str) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
     .get_result::<CountRow>(conn)
     .await
     .unwrap()
@@ -655,6 +689,7 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -875,6 +910,7 @@ async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, stat
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1179,5 +1215,243 @@ async fn http_start_blocks_a_prior_that_seals_between_read_and_start() {
         target_exec_count(&mut conn).await,
         1,
         "no fresh replacement slipped the gate (only the sealed prior remains)"
+    );
+}
+
+/// issue #618 (PR #1014): a fresh REQUEST-SCOPED-IDEMPOTENCY (#808) start under an
+/// active gate must be BLOCKED (503) and counted — the gate is enforced inside the
+/// `_idempotent` reservation transaction (`Some(GateMode::Check)`), rolling the
+/// reservation back so a retry can start fresh. Pre-fix (gate arg `None`): the
+/// keyed start slipped the gate uncounted (201/created).
+#[tokio::test]
+async fn keyed_start_blocked_by_gate_is_counted_and_rolls_back_reservation() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    diesel::sql_query("DELETE FROM harvest_start_idempotency")
+        .execute(&mut conn)
+        .await
+        .ok();
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    let api_state = build_api_state(&pool, registry);
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    raise_fleet_gate(&mut conn, &api_state, "keyed-incident").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/workflows/ag_target_wf/start")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "keyed-under-gate")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    set_global_admission_gate_cache(None);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a fresh keyed start under an active gate must be blocked (503)"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(blocked.len(), 1, "block counted exactly once: {blocked:?}");
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "no execution created for the blocked keyed start"
+    );
+    // The reservation rolled back — no idempotency claim persisted.
+    let claims: i64 = diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_start_idempotency")
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .unwrap()
+        .n;
+    assert_eq!(claims, 0, "blocked keyed start rolled back its reservation");
+}
+
+/// issue #618 (PR #1014): a fresh THROTTLED (#607) start under an active gate — the
+/// throttle RESERVES a token, then falls through to the gated plain start path,
+/// which BLOCKS it (503), counts the block once, and REFUNDS the reserved token.
+/// Pre-fix (gate arg `None`): the throttle-reserved start slipped the gate (201).
+#[tokio::test]
+async fn throttle_reserved_start_blocked_by_gate_refunds_token_and_counts() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    let api_state = build_api_state(&pool, registry);
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    raise_fleet_gate(&mut conn, &api_state, "throttle-incident").await;
+
+    // Fresh start: `reserve_or_defer` auto-creates the bucket with `burst` tokens
+    // and reserves one → Reserved → the plain gated start path runs and blocks.
+    let (status, body) = post_json(&app, "/workflows/ag_throttled_wf/start", json!({})).await;
+    set_global_admission_gate_cache(None);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a throttle-reserved fresh start under an active gate must be blocked: {body:?}"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(blocked.len(), 1, "block counted exactly once: {blocked:?}");
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(
+        target_exec_count_named(&mut conn, "ag_throttled_wf").await,
+        0,
+        "no execution created for the blocked throttled start"
+    );
+    // The reserved token was refunded: the bucket is back to full `burst` (10).
+    let bucket = autumn_harvest::throttle::bucket_key("ag_throttled_wf", "");
+    let tokens: f64 =
+        diesel::sql_query("SELECT tokens AS t FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket)
+            .get_result::<TokenRow>(&mut conn)
+            .await
+            .map(|r| r.t)
+            .unwrap_or(10.0);
+    assert!(
+        (tokens - 10.0).abs() < 1e-6,
+        "the reserved token was refunded on the block (tokens = {tokens})"
+    );
+}
+
+/// issue #618 (PR #1014) — THE BATCH TOCTOU FINDING: a batch item whose prior
+/// SEALS (to TERMINATED) between Phase 1's unlocked, policy-blind gate pre-check
+/// (which sees the still-RUNNING committed prior and skips the gate as an
+/// "idempotent retry") and Phase 2's start. Under the fix Phase 2 passes
+/// `Some(GateMode::Check)`, so `_collect` takes the `FOR UPDATE` lock, observes
+/// TERMINATED, creates a fresh replacement, and BLOCKS it — counted once, no
+/// replacement. Pre-fix (Phase 2 gate arg `None`): the fresh replacement slipped
+/// the gate uncounted (item Started, 2 rows).
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn batch_item_blocks_a_prior_that_seals_between_phase1_and_phase2() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    let api_state = build_api_state(&pool, registry);
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    let prior = seed_target_prior(&mut conn, "batch-seal-race", "RUNNING").await;
+    raise_fleet_gate(&mut conn, &api_state, "batch-seal-incident").await;
+
+    // Holder: lock the RUNNING prior FOR UPDATE and seal it to TERMINATED,
+    // uncommitted. Phase 1's plain SELECT sees the committed RUNNING state and
+    // skips the gate; Phase 2's FOR UPDATE lock queues behind the holder.
+    let mut holder = pool.get().await.unwrap();
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("BEGIN").await.unwrap();
+        diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+            .bind::<diesel::sql_types::Uuid, _>(prior)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET state='TERMINATED', completed_at=NOW() \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(prior)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    }
+
+    let app_clone = app.clone();
+    let start_task = tokio::spawn(async move {
+        let body = json!({
+            "atomic": false,
+            "items": [{ "workflow_name": "ag_target_wf", "workflow_id": "batch-seal-race" }]
+        });
+        let resp = app_clone
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workflows/batch_start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+        )
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("COMMIT").await.unwrap();
+    }
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(8), start_task)
+        .await
+        .expect("batch start did not complete within 8s")
+        .expect("join batch task");
+    set_global_admission_gate_cache(None);
+
+    // The batch response is a 200/OK envelope; the item itself must be rejected
+    // (not Started) and the block counted once, with no fresh replacement.
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "batch must not 500: {body:?}"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the batch item block must be counted exactly once: {blocked:?} (body {body:?})"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "no fresh replacement slipped the gate (only the sealed prior remains): {body:?}"
     );
 }

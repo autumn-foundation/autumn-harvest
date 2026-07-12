@@ -191,6 +191,7 @@ async fn start_running_workflow(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow should start")

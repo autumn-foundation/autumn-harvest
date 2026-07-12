@@ -495,6 +495,32 @@ pub const fn sentinel_gate_id() -> Uuid {
 
 // ── StartProducer & producer contract (issue #618) ────────────────────────────
 
+/// How a start path consults the admission gate when enforcement is moved into
+/// the core start primitive (issue #618, PR #1014).
+///
+/// The gate is evaluated inside `start_or_load_workflow_execution_collect` at the
+/// point — under a `FOR UPDATE` lock on any prior run — where it decides it will
+/// CREATE a new execution (a fresh admission). The mode selects which cache read
+/// the primitive performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// Fresh admissions (API start, batch, keyed-#808): fail-closed, retryable.
+    ///
+    /// Consults [`AdmissionGateCache::check`], which returns the synthetic
+    /// sentinel block for every start while the cache is uninitialized /
+    /// fail-closed — so a transient startup / gate-DB read error cannot bypass a
+    /// persisted incident gate. A blocked caller retries.
+    Check,
+    /// In-flight continuation / delivery (webhook delegate, completion-trigger
+    /// relay): consults [`AdmissionGateCache::check_cached`].
+    ///
+    /// Honours only the last-known cached gates snapshot — blocks a REAL matching
+    /// gate but NEVER the fail-closed sentinel — so already-committed
+    /// continuation work is not permanently dropped by a boot/DB blip it cannot
+    /// retry past.
+    CheckCached,
+}
+
 /// A bounded enumeration of the in-process code paths that can start a workflow.
 ///
 /// Used as the low-cardinality `producer` label on

@@ -287,6 +287,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("seed workflow");

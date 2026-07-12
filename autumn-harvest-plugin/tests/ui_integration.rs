@@ -438,6 +438,7 @@ async fn insert_workflow_on_url(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow insert should succeed");
@@ -2205,6 +2206,7 @@ async fn insert_child_workflow_on_url(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("child workflow insert should succeed");
@@ -3368,6 +3370,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow insert should succeed");
@@ -3541,6 +3544,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("workflow insert should succeed");

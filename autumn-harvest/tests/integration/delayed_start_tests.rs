@@ -240,6 +240,7 @@ async fn test_delayed_start_validation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap_err();
@@ -294,6 +295,7 @@ async fn test_delayed_start_validation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap_err();
@@ -411,6 +413,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("should start successfully");
@@ -496,6 +499,7 @@ async fn test_delayed_start_cancel_before_firing() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("should start successfully");
@@ -588,6 +592,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("should start successfully");
@@ -648,6 +653,7 @@ async fn test_immediate_start_skew_tolerance() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("should start successfully");

@@ -378,7 +378,7 @@ mod db_tests {
             origin: None,
             completion_callbacks: None,
         };
-        start_or_load_workflow_execution(&mut conn, first_params)
+        start_or_load_workflow_execution(&mut conn, first_params, None)
             .await
             .expect("first start should succeed");
 
@@ -450,7 +450,7 @@ mod db_tests {
             origin: None,
             completion_callbacks: None,
         };
-        start_or_load_workflow_execution(&mut conn, start_params)
+        start_or_load_workflow_execution(&mut conn, start_params, None)
             .await
             .expect("first start");
 

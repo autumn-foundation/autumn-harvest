@@ -785,7 +785,7 @@ async fn fire_claimed_debounce_row(
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
     match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None,
+        conn, params, true, false, None, None,
     )
     .await
     {

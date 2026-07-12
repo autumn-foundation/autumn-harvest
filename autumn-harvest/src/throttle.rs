@@ -956,7 +956,7 @@ async fn fire_claimed_throttle_row(
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
     // so follow-ups are collected and spawned only after commit.
     match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None,
+        conn, params, true, false, None, None,
     )
     .await
     {

@@ -9858,151 +9858,17 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
-    // issue #377 / issue #618: consult the admission gate before touching the DB.
-    // The gate is CAPTURED here for every non-debounce/non-batch start, but the
-    // *authoritative decision* is made differently per start path (issue #618
-    // round 21):
-    //
-    //   - PURE PLAIN path (no idempotency key, no throttle policy, explicit
-    //     `workflow_id`): NOT decided here. The gate is applied atomically under
-    //     the SAME `FOR UPDATE` lock as the create-vs-attach decision, via
-    //     `execution::gate_checked_start_or_load` at the plain start call below.
-    //     That closes the round-20 residual TOCTOU: an unlocked pre-read could
-    //     decide "attach → skip gate" and then, if the prior sealed before the
-    //     start ran on its own later transaction, `start_or_load` would CREATE a
-    //     fresh replacement that slipped an active gate uncounted (AllowDuplicate
-    //     over a prior that TERMINATED; AllowDuplicateFailedOnly over a prior that
-    //     FAILED/CANCELLED). Locking the prior and deciding the gate on that one
-    //     stable state — exactly as the webhook (round 12) and completion-trigger
-    //     relay (round 19) paths already do — makes the leak impossible by
-    //     construction.
-    //
-    //   - Every other path decides INLINE here from the round-20 policy-aware
-    //     pre-read, because each takes an early exit *before* the locked plain
-    //     start and so cannot borrow that primitive's atomicity:
-    //       * KEYED (#808): runs its own `_idempotent` primitive and returns; the
-    //         #808 committed-replay short-circuits to the `200` no-op above the
-    //         gate, so a keyed start reaching here is a genuinely fresh keyed
-    //         start that must be gated unless it is an explicit-`workflow_id`
-    //         idempotent attach.
-    //       * THROTTLE (#607): a throttle-applicable fresh start must be BLOCKED
-    //         at admission here (not silently deferred to a 202 that the exempt
-    //         scanner later fires), so its gate decision stays inline.
-    //       * auto-generated `workflow_id`: no prior can exist, so the create is
-    //         unconditional — block early (no lock needed, no race to close).
-    //     These retain a bounded pre-read residual (a prior sealing in the
-    //     read→start gap); it is out of this finding's scope (the finding's races
-    //     are both pure-plain) and the coordinator scoped keyed/throttle as
-    //     untouched. A future round can route `_idempotent` under a lock too.
-    let active_gate = if is_debounced_start || has_batch_policy {
-        None
-    } else {
-        let wf_owner = runtime
-            .registry
-            .workflows
-            .get(&workflow_name)
-            .and_then(|i| i.owner);
-        api_state
-            .gate_cache()
-            .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner)
-    };
-    if let Some((gate_id, reason, scope_kind)) = active_gate.as_ref() {
-        // The pure-plain explicit-`workflow_id` case defers its gate decision to
-        // the locked start below; every other path decides inline here.
-        let defer_to_locked_start =
-            explicit_workflow_id && idempotency_key.is_none() && !throttle_applies;
-        if !defer_to_locked_start {
-            // Whether a given (prior state, reuse policy) pair attaches vs.
-            // replaces is decided by the *same* pure matrix the start primitive
-            // uses, `start_will_create_new_execution` (issue #618 round 18/20) —
-            // do NOT fork it, or the gate and the start disagree. A retry can
-            // equally land on an already-pending *throttle* row (#607), which
-            // `reserve_or_defer`'s idempotency shortcut resolves without creating
-            // anything — also not a fresh admission.
-            let is_idempotent_retry = if explicit_workflow_id {
-                match api_state.storage_pool() {
-                    Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
-                        Ok(mut pre_conn) => {
-                            let prior_state = harvest_workflow_executions::table
-                                .filter(
-                                    harvest_workflow_executions::workflow_name.eq(&workflow_name),
-                                )
-                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                                .filter(
-                                    harvest_workflow_executions::state
-                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                                )
-                                .select(harvest_workflow_executions::state)
-                                .first::<String>(&mut pre_conn)
-                                .await
-                                .optional()
-                                .unwrap_or(None);
-                            // Skip the gate only when this start attaches to the
-                            // prior instead of creating a replacement.
-                            let attaches_without_creating =
-                                !autumn_harvest::execution::start_will_create_new_execution(
-                                    prior_state.as_deref(),
-                                    reuse_policy,
-                                );
-                            attaches_without_creating
-                                || (throttle_applies
-                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
-                                        &mut pre_conn,
-                                        &workflow_name,
-                                        &workflow_id,
-                                    )
-                                    .await
-                                    .unwrap_or(false))
-                        }
-                        Err(_) => false,
-                    },
-                    Err(_) => false,
-                }
-            } else {
-                false
-            };
-            if !is_idempotent_retry {
-                // Truncate reason to 64 *characters* (not bytes) for bounded metric
-                // cardinality; char_indices avoids splitting a multi-byte code point.
-                let reason_label = match reason.char_indices().nth(64) {
-                    Some((idx, _)) => &reason[..idx],
-                    None => reason.as_str(),
-                };
-                runtime
-                    .registry
-                    .telemetry()
-                    .metrics
-                    .record_admission_blocked(scope_kind, reason_label);
-                if let Ok(pool) = api_state.storage_pool()
-                    && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-                {
-                    let ar = NewAuditRecord {
-                        actor: &actor,
-                        operation: OP_WORKFLOW_START,
-                        target_type: TARGET_WORKFLOW,
-                        target_id: Some(workflow_name.as_str()),
-                        route_or_command: route,
-                        request_id: request_id.as_deref(),
-                        idempotency_key: None,
-                        status: STATUS_FAILED,
-                        error_summary: Some("admission blocked by gate"),
-                        shard_id: None,
-                        source: &source,
-                    };
-                    let _ = audit::insert_audit(&mut conn, &ar).await;
-                }
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "admission blocked",
-                        "gate_id": gate_id,
-                        "reason": reason,
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
+    // issue #377 / issue #618 (PR #1014): the admission gate is now enforced
+    // AUTHORITATIVELY inside the core start primitive at the point it decides —
+    // under a `FOR UPDATE` lock on any prior run — that it will CREATE a new
+    // execution. The plain / keyed (#808) start calls below pass
+    // `Some(GateMode::Check)`; a blocked fresh admission returns
+    // `HarvestError::AdmissionBlocked` (recorded once by the primitive) which the
+    // match arms map to `503`. This removed the round-20/21 unlocked pre-read gate
+    // decision (which had a residual seal-under-lock TOCTOU) entirely. The
+    // debounce / batch / throttle mutual-exclusion 400s and the #808 committed-
+    // replay probe above are unaffected. NOTE: the auto-generated-workflow_id and
+    // throttle paths reach the same gated plain/keyed start below.
 
     // issue #373: validate input against the workflow's published JSON Schema (if any).
     // Runs before the delayed-start checks so bad inputs fail fast and never
@@ -11246,6 +11112,11 @@ pub(crate) async fn start_workflow(
             key,
             window_secs,
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            // issue #618 (PR #1014): gate the keyed start under the primitive's
+            // reservation transaction. A fresh keyed start blocked by a gate rolls
+            // back the idempotency reservation (retryable); a committed-replay
+            // short-circuited to `200` above never reaches here.
+            Some(autumn_harvest::admission_gate::GateMode::Check),
         )
         .await;
 
@@ -11369,6 +11240,34 @@ pub(crate) async fn start_workflow(
                 )
                     .into_response()
             }
+            Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+                // A fresh keyed start blocked by an active gate under the primitive's
+                // reservation transaction (issue #618, PR #1014). The primitive
+                // already recorded the block count + rolled back the reservation.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "admission blocked",
+                        "gate_id": gate_id,
+                        "reason": reason,
+                    })),
+                )
+                    .into_response()
+            }
             Err(e) => {
                 let err_str = e.to_string();
                 let ar = NewAuditRecord {
@@ -11432,79 +11331,57 @@ pub(crate) async fn start_workflow(
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
         Some(runtime.registry.telemetry().metrics.as_ref());
 
-    // issue #618 round 21: for the pure-plain explicit-`workflow_id` path under an
-    // active gate, decide the gate AND the create-vs-attach outcome under ONE
-    // `FOR UPDATE` lock via `gate_checked_start_or_load` — closing the round-20
-    // TOCTOU where the prior sealed between an unlocked pre-read and the start.
-    // The primitive locks the prior (if any), computes `will_create` from that
-    // stable locked state, applies the gate iff a fresh execution will be created,
-    // and runs `start_or_load(..., in_outer_transaction=true)` in the same
-    // transaction. Every other path already decided its gate inline above, so this
-    // branch is taken only when a gate is active on the pure-plain path; a no-gate
-    // start (or a keyed/throttle path, which decided inline) uses the plain
-    // `_with_metrics` call, byte-for-byte unchanged.
-    let result = if let Some((gate_id, gate_reason, gate_scope)) =
-        active_gate.filter(|_| explicit_workflow_id && !throttle_applies)
-    {
-        match autumn_harvest::execution::gate_checked_start_or_load(
-            &mut conn,
-            start_params,
-            metrics_ref,
-            move |will_create| will_create.then_some((gate_reason, gate_scope)),
-        )
-        .await
-        {
-            Ok(autumn_harvest::execution::GateCheckedStart::Started(started)) => Ok(started),
-            Ok(autumn_harvest::execution::GateCheckedStart::Blocked { reason, scope_kind }) => {
-                // A genuinely fresh admission blocked by an active gate, decided
-                // under the lock. Refund any reserved throttle token (there is
-                // none on this pure-plain path, but mirror the AlreadyExists/Err
-                // arms defensively), count + audit the block, and return 503 —
-                // the same metric, audit row, and response shape the inline
-                // pre-check block produced.
-                if let Some(ref bucket) = throttle_reserved {
-                    let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
-                }
-                let reason_label = match reason.char_indices().nth(64) {
-                    Some((idx, _)) => &reason[..idx],
-                    None => reason.as_str(),
-                };
-                runtime
-                    .registry
-                    .telemetry()
-                    .metrics
-                    .record_admission_blocked(scope_kind, reason_label);
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_WORKFLOW_START,
-                    target_type: TARGET_WORKFLOW,
-                    target_id: Some(workflow_name.as_str()),
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: STATUS_FAILED,
-                    error_summary: Some("admission blocked by gate"),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "admission blocked",
-                        "gate_id": gate_id,
-                        "reason": reason,
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => Err(e),
-        }
-    } else {
-        start_or_load_workflow_execution_with_metrics(&mut conn, start_params, metrics_ref).await
-    };
+    // issue #618 (PR #1014): the admission gate is enforced AUTHORITATIVELY inside
+    // the core start primitive. `Some(GateMode::Check)` makes `_collect` apply the
+    // gate at the point — under a `FOR UPDATE` lock on any prior run — where it
+    // decides it will CREATE a new execution, closing the entire unlocked-pre-read
+    // TOCTOU class (incl. the round-20 seal-under-lock race) in one place. A blocked
+    // fresh admission returns `HarvestError::AdmissionBlocked` (recorded once by the
+    // primitive), handled by the `match result` arm below as `503`. An idempotent
+    // attach admits nothing and is never gated (returns the existing run). This path
+    // is reached by every non-debounce / non-batch start (plain, auto-id, and a
+    // throttle-`Reserved` fall-through — its token is refunded on a block below).
+    let result = start_or_load_workflow_execution_with_metrics(
+        &mut conn,
+        start_params,
+        metrics_ref,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await;
 
     match result {
+        Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            // A genuinely fresh admission blocked by an active gate under the
+            // primitive's `FOR UPDATE` lock (issue #618, PR #1014). The primitive
+            // already recorded the block count. Refund any reserved throttle token,
+            // audit the block, and return 503.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("admission blocked by gate"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response()
+        }
         Err(HarvestError::AlreadyExists {
             existing_exec_id,
             existing_state,
@@ -12433,6 +12310,14 @@ async fn batch_start_workflows(
                 false,
                 item_reject_fresh,
                 Some(runtime.registry.telemetry().metrics.as_ref()),
+                // issue #618 (PR #1014): gate each batch item authoritatively under
+                // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
+                // (Phase 1's policy-blind pre-check can skip the gate for an item
+                // whose prior seals before Phase 2 starts it). A blocked item's
+                // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
+                // `Err(e)` arm below (never a hard batch failure) — the block is
+                // counted once by the primitive.
+                Some(autumn_harvest::admission_gate::GateMode::Check),
             )
             .await;
 
@@ -19234,6 +19119,7 @@ async fn trigger_schedule_now(
             completion_callbacks: None,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        None,
     )
     .await;
 
@@ -20605,6 +20491,7 @@ async fn schedule_backfill(
                         completion_callbacks: None,
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
+                    None,
                 )
                 .await;
                 match result {
@@ -20898,6 +20785,7 @@ async fn schedule_backfill(
                         completion_callbacks: None,
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
+                    None,
                 )
                 .await;
                 match start_result {
@@ -30953,6 +30841,7 @@ mod tests {
                 completion_callbacks: None,
             },
             None,
+            None,
         )
         .await
         .expect("workflow execution should be seeded");
@@ -31032,6 +30921,7 @@ mod tests {
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
             None,
         )
         .await

@@ -255,7 +255,7 @@ pub mod worker;
 pub mod workers;
 
 pub use admission_gate::{
-    AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateScope,
+    AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateMode, GateScope,
     MAX_ACTIVE_GATES, ProducerContractEntry, ProducerGateStatus, StartProducer, check_admission,
     global_admission_gate_cache, producer_contract, set_global_admission_gate_cache,
 };
