@@ -30,10 +30,12 @@ use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
-use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
+use autumn_harvest::types::{ExecutionId, ShardId, UpdateId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{
-    DagCatalog, SchedulerMonitor, StartWorkflowParams, start_or_load_workflow_execution, tick_once,
+    DagCatalog, SchedulerMonitor, SignalWithStartParams, StartWorkflowParams,
+    UpdateWithStartParams, signal_with_start_workflow_execution_with_metrics,
+    start_or_load_workflow_execution, tick_once, update_with_start_workflow_execution_with_metrics,
 };
 use chrono::Utc;
 use diesel::sql_types::{BigInt, Nullable, Text};
@@ -3281,5 +3283,219 @@ async fn scanner_skips_a_source_row_claimed_by_a_concurrent_relay() {
     assert_eq!(
         outbox_remaining, 1,
         "the scanner must NOT delete a row owned by the concurrent relay — it skips it"
+    );
+}
+
+// ── issue #618 F2 (PR #1014 review): signal-/update-with-start gate the fresh
+// create AUTHORITATIVELY under the primitive's lock ───────────────────────────
+//
+// Before this change the signal-/update-with-start HTTP routes gated only via an
+// UNLOCKED pre-check and passed `gate = None` into the core start — the exact
+// unlocked-pre-read pattern the plain `api` start route was moved OFF (it had a
+// residual seal-under-lock / gate-raised-mid-request TOCTOU). A fresh create that
+// slipped that window was an UN-COUNTED admission (no `admission_blocked`, no
+// bypass), violating the "zero un-counted admissions" AC. Threading
+// `Some(GateMode::Check)` into the core makes the fresh-create decision gated
+// under the same `FOR UPDATE` lock the plain start route uses.
+//
+// These tests exercise the core directly with `Some(GateMode::Check)`: before the
+// fix the `_with_metrics` fns did not accept a gate argument (compile-error red,
+// per the repo's #593 red→green precedent); after the fix a fresh create under an
+// active gate is BLOCKED + COUNTED and no execution row is created, while a fresh
+// create with no gate proceeds (positive control).
+
+fn signal_with_start_fresh_params(workflow_id: &'static str) -> SignalWithStartParams<'static> {
+    SignalWithStartParams {
+        workflow_name: "ag_target_wf",
+        workflow_id,
+        exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+        input: json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        signal_name: "go",
+        signal_payload: json!({}),
+        idempotency_key: None,
+        max_workflow_input_bytes: 0,
+        max_signal_payload_bytes: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        reject_fresh_if_debounced: false,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+        workflow_info: None,
+    }
+}
+
+fn update_with_start_fresh_params(workflow_id: &'static str) -> UpdateWithStartParams<'static> {
+    UpdateWithStartParams {
+        workflow_name: "ag_target_wf",
+        workflow_id,
+        exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+        input: json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        update_id: UpdateId::new(),
+        update_name: "bump".to_string(),
+        update_args: json!({}),
+        idempotency_key: None,
+        max_workflow_input_bytes: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+        reject_fresh_if_debounced: false,
+    }
+}
+
+/// A FRESH signal-with-start create (no prior run) under an active Fleet gate is
+/// BLOCKED by the core's authoritative locked gate, records exactly one
+/// `record_admission_blocked`, and leaves NO execution row. Closes the
+/// un-counted-admission window a `gate = None` core left open (issue #618 F2).
+#[tokio::test]
+async fn gate_blocks_fresh_signal_with_start_create() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(Some(fleet_cache("sws-incident")));
+
+    let recorder = CapturingMetrics::default();
+    let outcome = signal_with_start_workflow_execution_with_metrics(
+        &mut conn,
+        signal_with_start_fresh_params("sws-fresh-blocked"),
+        Some(&recorder),
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await;
+
+    set_global_admission_gate_cache(None);
+
+    match outcome {
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => {}
+        Ok(o) => panic!(
+            "a fresh signal-with-start create under an active gate must be BLOCKED, not \
+             admitted (started_fresh={}, state={})",
+            o.started_fresh, o.state
+        ),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+    assert_eq!(
+        recorder.blocked().len(),
+        1,
+        "the block must be COUNTED exactly once on harvest.admission.blocked"
+    );
+    assert_eq!(
+        target_exec_count_named(&mut conn, "ag_target_wf").await,
+        0,
+        "a blocked fresh signal-with-start must roll back with NO execution row"
+    );
+}
+
+/// Positive control: with NO gate active a fresh signal-with-start create
+/// proceeds and no block is recorded — the gate arg does not over-block.
+#[tokio::test]
+async fn signal_with_start_fresh_create_proceeds_without_gate() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    let recorder = CapturingMetrics::default();
+    let outcome = signal_with_start_workflow_execution_with_metrics(
+        &mut conn,
+        signal_with_start_fresh_params("sws-fresh-ok"),
+        Some(&recorder),
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await
+    .expect("no gate: fresh signal-with-start must succeed");
+
+    assert!(outcome.started_fresh, "must be a fresh create");
+    assert!(
+        recorder.blocked().is_empty(),
+        "no gate active: no admission_blocked must be recorded"
+    );
+    assert_eq!(
+        target_exec_count_named(&mut conn, "ag_target_wf").await,
+        1,
+        "the fresh run must be created"
+    );
+}
+
+/// The update-with-start twin of `gate_blocks_fresh_signal_with_start_create`:
+/// a FRESH update-with-start create under an active gate is BLOCKED + COUNTED
+/// with no execution row (issue #618 F2, symmetric fix).
+#[tokio::test]
+async fn gate_blocks_fresh_update_with_start_create() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(Some(fleet_cache("uws-incident")));
+
+    let recorder = CapturingMetrics::default();
+    let outcome = update_with_start_workflow_execution_with_metrics(
+        &mut conn,
+        update_with_start_fresh_params("uws-fresh-blocked"),
+        Some(&recorder),
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await;
+
+    set_global_admission_gate_cache(None);
+
+    match outcome {
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => {}
+        Ok(o) => panic!(
+            "a fresh update-with-start create under an active gate must be BLOCKED \
+             (started_fresh={}, state={})",
+            o.started_fresh, o.state
+        ),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+    assert_eq!(
+        recorder.blocked().len(),
+        1,
+        "the block must be COUNTED once"
+    );
+    assert_eq!(
+        target_exec_count_named(&mut conn, "ag_target_wf").await,
+        0,
+        "a blocked fresh update-with-start must roll back with NO execution row"
     );
 }

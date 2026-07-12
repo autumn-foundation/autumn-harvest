@@ -13312,6 +13312,16 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_info: runtime.registry.workflows.get(&workflow_name),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
+        // primitive's `FOR UPDATE` lock, not just at the unlocked pre-check above.
+        // The pre-check catches the common case (gate already active when the
+        // request lands) and additionally blocks attaches; this closes the
+        // residual request-internal TOCTOU where a gate is raised between that
+        // pre-check and the locked create — mirroring the plain `api` start route,
+        // which was moved off an unlocked pre-read for exactly this window. A
+        // pre-check block short-circuits before this call, so a fresh create is
+        // never double-counted.
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
     .await;
 
@@ -13878,6 +13888,11 @@ async fn update_with_start_workflow(
         &mut conn,
         params,
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
+        // primitive's lock (see the sibling comment on the signal-with-start
+        // route). Closes the residual pre-check→locked-create TOCTOU; a pre-check
+        // block short-circuits before this call, so no double-count.
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
     .await;
 

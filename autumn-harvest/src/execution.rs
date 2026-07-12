@@ -3076,7 +3076,7 @@ pub async fn signal_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
 ) -> HarvestResult<SignalWithStartOutcome> {
-    signal_with_start_workflow_execution_with_metrics(conn, request, None).await
+    signal_with_start_workflow_execution_with_metrics(conn, request, None, None).await
 }
 
 /// # Errors
@@ -3088,6 +3088,16 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Admission gate (issue #618, PR #1014). Threaded into the fresh-create start
+    // calls below so a signal-with-start that CREATES a new execution is gated
+    // AUTHORITATIVELY under the primitive's `FOR UPDATE` lock — closing the
+    // request-internal TOCTOU that an unlocked pre-check alone leaves open (the
+    // exact seal-under-lock/gate-raised-mid-request window the plain `api` start
+    // route was moved off an unlocked pre-read to close). `None` for the
+    // continuation/example callers; the HTTP route passes `Some(GateMode::Check)`.
+    // The `reject_fresh_if_debounced` branch stays `None` — debounce owns its own
+    // admission (bypass-counted scanner relay).
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
@@ -3252,7 +3262,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             true,
                             false,
                             metrics,
-                            None,
+                            gate,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -3305,7 +3315,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             true,
                             false,
                             metrics,
-                            None,
+                            gate,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -3676,7 +3686,7 @@ pub async fn update_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: UpdateWithStartParams<'_>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
-    update_with_start_workflow_execution_with_metrics(conn, request, None).await
+    update_with_start_workflow_execution_with_metrics(conn, request, None, None).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3684,6 +3694,13 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: UpdateWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Admission gate (issue #618, PR #1014) — see the sibling doc on
+    // `signal_with_start_workflow_execution_with_metrics`. Threaded into the
+    // fresh-create start calls so an update-with-start that CREATES is gated
+    // authoritatively under the primitive's lock; the HTTP route passes
+    // `Some(GateMode::Check)`, continuation/example callers pass `None`, and the
+    // `reject_fresh_if_debounced` branch stays `None`.
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
     // Capture the queue for the post-commit update.admitted metric (issue #684)
     // before `request` is moved into the transaction closure. The update name is
@@ -3814,7 +3831,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         true,
                         false,
                         metrics,
-                        None,
+                        gate,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);
@@ -3854,7 +3871,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         true,
                         false,
                         metrics,
-                        None,
+                        gate,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);
