@@ -1212,6 +1212,7 @@ async fn test_mixed_timer_suspension_signal_resolves_inline_wakes_immediately() 
             "target-inline-signal-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1237,6 +1238,7 @@ async fn test_mixed_timer_suspension_signal_resolves_inline_wakes_immediately() 
             "caller-inline-signal-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1345,6 +1347,7 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
             "target-inline-cancel-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1370,6 +1373,7 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
             "caller-inline-cancel-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1493,6 +1497,7 @@ async fn test_pure_timer_after_inline_external_does_not_false_wake() {
             "target-pure-timer-guard-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1518,6 +1523,7 @@ async fn test_pure_timer_after_inline_external_does_not_false_wake() {
             "caller-pure-timer-guard-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
