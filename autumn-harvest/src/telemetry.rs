@@ -665,12 +665,16 @@ pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
 /// The consumed-set is computed in the executor's terminal arms (the only place
 /// the driven matcher exists) and **carried out on the terminal
 /// [`WorkflowOutcome`](crate::executor::WorkflowOutcome)**; the **worker** emits
-/// this counter from that map at the same site and under the same suppressions
-/// as [`METRIC_WORKFLOW_TERMINAL`] (issue #519) — downstream of the issue #603
-/// ND-block gate and the fast-path pause discard, so an ND-blocked or
-/// paused-then-discarded cycle never over-counts. Signals excused by a lost
-/// signal-or-deadline race (issue #476) are never counted. Labeled by
-/// `workflow`, `name`, and `queue`.
+/// this counter from that map **post-commit, in its `Persisted` arm** — the same
+/// discipline as [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] — so the
+/// counter represents **durable terminal outcomes only**. That arm is reached
+/// only after the persist transaction commits, downstream of the issue #603
+/// ND-block gate (`Failed{nd:Some}` early-returns before persist) and
+/// `check_paused_and_park` (a claimed-then-paused race returns via
+/// `ParkedPaused`, and a persist failure via the `Err` arm — neither reaches the
+/// emit). A retry/resume of such a discarded cycle therefore cannot double-count.
+/// Signals excused by a lost signal-or-deadline race (issue #476) are never
+/// counted. Labeled by `workflow`, `name`, and `queue`.
 ///
 /// **Coverage scope — KNOWN LIMITATION (deliberate):** this is emitted only
 /// from graceful `Completed`/`Failed` terminals reached through the workflow

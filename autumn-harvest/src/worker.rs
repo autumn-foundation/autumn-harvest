@@ -3582,15 +3582,39 @@ fn emit_update_result_metrics(
     }
 }
 
+/// Extract the terminal outcome's `unhandled_signals` map for post-commit
+/// emission (issue #684, Codex P2).
+///
+/// Populated only on [`WorkflowOutcome::Completed`] / [`WorkflowOutcome::Failed`];
+/// empty for `Suspended` (not terminal) and `ContinuedAsNew` (carries no map).
+/// The caller collects this **before** the persist transaction moves `outcome`
+/// and emits it only in the `Persisted` arm, so `harvest.signal.unhandled`
+/// counts durable terminal outcomes exactly once — a `ParkedPaused` discard or
+/// a persist failure returns before the emit and never over-counts.
+fn outcome_unhandled_signals(outcome: &WorkflowOutcome) -> std::collections::BTreeMap<String, u64> {
+    match outcome {
+        WorkflowOutcome::Completed {
+            unhandled_signals, ..
+        }
+        | WorkflowOutcome::Failed {
+            unhandled_signals, ..
+        } => unhandled_signals.clone(),
+        _ => std::collections::BTreeMap::new(),
+    }
+}
+
 /// Emit `harvest.signal.unhandled` once per unconsumed occurrence from a
 /// terminal outcome's `unhandled_signals` map (issue #684).
 ///
-/// Called only from the worker's `record_workflow_terminal` site (Completed /
-/// Failed arms), so it inherits #519's exact suppression discipline: the #603
-/// ND-block gate and the fast-path pause discard have already returned early,
-/// and Cancel/Terminate/Execution-timeout/Parent-close never carry a driven
-/// matcher (and so never a populated map). The map is empty for every other
-/// path, making this a no-op there.
+/// Called only from the worker's post-commit `Persisted` arm (the same
+/// discipline as `harvest.update.completed/failed`), so the counter represents
+/// DURABLE terminal outcomes only: this arm is reached only after the persist
+/// transaction commits, downstream of the #603 ND-block gate (`Failed{nd:Some}`
+/// early-returns before persist) and `check_paused_and_park` (a claimed-then-
+/// paused race returns via `ParkedPaused`, never here). Cancel/Terminate/
+/// Execution-timeout/Parent-close never carry a driven matcher (and so never a
+/// populated map). The map is empty for every non-terminal path, making this a
+/// no-op there.
 fn emit_unhandled_signal_metrics(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     workflow_name: &str,
@@ -9871,31 +9895,22 @@ async fn process_workflow_task(
     // Suspended is not a terminal state — a workflow that suspends N times
     // and then completes must produce exactly one `completed` increment.
     //
-    // Issue #684: harvest.signal.unhandled is emitted from the SAME match, from
-    // the terminal outcome's `unhandled_signals` map, so it inherits #519's
-    // exact suppression + exactly-once discipline: this site is downstream of
-    // the #603 ND-block gate (an ND-carrying Failed returned early above) and
-    // the fast-path pause discard, and the residual persist-time
-    // pause-race/persist-failure double-count edge is identical to #519's own.
+    // Issue #684: harvest.signal.unhandled is NOT emitted here. It is collected
+    // below (before the persist transaction moves `outcome`) and emitted
+    // post-commit in the `Persisted` arm — the same discipline as
+    // harvest.update.completed/failed — so it represents DURABLE terminal
+    // outcomes only. This site (`record_workflow_terminal`, #519) keeps its own
+    // pre-persist placement unchanged.
     match &outcome {
-        WorkflowOutcome::Completed {
-            unhandled_signals, ..
-        } => {
+        WorkflowOutcome::Completed { .. } => {
             telemetry.metrics.record_workflow_terminal(
                 &prepared.execution.workflow_name,
                 &task.queue_name,
                 WorkflowStatus::Completed,
             );
-            emit_unhandled_signal_metrics(
-                telemetry.metrics.as_ref(),
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                unhandled_signals,
-            );
         }
         WorkflowOutcome::Failed {
             non_deterministic_details,
-            unhandled_signals,
             ..
         } => {
             // Defensive (issue #603): an ND-carrying Failed outcome is gated
@@ -9918,14 +9933,6 @@ async fn process_workflow_task(
                 &prepared.execution.workflow_name,
                 &task.queue_name,
                 WorkflowStatus::Failed,
-            );
-            // Issue #684: a failed run with leftover signals is legitimately
-            // "unhandled" — same emission as the completed arm.
-            emit_unhandled_signal_metrics(
-                telemetry.metrics.as_ref(),
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                unhandled_signals,
             );
         }
         WorkflowOutcome::ContinuedAsNew { .. } => telemetry.metrics.record_workflow_terminal(
@@ -10049,6 +10056,16 @@ async fn process_workflow_task(
         &history_events,
         update_result_command_source(&outcome, &pending_cmds),
     );
+    // Issue #684 (Codex P2): extract the terminal outcome's unhandled-signal
+    // map now, before the persist transaction moves `outcome`. Emitted only
+    // post-commit in the `Persisted` arm (same discipline as
+    // update.completed/failed), so a ParkedPaused discard or persist failure
+    // never counts a signal that never became a durable terminal — and a
+    // retry/resume of that discarded cycle cannot double-count it. The map is
+    // populated only on Completed/Failed and is empty for Suspended/CAN (and,
+    // via the #603 gate returning early above, never reaches here on an
+    // ND-carrying Failed), so this is a no-op on every non-terminal path.
+    let unhandled_signal_metrics = outcome_unhandled_signals(&outcome);
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -10157,6 +10174,20 @@ async fn process_workflow_task(
                 &prepared.execution.workflow_name,
                 &update_metric_queue,
                 &update_result_metrics,
+            );
+            // Issue #684 (Codex P2): emit harvest.signal.unhandled post-commit
+            // too, so it represents DURABLE terminal outcomes only (mirrors
+            // update.completed/failed). This arm is reached only after the
+            // persist transaction committed, which is downstream of both the
+            // #603 ND-block gate (Failed{nd:Some} early-returns before persist)
+            // and `check_paused_and_park` (a claimed-then-paused race returns
+            // via the ParkedPaused arm below, never here). The map is empty on
+            // every non-terminal outcome, so this is a no-op there.
+            emit_unhandled_signal_metrics(
+                telemetry.metrics.as_ref(),
+                &prepared.execution.workflow_name,
+                &update_metric_queue,
+                &unhandled_signal_metrics,
             );
         }
         Err(error) => {
@@ -15940,5 +15971,90 @@ mod tests {
             collect_update_result_metrics(&history, &cmds),
             vec![("unknown".to_owned(), true)]
         );
+    }
+
+    // ── signal.unhandled post-commit collection (issue #684, Codex P2) ─────
+
+    /// A recording sink capturing every `record_signal_unhandled` call so
+    /// `emit_unhandled_signal_metrics` can be asserted directly.
+    #[derive(Default)]
+    struct SignalUnhandledSink {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    impl crate::telemetry::MetricsRecorder for SignalUnhandledSink {
+        fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+            self.calls.lock().unwrap().push((
+                workflow_name.to_owned(),
+                signal_name.to_owned(),
+                queue.to_owned(),
+            ));
+        }
+    }
+
+    fn completed_with_signals(pairs: &[(&str, u64)]) -> WorkflowOutcome {
+        WorkflowOutcome::Completed {
+            output: Value::Null,
+            unhandled_signals: pairs.iter().map(|(n, c)| ((*n).to_owned(), *c)).collect(),
+        }
+    }
+
+    #[test]
+    fn outcome_unhandled_signals_reads_terminal_maps_and_is_empty_otherwise() {
+        // Completed / Failed carry the map; Suspended / ContinuedAsNew do not.
+        // This is the pre-persist collection the worker feeds to the post-commit
+        // `Persisted`-arm emission — so nothing to emit exists for a non-terminal
+        // outcome, and the terminal map is captured before persist moves it.
+        assert_eq!(
+            outcome_unhandled_signals(&completed_with_signals(&[("late", 2)])),
+            std::collections::BTreeMap::from([("late".to_owned(), 2u64)]),
+        );
+        assert_eq!(
+            outcome_unhandled_signals(&WorkflowOutcome::Failed {
+                error: "boom".into(),
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::from([("x".to_owned(), 1u64)]),
+            }),
+            std::collections::BTreeMap::from([("x".to_owned(), 1u64)]),
+        );
+        assert!(
+            outcome_unhandled_signals(&WorkflowOutcome::Suspended { commands: vec![] }).is_empty(),
+            "a Suspended outcome is not terminal — nothing to emit"
+        );
+        assert!(
+            outcome_unhandled_signals(&WorkflowOutcome::ContinuedAsNew { input: Value::Null })
+                .is_empty(),
+            "continue-as-new carries no unhandled-signal map"
+        );
+    }
+
+    #[test]
+    fn emit_unhandled_signal_metrics_fires_once_per_occurrence() {
+        let sink = SignalUnhandledSink::default();
+        let map =
+            std::collections::BTreeMap::from([("a".to_owned(), 2u64), ("b".to_owned(), 1u64)]);
+        emit_unhandled_signal_metrics(&sink, "wf", "q", &map);
+        let calls = sink.calls.lock().unwrap().clone();
+        // 2 occurrences of "a" + 1 of "b" = 3 emissions, each carrying labels.
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.iter().filter(|(_, s, _)| s == "a").count(), 2);
+        assert!(calls.iter().all(|(w, _, q)| w == "wf" && q == "q"));
+    }
+
+    #[test]
+    fn emit_unhandled_signal_metrics_is_a_noop_for_the_empty_collected_map() {
+        // The `Persisted` arm always calls emit with the pre-collected map; for
+        // a non-terminal (or empty-terminal) outcome that map is empty, so no
+        // counter fires. This is the structural companion to the DB test that a
+        // ParkedPaused / persist-failure cycle — which returns before the
+        // `Persisted` arm entirely — emits nothing.
+        let sink = SignalUnhandledSink::default();
+        emit_unhandled_signal_metrics(
+            &sink,
+            "wf",
+            "q",
+            &outcome_unhandled_signals(&WorkflowOutcome::Suspended { commands: vec![] }),
+        );
+        assert!(sink.calls.lock().unwrap().is_empty());
     }
 }

@@ -1219,16 +1219,17 @@ async fn completion_never_touches_search_attrs_on_a_row_that_was_never_nd_blocke
     );
 }
 
-/// Issue #684 (FIX 2): `harvest.signal.unhandled` is emitted from the same
-/// worker site as `record_workflow_terminal` (#519) — downstream of the #603
-/// ND-block gate. So an ND-blocked cycle that carries an undrained signal must
-/// emit ZERO `signal.unhandled`, while a genuine terminal DOES emit exactly one.
-/// This is the falsifiable proof that emission moved off the executor's
-/// pre-gate path (where an earlier cut over-counted every ND-block cycle).
+/// Issue #684 (FIX 2): `harvest.signal.unhandled` is emitted post-commit from
+/// the worker's `Persisted` arm — downstream of the #603 ND-block gate. So an
+/// ND-blocked cycle that carries an undrained signal must emit ZERO
+/// `signal.unhandled`, while a genuine terminal DOES emit exactly one. This is
+/// the falsifiable proof that emission moved off the executor's pre-gate path
+/// (where an earlier cut over-counted every ND-block cycle) and is now gated on
+/// a durable commit.
 /// Issue #684 (FIX 2), positive case: a genuine terminal (Completed) that left
 /// a delivered signal undrained emits exactly one `harvest.signal.unhandled`
-/// with workflow+name+queue labels — the worker emits it from the terminal
-/// outcome's `unhandled_signals` map.
+/// with workflow+name+queue labels — the worker emits it post-commit from the
+/// terminal outcome's `unhandled_signals` map.
 #[tokio::test]
 async fn genuine_terminal_with_undrained_signal_emits_signal_unhandled() {
     let (url, _c) = setup_env_or_container().await;
@@ -1295,13 +1296,15 @@ async fn genuine_terminal_with_undrained_signal_emits_signal_unhandled() {
 /// Issue #684 (FIX 2), suppression case: an ND-blocked cycle emits ZERO
 /// `harvest.signal.unhandled`.
 ///
-/// `record_signal_unhandled` is emitted from the *exact same worker match arm*
-/// as `record_workflow_terminal` (#519) — both live only in the Completed /
-/// Failed arms at `process_workflow_task`, downstream of the #603 ND-block gate
-/// that returns early via `block_workflow_for_non_determinism`. So proving the
-/// ND-block cycle never reaches that site — `terminal_failed_count == 0`, the
-/// same invariant `divergent_replay_blocks_instead_of_failing` already asserts —
-/// is the co-located proof that signal.unhandled is suppressed identically. A
+/// `record_signal_unhandled` is emitted from the worker's post-commit
+/// `Persisted` arm at `process_workflow_task` (the same discipline as
+/// `harvest.update.completed/failed`), which is downstream of both the #603
+/// ND-block gate (returns early via `block_workflow_for_non_determinism`) and
+/// the `record_workflow_terminal` (#519) site. So proving the ND-block cycle
+/// never reaches the terminal site — `terminal_failed_count == 0`, the same
+/// invariant `divergent_replay_blocks_instead_of_failing` already asserts —
+/// proves it never reaches the (strictly-later) `Persisted` arm either, so
+/// signal.unhandled is suppressed identically. A
 /// signal is deliberately NOT injected into the *diverging* history: an
 /// out-of-band `SignalReceived` at the divergence frontier changes the replay
 /// outcome (v2 no longer diverges); the positive case is
