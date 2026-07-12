@@ -621,6 +621,34 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
     }
 }
 
+/// Collect preflight failures for DAG task references to unregistered
+/// activities.
+fn dag_unregistered_activity_failures<'a>(
+    dags: impl IntoIterator<Item = (&'a str, &'a [autumn_harvest::DagTask])>,
+    is_registered_activity: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (dag_name, tasks) in dags {
+        for task in tasks {
+            // A signal/timer gate (issue #746) stores its *signal* name in
+            // `activity_name` but dispatches no activity, so its identifier must
+            // not be validated against the activity catalog — otherwise a valid
+            // signal-gate DAG false-fails preflight before rollout. Mirror of the
+            // builder's `validate_dags_do_not_use_local_activities` gate skip.
+            if task.signal.is_some() {
+                continue;
+            }
+            if !is_registered_activity(&task.activity_name) {
+                failures.push(format!(
+                    "dag '{dag_name}' references unregistered activity '{}'",
+                    task.activity_name
+                ));
+            }
+        }
+    }
+    failures
+}
+
 fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResult {
     let Ok(runtime) = api_state.runtime() else {
         return check(
@@ -635,21 +663,13 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
         );
     };
 
-    let mut failures = Vec::new();
-    for dag in runtime.dags().values() {
-        for task in dag.definition.tasks() {
-            if !runtime
-                .registry()
-                .activities
-                .contains_key(&task.activity_name)
-            {
-                failures.push(format!(
-                    "dag '{}' references unregistered activity '{}'",
-                    dag.name, task.activity_name
-                ));
-            }
-        }
-    }
+    let mut failures = dag_unregistered_activity_failures(
+        runtime
+            .dags()
+            .values()
+            .map(|dag| (dag.name.as_str(), dag.definition.tasks())),
+        |name| runtime.registry().activities.contains_key(name),
+    );
     for activity in runtime.registry().activities.values() {
         if activity.default_queue == Some("") {
             failures.push(format!(
@@ -1393,5 +1413,77 @@ mod tests {
         assert!(sql.contains("has_sequence_privilege"));
         assert!(sql.contains("harvest_events_id_seq"));
         assert!(sql.contains("USAGE"));
+    }
+
+    fn activity_task(name: &str) -> autumn_harvest::DagTask {
+        autumn_harvest::DagTask {
+            activity_name: name.to_string(),
+            upstreams: Vec::new(),
+            trigger_rule: autumn_harvest::TriggerRule::AllSuccess,
+            retry_policy: None,
+            start_to_close: None,
+            queue: None,
+            map_upstream: None,
+            map_failure_policy: autumn_harvest::MapFailurePolicy::FailFast,
+            condition: None,
+            signal: None,
+        }
+    }
+
+    fn signal_gate_task(signal_name: &str) -> autumn_harvest::DagTask {
+        autumn_harvest::DagTask {
+            signal: Some(autumn_harvest::DagSignalGate {
+                signal_name: signal_name.to_string(),
+                timeout: None,
+                on_timeout: autumn_harvest::GateTimeoutAction::FailRun,
+            }),
+            ..activity_task(signal_name)
+        }
+    }
+
+    #[test]
+    fn catalog_check_skips_signal_gate_nodes() {
+        // A signal/timer gate (issue #746) stores its *signal* name in
+        // `activity_name` but dispatches no activity, so preflight must not
+        // report the gate identifier as an unregistered activity.
+        let registered: HashSet<&str> = ["extract", "load"].into_iter().collect();
+        let tasks = vec![
+            activity_task("extract"),
+            signal_gate_task("approval"), // signal name is NOT a registered activity
+            activity_task("load"),
+        ];
+
+        let failures = dag_unregistered_activity_failures(
+            std::iter::once(("etl_with_gate", tasks.as_slice())),
+            |name| registered.contains(name),
+        );
+
+        assert!(
+            failures.is_empty(),
+            "signal gate node must not be flagged as an unregistered activity: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_check_still_flags_genuinely_unregistered_activities() {
+        let registered: HashSet<&str> = std::iter::once("extract").collect();
+        let tasks = vec![
+            activity_task("extract"),
+            signal_gate_task("approval"),
+            activity_task("missing_activity"),
+        ];
+
+        let failures = dag_unregistered_activity_failures(
+            std::iter::once(("etl_with_gate", tasks.as_slice())),
+            |name| registered.contains(name),
+        );
+
+        assert_eq!(
+            failures,
+            vec![
+                "dag 'etl_with_gate' references unregistered activity 'missing_activity'"
+                    .to_string()
+            ]
+        );
     }
 }

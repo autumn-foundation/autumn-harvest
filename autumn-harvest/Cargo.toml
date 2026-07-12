@@ -116,6 +116,10 @@ name = "signal_aggregator"
 name = "activity_interceptor"
 required-features = ["testing"]
 
+[[example]]
+name = "dag_approval_gate"
+required-features = ["unified-dag-execution"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

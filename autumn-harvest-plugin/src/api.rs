@@ -8822,12 +8822,13 @@ async fn get_workflow_stack(
     let inputs_truncated_for_budget = decoder
         .as_ref()
         .map(|_| apply_input_response_budget(&mut pending_activities, default_input_cap));
-    let pending_local_activities = harvest_events::table
+    let mut pending_local_activities = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any([
             "LocalActivityScheduled",
             "LocalActivityCompleted",
             "LocalActivityFailed",
+            "LocalActivityExhausted",
         ]))
         .order(harvest_events::event_id.asc())
         .select((
@@ -8842,14 +8843,19 @@ async fn get_workflow_stack(
         .fold(
             std::collections::BTreeMap::<String, PendingLocalActivity>::new(),
             |mut acc, (event_type, event_data, ts)| {
+                // `harvest_events.event_data` stores the full adjacently-tagged
+                // envelope `{"type": ..., "data": {...}}`, so the event's own
+                // fields live under `.data`, not at the top level (#773).
                 let activity_id = event_data
-                    .get("activity_id")
+                    .get("data")
+                    .and_then(|d| d.get("activity_id"))
                     .and_then(serde_json::Value::as_str)
                     .map(ToOwned::to_owned);
                 match (event_type.as_str(), activity_id) {
                     ("LocalActivityScheduled", Some(activity_exec_id)) => {
                         let activity_name = event_data
-                            .get("name")
+                            .get("data")
+                            .and_then(|d| d.get("name"))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_string();
@@ -8857,20 +8863,15 @@ async fn get_workflow_stack(
                         // string on the event, which is what
                         // `LocalActivityFailed.activity_id` (and hence the
                         // failure map key) also carries — parse it to look up
-                        // the most-recent failure (issue #773). Decode the
-                        // error inline (issue #608) so the read-path decode is
-                        // scoped to the SURFACED local activities only (P3), and
-                        // fold it into `decode_outcome` for the audit row.
+                        // the most-recent failure (issue #773). Attach the RAW
+                        // (undecoded) failure here; decoding is deferred until
+                        // after the fold so an entry a later terminal event
+                        // removes is never decoded or audited, keeping the #608
+                        // read-path decode scoped to the local activities
+                        // actually surfaced (Codex P2, PR #1022).
                         let last_failure = uuid::Uuid::parse_str(&activity_exec_id)
                             .ok()
-                            .and_then(|aid| failures_by_activity.get(&aid).cloned())
-                            .map(|mut failure| {
-                                if let Some(codecs) = decoder.as_ref() {
-                                    decode_outcome = decode_outcome
-                                        .merged(decode_error_field(codecs, &mut failure.error));
-                                }
-                                failure
-                            });
+                            .and_then(|aid| failures_by_activity.get(&aid).cloned());
                         acc.insert(
                             activity_exec_id.clone(),
                             PendingLocalActivity {
@@ -8888,7 +8889,19 @@ async fn get_workflow_stack(
                             },
                         );
                     }
-                    ("LocalActivityCompleted", Some(activity_exec_id)) => {
+                    // Both `LocalActivityCompleted` (success) and
+                    // `LocalActivityExhausted` (terminal retry-budget failure,
+                    // issue #773) close the local activity, so remove the
+                    // pending entry for either. A *bare* `LocalActivityFailed`
+                    // (mid-retry, no following `LocalActivityExhausted`) falls
+                    // through and correctly stays pending. Without this, a
+                    // workflow that catches a terminal local-activity failure
+                    // and keeps running would report the exhausted activity as
+                    // pending forever (Codex review, PR #1022).
+                    (
+                        "LocalActivityCompleted" | "LocalActivityExhausted",
+                        Some(activity_exec_id),
+                    ) => {
                         acc.remove(&activity_exec_id);
                     }
                     _ => {}
@@ -8898,6 +8911,22 @@ async fn get_workflow_stack(
         )
         .into_values()
         .collect::<Vec<_>>();
+    // Decode each SURVIVING pending local activity's `last_failure` error inline
+    // (issue #608), folding into `decode_outcome` for the audit row. Deferred to
+    // here — rather than inside the fold's `LocalActivityScheduled` arm — so a
+    // failure whose pending entry a later `LocalActivityCompleted`/`Exhausted`
+    // event removed is never decoded or audited (a removed entry is not
+    // surfaced, so touching `decode_outcome` for it would write a spurious
+    // `payload.decode_read` audit row for data that never left the handler —
+    // Codex P2, PR #1022).
+    if let Some(codecs) = decoder.as_ref() {
+        for pla in &mut pending_local_activities {
+            if let Some(failure) = pla.last_failure.as_mut() {
+                decode_outcome =
+                    decode_outcome.merged(decode_error_field(codecs, &mut failure.error));
+            }
+        }
+    }
     let pending_timers = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_timers::fired.eq(false))

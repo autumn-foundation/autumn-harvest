@@ -21,6 +21,7 @@ mod cross_workflow_cancel_tests;
 mod cross_workflow_signal_tests;
 mod dag_builder;
 mod dag_mapping_tests;
+mod dag_signal_gate_tests;
 #[cfg(all(feature = "testing", feature = "unified-dag-execution"))]
 mod dag_unified_tests;
 mod dashboard_pack_docs;
