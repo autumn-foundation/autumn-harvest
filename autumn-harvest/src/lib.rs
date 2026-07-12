@@ -52,6 +52,11 @@ const _MIGRATIONS_LIST: &str = env!("HARVEST_MIGRATIONS_LIST");
 /// `&'static str` with no dependency on Diesel, so it is reachable from every
 /// test context — including the plugin crate's integration tests and no-default
 /// builds — without feature juggling.
+///
+/// `#[doc(hidden)]`: this is a test-support helper, not part of the engine's
+/// semver-stable public surface. It stays `pub` so the plugin crate's
+/// integration tests can call it across the crate boundary.
+#[doc(hidden)]
 #[must_use]
 pub const fn full_migrations_sql() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/all_migrations_bundle.sql"))

@@ -83,29 +83,47 @@ fn full_migrations_sql_bundle_is_complete() {
     let bundle = autumn_harvest::full_migrations_sql();
     assert!(!bundle.is_empty(), "migration bundle must not be empty");
 
-    // A sentinel from the very first migration (the initial schema)...
+    // A sentinel from the very first migration (the initial schema) proves the
+    // bundle carries real SQL content, not just headers.
     assert!(
         bundle.contains("CREATE TABLE harvest_workflow_executions"),
         "bundle must include the initial-schema migration"
     );
-    // ...and a sentinel from a much later migration (the build-policy ramp,
-    // 20260704000001 — precisely the migration nd_block_tests was missing). If
-    // the bundle stopped short, this would be absent.
+
+    // STRONG completeness: build.rs prepends `-- harvest-migration: <dir>` before
+    // each migration's up.sql, so the bundle must contain exactly one such header
+    // for EVERY entry in HARVEST_MIGRATIONS_LIST. This catches a bundle truncated
+    // after ANY migration — not merely the tail — which a single mid-list column
+    // sentinel (the old `target_build_id` check) would miss.
+    let names: Vec<&str> = MIGRATIONS_LIST
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| !bundle.contains(&format!("-- harvest-migration: {name}")))
+        .collect();
+    missing.sort_unstable();
     assert!(
-        bundle.contains("target_build_id"),
-        "bundle must include the build-policy-ramp migration (20260704000001); \
-         a missing tail column here is the exact drift class this guard prevents"
-    );
-    assert!(
-        bundle.contains("ramp_percent"),
-        "bundle must include the build-policy-ramp migration columns"
+        missing.is_empty(),
+        "full_migrations_sql() is missing {} of {} migration(s) — the bundle drifted from \
+         the migrations/ tree: {missing:?}",
+        missing.len(),
+        names.len()
     );
 
-    // The bundle must cover every enumerated migration directory: a rough
-    // lower bound is that it is at least as long as the number of migrations
-    // times a plausible minimum per-file size. Cheaper and more direct: assert
-    // the number of migrations is non-trivial and the bundle is substantial.
-    let migration_count = MIGRATIONS_LIST.split(',').filter(|s| !s.is_empty()).count();
+    // Explicit tail check: the newest (last, since the list is timestamp-sorted)
+    // migration's header must be present, so a truncated bundle can never pass.
+    let newest = names.last().expect("at least one migration");
+    assert!(
+        bundle.contains(&format!("-- harvest-migration: {newest}")),
+        "bundle must include the newest migration ({newest}); a missing tail is the exact \
+         drift class this guard prevents"
+    );
+
+    let migration_count = names.len();
     assert!(
         migration_count >= 70,
         "expected the full migration set ({migration_count} found)"

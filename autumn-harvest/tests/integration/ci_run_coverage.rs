@@ -1,19 +1,30 @@
 //! CI run-step coverage guard — no DB, no feature gate.
 //!
-//! Prevents the "silently-never-run DB test" class of bug: a testcontainers /
-//! `HARVEST_TEST_DATABASE_URL` integration test that compiles in CI (via
-//! `--no-run` and clippy) but is never *executed* against a live Postgres, so a
-//! real runtime failure stays invisible until it reaches production. Example:
-//! `nd_block_tests` was missing the `build_policy_ramp` migration, making every
-//! workflow start fail `column "target_build_id" does not exist`.
+//! Purpose: catch the "silently-never-run DB test" class of gap. A DB-gated
+//! integration test (core or plugin) can *compile* in CI — via `--no-run` and
+//! clippy — yet never be *executed* against a live Postgres, so any real
+//! runtime failure stays invisible. `workflow_retry_tests` is a live example:
+//! six of its nine DB tests never ran in CI (the run step is limited to a
+//! `::workflow_typed` sub-filter), hiding three genuine workflow-level-retry
+//! bugs.
 //!
-//! This guard, running in the cheap no-DB CI step on every OS, cross-checks the
-//! set of DB-gated integration tests (core + plugin) against the set of tests
-//! that `.github/workflows/ci.yml` actually *runs* (not merely `--no-run`
-//! compiles). Every DB-gated test must either have a covering run step or be
-//! listed — with a reason — in `ALLOWLIST`. `ALLOWLIST` is seeded fail-closed
-//! with the tests currently lacking a run step; it is technical debt to shrink,
-//! not to grow (a soft ratchet caps its length below).
+//! This is a *run-coverage* guard, deliberately distinct from *migration
+//! drift* (a hand-rolled `INIT_SQL` bundle missing a migration, which would
+//! fail `column/relation ... does not exist` at runtime). Drift is guarded
+//! separately in `migration_hygiene.rs`; this guard only answers "is every
+//! DB-gated test actually RUN by some `ci.yml` step?" — never whether its
+//! schema bundle is complete.
+//!
+//! Mechanics (runs in the cheap no-DB step on every OS): cross-check the set of
+//! DB-gated integration tests against the set of tests `.github/workflows/ci.yml`
+//! actually *runs*. A target is NOT credited as run when it is only
+//! `--no-run`-compiled, when the step selects only a `module::filter`
+//! sub-slice of it (the `::workflow_typed` trap above), or when every one of
+//! its `#[test]`/`#[tokio::test]` fns is `#[ignore]`d (a run step then executes
+//! nothing). Every DB-gated test must either have a genuine covering run step
+//! or be listed — with a reason — in `ALLOWLIST`. `ALLOWLIST` is fail-closed
+//! debt to SHRINK by wiring run steps, not to grow (a soft ratchet caps its
+//! length below).
 //!
 //! On failure the panic message lists every uncovered test so the fix is
 //! actionable: either add a Docker-backed run step in `ci.yml` or (rarely, with
@@ -34,20 +45,76 @@ const CORE_MOD_RS: &str = include_str!("mod.rs");
 
 // ── DB classification ───────────────────────────────────────────────────────
 
-/// A test file "needs a live DB" (== a Docker-backed CI run step) iff it
-/// actually spins up / connects to Postgres. These three tokens are the
-/// codebase's inline convention for that; tests that instead apply
-/// `autumn_harvest::MIGRATIONS` via `autumn_web::migrate::run_pending`, or that
-/// no-op unless `DATABASE_URL` is set, are deliberately *not* matched (they
-/// can't drift, or don't run in CI).
+/// A test file "needs a live DB" (== a Docker-backed CI run step) iff its
+/// *code* spins up / connects to Postgres. Two families of markers:
+///   * the classic testcontainers style (`with_init_sql(` / `Postgres::default(`)
+///     and the `HARVEST_TEST_DATABASE_URL` opt-in override, and
+///   * the paved `autumn_web::test::TestDb` + `run_pending(MIGRATIONS)` harness
+///     (`run_pending(` / `TestDb` / a real `testcontainers` import), which the
+///     original three-token list missed — so `mcp_tools_integration`,
+///     `webhook_receiver_integration`, and `webhook_durable_integration` evaded
+///     classification entirely (fail-open). Broadened here so they are caught.
+///
+/// Matching is against comment-stripped code only (see [`strip_line_comments`]):
+/// several genuinely no-DB HTTP tests reference their sibling `testcontainers`
+/// suite in `//!` prose, and the deliberately env-gated `status_summary_localpg`
+/// mentions `testcontainers` only in a doc comment — none of these must be
+/// misclassified. A file that no-ops unless `DATABASE_URL` is set (its only
+/// container mention being prose) is therefore left unmatched: it never runs in
+/// CI and cannot be a run-coverage gap.
 const LIVE_DB_TOKENS: &[&str] = &[
     "with_init_sql(",
     "Postgres::default(",
     "HARVEST_TEST_DATABASE_URL",
+    "run_pending(",
+    "TestDb",
+    "testcontainers",
 ];
 
+/// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that
+/// appear only in prose don't classify a no-DB test as needing a live DB. A
+/// leading-`//` check is enough: every observed false positive lives in a
+/// `//!` doc-comment block, and stripping only leading-comment lines never
+/// mangles mid-line code such as a `postgres://…` URL literal.
+fn strip_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn needs_live_db(source: &str) -> bool {
-    LIVE_DB_TOKENS.iter().any(|t| source.contains(t))
+    let code = strip_line_comments(source);
+    LIVE_DB_TOKENS.iter().any(|t| code.contains(t))
+}
+
+/// True when a file declares `#[test]`/`#[tokio::test]` fns but every one is
+/// `#[ignore]`d, so a run step targeting it executes nothing and must NOT be
+/// credited as covering it (the target must be allowlisted instead). Counts
+/// `#[ignore]` against the total test count; a file with no tests is not
+/// "all-ignored".
+fn all_tests_ignored(source: &str) -> bool {
+    let tests = source.matches("#[tokio::test").count() + source.matches("#[test]").count();
+    let ignored = source.matches("#[ignore").count();
+    tests > 0 && ignored >= tests
+}
+
+/// Whether a file's own leading `#![cfg(...)]` gates it on `feature = "testing"`.
+/// Fix #3: the dominant convention is a file-level `#![cfg(...)]` with a plain
+/// `mod X;` in `mod.rs`, so the covering-run `--features testing` requirement
+/// must be read from the file, not only from the `mod.rs` cfg line. The two are
+/// combined (unioned) by the caller — either gate requiring testing means the
+/// run must carry it — so the `mod.rs`-gated `all(testing, db)` submodules stay
+/// correct.
+fn file_requires_testing(source: &str) -> bool {
+    source
+        .lines()
+        .take_while(|l| {
+            let t = l.trim_start();
+            t.starts_with("#![") || t.starts_with("//") || t.is_empty()
+        })
+        .any(|l| l.trim_start().starts_with("#![cfg") && l.contains("feature = \"testing\""))
 }
 
 /// Meta-test files that are not DB tests but mention the classifier tokens as
@@ -79,6 +146,27 @@ const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not ye
 const ALLOWLIST_COMPLETION_CALLBACK_REASON: &str = "migration drift fixed (now uses full_migrations_sql); one pre-existing non-schema \
      test-logic bug (scanner_scopes… duplicate key on the active-uniqueness index) blocks a \
      green run step — handed off to the #605 owner (see PR report)";
+// workflow_retry_tests: the run step is deliberately limited to the
+// `::workflow_typed` sub-filter (issue #767 FIX B). Running the WHOLE module
+// fails 3 pre-existing, non-schema #523 workflow-level-retry bugs:
+// cancelled_workflow_is_not_retried, workflow_non_retryable_error_no_retry,
+// workflow_retry_exhaustion_counts_as_one_failure. Verified NOT migration
+// drift: the identical 3 fail under `full_migrations_sql()` too. Handed off to
+// the #523 owner; run step stays limited to workflow_typed. See PR report.
+const ALLOWLIST_WORKFLOW_RETRY_REASON: &str = "run step limited to `workflow_retry_tests::workflow_typed` (issue #767 FIX B); the full \
+     module hits 3 pre-existing NON-schema #523 retry bugs (cancelled_workflow_is_not_retried, \
+     workflow_non_retryable_error_no_retry, workflow_retry_exhaustion_counts_as_one_failure — \
+     identical failures under full_migrations_sql, so NOT drift). Owner: #523. See PR report.";
+// mcp_tools_integration / webhook_* integration: paved-path DB tests
+// (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
+// AND have every test #[ignore]d, so no CI step can execute them. The mcp one
+// is `--no-run`-compiled only; the webhooks feature is enabled by no CI step.
+// Wiring real Docker-backed run steps for #[ignore]d/feature-gated suites is
+// out of scope for this test-infra PR — tracked here honestly instead.
+const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `--no-run`-compiled in CI) AND all tests are #[ignore]d \
+     (TestDb/run_pending paved-path DB harness) — no CI step can execute it; tracked";
+const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not compiled or run by any CI step — AND all tests are #[ignore]d \
+     (TestDb/run_pending paved-path DB harness); tracked";
 
 const ALLOWLIST: &[(&str, &str)] = &[
     // ── core (autumn-harvest/tests/integration) ──
@@ -126,6 +214,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:workflow_handle_tests", ALLOWLIST_DEBT_REASON),
+    ("core:workflow_retry_tests", ALLOWLIST_WORKFLOW_RETRY_REASON),
     ("core:workflow_task_timeout_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
@@ -142,6 +231,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
         ALLOWLIST_DEBT_REASON,
     ),
     ("plugin:history_export_integration", ALLOWLIST_DEBT_REASON),
+    ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
     ("plugin:outbox_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:preflight_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:replay_canary_integration", ALLOWLIST_DEBT_REASON),
@@ -159,6 +249,14 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:terminate_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:usage_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:version_usage_integration", ALLOWLIST_DEBT_REASON),
+    (
+        "plugin:webhook_durable_integration",
+        ALLOWLIST_WEBHOOKS_IGNORED_REASON,
+    ),
+    (
+        "plugin:webhook_receiver_integration",
+        ALLOWLIST_WEBHOOKS_IGNORED_REASON,
+    ),
     ("plugin:workflow_count_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:workflow_filter_integration", ALLOWLIST_DEBT_REASON),
     (
@@ -175,10 +273,14 @@ const ALLOWLIST: &[(&str, &str)] = &[
 
 /// Soft ratchet: the allowlist may shrink but must never silently grow. Bump
 /// this ONLY with a deliberate justification (it should trend toward zero).
-/// 73 = the 76 never-run DB suites at PR time minus the three fixed and wired
-/// to Docker-backed run steps in this PR (`nd_block_tests`,
-/// `worker_session_tests`, plugin `build_ramp_integration`).
-const ALLOWLIST_MAX_LEN: usize = 73;
+/// 77 = the prior 73 plus the four surfaced by this hardening pass:
+///   * `core:workflow_retry_tests` — Fix #1 stopped a `::workflow_typed`
+///     sub-filter from masking the whole module (3 genuine #523 bugs);
+///   * `plugin:mcp_tools_integration`, `plugin:webhook_durable_integration`,
+///     `plugin:webhook_receiver_integration` — Fix #2 stopped the paved
+///     `TestDb`/`run_pending` DB harness from evading classification (all three
+///     are feature-gated + fully `#[ignore]`d, so no CI step can run them).
+const ALLOWLIST_MAX_LEN: usize = 77;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -195,7 +297,9 @@ fn run_commands() -> Vec<RunCommand> {
     let mut out = Vec::new();
     for line in CI_YAML.lines() {
         let line = line.trim();
-        // Commands live on `run:` lines (single-line in this workflow).
+        // ASSUMPTION: every `run: cargo test …` command is a single physical
+        // line (no YAML block scalars `|`/`>` spanning multiple lines). True for
+        // this workflow; a multi-line command would parse only its first line.
         let Some(idx) = line.find("cargo test") else {
             continue;
         };
@@ -219,9 +323,13 @@ fn features_of(cmd: &str) -> Option<&str> {
 
 // ── Core coverage ───────────────────────────────────────────────────────────
 
-/// (filter-first-segment, `has_testing`, `has_db`)
+/// (filter-first-segment, `partial`, `has_testing`, `has_db`)
 struct CoreFilter {
     seg: String,
+    /// The run filter was `module::something`, i.e. it selects only a *slice*
+    /// of the module's tests (e.g. `workflow_retry_tests::workflow_typed` runs
+    /// 3 of 9). Such a filter must NOT be credited as whole-module coverage.
+    partial: bool,
     has_testing: bool,
     has_db: bool,
 }
@@ -260,9 +368,13 @@ fn parse_core_coverage(cmds: &[RunCommand]) -> CoreCoverage {
                 let rest = rest.trim_start();
                 let first = rest.split_whitespace().next().unwrap_or("");
                 if !first.is_empty() && first != "--test-threads=1" {
+                    // A `module::test` filter runs only that slice, so it must
+                    // not credit the whole module (the `::workflow_typed` trap).
+                    let partial = first.contains("::");
                     let seg = first.split("::").next().unwrap_or(first).to_string();
                     filters.push(CoreFilter {
                         seg,
+                        partial,
                         has_testing,
                         has_db,
                     });
@@ -293,7 +405,8 @@ impl CoreCoverage {
             return true;
         }
         self.filters.iter().any(|f| {
-            f.has_db
+            !f.partial
+                && f.has_db
                 && (!needs_testing || f.has_testing)
                 && (module == f.seg || module.starts_with(&f.seg))
         })
@@ -356,6 +469,12 @@ fn plugin_required_features(source: &str) -> Vec<String> {
 struct PluginRun {
     tests: BTreeSet<String>,
     features: String,
+    /// A positional test filter followed the `--` separator (something other
+    /// than `--test-threads=N`), so the step runs only a slice — mirror of the
+    /// core `CoreFilter::partial` guard (Fix #6). Not triggered by any current
+    /// ci.yml plugin step, but keeps the two parsers symmetric so a future
+    /// `--test foo -- some_filter` can't over-credit `foo`.
+    partial: bool,
 }
 
 fn parse_plugin_runs(cmds: &[RunCommand]) -> Vec<PluginRun> {
@@ -369,6 +488,15 @@ fn parse_plugin_runs(cmds: &[RunCommand]) -> Vec<PluginRun> {
         // Collect every `--test <name>` token.
         let toks: Vec<&str> = cmd.split_whitespace().collect();
         let mut i = 0;
+        // Everything AFTER the first standalone `--` is a positional filter (not
+        // a cargo flag); anything there other than `--test-threads=N` slices the
+        // target's tests and must not be credited as full coverage.
+        let sep = toks.iter().position(|t| *t == "--");
+        let partial = sep.is_some_and(|s| {
+            toks[s + 1..]
+                .iter()
+                .any(|t| !t.starts_with("--test-threads"))
+        });
         while i < toks.len() {
             if toks[i] == "--test" {
                 if let Some(name) = toks.get(i + 1) {
@@ -383,14 +511,19 @@ fn parse_plugin_runs(cmds: &[RunCommand]) -> Vec<PluginRun> {
             continue;
         }
         let features = features_of(cmd).unwrap_or("").to_string();
-        out.push(PluginRun { tests, features });
+        out.push(PluginRun {
+            tests,
+            features,
+            partial,
+        });
     }
     out
 }
 
 fn plugin_covered(file_stem: &str, required_features: &[String], runs: &[PluginRun]) -> bool {
     runs.iter().any(|r| {
-        r.tests.contains(file_stem)
+        !r.partial
+            && r.tests.contains(file_stem)
             && required_features
                 .iter()
                 .all(|f| r.features.split(',').any(|rf| rf == f))
@@ -462,6 +595,128 @@ fn ci_parser_finds_known_run_steps() {
     );
 }
 
+// ── Fix #6: `--no-run` compile-only steps are never counted as runs ──────────
+
+#[test]
+fn no_run_compile_only_target_is_not_covered() {
+    let cmds = run_commands();
+    let plugin_runs = parse_plugin_runs(&cmds);
+    let run_targets: BTreeSet<&str> = plugin_runs
+        .iter()
+        .flat_map(|r| r.tests.iter().map(String::as_str))
+        .collect();
+    // `mcp_tools_integration` appears in ci.yml ONLY on a `--no-run` compile
+    // line, never a real run step — it must not be treated as covered.
+    assert!(
+        !run_targets.contains("mcp_tools_integration"),
+        "a `--no-run` compile-only target must NOT appear in the covered run set"
+    );
+    // Sanity: a genuine run target IS present.
+    assert!(run_targets.contains("api_scheduler_integration"));
+}
+
+// ── Fix #1: a `module::filter` sub-selection must not credit the whole module ─
+
+#[test]
+fn subfilter_does_not_credit_whole_module() {
+    // The exact ci.yml shape that masked 6 of `workflow_retry_tests`' 9 DB tests.
+    let sub = vec![RunCommand {
+        text: "cargo test -p autumn-harvest --test integration -- \
+               workflow_retry_tests::workflow_typed --test-threads=1"
+            .to_string(),
+    }];
+    let cov = parse_core_coverage(&sub);
+    assert!(
+        !cov.covers("workflow_retry_tests", false),
+        "a `module::test` sub-filter must NOT credit the whole module as covered"
+    );
+
+    // Whereas the whole-module filter DOES cover it.
+    let whole = vec![RunCommand {
+        text: "cargo test -p autumn-harvest --test integration -- \
+               workflow_retry_tests --test-threads=1"
+            .to_string(),
+    }];
+    assert!(
+        parse_core_coverage(&whole).covers("workflow_retry_tests", false),
+        "a whole-module filter must credit the module"
+    );
+}
+
+// ── Fix #2: classifier is fail-CLOSED for the paved live-DB path & honest about
+//    env-gated / no-DB HTTP tests ──────────────────────────────────────────────
+
+#[test]
+fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
+    let dir = plugin_tests_dir();
+    // These three spin a real container via `autumn_web::test::TestDb` +
+    // `run_pending(MIGRATIONS)` — the paved path the original three-token list
+    // missed. They must now classify as DB tests, and each is fully `#[ignore]`d.
+    for stem in [
+        "mcp_tools_integration",
+        "webhook_receiver_integration",
+        "webhook_durable_integration",
+    ] {
+        let src = read_source(&dir.join(format!("{stem}.rs")));
+        assert!(
+            needs_live_db(&src),
+            "{stem} uses the TestDb/run_pending paved DB path and must be classified as DB-gated"
+        );
+        assert!(
+            all_tests_ignored(&src),
+            "{stem}: all its tests are #[ignore]d — a run step could not execute it"
+        );
+    }
+}
+
+#[test]
+fn env_gated_and_no_db_http_tests_are_not_classified() {
+    let dir = plugin_tests_dir();
+    // `status_summary_localpg` is a no-op unless `DATABASE_URL` is set and only
+    // mentions `testcontainers` in prose — it must stay excluded (verifies the
+    // deliberate DATABASE_URL-only exclusion holds after broadening the tokens).
+    // The two `*_http_tests` are genuinely no-DB harnesses whose only container
+    // reference is a `//!` pointer to their sibling suite.
+    for stem in [
+        "status_summary_localpg",
+        "mcp_tools_http_tests",
+        "webhook_receiver_http_tests",
+    ] {
+        let src = read_source(&dir.join(format!("{stem}.rs")));
+        assert!(
+            !needs_live_db(&src),
+            "{stem} must NOT be classified as needing a live DB (env-gated / no-DB; \
+             its container tokens live only in comments)"
+        );
+    }
+}
+
+#[test]
+fn strip_line_comments_drops_prose_container_tokens() {
+    let src = "//! see the testcontainers suite\nlet x = 1; // TestDb reference in prose\ncode();";
+    let code = strip_line_comments(src);
+    assert!(
+        !code.contains("testcontainers"),
+        "leading `//!` line must be dropped"
+    );
+    // A trailing inline comment survives (its line isn't a leading comment), but
+    // that's fine: real code markers are function calls / types, not prose.
+    assert!(code.contains("code();"));
+}
+
+#[test]
+fn file_requires_testing_reads_leading_file_cfg() {
+    assert!(file_requires_testing(
+        "#![cfg(all(feature = \"db\", feature = \"testing\"))]\nfn a() {}"
+    ));
+    assert!(file_requires_testing("#![cfg(feature = \"testing\")]\n"));
+    assert!(!file_requires_testing("#![cfg(feature = \"db\")]\n"));
+    // A mid-file `#[cfg(feature = \"testing\")]` on some item is not a file gate.
+    assert!(!file_requires_testing(
+        "use x;\n#[cfg(feature = \"testing\")]\nfn a() {}"
+    ));
+}
+
 // ── The guard ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -493,7 +748,16 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         }
         let key = format!("core:{}", m.name);
         live_db_keys.insert(key.clone());
-        if core_cov.covers(&m.name, m.needs_testing) {
+        // Fix #3: the covering-run `--features testing` requirement is the UNION
+        // of the `mod.rs` cfg and the file's own leading `#![cfg]` (either gate
+        // requiring testing means the run must carry it). This keeps the
+        // `mod.rs`-only `all(testing, db)` submodules correct while also picking
+        // up file-level `#![cfg(feature = "testing")]` on plain-`mod` files.
+        let needs_testing = m.needs_testing || file_requires_testing(&src);
+        // A covering run step can't credit a target whose tests are all
+        // `#[ignore]`d — it would execute nothing.
+        let covered = core_cov.covers(&m.name, needs_testing) && !all_tests_ignored(&src);
+        if covered {
             continue;
         }
         if allowlisted(&key) {
@@ -502,7 +766,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         uncovered.push(format!(
             "{key} (add a `cargo test -p autumn-harvest{} --test integration -- {} --test-threads=1` \
              run step in ci.yml, guarded `if: runner.os == 'Linux'`)",
-            if m.needs_testing { " --features testing" } else { "" },
+            if needs_testing { " --features testing" } else { "" },
             m.name
         ));
     }
@@ -524,7 +788,10 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         let key = format!("plugin:{stem}");
         live_db_keys.insert(key.clone());
         let req = plugin_required_features(&src);
-        if plugin_covered(&stem, &req, &plugin_runs) {
+        // A covering run step can't credit an all-`#[ignore]`d target — it runs
+        // nothing — so force it uncovered (→ must be allowlisted).
+        let covered = plugin_covered(&stem, &req, &plugin_runs) && !all_tests_ignored(&src);
+        if covered {
             continue;
         }
         if allowlisted(&key) {

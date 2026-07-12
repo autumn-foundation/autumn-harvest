@@ -23,11 +23,15 @@ fn main() {
         .collect();
     names.sort();
 
-    // Each individual SQL file is also watched so edits to existing
-    // migrations trigger a recompile as well.
+    // Watch each migration directory (catches added/removed sibling files like
+    // down.sql) AND its `up.sql` file explicitly, so an IN-PLACE edit to an
+    // existing migration's up.sql — which changes neither the directory listing
+    // nor `HARVEST_MIGRATIONS_LIST` — still invalidates the fingerprint and
+    // regenerates the concatenated bundle below.
     for name in &names {
         let dir = migrations_dir.join(name);
         println!("cargo:rerun-if-changed={}", dir.display());
+        println!("cargo:rerun-if-changed={}", dir.join("up.sql").display());
     }
 
     println!(
@@ -52,10 +56,25 @@ fn main() {
     let mut bundle = String::new();
     for name in &names {
         let up = migrations_dir.join(name).join("up.sql");
-        if let Ok(sql) = fs::read_to_string(&up) {
-            bundle.push_str(&sql);
-            bundle.push('\n');
-        }
+        // Fail the build LOUDLY on a missing/unreadable up.sql rather than
+        // silently dropping that migration from the bundle — a silently-short
+        // bundle is exactly the drift this helper exists to prevent.
+        let sql = fs::read_to_string(&up).unwrap_or_else(|e| {
+            panic!(
+                "migration {name}: missing/unreadable up.sql ({}): {e}",
+                up.display()
+            )
+        });
+        // Prepend a self-describing SQL-comment header per migration so the
+        // bundle records exactly which migrations it contains. `migration_hygiene`
+        // asserts one header per `HARVEST_MIGRATIONS_LIST` entry, so a bundle
+        // truncated after ANY migration (not just the tail) is caught. Postgres
+        // ignores `--` line comments, so this is inert when the bundle is applied.
+        bundle.push_str("-- harvest-migration: ");
+        bundle.push_str(name);
+        bundle.push('\n');
+        bundle.push_str(&sql);
+        bundle.push('\n');
     }
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
     let bundle_path = Path::new(&out_dir).join("all_migrations_bundle.sql");
