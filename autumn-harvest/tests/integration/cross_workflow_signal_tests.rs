@@ -120,10 +120,50 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
 );
 
-async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
+// Rewrite the database (path) component of a Postgres URL, preserving scheme,
+// authority (user/host/port), and any query string. Test-only helper for the
+// local-Postgres path below.
+fn rewrite_pg_db(base: &str, db: &str) -> String {
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let rest = &base[after_scheme..];
+    let (authority, tail) = rest
+        .find('/')
+        .map_or((rest, ""), |i| (&rest[..i], &rest[i + 1..]));
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
+}
+
+async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+
+    // Local-Postgres path (no Docker): when HARVEST_TEST_DATABASE_URL points at
+    // a live Postgres, create a fresh per-test database, apply the full
+    // migration bundle, and hand back its URL. CI leaves the env var unset and
+    // uses the testcontainers path below (which is the authoritative path).
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        use diesel_async::SimpleAsyncConnection;
+        // The per-test `harvest678_<uuid>` database is intentionally NOT dropped:
+        // this local-dev-only path is env-gated, and CI leaves the env var unset
+        // so it uses the testcontainers path (which self-cleans on container drop).
+        let db_name = format!("harvest678_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&base_url)
+            .await
+            .expect("failed to connect to HARVEST_TEST_DATABASE_URL base");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .await
+            .expect("failed to create per-test database");
+        let new_url = rewrite_pg_db(&base_url, &db_name);
+        let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
+            .await
+            .expect("failed to connect to per-test database");
+        conn.batch_execute(INIT_SQL)
+            .await
+            .expect("failed to apply INIT_SQL to per-test database");
+        return (new_url, None);
+    }
 
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
@@ -142,7 +182,7 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
         .expect("failed to get container port");
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    (database_url, container)
+    (database_url, Some(container))
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {
@@ -219,6 +259,147 @@ fn mixed_suspension_workflow<'a>(
             }
         }
     })
+}
+
+// A target that stays RUNNING (parked on a signal that never arrives) so an
+// external cancel resolves against a live execution.
+fn cancel_target_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: serde_json::Value = ctx
+            .receive_signal("never_arrives")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"status": "signalled"}))
+    })
+}
+
+// select! between a 1-hour timer and request_cancel_external_workflow. Mirrors
+// mixed_suspension_workflow but on the external-cancel primitive (issue #492).
+fn mixed_suspension_cancel_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        let timer_fut = ctx.timer("long_timer", 3600);
+        let cancel_fut = ctx.request_cancel_external_workflow(target);
+
+        tokio::select! {
+            res = timer_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "timer_fired"}))
+            }
+            res = cancel_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "cancel_resolved"}))
+            }
+        }
+    })
+}
+
+// Issue #678 correctness guard: resolve an external op INLINE (cycle 1, its
+// terminal appended this cycle), THEN park a PURE `ctx.timer()` in a later cycle.
+// The earlier, fully-observed external op must NOT false-wake the pure timer —
+// `resolved_external_ids` is scoped to the ids resolved on the *current* cycle,
+// which for the timer-park cycle is empty.
+fn external_then_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        // Cycle 1: external signal resolves inline against the same-shard target.
+        ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hi"}))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Later cycle: a PURE timer park with no external op in the batch.
+        ctx.timer("sleep", 3).await.map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({"status": "done"}))
+    })
+}
+
+// Compact WorkflowInfo builder mirroring the exact field set used by the inline
+// struct literals elsewhere in this file (kept in one place so field drift
+// breaks every test together rather than silently diverging).
+fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name,
+        module: "cross_workflow_signal_tests",
+        handler,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
+// Compact StartWorkflowParams builder mirroring the exact field set used by the
+// inline struct literals elsewhere in this file.
+fn mk_start_params(
+    exec_id: ExecutionId,
+    workflow_name: &'static str,
+    workflow_id: &'static str,
+    input: serde_json::Value,
+) -> StartWorkflowParams<'static> {
+    StartWorkflowParams {
+        exec_id,
+        workflow_name,
+        workflow_id,
+        input,
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::default(),
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+    }
 }
 
 #[tokio::test]
@@ -970,6 +1151,408 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         Some("signaled")
     );
     assert_eq!(completed.1.state, "COMPLETED");
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── Issue #678: inline-resolved mixed timer + external op wakes immediately ──
+//
+// A `select!{ timer(3600s), signal_external_workflow(target) }` where the
+// target EXISTS on the same shard resolves `ExternalSignalDelivered` INLINE in
+// the same decision cycle. The caller must wake immediately on that terminal
+// rather than parking its timer until fires_at (up to 1 hour). This differs
+// from `test_mixed_timer_suspension_signal_wakes_timer` (the passing control),
+// which starts the caller FIRST so the external resolves via the NotFound ->
+// outbox path. Here the target is started FIRST and confirmed RUNNING so the
+// caller's op resolves inline. Without the fix the caller stays RUNNING for
+// ~1h and this 30s bound trips -> RED.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mixed_timer_suspension_signal_resolves_inline_wakes_immediately() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external signal resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info("mixed_suspension_workflow", mixed_suspension_workflow),
+            wf_info("target_workflow", target_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-mixed-inline-signal".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on
+    // receive_signal), so the caller's signal_external_workflow resolves inline.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "target_workflow",
+            "target-inline-signal-1",
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING (parked on signal) before caller starts");
+
+    // Now start the CALLER pointed at the already-running target.
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "mixed_suspension_workflow",
+            "caller-inline-signal-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Tight 30s bound: proves the caller woke immediately on the inline
+    // ExternalSignalDelivered instead of waiting out the 3600s timer.
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if completed.is_err() {
+        let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+        let target = load_execution_from_url(&database_url, target_exec_id).await;
+        let caller_history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
+            .await
+            .unwrap();
+        let target_history = autumn_harvest::store::load_history(&mut conn, target_exec_id)
+            .await
+            .unwrap();
+        println!("TIMEOUT DIAGNOSTICS (inline signal):");
+        println!(
+            "Caller State: {}, output: {:?}",
+            caller.state, caller.output
+        );
+        println!("Caller History: {:?}", caller_history.events);
+        println!(
+            "Target State: {}, output: {:?}",
+            target.state, target.output
+        );
+        println!("Target History: {:?}", target_history.events);
+        panic!(
+            "caller should wake immediately on the inline ExternalSignalDelivered, \
+             not park the timer for 1 hour"
+        );
+    }
+
+    let caller = completed.unwrap();
+    assert_eq!(caller.state, "COMPLETED");
+    assert_eq!(
+        caller.output.unwrap()["status"].as_str(),
+        Some("signaled"),
+        "caller must resolve on the signal branch, not the timer branch"
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// Same latency bug for the external-CANCEL primitive (issue #492). A
+// `select!{ timer(3600s), request_cancel_external_workflow(target) }` where the
+// target EXISTS on the same shard resolves `ExternalCancelDelivered` INLINE.
+// The caller must wake immediately; without the fix it parks the timer for ~1h
+// and this 30s bound trips -> RED.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external cancel resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info(
+                "mixed_suspension_cancel_workflow",
+                mixed_suspension_cancel_workflow,
+            ),
+            wf_info("cancel_target_workflow", cancel_target_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-mixed-inline-cancel".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on a signal that
+    // never arrives), so the caller's cancel resolves inline against a live run.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "cancel_target_workflow",
+            "target-inline-cancel-1",
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING before caller starts");
+
+    // Now start the CALLER pointed at the already-running target.
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "mixed_suspension_cancel_workflow",
+            "caller-inline-cancel-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Tight 30s bound: proves the caller woke immediately on the inline
+    // ExternalCancelDelivered instead of waiting out the 3600s timer.
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if completed.is_err() {
+        let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+        let target = load_execution_from_url(&database_url, target_exec_id).await;
+        let caller_history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
+            .await
+            .unwrap();
+        let target_history = autumn_harvest::store::load_history(&mut conn, target_exec_id)
+            .await
+            .unwrap();
+        println!("TIMEOUT DIAGNOSTICS (inline cancel):");
+        println!(
+            "Caller State: {}, output: {:?}",
+            caller.state, caller.output
+        );
+        println!("Caller History: {:?}", caller_history.events);
+        println!(
+            "Target State: {}, output: {:?}",
+            target.state, target.output
+        );
+        println!("Target History: {:?}", target_history.events);
+        panic!(
+            "caller should wake immediately on the inline ExternalCancelDelivered, \
+             not park the timer for 1 hour"
+        );
+    }
+
+    let caller = completed.unwrap();
+    assert_eq!(caller.state, "COMPLETED");
+    assert_eq!(
+        caller.output.unwrap()["status"].as_str(),
+        Some("cancel_resolved"),
+        "caller must resolve on the cancel branch, not the timer branch"
+    );
+
+    // The inline cancel must actually have cancelled the target. It may settle
+    // just after the caller wakes, so poll briefly for the terminal transition.
+    let target = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "CANCELLED" {
+                break target;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cancel target should reach CANCELLED after the inline cancel");
+    assert_eq!(target.state, "CANCELLED");
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── Issue #678 correctness guard: pure timer after inline external ──────────
+//
+// The inline self-wake must be scoped to the ids resolved THIS cycle. A
+// workflow that resolves an external op inline (cycle 1) and THEN parks a PURE
+// `ctx.timer()` (later cycle) must not be false-woken by the earlier op: the
+// timer's park cycle appends no external terminal, so `resolved_external_ids`
+// is empty and the row parks normally. This proves the fix does not degrade
+// the pure-timer contract (the timer must actually sleep out its duration).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pure_timer_after_inline_external_does_not_false_wake() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external signal resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info("external_then_timer_workflow", external_then_timer_workflow),
+            wf_info("target_workflow", target_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-pure-timer-after-external".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on receive_signal),
+    // so the caller's signal_external_workflow resolves inline in cycle 1.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "target_workflow",
+            "target-pure-timer-guard-1",
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING (parked on signal) before caller starts");
+
+    let start = std::time::Instant::now();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "external_then_timer_workflow",
+            "caller-pure-timer-guard-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // At ~1.5s the caller must still be RUNNING: the earlier inline external must
+    // NOT have false-woken the pure 3s timer park.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mid = load_execution_from_url(&database_url, caller_exec_id).await;
+    assert_ne!(
+        mid.state,
+        "COMPLETED",
+        "pure 3s timer must not be false-woken by the earlier inline external op \
+         (elapsed {:?})",
+        start.elapsed()
+    );
+
+    // The timer eventually fires (~3s) and the caller completes.
+    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("caller should complete after its 3s timer fires");
+
+    assert_eq!(completed.state, "COMPLETED");
+    assert_eq!(
+        completed.output.unwrap()["status"].as_str(),
+        Some("done"),
+        "caller must complete via the pure timer branch"
+    );
 
     worker.shutdown();
     let _ = handle.await;
