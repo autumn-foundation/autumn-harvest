@@ -833,3 +833,242 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
         "only the exempt producers started targets; nothing gated slipped the gate"
     );
 }
+
+/// Seed a prior `ag_target_wf` execution with an explicit `workflow_id` and a
+/// terminal-or-live `state`, so the HTTP start route's gate-skip pre-check has a
+/// concrete prior to reason about. Returns the seeded prior's execution id.
+async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, state: &str) -> Uuid {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: "ag_target_wf",
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: autumn_harvest::types::Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+    )
+    .await
+    .unwrap();
+    if state != "RUNNING" {
+        let sql = if state == "COMPLETED" {
+            "UPDATE harvest_workflow_executions SET state=$2, output='{}'::jsonb, \
+             completed_at=NOW() WHERE id=$1"
+        } else {
+            "UPDATE harvest_workflow_executions SET state=$2, error='seed', \
+             completed_at=NOW() WHERE id=$1"
+        };
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .bind::<diesel::sql_types::Text, _>(state)
+            .execute(conn)
+            .await
+            .unwrap();
+    }
+    exec_id.as_uuid()
+}
+
+/// Raise a `Fleet` gate and publish the cache the API + core paths share.
+async fn raise_fleet_gate(conn: &mut AsyncPgConnection, api_state: &HarvestApiState, reason: &str) {
+    autumn_harvest::admission_gate::db::create_gate(
+        conn,
+        &GateScope::Fleet,
+        reason,
+        None,
+        "test",
+        None,
+    )
+    .await
+    .unwrap();
+    let gates = autumn_harvest::admission_gate::db::load_active_gates(conn)
+        .await
+        .unwrap();
+    api_state.gate_cache().refresh(gates);
+    set_global_admission_gate_cache(Some(api_state.gate_cache()));
+}
+
+/// Round 20 (issue #618): the HTTP start route's gate-skip pre-check must be
+/// reuse-policy aware. `TerminateIfRunning` over a *live* prior ALWAYS creates a
+/// replacement, so it is a genuine admission and MUST be blocked by an active
+/// gate — the old policy-blind "non-sealed row exists → skip gate" wrongly let
+/// it slip.
+#[tokio::test]
+async fn gate_blocks_terminate_if_running_start_over_a_live_prior() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    let api_state = build_api_state(&pool, registry);
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    seed_target_prior(&mut conn, "tir-live-prior", "RUNNING").await;
+    raise_fleet_gate(&mut conn, &api_state, "tir-incident").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/ag_target_wf/start",
+        json!({ "workflow_id": "tir-live-prior", "reuse_policy": "terminate_if_running" }),
+    )
+    .await;
+    set_global_admission_gate_cache(None);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "TerminateIfRunning over a live prior creates a replacement and must be gated: {body:?}"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the block must be counted exactly once: {blocked:?}"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "only the seeded prior exists; no replacement slipped the gate"
+    );
+}
+
+/// Round 20 (issue #618): `AllowDuplicateFailedOnly` over a prior that is
+/// FAILED/CANCELLED at read time creates a replacement, so it is a genuine
+/// admission and MUST be blocked by an active gate.
+#[tokio::test]
+async fn gate_blocks_allow_duplicate_failed_only_start_over_a_failed_prior() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    let api_state = build_api_state(&pool, registry);
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    seed_target_prior(&mut conn, "adfo-failed-prior", "FAILED").await;
+    raise_fleet_gate(&mut conn, &api_state, "adfo-incident").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/ag_target_wf/start",
+        json!({ "workflow_id": "adfo-failed-prior", "reuse_policy": "allow_duplicate_failed_only" }),
+    )
+    .await;
+    set_global_admission_gate_cache(None);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ADFO over a FAILED prior creates a replacement and must be gated: {body:?}"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the block must be counted exactly once: {blocked:?}"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "only the seeded FAILED prior exists; no replacement slipped the gate"
+    );
+}
+
+/// Round 20 (issue #618): the fix must NOT regress the idempotent-attach bypass
+/// (#808). `AllowDuplicate` attaches to the prior (live OR terminal) instead of
+/// creating anything, so an active gate must be SKIPPED — the retry returns the
+/// existing execution (200) and counts no block, with no new execution.
+#[tokio::test]
+async fn gate_skips_allow_duplicate_attach_regardless_of_prior_state() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+
+    for prior_state in ["RUNNING", "COMPLETED"] {
+        scrub(&mut conn).await;
+        let metrics = Arc::new(CapturingMetrics::default());
+        let registry = build_registry(Arc::clone(&metrics));
+        let api_state = build_api_state(&pool, registry);
+        let app = harvest_api_router(api_state.clone())
+            .with_state(AppState::for_test().with_profile("test"));
+
+        seed_target_prior(&mut conn, "ad-prior", prior_state).await;
+        raise_fleet_gate(&mut conn, &api_state, "ad-incident").await;
+
+        let (status, body) = post_json(
+            &app,
+            "/workflows/ag_target_wf/start",
+            json!({ "workflow_id": "ad-prior", "reuse_policy": "allow_duplicate" }),
+        )
+        .await;
+        set_global_admission_gate_cache(None);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "AllowDuplicate attaches ({prior_state} prior); the gate must be skipped: {body:?}"
+        );
+        assert!(
+            metrics.blocked().is_empty(),
+            "an attach is not an admission — no block may be counted ({prior_state} prior)"
+        );
+        assert_eq!(
+            target_exec_count(&mut conn).await,
+            1,
+            "attach created no new execution ({prior_state} prior)"
+        );
+    }
+}

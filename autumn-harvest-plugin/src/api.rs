@@ -9827,11 +9827,25 @@ pub(crate) async fn start_workflow(
                 .gate_cache()
                 .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner);
         if let Some((gate_id, reason, scope_kind)) = gates {
-            // Idempotent retry bypass: if the caller supplied an explicit
-            // workflow_id, check whether a non-terminal execution already
-            // exists on this shard.  start_or_load_workflow_execution with
-            // AllowDuplicate (or AllowDuplicateFailedOnly for live runs) would
-            // return it without creating new work, so the gate must not block.
+            // Idempotent-retry / attach bypass: if the caller supplied an
+            // explicit workflow_id, the gate must not block a start that will
+            // *attach to* (not create) an execution — a legitimate retry that
+            // produces no new work. Whether a given (prior state, reuse policy)
+            // pair attaches vs. replaces is decided by the *same* pure matrix
+            // the start primitive itself uses, `start_will_create_new_execution`
+            // (issue #618 round 18) — do NOT fork the matrix here, or the gate
+            // and the start disagree (issue #618 round 20). A start that WILL
+            // create a new execution (a fresh workflow_id, TerminateIfRunning
+            // over any live prior, or AllowDuplicateFailedOnly over a prior
+            // already FAILED/CANCELLED at read time) is a genuine admission and
+            // must pass through the gate; an attach (AllowDuplicate,
+            // RejectDuplicate, or ADFO over a live prior) creates nothing and is
+            // bypassed.
+            //
+            // The prior's state is read (non-sealed rows only — CONTINUED_AS_NEW
+            // and TERMINATED are outside the active-uniqueness index, so a start
+            // over them always creates and the query correctly yields None →
+            // will-create → gate applies).
             //
             // A retry can equally land on an already-pending *throttle* row
             // (code review, issue #607): `reserve_or_defer`'s own idempotency
@@ -9848,11 +9862,24 @@ pub(crate) async fn start_workflow(
             // genuinely fresh keyed start with no live claim, which must pass
             // through the gate normally. This bypass therefore only covers the
             // explicit-`workflow_id` idempotent-retry case.
+            //
+            // Residual bounded TOCTOU (issue #618 round 20): the prior state is
+            // read on a throwaway connection and released before the start runs
+            // on its own transaction later, so a prior that seals (e.g. a live
+            // run → FAILED) between this read and the start could turn an ADFO
+            // attach decided here into a replacement that slips the gate.
+            // Closing it fully would require moving the gate check inside the
+            // locked start transaction of every start path (plain, keyed,
+            // throttle-reserved), i.e. the #808/debounce/throttle-layering
+            // refactor this change deliberately does not attempt. The window is
+            // narrow (needs a concurrent seal in the read→start gap) and the
+            // common replacement cases — TerminateIfRunning over any live prior
+            // and ADFO over an already-terminal prior — are now gated correctly.
             let is_idempotent_retry = if explicit_workflow_id {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
                         Ok(mut pre_conn) => {
-                            let has_execution = harvest_workflow_executions::table
+                            let prior_state = harvest_workflow_executions::table
                                 .filter(
                                     harvest_workflow_executions::workflow_name.eq(&workflow_name),
                                 )
@@ -9861,13 +9888,19 @@ pub(crate) async fn start_workflow(
                                     harvest_workflow_executions::state
                                         .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                                 )
-                                .select(harvest_workflow_executions::id)
-                                .first::<uuid::Uuid>(&mut pre_conn)
+                                .select(harvest_workflow_executions::state)
+                                .first::<String>(&mut pre_conn)
                                 .await
                                 .optional()
-                                .unwrap_or(None)
-                                .is_some();
-                            has_execution
+                                .unwrap_or(None);
+                            // Skip the gate only when this start attaches to the
+                            // prior instead of creating a replacement.
+                            let attaches_without_creating =
+                                !autumn_harvest::execution::start_will_create_new_execution(
+                                    prior_state.as_deref(),
+                                    reuse_policy,
+                                );
+                            attaches_without_creating
                                 || (throttle_applies
                                     && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
                                         &mut pre_conn,
