@@ -259,7 +259,10 @@ pub fn check_admission<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateCreateError {
     /// The active gate count reached [`MAX_ACTIVE_GATES`].
-    TooManyGates { limit: usize },
+    TooManyGates {
+        /// The current maximum allowed active gates limit.
+        limit: usize,
+    },
     /// The reason string was empty.
     EmptyReason,
 }
@@ -395,6 +398,7 @@ impl AdmissionGateCache {
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
 
 #[cfg(feature = "db")]
+/// Database operations for creating, reading, and lifting admission gates.
 pub mod db {
     use super::{AdmissionGate, AdmissionGateId, DateTime, GateScope, MAX_ACTIVE_GATES, Utc, Uuid};
     use crate::error::{HarvestResult, database_error};
@@ -598,15 +602,49 @@ pub mod db {
 // ── Serialisable view (for API responses) ────────────────────────────────────
 
 /// JSON-serialisable view of an admission gate for API responses.
+///
+/// This struct provides a clean, API-friendly representation of an admission
+/// gate. It strips away internal database-specific types while providing a
+/// clear picture of the gate's scope, reason, and active status.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
+/// use uuid::Uuid;
+/// use chrono::Utc;
+///
+/// let view = AdmissionGateView {
+///     id: Uuid::new_v4(),
+///     scope_kind: "global".to_string(),
+///     scope_value: None,
+///     reason: "Emergency maintenance".to_string(),
+///     message: Some("System is currently under maintenance.".to_string()),
+///     created_by: "operator".to_string(),
+///     created_at: Utc::now(),
+///     expires_at: None,
+///     is_active: true,
+/// };
+///
+/// assert!(view.is_active);
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionGateView {
+    /// Unique identifier for this gate.
     pub id: Uuid,
+    /// The scope type this gate applies to (e.g., `"global"`, `"workflow"`, `"queue"`).
     pub scope_kind: String,
+    /// The specific value for the scope (e.g., the workflow name), if applicable.
     pub scope_value: Option<String>,
+    /// The operational reason for placing this gate.
     pub reason: String,
+    /// An optional human-readable message provided to users when their workload is rejected.
     pub message: Option<String>,
+    /// The identifier of the operator or automated system that created the gate.
     pub created_by: String,
+    /// The timestamp when the gate was created.
     pub created_at: DateTime<Utc>,
+    /// The optional timestamp when the gate automatically expires and stops blocking.
     pub expires_at: Option<DateTime<Utc>>,
     /// `true` when the gate is currently blocking (active + not expired).
     pub is_active: bool,

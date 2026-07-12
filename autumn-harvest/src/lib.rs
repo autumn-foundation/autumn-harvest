@@ -24,6 +24,7 @@ macro_rules! cfg_db {
     ($($item:item)*) => {};
 }
 
+/// The embedded migrations for the harvest engine schema.
 #[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
@@ -62,6 +63,7 @@ pub mod circuit_breaker;
 /// Pushes a workflow's terminal result to an operator-registered URL,
 /// HMAC-signed and SSRF-guarded.
 pub mod completion_callback;
+/// Data models and mapping logic for webhook completion triggers.
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
@@ -88,6 +90,7 @@ pub mod diagnostic;
 /// destructures [`builder::WorkerConfig`] exhaustively (no `..`) so a new
 /// tunable is a compile error until it is surfaced.
 pub mod effective_config;
+/// Constraint evaluation engine for capability-based worker routing.
 pub mod eligibility;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
@@ -202,6 +205,7 @@ pub mod notify;
 #[doc(hidden)]
 pub mod queue;
 #[cfg(feature = "db")]
+/// Database recording structs for scheduler execution tracking.
 pub mod schedule_decision;
 #[cfg(feature = "db")]
 pub mod scheduler;
