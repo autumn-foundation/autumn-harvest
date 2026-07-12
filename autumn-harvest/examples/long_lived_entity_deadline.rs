@@ -192,11 +192,11 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            // The system_now() capture should_continue_as_new() records because a
-            // deadline exists.
+            // The clock read should_continue_as_new()'s deadline branch records
+            // because a deadline exists — under the reserved probe name (#772).
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Now,
-                name: None,
+                name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
                 value: json!(recorded_now.timestamp_millis()),
             },
             // The checkpoint fork carrying the state forward.

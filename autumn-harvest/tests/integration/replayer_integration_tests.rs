@@ -466,10 +466,11 @@ async fn persist_deadline_probe_history(
             last_error: None,
             scheduled_time: None,
         },
-        // The recorded clock read from should_continue_as_new()'s deadline branch.
+        // The recorded clock read from should_continue_as_new()'s deadline branch
+        // — recorded under the reserved probe name (issue #772).
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::event::SideEffectKind::Now,
-            name: None,
+            name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
             value: serde_json::json!(now_capture.timestamp_millis()),
         },
         WorkflowEvent::ActivityScheduled {

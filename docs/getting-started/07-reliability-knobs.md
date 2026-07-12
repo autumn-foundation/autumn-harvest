@@ -171,7 +171,12 @@ deadline-aware binary the deadline branch degrades to history-count-only for the
 run's already-recorded portion (it does **not** nd-block), and it picks the
 deadline feature up automatically once it executes live past its pre-upgrade
 frontier. You can deploy the new binary while such runs are in flight without
-any special sequencing.
+any special sequencing. The engine's deadline clock read is recorded under a
+reserved side-effect name, so it never consumes an author-side `ctx.system_now()`
+/ `ctx.sleep_until()` `Now` — even a pre-upgrade history where the
+`should_continue_as_new()` check sits immediately before a `ctx.system_now()`
+call replays cleanly, with that `Now` matched by the workflow's own read rather
+than the deadline probe.
 
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.patched()` — the recommended default for the

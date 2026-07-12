@@ -2928,16 +2928,22 @@ impl WorkflowContext {
     /// pre-#772 history whose `should_continue_as_new()` call site recorded no
     /// `system_now` clock read).
     ///
+    /// The probe records/matches its clock read under a reserved sentinel name
+    /// ([`DEADLINE_PROBE_SIDE_EFFECT_NAME`](crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME))
+    /// so it is never confused with an author-side [`system_now`](Self::system_now)
+    /// read (recorded with `name: None`) at the same cursor position.
+    ///
     /// Semantics (peeking the matcher cursor via
     /// [`HistoryMatcher::match_side_effect_now_tolerant`]):
     ///
-    /// - **Live frontier**: record a fresh `SideEffectRecorded{Now}` + push the
-    ///   `RecordSideEffect` command exactly as [`system_now`](Self::system_now)
-    ///   does, and return `Some(instant)`.
-    /// - **Cursor holds a matching `SideEffectRecorded{Now}`**: consume it and
-    ///   return `Some(recorded_value)` — identical to strict replay.
-    /// - **Cursor holds any OTHER recorded event** (old-history migration):
-    ///   return `None` WITHOUT consuming the cursor and WITHOUT diverging.
+    /// - **Live frontier**: record a fresh sentinel-named `SideEffectRecorded{Now}`
+    ///   and push the `RecordSideEffect` command (like [`system_now`](Self::system_now),
+    ///   but under the reserved probe name), then return `Some(instant)`.
+    /// - **Cursor holds the probe's own sentinel-named `SideEffectRecorded{Now}`**:
+    ///   consume it and return `Some(recorded_value)` — identical to strict replay.
+    /// - **Cursor holds any OTHER recorded event** (an old-history migration, OR a
+    ///   user `system_now()` Now belonging to author code): return `None` WITHOUT
+    ///   consuming the cursor and WITHOUT diverging.
     ///
     /// This is deliberately tolerant, unlike the strict `system_now()` /
     /// `time_until_deadline()` used by public author code (any direct call to
@@ -2963,18 +2969,20 @@ impl WorkflowContext {
             crate::replay::SideEffectNowMatch::NotRecorded => None,
             crate::replay::SideEffectNowMatch::Frontier => {
                 let millis = Utc::now().timestamp_millis();
-                // Record the fresh clock read exactly as `system_now` does at
-                // its `NoMatch` (frontier) branch: append the value + push the
-                // `RecordSideEffect` bookkeeping command. Unlike `system_now`,
-                // no strict-replay deferred non-determinism is recorded here —
-                // reaching the frontier for the engine-internal deadline read is
-                // expected on a fresh execution / live continuation, not an
-                // author determinism bug.
+                // Record the fresh clock read like `system_now` does at its
+                // `NoMatch` (frontier) branch — append the value + push the
+                // `RecordSideEffect` bookkeeping command — but under the reserved
+                // deadline-probe name so a later tolerant read matches the
+                // probe's own `Now` and never an author-side `system_now()` Now
+                // (issue #772). Unlike `system_now`, no strict-replay deferred
+                // non-determinism is recorded here — reaching the frontier for
+                // the engine-internal deadline read is expected on a fresh
+                // execution / live continuation, not an author determinism bug.
                 let value = serde_json::to_value(millis)
                     .expect("i64 millis must serialise to a JSON value");
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Now,
-                    name: None,
+                    name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
                     value,
                 });
                 Some(DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time))
@@ -11232,8 +11240,22 @@ mod tests {
         .with_execution_timeout(execution_timeout)
     }
 
-    /// A recorded `system_now` capture at the given wall-clock instant.
+    /// A recorded deadline-probe clock read at the given wall-clock instant —
+    /// recorded under the reserved probe name so the tolerant matcher consumes
+    /// it (issue #772).
     fn recorded_now(instant: DateTime<Utc>) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Now,
+            name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(instant.timestamp_millis()),
+        }
+    }
+
+    /// A recorded author-side `system_now()` capture (`name: None`) at the given
+    /// instant — the shape the PUBLIC [`system_now`](WorkflowContext::system_now)
+    /// / [`time_until_deadline`](WorkflowContext::time_until_deadline) accessors
+    /// match (strictly), distinct from the tolerant deadline probe (issue #772).
+    fn recorded_user_now(instant: DateTime<Utc>) -> WorkflowEvent {
         WorkflowEvent::SideEffectRecorded {
             kind: crate::event::SideEffectKind::Now,
             name: None,
@@ -11362,9 +11384,12 @@ mod tests {
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let clock = t0 + chrono::Duration::seconds(10);
         // execution_timeout = 30s, recorded clock = t0+10s ⇒ 20s remaining.
+        // `time_until_deadline()` reads the PUBLIC (strict) `system_now()`, so
+        // the recorded clock must be a bare user `Now` (`name: None`), not the
+        // deadline probe's sentinel-named read (issue #772).
         let ctx = deadline_ctx(
             t0,
-            vec![recorded_now(clock)],
+            vec![recorded_user_now(clock)],
             Some(chrono::Duration::seconds(30)),
         );
         assert_eq!(
@@ -11547,11 +11572,11 @@ mod tests {
                 &cmds[0],
                 WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Now,
-                    name: None,
+                    name: Some(name),
                     ..
-                }
+                } if name == crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME
             ),
-            "the recorded command must be a Now side-effect, got {:?}",
+            "the recorded command must be a sentinel-named Now side-effect, got {:?}",
             cmds[0]
         );
     }

@@ -369,6 +369,37 @@ fn should_can_then_timer_workflow<'a>(
     })
 }
 
+/// Migration-path shape (issue #772, deadline-probe naming fix): the deadline
+/// check sits immediately before a **user** `ctx.system_now()` call, then a
+/// durable timer. In a pre-#772 history there is NO recorded deadline-probe
+/// `Now` at the check site — but there IS the user's own `system_now()` Now at
+/// the cursor. The deadline probe must NOT consume that user `Now`; it belongs
+/// to `ctx.system_now()`. Before the naming fix, the tolerant matcher treated
+/// any `SideEffectRecorded{Now, name: None}` at the cursor as its own read,
+/// stole the user's `Now`, and the subsequent `ctx.system_now()` then replayed
+/// against the following `TimerStarted` and reported false non-determinism.
+fn should_can_then_user_now_then_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if ctx.should_continue_as_new() {
+            let prev = input["cycle"].as_i64().unwrap_or(0);
+            ctx.continue_as_new(serde_json::json!({ "cycle": prev + 1 }))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(Value::Null);
+        }
+        // A genuine author-side `system_now()` immediately after the deadline
+        // check. Its recorded `Now` must be consumed HERE, not by the probe.
+        let _captured = ctx.system_now();
+        ctx.timer("renewal", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("done"))
+    })
+}
+
 /// Cancellable durable timer (issue #768): arm, then await the outcome.
 fn cancellable_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1152,6 +1183,10 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn(
             "should_can_then_timer_workflow",
             should_can_then_timer_workflow,
+        )
+        .register_fn(
+            "should_can_then_user_now_then_timer_workflow",
+            should_can_then_user_now_then_timer_workflow,
         )
 }
 
@@ -1965,7 +2000,7 @@ fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEve
         },
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
-            name: None,
+            name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
             value: serde_json::json!(recorded_now.timestamp_millis()),
         },
     ]
@@ -2014,6 +2049,40 @@ fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("renewal"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("renewal"),
+        },
+    ]
+}
+
+/// Build a **pre-#772** history for `should_can_then_user_now_then_timer_workflow`:
+/// recorded under the old binary (which had no deadline read), it carries the
+/// author's own `system_now()` capture (`{Now, name: None}`) at the
+/// `should_continue_as_new()` call site, followed by the durable timer. The
+/// probe must leave the user's `Now` for `ctx.system_now()`.
+fn pre_772_user_now_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
+    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    // The user's recorded wall clock, well within the 30s budget so that even
+    // if the (buggy) probe were to consume it, the deadline branch would not
+    // trip — isolating the failure to the stolen-`Now` divergence.
+    let user_now = t0 + chrono::Duration::seconds(1);
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "cycle": 0 }),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(user_now.timestamp_millis()),
         },
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("renewal"),
@@ -2112,6 +2181,34 @@ async fn should_continue_as_new_tolerates_pre_772_history_without_nd_block() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a pre-#772 history must replay cleanly under the deadline-aware binary \
          (no divergence, no spurious ContinueAsNew), got: {report}"
+    );
+}
+
+/// Migration-path bug fix (issue #772): a pre-#772 history where the
+/// `should_continue_as_new()` check sits immediately before a **user**
+/// `ctx.system_now()` call. The recorded `SideEffectRecorded{Now, name: None}`
+/// at the cursor belongs to `ctx.system_now()`, NOT the engine's deadline
+/// probe. Before the naming fix the tolerant matcher stole that `Now`,
+/// advanced the cursor, and the subsequent `ctx.system_now()` diverged against
+/// the following `TimerStarted` — reporting false non-determinism on upgrade.
+/// The probe now records/matches under a reserved sentinel name, so the user's
+/// `Now` is left untouched and the history replays cleanly.
+#[tokio::test]
+async fn deadline_probe_does_not_consume_a_user_system_now() {
+    let events = pre_772_user_now_timer_history(1_700_000_000_000);
+    let report = build_replayer()
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_snapshot(make_snapshot(
+            "should_can_then_user_now_then_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the deadline probe must not consume the user's system_now() Now: a \
+         pre-#772 history with a user Now at the check site must replay cleanly, \
+         got: {report}"
     );
 }
 
