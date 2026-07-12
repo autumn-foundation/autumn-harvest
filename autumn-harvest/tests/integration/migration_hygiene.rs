@@ -103,7 +103,7 @@ fn full_migrations_sql_bundle_is_complete() {
     let mut missing: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| !bundle.contains(&format!("-- harvest-migration: {name}")))
+        .filter(|name| !bundle.contains(&format!("-- harvest-migration: {name}\n")))
         .collect();
     missing.sort_unstable();
     assert!(
@@ -118,7 +118,7 @@ fn full_migrations_sql_bundle_is_complete() {
     // migration's header must be present, so a truncated bundle can never pass.
     let newest = names.last().expect("at least one migration");
     assert!(
-        bundle.contains(&format!("-- harvest-migration: {newest}")),
+        bundle.contains(&format!("-- harvest-migration: {newest}\n")),
         "bundle must include the newest migration ({newest}); a missing tail is the exact \
          drift class this guard prevents"
     );

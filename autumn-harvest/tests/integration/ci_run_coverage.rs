@@ -165,7 +165,7 @@ const ALLOWLIST_WORKFLOW_RETRY_REASON: &str = "run step limited to `workflow_ret
 // out of scope for this test-infra PR — tracked here honestly instead.
 const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `--no-run`-compiled in CI) AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness) — no CI step can execute it; tracked";
-const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not compiled or run by any CI step — AND all tests are #[ignore]d \
+const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (compiled only via `--no-run`) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
 
 const ALLOWLIST: &[(&str, &str)] = &[
