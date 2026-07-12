@@ -143,6 +143,22 @@ from the recorded start time and the clock read reuses the existing
 to the same `continue_as_new` on every worker. See
 `examples/long_lived_entity_deadline.rs`.
 
+**Call `should_continue_as_new()` once per decision cycle.** When the workflow
+declares an `execution_timeout`, each `should_continue_as_new()` call reads the
+deadline clock and records **one** `SideEffectRecorded{Now}` event on the live
+frontier (a no-timeout workflow records nothing). Call it once at the top of a
+decision cycle — not in a tight inner loop that fires it dozens of times per
+cycle — or the history grows a `Now` event per call.
+
+**Rollout is graceful — no "upgrade the fleet first" dance.** An in-flight
+execution recorded *before* this feature shipped carries no deadline clock read
+at the `should_continue_as_new()` call site. When it resumes under a
+deadline-aware binary the deadline branch degrades to history-count-only for the
+run's already-recorded portion (it does **not** nd-block), and it picks the
+deadline feature up automatically once it executes live past its pre-upgrade
+frontier. You can deploy the new binary while such runs are in flight without
+any special sequencing.
+
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.patched()` — the recommended default for the
 overwhelmingly common two-state (before/after) change — so old executions

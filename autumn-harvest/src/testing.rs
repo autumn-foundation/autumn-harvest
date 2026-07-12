@@ -2099,6 +2099,15 @@ async fn replay_fixture_file(
     }
 
     // Build a single-use replayer and run with timeout.
+    //
+    // Known limitation (issue #772): `execution_timeout` is hardcoded to `None`
+    // here because the directory-fixture format (`HistorySnapshot` JSON) carries
+    // no execution-timeout field, so this path cannot validate
+    // deadline-triggered `continue_as_new` fixtures — `ctx.deadline()` is always
+    // `None` for directory replays. Follow-up: add an optional timeout field to
+    // the snapshot format if directory-driven deadline fixtures are needed. Tests
+    // that need a deadline use `WorkflowReplayer::with_execution_timeout` directly
+    // (see `tests/integration/replayer_tests.rs`).
     let replayer = WorkflowReplayer {
         handlers: handlers.clone(),
         state,

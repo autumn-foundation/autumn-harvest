@@ -335,6 +335,45 @@ pub enum PatchMarkerMatch {
     NewlyPatched,
 }
 
+/// Outcome of a *tolerant* deadline-branch clock read (issue #772).
+///
+/// Used ONLY by `should_continue_as_new`'s internal deadline check
+/// ([`crate::context::WorkflowContext::deadline_clock_read`]) — never by the
+/// public `system_now()`/`time_until_deadline()`, which stay strict.
+///
+/// The critical difference from
+/// [`match_side_effect_event`](HistoryMatcher::match_side_effect_event): a
+/// cursor holding a *non-`Now`* recorded event resolves to
+/// [`SideEffectNowMatch::NotRecorded`] (cursor left untouched, no divergence)
+/// rather than [`HistoryMatch::Diverged`]. This is what lets a workflow that
+/// declares an `execution_timeout` and calls `should_continue_as_new()` at the
+/// top of a run resume gracefully under a new binary even when its recorded
+/// history predates #772 (and so carries no `SideEffectRecorded{Now}` at that
+/// position): the deadline branch simply degrades to history-count-only for the
+/// pre-upgrade recorded portion instead of recording a non-determinism error
+/// and nd-blocking the run (issue #603).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideEffectNowMatch {
+    /// The cursor held a matching `SideEffectRecorded { kind: Now }`; its
+    /// recorded millis value was consumed and the cursor advanced (identical to
+    /// strict replay).
+    Matched {
+        /// The recorded wall-clock instant, as Unix milliseconds.
+        millis: i64,
+    },
+    /// The cursor held some *other* recorded event (an old-history migration:
+    /// the `should_continue_as_new()` call site recorded no clock read here).
+    /// The cursor is left untouched and no divergence is raised — the caller
+    /// degrades the deadline branch to "unavailable". Fail-safe by
+    /// construction: it can never emit a wrong command, and any genuine
+    /// control-flow divergence still nd-errors at the next real command.
+    NotRecorded,
+    /// The cursor is at the live frontier (past the end of recorded history).
+    /// The caller records a fresh `Now` side-effect exactly as `system_now()`
+    /// does and returns the captured instant.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -4611,6 +4650,50 @@ impl HistoryMatcher {
 
                 event_index: i32::try_from(self.cursor).ok(),
             },
+        }
+    }
+
+    /// Tolerant deadline-branch wall-clock read (issue #772).
+    ///
+    /// Peeks the cursor for a `SideEffectRecorded { kind: Now, name: None }`
+    /// (the shape `system_now()` records) and resolves to one of three states —
+    /// see [`SideEffectNowMatch`] for the full rationale. Unlike the strict
+    /// [`match_side_effect_event`](Self::match_side_effect_event), a cursor
+    /// holding any *other* recorded event resolves to
+    /// [`SideEffectNowMatch::NotRecorded`] (cursor untouched, no divergence)
+    /// rather than [`HistoryMatch::Diverged`].
+    ///
+    /// Uses the same [`prepare_match`](Self::prepare_match) preamble as the
+    /// strict matcher, so it lands on exactly the same cursor position — the
+    /// only difference is the non-diverging treatment of a non-`Now` event.
+    #[must_use]
+    pub fn match_side_effect_now_tolerant(&mut self) -> SideEffectNowMatch {
+        if !self.prepare_match() {
+            // Past the end of recorded history — the live frontier.
+            return SideEffectNowMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: None,
+                value,
+            } => {
+                // Recorded `Now` values are always a JSON integer (millis). A
+                // malformed value is treated as "unavailable" rather than
+                // diverging (fail-safe; practically unreachable).
+                match value.as_i64() {
+                    Some(millis) => {
+                        self.cursor += 1;
+                        self.advance_to_next_unconsumed_event();
+                        SideEffectNowMatch::Matched { millis }
+                    }
+                    None => SideEffectNowMatch::NotRecorded,
+                }
+            }
+            // Any other recorded event: do NOT consume the cursor, do NOT
+            // diverge. The deadline branch degrades to history-count-only for
+            // the recorded portion of a pre-#772 history.
+            _ => SideEffectNowMatch::NotRecorded,
         }
     }
 
@@ -10328,6 +10411,65 @@ mod tests {
             HistoryMatch::Matched {
                 output: serde_json::json!(uuid2.to_string())
             }
+        );
+    }
+
+    // ── Tolerant deadline clock read (issue #772 Finding 1) ─────────────────
+
+    #[test]
+    fn match_side_effect_now_tolerant_matches_recorded_now() {
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(1_700_000_000_123_i64),
+        }]);
+        assert_eq!(
+            matcher.match_side_effect_now_tolerant(),
+            SideEffectNowMatch::Matched {
+                millis: 1_700_000_000_123
+            }
+        );
+        // Cursor consumed the event.
+        assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn match_side_effect_now_tolerant_not_recorded_for_non_now_event_leaves_cursor() {
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("t"),
+            duration_secs: 60,
+        }]);
+        let before = matcher.position();
+        assert_eq!(
+            matcher.match_side_effect_now_tolerant(),
+            SideEffectNowMatch::NotRecorded
+        );
+        // Cursor NOT advanced: the next real match sees the TimerStarted.
+        assert_eq!(matcher.position(), before);
+        assert!(matcher.is_replaying());
+    }
+
+    #[test]
+    fn match_side_effect_now_tolerant_not_recorded_for_other_side_effect_kind() {
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("some-uuid"),
+        }]);
+        let before = matcher.position();
+        assert_eq!(
+            matcher.match_side_effect_now_tolerant(),
+            SideEffectNowMatch::NotRecorded
+        );
+        assert_eq!(matcher.position(), before);
+    }
+
+    #[test]
+    fn match_side_effect_now_tolerant_frontier_past_end() {
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(
+            matcher.match_side_effect_now_tolerant(),
+            SideEffectNowMatch::Frontier
         );
     }
 }
