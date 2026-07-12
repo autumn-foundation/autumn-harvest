@@ -12,32 +12,48 @@
 //! drift* (a hand-rolled `INIT_SQL` bundle missing a migration, which would
 //! fail `column/relation ... does not exist` at runtime). Drift is guarded
 //! separately in `migration_hygiene.rs`; this guard only answers "is every
-//! DB-gated test actually RUN by some `ci.yml` step?" — never whether its
-//! schema bundle is complete.
+//! DB-gated test actually RUN by some CI step?" — never whether its schema
+//! bundle is complete.
 //!
-//! Mechanics (runs in the cheap no-DB step on every OS): cross-check the set of
-//! DB-gated integration tests against the set of tests `.github/workflows/ci.yml`
-//! actually *runs*. A target is NOT credited as run when it is only
-//! `--no-run`-compiled, when the step selects only a `module::filter`
-//! sub-slice of it (the `::workflow_typed` trap above), or when every one of
-//! its `#[test]`/`#[tokio::test]` fns is `#[ignore]`d (a run step then executes
-//! nothing). Every DB-gated test must either have a genuine covering run step
-//! or be listed — with a reason — in `ALLOWLIST`. `ALLOWLIST` is fail-closed
-//! debt to SHRINK by wiring run steps, not to grow (a soft ratchet caps its
-//! length below).
+//! Source of truth: the per-suite CI runs are now DATA in the manifest
+//! `.github/ci/integration-suites.txt` (executed by `.github/ci/run-suites.sh`,
+//! which the `test` job invokes), not copy-pasted `cargo test` steps in
+//! `ci.yml`. This guard parses that structured manifest instead of scraping
+//! `run:` lines — the columns are already split, so the old `--test-threads=1`
+//! special-casing, `--no-run` string-grepping, and `module::filter`
+//! re-tokenization are gone. A target is NOT credited as run when its manifest
+//! row is `compileonly` (an explicit column, never a `--no-run` grep), when the
+//! row selects only a `module::filter` sub-slice (the `::workflow_typed` trap),
+//! or when every one of its `#[test]`/`#[tokio::test]` fns is `#[ignore]`d (a
+//! run then executes nothing). Every DB-gated test must either have a covering
+//! `linux`/`allos` manifest row or be listed — with a reason — in `ALLOWLIST`.
+//! `ALLOWLIST` is fail-closed debt to SHRINK by adding manifest rows, not to
+//! grow (a soft ratchet caps its length below).
 //!
-//! On failure the panic message lists every uncovered test so the fix is
-//! actionable: either add a Docker-backed run step in `ci.yml` or (rarely, with
-//! a documented reason) extend `ALLOWLIST`.
+//! A NEW assertion guards against the manifest being silently ignored: `ci.yml`
+//! must actually invoke the runner against the manifest, else the guard would
+//! read a manifest CI never executes (green-but-not-run). A second NEW assertion
+//! keeps the `merge=union` manifest sorted + unique (a union-merge artifact is a
+//! benign, one-command-fix CI failure, never a conflict).
+//!
+//! On failure the panic message lists every uncovered test and the exact
+//! manifest line to add.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 // ── Inputs embedded at compile time (recompile when they change) ────────────
 
-/// The whole CI workflow, so a reformat that breaks parsing recompiles — and
-/// trips the self-test below — rather than silently passing.
+/// The whole CI workflow, so a reformat that breaks the invocation assertion
+/// recompiles — and trips the self-test below — rather than silently passing.
 const CI_YAML: &str = include_str!("../../../.github/workflows/ci.yml");
+
+/// The manifest: the single source of truth for which per-suite runs CI does.
+const MANIFEST: &str = include_str!("../../../.github/ci/integration-suites.txt");
+
+/// The runner script, so we can assert it actually reads the manifest (closing
+/// the "runner step present but pointed elsewhere" gap).
+const RUN_SCRIPT: &str = include_str!("../../../.github/ci/run-suites.sh");
 
 /// The integration submodule declarations (source of truth for which core
 /// suites exist and their cfg gates).
@@ -45,8 +61,8 @@ const CORE_MOD_RS: &str = include_str!("mod.rs");
 
 // ── DB classification ───────────────────────────────────────────────────────
 
-/// A test file "needs a live DB" (== a Docker-backed CI run step) iff its
-/// *code* spins up / connects to Postgres. Two families of markers:
+/// A test file "needs a live DB" (== a Docker-backed CI run) iff its *code*
+/// spins up / connects to Postgres. Two families of markers:
 ///   * the classic testcontainers style (`with_init_sql(` / `Postgres::default(`)
 ///     and the `HARVEST_TEST_DATABASE_URL` opt-in override, and
 ///   * the paved `autumn_web::test::TestDb` + `run_pending(MIGRATIONS)` harness
@@ -90,7 +106,7 @@ fn needs_live_db(source: &str) -> bool {
 }
 
 /// True when a file declares `#[test]`/`#[tokio::test]` fns but every one is
-/// `#[ignore]`d, so a run step targeting it executes nothing and must NOT be
+/// `#[ignore]`d, so a run targeting it executes nothing and must NOT be
 /// credited as covering it (the target must be allowlisted instead). Counts
 /// `#[ignore]` against the total test count; a file with no tests is not
 /// "all-ignored".
@@ -101,12 +117,11 @@ fn all_tests_ignored(source: &str) -> bool {
 }
 
 /// Whether a file's own leading `#![cfg(...)]` gates it on `feature = "testing"`.
-/// Fix #3: the dominant convention is a file-level `#![cfg(...)]` with a plain
-/// `mod X;` in `mod.rs`, so the covering-run `--features testing` requirement
-/// must be read from the file, not only from the `mod.rs` cfg line. The two are
-/// combined (unioned) by the caller — either gate requiring testing means the
-/// run must carry it — so the `mod.rs`-gated `all(testing, db)` submodules stay
-/// correct.
+/// The dominant convention is a file-level `#![cfg(...)]` with a plain `mod X;`
+/// in `mod.rs`, so the covering-run `--features testing` requirement must be
+/// read from the file, not only from the `mod.rs` cfg line. The two are combined
+/// (unioned) by the caller — either gate requiring testing means the run must
+/// carry it — so the `mod.rs`-gated `all(testing, db)` submodules stay correct.
 fn file_requires_testing(source: &str) -> bool {
     source
         .lines()
@@ -122,28 +137,29 @@ fn file_requires_testing(source: &str) -> bool {
 /// be misclassified as needing a live DB.
 const SELF_EXCLUDE: &[&str] = &["ci_run_coverage", "migration_hygiene"];
 
-// ── Allowlist: DB-gated tests without a CI run step (technical debt) ─────────
+// ── Allowlist: DB-gated tests without a covering manifest row (technical debt) ─
 //
 // Keyed `core:<module>` / `plugin:<file-stem>`. Every entry carries a reason.
-// Seeded fail-closed with the tests that currently lack a Docker-backed run
-// step so the guard is green on commit. SHRINK this by wiring run steps; the
+// Seeded fail-closed with the tests that currently lack a covering manifest row
+// so the guard is green on commit. SHRINK this by adding manifest rows; the
 // ratchet below forbids silent growth. This guard PROVED it bites: during
 // development `nd_block_tests` was left out and the guard failed naming it (the
 // TDD red step). `nd_block_tests`, `worker_session_tests`, and the plugin
-// `build_ramp_integration` suites were fixed and wired to Docker-backed run
-// steps in this PR, so they are no longer here.
+// `build_ramp_integration` suites are wired (they have `linux` manifest rows),
+// so they are no longer here.
 
-const ALLOWLIST_DEBT_REASON: &str = "DB integration test not yet wired to a Docker-backed CI run step; test-coverage debt to shrink";
-const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not yet wired to a Docker-backed CI run step (needs --features testing when wired)";
+const ALLOWLIST_DEBT_REASON: &str =
+    "DB integration test not yet wired to a covering manifest row; test-coverage debt to shrink";
+const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not yet wired to a covering manifest row (needs the `testing` feature when wired)";
 // mcp_tools_integration / webhook_* integration: paved-path DB tests
 // (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
-// AND have every test #[ignore]d, so no CI step can execute them. The mcp one
-// is `--no-run`-compiled only; the webhooks feature is enabled by no CI step.
-// Wiring real Docker-backed run steps for #[ignore]d/feature-gated suites is
+// AND have every test #[ignore]d, so no CI run can execute them. The mcp one is
+// only `compileonly` in the manifest; the webhooks feature is enabled by no CI
+// run. Wiring real Docker-backed runs for #[ignore]d/feature-gated suites is
 // out of scope for this test-infra PR — tracked here honestly instead.
-const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `--no-run`-compiled in CI) AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness) — no CI step can execute it; tracked";
-const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (compiled only via `--no-run`) — AND all tests are #[ignore]d \
+const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `compileonly` in the manifest) AND all tests are #[ignore]d \
+     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked";
+const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
 
 const ALLOWLIST: &[(&str, &str)] = &[
@@ -245,142 +261,134 @@ const ALLOWLIST: &[(&str, &str)] = &[
 
 /// Soft ratchet: the allowlist may shrink but must never silently grow. Bump
 /// this ONLY with a deliberate justification (it should trend toward zero).
-/// 74 = the prior 77 minus the three wired to Docker-backed run steps in the
-/// PR-#1031 follow-up (each was a test-harness bug, now fixed, so the whole
-/// module runs green): `core:workflow_retry_tests` (its `::workflow_typed`
-/// sub-filter now covers the whole module), `core:completion_callback_tests`,
-/// and `core:event_batch_tests`.
+/// 74 = the prior 77 minus the three now wired to covering `linux` manifest
+/// rows (each was a test-harness bug, now fixed, so the whole module runs
+/// green): `core:workflow_retry_tests` (its `::workflow_typed` sub-filter is
+/// replaced by a whole-module row), `core:completion_callback_tests`, and
+/// `core:event_batch_tests`.
 const ALLOWLIST_MAX_LEN: usize = 74;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
 }
 
-// ── ci.yml parsing (tolerant, token-based over the whole text) ──────────────
+// ── Manifest parsing (structured — columns already split) ───────────────────
 
-/// A single `run: cargo test ...` command that is an actual RUN (not `--no-run`).
-struct RunCommand {
-    text: String,
+/// One manifest record: `osclass crate target features filter`.
+struct SuiteRow {
+    /// `linux` | `allos` | `compileonly`.
+    osclass: String,
+    /// `autumn-harvest` | `autumn-harvest-plugin`.
+    krate: String,
+    /// The `--test <target>` binary (core suites use `integration`).
+    target: String,
+    /// Comma-list of features, or `-`.
+    features: String,
+    /// Positional filter after `--`, or `-` for the whole target.
+    filter: String,
 }
 
-fn run_commands() -> Vec<RunCommand> {
-    let mut out = Vec::new();
-    for line in CI_YAML.lines() {
-        let line = line.trim();
-        // ASSUMPTION: every `run: cargo test …` command is a single physical
-        // line (no YAML block scalars `|`/`>` spanning multiple lines). True for
-        // this workflow; a multi-line command would parse only its first line.
-        let Some(idx) = line.find("cargo test") else {
-            continue;
-        };
-        let cmd = &line[idx..];
-        if cmd.contains("--no-run") {
-            continue; // compile-only, not a run
+impl SuiteRow {
+    /// `linux`/`allos` rows execute in CI; `compileonly` never does.
+    fn runs(&self) -> bool {
+        self.osclass == "linux" || self.osclass == "allos"
+    }
+
+    /// The `--features` tokens as a set (`-` ⇒ empty).
+    fn feature_set(&self) -> BTreeSet<&str> {
+        if self.features == "-" {
+            BTreeSet::new()
+        } else {
+            self.features.split(',').collect()
         }
-        out.push(RunCommand {
-            text: cmd.to_string(),
+    }
+}
+
+fn parse_manifest() -> Vec<SuiteRow> {
+    // Fail-closed value allowlists: an unknown `osclass` routes a suite to NO
+    // run-mode (`runs()`/`do_compile` both ignore it) → a silently-never-run
+    // suite, exactly the gap this guard exists to catch; an unknown `crate`
+    // would never match a coverage lookup. Reject either as a typo.
+    // extend this set when a new crate/osclass is introduced.
+    const VALID_OSCLASS: &[&str] = &["linux", "allos", "compileonly"];
+    const VALID_CRATE: &[&str] = &["autumn-harvest", "autumn-harvest-plugin"];
+    let mut out = Vec::new();
+    for (n, line) in MANIFEST.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = t.split_whitespace().collect();
+        assert_eq!(
+            cols.len(),
+            5,
+            "manifest line {} must have exactly 5 whitespace-separated columns \
+             (osclass crate target features filter), got {}: {t:?}",
+            n + 1,
+            cols.len()
+        );
+        // Fail-closed value checks (allowlists hoisted above the loop).
+        assert!(
+            VALID_OSCLASS.contains(&cols[0]),
+            "manifest line {} has unknown osclass {:?} (expected one of {VALID_OSCLASS:?})",
+            n + 1,
+            cols[0]
+        );
+        assert!(
+            VALID_CRATE.contains(&cols[1]),
+            "manifest line {} has unknown crate {:?} (expected one of {VALID_CRATE:?})",
+            n + 1,
+            cols[1]
+        );
+        out.push(SuiteRow {
+            osclass: cols[0].to_string(),
+            krate: cols[1].to_string(),
+            target: cols[2].to_string(),
+            features: cols[3].to_string(),
+            filter: cols[4].to_string(),
         });
     }
     out
 }
 
-/// Extract the value following `--features` in a command (comma-list), if any.
-fn features_of(cmd: &str) -> Option<&str> {
-    let idx = cmd.find("--features")?;
-    let rest = cmd[idx + "--features".len()..].trim_start();
-    Some(rest.split_whitespace().next().unwrap_or(""))
-}
-
 // ── Core coverage ───────────────────────────────────────────────────────────
 
-/// (filter-first-segment, `partial`, `has_testing`, `has_db`)
-struct CoreFilter {
-    seg: String,
-    /// The run filter was `module::something`, i.e. it selects only a *slice*
-    /// of the module's tests (e.g. `workflow_retry_tests::workflow_typed` runs
-    /// 3 of 9). Such a filter must NOT be credited as whole-module coverage.
-    partial: bool,
-    has_testing: bool,
-    has_db: bool,
-}
-
-struct CoreCoverage {
-    filters: Vec<CoreFilter>,
-    /// A whole-target `--test integration` run that includes the db feature.
-    whole_db: bool,
-    whole_db_testing: bool,
-}
-
-fn parse_core_coverage(cmds: &[RunCommand]) -> CoreCoverage {
-    let mut filters = Vec::new();
-    let mut whole_db = false;
-    let mut whole_db_testing = false;
-    for c in cmds {
-        let cmd = &c.text;
-        // core crate only (plugin check FIRST because it is a superstring).
-        if cmd.contains("-p autumn-harvest-plugin") {
-            continue;
+/// A core `integration` submodule is covered iff some executing (`linux`/`allos`)
+/// manifest row enables `db` (so the module compiles + its tests exist), carries
+/// `testing` when the module needs it, and targets it whole (a whole-target run,
+/// or a filter whose first `::`-segment prefixes the module name — a partial
+/// `module::test` filter never credits the whole module).
+///
+/// `autumn-harvest` has `default = ["db", "unified-dag-execution"]`; the runner
+/// keeps defaults for `linux` integration rows (Docker Postgres) and strips them
+/// (`--no-default-features`) for `allos` integration rows (no live DB). So a
+/// `linux` integration row always has `db`; an `allos` integration row has it
+/// only if it lists it explicitly. `testing` is never a default, so it must be
+/// listed regardless of osclass.
+fn core_covers(rows: &[SuiteRow], module: &str, needs_testing: bool) -> bool {
+    rows.iter().any(|r| {
+        if r.krate != "autumn-harvest" || r.target != "integration" || !r.runs() {
+            return false;
         }
-        if !cmd.contains("-p autumn-harvest") {
-            continue;
+        let feats = r.feature_set();
+        let has_db = r.osclass == "linux" || feats.contains("db");
+        let has_testing = feats.contains("testing");
+        if !has_db {
+            return false;
         }
-        if !cmd.contains("--test integration") {
-            continue;
+        if needs_testing && !has_testing {
+            return false;
         }
-        let has_no_default = cmd.contains("--no-default-features");
-        let feats = features_of(cmd).unwrap_or("");
-        let has_db = !has_no_default || feats.split(',').any(|f| f == "db");
-        let has_testing = feats.split(',').any(|f| f == "testing");
-        // Is there a filter after `--test integration -- `?
-        if let Some(pos) = cmd.find("--test integration") {
-            let after = cmd[pos + "--test integration".len()..].trim_start();
-            if let Some(rest) = after.strip_prefix("--") {
-                let rest = rest.trim_start();
-                let first = rest.split_whitespace().next().unwrap_or("");
-                if !first.is_empty() && first != "--test-threads=1" {
-                    // A `module::test` filter runs only that slice, so it must
-                    // not credit the whole module (the `::workflow_typed` trap).
-                    let partial = first.contains("::");
-                    let seg = first.split("::").next().unwrap_or(first).to_string();
-                    filters.push(CoreFilter {
-                        seg,
-                        partial,
-                        has_testing,
-                        has_db,
-                    });
-                    continue;
-                }
-            }
-            // No filter → whole-target run.
-            if has_db {
-                whole_db = true;
-                whole_db_testing = whole_db_testing || has_testing;
-            }
+        if r.filter == "-" {
+            return true; // whole target
         }
-    }
-    CoreCoverage {
-        filters,
-        whole_db,
-        whole_db_testing,
-    }
-}
-
-impl CoreCoverage {
-    /// A core module is covered iff a db-carrying run targets it (whole-target
-    /// or a filter whose first segment prefixes the module name). When the
-    /// module is `testing`-gated the covering run must also carry `--features
-    /// testing`, else the module compiles to nothing and never runs.
-    fn covers(&self, module: &str, needs_testing: bool) -> bool {
-        if self.whole_db && (!needs_testing || self.whole_db_testing) {
-            return true;
+        if r.filter.contains("::") {
+            return false; // partial slice — no whole-module credit
         }
-        self.filters.iter().any(|f| {
-            !f.partial
-                && f.has_db
-                && (!needs_testing || f.has_testing)
-                && (module == f.seg || module.starts_with(&f.seg))
-        })
-    }
+        // No `::` here (guarded above), so the whole filter is the module segment.
+        let seg = r.filter.as_str();
+        module == seg || module.starts_with(seg)
+    })
 }
 
 // ── mod.rs parsing: (module, needs_testing) ─────────────────────────────────
@@ -418,7 +426,7 @@ fn parse_core_modules() -> Vec<CoreModule> {
 // ── Plugin coverage ─────────────────────────────────────────────────────────
 
 /// Features required to even compile a plugin test file (from a top-level
-/// `#![cfg(feature = "X")]`), so a covering run step must carry them.
+/// `#![cfg(feature = "X")]`), so a covering run must carry them.
 fn plugin_required_features(source: &str) -> Vec<String> {
     let mut feats = Vec::new();
     for line in source.lines() {
@@ -436,67 +444,16 @@ fn plugin_required_features(source: &str) -> Vec<String> {
     feats
 }
 
-struct PluginRun {
-    tests: BTreeSet<String>,
-    features: String,
-    /// A positional test filter followed the `--` separator (something other
-    /// than `--test-threads=N`), so the step runs only a slice — mirror of the
-    /// core `CoreFilter::partial` guard (Fix #6). Not triggered by any current
-    /// ci.yml plugin step, but keeps the two parsers symmetric so a future
-    /// `--test foo -- some_filter` can't over-credit `foo`.
-    partial: bool,
-}
-
-fn parse_plugin_runs(cmds: &[RunCommand]) -> Vec<PluginRun> {
-    let mut out = Vec::new();
-    for c in cmds {
-        let cmd = &c.text;
-        if !cmd.contains("-p autumn-harvest-plugin") {
-            continue;
+/// A plugin test file is covered iff an executing (`linux`/`allos`) manifest row
+/// targets it whole (`filter == "-"` — a positional filter would slice it, the
+/// mirror of the core partial-filter guard) and lists every required feature.
+/// `compileonly` rows never cover.
+fn plugin_covered(rows: &[SuiteRow], stem: &str, required: &[String]) -> bool {
+    rows.iter().any(|r| {
+        r.krate == "autumn-harvest-plugin" && r.target == stem && r.runs() && r.filter == "-" && {
+            let feats = r.feature_set();
+            required.iter().all(|f| feats.contains(f.as_str()))
         }
-        let mut tests = BTreeSet::new();
-        // Collect every `--test <name>` token.
-        let toks: Vec<&str> = cmd.split_whitespace().collect();
-        let mut i = 0;
-        // Everything AFTER the first standalone `--` is a positional filter (not
-        // a cargo flag); anything there other than `--test-threads=N` slices the
-        // target's tests and must not be credited as full coverage.
-        let sep = toks.iter().position(|t| *t == "--");
-        let partial = sep.is_some_and(|s| {
-            toks[s + 1..]
-                .iter()
-                .any(|t| !t.starts_with("--test-threads"))
-        });
-        while i < toks.len() {
-            if toks[i] == "--test" {
-                if let Some(name) = toks.get(i + 1) {
-                    tests.insert((*name).to_string());
-                }
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        if tests.is_empty() {
-            continue;
-        }
-        let features = features_of(cmd).unwrap_or("").to_string();
-        out.push(PluginRun {
-            tests,
-            features,
-            partial,
-        });
-    }
-    out
-}
-
-fn plugin_covered(file_stem: &str, required_features: &[String], runs: &[PluginRun]) -> bool {
-    runs.iter().any(|r| {
-        !r.partial
-            && r.tests.contains(file_stem)
-            && required_features
-                .iter()
-                .all(|f| r.features.split(',').any(|rf| rf == f))
     })
 }
 
@@ -514,39 +471,39 @@ fn read_source(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-// ── Self-test: the parser must find known-existing run steps ────────────────
+// ── Self-test: the manifest parser must find known rows ─────────────────────
 
 #[test]
-fn ci_parser_finds_known_run_steps() {
-    let cmds = run_commands();
+fn manifest_parser_finds_known_rows() {
+    let rows = parse_manifest();
     assert!(
-        !cmds.is_empty(),
-        "found no `run: cargo test` commands in ci.yml — parser or workflow format broke"
+        !rows.is_empty(),
+        "parsed no manifest rows — parser or manifest format broke"
     );
 
-    let core = parse_core_coverage(&cmds);
-    let core_segs: BTreeSet<&str> = core.filters.iter().map(|f| f.seg.as_str()).collect();
+    // Known core `linux` integration filters.
+    let core_filters: BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.krate == "autumn-harvest" && r.target == "integration" && r.runs())
+        .map(|r| r.filter.as_str())
+        .collect();
     for expected in [
         "integration_e2e",
         "force_fail",
         "typed_workflow_failure_tests",
     ] {
         assert!(
-            core_segs.contains(expected),
-            "self-test: expected a core `--test integration -- {expected}` run filter, \
-             found {core_segs:?}. Did ci.yml formatting change?"
+            core_filters.contains(expected),
+            "self-test: expected a core `integration` row filtered on {expected}, \
+             found {core_filters:?}"
         );
     }
-    assert!(
-        core.filters.len() >= 8,
-        "self-test: expected ≥8 core run filters, found {} — parser likely broke",
-        core.filters.len()
-    );
 
-    let plugin_runs = parse_plugin_runs(&cmds);
-    let plugin_tests: BTreeSet<&str> = plugin_runs
+    // Known plugin `linux` targets.
+    let plugin_targets: BTreeSet<&str> = rows
         .iter()
-        .flat_map(|r| r.tests.iter().map(String::as_str))
+        .filter(|r| r.krate == "autumn-harvest-plugin" && r.runs())
+        .map(|r| r.target.as_str())
         .collect();
     for expected in [
         "api_scheduler_integration",
@@ -554,67 +511,99 @@ fn ci_parser_finds_known_run_steps() {
         "query_integration",
     ] {
         assert!(
-            plugin_tests.contains(expected),
-            "self-test: expected a plugin `--test {expected}` run step, found {plugin_tests:?}"
+            plugin_targets.contains(expected),
+            "self-test: expected a plugin run row for {expected}, found {plugin_targets:?}"
         );
     }
     assert!(
-        plugin_tests.len() >= 15,
+        plugin_targets.len() >= 15,
         "self-test: expected ≥15 plugin run targets, found {} — parser likely broke",
-        plugin_tests.len()
+        plugin_targets.len()
     );
 }
 
-// ── Fix #6: `--no-run` compile-only steps are never counted as runs ──────────
+// ── A `compileonly` row is never credited as covered ─────────────────────────
 
 #[test]
-fn no_run_compile_only_target_is_not_covered() {
-    let cmds = run_commands();
-    let plugin_runs = parse_plugin_runs(&cmds);
-    let run_targets: BTreeSet<&str> = plugin_runs
-        .iter()
-        .flat_map(|r| r.tests.iter().map(String::as_str))
-        .collect();
-    // `mcp_tools_integration` appears in ci.yml ONLY on a `--no-run` compile
-    // line, never a real run step — it must not be treated as covered.
+fn compileonly_row_is_not_credited_as_covered() {
+    let rows = parse_manifest();
+    // `mcp_tools_integration` is `compileonly` in the manifest — it must not be
+    // treated as covered.
     assert!(
-        !run_targets.contains("mcp_tools_integration"),
-        "a `--no-run` compile-only target must NOT appear in the covered run set"
+        rows.iter()
+            .any(|r| r.target == "mcp_tools_integration" && r.osclass == "compileonly"),
+        "expected `mcp_tools_integration` to be a `compileonly` manifest row"
     );
-    // Sanity: a genuine run target IS present.
-    assert!(run_targets.contains("api_scheduler_integration"));
+    assert!(
+        !plugin_covered(&rows, "mcp_tools_integration", &[]),
+        "a `compileonly` target must NOT be credited as covered"
+    );
+    // Sanity: a genuine `linux` run target IS covered.
+    assert!(plugin_covered(&rows, "api_scheduler_integration", &[]));
 }
 
-// ── Fix #1: a `module::filter` sub-selection must not credit the whole module ─
+// ── A `module::filter` sub-selection must not credit the whole module ────────
 
 #[test]
 fn subfilter_does_not_credit_whole_module() {
-    // The exact ci.yml shape that masked 6 of `workflow_retry_tests`' 9 DB tests.
-    let sub = vec![RunCommand {
-        text: "cargo test -p autumn-harvest --test integration -- \
-               workflow_retry_tests::workflow_typed --test-threads=1"
-            .to_string(),
+    // The exact manifest shape that would mask 6 of `workflow_retry_tests`' 9 DB
+    // tests: a partial `module::test` filter.
+    let sub = vec![SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "-".into(),
+        filter: "workflow_retry_tests::workflow_typed".into(),
     }];
-    let cov = parse_core_coverage(&sub);
     assert!(
-        !cov.covers("workflow_retry_tests", false),
+        !core_covers(&sub, "workflow_retry_tests", false),
         "a `module::test` sub-filter must NOT credit the whole module as covered"
     );
 
-    // Whereas the whole-module filter DOES cover it.
-    let whole = vec![RunCommand {
-        text: "cargo test -p autumn-harvest --test integration -- \
-               workflow_retry_tests --test-threads=1"
-            .to_string(),
+    // Whereas a whole-module filter DOES cover it.
+    let whole = vec![SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "-".into(),
+        filter: "workflow_retry_tests".into(),
     }];
     assert!(
-        parse_core_coverage(&whole).covers("workflow_retry_tests", false),
+        core_covers(&whole, "workflow_retry_tests", false),
         "a whole-module filter must credit the module"
     );
 }
 
-// ── Fix #2: classifier is fail-CLOSED for the paved live-DB path & honest about
-//    env-gated / no-DB HTTP tests ──────────────────────────────────────────────
+// ── An `allos` core `integration` row without `db` does not cover a db module ─
+
+#[test]
+fn allos_row_without_db_does_not_cover_a_db_module() {
+    // Mirrors the real `allos autumn-harvest integration testing -` replayer row:
+    // it runs `--no-default-features --features testing`, so it has NO db and
+    // must not credit a db-gated module.
+    let allos_no_db = vec![SuiteRow {
+        osclass: "allos".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "testing".into(),
+        filter: "-".into(),
+    }];
+    assert!(
+        !core_covers(&allos_no_db, "some_db_module", false),
+        "an allos row without `db` (--no-default-features) must not cover a db-gated module"
+    );
+    // A `linux` row (defaults on ⇒ db) covers it.
+    let linux = vec![SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "-".into(),
+        filter: "-".into(),
+    }];
+    assert!(core_covers(&linux, "some_db_module", false));
+}
+
+// ── Fail-CLOSED classifier & honesty about env-gated / no-DB HTTP tests ──────
 
 #[test]
 fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
@@ -634,7 +623,7 @@ fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
         );
         assert!(
             all_tests_ignored(&src),
-            "{stem}: all its tests are #[ignore]d — a run step could not execute it"
+            "{stem}: all its tests are #[ignore]d — a run could not execute it"
         );
     }
 }
@@ -687,13 +676,61 @@ fn file_requires_testing_reads_leading_file_cfg() {
     ));
 }
 
+// ── The manifest must actually be executed by CI ─────────────────────────────
+
+#[test]
+fn ci_yaml_invokes_the_runner_against_the_manifest() {
+    // Without this, deleting a runner step (but keeping the manifest) would make
+    // the guard read a manifest CI never executes → green-but-not-run.
+    for needle in [
+        "run-suites.sh compile",
+        "run-suites.sh run allos",
+        "run-suites.sh run linux",
+    ] {
+        assert!(
+            CI_YAML.contains(needle),
+            "ci.yml must invoke `bash .github/ci/{needle}` — the manifest is executed by the \
+             runner script, and a missing invocation would silently stop running suites while \
+             this guard stayed green"
+        );
+    }
+    assert!(
+        RUN_SCRIPT.contains("integration-suites.txt"),
+        "the runner script (.github/ci/run-suites.sh) must reference the manifest \
+         `integration-suites.txt`, else it would execute some other list"
+    );
+}
+
+// ── The `merge=union` manifest must stay sorted + unique ─────────────────────
+
+#[test]
+fn manifest_is_sorted_and_unique() {
+    let rows: Vec<&str> = MANIFEST
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .collect();
+    let mut want = rows.clone();
+    want.sort_unstable();
+    want.dedup();
+    assert_eq!(
+        rows, want,
+        "\n.github/ci/integration-suites.txt data lines are not sorted+unique — a merge=union \
+         artifact (two PRs' additions interleaved or duplicated). This is a benign, one-command \
+         fix, never a conflict. Re-sort the DATA lines (keep the header comment on top), e.g.:\n\
+         \x20 LC_ALL=C sort -o .github/ci/integration-suites.txt \\\n\
+         \x20   <(grep -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \\\n\
+         \x20   <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)"
+    );
+}
+
 // ── The guard ───────────────────────────────────────────────────────────────
 
 #[test]
 fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
-    let cmds = run_commands();
-    let core_cov = parse_core_coverage(&cmds);
-    let plugin_runs = parse_plugin_runs(&cmds);
+    let rows = parse_manifest();
 
     let core_dir = core_integration_dir();
     let plugin_dir = plugin_tests_dir();
@@ -718,15 +755,15 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         }
         let key = format!("core:{}", m.name);
         live_db_keys.insert(key.clone());
-        // Fix #3: the covering-run `--features testing` requirement is the UNION
-        // of the `mod.rs` cfg and the file's own leading `#![cfg]` (either gate
-        // requiring testing means the run must carry it). This keeps the
-        // `mod.rs`-only `all(testing, db)` submodules correct while also picking
-        // up file-level `#![cfg(feature = "testing")]` on plain-`mod` files.
+        // The covering-run `--features testing` requirement is the UNION of the
+        // `mod.rs` cfg and the file's own leading `#![cfg]` (either gate requiring
+        // testing means the run must carry it). This keeps the `mod.rs`-only
+        // `all(testing, db)` submodules correct while also picking up file-level
+        // `#![cfg(feature = "testing")]` on plain-`mod` files.
         let needs_testing = m.needs_testing || file_requires_testing(&src);
-        // A covering run step can't credit a target whose tests are all
-        // `#[ignore]`d — it would execute nothing.
-        let covered = core_cov.covers(&m.name, needs_testing) && !all_tests_ignored(&src);
+        // A covering run can't credit a target whose tests are all `#[ignore]`d —
+        // it would execute nothing.
+        let covered = core_covers(&rows, &m.name, needs_testing) && !all_tests_ignored(&src);
         if covered {
             continue;
         }
@@ -734,9 +771,9 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
             continue;
         }
         uncovered.push(format!(
-            "{key} (add a `cargo test -p autumn-harvest{} --test integration -- {} --test-threads=1` \
-             run step in ci.yml, guarded `if: runner.os == 'Linux'`)",
-            if needs_testing { " --features testing" } else { "" },
+            "{key} (add manifest line `linux  autumn-harvest  integration  {}  {}` to \
+             .github/ci/integration-suites.txt)",
+            if needs_testing { "testing" } else { "-" },
             m.name
         ));
     }
@@ -758,23 +795,23 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         let key = format!("plugin:{stem}");
         live_db_keys.insert(key.clone());
         let req = plugin_required_features(&src);
-        // A covering run step can't credit an all-`#[ignore]`d target — it runs
+        // A covering run can't credit an all-`#[ignore]`d target — it runs
         // nothing — so force it uncovered (→ must be allowlisted).
-        let covered = plugin_covered(&stem, &req, &plugin_runs) && !all_tests_ignored(&src);
+        let covered = plugin_covered(&rows, &stem, &req) && !all_tests_ignored(&src);
         if covered {
             continue;
         }
         if allowlisted(&key) {
             continue;
         }
-        let feat_flag = if req.is_empty() {
-            String::new()
+        let feats = if req.is_empty() {
+            "-".to_string()
         } else {
-            format!(" --features {}", req.join(","))
+            req.join(",")
         };
         uncovered.push(format!(
-            "{key} (add a `cargo test -p autumn-harvest-plugin{feat_flag} --test {stem} -- --test-threads=1` \
-             run step in ci.yml, guarded `if: runner.os == 'Linux'`)"
+            "{key} (add manifest line `linux  autumn-harvest-plugin  {stem}  {feats}  -` to \
+             .github/ci/integration-suites.txt)"
         ));
     }
 
@@ -789,7 +826,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
 
     assert!(
         uncovered.is_empty(),
-        "these DB-gated integration tests have NO CI run step and are NOT allowlisted \
+        "these DB-gated integration tests have NO covering manifest row and are NOT allowlisted \
          — they compile in CI but never run against a live Postgres (the nd_block class of \
          invisible bug):\n  {}",
         uncovered.join("\n  ")
@@ -806,8 +843,8 @@ fn allowlist_does_not_grow_silently() {
     assert!(
         ALLOWLIST.len() <= ALLOWLIST_MAX_LEN,
         "ALLOWLIST grew to {} entries (cap {ALLOWLIST_MAX_LEN}). It is technical debt to SHRINK \
-         by wiring run steps, not to grow. If a new DB test genuinely cannot run in CI yet, raise \
-         the cap deliberately with justification.",
+         by adding manifest rows, not to grow. If a new DB test genuinely cannot run in CI yet, \
+         raise the cap deliberately with justification.",
         ALLOWLIST.len()
     );
 }
