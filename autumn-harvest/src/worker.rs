@@ -5536,7 +5536,8 @@ fn merge_wake_events(
 /// (see [`merge_wake_events`]).
 ///
 /// Returns the fired timer IDs and delivered signal names.
-async fn ingest_due_timers_and_signals(
+#[doc(hidden)] // exposed for the #779 transient-conflict integration test; not a stable API
+pub async fn ingest_due_timers_and_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
@@ -5605,6 +5606,95 @@ async fn ingest_due_timers_and_signals(
     .await?;
 
     Ok((fired_timer_ids, signal_names))
+}
+
+/// Re-drive the claimed parent workflow task after a transient wake-event-ingest
+/// event-id conflict (issue #779), instead of terminally failing the run.
+///
+/// The task is currently claimed by this worker (`state = 'RUNNING'`,
+/// `worker_id` set). We first [`park`](queue::park_workflow_task) it to release
+/// the claim, then [`wake`](queue::wake_workflow_task) it to re-pend the row to
+/// `PENDING` with an immediate `scheduled_at` and a `pg_notify`, so an idle
+/// poller re-claims it promptly. This is the exact pause(park)/resume(wake)
+/// mechanism used elsewhere; no event is appended, no state is changed, no
+/// retry attempt is consumed.
+///
+/// `park`'s `wake_requested` return value is intentionally discarded: we always
+/// wake immediately afterward on the same connection, so a wake that raced in
+/// during the claim is subsumed by the wake we issue here.
+async fn requeue_parent_on_transient_ingest_conflict(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+    queue::wake_workflow_task(conn, exec_id).await?;
+    Ok(())
+}
+
+/// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
+/// transient `(workflow_exec_id, event_id)` UNIQUE conflict into a re-drive of
+/// the parent workflow task rather than a terminal failure (issue #779).
+///
+/// Returns:
+/// - `Ok(Some((timers_fired, signals_delivered)))` — the ingest succeeded (or
+///   was a no-op); proceed with this cycle.
+/// - `Ok(None)` — a transient event-id conflict was detected; the parent task
+///   has been re-pended for immediate re-claim and the caller must abandon this
+///   cycle without failing the run.
+/// - `Err(_)` — a genuine (non-conflict) error; the caller fails the execution
+///   exactly as before.
+///
+/// The classification is scoped to the ingest boundary and is precise: only a
+/// UNIQUE violation on the `harvest_events (workflow_exec_id, event_id)`
+/// constraint is treated as transient (see
+/// [`HarvestError::is_event_id_unique_violation`]). A successful ingest and any
+/// genuine error are unaffected.
+///
+/// The retry is provably convergent: the winner's event is already committed, so
+/// the re-driven task's fresh history load advances `next_event_id` past it, and
+/// an already-`fired` timer is excluded from the next ingest — the same conflict
+/// cannot recur, so there is no hot loop even though the re-pend schedules the
+/// task for immediate re-claim.
+#[doc(hidden)] // exposed for the #779 transient-conflict integration test; not a stable API
+pub async fn ingest_wake_events_or_requeue(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+) -> HarvestResult<Option<(Vec<TimerId>, Vec<String>)>> {
+    match ingest_due_timers_and_signals(conn, exec_id, next_event_id).await {
+        Ok(pair) => Ok(Some(pair)),
+        Err(e) if e.is_event_id_unique_violation() => {
+            requeue_parent_on_transient_ingest_conflict(
+                conn,
+                task,
+                worker_id,
+                sticky_timeout,
+                exec_id,
+            )
+            .await?;
+            tracing::warn!(
+                task_id = %task.id,
+                workflow_exec_id = %exec_id,
+                "harvest: transient event-id conflict during wake-event ingest \
+                 (a concurrent append committed the same event_id first); \
+                 re-driving the parent workflow task instead of failing the run \
+                 (issue #779)"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn fail_task_only(
@@ -8480,8 +8570,9 @@ async fn load_workflow_replay_state(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
+    sticky_timeout: Duration,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<(store::EventHistory, Vec<TimerId>, Vec<String>)> {
+) -> HarvestResult<Option<(store::EventHistory, Vec<TimerId>, Vec<String>)>> {
     let history_result = store::load_history_inflated(
         conn,
         exec_id,
@@ -8493,11 +8584,21 @@ async fn load_workflow_replay_state(
 
     // Single chronological ingest: due timer fires and pending signals are
     // appended in occurrence order (signal received before a deadline lands
-    // before that TimerFired) — see merge_wake_events.
-    let ingest_result =
-        ingest_due_timers_and_signals(conn, exec_id, initial_history.next_event_id).await;
-    let (timers_fired, signals_delivered) =
-        fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
+    // before that TimerFired) — see merge_wake_events. A transient event-id
+    // conflict with a concurrent append_single_event committer re-drives the
+    // task instead of failing the run (issue #779).
+    let Some((timers_fired, signals_delivered)) = ingest_wake_events_or_requeue(
+        conn,
+        task,
+        worker_id,
+        sticky_timeout,
+        exec_id,
+        initial_history.next_event_id,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
 
     let final_history_result = store::load_history_inflated(
         conn,
@@ -8508,7 +8609,7 @@ async fn load_workflow_replay_state(
     .await;
     let final_history =
         fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
-    Ok((final_history, timers_fired, signals_delivered))
+    Ok(Some((final_history, timers_fired, signals_delivered)))
 }
 
 /// Prepare the workflow task, checking the in-process LRU cache first.
@@ -8530,7 +8631,7 @@ async fn prepare_workflow_task_with_cache(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     sticky_timeout: Duration,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<PreparedWorkflowTask> {
+) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
         fail_task_only(conn, task.id, &error.to_string()).await?;
@@ -8568,11 +8669,21 @@ async fn prepare_workflow_task_with_cache(
             fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
 
         // Single chronological ingest of due timers + pending signals (see
-        // merge_wake_events for the occurrence-order contract).
-        let ingest_result =
-            ingest_due_timers_and_signals(conn, exec_id, existing_delta.next_event_id).await;
-        let (timers_fired, signals_delivered) =
-            fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
+        // merge_wake_events for the occurrence-order contract). A transient
+        // event-id conflict with a concurrent append_single_event committer
+        // re-drives the task instead of failing the run (issue #779).
+        let Some((timers_fired, signals_delivered)) = ingest_wake_events_or_requeue(
+            conn,
+            task,
+            worker_id,
+            sticky_timeout,
+            exec_id,
+            existing_delta.next_event_id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
 
         // Load events appended by the ingest.
         let after_ingest_result = store::load_history_since_inflated(
@@ -8593,7 +8704,7 @@ async fn prepare_workflow_task_with_cache(
         history_events.extend(after_ingest.events);
         let next_event_id = after_ingest.next_event_id;
 
-        Ok(PreparedWorkflowTask {
+        Ok(Some(PreparedWorkflowTask {
             execution,
             exec_id,
             history_events,
@@ -8601,13 +8712,18 @@ async fn prepare_workflow_task_with_cache(
             timers_fired,
             signals_delivered,
             was_cache_hit: true,
-        })
+        }))
     } else {
-        // Cache miss path: full history load.
-        let (history, timers_fired, signals_delivered) =
-            load_workflow_replay_state(conn, task, worker_id, exec_id, offloader).await?;
+        // Cache miss path: full history load. A transient event-id conflict
+        // re-drives the task (issue #779), surfaced here as `None`.
+        let Some((history, timers_fired, signals_delivered)) =
+            load_workflow_replay_state(conn, task, worker_id, exec_id, sticky_timeout, offloader)
+                .await?
+        else {
+            return Ok(None);
+        };
 
-        Ok(PreparedWorkflowTask {
+        Ok(Some(PreparedWorkflowTask {
             execution,
             exec_id,
             history_events: history.events,
@@ -8615,7 +8731,7 @@ async fn prepare_workflow_task_with_cache(
             timers_fired,
             signals_delivered,
             was_cache_hit: false,
-        })
+        }))
     }
 }
 
@@ -9615,7 +9731,7 @@ async fn process_workflow_task(
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
 ) -> HarvestResult<()> {
-    let mut prepared = prepare_workflow_task_with_cache(
+    let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
         task,
         worker_id,
@@ -9623,7 +9739,14 @@ async fn process_workflow_task(
         sticky_timeout,
         registry.payload_offloader(),
     )
-    .await?;
+    .await?
+    else {
+        // Issue #779: a transient wake-event-ingest event-id conflict re-drove
+        // the parent task (park + wake). The run was NOT failed; abandon this
+        // cycle and let the re-pended task be re-claimed with a fresh history
+        // load that advances past the winner's committed event.
+        return Ok(());
+    };
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         let error = format!(
             "no workflow handler registered for '{}'",

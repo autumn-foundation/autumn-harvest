@@ -1056,3 +1056,246 @@ async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_time
         "the child-timeout timer row is marked fired"
     );
 }
+
+/// Transient wake-event-ingest event-id conflict → the parent workflow task is
+/// re-driven (park + wake), NOT terminally failed (issue #779 shared-path fix).
+///
+/// Deterministic reproduction of the pre-existing shared-path hazard that
+/// #779's child-timeout deadline materialization newly exercises (a child
+/// completing late while the parent is claimed for its due `__child_timeout`
+/// deadline), and that also already affected the `timeout.rs` /
+/// `external_task.rs` concurrent-`append_single_event` racers:
+/// `ingest_due_timers_and_signals` appends `TimerFired`/`SignalReceived` at a
+/// `next_event_id` precomputed from an earlier `load_history`, with no exec-row
+/// lock and no `MAX(event_id)` recompute. A concurrent committer that took that
+/// same `event_id` first makes the ingest's batch insert hit
+/// `UNIQUE(workflow_exec_id, event_id)`.
+///
+/// RED (pre-fix): that raw `ingest_due_timers_and_signals` error flowed through
+/// `fail_execution_on_error` and terminally FAILED a healthy run — this test
+/// first asserts the raw error is classified as the transient conflict (the
+/// exact input the pre-fix path failed on). GREEN: `ingest_wake_events_or_requeue`
+/// re-drives the task instead (`Ok(None)`), leaves the run RUNNING, appends no
+/// event, and a fresh re-claim + re-drive advances past the winner's committed
+/// event so the ingest completes cleanly — the same conflict provably cannot
+/// recur (convergent in one retry, no hot loop).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
+    use autumn_harvest::queue::{self};
+    use autumn_harvest::schema::harvest_task_queue::dsl as task_dsl;
+    use autumn_harvest::schema::harvest_workflow_executions::dsl as exec_dsl;
+    use diesel::QueryDsl;
+    use std::time::Duration;
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    // Seed a RUNNING execution with WorkflowStarted at event_id 0.
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::workflow_started(
+            serde_json::json!({}),
+            chrono::Utc::now(),
+        )],
+        0,
+    )
+    .await
+    .expect("seed WorkflowStarted");
+
+    // A DUE timer gives the ingest real work (a TimerFired to append).
+    let due_timer = "user_timer:reminder";
+    diesel::insert_into(autumn_harvest::schema::harvest_timers::dsl::harvest_timers)
+        .values(&autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: exec_id.as_uuid(),
+            timer_id: due_timer,
+            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert due timer");
+
+    // Enqueue + claim the parent workflow task so it is RUNNING (claimed) — the
+    // state `park_workflow_task` requires to release the claim on re-drive.
+    let mut params =
+        queue::EnqueueParams::new("default", queue::TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    let task = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-779",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task")
+    .expect("a claimable workflow task");
+
+    // The ingest would compute next_event_id = 1 (after WorkflowStarted at 0).
+    let stale_next_event_id = 1;
+
+    // Concurrent committer wins the race: append_single_event takes event_id 1
+    // (MAX+1) first — exactly the timeout.rs / external_task.rs / #779
+    // child-timeout materializer racer.
+    autumn_harvest::store::append_single_event(
+        &mut conn,
+        exec_id,
+        WorkflowEvent::SignalReceived {
+            signal_name: "concurrent".to_string(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .await
+    .expect("concurrent committer appends at event_id 1");
+
+    // RED: the raw ingest at the stale id hits UNIQUE(exec_id, event_id) — this
+    // is the exact Err the pre-fix code fed into fail_execution_on_error,
+    // terminally FAILING the run. (This call rolls back; nothing is committed.)
+    let raw_err = autumn_harvest::worker::ingest_due_timers_and_signals(
+        &mut conn,
+        exec_id,
+        stale_next_event_id,
+    )
+    .await
+    .expect_err("stale-id ingest must conflict on the committed event_id");
+    assert!(
+        raw_err.is_event_id_unique_violation(),
+        "the ingest conflict must be classified as the transient event-id conflict \
+         (the input the pre-fix fail_execution_on_error terminally failed on); got: {raw_err}"
+    );
+
+    // GREEN: the fix converts that same conflict into a re-drive, not a failure.
+    let outcome = autumn_harvest::worker::ingest_wake_events_or_requeue(
+        &mut conn,
+        &task,
+        "worker-779",
+        Duration::from_secs(5),
+        exec_id,
+        stale_next_event_id,
+    )
+    .await
+    .expect("a transient conflict is NOT a genuine error");
+    assert!(
+        outcome.is_none(),
+        "transient event-id conflict → the parent task is re-driven (None), not failed"
+    );
+
+    // (a) the run was NOT terminally failed — still RUNNING.
+    let exec_state: String = exec_dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(exec_dsl::state)
+        .first(&mut conn)
+        .await
+        .expect("load exec state");
+    assert_eq!(exec_state, "RUNNING", "the healthy run must not be failed");
+
+    // (b) no WorkflowFailed event was appended.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "no WorkflowFailed on a transient conflict: {:?}",
+        history.events,
+    );
+
+    // (c) the timer was NOT marked fired (the ingest transaction rolled back).
+    let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
+    assert!(
+        timers.iter().all(|t| !t.fired),
+        "the ingest rolled back — the timer must stay unfired until a clean re-drive"
+    );
+
+    // (d) the parent task was re-pended to PENDING (park + wake) and is
+    //     immediately claimable — no retry attempt consumed, no failure.
+    let (task_state, task_worker, task_scheduled): (
+        String,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    ) = task_dsl::harvest_task_queue
+        .find(task.id)
+        .select((task_dsl::state, task_dsl::worker_id, task_dsl::scheduled_at))
+        .first(&mut conn)
+        .await
+        .expect("load task row");
+    assert_eq!(
+        task_state, "PENDING",
+        "the parent task is re-pended for immediate re-claim"
+    );
+    assert!(task_worker.is_none(), "the claim was released on re-drive");
+    assert!(
+        task_scheduled <= chrono::Utc::now(),
+        "the re-pended task is immediately claimable (scheduled_at in the past)"
+    );
+
+    // Re-drive: a fresh re-claim + fresh history load advances next_event_id
+    // past the winner's committed event, so the ingest completes cleanly and
+    // the same conflict provably cannot recur.
+    let task2 = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-779",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("re-claim")
+    .expect("the re-pended parent task is immediately re-claimable");
+    let fresh = load_history_from_url(&database_url, exec_id).await;
+    let (fired_timers, _signals) = autumn_harvest::worker::ingest_wake_events_or_requeue(
+        &mut conn,
+        &task2,
+        "worker-779",
+        Duration::from_secs(5),
+        exec_id,
+        fresh.next_event_id,
+    )
+    .await
+    .expect("clean re-drive")
+    .expect("the re-drive ingests cleanly (Some), not a second conflict");
+    assert_eq!(
+        fired_timers.len(),
+        1,
+        "the due timer fires on the clean re-drive"
+    );
+    assert_eq!(fired_timers[0].as_str(), due_timer);
+
+    // The timer is now durably fired + a TimerFired event was appended; the run
+    // proceeds normally (still RUNNING) — the healthy run was never lost.
+    let timers_after = load_timers_for_execution_from_url(&database_url, exec_id).await;
+    assert!(
+        timers_after
+            .iter()
+            .any(|t| t.timer_id == due_timer && t.fired),
+        "the timer is marked fired after the clean re-drive"
+    );
+    let history_after = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        history_after
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "a TimerFired was appended on the clean re-drive"
+    );
+    let exec_state_after: String = exec_dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(exec_dsl::state)
+        .first(&mut conn)
+        .await
+        .expect("load exec state after re-drive");
+    assert_eq!(
+        exec_state_after, "RUNNING",
+        "the run proceeds normally after the transient-conflict re-drive"
+    );
+}
