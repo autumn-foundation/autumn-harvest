@@ -172,6 +172,11 @@ struct WorkflowHandleClientInner {
     default_debounce_max_wait: Duration,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
     max_workflow_attempts: Option<u32>,
+    /// Engine metrics recorder (issue #684). Wired by the runtime so the
+    /// in-process update path (`execute_update_in_process`) can emit
+    /// `harvest.update.admitted` at admission, matching the HTTP/UI paths.
+    /// Defaults to a no-op recorder when the client is built without one.
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -198,6 +203,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("history_policy", &self.history_policy)
             .field("default_debounce_max_wait", &self.default_debounce_max_wait)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("metrics", &"<MetricsRecorder>")
             .finish()
     }
 }
@@ -258,7 +264,21 @@ impl WorkflowHandleClient {
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
                 default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
                 max_workflow_attempts: None,
+                metrics: Arc::new(crate::telemetry::NoOpMetrics),
             }),
+        }
+    }
+
+    /// Wire the engine metrics recorder into the client (issue #684).
+    ///
+    /// The in-process update path emits `harvest.update.admitted` at admission,
+    /// matching the HTTP and Vantage-UI paths. Defaults to a no-op recorder.
+    #[must_use]
+    pub fn with_metrics(self, metrics: Arc<dyn crate::telemetry::MetricsRecorder>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.metrics = metrics;
+        Self {
+            inner: Arc::new(inner),
         }
     }
 
@@ -1103,8 +1123,20 @@ impl WorkflowHandle {
     ) -> HarvestResult<Value> {
         self.validate_workflow_type(conn, workflow_name).await?;
         let update_id = crate::types::UpdateId::new();
-        crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
-            .await?;
+        // Issue #684: emit harvest.update.admitted post-commit for the in-process
+        // typed-client path too. The update's completion is driven by the worker
+        // (woken below), which emits update.completed/failed, so admitting
+        // without recording admitted would leave this path asymmetric. The
+        // recorder defaults to a no-op when the client was built without one.
+        crate::store::admit_update_event(
+            conn,
+            self.exec_id,
+            update_id,
+            name.to_string(),
+            input,
+            Some(self.client.inner.metrics.as_ref()),
+        )
+        .await?;
         crate::queue::wake_workflow_task(conn, self.exec_id).await?;
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);

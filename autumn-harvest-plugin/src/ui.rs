@@ -1741,12 +1741,19 @@ async fn trigger_update_ui(
     };
 
     let update_id = UpdateId::new();
+    // Resolve the engine recorder (if the runtime is installed) so
+    // admit_update_event emits harvest.update.admitted post-commit (issue #684).
+    let ui_runtime = api_state.runtime().ok();
+    let ui_metrics = ui_runtime
+        .as_ref()
+        .map(|r| r.registry().telemetry().metrics.as_ref());
     let (status, error_summary, flash) = match admit_update_event(
         &mut conn,
         exec_id,
         update_id,
         form.update_name.clone(),
         payload_json,
+        ui_metrics,
     )
     .await
     {

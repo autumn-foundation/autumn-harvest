@@ -1887,6 +1887,7 @@ async fn update_during_pause_is_rejected() {
         autumn_harvest::types::UpdateId::new(),
         "set_priority".to_string(),
         serde_json::json!({"p": 1}),
+        None,
     )
     .await
     .expect_err("updates against a paused workflow must be rejected");
@@ -2057,7 +2058,7 @@ async fn pause_defers_timer_then_resume_fires_and_replays_deterministically() {
         .collect();
     let outcome = run_workflow(exec_id, replay_history, timer_wf, Value::Null).await;
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(
                 output,
                 serde_json::json!("done"),

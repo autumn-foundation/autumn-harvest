@@ -3551,6 +3551,188 @@ async fn persist_update_result_commands(
     Ok(())
 }
 
+/// Collect `(update_name, completed)` pairs for every `RecordUpdateResult`
+/// command in `pending_cmds`, resolving the update name from the
+/// `UpdateAdmitted` events in `history_events` (issue #684).
+///
+/// Pure (no DB), unit-tested. `completed` is `true` for an `Ok` result
+/// (→ `harvest.update.completed`) and `false` for an `Err` result
+/// (→ `harvest.update.failed`). The pairs are collected **before** the persist
+/// transaction (which moves `pending_cmds`) but emitted only in the worker's
+/// `Persisted` arm, so a persist failure never over-counts. `RecordUpdateResult`
+/// is produced once on live execution (replay short-circuits in
+/// `execute_admitted_update`), so each update result is counted exactly once.
+/// An update whose name cannot be resolved from history (should not happen —
+/// admission always precedes the result) is labeled `"unknown"` rather than
+/// dropped, keeping the label bounded.
+///
+/// The `name` label is bounded to the actual handler set (issue #684, Codex P2)
+/// using the **result** as the discriminator, not the declarative registry: the
+/// raw route `POST /workflows/{id}/update/{name}` can admit an unregistered
+/// name, which then fails the workflow's handler lookup with the exact
+/// `"update handler '<name>' not found"` error (see
+/// [`crate::context::WorkflowContext::execute_admitted_update`]). Only that case
+/// is bucketed to the
+/// [`UNREGISTERED_UPDATE_NAME`](crate::telemetry::UNREGISTERED_UPDATE_NAME)
+/// sentinel; every real handler — whether registered declaratively via
+/// `#[update]` **or** imperatively via `ctx.register_update_handler` — keeps its
+/// name. Bucketing against `registry.update_handlers` would be wrong here: it is
+/// declarative-only and does not capture imperatively-registered handlers (the
+/// common pattern), so it would mislabel legitimate updates as unregistered.
+fn collect_update_result_metrics(
+    history_events: &[WorkflowEvent],
+    pending_cmds: &[WorkflowCommand],
+) -> Vec<(String, bool)> {
+    // Fast path: nothing to resolve or emit.
+    if !pending_cmds
+        .iter()
+        .any(|c| matches!(c, WorkflowCommand::RecordUpdateResult { .. }))
+    {
+        return Vec::new();
+    }
+
+    let mut names: std::collections::HashMap<crate::types::UpdateId, &str> =
+        std::collections::HashMap::new();
+    for event in history_events {
+        if let WorkflowEvent::UpdateAdmitted {
+            update_id, name, ..
+        } = event
+        {
+            names.insert(*update_id, name.as_str());
+        }
+    }
+
+    pending_cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordUpdateResult { update_id, result } => {
+                let name = names.get(update_id).copied().unwrap_or("unknown");
+                let label = if is_unregistered_update_failure(name, result) {
+                    crate::telemetry::UNREGISTERED_UPDATE_NAME
+                } else {
+                    name
+                };
+                Some((label.to_owned(), result.is_ok()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a `RecordUpdateResult` is the "update handler not found" failure a
+/// genuinely-unregistered update name produces (issue #684, Codex P2).
+///
+/// The exact error is `format!("update handler '{name}' not found")`, minted by
+/// [`crate::context::WorkflowContext::execute_admitted_update`] when no handler
+/// is registered for the admitted name. Matching the exact string (including the
+/// name) keeps a real handler that happens to return a similar message from
+/// being mislabeled.
+fn is_unregistered_update_failure(name: &str, result: &Result<serde_json::Value, String>) -> bool {
+    matches!(result, Err(error) if *error == format!("update handler '{name}' not found"))
+}
+
+/// Select the command list carrying this cycle's `RecordUpdateResult`s given
+/// the workflow outcome (issue #684).
+///
+/// On a [`WorkflowOutcome::Suspended`] outcome the update results live **inside
+/// the outcome's `commands`** — the executor returns `(Suspended { commands },
+/// vec![])`, so the worker's second tuple element (`pending_cmds`) is empty.
+/// On every other outcome (terminal-with-commands, continue-as-new) the update
+/// results ride in `pending_cmds`. Reading only `pending_cmds` (as an earlier
+/// cut did) silently undercounts the **common** case: an admitted update
+/// completes and the long-running workflow loops back to a `wait_for_signal` /
+/// activity and suspends. The persist path is the same single main transaction
+/// in both cases (`handle_suspended_workflow` for suspend,
+/// `persist_terminal_outcome_commands` for terminal), so the `Persisted`-arm
+/// emission is post-commit and exactly-once for both once the source is right.
+fn update_result_command_source<'a>(
+    outcome: &'a WorkflowOutcome,
+    pending_cmds: &'a [WorkflowCommand],
+) -> &'a [WorkflowCommand] {
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => commands,
+        _ => pending_cmds,
+    }
+}
+
+/// Emit `harvest.update.completed` / `harvest.update.failed` for each collected
+/// `(update_name, completed)` pair (issue #684). Shared by the worker's
+/// `Persisted`-arm terminal/suspend emission and the two inline external-signal
+/// suspension branches, which persist their update results outside the main
+/// transaction and would otherwise leave them uncounted.
+///
+/// The `update_name` is already bounded by `collect_update_result_metrics` (an
+/// unregistered name's handler-not-found failure is bucketed to the
+/// [`UNREGISTERED_UPDATE_NAME`](crate::telemetry::UNREGISTERED_UPDATE_NAME)
+/// sentinel, issue #684 Codex P2), so this helper emits the name verbatim.
+fn emit_update_result_metrics(
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    workflow_name: &str,
+    queue: &str,
+    results: &[(String, bool)],
+) {
+    for (update_name, completed) in results {
+        if *completed {
+            metrics.record_update_completed(workflow_name, update_name, queue);
+        } else {
+            metrics.record_update_failed(workflow_name, update_name, queue);
+        }
+    }
+}
+
+/// Extract the terminal outcome's `unhandled_signals` map for post-commit
+/// emission (issue #684, Codex P2).
+///
+/// Populated only on [`WorkflowOutcome::Completed`] / [`WorkflowOutcome::Failed`];
+/// empty for `Suspended` (not terminal) and `ContinuedAsNew` (carries no map).
+/// The caller collects this **before** the persist transaction moves `outcome`
+/// and emits it only in the `Persisted` arm, so `harvest.signal.unhandled`
+/// counts durable terminal outcomes exactly once — a `ParkedPaused` discard or
+/// a persist failure returns before the emit and never over-counts.
+fn outcome_unhandled_signals(outcome: &WorkflowOutcome) -> std::collections::BTreeMap<String, u64> {
+    match outcome {
+        WorkflowOutcome::Completed {
+            unhandled_signals, ..
+        }
+        | WorkflowOutcome::Failed {
+            unhandled_signals, ..
+        } => unhandled_signals.clone(),
+        _ => std::collections::BTreeMap::new(),
+    }
+}
+
+/// Emit `harvest.signal.unhandled` once per unconsumed occurrence from a
+/// terminal outcome's `unhandled_signals` map (issue #684).
+///
+/// The map is grouped by signal name for the executor's bookkeeping, but the
+/// signal `name` is NOT a metric label (issue #684, Codex P2 — free-form send
+/// route, no declared registry to bound it). This sums the per-name counts and
+/// emits one increment per unconsumed occurrence against the single
+/// `(workflow, queue)` series, so the counter still reflects the terminal
+/// outcome's total unconsumed-signal volume without the unbounded name
+/// dimension.
+///
+/// Called only from the worker's post-commit `Persisted` arm (the same
+/// discipline as `harvest.update.completed/failed`), so the counter represents
+/// DURABLE terminal outcomes only: this arm is reached only after the persist
+/// transaction commits, downstream of the #603 ND-block gate (`Failed{nd:Some}`
+/// early-returns before persist) and `check_paused_and_park` (a claimed-then-
+/// paused race returns via `ParkedPaused`, never here). Cancel/Terminate/
+/// Execution-timeout/Parent-close never carry a driven matcher (and so never a
+/// populated map). The map is empty for every non-terminal path, making this a
+/// no-op there.
+fn emit_unhandled_signal_metrics(
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    workflow_name: &str,
+    queue: &str,
+    by_name: &std::collections::BTreeMap<String, u64>,
+) {
+    let total: u64 = by_name.values().sum();
+    for _ in 0..total {
+        metrics.record_signal_unhandled(workflow_name, queue);
+    }
+}
+
 /// Apply `UpsertSearchAttributes` patches from `commands` to `base` in memory.
 ///
 /// Returns the patched value, or the original `base` if no patch commands exist.
@@ -8139,7 +8321,7 @@ async fn persist_workflow_outcome(
     let is_detached_child = execution.parent_close_policy.is_some();
 
     match (outcome, parent_exec_id) {
-        (WorkflowOutcome::Completed { output }, Some(parent_id)) if !is_detached_child => {
+        (WorkflowOutcome::Completed { output, .. }, Some(parent_id)) if !is_detached_child => {
             let res = persist_child_workflow_completion(
                 conn,
                 persistence.task.id,
@@ -8153,7 +8335,7 @@ async fn persist_workflow_outcome(
             .await?;
             Ok((false, vec![res]))
         }
-        (WorkflowOutcome::Completed { output }, _) => {
+        (WorkflowOutcome::Completed { output, .. }, _) => {
             // Root workflow or detached child completing — no parent wake.
             let res = persist_workflow_completion(
                 conn,
@@ -8908,6 +9090,16 @@ async fn process_workflow_task(
             signal.name = signal_name.as_str(),
         )
         .in_scope(|| {});
+        // Issue #684: count each durably-delivered signal. This is the single
+        // live-only delivery choke point (ingest_due_timers_and_signals) and
+        // each signal appears in `signals_delivered` exactly once (marked
+        // consumed in harvest_signals), so the counter fires exactly once per
+        // delivery. Never emitted on replay. The signal name is NOT a metric
+        // label (issue #684, Codex P2 — free-form send route, no declared
+        // registry to bound it); it stays a span-only attribute above.
+        telemetry
+            .metrics
+            .record_signal_received(&prepared.execution.workflow_name, &task.queue_name);
     }
 
     // Emit workflow.started exactly once per execution.  Two independent
@@ -9283,6 +9475,16 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Issue #684: the update results just persisted inline (autocommit)
+                // are stripped from the reconstructed suspension below, so they
+                // never reach the main-transaction Persisted-arm emission — emit
+                // here, post-commit, or they would be silently uncounted.
+                emit_update_result_metrics(
+                    telemetry.metrics.as_ref(),
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    &collect_update_result_metrics(&history_events, &commands),
+                );
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
@@ -9478,6 +9680,16 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Issue #684: `split_mixed_signal_batch` below drops
+                // `RecordUpdateResult` from `remaining_commands`, so these
+                // inline-persisted update results never reach the main-transaction
+                // Persisted-arm emission — emit here, post-commit.
+                emit_update_result_metrics(
+                    telemetry.metrics.as_ref(),
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    &collect_update_result_metrics(&history_events, &commands),
+                );
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
@@ -9844,12 +10056,21 @@ async fn process_workflow_task(
     // Emit the once-per-terminal-outcome counter (issue #519).
     // Suspended is not a terminal state — a workflow that suspends N times
     // and then completes must produce exactly one `completed` increment.
+    //
+    // Issue #684: harvest.signal.unhandled is NOT emitted here. It is collected
+    // below (before the persist transaction moves `outcome`) and emitted
+    // post-commit in the `Persisted` arm — the same discipline as
+    // harvest.update.completed/failed — so it represents DURABLE terminal
+    // outcomes only. This site (`record_workflow_terminal`, #519) keeps its own
+    // pre-persist placement unchanged.
     match &outcome {
-        WorkflowOutcome::Completed { .. } => telemetry.metrics.record_workflow_terminal(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            WorkflowStatus::Completed,
-        ),
+        WorkflowOutcome::Completed { .. } => {
+            telemetry.metrics.record_workflow_terminal(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                WorkflowStatus::Completed,
+            );
+        }
         WorkflowOutcome::Failed {
             non_deterministic_details,
             ..
@@ -9985,6 +10206,29 @@ async fn process_workflow_task(
     let is_terminal_with_commands =
         !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
     let counter_action = schedule_counter_action(&outcome);
+    // Issue #684: collect update.completed/failed metric data now, while
+    // `history_events`, `outcome`, and `pending_cmds` are all still in scope
+    // (the persist transaction below moves `outcome`, `pending_cmds`, and
+    // `task`). The `RecordUpdateResult`s live in `outcome.commands` on the
+    // Suspended path (the common case) and in `pending_cmds` on the terminal /
+    // continue-as-new paths — `update_result_command_source` picks the right
+    // one. Emitted only post-commit in the `Persisted` arm so a persist failure
+    // (and the ParkedPaused discard) never over-counts.
+    let update_result_metrics = collect_update_result_metrics(
+        &history_events,
+        update_result_command_source(&outcome, &pending_cmds),
+    );
+    // Issue #684 (Codex P2): extract the terminal outcome's unhandled-signal
+    // map now, before the persist transaction moves `outcome`. Emitted only
+    // post-commit in the `Persisted` arm (same discipline as
+    // update.completed/failed), so a ParkedPaused discard or persist failure
+    // never counts a signal that never became a durable terminal — and a
+    // retry/resume of that discarded cycle cannot double-count it. The map is
+    // populated only on Completed/Failed and is empty for Suspended/CAN (and,
+    // via the #603 gate returning early above, never reaches here on an
+    // ND-carrying Failed), so this is a no-op on every non-terminal path.
+    let unhandled_signal_metrics = outcome_unhandled_signals(&outcome);
+    let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
 
@@ -10088,6 +10332,29 @@ async fn process_workflow_task(
                 )
                 .await;
             }
+
+            // Issue #684: emit update.completed/update.failed post-commit,
+            // exactly once per update result (data collected pre-persist above).
+            emit_update_result_metrics(
+                telemetry.metrics.as_ref(),
+                &prepared.execution.workflow_name,
+                &update_metric_queue,
+                &update_result_metrics,
+            );
+            // Issue #684 (Codex P2): emit harvest.signal.unhandled post-commit
+            // too, so it represents DURABLE terminal outcomes only (mirrors
+            // update.completed/failed). This arm is reached only after the
+            // persist transaction committed, which is downstream of both the
+            // #603 ND-block gate (Failed{nd:Some} early-returns before persist)
+            // and `check_paused_and_park` (a claimed-then-paused race returns
+            // via the ParkedPaused arm below, never here). The map is empty on
+            // every non-terminal outcome, so this is a no-op there.
+            emit_unhandled_signal_metrics(
+                telemetry.metrics.as_ref(),
+                &prepared.execution.workflow_name,
+                &update_metric_queue,
+                &unhandled_signal_metrics,
+            );
         }
         Err(error) => {
             // Preserve per-path error handling: a terminal-with-commands persist
@@ -15712,6 +15979,7 @@ mod tests {
         let outcome = WorkflowOutcome::Failed {
             error: "non-deterministic replay: test".to_string(),
             handler_panic: false,
+            unhandled_signals: std::collections::BTreeMap::new(),
             non_deterministic_details: Some(crate::error::NonDeterministicDetails {
                 event_index: Some(0),
                 expected: None,
@@ -15844,5 +16112,281 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ── collect_update_result_metrics (issue #684) ────────────────────────
+
+    fn admitted(update_id: crate::types::UpdateId, name: &str) -> WorkflowEvent {
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: name.to_string(),
+            input: Value::Null,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn collect_update_result_metrics_empty_without_record_update_result() {
+        let id = crate::types::UpdateId::new();
+        let history = vec![admitted(id, "set_priority")];
+        let cmds = vec![WorkflowCommand::RecordMarker {
+            name: "m".into(),
+            details: Value::Null,
+        }];
+        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+    }
+
+    #[test]
+    fn collect_update_result_metrics_resolves_name_and_completed_flag() {
+        let ok_id = crate::types::UpdateId::new();
+        let err_id = crate::types::UpdateId::new();
+        let history = vec![admitted(ok_id, "set_priority"), admitted(err_id, "cancel")];
+        let cmds = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: ok_id,
+                result: Ok(serde_json::json!("done")),
+            },
+            WorkflowCommand::RecordUpdateResult {
+                update_id: err_id,
+                result: Err("nope".into()),
+            },
+        ];
+        let out = collect_update_result_metrics(&history, &cmds);
+        assert_eq!(
+            out,
+            vec![
+                ("set_priority".to_owned(), true),
+                ("cancel".to_owned(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn update_result_command_source_reads_suspended_outcome_commands_not_pending() {
+        // Issue #684 regression: the common suspend path carries its
+        // RecordUpdateResult INSIDE the Suspended outcome's `commands`, while
+        // `pending_cmds` (the executor's second tuple element) is EMPTY. An
+        // earlier cut collected from `pending_cmds` only and silently
+        // undercounted every update that completed and then suspended.
+        let id = crate::types::UpdateId::new();
+        let history = vec![admitted(id, "set_priority")];
+        let suspend_commands = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: id,
+                result: Ok(serde_json::json!("done")),
+            },
+            // A benign bookkeeping command standing in for the wait the workflow
+            // suspends on after the update completes.
+            WorkflowCommand::RecordMarker {
+                name: "m".into(),
+                details: Value::Null,
+            },
+        ];
+        let outcome = WorkflowOutcome::Suspended {
+            commands: suspend_commands,
+        };
+        let pending_cmds: Vec<WorkflowCommand> = Vec::new();
+
+        // The bug: reading only pending_cmds finds nothing.
+        assert!(
+            collect_update_result_metrics(&history, &pending_cmds).is_empty(),
+            "pending_cmds is empty on the suspend path — this is the source of the bug"
+        );
+        // The fix: the source selector reaches into the Suspended commands.
+        let source = update_result_command_source(&outcome, &pending_cmds);
+        assert_eq!(
+            collect_update_result_metrics(&history, source),
+            vec![("set_priority".to_owned(), true)],
+            "the suspend path's update result must be collected from the outcome's commands"
+        );
+    }
+
+    #[test]
+    fn update_result_command_source_reads_pending_cmds_for_terminal_outcomes() {
+        // Terminal (and continue-as-new) outcomes carry their RecordUpdateResult
+        // in pending_cmds, NOT inside the outcome, so the selector must return
+        // pending_cmds there.
+        let id = crate::types::UpdateId::new();
+        let pending_cmds = vec![WorkflowCommand::RecordUpdateResult {
+            update_id: id,
+            result: Err("nope".into()),
+        }];
+        for outcome in [
+            WorkflowOutcome::Completed {
+                output: Value::Null,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            },
+            WorkflowOutcome::Failed {
+                error: "boom".into(),
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            },
+            WorkflowOutcome::ContinuedAsNew { input: Value::Null },
+        ] {
+            let source = update_result_command_source(&outcome, &pending_cmds);
+            assert_eq!(
+                source.len(),
+                1,
+                "terminal/CAN outcomes must read update results from pending_cmds"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_update_result_metrics_labels_unresolved_name_as_unknown() {
+        // A RecordUpdateResult whose UpdateAdmitted is not in the loaded history
+        // (should not happen in practice) is labeled "unknown", never dropped.
+        let id = crate::types::UpdateId::new();
+        let history: Vec<WorkflowEvent> = vec![];
+        let cmds = vec![WorkflowCommand::RecordUpdateResult {
+            update_id: id,
+            result: Ok(Value::Null),
+        }];
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            vec![("unknown".to_owned(), true)]
+        );
+    }
+
+    #[test]
+    fn collect_update_result_metrics_buckets_only_handler_not_found_to_sentinel() {
+        // Issue #684 (Codex P2): an unregistered update name — admitted via the
+        // free-form raw route — fails with the exact "update handler '<name>'
+        // not found" error; only that case buckets to __unregistered__. A real
+        // handler that fails with any other error keeps its name (a real handler
+        // may be declarative OR imperative, so bucketing against the declarative
+        // registry would mislabel it).
+        let unregistered_id = crate::types::UpdateId::new();
+        let real_id = crate::types::UpdateId::new();
+        let history = vec![
+            admitted(unregistered_id, "totally_random_name"),
+            admitted(real_id, "set_priority"),
+        ];
+        let cmds = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: unregistered_id,
+                result: Err("update handler 'totally_random_name' not found".to_owned()),
+            },
+            WorkflowCommand::RecordUpdateResult {
+                update_id: real_id,
+                result: Err("validation failed".to_owned()),
+            },
+        ];
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            vec![
+                (crate::telemetry::UNREGISTERED_UPDATE_NAME.to_owned(), false),
+                ("set_priority".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_unregistered_update_failure_matches_exact_not_found_error_only() {
+        let ok: Result<Value, String> = Ok(Value::Null);
+        assert!(!is_unregistered_update_failure("set_val", &ok));
+        assert!(is_unregistered_update_failure(
+            "set_val",
+            &Err("update handler 'set_val' not found".to_owned())
+        ));
+        // A different name in the error must not match this update's name.
+        assert!(!is_unregistered_update_failure(
+            "set_val",
+            &Err("update handler 'other' not found".to_owned())
+        ));
+        // An unrelated error from a real handler is not bucketed.
+        assert!(!is_unregistered_update_failure(
+            "set_val",
+            &Err("boom".to_owned())
+        ));
+    }
+
+    // ── signal.unhandled post-commit collection (issue #684, Codex P2) ─────
+
+    /// A recording sink capturing every `record_signal_unhandled` call so
+    /// `emit_unhandled_signal_metrics` can be asserted directly. The signal name
+    /// is not a label (issue #684, Codex P2), so each call carries only
+    /// `(workflow, queue)`.
+    #[derive(Default)]
+    struct SignalUnhandledSink {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl crate::telemetry::MetricsRecorder for SignalUnhandledSink {
+        fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((workflow_name.to_owned(), queue.to_owned()));
+        }
+    }
+
+    fn completed_with_signals(pairs: &[(&str, u64)]) -> WorkflowOutcome {
+        WorkflowOutcome::Completed {
+            output: Value::Null,
+            unhandled_signals: pairs.iter().map(|(n, c)| ((*n).to_owned(), *c)).collect(),
+        }
+    }
+
+    #[test]
+    fn outcome_unhandled_signals_reads_terminal_maps_and_is_empty_otherwise() {
+        // Completed / Failed carry the map; Suspended / ContinuedAsNew do not.
+        // This is the pre-persist collection the worker feeds to the post-commit
+        // `Persisted`-arm emission — so nothing to emit exists for a non-terminal
+        // outcome, and the terminal map is captured before persist moves it.
+        assert_eq!(
+            outcome_unhandled_signals(&completed_with_signals(&[("late", 2)])),
+            std::collections::BTreeMap::from([("late".to_owned(), 2u64)]),
+        );
+        assert_eq!(
+            outcome_unhandled_signals(&WorkflowOutcome::Failed {
+                error: "boom".into(),
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::from([("x".to_owned(), 1u64)]),
+            }),
+            std::collections::BTreeMap::from([("x".to_owned(), 1u64)]),
+        );
+        assert!(
+            outcome_unhandled_signals(&WorkflowOutcome::Suspended { commands: vec![] }).is_empty(),
+            "a Suspended outcome is not terminal — nothing to emit"
+        );
+        assert!(
+            outcome_unhandled_signals(&WorkflowOutcome::ContinuedAsNew { input: Value::Null })
+                .is_empty(),
+            "continue-as-new carries no unhandled-signal map"
+        );
+    }
+
+    #[test]
+    fn emit_unhandled_signal_metrics_sums_the_map_without_a_name_label() {
+        let sink = SignalUnhandledSink::default();
+        let map =
+            std::collections::BTreeMap::from([("a".to_owned(), 2u64), ("b".to_owned(), 1u64)]);
+        emit_unhandled_signal_metrics(&sink, "wf", "q", &map);
+        let calls = sink.calls.lock().unwrap().clone();
+        // 2 occurrences of "a" + 1 of "b" = 3 total emissions, each against the
+        // single (workflow, queue) series — the signal name is not a label
+        // (issue #684, Codex P2), so the map is summed to preserve the total
+        // unconsumed volume while dropping the unbounded name dimension.
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|(w, q)| w == "wf" && q == "q"));
+    }
+
+    #[test]
+    fn emit_unhandled_signal_metrics_is_a_noop_for_the_empty_collected_map() {
+        // The `Persisted` arm always calls emit with the pre-collected map; for
+        // a non-terminal (or empty-terminal) outcome that map is empty, so no
+        // counter fires. This is the structural companion to the DB test that a
+        // ParkedPaused / persist-failure cycle — which returns before the
+        // `Persisted` arm entirely — emits nothing.
+        let sink = SignalUnhandledSink::default();
+        emit_unhandled_signal_metrics(
+            &sink,
+            "wf",
+            "q",
+            &outcome_unhandled_signals(&WorkflowOutcome::Suspended { commands: vec![] }),
+        );
+        assert!(sink.calls.lock().unwrap().is_empty());
     }
 }

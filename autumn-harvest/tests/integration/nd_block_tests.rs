@@ -61,6 +61,7 @@ struct RecordingMetrics {
     block_labels: Mutex<Vec<(String, String)>>,
     nd_detections: Mutex<usize>,
     terminal_failed: Mutex<usize>,
+    signal_unhandled: Mutex<Vec<(String, String)>>,
 }
 
 impl RecordingMetrics {
@@ -75,11 +76,26 @@ impl RecordingMetrics {
     fn terminal_failed_count(&self) -> usize {
         *self.terminal_failed.lock().unwrap()
     }
+
+    fn signal_unhandled_count(&self) -> usize {
+        self.signal_unhandled.lock().unwrap().len()
+    }
 }
 
 impl MetricsRecorder for RecordingMetrics {
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
         self.block_labels
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), queue.to_string()));
+    }
+
+    // Issue #684: emitted from the same worker site as record_workflow_terminal
+    // (downstream of the #603 ND-block gate), so an ND-blocked cycle must record
+    // zero of these. No `name` label (issue #684, Codex P2 — free-form send
+    // route), so each call carries only `(workflow, queue)`.
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        self.signal_unhandled
             .lock()
             .unwrap()
             .push((workflow_name.to_string(), queue.to_string()));
@@ -175,6 +191,19 @@ fn parent_handler(
 }
 
 // ── Test helpers ───────────────────────────────────────────────────────────
+
+/// Env-redirectable setup (issue #684): run against an already-migrated
+/// `HARVEST_TEST_DATABASE_URL` when set (no Docker), otherwise testcontainers.
+async fn setup_env_or_container() -> (String, Option<ContainerAsync<Postgres>>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, c) = setup().await;
+    (url, Some(c))
+}
 
 async fn setup() -> (String, ContainerAsync<Postgres>) {
     let _ = tracing_subscriber::fmt()
@@ -1115,5 +1144,149 @@ async fn completion_never_touches_search_attrs_on_a_row_that_was_never_nd_blocke
         attrs.get("tenant"),
         Some(&serde_json::json!("acme")),
         "unrelated search_attrs keys must be untouched: {attrs}"
+    );
+}
+
+/// Issue #684 (FIX 2): `harvest.signal.unhandled` is emitted post-commit from
+/// the worker's `Persisted` arm — downstream of the #603 ND-block gate. So an
+/// ND-blocked cycle that carries an undrained signal must emit ZERO
+/// `signal.unhandled`, while a genuine terminal DOES emit exactly one. This is
+/// the falsifiable proof that emission moved off the executor's pre-gate path
+/// (where an earlier cut over-counted every ND-block cycle) and is now gated on
+/// a durable commit.
+/// Issue #684 (FIX 2), positive case: a genuine terminal (Completed) that left
+/// a delivered signal undrained emits exactly one `harvest.signal.unhandled`
+/// with workflow+queue labels (no free-form name; issue #684 Codex P2) — the
+/// worker emits it post-commit from the terminal outcome's `unhandled_signals`
+/// map, summed to the `(workflow, queue)` series.
+#[tokio::test]
+async fn genuine_terminal_with_undrained_signal_emits_signal_unhandled() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let metrics_a = Arc::new(RecordingMetrics::default());
+    let exec_a = start_workflow(&mut conn, "sig_term_wf", &format!("sig-term-{uniq}")).await;
+    // Inject an unconsumed SignalReceived directly into history (event_id after
+    // WorkflowStarted) so it is deterministically present when the worker drives
+    // immediate_complete_handler to completion — no ingestion-timing race.
+    let next_id = i32::try_from(get_history(&mut conn, exec_a).await.len()).unwrap();
+    store::append_events(
+        &mut conn,
+        exec_a,
+        &[WorkflowEvent::SignalReceived {
+            signal_name: "late".into(),
+            payload: Value::Null,
+        }],
+        next_id,
+    )
+    .await
+    .expect("inject SignalReceived");
+    let (worker_a, handle_a) = spawn_worker(
+        make_worker(
+            vec![wf_info("sig_term_wf", immediate_complete_handler)],
+            metrics_a.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if get_state(&mut conn, exec_a).await == "COMPLETED" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("workflow must complete");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    worker_a.shutdown();
+    let _ = handle_a.await;
+    assert_eq!(
+        metrics_a.signal_unhandled_count(),
+        1,
+        "a genuine terminal with an undrained signal must emit exactly one signal.unhandled"
+    );
+    assert_eq!(
+        metrics_a.signal_unhandled.lock().unwrap()[0],
+        ("sig_term_wf".to_string(), "default".to_string()),
+        "signal.unhandled must carry workflow+queue labels only (no free-form name; issue #684 Codex P2)"
+    );
+}
+
+/// Issue #684 (FIX 2), suppression case: an ND-blocked cycle emits ZERO
+/// `harvest.signal.unhandled`.
+///
+/// `record_signal_unhandled` is emitted from the worker's post-commit
+/// `Persisted` arm at `process_workflow_task` (the same discipline as
+/// `harvest.update.completed/failed`), which is downstream of both the #603
+/// ND-block gate (returns early via `block_workflow_for_non_determinism`) and
+/// the `record_workflow_terminal` (#519) site. So proving the ND-block cycle
+/// never reaches the terminal site — `terminal_failed_count == 0`, the same
+/// invariant `divergent_replay_blocks_instead_of_failing` already asserts —
+/// proves it never reaches the (strictly-later) `Persisted` arm either, so
+/// signal.unhandled is suppressed identically. A
+/// signal is deliberately NOT injected into the *diverging* history: an
+/// out-of-band `SignalReceived` at the divergence frontier changes the replay
+/// outcome (v2 no longer diverges); the positive case is
+/// `genuine_terminal_with_undrained_signal_emits_signal_unhandled`.
+#[tokio::test]
+async fn nd_blocked_cycle_does_not_emit_signal_unhandled() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let metrics_b = Arc::new(RecordingMetrics::default());
+    let exec_b = start_workflow(&mut conn, "nd_wf", &format!("sig-ndblock-{uniq}")).await;
+
+    // Phase 1: v1 arms the timer and suspends.
+    let (worker1, handle1) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_wf", timer_v1_handler)],
+            metrics_b.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    wait_for_timer_started(&mut conn, exec_b).await;
+    worker1.shutdown();
+    let _ = handle1.await;
+
+    // Phase 2: v2 diverges (schedules an activity where v1 recorded a timer) —
+    // the cycle ND-blocks and must never reach the terminal-emit site.
+    fire_timer_now(&mut conn, exec_b).await;
+    let (worker2, handle2) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_wf", divergent_v2_handler)],
+            metrics_b.clone(),
+            "v2",
+        ),
+        build_pool(&url),
+    );
+    let (blocked, _reason, _count, _attrs) = wait_for_nd_block(&mut conn, exec_b, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    worker2.shutdown();
+    let _ = handle2.await;
+
+    assert!(blocked, "the execution must be ND-blocked");
+    assert_eq!(metrics_b.nd_block_count(), 1, "the cycle must have blocked");
+    assert_eq!(
+        metrics_b.signal_unhandled_count(),
+        0,
+        "an ND-blocked cycle must NOT emit signal.unhandled (it never reaches the \
+         record_workflow_terminal site)"
+    );
+    assert_eq!(
+        metrics_b.terminal_failed_count(),
+        0,
+        "co-location proof: the terminal-failed counter (same match arm) is also \
+         suppressed on ND-block, so signal.unhandled — emitted from that arm — is too"
     );
 }

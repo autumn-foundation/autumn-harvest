@@ -62,18 +62,19 @@ use crate::telemetry::{
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_AUTO_PAUSED,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
     METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_SESSION_ACQUISITION, METRIC_SUMMARY_DELETED, METRIC_TASK_QUARANTINED,
-    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
-    METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
-    METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
-    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION,
-    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
-    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
-    WorkflowStatus,
+    METRIC_SESSION_ACQUISITION, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED,
+    METRIC_SUMMARY_DELETED, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
+    METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED, METRIC_WORKER_SLOT_TARGET,
+    METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS,
+    METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -791,6 +792,69 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — signal names come from the
+        // free-form send route and have no declared registry to bound them.
+        counter!(
+            METRIC_SIGNAL_RECEIVED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — see record_signal_received.
+        counter!(
+            METRIC_SIGNAL_UNHANDLED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — admission is at the free-form
+        // update route boundary where the name is not yet resolved against a
+        // registered handler (declarative OR imperative), so it cannot be bounded
+        // by construction. Per-name visibility lives on completed/failed/rejected.
+        counter!(
+            METRIC_UPDATE_ADMITTED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_rejected(&self, workflow_name: &str, update_name: &str) {
+        counter!(
+            METRIC_UPDATE_REJECTED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_completed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        counter!(
+            METRIC_UPDATE_COMPLETED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_failed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        counter!(
+            METRIC_UPDATE_FAILED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_user_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
         let ls: Vec<Label> = labels
             .iter()
@@ -1065,5 +1129,125 @@ mod tests {
             .metrics
             .record_workflow_started("onboarding", "default");
         telemetry.metrics.record_dlq_entries(0, 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
+    fn bridges_signal_update_lifecycle_counters_with_bounded_labels() {
+        // Issue #684: a local `metrics::Recorder` captures the registered
+        // counter keys, so a swapped or dropped label value in any of the six
+        // signal/update lifecycle bridges is caught here (not just no-panic).
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_signal_received("wf", "q");
+            rec.record_signal_unhandled("wf", "q");
+            rec.record_update_admitted("wf", "q");
+            rec.record_update_rejected("wf", "set_priority");
+            rec.record_update_completed("wf", "set_priority", "q");
+            rec.record_update_failed("wf", "set_priority", "q");
+        });
+
+        // Signals carry no `name` label (issue #684, Codex P2): free-form send
+        // route, no declared registry to bound it.
+        let wf_q = |q: &str| {
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), q.to_owned()),
+            ]
+        };
+        let wf_name_q = |name: &str, q: &str| {
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_NAME.to_owned(), name.to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), q.to_owned()),
+            ]
+        };
+        let wf_name = |name: &str| {
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_NAME.to_owned(), name.to_owned()),
+            ]
+        };
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (METRIC_SIGNAL_RECEIVED.to_owned(), wf_q("q")),
+                (METRIC_SIGNAL_UNHANDLED.to_owned(), wf_q("q")),
+                (METRIC_UPDATE_ADMITTED.to_owned(), wf_q("q")),
+                (METRIC_UPDATE_REJECTED.to_owned(), wf_name("set_priority")),
+                (
+                    METRIC_UPDATE_COMPLETED.to_owned(),
+                    wf_name_q("set_priority", "q")
+                ),
+                (
+                    METRIC_UPDATE_FAILED.to_owned(),
+                    wf_name_q("set_priority", "q")
+                ),
+            ],
+            "signal + update.admitted bridges register with (workflow, queue) only \
+             and the completed/failed/rejected update bridges with the documented \
+             workflow/name[/queue] constants, values un-swapped"
+        );
     }
 }

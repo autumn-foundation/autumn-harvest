@@ -14,9 +14,11 @@ use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
     METRIC_QUEUE_DISPATCHED, METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED,
     METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
-    METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED,
+    METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics,
+    WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -216,6 +218,72 @@ impl MetricsRecorder for RecordingMetrics {
             ],
         });
     }
+
+    // ── Signal & update lifecycle counters (issue #684) ───────────────────
+
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SIGNAL_RECEIVED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
+
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SIGNAL_UNHANDLED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
+
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_UPDATE_ADMITTED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
+
+    fn record_update_rejected(&self, workflow_name: &str, update_name: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_UPDATE_REJECTED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("name", update_name.to_owned()),
+            ],
+        });
+    }
+
+    fn record_update_completed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_UPDATE_COMPLETED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
+
+    fn record_update_failed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_UPDATE_FAILED,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +291,7 @@ impl MetricsRecorder for RecordingMetrics {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)] // one call + assertion per catalogue metric
 fn all_catalogue_metrics_are_reachable_via_trait() {
     // Wires every record_* call through RecordingMetrics and verifies the
     // expected metric name appears in the sample list — one assertion per
@@ -244,6 +313,12 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_retention_deleted("my_workflow", 50);
     rec.record_workflow_task_timeout("my_workflow", "default");
     rec.record_task_dispatched("default");
+    rec.record_signal_received("my_workflow", "default");
+    rec.record_signal_unhandled("my_workflow", "default");
+    rec.record_update_admitted("my_workflow", "default");
+    rec.record_update_rejected("my_workflow", "set_priority");
+    rec.record_update_completed("my_workflow", "set_priority", "default");
+    rec.record_update_failed("my_workflow", "set_priority", "default");
 
     let samples = rec.drain();
     let names: Vec<&str> = samples.iter().map(|s| s.name).collect();
@@ -318,6 +393,16 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
         names.contains(&METRIC_QUEUE_DISPATCHED),
         "harvest.queue.dispatched not sampled"
     );
+    for (metric, label) in [
+        (METRIC_SIGNAL_RECEIVED, "harvest.signal.received"),
+        (METRIC_SIGNAL_UNHANDLED, "harvest.signal.unhandled"),
+        (METRIC_UPDATE_ADMITTED, "harvest.update.admitted"),
+        (METRIC_UPDATE_REJECTED, "harvest.update.rejected"),
+        (METRIC_UPDATE_COMPLETED, "harvest.update.completed"),
+        (METRIC_UPDATE_FAILED, "harvest.update.failed"),
+    ] {
+        assert!(names.contains(&metric), "{label} not sampled");
+    }
 }
 
 #[test]
@@ -340,6 +425,12 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 0, 0, 0.0);
     rec.record_workflow_task_timeout("wf", "default");
+    rec.record_signal_received("wf", "default");
+    rec.record_signal_unhandled("wf", "default");
+    rec.record_update_admitted("wf", "default");
+    rec.record_update_rejected("wf", "set_priority");
+    rec.record_update_completed("wf", "set_priority", "default");
+    rec.record_update_failed("wf", "set_priority", "default");
 
     for sample in rec.drain() {
         for (key, _val) in &sample.labels {
@@ -347,6 +438,61 @@ fn cardinality_no_execution_id_label_on_any_metric() {
                 !key.contains("execution_id") && !key.contains("execution.id"),
                 "forbidden label '{key}' found on metric '{}' — execution.id must never be a metric label",
                 sample.name,
+            );
+        }
+    }
+}
+
+#[test]
+fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
+    // Issue #684: the six signal/update lifecycle counters must be reachable
+    // via the trait with exactly the bounded label sets documented in
+    // telemetry.rs — execution.id is forbidden by construction (ADR-0001 §7).
+    // Scope note (mirrors saga_counters_...): the label keys asserted below
+    // belong to the RecordingMetrics test double, so this pins the trait's
+    // reachable surface; production label content is pinned by the
+    // metrics_rs_adapter bridge test and the context-level tests.
+    let rec = RecordingMetrics::default();
+    rec.record_signal_received("wf", "default");
+    rec.record_signal_unhandled("wf", "default");
+    rec.record_update_admitted("wf", "default");
+    rec.record_update_rejected("wf", "set_priority");
+    rec.record_update_completed("wf", "set_priority", "default");
+    rec.record_update_failed("wf", "set_priority", "default");
+
+    let samples = rec.drain();
+    assert_eq!(samples.len(), 6);
+
+    // Issue #684 (Codex P2): the signal counters AND update.admitted carry NO
+    // free-form `name` label — signal names come from the free-form send route,
+    // and admission happens at the free-form update route boundary before the
+    // name is resolved against a handler (declarative OR imperative), so neither
+    // can be bounded by construction. update.rejected/completed/failed keep the
+    // `name` label because it resolves against the registered/declared handler
+    // set (failed buckets an unregistered name to the __unregistered__ sentinel).
+    let expected: &[(&str, &[&str])] = &[
+        (METRIC_SIGNAL_RECEIVED, &["workflow", "queue"]),
+        (METRIC_SIGNAL_UNHANDLED, &["workflow", "queue"]),
+        (METRIC_UPDATE_ADMITTED, &["workflow", "queue"]),
+        (METRIC_UPDATE_REJECTED, &["workflow", "name"]),
+        (METRIC_UPDATE_COMPLETED, &["workflow", "name", "queue"]),
+        (METRIC_UPDATE_FAILED, &["workflow", "name", "queue"]),
+    ];
+
+    for (metric, want_keys) in expected {
+        let sample = samples
+            .iter()
+            .find(|s| s.name == *metric)
+            .unwrap_or_else(|| panic!("{metric} not sampled"));
+        let keys: Vec<&str> = sample.labels.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            &keys, want_keys,
+            "{metric} must carry exactly {want_keys:?}; got {sample:?}"
+        );
+        for (key, _) in &sample.labels {
+            assert!(
+                !key.contains("execution_id") && !key.contains("execution.id"),
+                "execution.id must never be a metric label (metric '{metric}')"
             );
         }
     }

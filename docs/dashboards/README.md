@@ -133,6 +133,8 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_workflow_non_determinism` | Workflow health | Non-determinism detections (+ Non-determinism blocks entered) | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_non_determinism) |
 | `harvest_saga_compensation_spike` | Sagas | Saga compensations | [runbook](../runbooks/harvest-alerts.md#harvest_saga_compensation_spike) |
 | `harvest_saga_compensation_failed` | Sagas | Saga compensation failures | [runbook](../runbooks/harvest-alerts.md#harvest_saga_compensation_failed) |
+| `harvest_update_rejected_rate` | Signal & update lifecycle | Update validator rejections | [runbook](../runbooks/harvest-alerts.md#harvest_update_rejected_rate) |
+| `harvest_signal_unhandled_rate` | Signal & update lifecycle | Unhandled signals | [runbook](../runbooks/harvest-alerts.md#harvest_signal_unhandled_rate) |
 
 ### Readiness-style alerts (no native metric)
 

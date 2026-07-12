@@ -2083,6 +2083,28 @@ impl WorkflowContext {
         self.match_history(|m| m.has_non_lifecycle_unconsumed())
     }
 
+    /// Delivered signals this workflow left unconsumed at the current frontier,
+    /// keyed by signal name → occurrence count (issue #684).
+    ///
+    /// Read-only snapshot of the driven matcher's authoritative consumed-set.
+    /// Called by the executor's terminal arms (`drive_workflow`) — the only
+    /// place that consumed-set exists — **after**
+    /// [`flush_pending_signal_handlers`](Self::flush_pending_signal_handlers)
+    /// so issue #546 push handlers get their final claim first. The returned
+    /// map is carried out on the terminal [`WorkflowOutcome`] and the
+    /// **worker** emits `harvest.signal.unhandled` from it, at the same site
+    /// and under the same suppressions as `record_workflow_terminal` (#519).
+    ///
+    /// Emission deliberately does **not** happen here: emitting in the executor
+    /// is upstream of the #603 ND-block gate and the fast-path pause discard, so
+    /// an ND-blocked (or paused-then-discarded) cycle would over-count. Moving
+    /// the emission to the worker — beside `record_workflow_terminal` — makes it
+    /// symmetric with #519's own suppression discipline.
+    pub(crate) fn unhandled_signals(&self) -> std::collections::BTreeMap<String, u64> {
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.unconsumed_signals_by_name()
+    }
+
     /// Create a minimal handler context for declarative `#[update]` dispatch.
     ///
     /// Returns an `Arc<Self>` so the context can be captured by value inside
@@ -16979,5 +17001,47 @@ mod tests {
         assert!(obs.counted, "a recorded marker is counted even in a probe");
         assert_eq!(recorder.compensated.lock().unwrap().len(), 0);
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    // ── unhandled_signals (issue #684) ────────────────────────────────────
+    //
+    // The executor's terminal arms read this map and carry it out on the
+    // WorkflowOutcome; the WORKER emits harvest.signal.unhandled from it (so it
+    // inherits #519's suppression discipline). These tests exercise the pure
+    // reader — that it reflects the driven matcher's consumed-set.
+
+    fn started_then_signal(signal: &str) -> Vec<WorkflowEvent> {
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: signal.into(),
+                payload: Value::Null,
+            },
+        ]
+    }
+
+    #[test]
+    fn unhandled_signals_reports_an_undrained_signal_by_name() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_then_signal("approve"));
+        let by_name = ctx.unhandled_signals();
+        assert_eq!(by_name.get("approve"), Some(&1));
+        assert_eq!(by_name.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unhandled_signals_is_empty_when_signal_is_consumed() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_then_signal("go"));
+        // Consume the signal exactly as a workflow body would.
+        let _ = ctx.wait_for_signal("go").await.expect("signal present");
+        assert!(
+            ctx.unhandled_signals().is_empty(),
+            "a consumed signal must not be reported as unhandled"
+        );
     }
 }

@@ -5462,6 +5462,82 @@ impl autumn_harvest::telemetry::MetricsRecorder for CountingMetrics {
     }
 }
 
+// ── signal.unhandled is never emitted by the replay path (issue #684, AC2) ──
+
+/// Counts `record_signal_unhandled` calls.
+#[derive(Default)]
+struct SignalUnhandledCounter {
+    unhandled: std::sync::atomic::AtomicU64,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for SignalUnhandledCounter {
+    fn record_signal_unhandled(&self, _workflow_name: &str, _queue: &str) {
+        self.unhandled
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A workflow that consumes a single "go" signal and returns — so the recorded
+/// history it produces replays cleanly (the signal is consumed at replay).
+fn signal_wait_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _ = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// AC2 (issue #684): a `WorkflowReplayer` replay of an already-terminal history
+/// drives the strict/canary path (`run_workflow_strict`/`run_workflow_canary`),
+/// NOT the live `drive_workflow` where `harvest.signal.unhandled` is emitted, so
+/// re-replaying a terminal history emits ZERO unhandled-signal samples — the
+/// counter can never double-count on replay by construction.
+#[tokio::test]
+async fn replay_of_terminal_history_never_emits_signal_unhandled() {
+    let metrics = std::sync::Arc::new(SignalUnhandledCounter::default());
+    let replayer = WorkflowReplayer::new()
+        .register_fn("signal_wait_workflow", signal_wait_workflow)
+        .with_metrics(metrics.clone());
+
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".into(),
+            payload: Value::Null,
+        },
+    ];
+
+    // Replay several cycles: the signal is consumed each time (ReplaySucceeded),
+    // and the unhandled counter never increments on any replay cycle.
+    for cycle in 0..5 {
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "signal_wait_workflow",
+                exec_id,
+                events.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "cycle {cycle}: consuming-signal workflow must replay cleanly, got: {report}"
+        );
+    }
+    assert_eq!(
+        metrics.unhandled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the replay path must never emit harvest.signal.unhandled (AC2: no double-count on replay)"
+    );
+}
+
 /// One activity, then a single business-counter increment and one histogram
 /// sample (issue #758's "counter incremented once in workflow code" shape;
 /// the histogram proves suppression covers both metric kinds).

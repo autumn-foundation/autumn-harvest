@@ -28,7 +28,8 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START,
+    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_SIGNAL_RECEIVED,
+    METRIC_SIGNAL_UNHANDLED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_FAILED,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
     MetricsRecorder, TelemetryConfig, WorkflowStatus,
@@ -300,11 +301,79 @@ impl MetricsRecorder for RecordingMetrics {
             ],
         );
     }
+
+    // ── Signal & update lifecycle counters (issue #684) ───────────────────
+
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        self.push(
+            METRIC_SIGNAL_RECEIVED,
+            vec![
+                ("queue", queue.to_owned()),
+                ("workflow", workflow_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        self.push(
+            METRIC_SIGNAL_UNHANDLED,
+            vec![
+                ("queue", queue.to_owned()),
+                ("workflow", workflow_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
+        self.push(
+            METRIC_UPDATE_ADMITTED,
+            vec![
+                ("queue", queue.to_owned()),
+                ("workflow", workflow_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_update_completed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        self.push(
+            METRIC_UPDATE_COMPLETED,
+            vec![
+                ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
+                ("workflow", workflow_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_update_failed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        self.push(
+            METRIC_UPDATE_FAILED,
+            vec![
+                ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
+                ("workflow", workflow_name.to_owned()),
+            ],
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Env-redirectable DB setup (issue #684): when `HARVEST_TEST_DATABASE_URL` is
+/// set, run against that already-migrated Postgres directly (no container);
+/// otherwise fall back to a fresh testcontainers Postgres. Used by tests that
+/// must be runnable without Docker where a local migrated Postgres is available.
+async fn setup_db_env_or_container() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
+}
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -463,6 +532,48 @@ fn unfinished_updates_test_workflow<'a>(
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move { Ok(serde_json::json!({"completed": true})) })
+}
+
+/// Fixed update id shared between `update_then_suspend_workflow` and its test so
+/// the workflow can deterministically drive the pre-admitted update (issue #684).
+const FIX1_UPDATE_UUID: Uuid = Uuid::from_u128(0x0684_0000_0000_7001_8000_0000_0000_0001);
+
+/// Issue #684 (FIX 1): drives its pre-admitted `set_val` update to completion,
+/// then suspends forever on a signal that never arrives. The update's
+/// `RecordUpdateResult` therefore rides out on the SUSPENDED outcome (not a
+/// terminal one) — the common suspend path on which an earlier cut collected
+/// the metric only from `pending_cmds` (empty on suspend) and undercounted.
+///
+/// The update id is fixed so `execute_admitted_update` replays deterministically
+/// (once completed, `match_update` short-circuits without re-running).
+fn update_then_suspend_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.register_update_handler_no_validator(
+            "set_val",
+            |input: serde_json::Value| async move {
+                Ok::<serde_json::Value, String>(serde_json::json!({"applied": input}))
+            },
+        );
+        // Drive the pre-admitted update. On the first live cycle match_update
+        // is NoMatch (admitted, not yet completed) so the handler runs and
+        // pushes RecordUpdateResult; on any replay it short-circuits.
+        let _ = ctx
+            .execute_admitted_update(
+                UpdateId::from_uuid(FIX1_UPDATE_UUID),
+                "set_val",
+                serde_json::json!({"v": 7}),
+            )
+            .await;
+        // Then suspend forever — the update completed on a SUSPEND cycle.
+        let _ = ctx
+            .wait_for_signal("done")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"completed": true}))
+    })
 }
 
 fn metrics_activity<'a>(
@@ -3288,5 +3399,192 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
     assert!(
         names.contains(&METRIC_WORKFLOW_UNFINISHED_HANDLERS),
         "harvest.workflow.unfinished_handlers must be emitted; got: {names:?}"
+    );
+}
+
+/// Issue #684 (FIX 1): an admitted update that completes while the workflow
+/// SUSPENDS (loops back to a wait, does not terminate) must emit exactly one
+/// `harvest.update.completed`. An earlier cut collected the metric only from
+/// `pending_cmds`, which is empty on the suspend path, so this fired zero times.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // linear DB setup + drive + assertions
+async fn update_completed_metric_fires_on_the_suspend_path() {
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let exec_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "update_then_suspend_workflow",
+        workflow_id: &format!("update-suspend-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("insert execution row");
+
+    // Pre-admit the update (WorkflowStarted + UpdateAdmitted). The workflow body
+    // drives it to completion on its first cycle and then suspends, so the
+    // update result rides out on the SUSPENDED outcome — FIX 1's exact scenario.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: UpdateId::from_uuid(FIX1_UPDATE_UUID),
+                name: "set_val".to_string(),
+                input: serde_json::json!({"v": 7}),
+                timestamp: Utc::now(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted + UpdateAdmitted");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue workflow task");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "update_then_suspend_workflow",
+            module: "metrics_integration",
+            handler: update_then_suspend_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    let worker = build_worker("metrics-worker-update-suspend", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // The workflow drives the pre-admitted update on its first cycle, appends
+    // UpdateCompleted, and suspends on wait_for_signal("done"); the row stays
+    // RUNNING (SUSPENDED is not a persisted state).
+    wait_for_state(&database_url, exec_id, "RUNNING").await;
+
+    // Poll history until UpdateCompleted is durably appended on the suspend path.
+    let expected_update_id = UpdateId::from_uuid(FIX1_UPDATE_UUID);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let h = load_history(&database_url, exec_id).await;
+            if h.events.iter().any(|e| {
+                matches!(e, WorkflowEvent::UpdateCompleted { update_id: id, .. } if *id == expected_update_id)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("UpdateCompleted must be appended on the suspend path");
+
+    // Let the worker settle any extra wake cycles (each re-drive short-circuits
+    // in execute_admitted_update, so the counter must stay at exactly one).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    worker.shutdown();
+    handle.await.expect("worker joins cleanly");
+
+    // The workflow is STILL suspended (not terminal) — the update completed on
+    // the SUSPEND path, exactly what FIX 1 targets.
+    let ex = load_execution(&database_url, exec_id).await;
+    assert_eq!(
+        ex.state, "RUNNING",
+        "the workflow must still be suspended (RUNNING), proving the suspend path"
+    );
+
+    let emissions = recording.drain();
+    let completed = emissions
+        .iter()
+        .filter(|e| e.name == METRIC_UPDATE_COMPLETED)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed.len(),
+        1,
+        "harvest.update.completed must fire exactly once on the suspend path; got {emissions:?}"
+    );
+    assert_eq!(
+        completed[0].labels_debug,
+        "name=set_val,queue=default,workflow=update_then_suspend_workflow",
+        "update.completed must carry workflow+name+queue labels"
+    );
+    assert_eq!(
+        emissions
+            .iter()
+            .filter(|e| e.name == METRIC_UPDATE_FAILED)
+            .count(),
+        0,
+        "no update.failed for a successful update"
     );
 }

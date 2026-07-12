@@ -466,71 +466,98 @@ pub async fn append_single_event(
 /// Returns [`crate::error::HarvestError::UpdateRejected`] if the execution is
 /// not in the `RUNNING` state.
 /// Returns [`crate::error::HarvestError::Database`] on query or insert failure.
+///
+/// When `metrics` is `Some`, `harvest.update.admitted` is emitted **once,
+/// post-commit** (issue #684), labeled by the resolved workflow name and queue.
+/// Callers that run `admit_update_event` inside a larger outer transaction
+/// (e.g. `update_with_start`) pass `None` and emit at their own outer-commit
+/// boundary instead, so the metric never fires on a rollback.
+///
+/// The update `name` is deliberately NOT a label (issue #684, Codex P2): unlike
+/// the terminal `harvest.update.completed`/`failed` counters — which bound an
+/// unregistered name to the `__unregistered__` sentinel using the workflow's
+/// handler-not-found result — the admission site has no way to know whether a
+/// name resolves to a handler (imperative `ctx.register_update_handler`
+/// handlers are not known until the workflow executes), so it cannot bound the
+/// name without mislabeling legitimate imperatively-registered updates.
+/// Dropping the label bounds this counter's cardinality by construction;
+/// per-name visibility lives on the post-resolution completed/failed/rejected
+/// counters.
 pub async fn admit_update_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     update_id: crate::types::UpdateId,
     name: String,
     input: serde_json::Value,
+    metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
-    conn.transaction::<(), crate::error::HarvestError, _>(|conn| {
-        async move {
-            // Acquire a row-level lock so concurrent appenders serialize their
-            // MAX(event_id) + INSERT pairs and the state check is consistent.
-            let execution: WorkflowExecution = harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .for_update()
-                .select(WorkflowExecution::as_select())
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .ok_or_else(|| {
-                    crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                })?;
+    let (workflow_name, queue_name) = conn
+        .transaction::<(String, String), crate::error::HarvestError, _>(|conn| {
+            async move {
+                // Acquire a row-level lock so concurrent appenders serialize their
+                // MAX(event_id) + INSERT pairs and the state check is consistent.
+                let execution: WorkflowExecution = harvest_workflow_executions::table
+                    .find(exec_id.as_uuid())
+                    .for_update()
+                    .select(WorkflowExecution::as_select())
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?
+                    .ok_or_else(|| {
+                        crate::error::HarvestError::NotFound(format!(
+                            "workflow execution {exec_id}"
+                        ))
+                    })?;
 
-            // Reject updates submitted while the execution is paused with a
-            // dedicated error (issue #383). Updates may admit-and-mutate workflow
-            // state, so they are rejected rather than silently queued behind the
-            // pause — surfacing operator intent as a 409 at the API layer.
-            if execution.state == "PAUSED" {
-                return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
+                // Reject updates submitted while the execution is paused with a
+                // dedicated error (issue #383). Updates may admit-and-mutate workflow
+                // state, so they are rejected rather than silently queued behind the
+                // pause — surfacing operator intent as a 409 at the API layer.
+                if execution.state == "PAUSED" {
+                    return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
+                }
+
+                // Reject the update if the execution is no longer running.
+                if execution.state != "RUNNING" {
+                    return Err(crate::error::HarvestError::UpdateRejected {
+                        reason: format!(
+                            "workflow {exec_id} is not RUNNING (state: {})",
+                            execution.state
+                        ),
+                    });
+                }
+
+                let max_id: Option<i32> = harvest_events::table
+                    .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .select(max(harvest_events::event_id))
+                    .first(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+                let event = WorkflowEvent::UpdateAdmitted {
+                    update_id,
+                    name,
+                    input,
+                    timestamp: chrono::Utc::now(),
+                };
+                append_events(conn, exec_id, &[event], next_id).await?;
+                Ok((execution.workflow_name, execution.queue_name))
             }
+            .scope_boxed()
+        })
+        .await?;
 
-            // Reject the update if the execution is no longer running.
-            if execution.state != "RUNNING" {
-                return Err(crate::error::HarvestError::UpdateRejected {
-                    reason: format!(
-                        "workflow {exec_id} is not RUNNING (state: {})",
-                        execution.state
-                    ),
-                });
-            }
-
-            let max_id: Option<i32> = harvest_events::table
-                .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-                .select(max(harvest_events::event_id))
-                .first(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-
-            let next_id = max_id.map_or(0, |id| id.saturating_add(1));
-            let event = WorkflowEvent::UpdateAdmitted {
-                update_id,
-                name,
-                input,
-                timestamp: chrono::Utc::now(),
-            };
-            append_events(conn, exec_id, &[event], next_id).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    // Post-commit: emit harvest.update.admitted exactly once (issue #684).
+    if let Some(metrics) = metrics {
+        metrics.record_update_admitted(&workflow_name, &queue_name);
+    }
+    Ok(())
 }
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.

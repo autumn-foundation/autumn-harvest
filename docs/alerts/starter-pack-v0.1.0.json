@@ -733,6 +733,70 @@
         "GET /api/harvest/workflows/{execution_id}/history"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed"
+    },
+    {
+      "id": "harvest_update_rejected_rate",
+      "status": "enforceable",
+      "signal_source": "harvest.update.rejected counter (issue #684), incremented once per workflow update rejected by its registered validator before admission (a durable pre-admission 422).",
+      "default_threshold": "Ticket when the per-workflow validator-rejection rate is sustained above baseline for 10 minutes: sum by (workflow) (rate(harvest_update_rejected_total[5m])) rising materially above its normal level. Starter default — tune per workflow; a healthy client should see near-zero validator rejections.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A workflow's update handler is receiving payloads its validator rejects at a sustained rate. This usually means a client is sending malformed or stale update requests (a schema/version drift after a deploy, a buggy caller, or a retry storm of an already-invalid payload). Rejections are cheap and safe — the update never becomes durable history — but a spike means legitimate callers may be failing to drive the workflow.",
+      "first_action": "Identify the offending update and caller: the metric's workflow + name labels name the workflow type and update. Inspect the caller's payload against the workflow's registered update validator, and check for a recent client or workflow deploy that changed the expected shape.",
+      "dependencies": [
+        {
+          "ref": "#684",
+          "status": "shipped",
+          "surface": "harvest.update.rejected{workflow, name} counter emitted at the admit_update and update_with_start validator-rejection sites"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Scope is validator rejections only (a pre-admission 422); non-RUNNING/paused admission-state conflicts are surfaced as caller errors, not counted here. workflow and name labels are bounded; execution.id is never a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_update_rejected_total[5m]))"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows/types/{workflow_name}/handlers",
+        "GET /api/harvest/workflows?workflow_name=<name>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_update_rejected_rate"
+    },
+    {
+      "id": "harvest_signal_unhandled_rate",
+      "status": "enforceable",
+      "signal_source": "harvest.signal.unhandled counter (issue #684), incremented once per delivered signal a workflow left unconsumed when it reached a Completed or Failed terminal outcome.",
+      "default_threshold": "Ticket when the per-workflow unhandled-signal rate is sustained above baseline for 10 minutes: sum by (workflow) (rate(harvest_signal_unhandled_total[5m])) rising materially above normal. Starter default — a small steady rate can be legitimate (late/duplicate signals a workflow deliberately ignores); alert on a change from the workflow's own baseline, not an absolute floor.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A workflow type is completing (or failing) while delivered signals it received were never consumed by a wait_for_signal/receive_signal call or a push handler. This often indicates a race between a signal-sending caller and the workflow's own control flow, a removed/renamed signal handler after a deploy, or a signal arriving after the workflow already decided to finish. Coverage is scoped to graceful (Completed/Failed) terminal outcomes reached via the worker drive; cancel/terminate/execution-timeout are out of scope by design.",
+      "first_action": "Identify the workflow type and signal from the metric's workflow + name labels. Confirm whether the workflow is expected to consume that signal on every run, and check for a recent workflow deploy that removed or renamed the corresponding wait_for_signal/receive_signal/register_signal_handler call, or a caller that started sending a signal the workflow no longer handles.",
+      "dependencies": [
+        {
+          "ref": "#684",
+          "status": "shipped",
+          "surface": "harvest.signal.unhandled{workflow, name} counter emitted from the executor terminal arms for Completed/Failed outcomes"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Signals excused by a lost signal-or-deadline race (issue #476) are never counted. Scope is Completed/Failed terminal outcomes only (the paths with a driven matcher); cancel/terminate/execution-timeout/parent-close are structurally out of scope. workflow and name labels are bounded; execution.id is never a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_signal_unhandled_total[5m]))"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?workflow_name=<name>&state=COMPLETED",
+        "GET /api/harvest/workflows/{execution_id}/history"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_signal_unhandled_rate"
     }
   ]
 }

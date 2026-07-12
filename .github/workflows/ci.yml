@@ -209,6 +209,9 @@ jobs:
       - name: Run Docker-backed force-fail integration tests (issue #765)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- force_fail --test-threads=1
+      - name: Run Docker-backed signal/update metric integration tests (issue #684)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
       - name: Run Docker-backed panic containment integration tests (issue #782)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- panic_containment_tests --test-threads=1
