@@ -144,6 +144,9 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
     // uses the testcontainers path below (which is the authoritative path).
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         use diesel_async::SimpleAsyncConnection;
+        // The per-test `harvest678_<uuid>` database is intentionally NOT dropped:
+        // this local-dev-only path is env-gated, and CI leaves the env var unset
+        // so it uses the testcontainers path (which self-cleans on container drop).
         let db_name = format!("harvest678_{}", uuid::Uuid::new_v4().simple());
         let mut admin = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&base_url)
             .await
@@ -298,6 +301,33 @@ fn mixed_suspension_cancel_workflow<'a>(
                 Ok(serde_json::json!({"status": "cancel_resolved"}))
             }
         }
+    })
+}
+
+// Issue #678 correctness guard: resolve an external op INLINE (cycle 1, its
+// terminal appended this cycle), THEN park a PURE `ctx.timer()` in a later cycle.
+// The earlier, fully-observed external op must NOT false-wake the pure timer —
+// `resolved_external_ids` is scoped to the ids resolved on the *current* cycle,
+// which for the timer-park cycle is empty.
+fn external_then_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        // Cycle 1: external signal resolves inline against the same-shard target.
+        ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hi"}))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Later cycle: a PURE timer park with no external op in the batch.
+        ctx.timer("sleep", 3).await.map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({"status": "done"}))
     })
 }
 
@@ -1389,6 +1419,139 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
         caller.output.unwrap()["status"].as_str(),
         Some("cancel_resolved"),
         "caller must resolve on the cancel branch, not the timer branch"
+    );
+
+    // The inline cancel must actually have cancelled the target. It may settle
+    // just after the caller wakes, so poll briefly for the terminal transition.
+    let target = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "CANCELLED" {
+                break target;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cancel target should reach CANCELLED after the inline cancel");
+    assert_eq!(target.state, "CANCELLED");
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── Issue #678 correctness guard: pure timer after inline external ──────────
+//
+// The inline self-wake must be scoped to the ids resolved THIS cycle. A
+// workflow that resolves an external op inline (cycle 1) and THEN parks a PURE
+// `ctx.timer()` (later cycle) must not be false-woken by the earlier op: the
+// timer's park cycle appends no external terminal, so `resolved_external_ids`
+// is empty and the row parks normally. This proves the fix does not degrade
+// the pure-timer contract (the timer must actually sleep out its duration).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pure_timer_after_inline_external_does_not_false_wake() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external signal resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info("external_then_timer_workflow", external_then_timer_workflow),
+            wf_info("target_workflow", target_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-pure-timer-after-external".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on receive_signal),
+    // so the caller's signal_external_workflow resolves inline in cycle 1.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "target_workflow",
+            "target-pure-timer-guard-1",
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING (parked on signal) before caller starts");
+
+    let start = std::time::Instant::now();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "external_then_timer_workflow",
+            "caller-pure-timer-guard-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // At ~1.5s the caller must still be RUNNING: the earlier inline external must
+    // NOT have false-woken the pure 3s timer park.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mid = load_execution_from_url(&database_url, caller_exec_id).await;
+    assert_ne!(
+        mid.state,
+        "COMPLETED",
+        "pure 3s timer must not be false-woken by the earlier inline external op \
+         (elapsed {:?})",
+        start.elapsed()
+    );
+
+    // The timer eventually fires (~3s) and the caller completes.
+    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("caller should complete after its 3s timer fires");
+
+    assert_eq!(completed.state, "COMPLETED");
+    assert_eq!(
+        completed.output.unwrap()["status"].as_str(),
+        Some("done"),
+        "caller must complete via the pure timer branch"
     );
 
     worker.shutdown();
