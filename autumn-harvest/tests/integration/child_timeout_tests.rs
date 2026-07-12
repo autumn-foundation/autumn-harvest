@@ -518,12 +518,16 @@ const RACE_TIMER_ID: &str = "__child_timeout:1:timeout_child";
 /// (seq 1 → `__child_timeout:1:timeout_child`). A matching `harvest_timers` row
 /// is inserted OVERDUE (`fires_at = NOW() - 2s`, `fired = false`) — the exact
 /// state a child completing/failing after its deadline races against.
-async fn setup_parent_racing_overdue_child(
+/// Seed the parent's parked-on-overdue-child-timeout state: append the
+/// `WorkflowStarted, ChildWorkflowStarted(child), TimerStarted(deadline)` prefix
+/// and insert a matching OVERDUE `harvest_timers` row (`fires_at = NOW() - 2s`,
+/// `fired = false`) for `RACE_TIMER_ID`. Shared by the fake-child and real-child
+/// setups so both drive the exact recorded state a late-terminating child races.
+async fn seed_overdue_child_race(
     conn: &mut AsyncPgConnection,
-) -> (ExecutionId, ExecutionId) {
-    let parent_exec_id = insert_workflow_execution(conn).await;
-    let child_exec_id = ExecutionId::new();
-
+    parent_exec_id: ExecutionId,
+    child_exec_id: ExecutionId,
+) {
     let started_prefix = vec![
         WorkflowEvent::workflow_started(serde_json::json!({"id": 1}), chrono::Utc::now()),
         WorkflowEvent::ChildWorkflowStarted {
@@ -550,7 +554,48 @@ async fn setup_parent_racing_overdue_child(
         .execute(conn)
         .await
         .expect("insert overdue deadline timer");
+}
 
+async fn setup_parent_racing_overdue_child(
+    conn: &mut AsyncPgConnection,
+) -> (ExecutionId, ExecutionId) {
+    let parent_exec_id = insert_workflow_execution(conn).await;
+    let child_exec_id = ExecutionId::new();
+    seed_overdue_child_race(conn, parent_exec_id, child_exec_id).await;
+    (parent_exec_id, child_exec_id)
+}
+
+/// Like [`setup_parent_racing_overdue_child`], but the child is a REAL RUNNING
+/// `harvest_workflow_executions` row LINKED to the parent as an awaited child
+/// (`parent_id` set, `parent_close_policy` NULL) so the out-of-band operator
+/// paths (`cancel_workflow_execution` / `terminate_workflow_execution`) and the
+/// child's own execution-timeout scanner (`enforce_workflow_execution_timeouts`)
+/// can act on it. When `child_deadline_at` is `Some`, the child row's execution
+/// deadline is set (in the past) so the timeout scanner picks it up.
+async fn setup_parent_racing_overdue_real_child(
+    conn: &mut AsyncPgConnection,
+    child_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> (ExecutionId, ExecutionId) {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl;
+    use diesel::{ExpressionMethods, QueryDsl};
+
+    let parent_exec_id = insert_workflow_execution(conn).await;
+    let child_exec_id = insert_workflow_execution(conn).await;
+
+    // Link child → parent as an AWAITED child (parent_close_policy stays NULL,
+    // the invariant notify_awaited_parent_of_child_terminal / the execution
+    // timeout scanner both gate on) and, for the execution-timeout scenario, set
+    // its deadline in the past so enforce_workflow_execution_timeouts selects it.
+    diesel::update(dsl::harvest_workflow_executions.find(child_exec_id.as_uuid()))
+        .set((
+            dsl::parent_id.eq(Some(parent_exec_id.as_uuid())),
+            dsl::deadline_at.eq(child_deadline_at),
+        ))
+        .execute(conn)
+        .await
+        .expect("link child to parent");
+
+    seed_overdue_child_race(conn, parent_exec_id, child_exec_id).await;
     (parent_exec_id, child_exec_id)
 }
 
@@ -678,6 +723,144 @@ async fn over_deadline_child_failure_orders_deadline_first_and_resolves_none() {
         Ok(None),
         "an over-deadline child FAILURE must resolve to None (deadline won), not surface Err"
     );
+}
+
+// ── #779 Codex P2-D: over-deadline OPERATOR/TIMEOUT out-of-band terminals ─────
+//
+// Beyond the worker's completion/failure wake paths (fixed in P1), three OTHER
+// out-of-band paths append a child terminal to a parent WITHOUT going through
+// wake_parent_for_child_completion/_failure: an operator CANCEL, an operator
+// TERMINATE (both via execution::notify_awaited_parent_of_child_terminal), and
+// the child's OWN execution timeout (via timeout::wake_parent_for_child_timeout).
+// Each must also materialize the parent's DUE __child_timeout deadline FIRST so
+// an over-deadline child resolves the parent's spawn_child_workflow_timeout to
+// None (not Err). These drive the REAL public entry points, mirroring the P1
+// tests that drive the real wake functions.
+
+/// Assert the parent's history ends with `[TimerFired(deadline),
+/// ChildWorkflowFailed]` — the overdue deadline ordered ahead of the out-of-band
+/// child terminal — and that the primitive replays to `None`.
+async fn assert_parent_resolves_none_after_overdue_terminal(
+    database_url: &str,
+    parent_exec_id: ExecutionId,
+    context: &str,
+) {
+    let history = load_history_from_url(database_url, parent_exec_id).await;
+    let tail: Vec<&WorkflowEvent> = history.events.iter().rev().take(2).collect();
+    assert!(
+        matches!(tail.as_slice(), [WorkflowEvent::ChildWorkflowFailed { .. }, WorkflowEvent::TimerFired { timer_id }] if timer_id.as_str() == RACE_TIMER_ID),
+        "[{context}] parent history must end with [TimerFired(deadline), ChildWorkflowFailed]; got: {:?}",
+        history
+            .events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>()
+    );
+
+    let outcome = replay_child_timeout(database_url, parent_exec_id).await;
+    assert_eq!(
+        outcome,
+        Ok(None),
+        "[{context}] an over-deadline child must resolve to None (deadline won), not Err"
+    );
+}
+
+/// Operator CANCEL of an over-deadline awaited child appends its terminal via
+/// `notify_awaited_parent_of_child_terminal`, which (post-fix) materializes the
+/// overdue `__child_timeout` deadline first → the parent resolves `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_deadline_child_operator_cancel_orders_deadline_first_and_resolves_none() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let (parent_exec_id, child_exec_id) =
+        setup_parent_racing_overdue_real_child(&mut conn, None).await;
+
+    // REAL out-of-band operator-cancel path on the awaited child.
+    autumn_harvest::execution::cancel_workflow_execution(
+        &mut conn,
+        child_exec_id,
+        "operator abort",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel child");
+
+    assert_parent_resolves_none_after_overdue_terminal(
+        &database_url,
+        parent_exec_id,
+        "operator-cancel",
+    )
+    .await;
+}
+
+/// Operator TERMINATE of an over-deadline awaited child takes the same
+/// `notify_awaited_parent_of_child_terminal` path → the parent resolves `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_deadline_child_operator_terminate_orders_deadline_first_and_resolves_none() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let (parent_exec_id, child_exec_id) =
+        setup_parent_racing_overdue_real_child(&mut conn, None).await;
+
+    // REAL out-of-band operator-terminate path on the awaited child.
+    autumn_harvest::execution::terminate_workflow_execution(
+        &mut conn,
+        child_exec_id,
+        "operator terminate",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("terminate child");
+
+    assert_parent_resolves_none_after_overdue_terminal(
+        &database_url,
+        parent_exec_id,
+        "operator-terminate",
+    )
+    .await;
+}
+
+/// The child hitting its OWN execution timeout (issue #243) appends its terminal
+/// to the parent via `timeout::wake_parent_for_child_timeout` (post-fix it
+/// materializes the overdue `__child_timeout` deadline first) → the parent
+/// resolves `None`, not the child-timeout `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_deadline_child_execution_timeout_orders_deadline_first_and_resolves_none() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    // Child's own execution deadline is 5s in the past so the scanner selects it.
+    let child_deadline = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let (parent_exec_id, _child_exec_id) =
+        setup_parent_racing_overdue_real_child(&mut conn, Some(child_deadline)).await;
+
+    // REAL execution-timeout scanner: times out the overdue child and notifies
+    // the parent via wake_parent_for_child_timeout.
+    let timed_out = autumn_harvest::timeout::enforce_workflow_execution_timeouts(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("enforce execution timeouts");
+    assert!(
+        timed_out >= 1,
+        "the overdue child must be timed out (got {timed_out})"
+    );
+
+    assert_parent_resolves_none_after_overdue_terminal(
+        &database_url,
+        parent_exec_id,
+        "child-execution-timeout",
+    )
+    .await;
 }
 
 /// Focused helper coverage: `materialize_due_child_timeout_deadlines`

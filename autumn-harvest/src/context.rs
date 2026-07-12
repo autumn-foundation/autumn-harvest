@@ -1322,6 +1322,19 @@ pub fn is_reserved_session_activity_name(name: &str) -> bool {
 pub const DEFAULT_SESSION_ACQUISITION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+/// Reserved timer-id prefix for the child-workflow-timeout race (issue #779).
+///
+/// [`WorkflowContext::spawn_child_workflow_timeout`] derives its deadline
+/// timer id as `{CHILD_TIMEOUT_TIMER_PREFIX}{seq}:{workflow_name}` from the
+/// per-context `child_timeout_seq` counter. The worker's
+/// `extract_child_timeout_race` extractor requires this exact prefix so a
+/// hand-rolled `tokio::join!(spawn_child_workflow(..), timer(..))` batch
+/// (one plain child + one ordinary timer) is NOT mistaken for the
+/// child-timeout primitive — it must stay on the generic fail-loud
+/// "unsupported commands" path so its ordinary timer is never silently left
+/// undeleted on a child-win.
+pub(crate) const CHILD_TIMEOUT_TIMER_PREFIX: &str = "__child_timeout:";
+
 /// Saturating `Duration` → milliseconds conversion for error reporting
 /// (a multi-year timeout would otherwise overflow `u64` millis on `as_millis`).
 fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
@@ -5327,7 +5340,7 @@ impl WorkflowContext {
             *seq += 1;
             *seq
         };
-        let timer_id = format!("__child_timeout:{seq}:{workflow_name}");
+        let timer_id = format!("{CHILD_TIMEOUT_TIMER_PREFIX}{seq}:{workflow_name}");
         // Round up so a sub-second timeout still arms a durable timer.
         let duration_secs = timeout
             .as_secs()

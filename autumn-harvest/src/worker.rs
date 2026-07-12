@@ -1352,6 +1352,23 @@ fn extract_child_timeout_race(
                 if timer.is_some() {
                     return None;
                 }
+                // Require the reserved `__child_timeout:` prefix that
+                // `spawn_child_workflow_timeout` stamps on its deadline timer.
+                // Without this, an arbitrary
+                // `tokio::join!(spawn_child_workflow(..), timer("mytimer", n))`
+                // batch (one plain child + one ordinary timer) would be silently
+                // treated as the child-timeout primitive, bypassing the previous
+                // fail-loud "unsupported commands" behavior — and on a child-win
+                // no `spawn_child_workflow_timeout` teardown would run to delete
+                // that ordinary timer row, so the parent could complete with an
+                // unfired `harvest_timers` dependency. Fall through to the generic
+                // path (return None) when the prefix is absent.
+                if !timer_id
+                    .as_str()
+                    .starts_with(crate::context::CHILD_TIMEOUT_TIMER_PREFIX)
+                {
+                    return None;
+                }
                 timer = Some(StartedTimerCommand {
                     timer_id: timer_id.clone(),
                     duration_secs: *duration_secs,
@@ -16182,6 +16199,40 @@ mod tests {
         assert!(
             extract_child_timeout_race(&with_signal_wait).is_none(),
             "a child-timeout batch carrying a WaitForSignal must not match"
+        );
+    }
+
+    #[test]
+    fn extract_child_timeout_race_requires_reserved_timer_prefix() {
+        // (a) A `__child_timeout:`-prefixed timer STILL matches (the real
+        // primitive): child_timeout_batch() uses the reserved prefix.
+        assert!(
+            extract_child_timeout_race(&child_timeout_batch()).is_some(),
+            "the reserved-prefix child-timeout batch must still match"
+        );
+
+        // (b) An ORDINARY timer id (a hand-rolled
+        // `tokio::join!(spawn_child_workflow(..), timer("mytimer", n))` batch)
+        // must be REJECTED — it must fall through to the generic fail-loud
+        // "unsupported commands" path, exactly as before #779, so its ordinary
+        // timer is never silently left undeleted on a child-win.
+        let ordinary = vec![
+            WorkflowCommand::StartChildWorkflow {
+                child_id: ExecutionId::new(),
+                workflow_name: "timeout_child".to_string(),
+                input: serde_json::json!({"id": 1}),
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: TimerId::new("mytimer"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert!(
+            extract_child_timeout_race(&ordinary).is_none(),
+            "a child + ordinary (non-`__child_timeout:`) timer must NOT match the \
+             child-timeout race"
         );
     }
 
