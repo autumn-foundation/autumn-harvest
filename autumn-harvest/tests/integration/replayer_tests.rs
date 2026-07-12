@@ -5081,6 +5081,101 @@ async fn child_timeout_child_fails_before_deadline_replays_deterministically() {
     );
 }
 
+/// A still-running child-timeout workflow: the child started and the deadline
+/// timer is armed, but neither has resolved yet. This is the exact shape of a
+/// live execution parked on `spawn_child_workflow_timeout` — the history ends
+/// at the recorded frontier with the race `InProgress`.
+fn child_in_flight_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+    ]
+}
+
+/// Codex P2 (issue #779): a healthy in-flight child-timeout workflow sampled by
+/// the deploy replay canary reaches the recorded-history frontier with the race
+/// still `InProgress` and then *suspends* — it must report `ReplaySucceeded`,
+/// not a false non-determinism. Mirrors `check_strict_replay_no_match`'s
+/// canary-at-frontier exception, which the `InProgress` arm previously ignored.
+#[tokio::test]
+async fn child_timeout_in_flight_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot(
+            "child_or_deadline",
+            exec_id,
+            child_in_flight_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight child-timeout race at the history frontier must be a \
+         healthy suspend in canary mode, not a false non-determinism:\n{report}"
+    );
+}
+
+/// Regression guard for the fix above: the canary exception must NOT weaken
+/// STRICT (non-canary) replay. `WorkflowReplayer::replay_from_events` runs
+/// strict replay, where an unresolved race at the end of a fixture is still a
+/// fixture problem and must report non-determinism.
+#[tokio::test]
+async fn child_timeout_in_flight_strict_still_reports_nondeterminism() {
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(child_in_flight_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "strict (non-canary) replay of an unresolved race must still be a \
+         non-determinism error — the canary exception must not weaken it:\n{report}"
+    );
+}
+
+/// Mandatory guardrail: the canary-at-frontier exception must ONLY cover a
+/// genuinely-suspending in-flight race. A real code-vs-history divergence (here
+/// the handler passes a different child input than history recorded) resolves
+/// as `Diverged`, never `InProgress`, so it must STILL be reported as
+/// non-determinism even in canary mode.
+#[tokio::test]
+async fn child_timeout_genuine_divergence_still_detected_in_canary() {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    // Recorded child input `{"id": 7}` diverges from the handler's `{"id": 42}`.
+    let divergent = vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 7}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+    ];
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot("child_or_deadline", exec_id, divergent))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a genuine mid-history divergence must still be detected in canary mode \
+         — the frontier exception must not mask it:\n{report}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Push-based signal handlers (issue #546)
 // ---------------------------------------------------------------------------

@@ -5417,15 +5417,29 @@ impl WorkflowContext {
             outcome @ (ChildOrTimerMatch::NoMatch | ChildOrTimerMatch::InProgress { .. }) => {
                 let recorded_child_id = match outcome {
                     ChildOrTimerMatch::InProgress { child_id } => {
-                        if self.strict_replay {
-                            // Strict replay (WorkflowReplayer) always gets complete
-                            // histories — an unresolved race is a fixture problem.
+                        // A running workflow parked on this race replays to
+                        // `InProgress` at the recorded-history frontier. The
+                        // deploy canary samples exactly such executions and
+                        // expects them to *suspend* (ReplaySucceeded), so mirror
+                        // `check_strict_replay_no_match`'s canary-at-end
+                        // exception: fall through to re-park (which suspends)
+                        // rather than reporting a false non-determinism. A
+                        // genuine mid-history divergence never reaches this arm
+                        // (it returns `Diverged`); an unresolved race with events
+                        // still after it (position < len — a fixture bug) stays a
+                        // hard error. Strict `WorkflowReplayer` runs (non-canary)
+                        // always get complete histories, so an unresolved race
+                        // there is still a fixture problem.
+                        let (position, at_frontier) = self.match_history(|m| {
+                            (i32::try_from(m.position()).ok(), m.position() >= m.len())
+                        });
+                        if self.strict_replay && !(self.canary_mode && at_frontier) {
                             return Err(self.nd_error(
                                 format!(
                                     "child-or-timeout race '{workflow_name}' started but \
                                      unresolved in history"
                                 ),
-                                self.match_history(|m| i32::try_from(m.position()).ok()),
+                                position,
                                 Some("ChildOrTimerResolved".to_string()),
                                 Some("ChildOrTimerInProgress".to_string()),
                             ));
