@@ -3977,6 +3977,314 @@
           "description": "Contained workflow-body handler panics per second (issue #782) \u2014 a panic in a `#[workflow]` body caught in the executor and re-dispatched under a bounded panic-retry budget (WorkerConfig::workflow_panic_max_attempts), then failed terminally as a typed `HandlerPanic`. Emitted on every panic entry (each retry and the final terminal failure), so a workflow that panics N times before exhausting its budget emits N samples. A rise indicates a deterministic code bug on the workflow path."
         }
       ]
+    },
+    {
+      "id": 900,
+      "type": "row",
+      "title": "Signal & update lifecycle",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 85
+      },
+      "panels": [
+        {
+          "id": 901,
+          "type": "timeseries",
+          "title": "Signals received",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 86
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, name) (rate(harvest_signal_received_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Signals durably delivered into workflow histories per second (issue #684). Counted at the single live-only delivery choke point; each signal is counted exactly once, never on replay."
+        },
+        {
+          "id": 902,
+          "type": "timeseries",
+          "title": "Unhandled signals",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 86
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, name) (rate(harvest_signal_unhandled_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_signal_unhandled_rate (docs/runbooks/harvest-alerts.md#harvest_signal_unhandled_rate) Delivered signals a workflow left unconsumed when it reached a Completed/Failed terminal outcome (issue #684). Signals excused by a lost signal-or-deadline race (#476) are never counted; cancel/terminate/timeout are out of scope. A sustained rise above baseline means callers may be failing to drive the workflow."
+        },
+        {
+          "id": 903,
+          "type": "timeseries",
+          "title": "Updates admitted",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 94
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, name) (rate(harvest_update_admitted_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Workflow updates durably admitted per second (issue #684). Emitted post-commit at the single admission choke point. No queue label is available at the admission site."
+        },
+        {
+          "id": 904,
+          "type": "timeseries",
+          "title": "Update validator rejections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 94
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, name) (rate(harvest_update_rejected_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_update_rejected_rate (docs/runbooks/harvest-alerts.md#harvest_update_rejected_rate) Workflow updates rejected by their registered validator before admission (a durable pre-admission 422) (issue #684). Scope is validator rejections only. A spike usually means a client is sending malformed/stale update payloads."
+        },
+        {
+          "id": 905,
+          "type": "timeseries",
+          "title": "Updates completed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 102
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, name) (rate(harvest_update_completed_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Admitted workflow updates whose handler completed successfully per second (issue #684). Emitted post-commit, exactly once per completed update."
+        },
+        {
+          "id": 906,
+          "type": "timeseries",
+          "title": "Updates failed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 102
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, name) (rate(harvest_update_failed_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Admitted workflow updates whose handler returned an error per second (issue #684). Emitted post-commit, exactly once per failed update."
+        }
+      ]
     }
   ]
 }

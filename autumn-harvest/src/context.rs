@@ -2083,6 +2083,41 @@ impl WorkflowContext {
         self.match_history(|m| m.has_non_lifecycle_unconsumed())
     }
 
+    /// Emit `harvest.signal.unhandled` for every delivered signal the workflow
+    /// left unconsumed at a terminal outcome (issue #684).
+    ///
+    /// Called by the executor's terminal arms (`drive_workflow`) — the only
+    /// place the driven matcher's authoritative consumed-set exists — **after**
+    /// [`flush_pending_signal_handlers`](Self::flush_pending_signal_handlers)
+    /// so issue #546 push handlers get their final claim first. One counter
+    /// increment is emitted per unconsumed occurrence, labeled by the context's
+    /// workflow name, the signal name, and the queue.
+    ///
+    /// No `is_replaying()` guard: the live worker reaches a terminal outcome
+    /// exactly once per execution (a sealed run is never re-dispatched), and the
+    /// only other `drive_workflow` caller is the test/simulator harness. The
+    /// strict/canary replay paths (`WorkflowReplayer`) go through a different
+    /// executor function and never call this, so a replay of an already-terminal
+    /// history emits nothing — the counter cannot double-count on replay.
+    /// (A `!is_replaying()` guard would in fact be wrong here: an unconsumed
+    /// signal is itself an unconsumed event ahead of the cursor, so
+    /// `is_replaying()` is `true` precisely when there is something to report.)
+    pub(crate) fn report_unhandled_signals(&self) {
+        let by_name = {
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
+            matcher.unconsumed_signals_by_name()
+        };
+        for (signal_name, count) in by_name {
+            for _ in 0..count {
+                self.metrics.record_signal_unhandled(
+                    &self.workflow_name,
+                    &signal_name,
+                    &self.queue_name,
+                );
+            }
+        }
+    }
+
     /// Create a minimal handler context for declarative `#[update]` dispatch.
     ///
     /// Returns an `Arc<Self>` so the context can be captured by value inside
@@ -16979,5 +17014,69 @@ mod tests {
         assert!(obs.counted, "a recorded marker is counted even in a probe");
         assert_eq!(recorder.compensated.lock().unwrap().len(), 0);
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    // ── report_unhandled_signals (issue #684) ─────────────────────────────
+
+    /// Captures `record_signal_unhandled` samples as `(workflow, name, queue)`.
+    #[derive(Default)]
+    struct UnhandledSignalRecorder {
+        samples: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl crate::telemetry::MetricsRecorder for UnhandledSignalRecorder {
+        fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+            self.samples.lock().unwrap().push((
+                workflow_name.to_owned(),
+                signal_name.to_owned(),
+                queue.to_owned(),
+            ));
+        }
+    }
+
+    fn started_then_signal(signal: &str) -> Vec<WorkflowEvent> {
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: signal.into(),
+                payload: Value::Null,
+            },
+        ]
+    }
+
+    #[test]
+    fn report_unhandled_signals_emits_once_with_workflow_name_queue_labels() {
+        let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_then_signal("approve"))
+            .with_workflow_name("notif")
+            .with_queue_name("q")
+            .with_metrics(recorder.clone());
+        ctx.report_unhandled_signals();
+        assert_eq!(
+            recorder.samples.lock().unwrap().as_slice(),
+            &[("notif".to_owned(), "approve".to_owned(), "q".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn report_unhandled_signals_emits_nothing_when_signal_is_consumed() {
+        let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), started_then_signal("go"))
+            .with_workflow_name("notif")
+            .with_queue_name("q")
+            .with_metrics(recorder.clone());
+        // Consume the signal exactly as a workflow body would.
+        let _ = ctx.wait_for_signal("go").await.expect("signal present");
+        ctx.report_unhandled_signals();
+        assert!(
+            recorder.samples.lock().unwrap().is_empty(),
+            "a consumed signal must not be reported as unhandled"
+        );
     }
 }

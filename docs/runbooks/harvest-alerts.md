@@ -1039,3 +1039,118 @@ to the downstream owner when the compensation path's dependency is the thing
 that failed. Escalate to the on-call engineering lead if increments continue
 accruing after the traffic source is paused (indicates unwinds still failing
 mid-flight).
+
+## harvest_update_rejected_rate
+
+**What to do when workflow updates are being rejected by their validators:**
+the `harvest.update.rejected` counter (issue #684) fires once per workflow
+update rejected by its **registered validator** before admission (a durable
+pre-admission `422`). The metric's `workflow` + `name` labels name the
+workflow type and the update. Scope is deliberately validator-only:
+non-`RUNNING`/paused admission-state conflicts are surfaced to the caller as
+errors, not counted here. A rejection is cheap and safe (the update never
+becomes durable history), so this alert is about *callers failing to drive
+the workflow*, not about engine health.
+
+### Triage steps
+
+1. Read the `workflow` and `name` labels to identify the workflow type and
+   the update handler being rejected.
+2. Inspect the registered validator and the caller's payload shape:
+   `GET /api/harvest/workflows/types/{workflow_name}/handlers` lists the
+   workflow's declared update handlers.
+3. Correlate with recent deploys: a client that started sending a new/changed
+   payload, or a workflow whose validator got stricter, is the usual cause.
+4. Capture a sample rejected payload from the caller's logs and run it
+   against the validator locally to confirm the rejection reason.
+
+### Likely causes
+
+- A client/version drift after a deploy: the caller's update payload no longer
+  matches the workflow's validator (renamed/removed field, tightened bound).
+- A buggy or misconfigured caller sending malformed update requests.
+- A retry storm of an already-invalid payload (the caller retries a request
+  the validator will always reject).
+
+### False positives
+
+Expected during a controlled client/workflow migration window where old and
+new payload shapes briefly coexist. A small steady trickle can also be a
+mis-behaving but non-critical caller. Alert on a sustained rise above the
+workflow's own baseline, not an absolute floor — a healthy client should see
+near-zero validator rejections.
+
+### Safe actions
+
+1. Pause or roll back the offending caller (or its recent deploy) if it is
+   sending an invalid payload shape.
+2. Fix the caller's payload to match the validator, or (if the validator is
+   wrong) fix and redeploy the workflow's update handler.
+3. No engine-side remediation is needed: rejected updates append nothing to
+   history and never wedge a workflow.
+
+### Escalation criteria
+
+Ticket the workflow owner with a sample rejected payload and the validator's
+reason. Escalate to the caller's owning team when the source is a client
+deploy. Page only if the rejected update path is on a critical control flow
+(e.g. an operator-driven pause/adjust update) and legitimate operators are
+being blocked.
+
+## harvest_signal_unhandled_rate
+
+**What to do when workflows are leaving signals unconsumed:** the
+`harvest.signal.unhandled` counter (issue #684) fires once per delivered
+signal a workflow left unconsumed (no `wait_for_signal`/`receive_signal`, no
+push handler) by the time it reached a **Completed or Failed** terminal
+outcome. The `workflow` + `name` labels name the workflow type and the
+signal. Coverage is scoped to the graceful-terminal SLO: cancel / terminate /
+execution-timeout / parent-close outcomes have no driven matcher and are
+structurally out of scope. Signals excused by a lost signal-or-deadline race
+(issue #476) are never counted.
+
+### Triage steps
+
+1. Read the `workflow` and `name` labels to identify the workflow type and
+   the signal being dropped.
+2. Confirm whether that workflow is *expected* to consume that signal on every
+   run, or whether the signal is a best-effort/late notification the workflow
+   deliberately ignores.
+3. List recent runs of the workflow type and inspect a completed run's history
+   for the delivered-but-unconsumed `SignalReceived`:
+   `GET /api/harvest/workflows?workflow_name=<name>&state=COMPLETED`, then
+   `GET /api/harvest/workflows/{execution_id}/history`.
+4. Correlate with recent workflow deploys: a removed or renamed
+   `wait_for_signal`/`receive_signal`/`register_signal_handler` call is a
+   common cause.
+
+### Likely causes
+
+- A race between a signal-sending caller and the workflow's own control flow
+  (the signal arrives after the workflow already decided to finish).
+- A workflow deploy that removed or renamed the handler for a signal callers
+  are still sending.
+- A caller sending a signal the workflow never handled (wrong signal name).
+
+### False positives
+
+A small steady rate is often legitimate: late or duplicate signals a workflow
+intentionally ignores (e.g. a second approval after the run already decided).
+Alert on a change from the workflow's own baseline, not an absolute floor.
+
+### Safe actions
+
+1. If the workflow should handle the signal, restore or rename the
+   `wait_for_signal`/`receive_signal`/`register_signal_handler` call and
+   redeploy (in-flight runs replay deterministically; new runs pick it up).
+2. If callers are sending the wrong signal, fix the caller.
+3. No engine-side remediation is needed: an unhandled signal does not fail the
+   run — the metric is purely an observability signal.
+
+### Escalation criteria
+
+Ticket the workflow owner with the signal name and a sample run id. Escalate
+to the caller's owning team when the source is a caller sending an unexpected
+signal. Page only if the dropped signal is on a critical control path (e.g. a
+cancel/approval the run must observe) and business-critical runs are visibly
+diverging.

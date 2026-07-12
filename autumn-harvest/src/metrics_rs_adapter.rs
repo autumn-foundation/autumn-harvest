@@ -62,18 +62,19 @@ use crate::telemetry::{
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_AUTO_PAUSED,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
     METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_SESSION_ACQUISITION, METRIC_SUMMARY_DELETED, METRIC_TASK_QUARANTINED,
-    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
-    METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
-    METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
-    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION,
-    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
-    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
-    WorkflowStatus,
+    METRIC_SESSION_ACQUISITION, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED,
+    METRIC_SUMMARY_DELETED, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
+    METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED, METRIC_WORKER_SLOT_TARGET,
+    METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS,
+    METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -791,6 +792,64 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_signal_received(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+        counter!(
+            METRIC_SIGNAL_RECEIVED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => signal_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+        counter!(
+            METRIC_SIGNAL_UNHANDLED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => signal_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_admitted(&self, workflow_name: &str, update_name: &str) {
+        counter!(
+            METRIC_UPDATE_ADMITTED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_rejected(&self, workflow_name: &str, update_name: &str) {
+        counter!(
+            METRIC_UPDATE_REJECTED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_completed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        counter!(
+            METRIC_UPDATE_COMPLETED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_update_failed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        counter!(
+            METRIC_UPDATE_FAILED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_NAME => update_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_user_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
         let ls: Vec<Label> = labels
             .iter()
@@ -1068,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
     fn bridges_signal_update_lifecycle_counters_with_bounded_labels() {
         // Issue #684: a local `metrics::Recorder` captures the registered
         // counter keys, so a swapped or dropped label value in any of the six
@@ -1160,7 +1220,10 @@ mod tests {
             counters.as_slice(),
             &[
                 (METRIC_SIGNAL_RECEIVED.to_owned(), wf_name_q("approve", "q")),
-                (METRIC_SIGNAL_UNHANDLED.to_owned(), wf_name_q("approve", "q")),
+                (
+                    METRIC_SIGNAL_UNHANDLED.to_owned(),
+                    wf_name_q("approve", "q")
+                ),
                 (METRIC_UPDATE_ADMITTED.to_owned(), wf_name("set_priority")),
                 (METRIC_UPDATE_REJECTED.to_owned(), wf_name("set_priority")),
                 (

@@ -291,6 +291,7 @@ impl MetricsRecorder for RecordingMetrics {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)] // one call + assertion per catalogue metric
 fn all_catalogue_metrics_are_reachable_via_trait() {
     // Wires every record_* call through RecordingMetrics and verifies the
     // expected metric name appears in the sample list — one assertion per

@@ -5520,7 +5520,11 @@ async fn replay_of_terminal_history_never_emits_signal_unhandled() {
     // and the unhandled counter never increments on any replay cycle.
     for cycle in 0..5 {
         let report = replayer
-            .replay_from_snapshot(make_snapshot("signal_wait_workflow", exec_id, events.clone()))
+            .replay_from_snapshot(make_snapshot(
+                "signal_wait_workflow",
+                exec_id,
+                events.clone(),
+            ))
             .await;
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),

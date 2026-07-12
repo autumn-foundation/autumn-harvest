@@ -1887,6 +1887,7 @@ async fn update_during_pause_is_rejected() {
         autumn_harvest::types::UpdateId::new(),
         "set_priority".to_string(),
         serde_json::json!({"p": 1}),
+        None,
     )
     .await
     .expect_err("updates against a paused workflow must be rejected");

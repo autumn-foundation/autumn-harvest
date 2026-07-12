@@ -3489,6 +3489,55 @@ async fn persist_update_result_commands(
     Ok(())
 }
 
+/// Collect `(update_name, completed)` pairs for every `RecordUpdateResult`
+/// command in `pending_cmds`, resolving the update name from the
+/// `UpdateAdmitted` events in `history_events` (issue #684).
+///
+/// Pure (no DB), unit-tested. `completed` is `true` for an `Ok` result
+/// (→ `harvest.update.completed`) and `false` for an `Err` result
+/// (→ `harvest.update.failed`). The pairs are collected **before** the persist
+/// transaction (which moves `pending_cmds`) but emitted only in the worker's
+/// `Persisted` arm, so a persist failure never over-counts. `RecordUpdateResult`
+/// is produced once on live execution (replay short-circuits in
+/// `execute_admitted_update`), so each update result is counted exactly once.
+/// An update whose name cannot be resolved from history (should not happen —
+/// admission always precedes the result) is labeled `"unknown"` rather than
+/// dropped, keeping the label bounded.
+fn collect_update_result_metrics(
+    history_events: &[WorkflowEvent],
+    pending_cmds: &[WorkflowCommand],
+) -> Vec<(String, bool)> {
+    // Fast path: nothing to resolve or emit.
+    if !pending_cmds
+        .iter()
+        .any(|c| matches!(c, WorkflowCommand::RecordUpdateResult { .. }))
+    {
+        return Vec::new();
+    }
+
+    let mut names: std::collections::HashMap<crate::types::UpdateId, &str> =
+        std::collections::HashMap::new();
+    for event in history_events {
+        if let WorkflowEvent::UpdateAdmitted {
+            update_id, name, ..
+        } = event
+        {
+            names.insert(*update_id, name.as_str());
+        }
+    }
+
+    pending_cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordUpdateResult { update_id, result } => {
+                let name = names.get(update_id).copied().unwrap_or("unknown");
+                Some((name.to_owned(), result.is_ok()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Apply `UpsertSearchAttributes` patches from `commands` to `base` in memory.
 ///
 /// Returns the patched value, or the original `base` if no patch commands exist.
@@ -8806,6 +8855,16 @@ async fn process_workflow_task(
             signal.name = signal_name.as_str(),
         )
         .in_scope(|| {});
+        // Issue #684: count each durably-delivered signal. This is the single
+        // live-only delivery choke point (ingest_due_timers_and_signals) and
+        // each signal appears in `signals_delivered` exactly once (marked
+        // consumed in harvest_signals), so the counter fires exactly once per
+        // delivery. Never emitted on replay.
+        telemetry.metrics.record_signal_received(
+            &prepared.execution.workflow_name,
+            signal_name,
+            &task.queue_name,
+        );
     }
 
     // Emit workflow.started exactly once per execution.  Two independent
@@ -9866,6 +9925,12 @@ async fn process_workflow_task(
     let is_terminal_with_commands =
         !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
     let counter_action = schedule_counter_action(&outcome);
+    // Issue #684: collect update.completed/failed metric data now, while
+    // `history_events` and `pending_cmds` are both still in scope (the persist
+    // transaction below moves `pending_cmds` and `task`). Emitted only
+    // post-commit in the `Persisted` arm so a persist failure never over-counts.
+    let update_result_metrics = collect_update_result_metrics(&history_events, &pending_cmds);
+    let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
 
@@ -9964,6 +10029,24 @@ async fn process_workflow_task(
                     Some(registry.telemetry().metrics.as_ref()),
                 )
                 .await;
+            }
+
+            // Issue #684: emit update.completed/update.failed post-commit,
+            // exactly once per update result (data collected pre-persist above).
+            for (update_name, completed) in &update_result_metrics {
+                if *completed {
+                    telemetry.metrics.record_update_completed(
+                        &prepared.execution.workflow_name,
+                        update_name,
+                        &update_metric_queue,
+                    );
+                } else {
+                    telemetry.metrics.record_update_failed(
+                        &prepared.execution.workflow_name,
+                        update_name,
+                        &update_metric_queue,
+                    );
+                }
             }
         }
         Err(error) => {
@@ -15610,6 +15693,69 @@ mod tests {
                 chrono::Duration::seconds(300)
             ),
             None
+        );
+    }
+
+    // ── collect_update_result_metrics (issue #684) ────────────────────────
+
+    fn admitted(update_id: crate::types::UpdateId, name: &str) -> WorkflowEvent {
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: name.to_string(),
+            input: Value::Null,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn collect_update_result_metrics_empty_without_record_update_result() {
+        let id = crate::types::UpdateId::new();
+        let history = vec![admitted(id, "set_priority")];
+        let cmds = vec![WorkflowCommand::RecordMarker {
+            name: "m".into(),
+            details: Value::Null,
+        }];
+        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+    }
+
+    #[test]
+    fn collect_update_result_metrics_resolves_name_and_completed_flag() {
+        let ok_id = crate::types::UpdateId::new();
+        let err_id = crate::types::UpdateId::new();
+        let history = vec![admitted(ok_id, "set_priority"), admitted(err_id, "cancel")];
+        let cmds = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: ok_id,
+                result: Ok(serde_json::json!("done")),
+            },
+            WorkflowCommand::RecordUpdateResult {
+                update_id: err_id,
+                result: Err("nope".into()),
+            },
+        ];
+        let out = collect_update_result_metrics(&history, &cmds);
+        assert_eq!(
+            out,
+            vec![
+                ("set_priority".to_owned(), true),
+                ("cancel".to_owned(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_update_result_metrics_labels_unresolved_name_as_unknown() {
+        // A RecordUpdateResult whose UpdateAdmitted is not in the loaded history
+        // (should not happen in practice) is labeled "unknown", never dropped.
+        let id = crate::types::UpdateId::new();
+        let history: Vec<WorkflowEvent> = vec![];
+        let cmds = vec![WorkflowCommand::RecordUpdateResult {
+            update_id: id,
+            result: Ok(Value::Null),
+        }];
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            vec![("unknown".to_owned(), true)]
         );
     }
 }

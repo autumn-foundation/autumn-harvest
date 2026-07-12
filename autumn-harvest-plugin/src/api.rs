@@ -13741,6 +13741,12 @@ async fn update_with_start_workflow(
         && let Some(validator) = update_info.validator
         && let Err(reason) = (validator)(&update_args)
     {
+        // Issue #684: a durable pre-admission validator rejection.
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_update_rejected(&workflow_name, &request.update_name);
         let ar = NewAuditRecord {
             actor: &actor,
             operation: OP_WORKFLOW_UPDATE_WITH_START,
@@ -26902,6 +26908,12 @@ pub(crate) async fn admit_update(
         && let Some(validator) = update_info.validator
         && let Err(reason) = (validator)(&request.input)
     {
+        // Issue #684: a durable pre-admission validator rejection.
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_update_rejected(&execution.workflow_name, &update_name);
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
@@ -26918,9 +26930,17 @@ pub(crate) async fn admit_update(
     // that also verifies the execution is still RUNNING.  Doing the state check
     // and the insert under the same row-level lock prevents a TOCTOU race where
     // the workflow could complete between a separate state read and the insert.
-    // UpdateRejected is returned if the execution is no longer RUNNING.
-    if let Err(e) =
-        store::admit_update_event(&mut conn, exec_id, update_id, update_name, request.input).await
+    // UpdateRejected is returned if the execution is no longer RUNNING. The
+    // recorder emits harvest.update.admitted post-commit (issue #684).
+    if let Err(e) = store::admit_update_event(
+        &mut conn,
+        exec_id,
+        update_id,
+        update_name,
+        request.input,
+        Some(runtime.registry.telemetry().metrics.as_ref()),
+    )
+    .await
     {
         return map_error(e).into_response();
     }

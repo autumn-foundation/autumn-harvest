@@ -1100,6 +1100,11 @@ async fn drive_workflow(
                 // that registers a handler and then completes without ever
                 // awaiting an activity/timer/signal).
                 ctx.flush_pending_signal_handlers();
+                // Issue #684: emit harvest.signal.unhandled for any delivered
+                // signal the workflow left unconsumed at this Completed/Failed
+                // terminal outcome (after the flush above, so push handlers get
+                // their last claim first). Terminal arms only — never Suspended.
+                ctx.report_unhandled_signals();
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
                 // may have absorbed a replay divergence and recorded it as a
                 // deferred non-determinism error (issue #384). Surface it as a
@@ -1120,6 +1125,9 @@ async fn drive_workflow(
             Ok(Err(error)) => {
                 // See the `Ok(Ok(output))` arm above (issue #546).
                 ctx.flush_pending_signal_handlers();
+                // Issue #684: a failed run with leftover signals is legitimately
+                // "unhandled" — same terminal-arm emission as the completed path.
+                ctx.report_unhandled_signals();
                 let details = ctx.take_nd_details();
                 let outcome = ctx.take_deferred_nd_error().map_or(
                     WorkflowOutcome::Failed {

@@ -644,6 +644,73 @@ pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 /// is never a label -- a session's identity stays span-/log-only here.
 pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 
+/// Counter: a `SignalReceived` event was durably delivered into a workflow's
+/// history and promoted to a live workflow-task wake (issue #684).
+///
+/// Emitted once per delivered signal at the single durable-delivery choke
+/// point (`ingest_due_timers_and_signals`, live worker path only — never on
+/// replay). Labeled by `workflow` (workflow name), `name` (signal name), and
+/// `queue` (task queue). Both `name` and `workflow` are statically declared
+/// per workflow, so cardinality is bounded; `execution.id` is span-only per
+/// ADR-0001 §7 and must never appear here.
+pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
+
+/// Counter: a delivered `SignalReceived` was never consumed at a terminal
+/// outcome (issue #684).
+///
+/// "Never consumed" = no `wait_for_signal`/`receive_signal` and no push handler
+/// claimed it by the time the run reached a **Completed or Failed** terminal
+/// outcome via the worker drive.
+///
+/// Emitted from the executor's terminal arms, where the driven matcher's
+/// authoritative consumed-set exists. Signals excused by a lost
+/// signal-or-deadline race (issue #476) are never counted. Labeled by
+/// `workflow`, `name`, and `queue`.
+///
+/// **Coverage scope (deliberate):** Cancel / Terminate / Execution-timeout /
+/// Parent-close terminal paths have no driven matcher and are structurally
+/// out of scope — a force-killed run's "unhandled signals" is not a
+/// graceful-completion SLO signal. `execution.id` is span-only per
+/// ADR-0001 §7.
+pub const METRIC_SIGNAL_UNHANDLED: &str = "harvest.signal.unhandled";
+
+/// Counter: a workflow update was durably admitted (`UpdateAdmitted` appended)
+/// (issue #684).
+///
+/// Emitted post-commit at the single admission choke point
+/// (`store::admit_update_event`) for the HTTP, Vantage-UI, and update-with-start
+/// paths. Labeled by `workflow` (workflow name) and `name` (update name); no
+/// queue label is available at the admission site. `execution.id` is span-only
+/// per ADR-0001 §7.
+pub const METRIC_UPDATE_ADMITTED: &str = "harvest.update.admitted";
+
+/// Counter: a workflow update was rejected by its registered validator before
+/// admission (a pre-admission `422`) (issue #684).
+///
+/// Emitted at the two durable validator-rejection sites (the `admit_update`
+/// and `update_with_start` HTTP handlers). Scope is deliberately limited to
+/// **validator** rejections — non-`RUNNING`/paused admission-state conflicts
+/// are surfaced as caller errors, not counted here. Labeled by `workflow` and
+/// `name` (update name). `execution.id` is span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_REJECTED: &str = "harvest.update.rejected";
+
+/// Counter: an admitted workflow update ran its handler to success
+/// (`UpdateCompleted` appended) (issue #684).
+///
+/// Emitted post-commit in the worker's `Persisted` arm, exactly once per
+/// completed update (the `RecordUpdateResult` command is produced once on live
+/// execution). Labeled by `workflow`, `name` (update name), and `queue`.
+/// `execution.id` is span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_COMPLETED: &str = "harvest.update.completed";
+
+/// Counter: an admitted workflow update's handler returned an error
+/// (`UpdateFailed` appended) (issue #684).
+///
+/// Emitted post-commit in the worker's `Persisted` arm, exactly once per
+/// failed update. Labeled by `workflow`, `name` (update name), and `queue`.
+/// `execution.id` is span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_FAILED: &str = "harvest.update.failed";
+
 /// Bounded outcome classification for a worker-session acquisition attempt
 /// (issue #606).
 ///
@@ -1937,6 +2004,59 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.saga.compensation_failed{workflow, queue}`.
     fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    // ── Signal & update lifecycle counters (issue #684) ───────────────────
+
+    /// A `SignalReceived` event was durably delivered into a workflow's
+    /// history (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_SIGNAL_RECEIVED`] with labels `workflow`,
+    /// `name` (signal name), and `queue`.
+    fn record_signal_received(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+        let _ = (workflow_name, signal_name, queue);
+    }
+
+    /// A delivered signal was never consumed by the workflow before it reached
+    /// a Completed/Failed terminal outcome (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_SIGNAL_UNHANDLED`] with labels `workflow`,
+    /// `name` (signal name), and `queue`.
+    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+        let _ = (workflow_name, signal_name, queue);
+    }
+
+    /// A workflow update was durably admitted (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_ADMITTED`] with labels `workflow`
+    /// and `name` (update name).
+    fn record_update_admitted(&self, workflow_name: &str, update_name: &str) {
+        let _ = (workflow_name, update_name);
+    }
+
+    /// A workflow update was rejected by its validator before admission
+    /// (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_REJECTED`] with labels `workflow`
+    /// and `name` (update name).
+    fn record_update_rejected(&self, workflow_name: &str, update_name: &str) {
+        let _ = (workflow_name, update_name);
+    }
+
+    /// An admitted workflow update completed successfully (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_COMPLETED`] with labels `workflow`,
+    /// `name` (update name), and `queue`.
+    fn record_update_completed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        let _ = (workflow_name, update_name, queue);
+    }
+
+    /// An admitted workflow update's handler failed (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_FAILED`] with labels `workflow`,
+    /// `name` (update name), and `queue`.
+    fn record_update_failed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        let _ = (workflow_name, update_name, queue);
     }
 
     /// Whether this recorder actually forwards samples anywhere.

@@ -1103,8 +1103,18 @@ impl WorkflowHandle {
     ) -> HarvestResult<Value> {
         self.validate_workflow_type(conn, workflow_name).await?;
         let update_id = crate::types::UpdateId::new();
-        crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
-            .await?;
+        // The in-process client carries no MetricsRecorder, so update.admitted
+        // (issue #684) is not emitted on this path — consistent with the other
+        // engine metrics this client does not wire.
+        crate::store::admit_update_event(
+            conn,
+            self.exec_id,
+            update_id,
+            name.to_string(),
+            input,
+            None,
+        )
+        .await?;
         crate::queue::wake_workflow_task(conn, self.exec_id).await?;
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);

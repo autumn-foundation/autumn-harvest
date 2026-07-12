@@ -1399,6 +1399,50 @@ impl HistoryMatcher {
         !self.pending_external_cancels.is_empty()
     }
 
+    /// End-of-drive count of genuinely-unconsumed `SignalReceived` events,
+    /// keyed by signal name (issue #684).
+    ///
+    /// Mirrors [`Self::has_non_lifecycle_unconsumed`]'s two sources — the
+    /// cursor scan for still-in-history `SignalReceived` events, plus the
+    /// `pending_signals` buffer for signals drained early by a `prepare_match`
+    /// sweep but never consumed by a `wait_for_signal`/push handler — but
+    /// restricted to `SignalReceived` and grouped by name. Signals excused by
+    /// a lost signal-or-deadline race (issue #476, `late_race_signal_events`)
+    /// are excluded, exactly as they are from the boolean check. A signal
+    /// consumed by a wait or claimed by a push handler is in
+    /// `consumed_signal_events` and removed from `pending_signals`, so it never
+    /// appears in either source.
+    ///
+    /// Read-only (`&self`): the caller is expected to have already driven the
+    /// matcher to the terminal frontier.
+    #[must_use]
+    pub fn unconsumed_signals_by_name(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+
+        // Source 1: SignalReceived events still at/after the cursor that were
+        // never consumed and are not excused by a lost race.
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() {
+            if let WorkflowEvent::SignalReceived { signal_name, .. } = &self.events[cursor]
+                && !self.is_consumed(cursor)
+                && !self.late_race_signal_events.contains(&cursor)
+            {
+                *counts.entry(signal_name.clone()).or_insert(0) += 1;
+            }
+            cursor += 1;
+        }
+
+        // Source 2: signals drained early into pending_signals (index < cursor)
+        // that were never consumed, minus the exact lost-race exemptions.
+        for (signal_name, _, idx) in &self.pending_signals {
+            if !self.late_race_signal_events.contains(idx) {
+                *counts.entry(signal_name.clone()).or_insert(0) += 1;
+            }
+        }
+
+        counts
+    }
+
     /// Current cursor position in the event list.
     #[must_use]
     pub const fn position(&self) -> usize {

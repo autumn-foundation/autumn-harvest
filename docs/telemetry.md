@@ -335,6 +335,12 @@ metric is emitted in the source code.
 | `harvest.activity.panic` | Counter | `worker.rs` — activity/local-activity dispatch boundary, once per panicking attempt: a `#[activity]` body panic caught via `catch_unwind` and converted to a retryable typed `HandlerPanic` failure, distinct from ordinary `Err` failures and from process-crash quarantine (issue #782) |
 | `harvest.workflow.panic` | Counter | `worker.rs` — `process_workflow_task`, on every panic entry (each bounded re-dispatch and the final terminal failure): a `#[workflow]` body panic caught in the executor and contained under the panic-retry budget (issue #782) |
 | `harvest.completion_trigger.skipped` | Counter | `completion_trigger.rs` — `evaluate_triggers_for_execution`, on output-guard skips (`condition_unmet` = guard evaluated false, once per fresh skip — a redelivered, already-resolved skip records `deduped` on `harvest.completion_trigger.fires` instead; `condition_invalid` = stored condition unparseable/over-cap, fail-closed with no fires row — the fire is lost for that terminal unless evaluation re-enters, so alert on this reason and re-trigger by hand; see docs/completion-triggers.md "Fail-closed on invalid stored conditions"). Best-effort on the operator cancel/terminate and parent-close-cascade paths (no recorder threaded there); the fires-row `outcome` column is the authoritative skip record (issue #810) |
+| `harvest.signal.received` | Counter | `worker.rs` — `process_workflow_task`, once per durably-delivered `SignalReceived` (the live-only `ingest_due_timers_and_signals` choke point, beside the `harvest.signal.deliver` span). Never on replay (issue #684) |
+| `harvest.signal.unhandled` | Counter | `executor.rs` — `drive_workflow` terminal arms (`Ok(Ok)`/`Ok(Err)`, never Suspended), via `WorkflowContext::report_unhandled_signals` after the push-handler flush. Once per delivered signal left unconsumed at a **Completed/Failed** terminal outcome; lost signal-or-deadline races (#476) excluded; cancel/terminate/timeout out of scope (issue #684) |
+| `harvest.update.admitted` | Counter | `store.rs` — `admit_update_event`, post-commit, once per durably admitted update (HTTP `admit_update`, Vantage UI, and `update_with_start` — the latter emits at its own outer-commit boundary; the in-process typed client wires no recorder) (issue #684) |
+| `harvest.update.rejected` | Counter | `api.rs` (plugin) — the `admit_update` and `update_with_start` handlers, once per update rejected by its registered validator before admission (a durable pre-admission 422). Validator rejections only; non-RUNNING/paused state conflicts are caller errors, not counted (issue #684) |
+| `harvest.update.completed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateCompleted` (name resolved from the `UpdateAdmitted` events in history) (issue #684) |
+| `harvest.update.failed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateFailed` (issue #684) |
 
 ### Label sets
 
@@ -365,6 +371,12 @@ metric is emitted in the source code.
 | `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
 | `harvest.saga.compensated` | `workflow`, `queue` |
 | `harvest.saga.compensation_failed` | `workflow`, `queue` |
+| `harvest.signal.received` | `workflow`, `name` (signal name, bounded), `queue` |
+| `harvest.signal.unhandled` | `workflow`, `name` (signal name, bounded), `queue` |
+| `harvest.update.admitted` | `workflow`, `name` (update name, bounded) |
+| `harvest.update.rejected` | `workflow`, `name` (update name, bounded) |
+| `harvest.update.completed` | `workflow`, `name` (update name, bounded), `queue` |
+| `harvest.update.failed` | `workflow`, `name` (update name, bounded), `queue` |
 | `harvest.completion_trigger.skipped` | `trigger` (trigger UUID — same precedent as `harvest.completion_trigger.fires`), `reason` (`condition_unmet\|condition_invalid`) |
 | `harvest.activity.panic` | `activity`, `queue` |
 | `harvest.workflow.panic` | `workflow`, `queue` |

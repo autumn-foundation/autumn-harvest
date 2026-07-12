@@ -3395,6 +3395,9 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     request: UpdateWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
+    // Capture the update name for the post-commit update.admitted metric
+    // (issue #684) before `request` is moved into the transaction closure.
+    let update_name_for_metric = request.update_name.clone();
     let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
         .transaction::<(
             UpdateWithStartOutcome,
@@ -3628,12 +3631,17 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                 // The admitted update is part of the same outer transaction as the
                 // WorkflowStarted event, so a crash never leaves a half-started
                 // execution with no admitted update.
+                // Pass `None`: this admission is part of the outer transaction,
+                // so update.admitted (issue #684) is emitted post-outer-commit
+                // below (gated on `outcome.update_admitted`) rather than at the
+                // inner savepoint, so a later outer rollback never over-counts.
                 store::admit_update_event(
                     conn,
                     started.exec_id,
                     request.update_id,
                     request.update_name.clone(),
                     request.update_args.clone(),
+                    None,
                 )
                 .await?;
 
@@ -3674,6 +3682,12 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                 &q_name,
                 crate::telemetry::WorkflowStatus::Cancelled,
             );
+        }
+        // Post-outer-commit: emit update.admitted (issue #684) only when an
+        // update was actually admitted (an idempotency dedup short-circuit
+        // reports update_admitted == false and admits nothing).
+        if outcome.update_admitted {
+            m.record_update_admitted(&outcome.workflow_name, &update_name_for_metric);
         }
     }
 
