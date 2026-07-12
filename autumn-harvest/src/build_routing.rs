@@ -807,3 +807,136 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_merge_reachability_empty() {
+        let result = merge_reachability(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_merge_reachability_single_shard_single_build() {
+        let input = vec![vec![BuildReachability {
+            build_id: "build_1".to_string(),
+            open_executions: 1,
+            pending_tasks: 2,
+            active_workers: 3,
+            stale_workers: 4,
+            safe_to_retire: false,
+        }]];
+
+        let result = merge_reachability(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].build_id, "build_1");
+        assert_eq!(result[0].open_executions, 1);
+        assert_eq!(result[0].pending_tasks, 2);
+        assert_eq!(result[0].active_workers, 3);
+        assert_eq!(result[0].stale_workers, 4);
+        assert!(!result[0].safe_to_retire);
+    }
+
+    #[test]
+    fn test_merge_reachability_multiple_shards_summing() {
+        let input = vec![
+            vec![BuildReachability {
+                build_id: "build_1".to_string(),
+                open_executions: 1,
+                pending_tasks: 2,
+                active_workers: 3,
+                stale_workers: 4,
+                safe_to_retire: false,
+            }],
+            vec![BuildReachability {
+                build_id: "build_1".to_string(),
+                open_executions: 10,
+                pending_tasks: 20,
+                active_workers: 30,
+                stale_workers: 40,
+                safe_to_retire: false,
+            }],
+            vec![BuildReachability {
+                build_id: "build_2".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 0,
+                stale_workers: 1,
+                safe_to_retire: false, // will be recomputed to true
+            }],
+        ];
+
+        let result = merge_reachability(input);
+        assert_eq!(result.len(), 2);
+
+        let build1 = result.iter().find(|r| r.build_id == "build_1").unwrap();
+        assert_eq!(build1.open_executions, 11);
+        assert_eq!(build1.pending_tasks, 22);
+        assert_eq!(build1.active_workers, 33);
+        assert_eq!(build1.stale_workers, 44);
+        assert!(!build1.safe_to_retire);
+
+        let build2 = result.iter().find(|r| r.build_id == "build_2").unwrap();
+        assert_eq!(build2.open_executions, 0);
+        assert_eq!(build2.pending_tasks, 0);
+        assert_eq!(build2.active_workers, 0);
+        assert_eq!(build2.stale_workers, 1);
+        assert!(build2.safe_to_retire);
+    }
+
+    #[test]
+    fn test_merge_reachability_safe_to_retire_logic() {
+        struct TestCase {
+            name: &'static str,
+            open: i64,
+            pending: i64,
+            expected_safe: bool,
+        }
+
+        let cases = vec![
+            TestCase {
+                name: "zero open and pending",
+                open: 0,
+                pending: 0,
+                expected_safe: true,
+            },
+            TestCase {
+                name: "open but zero pending",
+                open: 1,
+                pending: 0,
+                expected_safe: false,
+            },
+            TestCase {
+                name: "zero open but pending",
+                open: 0,
+                pending: 1,
+                expected_safe: false,
+            },
+            TestCase {
+                name: "open and pending",
+                open: 1,
+                pending: 1,
+                expected_safe: false,
+            },
+        ];
+
+        for case in cases {
+            let input = vec![vec![BuildReachability {
+                build_id: case.name.to_string(),
+                open_executions: case.open,
+                pending_tasks: case.pending,
+                active_workers: 0,
+                stale_workers: 0,
+                safe_to_retire: false,
+            }]];
+
+            let result = merge_reachability(input);
+            assert_eq!(
+                result[0].safe_to_retire, case.expected_safe,
+                "Failed on case: {}",
+                case.name
+            );
+        }
+    }
+}
