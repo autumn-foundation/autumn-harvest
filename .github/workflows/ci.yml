@@ -139,12 +139,6 @@ jobs:
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
-      - name: Run testing-feature integration tests (replayer)
-        if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --no-default-features --features testing --test integration
-      - name: Run metrics-rs adapter integration tests (issue #754)
-        if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --no-default-features --features testing,metrics-rs --test integration -- metrics_rs_adapter
       - name: Run classic (non-unified) DAG tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features db --lib
@@ -154,31 +148,15 @@ jobs:
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib
-      - name: Run db-gated property suites (build_routing, dlq)
-        # The pure property suites run under the no-db line above; the db-gated
-        # submodules (build_routing_props, dlq_props) target pure functions in
-        # #[cfg(feature = "db")] modules and are otherwise only compiled — never
-        # executed — by the --no-run / --lib db steps. They need no live Postgres.
-        if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --features db --test property
       - name: Free disk space
         if: needs.changes.outputs.code == 'true'
         run: cargo clean
       - name: Run plugin lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --lib
-      - name: Run plugin contract regression tests
-        if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test contract_regression
-      - name: Run plugin effective-config HTTP tests (issue #695)
-        if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test effective_config_http_tests
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
-      - name: Compile plugin MCP integration tests
-        if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --test mcp_tools_integration --no-run
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
@@ -200,105 +178,32 @@ jobs:
       - name: Run activity_interceptor example tests (issue #680)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_interceptor
-      - name: Compile plugin integration tests
+      # ── Manifest-driven integration suites ──────────────────────────────
+      # The per-suite `cargo test` steps that used to live here are now data in
+      # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
+      # Adding a suite is one sorted manifest line — no edit to this file. See
+      # `autumn-harvest/tests/integration/ci_run_coverage.rs` for the coverage
+      # guard that keeps the manifest honest. Per-step `if:` gating is preserved
+      # exactly (NOT hoisted to a job-level `if:` — see the note on the `test`
+      # job above); `shell: bash` resolves to Git Bash on Windows.
+      - name: Compile plugin integration test suites (manifest, all OSes)
         if: needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test status_summary_integration --test status_summary_localpg --test query_integration --test timeline_integration --test dag_run_graph_integration --test start_idempotency_integration --test eligibility_tests --test legal_hold_integration --test workflow_summaries_integration --test run_chain_integration --test build_ramp_integration --no-run
-      - name: Run Docker-backed integration tests
+        shell: bash
+        run: bash .github/ci/run-suites.sh compile
+      - name: Run all-OS manifest suites (no live DB)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: bash .github/ci/run-suites.sh run allos
+      - name: Run Linux Docker-backed manifest suites (serial)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- integration_e2e --test-threads=1
-      - name: Run Docker-backed force-fail integration tests (issue #765)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- force_fail --test-threads=1
+        shell: bash
+        run: bash .github/ci/run-suites.sh run linux
+      # Issue #684's signal/update-metric run targets SPECIFIC test paths across
+      # two modules (a multi-token `--` filter), which the single-`filter`-column
+      # manifest schema cannot represent; it stays a literal Docker-backed step.
       - name: Run Docker-backed signal/update metric integration tests (issue #684)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
-      - name: Run Docker-backed panic containment integration tests (issue #782)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- panic_containment_tests --test-threads=1
-      - name: Run Docker-backed activity interceptor integration tests (issue #680)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- activity_interceptor_tests --test-threads=1
-      - name: Run Docker-backed cross-workflow signal integration tests (issue #678)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- cross_workflow_signal_tests --test-threads=1
-      - name: Run retention override integration tests (issue #737)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- retention_overrides_tests --test-threads=1
-      - name: Run retention summary integration tests (issue #752)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- retention_summary_tests --test-threads=1
-      - name: Run Docker-backed typed workflow failure integration tests (issue #767)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests --test-threads=1
-      - name: Run Docker-backed workflow-level retry integration tests (issue #523 / #767)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests --test-threads=1
-      - name: Run Docker-backed completion-callback integration tests (issue #605)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- completion_callback_tests --test-threads=1
-      - name: Run Docker-backed event-batch integration tests (issue #921)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- event_batch_tests --test-threads=1
-      - name: Run plugin API and scheduler integration tests
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
-      - name: Run plugin read-path decode integration tests (issue #608)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test read_path_decode_integration -- --test-threads=1
-      - name: Run plugin UI integration tests
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test ui_integration -- --test-threads=1
-      - name: Run plugin completion trigger integration tests (issue #810)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test completion_triggers_integration -- --test-threads=1
-      - name: Run plugin fail-now integration tests (issue #765)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test fail_now_integration -- --test-threads=1
-      - name: Run plugin legal-hold integration tests (issue #747)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test legal_hold_integration -- --test-threads=1
-      - name: Run plugin summary-retention integration tests (issue #752)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test workflow_summaries_integration -- --test-threads=1
-      - name: Run plugin DAG run graph integration tests (issue #690)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test dag_run_graph_integration -- --test-threads=1
-      - name: Run core schedule run-history integration tests (issue #762)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- schedule_runs_tests --test-threads=1
-      - name: Run plugin schedule run-history integration tests (issue #762)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test schedule_runs_integration -- --test-threads=1
-      - name: Run core start-idempotency integration tests (issue #808)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- start_idempotency_tests --test-threads=1
-      - name: Run plugin start-idempotency integration tests (issue #808)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test start_idempotency_integration -- --test-threads=1
-      - name: Run plugin status-summary integration tests (issue #679)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test status_summary_integration -- --test-threads=1
-      - name: Run plugin timeline integration tests (issue #739)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test timeline_integration -- --test-threads=1
-      - name: Run plugin run-chain integration tests (issue #701)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test run_chain_integration -- --test-threads=1
-      - name: Run plugin terminal-query integration tests (issue #612)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test query_integration -- --test-threads=1
-      - name: Run plugin eligibility explainer integration tests (issue #611)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test eligibility_tests -- --test-threads=1
-      - name: Run Docker-backed non-determinism block integration tests (issue #603)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --features testing --test integration -- nd_block --test-threads=1
-      - name: Run Docker-backed worker session integration tests (issue #606)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --features testing --test integration -- worker_session_tests --test-threads=1
-      - name: Run plugin build-ramp integration tests (issue #604)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --test build_ramp_integration -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds
