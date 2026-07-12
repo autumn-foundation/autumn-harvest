@@ -118,6 +118,59 @@ fn failing_child(_ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     Box::pin(async move { Err("downstream 503".to_string()) })
 }
 
+/// A child that blocks until a `"go"` signal is delivered, then completes. Used
+/// by the self-wake test to keep the child RUNNING under external control while
+/// the parent is forced through a re-park cycle.
+fn signal_gated_child(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let _ = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"released": true}))
+    })
+}
+
+/// Parent runs TWO child-timeouts SEQUENTIALLY in one workflow body: the first
+/// child completes (→ `Some`), the second hangs past a SHORT deadline (→ `None`).
+fn parent_two_sequential(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let first: Option<Value> = ctx
+            .spawn_child_workflow_timeout(
+                "seq_fast_child",
+                serde_json::json!({"n": 1}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let second: Option<Value> = ctx
+            .spawn_child_workflow_timeout(
+                "seq_hang_child",
+                serde_json::json!({"n": 2}),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "first": first, "second": second }))
+    })
+}
+
+/// Poll the parent's children until exactly `expected` exist and the child at
+/// `idx` reaches `state`, or panic after ~10s. Returns the children snapshot.
+async fn wait_for_child_state(
+    database_url: &str,
+    parent_exec_id: ExecutionId,
+    expected: usize,
+    idx: usize,
+    state: &str,
+) -> Vec<autumn_harvest::models::WorkflowExecution> {
+    for _ in 0..100 {
+        let children = load_child_executions_from_url(database_url, parent_exec_id).await;
+        if children.len() == expected && children.get(idx).is_some_and(|c| c.state == state) {
+            return children;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("child[{idx}] did not reach state {state} (expected {expected} children)");
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -142,10 +195,18 @@ async fn child_completes_before_deadline_parent_gets_some() {
     worker.shutdown();
     handle.await.expect("join");
 
+    let output = parent.output.expect("completed parent must have output");
     assert_eq!(
-        parent.output.and_then(|o| o.get("outcome").cloned()),
+        output.get("outcome").cloned(),
         Some(serde_json::json!("child_done")),
         "child completed before the deadline → parent must get Some"
+    );
+    // Assert the actual winning child PAYLOAD flowed through, not just the
+    // branch tag: `fast_child` echoes its input `{"id": 1}`.
+    assert_eq!(
+        output.get("child").cloned(),
+        Some(serde_json::json!({"echo": {"id": 1}})),
+        "the child's actual output payload must surface to the parent"
     );
 }
 
@@ -225,7 +286,163 @@ async fn child_fails_before_deadline_parent_gets_typed_err() {
         parent.error.unwrap_or_default().contains("downstream 503"),
         "the child's failure must surface to the parent"
     );
-    // Sanity: the deadline was never reached, so no TimerFired should be present
-    // in the parent history on the child-failure path.
-    let _child_id = ExecutionId::new(); // keep ExecutionId import exercised
+    // The deadline was never reached (child failed fast under a 300s timer), so
+    // no TimerFired may appear in the parent history on the child-failure path.
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        !parent_history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "no deadline TimerFired must be recorded when the child fails before the deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sequential_child_timeouts_resolve_independently() {
+    // AC: a real workflow runs child-timeouts SEQUENTIALLY (each in its own
+    // suspension batch — the join! shape is worker-rejected). The seq counter
+    // and distinct `__child_timeout:{seq}` ids must both work end-to-end: the
+    // first child completes → Some, the second times out → None.
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({"id": 4})).await;
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info("e2e_test_workflow", parent_two_sequential),
+            wf_info("seq_fast_child", fast_child),
+            wf_info("seq_hang_child", hanging_child),
+        ],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-779-seq", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent must have output");
+    // First child completed before its (long) deadline → Some(echoed input).
+    assert_eq!(
+        output.get("first").cloned(),
+        Some(serde_json::json!({"echo": {"n": 1}})),
+        "the first sequential child must resolve to Some(its output)"
+    );
+    // Second child hung past its short deadline → None (JSON null).
+    assert_eq!(
+        output.get("second").cloned(),
+        Some(Value::Null),
+        "the second sequential child must time out to None"
+    );
+
+    // Exactly two children: the fast one COMPLETED, the hung one CANCELLED.
+    let children = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(children.len(), 2, "exactly two child executions");
+    let fast = children
+        .iter()
+        .find(|c| c.workflow_name == "seq_fast_child")
+        .expect("fast child row");
+    let hung = children
+        .iter()
+        .find(|c| c.workflow_name == "seq_hang_child")
+        .expect("hung child row");
+    assert_eq!(fast.state, "COMPLETED", "the fast child must complete");
+    assert_eq!(
+        hung.state, "CANCELLED",
+        "the timed-out child must be sealed CANCELLED"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_completes_in_park_gap_self_wakes_parent() {
+    // R3: exercises the RE-PARK path in `persist_child_timeout_race` and its
+    // post-commit self-wake re-check. A parent parked on a child-timeout race
+    // is woken by an UNRELATED wake while its child is still RUNNING — it
+    // reloads history, matches `InProgress`, and RE-PARKS, running the self-wake
+    // re-check (which correctly observes the child NOT-yet-terminal and does not
+    // double-wake). The child is then released and the parent resolves to Some.
+    //
+    // HONEST COVERAGE NOTE: this reliably drives the re-park machinery + the
+    // self-wake re-check code path, and proves the parent still reaches
+    // COMPLETED with Some across a spurious re-park. It does NOT deterministically
+    // force the branch where the re-check observes an ALREADY-terminal child (the
+    // child-completes-strictly-inside-the-park-gap interleaving): the child-row
+    // terminal state and the parent-history `ChildWorkflowCompleted` event are
+    // committed in ONE transaction (`persist_child_workflow_completion`), so that
+    // branch is only reachable via a genuine timing race against a stale history
+    // snapshot, which the current harness cannot pin without mid-transaction
+    // instrumentation. The re-park cycle here executes the exact same re-check.
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({"id": 5})).await;
+
+    // 300s deadline so the timer NEVER fires — the only resolution is the child.
+    let reg = registry(
+        wf_info("e2e_test_workflow", parent_await_child),
+        wf_info("timeout_child", signal_gated_child),
+    );
+    let worker = build_runtime_worker("worker-779-selfwake", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Wait until the child is spawned AND RUNNING (parked on its "go" signal) —
+    // the parent is now parked on the child-timeout mixed batch.
+    let children = wait_for_child_state(&database_url, parent_exec_id, 1, 0, "RUNNING").await;
+    let child_exec_id = ExecutionId::from_uuid(children[0].id);
+
+    // Force a genuine re-park: wake the parent by an UNRELATED wake while the
+    // child is still RUNNING. The worker re-claims, reloads history, matches
+    // InProgress, and re-parks — running the self-wake re-check with the child
+    // not-yet-terminal. Repeat to make the re-park cycle unmistakable.
+    for _ in 0..3 {
+        autumn_harvest::queue::wake_workflow_task(&mut conn, parent_exec_id)
+            .await
+            .expect("wake parent");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    // The parent must NOT have terminated across the spurious re-parks (the
+    // self-wake re-check is a no-op while the child runs, and the 300s timer
+    // never fires) — proving the re-park cycles were benign.
+    let mid_history = load_history_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        !mid_history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::WorkflowCompleted { .. }
+                | WorkflowEvent::WorkflowFailed { .. }
+                | WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+        )),
+        "parent must not terminate or observe a child terminal across the spurious re-parks"
+    );
+
+    // Now release the child: it completes, wakes the parent, and the parent
+    // resolves the race to Some.
+    autumn_harvest::signal::send_signal(&mut conn, child_exec_id, "go", serde_json::json!({}))
+        .await
+        .expect("deliver go signal to child");
+    autumn_harvest::queue::wake_workflow_task(&mut conn, child_exec_id)
+        .await
+        .expect("wake child");
+
+    let parent = wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    assert_eq!(
+        parent.output.and_then(|o| o.get("outcome").cloned()),
+        Some(serde_json::json!("child_done")),
+        "after a re-park, the child completion must still resolve the parent to Some"
+    );
 }

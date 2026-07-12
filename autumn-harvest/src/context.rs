@@ -5298,8 +5298,9 @@ impl WorkflowContext {
     ///
     /// Returns [`HarvestError::WorkflowFailed`] if the child fails before the
     /// deadline, [`HarvestError::PayloadTooLarge`] if the child input exceeds
-    /// the configured cap, or [`HarvestError::NonDeterministic`] on replay
-    /// divergence.
+    /// the configured cap, [`HarvestError::NonDeterministic`] on replay
+    /// divergence, or [`HarvestError::Cancelled`] if both the child and timer
+    /// result channels are dropped (mirrors `wait_for_signal_timeout`).
     ///
     /// # Panics
     ///
@@ -5337,6 +5338,11 @@ impl WorkflowContext {
         });
 
         match history_match {
+            // Child wins. The deadline timer is intentionally left armed (no
+            // TimerCancelled command) — exact parity with `wait_for_signal_timeout`:
+            // the stray `TimerFired` from the still-armed durable timer is a
+            // deliberate parity decision, consumed on replay by
+            // `settle_race_child_won` so it never trips a divergence.
             ChildOrTimerMatch::ChildCompleted { output } => Ok(Some(output)),
             ChildOrTimerMatch::ChildFailed {
                 error,
@@ -14648,10 +14654,20 @@ mod tests {
         }
     }
 
-    /// Two concurrent child-timeouts draw distinct `__child_timeout:{seq}` ids
-    /// from the per-context counter.
+    /// Two `spawn_child_workflow_timeout` calls draw distinct
+    /// `__child_timeout:{seq}` ids from the per-context counter (SEQUENTIAL seq
+    /// allocation — the counter increments once per call under its own lock).
+    ///
+    /// NOTE: this asserts only the seq-counter/timer-id distinctness at the
+    /// context layer; it does NOT prove two child-timeouts run *concurrently*.
+    /// The `tokio::join!` here produces a single 2-child + 2-timer suspension
+    /// batch, which the worker's `extract_child_timeout_race` deliberately
+    /// REJECTS (see `extract_child_timeout_race_rejects_second_timer_or_signal_wait`
+    /// in worker.rs) — a real workflow must run child-timeouts SEQUENTIALLY,
+    /// each in its own suspension batch (covered end-to-end by the DB e2e
+    /// `two_sequential_child_timeouts_resolve_independently`).
     #[tokio::test]
-    async fn child_timeout_two_concurrent_races_use_distinct_timer_ids() {
+    async fn child_timeout_seq_counter_allocates_distinct_ids_per_call() {
         let ctx = Arc::new(WorkflowContext::new_test());
         let ctx_task = Arc::clone(&ctx);
         let join = tokio::spawn(async move {
@@ -14735,6 +14751,87 @@ mod tests {
             .await
             .expect("typed replay resolves");
         assert_eq!(result, Some(Report { processed: true }));
+    }
+
+    /// A fresh child-timeout whose serialized input exceeds the workflow-input
+    /// cap fails with a typed `PayloadTooLarge { ChildWorkflowInput }` BEFORE
+    /// any command is pushed — mirroring `spawn_child_workflow_raw`'s cap so an
+    /// oversized child input can never wedge the parent (R12).
+    #[tokio::test]
+    async fn child_timeout_oversized_input_rejected() {
+        let ctx = WorkflowContext::new_test().with_payload_caps(
+            1024 * 1024,
+            2 * 1024 * 1024,
+            256 * 1024,
+            2 * 1024 * 1024,
+        );
+        let oversized = serde_json::json!({ "data": "x".repeat(2 * 1024 * 1024) });
+
+        let err = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect_err("oversized child input must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestError::PayloadTooLarge {
+                    kind: PayloadKind::ChildWorkflowInput,
+                    ..
+                }
+            ),
+            "expected PayloadTooLarge {{ ChildWorkflowInput }}, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a cap failure must push NO command (no StartChildWorkflow / StartTimer)"
+        );
+    }
+
+    /// A `Duration::ZERO` timeout arms a 0-second durable timer — exact parity
+    /// with `wait_for_signal_timeout`, which uses the identical
+    /// `as_secs() + (subsec_nanos() > 0)` rounding (no implicit floor). The
+    /// timer is still emitted so the deadline branch can fire on the next poll.
+    #[tokio::test]
+    async fn child_timeout_zero_duration_still_arms_timer() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_task = Arc::clone(&ctx);
+        let join = tokio::spawn(async move {
+            ctx_task
+                .spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"id": 1}),
+                    std::time::Duration::ZERO,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let commands = ctx.drain_commands();
+        let duration_secs = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartTimer { duration_secs, .. } => Some(*duration_secs),
+                _ => None,
+            })
+            .expect("a StartTimer must still be armed for a zero-duration deadline");
+        assert_eq!(
+            duration_secs, 0,
+            "Duration::ZERO must arm a 0s timer, matching wait_for_signal_timeout"
+        );
+
+        let child_tx = commands
+            .into_iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { result_tx, .. } => Some(result_tx),
+                _ => None,
+            })
+            .expect("child channel");
+        child_tx.send(Ok(serde_json::json!(null))).ok();
+        let _ = join.await;
     }
 
     // ── upsert_search_attrs tests ─────────────────────────────────────

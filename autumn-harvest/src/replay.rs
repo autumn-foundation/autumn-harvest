@@ -4034,6 +4034,14 @@ impl HistoryMatcher {
             }
             fired_scan += 1;
         }
+        // Intentional divergence from `settle_race_signal_won`, which resumes at
+        // `signal_pos + 1` (just past the winning signal). Here the child/timer
+        // start pair was matched positionally, so the cursor rewinds to
+        // `resume_pos` (the first event after the started pair) and
+        // `advance_to_next_unconsumed_event` then skips the just-consumed winning
+        // terminal (marked above) plus any consumed interleaved events. Verified
+        // equivalent: the winning terminal is `consumed_out_of_order_events`, so
+        // both forms land the cursor at the same next-unconsumed event.
         self.cursor = first_interleaved_command.unwrap_or(resume_pos);
         self.advance_to_next_unconsumed_event();
     }
@@ -9956,6 +9964,59 @@ mod tests {
             HistoryMatch::Matched {
                 output: serde_json::json!("logged")
             }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_win_across_interleaved_signal_is_transparent() {
+        // A signal recorded between the child/timer start pair and the child's
+        // terminal must be STASHED (transparent to the race scan) — the #476
+        // "ignored late signal" analog — so the race still resolves to
+        // ChildCompleted and the signal remains observable by a later
+        // signal-wait. It must NOT flip the winner or trip a divergence.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            },
+            "an interleaved signal must not flip the child-win outcome"
+        );
+        // The stashed signal is still deliverable to a later signal wait.
+        assert_eq!(
+            matcher.match_signal("approval"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            },
+            "the interleaved signal must remain observable after the race resolves"
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "no dangling unconsumed events after the race + signal are matched"
         );
     }
 

@@ -5406,6 +5406,12 @@ async fn persist_child_timeout_race(
                 // reschedule_task defers the row to fires_at (the timer fire). The
                 // sentinel makes a child-terminal wake re-pend it early via the
                 // second arm of primary_repend_workflow_task_query.
+                //
+                // NOTE: a child-timeout parked row deliberately reuses the
+                // `mixed_signal_suspension` sentinel even though it has NO
+                // WaitForSignal command — a future signal-wait edit keyed on this
+                // exact literal must keep re-pending child-timeout rows too, or a
+                // child-terminal wake would silently fail to pull this row forward.
                 queue::reschedule_task(conn, task_id, fires_at).await?;
                 diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                     .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
@@ -16044,6 +16050,35 @@ mod tests {
         assert!(
             extract_child_timeout_race(&with_second_child).is_none(),
             "a batch with a second child must not match the child-timeout race"
+        );
+    }
+
+    #[test]
+    fn extract_child_timeout_race_rejects_second_timer_or_signal_wait() {
+        // A second StartTimer means this is not the canonical one-child /
+        // one-timer race — fall through to fail-loud rather than silently
+        // dropping the extra timer's event.
+        let mut with_second_timer = child_timeout_batch();
+        with_second_timer.push(WorkflowCommand::StartTimer {
+            timer_id: TimerId::new("__child_timeout:2:timeout_child"),
+            duration_secs: 60,
+            result_tx: oneshot::channel::<()>().0,
+        });
+        assert!(
+            extract_child_timeout_race(&with_second_timer).is_none(),
+            "a batch with a second timer must not match the child-timeout race"
+        );
+
+        // A WaitForSignal riding the batch is the signal-or-deadline shape
+        // (issue #476), not a child-timeout race — it must not match here.
+        let mut with_signal_wait = child_timeout_batch();
+        with_signal_wait.push(WorkflowCommand::WaitForSignal {
+            signal_name: "approval".to_string(),
+            result_tx: oneshot::channel::<serde_json::Value>().0,
+        });
+        assert!(
+            extract_child_timeout_race(&with_signal_wait).is_none(),
+            "a child-timeout batch carrying a WaitForSignal must not match"
         );
     }
 
