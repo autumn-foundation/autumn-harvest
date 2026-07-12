@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use autumn_harvest::context::{SessionOptions, WorkflowContext};
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure, decode_workflow_failure};
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
@@ -5173,6 +5174,147 @@ async fn child_timeout_genuine_divergence_still_detected_in_canary() {
         matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "a genuine mid-history divergence must still be detected in canary mode \
          — the frontier exception must not mask it:\n{report}"
+    );
+}
+
+/// A child-timeout whose serialized input exceeds the workflow-input cap on a
+/// FRESH dispatch, PROPAGATING the resulting `PayloadTooLarge` via `?`. The
+/// live over-cap run records no child/timer events — the child was never
+/// dispatched — so the terminal history is just `WorkflowFailed`.
+fn child_timeout_oversized_propagate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // >2 MiB (DEFAULT_MAX_WORKFLOW_INPUT_BYTES) — exceeds the replay cap.
+        let oversized = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+/// Same fresh over-cap child-timeout, but CATCHES the `PayloadTooLarge` and
+/// degrades gracefully, then completes. The live run records no child/timer
+/// events, so the terminal history is `WorkflowCompleted` — on replay the
+/// cursor sits on that event, NOT a recorded child start.
+fn child_timeout_oversized_catch_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let oversized = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        let outcome = match ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+        {
+            Ok(o) => o,
+            // Degrade gracefully on an oversized sub-orchestration input; any
+            // OTHER error (e.g. a genuine non-determinism) still propagates, so
+            // a spurious `Diverged` from mis-ordering the cap check would NOT be
+            // swallowed and this workflow would fail instead of completing.
+            Err(HarvestError::PayloadTooLarge { .. }) => {
+                return Ok(serde_json::json!({"skipped_oversized": true}));
+            }
+            Err(other) => return Err(other.to_string()),
+        };
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+/// Codex P2 (issue #779): a fresh child-timeout over-cap input records NO
+/// child/timer events, so on replay the cursor sits on the next real event
+/// (here a caught-and-continued `WorkflowCompleted`). The payload-cap pre-check
+/// must run BEFORE `match_child_or_timer`, so replay reproduces the same
+/// `PayloadTooLarge` (which the workflow catches and continues) instead of
+/// diverging against the non-child event at the cursor. Before the fix this
+/// history replayed as a non-determinism / `WorkflowFailed`.
+#[tokio::test]
+async fn child_timeout_oversized_input_caught_replays_succeeded() {
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"skipped_oversized": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_timeout_oversized_catch_workflow)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a caught cap-failure child-timeout history must replay cleanly — the \
+         cap pre-check must reproduce PayloadTooLarge before the matcher \
+         diverges on the WorkflowCompleted at the cursor:\n{report}"
+    );
+}
+
+/// Companion to the catch case: a fresh over-cap child-timeout that PROPAGATES
+/// the `PayloadTooLarge` records only a terminal `WorkflowFailed`. On replay the
+/// cursor sits on that `WorkflowFailed`; the cap pre-check must reproduce the
+/// same `PayloadTooLarge` deterministically rather than a spurious
+/// non-determinism. Mirrors
+/// `child_timeout_child_fails_before_deadline_replays_deterministically`.
+#[tokio::test]
+async fn child_timeout_oversized_input_propagated_replays_deterministically() {
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::WorkflowFailed {
+            error: "child workflow input payload too large".to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
+
+    let mut reproduced = Vec::new();
+    for _ in 0..2 {
+        let report = WorkflowReplayer::new()
+            .register_fn(
+                "child_or_deadline",
+                child_timeout_oversized_propagate_workflow,
+            )
+            .replay_from_events(events.clone())
+            .await;
+        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
+            panic!(
+                "a propagated cap failure must surface as WorkflowFailed, not a \
+                 spurious non-determinism:\n{report}"
+            );
+        };
+        assert!(
+            error.contains("too large") || error.to_lowercase().contains("payload"),
+            "the reproduced error must be the PayloadTooLarge, not a \
+             non-determinism message: {error}"
+        );
+        assert!(
+            !error.to_lowercase().contains("non-deterministic")
+                && !error.contains("mismatch")
+                && !error.contains("ChildWorkflowStarted"),
+            "the cap failure must NOT be masked by a history-matcher divergence: \
+             {error}"
+        );
+        reproduced.push(error);
+    }
+    assert_eq!(
+        reproduced[0], reproduced[1],
+        "the cap failure must reproduce byte-identically across replay cycles"
     );
 }
 

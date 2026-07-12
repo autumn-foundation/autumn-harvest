@@ -5346,6 +5346,38 @@ impl WorkflowContext {
             .as_secs()
             .saturating_add(u64::from(timeout.subsec_nanos() > 0));
 
+        // Enforce the child-workflow input payload cap on a FRESH dispatch
+        // BEFORE the history matcher runs (Codex P2, issue #779). On a live
+        // over-cap call the child is never dispatched, so no child/timer events
+        // are recorded; on replay of that history `match_child_or_timer` would
+        // otherwise find the next real event (`WorkflowFailed`, or a
+        // caught-and-continued activity) at the cursor and report a spurious
+        // non-determinism instead of reproducing the same `PayloadTooLarge`.
+        // Running the pure input-size check first makes a cap-failure history
+        // replay deterministically. Gated to a fresh dispatch via a read-only
+        // peek (mirroring the fan-out's `peek_fan_out_count`) so an
+        // already-recorded child — under-cap at record time — is never
+        // re-judged against a possibly-changed cap; for every under-cap input
+        // this is byte-identical to the prior behavior (the cap check is a
+        // no-op and the matcher proceeds exactly as before). Scope: the cap
+        // decision depends on the live `payload_max_workflow_input`, so
+        // replay-consistency holds when the cap is stable (the normal case) —
+        // this does not claim replay-safety across a cap change (see the
+        // fan-out `validate_child_payload_caps` note).
+        let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor());
+        if fresh_dispatch {
+            let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+            if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
+                return Err(HarvestError::PayloadTooLarge {
+                    kind: PayloadKind::ChildWorkflowInput,
+                    observed_bytes: observed,
+                    cap_bytes: self.payload_max_workflow_input,
+                    workflow_type: self.workflow_name.clone(),
+                    activity_name: None,
+                });
+            }
+        }
+
         let history_match = self.match_history(|m| {
             m.match_child_or_timer(workflow_name, &input, &timer_id, Some(duration_secs))
         });
@@ -5467,22 +5499,11 @@ impl WorkflowContext {
                     }
                 };
 
-                // Enforce the child-workflow input payload cap before scheduling
-                // a fresh child (a re-park reuses the already-recorded input).
-                if recorded_child_id.is_none() {
-                    let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                    if self.payload_max_workflow_input > 0
-                        && observed > self.payload_max_workflow_input
-                    {
-                        return Err(HarvestError::PayloadTooLarge {
-                            kind: PayloadKind::ChildWorkflowInput,
-                            observed_bytes: observed,
-                            cap_bytes: self.payload_max_workflow_input,
-                            workflow_type: self.workflow_name.clone(),
-                            activity_name: None,
-                        });
-                    }
-                }
+                // The child-workflow input payload cap was already enforced at
+                // the top of this method (gated to a fresh dispatch via the
+                // read-only `peek_child_start_at_cursor`), so a NoMatch here has
+                // already passed it and a re-park (InProgress) reuses the
+                // already-recorded input — no cap re-check is needed here.
 
                 // First live run (NoMatch) or re-park after a spurious wake
                 // (InProgress): spawn the child and arm the deadline timer in a

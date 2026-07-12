@@ -4070,6 +4070,57 @@ impl HistoryMatcher {
         false
     }
 
+    /// Read-only peek: does a recorded `ChildWorkflowStarted` already sit at the
+    /// cursor a [`Self::match_child_or_timer`] call would land on (issue #779)?
+    ///
+    /// Used by [`crate::context::WorkflowContext::spawn_child_workflow_timeout`]
+    /// to decide, *before* calling `match_child_or_timer`, whether this call is a
+    /// **fresh dispatch** (no recorded child-timeout start yet) so the
+    /// payload-cap pre-check can run first — mirroring the fan-out's
+    /// [`peek_fan_out_count`](crate::context::WorkflowContext) marker peek. On a
+    /// live over-cap call the child is never dispatched, so no child/timer events
+    /// are recorded; on replay of that history the matcher would otherwise see
+    /// the next real event (`WorkflowFailed`, or a caught-and-continued activity)
+    /// at the cursor and report a spurious non-determinism instead of
+    /// reproducing the same `PayloadTooLarge`. Gating the cap check to a fresh
+    /// dispatch also keeps an already-recorded child (under-cap at record time)
+    /// from being re-judged against a possibly-changed cap.
+    ///
+    /// It never mutates the cursor and never consumes anything —
+    /// `match_child_or_timer` remains the sole authority for resolving the race.
+    /// The skip set mirrors [`Self::drain_early_signals`] so the peek agrees with
+    /// where the real match will land even when signals or update events precede
+    /// the recorded child start.
+    #[must_use]
+    pub(crate) fn peek_child_start_at_cursor(&self) -> bool {
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() {
+            let ev = &self.events[cursor];
+            // Skip consumed indices and the leading run of early-drainable
+            // signal / external-signal / external-cancel / update events, exactly
+            // as `prepare_match` -> `drain_early_signals` will before reading the
+            // structural event at the cursor.
+            if self.is_consumed(cursor)
+                || matches!(
+                    ev,
+                    WorkflowEvent::SignalReceived { .. }
+                        | WorkflowEvent::ExternalSignalRequested { .. }
+                        | WorkflowEvent::ExternalSignalDelivered { .. }
+                        | WorkflowEvent::ExternalSignalFailed { .. }
+                        | WorkflowEvent::ExternalCancelRequested { .. }
+                        | WorkflowEvent::ExternalCancelDelivered { .. }
+                        | WorkflowEvent::ExternalCancelFailed { .. }
+                )
+                || Self::is_update_event(ev)
+            {
+                cursor += 1;
+                continue;
+            }
+            return matches!(ev, WorkflowEvent::ChildWorkflowStarted { .. });
+        }
+        false
+    }
+
     /// Match a child-workflow-vs-deadline race against history (issue #779).
     ///
     /// Mirrors [`Self::match_signal_or_timer`] with the winner/loser roles
