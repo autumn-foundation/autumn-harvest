@@ -3113,3 +3113,81 @@ async fn test_try_receive_first_no_prior_wait_returns_oldest() {
         "a try_receive_signal with NO prior wait must return the oldest pre-queued signal"
     );
 }
+
+// ── Deadline-aware continue-as-new replay_check (issue #772) ───────────────────
+
+/// A deadline-aware workflow: it consults `should_continue_as_new()` (which,
+/// when an `execution_timeout` is configured, records a `SideEffectRecorded{Now}`
+/// deadline probe under the reserved sentinel name — even when the deadline
+/// fraction is nowhere near reached, since the clock is read before the fraction
+/// is compared), then performs one durable step.
+fn deadline_aware_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // With an execution_timeout configured, this call records the reserved
+        // `__harvest_deadline_probe` `SideEffectRecorded{Now}` event. For a far
+        // deadline the recommendation is false, so the run continues normally.
+        if ctx.should_continue_as_new() {
+            ctx.continue_as_new(json!({"checkpointed": true}))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({"checkpointed": true}));
+        }
+        // One durable step after the deadline probe, so an unconsumed probe on
+        // replay surfaces as an unambiguous command mismatch.
+        ctx.timer("cycle", 30).await.map_err(|e| e.to_string())?;
+        Ok(json!({"done": true}))
+    })
+}
+
+/// Issue #772 (review finding): `TestRunOutcome::replay_check` must carry the
+/// `WorkflowTestEnv::with_execution_timeout` budget into the `WorkflowReplayer`
+/// it builds. Otherwise the deadline branch is disabled during the self-check,
+/// leaving the live run's recorded `SideEffectRecorded{Now}` deadline probe
+/// unconsumed — a FALSE non-determinism report for an otherwise valid
+/// deadline-aware history.
+#[tokio::test]
+async fn deadline_aware_run_replay_check_carries_execution_timeout() {
+    use autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME;
+    use autumn_harvest::event::SideEffectKind;
+
+    let outcome = WorkflowTestEnv::new()
+        .with_execution_timeout(chrono::Duration::hours(24))
+        .run(deadline_aware_workflow, json!(null))
+        .await;
+
+    // The live run completed normally (far deadline ⇒ no checkpoint).
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"done": true})),
+        "run failed: {:?}",
+        outcome.result
+    );
+
+    // Sanity: the deadline probe was recorded, so the history genuinely
+    // exercises the deadline-aware code path this test guards.
+    let recorded_probe = outcome.events().iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEvent::SideEffectRecorded { kind: SideEffectKind::Now, name: Some(n), .. }
+                if n == DEADLINE_PROBE_SIDE_EFFECT_NAME
+        )
+    });
+    assert!(
+        recorded_probe,
+        "with_execution_timeout must make should_continue_as_new() record the deadline probe: {:?}",
+        outcome.events()
+    );
+
+    // The self-check must report ReplaySucceeded. Before the fix, replay_check
+    // built the replayer with execution_timeout None, disabling the deadline
+    // branch, so the recorded probe was left unconsumed → false non-determinism.
+    let report = outcome.replay_check(deadline_aware_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay_check must carry the test env's execution_timeout so the deadline-aware \
+         history replays cleanly, got: {report}"
+    );
+}

@@ -2326,6 +2326,14 @@ pub struct TestRunOutcome {
     /// Construction-time `simulated_now` (= `WorkflowStarted` timestamp), used
     /// to compute `final_now()` and `elapsed()` (issue #526).
     start_time: DateTime<Utc>,
+    /// Effective `execution_timeout` budget carried from the `WorkflowTestEnv`
+    /// that produced this outcome (issue #772). `replay_check` re-applies it to
+    /// the `WorkflowReplayer` it builds so the deadline branch is enabled during
+    /// the self-check — otherwise a deadline-aware history's recorded
+    /// `SideEffectRecorded{Now}` deadline probe is left unconsumed and reported
+    /// as a FALSE non-determinism. `None` (the default / no-timeout run) leaves
+    /// the replayer's deadline branch off, matching the live run.
+    execution_timeout: Option<chrono::Duration>,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -2447,6 +2455,14 @@ impl TestRunOutcome {
     /// The advancing virtual clock is enabled automatically (issue #526) so
     /// that time-branching workflows — those that branch on `ctx.now()` —
     /// replay correctly without a false `ReplayStatus::Failed`.
+    ///
+    /// The effective `execution_timeout` budget the producing
+    /// [`WorkflowTestEnv`] used (issue #772) is carried into the replayer so the
+    /// deadline branch is enabled during the self-check. Without it, a
+    /// deadline-aware history — one whose `should_continue_as_new()` recorded a
+    /// `SideEffectRecorded{Now}` deadline probe — would replay against a
+    /// deadline-disabled context, leave that probe unconsumed, and report a
+    /// FALSE non-determinism.
     pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
         let snapshot = crate::testing::HistorySnapshot {
             workflow_name: "__test__".to_string(),
@@ -2454,12 +2470,14 @@ impl TestRunOutcome {
             events: self.events.clone(),
             context_headers: None,
         };
-        WorkflowReplayer::new()
+        let mut replayer = WorkflowReplayer::new()
             .with_existing_state(self.state.clone())
             .register_fn("__test__", handler)
-            .with_advancing_timer_clock()
-            .replay_from_snapshot(snapshot)
-            .await
+            .with_advancing_timer_clock();
+        if let Some(execution_timeout) = self.execution_timeout {
+            replayer = replayer.with_execution_timeout(execution_timeout);
+        }
+        replayer.replay_from_snapshot(snapshot).await
     }
 }
 
@@ -2933,6 +2951,7 @@ impl WorkflowTestEnv {
                                 exec_id,
                                 state: self.state.clone(),
                                 start_time,
+                                execution_timeout: self.execution_timeout,
                             };
                         }
                     };
@@ -2946,6 +2965,7 @@ impl WorkflowTestEnv {
                             exec_id,
                             state: self.state.clone(),
                             start_time,
+                            execution_timeout: self.execution_timeout,
                         };
                     }
                 }
@@ -2970,6 +2990,7 @@ impl WorkflowTestEnv {
             exec_id,
             state: self.state.clone(),
             start_time,
+            execution_timeout: self.execution_timeout,
         }
     }
 
@@ -3023,6 +3044,7 @@ impl WorkflowTestEnv {
             exec_id,
             state: self.state.clone(),
             start_time,
+            execution_timeout: self.execution_timeout,
         }
     }
 
