@@ -261,11 +261,20 @@ async fn size_triggered_flush_threads_completion_callbacks_into_the_started_exec
         }
     }
 
+    // Production CONCATENATES each admission's completion_callbacks (issue #921)
+    // and dedups only at DELIVERY time — so admitting the same single-target
+    // array on all 3 batch admissions stores the concatenated union
+    // `[hook, hook, hook]`, NOT `[hook]`. The passing sibling
+    // `a_later_admissions_completion_callbacks_are_merged_not_dropped` encodes the
+    // same concatenate-and-merge contract with two *distinct* targets (→ len 2).
     let stored = started_execution_completion_callbacks(&mut conn, "callback-batch-001").await;
+    let hook = callbacks.as_array().expect("callbacks is an array")[0].clone();
+    let expected = json!([hook, hook, hook]);
     assert_eq!(
         stored,
-        Some(callbacks),
-        "a size-flushed batch start must carry the caller's completion_callbacks through"
+        Some(expected),
+        "a size-flushed batch start must carry every admission's completion_callbacks \
+         through, concatenated (deduped only at delivery)"
     );
 }
 

@@ -177,21 +177,27 @@ fn install_config(deliverer: Arc<dyn CompletionCallbackDeliverer>, retry_policy:
 async fn insert_terminal_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    workflow_id: &str,
     state: &str,
     output: Option<&str>,
     error: Option<&str>,
     completion_callbacks: Option<&str>,
 ) {
+    // `workflow_id` is parameterized: two rows sharing `(workflow_name,
+    // workflow_id)` collide on the partial active-uniqueness index
+    // `harvest_we_workflow_name_workflow_id_active_key` (COMPLETED is not excluded),
+    // so a test inserting two terminal execs must give them distinct ids.
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (id, workflow_name, workflow_id, shard_id, input, state, output, error, completed_at, completion_callbacks)
-         VALUES ($1, 'process_refund', 'wf-1', 0, 'null'::jsonb, $2, $3::jsonb, $4, now(), $5::jsonb)",
+         VALUES ($1, 'process_refund', $6, 0, 'null'::jsonb, $2, $3::jsonb, $4, now(), $5::jsonb)",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Text, _>(state)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(output)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(error)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(completion_callbacks)
+    .bind::<diesel::sql_types::Text, _>(workflow_id)
     .execute(conn)
     .await
     .expect("insert execution");
@@ -232,6 +238,7 @@ async fn enqueue_on_completion_creates_one_row_per_matching_target() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some(r#"{"refunded":true}"#),
         None,
@@ -268,6 +275,7 @@ async fn enqueue_skips_targets_whose_filter_does_not_match() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "FAILED",
         None,
         Some("card declined"),
@@ -297,6 +305,7 @@ async fn enqueue_is_idempotent_on_re_evaluation() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -327,7 +336,16 @@ async fn no_targets_configured_enqueues_nothing() {
 
     let exec_id = ExecutionId::new();
     // No completion_callbacks and no builder defaults configured.
-    insert_terminal_execution(&mut conn, exec_id, "COMPLETED", Some("{}"), None, None).await;
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "wf-1",
+        "COMPLETED",
+        Some("{}"),
+        None,
+        None,
+    )
+    .await;
 
     evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
         .await
@@ -405,6 +423,7 @@ async fn scanner_dispatches_a_batch_of_deliveries_concurrently_not_sequentially(
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -460,6 +479,7 @@ async fn scanner_marks_delivered_on_2xx() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some(r#"{"refunded":true}"#),
         None,
@@ -515,6 +535,7 @@ async fn scanner_reschedules_with_backoff_on_non_2xx() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -603,6 +624,7 @@ async fn scanner_schedules_backoff_from_attempt_completion_not_claim_time() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -665,6 +687,7 @@ async fn erase_racing_a_dead_letter_write_does_not_reintroduce_pii() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some(&format!(r#"{{"email":"{pii}"}}"#)),
         None,
@@ -742,6 +765,7 @@ async fn scanner_dead_letters_on_retry_exhaustion() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "FAILED",
         None,
         Some("card declined"),
@@ -823,6 +847,7 @@ async fn scanner_rejects_dispatch_when_target_is_no_longer_allowlisted() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some(r#"{"refunded":true}"#),
         None,
@@ -1030,6 +1055,7 @@ async fn scanner_ignores_rows_not_yet_due() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -1092,6 +1118,7 @@ async fn scanner_scopes_claims_to_the_assigned_shard_when_shards_share_a_pool() 
     insert_terminal_execution(
         &mut conn,
         exec_shard0,
+        "wf-0",
         "COMPLETED",
         Some("{}"),
         None,
@@ -1106,6 +1133,7 @@ async fn scanner_scopes_claims_to_the_assigned_shard_when_shards_share_a_pool() 
     insert_terminal_execution(
         &mut conn,
         exec_shard1,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -1173,6 +1201,7 @@ async fn list_deliveries_for_execution_returns_rows_in_callback_index_order() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,
@@ -1211,6 +1240,7 @@ async fn redrive_delivery_resets_a_failed_row_and_clears_its_dlq_entry() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "FAILED",
         None,
         Some("card declined"),
@@ -1322,6 +1352,7 @@ async fn redrive_delivery_is_a_no_op_when_delivery_belongs_to_a_different_execut
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "FAILED",
         None,
         Some("boom"),
@@ -1375,6 +1406,7 @@ async fn redrive_delivery_rejects_a_non_failed_delivery() {
     insert_terminal_execution(
         &mut conn,
         exec_id,
+        "wf-1",
         "COMPLETED",
         Some("{}"),
         None,

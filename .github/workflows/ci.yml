@@ -227,9 +227,15 @@ jobs:
       - name: Run Docker-backed typed workflow failure integration tests (issue #767)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- typed_workflow_failure_tests --test-threads=1
-      - name: Run Docker-backed typed workflow-failure retry-gate tests (issue #767 FIX B)
+      - name: Run Docker-backed workflow-level retry integration tests (issue #523 / #767)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests::workflow_typed --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- workflow_retry_tests --test-threads=1
+      - name: Run Docker-backed completion-callback integration tests (issue #605)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --test integration -- completion_callback_tests --test-threads=1
+      - name: Run Docker-backed event-batch integration tests (issue #921)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --test integration -- event_batch_tests --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
