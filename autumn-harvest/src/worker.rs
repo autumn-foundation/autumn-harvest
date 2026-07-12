@@ -9971,6 +9971,10 @@ async fn process_workflow_task(
                 .filter(|_| is_replay)
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
             build_id: Some(build_id.to_string()),
+            // Issue #772: thread the run's effective execution-timeout budget so
+            // `ctx.deadline()` / `ctx.should_continue_as_new()` can reason about
+            // the deadline for deadline-aware continue-as-new.
+            execution_timeout: prepared.execution.execution_timeout,
         };
 
         // Filter declarative handlers to those that target this workflow type.

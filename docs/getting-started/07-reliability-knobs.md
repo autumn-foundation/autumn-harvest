@@ -106,6 +106,43 @@ down to `execution_timeout`** at start time. Pause suspends the SLA clock
 (resume pushes `sla_deadline_at` forward by the paused span), so a deliberately
 parked run never false-breaches.
 
+**Checkpoint before the deadline kills you (deadline-aware `continue_as_new`).**
+A long-lived entity workflow (a subscription, a cart, a device) can run for
+weeks while recording only a handful of events — it never approaches the history
+event-count threshold that `ctx.should_continue_as_new()` watches. But if it
+declares an `execution_timeout` for runaway protection, that hard timeout will
+eventually terminate it mid-flight even though it is perfectly healthy. To avoid
+that, `should_continue_as_new()` has a **second trigger** (issue #772): it also
+returns `true` once the run has consumed a configurable fraction (default
+`0.8`) of its `execution_timeout` budget. Checkpoint with `continue_as_new`
+*before* the hard deadline truncates you, carrying state forward into a fresh
+run with a fresh deadline:
+
+```rust
+#[workflow(execution_timeout = "24h")]
+async fn subscription_entity(ctx: &WorkflowContext, state: SubState) -> Result<SubState, String> {
+    // Fires on history size OR ~80% of the execution_timeout budget.
+    if ctx.should_continue_as_new() {
+        ctx.continue_as_new(serde_json::to_value(&state).unwrap()).await?;
+    }
+    // ... one cycle of durable work ...
+    Ok(state)
+}
+```
+
+Two replay-safe, event-free accessors back this: `ctx.deadline()` (the
+`WorkflowStarted` timestamp + effective `execution_timeout`, or `None` when
+there is no timeout) and `ctx.time_until_deadline()` (measured against the
+replay-safe recorded clock `ctx.system_now()`, **never** `chrono::Utc::now()`).
+A workflow with **no** `execution_timeout` behaves exactly as before and records
+nothing extra. Tune the fraction with
+`HarvestBuilder::history_continue_as_new_deadline_fraction(f64)` (clamped to
+`[0.0, 1.0]`). **No new event variant, no migration** — the deadline is derived
+from the recorded start time and the clock read reuses the existing
+`SideEffectRecorded{Now}` event, so a history that crossed the deadline replays
+to the same `continue_as_new` on every worker. See
+`examples/long_lived_entity_deadline.rs`.
+
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.patched()` — the recommended default for the
 overwhelmingly common two-state (before/after) change — so old executions

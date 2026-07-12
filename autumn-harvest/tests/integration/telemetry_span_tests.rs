@@ -628,6 +628,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     state,
                     std::collections::HashMap::new(),
                     std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+                    None,
                 )
                 .await;
             });

@@ -301,6 +301,42 @@ fn sleep_until_workflow<'a>(
     })
 }
 
+/// Deadline-aware continue-as-new (issue #772): at the top of the run, check
+/// `should_continue_as_new()`; when it trips (event count OR the deadline
+/// fraction), fork a fresh run via `continue_as_new`. Otherwise do a unit of
+/// "work" and complete. Registered with a per-run `execution_timeout` on the
+/// replayer so the deadline branch is exercised.
+fn deadline_can_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if ctx.should_continue_as_new() {
+            let prev = input["cycle"].as_i64().unwrap_or(0);
+            ctx.continue_as_new(serde_json::json!({ "cycle": prev + 1 }))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::json!("done"))
+    })
+}
+
+/// Deadline-aware decision probe (issue #772): reads `should_continue_as_new()`
+/// and completes with the boolean, without parking on `continue_as_new`. Used
+/// for the high-volume 1000× determinism bar so each replay is fast (no 100 ms
+/// suspension wait) while still exercising the deadline-driven `system_now`
+/// consumption on every replay.
+fn deadline_probe_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let trip = ctx.should_continue_as_new();
+        Ok(serde_json::json!(trip))
+    })
+}
+
 /// Cancellable durable timer (issue #768): arm, then await the outcome.
 fn cancellable_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1076,6 +1112,8 @@ fn build_replayer() -> WorkflowReplayer {
             drain_after_activity_workflow,
         )
         .register_fn("drain_n_signals_workflow", drain_n_signals_workflow)
+        .register_fn("deadline_can_workflow", deadline_can_workflow)
+        .register_fn("deadline_probe_workflow", deadline_probe_workflow)
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -1852,6 +1890,102 @@ async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
         ),
         "dropping the frozen system_now() capture must surface as SideEffectDrift, got: {report}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-aware continue-as-new (issue #772)
+// ---------------------------------------------------------------------------
+
+/// Build a history for `deadline_can_workflow` whose recorded wall clock has
+/// consumed `consumed_secs` of the run's execution-timeout budget, then
+/// continued-as-new. `should_continue_as_new()` records the `system_now()`
+/// read as a `SideEffectRecorded{Now}` (because a deadline exists), and the
+/// deadline branch forks a fresh run.
+fn deadline_can_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent> {
+    let mut events = deadline_probe_history(t0_millis, consumed_secs);
+    events.push(WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id: ExecutionId::new(),
+        input: serde_json::json!({ "cycle": 1 }),
+    });
+    events
+}
+
+/// Build a history for `deadline_probe_workflow`: `WorkflowStarted` plus the
+/// single `system_now()` capture that `should_continue_as_new()` records when a
+/// deadline exists. The workflow completes (no continue-as-new), so replaying
+/// this history is fast (no 100 ms suspension wait).
+fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent> {
+    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    let recorded_now = t0 + chrono::Duration::seconds(consumed_secs);
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "cycle": 0 }),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(recorded_now.timestamp_millis()),
+        },
+    ]
+}
+
+/// AC5: a history that crossed the deadline replays to the same
+/// `ContinueAsNew` command (`ReplaySucceeded`). The `execution_timeout` is
+/// supplied to the replayer, so `should_continue_as_new()`'s deadline branch is
+/// exercised deterministically against the recorded `system_now()` capture.
+#[tokio::test]
+async fn replay_deadline_crossed_history_yields_continue_as_new() {
+    // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ deadline branch trips.
+    let events = deadline_can_history(1_700_000_000_000, 27);
+    let report = build_replayer()
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_snapshot(make_snapshot(
+            "deadline_can_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a deadline-crossed history must replay to ContinueAsNew, got: {report}"
+    );
+}
+
+/// The falsifiable bar for issue #772: the deadline-driven
+/// `should_continue_as_new()` decision replays deterministically across
+/// N = 1000 distinct fixtures with zero divergences. Each iteration varies the
+/// frozen `system_now()` capture, consumed fraction, and execution-timeout
+/// budget, so this is 1000 varied cases, not one fixture cloned. The workflow
+/// completes (rather than parking on `continue_as_new`) purely so 1000 replays
+/// stay fast — the `ContinueAsNew` *command* itself is proven separately by
+/// `replay_deadline_crossed_history_yields_continue_as_new`.
+#[tokio::test]
+async fn deadline_triggered_can_replays_deterministically_1000x() {
+    let base = 1_600_000_000_000_i64;
+    for i in 0..1000_i64 {
+        // Budget 20..=119s; consumed is always ≥ 0.85 of it so the deadline
+        // fraction (0.8) always trips, across a spread of budgets/instants.
+        let budget_secs = 20 + (i % 100);
+        let consumed_secs = (budget_secs * 85) / 100 + 1;
+        let t0_millis = base + i * 41_000;
+        let events = deadline_probe_history(t0_millis, consumed_secs);
+        let report = build_replayer()
+            .with_execution_timeout(chrono::Duration::seconds(budget_secs))
+            .replay_from_snapshot(make_snapshot(
+                "deadline_probe_workflow",
+                ExecutionId::new(),
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "deadline replay pass {i} must succeed with zero divergences, got: {report}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1302,6 +1302,21 @@ impl HarvestBuilder {
         self
     }
 
+    /// Override the deadline fraction used by
+    /// [`crate::context::WorkflowContext::should_continue_as_new`] for
+    /// deadline-aware continue-as-new (issue #772). Clamped into `[0.0, 1.0]`.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`](crate::context::DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION)
+    /// (`0.8`).
+    #[must_use]
+    pub const fn history_continue_as_new_deadline_fraction(mut self, fraction: f64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_continue_as_new_deadline_fraction(fraction);
+        self
+    }
+
     /// Configure an opt-in hard cap for workflow history event counts.
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
@@ -3043,6 +3058,25 @@ mod tests {
 
         assert_eq!(policy.continue_as_new_threshold(), 128);
         assert_eq!(policy.event_hard_cap(), Some(256));
+    }
+
+    #[test]
+    fn harvest_builder_accepts_deadline_fraction_override() {
+        // Issue #772: the deadline-aware continue-as-new fraction is
+        // configurable and clamped into [0.0, 1.0].
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_deadline_fraction(0.6)
+            .build();
+        let policy = built.history_policy();
+        assert!((policy.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
+
+        let clamped = HarvestBuilder::new()
+            .history_continue_as_new_deadline_fraction(2.0)
+            .build();
+        assert!(
+            (clamped.history_policy().continue_as_new_deadline_fraction() - 1.0).abs()
+                < f64::EPSILON
+        );
     }
 
     #[cfg(feature = "db")]

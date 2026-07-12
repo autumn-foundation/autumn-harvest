@@ -48,15 +48,32 @@ pub fn empty_shared_state() -> SharedState {
 /// Default soft history-size threshold for recommending `continue_as_new`.
 pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 
+/// Default deadline-fraction trigger for [`WorkflowContext::should_continue_as_new`]
+/// (issue #772).
+///
+/// The fraction of a workflow's `execution_timeout` budget that must be consumed
+/// before a deadline-driven checkpoint is recommended. `0.8` means the workflow
+/// is advised to `continue_as_new` once it is within the final 20% of its
+/// deadline.
+pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
+
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
 pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 
 /// Replay-safe history guardrails made available to workflow code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` (but not `Eq`) because
+/// [`continue_as_new_deadline_fraction`](Self::continue_as_new_deadline_fraction)
+/// is an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkflowHistoryPolicy {
     continue_as_new_threshold: u64,
     event_hard_cap: Option<u64>,
+    /// Fraction of `execution_timeout` consumed at which
+    /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
+    /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
+    continue_as_new_deadline_fraction: f64,
 }
 
 impl Default for WorkflowHistoryPolicy {
@@ -64,6 +81,7 @@ impl Default for WorkflowHistoryPolicy {
         Self {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
             event_hard_cap: None,
+            continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
         }
     }
 }
@@ -81,6 +99,15 @@ impl WorkflowHistoryPolicy {
         self.event_hard_cap
     }
 
+    /// Fraction of the `execution_timeout` budget at which
+    /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
+    /// deadline-driven `continue_as_new` (issue #772). Defaults to
+    /// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`].
+    #[must_use]
+    pub const fn continue_as_new_deadline_fraction(self) -> f64 {
+        self.continue_as_new_deadline_fraction
+    }
+
     /// Override the soft continue-as-new threshold.
     #[must_use]
     pub const fn with_continue_as_new_threshold(mut self, threshold: u64) -> Self {
@@ -92,6 +119,16 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
         self.event_hard_cap = Some(cap);
+        self
+    }
+
+    /// Override the deadline fraction (issue #772). The value is **clamped**
+    /// into `[0.0, 1.0]` — a fraction outside that range is meaningless (a
+    /// value ≤ 0 would recommend checkpointing immediately; ≥ 1 would never
+    /// recommend it before the hard timeout).
+    #[must_use]
+    pub const fn with_continue_as_new_deadline_fraction(mut self, fraction: f64) -> Self {
+        self.continue_as_new_deadline_fraction = fraction.clamp(0.0, 1.0);
         self
     }
 }
@@ -1628,6 +1665,11 @@ pub struct WorkflowContext {
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
     history_policy: WorkflowHistoryPolicy,
+    /// The effective execution-timeout budget for this run (issue #243/#772), or
+    /// `None` when the workflow has no `execution_timeout`. Used purely to derive
+    /// [`deadline`](Self::deadline) from the recorded `start_time`; records no
+    /// event. Threaded from the execution row by the worker.
+    execution_timeout: Option<chrono::Duration>,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Monotonically increasing counter for naming fan-out count markers.
@@ -2007,6 +2049,7 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             history_policy,
+            execution_timeout: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2146,6 +2189,7 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
+            execution_timeout: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2200,6 +2244,7 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
+            execution_timeout: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2383,6 +2428,22 @@ impl WorkflowContext {
         self
     }
 
+    /// Set the effective execution-timeout budget for deadline-aware
+    /// continue-as-new (issue #772).
+    ///
+    /// Threaded by the executor from the execution row's `execution_timeout`
+    /// (issue #243). `None` (the default) leaves [`deadline`](Self::deadline)
+    /// as `None`, so [`should_continue_as_new`](Self::should_continue_as_new)
+    /// behaves exactly as before and records no side-effect.
+    #[must_use]
+    pub const fn with_execution_timeout(
+        mut self,
+        execution_timeout: Option<chrono::Duration>,
+    ) -> Self {
+        self.execution_timeout = execution_timeout;
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// The task queue this workflow execution runs on.
@@ -2414,6 +2475,46 @@ impl WorkflowContext {
             return self.start_time + delta;
         }
         self.start_time
+    }
+
+    /// The absolute wall-clock deadline this run must finish by, or `None` when
+    /// the workflow has no `execution_timeout` (issue #772).
+    ///
+    /// Derived purely from the recorded `WorkflowStarted` timestamp
+    /// ([`now`](Self::now) with no advancing clock) plus the effective
+    /// `execution_timeout` (issue #243), so it is **pure and replay-safe**: it
+    /// records no event and returns the same value on every replay and every
+    /// worker. `None` is returned when there is no `execution_timeout` or when
+    /// the computed deadline would overflow the representable range.
+    #[must_use]
+    pub fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.execution_timeout
+            .and_then(|budget| self.start_time.checked_add_signed(budget))
+    }
+
+    /// Time remaining until the execution [`deadline`](Self::deadline), or
+    /// `None` when the workflow has no `execution_timeout` (issue #772).
+    ///
+    /// The remaining time is measured against the replay-safe recorded wall
+    /// clock ([`system_now`](Self::system_now), issue #384) — **never**
+    /// `chrono::Utc::now()` — so it is deterministic across replays. A negative
+    /// duration means the deadline has already passed.
+    ///
+    /// A workflow with no deadline records **no** side-effect: the pure
+    /// [`deadline`](Self::deadline) check runs first, so `system_now` (which
+    /// records a `SideEffectRecorded` event) is only consulted when a deadline
+    /// actually exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned (via
+    /// [`system_now`](Self::system_now)).
+    #[must_use]
+    pub fn time_until_deadline(&self) -> Option<chrono::Duration> {
+        // Check the pure deadline first so a no-deadline workflow never records
+        // a `system_now` side-effect (AC4).
+        let deadline = self.deadline()?;
+        Some(deadline - self.system_now())
     }
 
     /// The nominal scheduled fire-time (logical slot) this run is responsible for,
@@ -2638,11 +2739,67 @@ impl WorkflowContext {
         self.match_history(|matcher| matcher.event_count())
     }
 
-    /// Returns `true` once [`Self::history_event_count`] exceeds the configured
-    /// soft continue-as-new threshold.
+    /// Returns `true` when the workflow should checkpoint via `continue_as_new`.
+    ///
+    /// Two independent triggers, either of which is sufficient:
+    ///
+    /// 1. **History size** — [`Self::history_event_count`] exceeds the configured
+    ///    soft continue-as-new threshold (the pre-issue-#772 behaviour).
+    /// 2. **Deadline fraction** (issue #772) — the run has consumed at least
+    ///    [`WorkflowHistoryPolicy::continue_as_new_deadline_fraction`] of its
+    ///    `execution_timeout` budget. This lets a **long-lived, low-event**
+    ///    workflow checkpoint *before* the hard `execution_timeout` (issue #243)
+    ///    kills it, even though its history would never approach the event
+    ///    threshold.
+    ///
+    /// ## Replay determinism
+    ///
+    /// The deadline check consults the replay-safe recorded clock
+    /// ([`system_now`](Self::system_now)), so its answer is deterministic across
+    /// replays and workers. A workflow with **no** `execution_timeout` records
+    /// zero side-effects here and behaves exactly as before (AC4). The two
+    /// triggers are combined without short-circuiting the deadline check, so a
+    /// timeout-bearing workflow records exactly one `system_now` per call
+    /// regardless of the event-count branch — keeping the recorded side-effect
+    /// stream a pure function of "has a deadline", not of the (task-varying)
+    /// event count.
     #[must_use]
     pub fn should_continue_as_new(&self) -> bool {
-        self.history_event_count() > self.history_policy.continue_as_new_threshold()
+        let by_events =
+            self.history_event_count() > self.history_policy.continue_as_new_threshold();
+        // Evaluate the deadline branch unconditionally (bound before the `||`)
+        // so the `system_now` recording it performs is not gated by the
+        // event-count trigger.
+        let by_deadline = self.deadline_fraction_reached();
+        by_events || by_deadline
+    }
+
+    /// Returns `true` when the run has consumed at least the configured fraction
+    /// of its `execution_timeout` budget (issue #772).
+    ///
+    /// Returns `false` — recording **no** side-effect — when the workflow has no
+    /// `execution_timeout` or a non-positive budget. Otherwise it consults the
+    /// replay-safe recorded clock via [`time_until_deadline`](Self::time_until_deadline)
+    /// (which records exactly one `system_now`). A deadline already in the past
+    /// (negative remaining) trips.
+    #[allow(clippy::cast_precision_loss)]
+    fn deadline_fraction_reached(&self) -> bool {
+        let Some(total) = self.execution_timeout else {
+            return false;
+        };
+        let total_ms = total.num_milliseconds();
+        if total_ms <= 0 {
+            return false;
+        }
+        // execution_timeout is Some, so this records the clock read.
+        let Some(remaining) = self.time_until_deadline() else {
+            return false;
+        };
+        let fraction = self.history_policy.continue_as_new_deadline_fraction();
+        // Trip once at least `fraction` of the budget is consumed, i.e. the
+        // remaining time is at most `(1 - fraction)` of the total. Negative
+        // remaining (past the deadline) trips.
+        (remaining.num_milliseconds() as f64) <= (1.0 - fraction) * (total_ms as f64)
     }
 
     /// Returns `true` if the context is currently replaying recorded history
@@ -10846,6 +11003,170 @@ mod tests {
 
         assert_eq!(ctx.history_event_count(), 2);
         assert!(!ctx.should_continue_as_new());
+    }
+
+    // ── Deadline-aware continue-as-new (issue #772) ─────────────────────────
+
+    /// Build a replay context whose first event carries `t0` as the
+    /// `WorkflowStarted` timestamp, plus any extra events (e.g. a recorded
+    /// `SideEffectRecorded{Now}` for `system_now`).
+    fn deadline_ctx(
+        t0: DateTime<Utc>,
+        extra: Vec<WorkflowEvent>,
+        execution_timeout: Option<chrono::Duration>,
+    ) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.extend(extra);
+        WorkflowContext::for_replay(ExecutionId::new(), events)
+            .with_execution_timeout(execution_timeout)
+    }
+
+    /// A recorded `system_now` capture at the given wall-clock instant.
+    fn recorded_now(instant: DateTime<Utc>) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(instant.timestamp_millis()),
+        }
+    }
+
+    #[test]
+    fn deadline_returns_start_plus_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+        assert_eq!(ctx.deadline(), Some(t0 + chrono::Duration::seconds(30)));
+    }
+
+    #[test]
+    fn deadline_is_none_without_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(t0, vec![], None);
+        assert_eq!(ctx.deadline(), None);
+    }
+
+    #[test]
+    fn time_until_deadline_uses_recorded_clock() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let clock = t0 + chrono::Duration::seconds(10);
+        // execution_timeout = 30s, recorded clock = t0+10s ⇒ 20s remaining.
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert_eq!(
+            ctx.time_until_deadline(),
+            Some(chrono::Duration::seconds(20))
+        );
+    }
+
+    #[test]
+    fn time_until_deadline_is_none_without_deadline() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // No execution_timeout: time_until_deadline must be None AND must not
+        // consult (or record) the wall clock.
+        let ctx = deadline_ctx(t0, vec![], None);
+        assert_eq!(ctx.time_until_deadline(), None);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no side-effect command must be recorded when there is no deadline"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_trips_on_deadline_fraction() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // 25s of a 30s budget consumed (0.83 ≥ 0.8) ⇒ trips, even though the
+        // event count is far under the soft threshold.
+        let clock = t0 + chrono::Duration::seconds(25);
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(ctx.history_event_count() < 10_000);
+        assert!(ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn should_continue_as_new_not_yet_before_fraction() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // Only 10s of a 30s budget consumed (0.33 < 0.8) ⇒ does not trip.
+        let clock = t0 + chrono::Duration::seconds(10);
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(!ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn should_continue_as_new_no_timeout_records_no_event_and_is_false() {
+        // AC4: a workflow with NO execution_timeout behaves exactly as today
+        // and records ZERO new side-effect events.
+        let ctx = WorkflowContext::new_test();
+        assert!(!ctx.should_continue_as_new());
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "should_continue_as_new must not record a side-effect when there is no deadline"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_still_trips_on_history_count() {
+        // Existing behaviour preserved: the event-count trigger fires
+        // independently of the deadline path (no execution_timeout here).
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll".into(),
+                details: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll".into(),
+                details: serde_json::json!({"n": 2}),
+            },
+        ];
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        );
+        assert!(ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn workflow_history_policy_deadline_fraction_default_and_clamp() {
+        let default = WorkflowHistoryPolicy::default();
+        assert!(
+            (default.continue_as_new_deadline_fraction()
+                - DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Clamped to [0.0, 1.0].
+        let over = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(1.5);
+        assert!((over.continue_as_new_deadline_fraction() - 1.0).abs() < f64::EPSILON);
+        let under = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(-0.5);
+        assert!(under.continue_as_new_deadline_fraction().abs() < f64::EPSILON);
+        let mid = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.6);
+        assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

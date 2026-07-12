@@ -296,6 +296,11 @@ pub struct WorkflowReplayer {
     /// Metrics recorder injected into the replayed `WorkflowContext`.
     /// Defaults to `NoOpMetrics`; inject a counting recorder for replay-safety tests.
     metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    /// Effective `execution_timeout` budget threaded into the replayed
+    /// `WorkflowContext` (issue #772) so replays can exercise deadline-aware
+    /// `continue_as_new`. `None` (the default) matches a workflow with no
+    /// execution timeout.
+    execution_timeout: Option<chrono::Duration>,
 }
 
 impl Default for WorkflowReplayer {
@@ -324,7 +329,21 @@ impl WorkflowReplayer {
             payload_offloader: None,
             use_advancing_clock: false,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            execution_timeout: None,
         }
+    }
+
+    /// Set the effective `execution_timeout` budget threaded into the replayed
+    /// `WorkflowContext` (issue #772).
+    ///
+    /// Required to exercise deadline-aware `continue_as_new`: without it,
+    /// `ctx.deadline()` is `None` and `ctx.should_continue_as_new()` never fires
+    /// on the deadline branch, so a history that continued-as-new because of the
+    /// deadline would replay as a divergence.
+    #[must_use]
+    pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
+        self.execution_timeout = Some(execution_timeout);
+        self
     }
 
     /// Inject a [`MetricsRecorder`](crate::telemetry::MetricsRecorder) into replayed
@@ -525,6 +544,7 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 headers,
                 self.metrics.clone(),
+                self.execution_timeout,
             )
             .await
         } else {
@@ -536,6 +556,7 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 headers,
                 self.metrics.clone(),
+                self.execution_timeout,
             )
             .await
         };
@@ -574,6 +595,7 @@ impl WorkflowReplayer {
             self.state.clone(),
             headers,
             self.metrics.clone(),
+            self.execution_timeout,
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -668,6 +690,7 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 self.context_headers.clone(),
                 self.metrics.clone(),
+                self.execution_timeout,
             )
             .await
         } else {
@@ -679,6 +702,7 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 self.context_headers.clone(),
                 self.metrics.clone(),
+                self.execution_timeout,
             )
             .await
         };
@@ -2082,6 +2106,7 @@ async fn replay_fixture_file(
         payload_offloader: None,
         use_advancing_clock: false,
         metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        execution_timeout: None,
     };
 
     let replay_result =
@@ -2400,6 +2425,10 @@ pub struct WorkflowTestEnv {
     /// Task queue name threaded into the `WorkflowContext` so in-context
     /// engine metrics carry a real `queue` label. Defaults to `""`.
     queue_name: String,
+    /// Effective `execution_timeout` budget threaded into the `WorkflowContext`
+    /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
+    /// `None` (the default) matches a workflow with no execution timeout.
+    execution_timeout: Option<chrono::Duration>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -2429,6 +2458,7 @@ impl WorkflowTestEnv {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             workflow_name: String::new(),
             queue_name: String::new(),
+            execution_timeout: None,
         }
     }
 
@@ -2636,6 +2666,16 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the effective `execution_timeout` budget for the contexts this env
+    /// builds (issue #772), so `ctx.deadline()` /
+    /// `ctx.should_continue_as_new()` can reason about deadline-aware
+    /// continue-as-new inside a live test run.
+    #[must_use]
+    pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
+        self.execution_timeout = Some(execution_timeout);
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -2707,7 +2747,10 @@ impl WorkflowTestEnv {
         // the executor's span-meta plumbing, the same path the worker uses)
         // so engine metrics emitted from inside the workflow carry real
         // labels a test can assert on.
-        let span_meta = if self.workflow_name.is_empty() && self.queue_name.is_empty() {
+        let span_meta = if self.workflow_name.is_empty()
+            && self.queue_name.is_empty()
+            && self.execution_timeout.is_none()
+        {
             None
         } else {
             Some(WorkflowExecuteSpanMeta {
@@ -2718,6 +2761,9 @@ impl WorkflowTestEnv {
                 is_replay: false,
                 link_traceparent: None,
                 build_id: None,
+                // Issue #772: thread the deadline budget so a live test run can
+                // exercise deadline-aware continue-as-new.
+                execution_timeout: self.execution_timeout,
             })
         };
 
