@@ -18,7 +18,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure};
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy, Schedule, WorkflowSchedule};
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{METRIC_WORKFLOW_RETRIES, MetricsRecorder, TelemetryConfig};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -206,12 +206,23 @@ fn always_fail_handler(
     Box::pin(async move { Err("permanent transient".to_string()) })
 }
 
-/// Always fails with a non-retryable error type prefix.
+/// Always fails with a typed `WorkflowFailure` whose `error_type` is the
+/// exception CLASS `"NullPointerException"` and whose message carries the detail
+/// (`"NullPointerException: bad input"`). The #523 retry gate matches
+/// `non_retryable_errors` against the decoded typed `error_type` class on exact
+/// equality (`RetryPolicy::is_non_retryable`) — NOT a substring of the raw
+/// message — so the fixture must publish the class as `error_type`, mirroring
+/// the passing sibling `workflow_typed_non_retryable_error_type_no_retry`.
 fn non_retryable_fail_handler(
     _ctx: &WorkflowContext,
     _input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
-    Box::pin(async move { Err("NullPointerException: bad input".to_string()) })
+    Box::pin(async move {
+        Err(
+            WorkflowFailure::new("NullPointerException", "NullPointerException: bad input")
+                .into_workflow_error_payload(),
+        )
+    })
 }
 
 /// Fails with a *typed* `WorkflowFailure` whose `error_type` is
@@ -289,7 +300,9 @@ fn timer_wait_handler(
     _input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
     Box::pin(async move {
-        ctx.timer("long-wait", 10)
+        // 3600s so the timer cannot fire during the poll window — the workflow
+        // stays durably parked until the test cancels it.
+        ctx.timer("long-wait", 3600)
             .await
             .map_err(|e| e.to_string())?;
         Ok(Value::Null)
@@ -508,6 +521,31 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
     }
     let state = get_state(conn, exec_id).await;
     panic!("execution {exec_id} never reached {states:?}; current state: {state}");
+}
+
+/// Wait until an execution is durably parked on a timer: a `harvest_timers` row
+/// exists for it (the workflow suspended on its `ctx.timer(...)`) — the
+/// unambiguous "parked" signal.
+///
+/// `"SUSPENDED"` is NOT a persisted state: a timer-parked run's row is
+/// `"RUNNING"` with `worker_id IS NULL`, and the state CHECK constraint forbids
+/// `"SUSPENDED"`. Poll the timer table (the existence of the durable timer row)
+/// instead of an unreachable state string.
+async fn wait_for_parked(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    for _ in 0..400 {
+        let timers: i64 = harvest_timers::table
+            .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+            .count()
+            .get_result(conn)
+            .await
+            .expect("count timers");
+        if timers > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let state = get_state(conn, exec_id).await;
+    panic!("execution {exec_id} never parked on a timer; current state: {state}");
 }
 
 /// Wait until a retry execution (`retry_of_exec_id = original_exec_id`) reaches
@@ -778,21 +816,13 @@ async fn workflow_retry_exhaustion_counts_as_one_failure() {
             .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. }))
     );
 
-    // The retry execution (attempt 2) does NOT have WorkflowRetryScheduled in its history.
-    let all_execs: Vec<(uuid::Uuid, i32)> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
-        .select((
-            harvest_workflow_executions::id,
-            harvest_workflow_executions::workflow_attempt,
-        ))
-        .load(&mut check2)
-        .await
-        .expect("load all executions");
-    let attempt2_id = all_execs
-        .iter()
-        .find(|(_, a)| *a == 2)
-        .map(|(id, _)| ExecutionId::from_uuid(*id))
-        .expect("attempt 2 must exist");
+    // The retry execution (attempt 2) does NOT have WorkflowRetryScheduled in its
+    // history. The #523 retry run gets its OWN distinct UUID `workflow_id` (the
+    // tested contract, per the passing `retry_run_has_fresh_history_and_correct_linkage`),
+    // so it can never be found by the original `workflow_id`; select it via the
+    // `retry_of_exec_id` FK — matching the `failed_count` loop above and the
+    // `wait_for_retry_state` helper.
+    let attempt2_id = wait_for_retry_state(&mut check2, exec_id, &["FAILED"]).await;
     let retry_history = get_history(&mut check2, attempt2_id).await;
     assert!(
         !retry_history
@@ -1218,9 +1248,10 @@ async fn cancelled_workflow_is_not_retried() {
         let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&pool)).await;
     });
 
-    // Wait for the workflow to start and schedule its timer (SUSPENDED state).
+    // Wait for the workflow to start and durably park on its timer. `"SUSPENDED"`
+    // is not a real state — poll for the timer row (RUNNING, worker_id IS NULL).
     let mut check = connect(&url).await;
-    wait_for_state(&mut check, exec_id, &["SUSPENDED"]).await;
+    wait_for_parked(&mut check, exec_id).await;
 
     // Cancel the execution.
     cancel_workflow_execution(
@@ -1237,6 +1268,12 @@ async fn cancelled_workflow_is_not_retried() {
     worker.shutdown();
     let _ = worker_handle.await;
 
+    // Scope: this verifies that cancelling a timer-PARKED run seals it CANCELLED
+    // and starts no second execution. Because cancel deletes the parked workflow
+    // task and seals CANCELLED directly (the handler is never re-run), the
+    // failure->retry gate is not exercised here; genuinely covering "a FAILED run
+    // that is then cancelled is not retried" would require a failing-then-cancelled
+    // race and is left as a follow-up.
     // No retry was performed.
     assert_eq!(
         metrics.retry_count(),

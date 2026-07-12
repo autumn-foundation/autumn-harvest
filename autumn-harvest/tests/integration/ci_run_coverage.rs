@@ -135,28 +135,6 @@ const SELF_EXCLUDE: &[&str] = &["ci_run_coverage", "migration_hygiene"];
 
 const ALLOWLIST_DEBT_REASON: &str = "DB integration test not yet wired to a Docker-backed CI run step; test-coverage debt to shrink";
 const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not yet wired to a Docker-backed CI run step (needs --features testing when wired)";
-// completion_callback_tests: the migration drift that blocked it is FIXED in
-// this PR (swapped to `full_migrations_sql()`), so 19/20 tests pass. But a
-// single PRE-EXISTING, non-schema test-logic bug blocks a green run step:
-// `scanner_scopes_claims_to_the_assigned_shard_when_shards_share_a_pool`
-// inserts two executions sharing `(workflow_name, workflow_id)` into one
-// shared pool and collides on the `harvest_we_workflow_name_workflow_id_active`
-// unique index (a duplicate-key panic in the #605 test setup, unrelated to
-// migrations). Allowlisted pending a follow-up by the #605 owner; see PR report.
-const ALLOWLIST_COMPLETION_CALLBACK_REASON: &str = "migration drift fixed (now uses full_migrations_sql); one pre-existing non-schema \
-     test-logic bug (scanner_scopes… duplicate key on the active-uniqueness index) blocks a \
-     green run step — handed off to the #605 owner (see PR report)";
-// workflow_retry_tests: the run step is deliberately limited to the
-// `::workflow_typed` sub-filter (issue #767 FIX B). Running the WHOLE module
-// fails 3 pre-existing, non-schema #523 workflow-level-retry bugs:
-// cancelled_workflow_is_not_retried, workflow_non_retryable_error_no_retry,
-// workflow_retry_exhaustion_counts_as_one_failure. Verified NOT migration
-// drift: the identical 3 fail under `full_migrations_sql()` too. Handed off to
-// the #523 owner; run step stays limited to workflow_typed. See PR report.
-const ALLOWLIST_WORKFLOW_RETRY_REASON: &str = "run step limited to `workflow_retry_tests::workflow_typed` (issue #767 FIX B); the full \
-     module hits 3 pre-existing NON-schema #523 retry bugs (cancelled_workflow_is_not_retried, \
-     workflow_non_retryable_error_no_retry, workflow_retry_exhaustion_counts_as_one_failure — \
-     identical failures under full_migrations_sql, so NOT drift). Owner: #523. See PR report.";
 // mcp_tools_integration / webhook_* integration: paved-path DB tests
 // (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
 // AND have every test #[ignore]d, so no CI step can execute them. The mcp one
@@ -175,15 +153,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
     ("core:cancellation_tests", ALLOWLIST_DEBT_REASON),
     ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
-    (
-        "core:completion_callback_tests",
-        ALLOWLIST_COMPLETION_CALLBACK_REASON,
-    ),
     ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
     ("core:cross_workflow_signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:debounce_tests", ALLOWLIST_DEBT_REASON),
     ("core:delayed_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:event_batch_tests", ALLOWLIST_DEBT_REASON),
     ("core:legal_hold_tests", ALLOWLIST_DEBT_REASON),
     ("core:metrics_integration", ALLOWLIST_DEBT_REASON),
     ("core:pause_tests", ALLOWLIST_DEBT_REASON),
@@ -214,7 +187,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:workflow_handle_tests", ALLOWLIST_DEBT_REASON),
-    ("core:workflow_retry_tests", ALLOWLIST_WORKFLOW_RETRY_REASON),
     ("core:workflow_task_timeout_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
@@ -273,14 +245,12 @@ const ALLOWLIST: &[(&str, &str)] = &[
 
 /// Soft ratchet: the allowlist may shrink but must never silently grow. Bump
 /// this ONLY with a deliberate justification (it should trend toward zero).
-/// 77 = the prior 73 plus the four surfaced by this hardening pass:
-///   * `core:workflow_retry_tests` — Fix #1 stopped a `::workflow_typed`
-///     sub-filter from masking the whole module (3 genuine #523 bugs);
-///   * `plugin:mcp_tools_integration`, `plugin:webhook_durable_integration`,
-///     `plugin:webhook_receiver_integration` — Fix #2 stopped the paved
-///     `TestDb`/`run_pending` DB harness from evading classification (all three
-///     are feature-gated + fully `#[ignore]`d, so no CI step can run them).
-const ALLOWLIST_MAX_LEN: usize = 77;
+/// 74 = the prior 77 minus the three wired to Docker-backed run steps in the
+/// PR-#1031 follow-up (each was a test-harness bug, now fixed, so the whole
+/// module runs green): `core:workflow_retry_tests` (its `::workflow_typed`
+/// sub-filter now covers the whole module), `core:completion_callback_tests`,
+/// and `core:event_batch_tests`.
+const ALLOWLIST_MAX_LEN: usize = 74;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
