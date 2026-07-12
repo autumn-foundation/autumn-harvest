@@ -53,7 +53,7 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_task_queue, harvest_workflow_executions,
 };
-use autumn_harvest::telemetry::TelemetryConfig;
+use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
@@ -354,6 +354,30 @@ impl ActivityInterceptor for InputInjectInterceptor {
     }
 }
 
+/// Maps the chain's `Ok` result to `Err` AFTER calling `next` (issue #680 Codex
+/// P2). For a transactional activity the inner handler has already sealed its
+/// `ActivityCompleted` + task-COMPLETED atomically before `next.run` returns, so
+/// this error transform is silently discarded from history — the point of the
+/// consistency fix is that metrics / circuit-breaker must reflect the committed
+/// (sealed) outcome, NOT this discarded post-`next` `Err`.
+struct OkToErrInterceptor;
+impl ActivityInterceptor for OkToErrInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        _invocation: &'a ActivityInvocation<'a>,
+        _ctx: &'a autumn_harvest::ActivityContext,
+        input: serde_json::Value,
+        next: ActivityInterceptorNext<'a>,
+    ) -> ActivityInterceptorFuture<'a> {
+        Box::pin(async move {
+            // If the handler committed Ok, discard the committed value and map to
+            // Err (a `?` propagates a genuine handler Err unchanged).
+            let _committed = next.run(input).await?;
+            Err("interceptor mapped a committed Ok to Err".to_string())
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers (benign — interceptors carry the behaviour under test).
 // ---------------------------------------------------------------------------
@@ -362,6 +386,41 @@ impl ActivityInterceptor for InputInjectInterceptor {
 /// shared log for the ordering test.
 fn echo_activity(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
+}
+
+/// Transactional activity: seals `ActivityCompleted { output: input }` + task
+/// COMPLETED atomically via `ctx.run_transactional`, then returns the committed
+/// value (issue #680 Codex P2 fixture). A benign `SELECT 1` proves the
+/// transaction's connection is usable; the closure returning `Ok(input)` records
+/// `input` as the committed output. Because the seal happens inside the user's
+/// transaction — BEFORE any outer interceptor regains control from `next.run` —
+/// an outer interceptor cannot alter the recorded outcome.
+fn txn_commit_activity(
+    ctx: &autumn_harvest::ActivityContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.run_transactional(|conn| {
+            Box::pin(async move {
+                diesel::sql_query("SELECT 1")
+                    .execute(conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(input)
+            })
+        })
+        .await
+    })
+}
+
+/// Workflow: run one transactional activity (`txn_commit`), return its result.
+fn wf_one_txn_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw("txn_commit", input, &queue)
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// Second regular activity: echoes its input.
@@ -459,6 +518,67 @@ fn build_registry(
         )
         .with_activity_interceptors(interceptors),
     )
+}
+
+/// Like [`build_registry`] but wires a capturing [`MetricsRecorder`] so a test
+/// can assert exactly which activity outcome the worker recorded (issue #680
+/// Codex P2 — proving metrics reflect the committed transactional outcome).
+fn build_registry_with_telemetry(
+    workflows: Vec<WorkflowInfo>,
+    activities: Vec<ActivityInfo>,
+    interceptors: Vec<Arc<dyn ActivityInterceptor>>,
+    metrics: Arc<dyn MetricsRecorder>,
+) -> Arc<HandlerRegistry> {
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
+    Arc::new(
+        HandlerRegistry::with_state_and_telemetry(
+            workflows,
+            activities,
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
+        )
+        .with_activity_interceptors(interceptors),
+    )
+}
+
+/// A capturing [`MetricsRecorder`] recording only the calls the transactional
+/// consistency tests assert on. `completions` is `(activity_name, status_str)`.
+#[derive(Default)]
+struct RecordingMetrics {
+    completions: Mutex<Vec<(String, String)>>,
+    failed: Mutex<Vec<String>>,
+    tripped: Mutex<Vec<String>>,
+    retried: Mutex<Vec<String>>,
+}
+impl MetricsRecorder for RecordingMetrics {
+    fn record_activity_completed_with_error_type(
+        &self,
+        activity_name: &str,
+        _queue: &str,
+        _duration_secs: f64,
+        status: ActivityStatus,
+        _error_type: Option<&str>,
+    ) {
+        self.completions
+            .lock()
+            .unwrap()
+            .push((activity_name.to_string(), status.as_str().to_string()));
+    }
+    fn record_activity_failed(
+        &self,
+        activity_name: &str,
+        _workflow_type: &str,
+        _error_type: &str,
+        _non_retryable: bool,
+    ) {
+        self.failed.lock().unwrap().push(activity_name.to_string());
+    }
+    fn record_circuit_tripped(&self, activity_name: &str) {
+        self.tripped.lock().unwrap().push(activity_name.to_string());
+    }
+    fn record_activity_retried(&self, activity_name: &str, _queue: &str) {
+        self.retried.lock().unwrap().push(activity_name.to_string());
+    }
 }
 
 fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
@@ -1423,5 +1543,213 @@ async fn interceptor_input_transform_reaches_handler_end_to_end() {
         workflow_completed_output(&history),
         expected,
         "the workflow must observe the handler's output over the transformed input"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 (issue #680 Codex P2 — load-bearing) — an OUTER interceptor that maps
+// a transactional activity's committed Ok → Err must NOT trip the circuit
+// breaker and must NOT record the attempt as Failed. A transactional activity
+// seals its own `ActivityCompleted` + task-COMPLETED atomically inside the
+// user's transaction; the interceptor's error transform is discarded from
+// history, so metrics + the circuit breaker must reflect the committed (sealed)
+// outcome, not the discarded post-`next` Err.
+//
+// Pre-fix this FAILS: the worker consumed the post-interceptor `Err`, so the
+// breaker tripped and metrics recorded Failed on an outcome history records as
+// ActivityCompleted — a real observability/history divergence NEW to
+// interceptors.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_error_transform_on_transactional_activity_does_not_trip_breaker() {
+    let (url, _container) = setup_db().await;
+    let queue = "q-txn-int-err";
+    let mut conn = connect(&url).await;
+    let value = serde_json::json!({ "v": 11, "committed": true });
+    let exec_id = seed_workflow(&mut conn, "wf_one_txn_activity", value.clone(), queue).await;
+
+    // failure_threshold = 1 (one retryable failure trips the breaker); retry
+    // budget 5 (pre-fix the worker also spuriously requeues the COMPLETED task).
+    let metrics = Arc::new(RecordingMetrics::default());
+    let registry = build_registry_with_telemetry(
+        vec![wf_info("wf_one_txn_activity", wf_one_txn_activity)],
+        vec![act_info_with_breaker(
+            "txn_commit",
+            txn_commit_activity,
+            false,
+            Some(RetryPolicy::fixed(5, Duration::from_millis(30))),
+            Some(CircuitBreakerPolicy::new(
+                1,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )),
+        )],
+        vec![Arc::new(OkToErrInterceptor)],
+        metrics.clone(),
+    );
+    let worker = build_worker("worker-txn-int-err", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    // The workflow observes the committed ActivityCompleted and completes; the
+    // interceptor's Err never reaches history (run_to_state asserts COMPLETED).
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // (a) The RECORDED history is the committed value — the transform was NOT
+    // applied to history, and there is no terminal ActivityFailed.
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        activity_completed_output(&history),
+        value,
+        "the committed ActivityCompleted output must be the transactional value V"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        "the discarded interceptor Err must never be recorded as an ActivityFailed; \
+         history={history:?}"
+    );
+
+    // (b) The workflow observes V.
+    assert_eq!(
+        workflow_completed_output(&history),
+        value,
+        "the workflow must observe the committed value V"
+    );
+
+    // (c) LOAD-BEARING: the breaker did NOT trip — it reflects the committed
+    // (Success) outcome, not the interceptor's discarded retryable Err.
+    let snap = registry
+        .circuit_breakers()
+        .snapshot("txn_commit", std::time::Instant::now())
+        .expect("the breaker must be tracked");
+    assert_eq!(
+        snap.state, "closed",
+        "a transactional self-commit must be treated as Success by the breaker, so it \
+         stays closed even though an outer interceptor mapped the committed Ok to Err"
+    );
+    assert!(
+        metrics.tripped.lock().unwrap().is_empty(),
+        "no circuit-tripped metric for a committed transactional activity"
+    );
+
+    // (c cont.) Metrics record the attempt as Completed, never Failed.
+    assert_eq!(
+        *metrics.completions.lock().unwrap(),
+        vec![("txn_commit".to_string(), "completed".to_string())],
+        "the duration/attempt metric must record the committed Completed outcome once"
+    );
+    assert!(
+        metrics.failed.lock().unwrap().is_empty(),
+        "no per-attempt activity.failed metric for a committed outcome"
+    );
+
+    // (d) No spurious retry and no DLQ row — the sealed task is not requeued.
+    assert!(
+        metrics.retried.lock().unwrap().is_empty(),
+        "a self-committed activity must never be requeued for retry; got {:?}",
+        metrics.retried.lock().unwrap()
+    );
+    assert_eq!(
+        count_dead_letters(&url, exec_id).await,
+        (0, 0),
+        "a committed transactional activity must not produce a dead-letter row"
+    );
+    // The single activity task is sealed COMPLETED on its first attempt — the
+    // fix skips the finalize/retry path, so it is never re-pended.
+    let activity_tasks: Vec<_> = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .filter(|t| t.task_type == "activity")
+        .collect();
+    assert_eq!(
+        activity_tasks.len(),
+        1,
+        "one activity task for one dispatch"
+    );
+    assert_eq!(
+        (activity_tasks[0].state.as_str(), activity_tasks[0].attempt),
+        ("COMPLETED", 1),
+        "the sealed task must be COMPLETED and never requeued to a second attempt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 (issue #680 Codex P2) — an OUTER interceptor's Ok→Ok′ result
+// transform on a transactional activity is observably IGNORED: history keeps
+// the committed value V (not V′), the workflow observes V, and metrics record
+// Completed. This documents that an interceptor observes but cannot transform a
+// self-sealed transactional outcome; history == metrics == breaker all reflect V.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_result_transform_on_transactional_activity_is_observably_ignored() {
+    let (url, _container) = setup_db().await;
+    let queue = "q-txn-int-ok";
+    let mut conn = connect(&url).await;
+    let value = serde_json::json!({ "v": 12 });
+    let exec_id = seed_workflow(&mut conn, "wf_one_txn_activity", value.clone(), queue).await;
+
+    // CountingTransformInterceptor maps the handler's Ok(V) → Ok({"intercepted": V}).
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let metrics = Arc::new(RecordingMetrics::default());
+    let registry = build_registry_with_telemetry(
+        vec![wf_info("wf_one_txn_activity", wf_one_txn_activity)],
+        vec![act_info("txn_commit", txn_commit_activity, false, None)],
+        vec![Arc::new(CountingTransformInterceptor {
+            seen: seen.clone(),
+        })],
+        metrics.clone(),
+    );
+    let worker = build_worker("worker-txn-int-ok", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    // The recorded output is the committed V, NOT the interceptor's {"intercepted": V}.
+    assert_eq!(
+        activity_completed_output(&history),
+        value,
+        "the committed ActivityCompleted output must be V, not the interceptor's Ok′ \
+         transform — a transactional activity seals its own outcome"
+    );
+    assert_eq!(
+        workflow_completed_output(&history),
+        value,
+        "the workflow must observe the committed V, not the discarded Ok′ transform"
+    );
+    // Metrics reflect the committed Completed outcome.
+    assert_eq!(
+        *metrics.completions.lock().unwrap(),
+        vec![("txn_commit".to_string(), "completed".to_string())],
+        "metrics must record Completed for the committed transactional activity"
+    );
+    assert!(
+        metrics.failed.lock().unwrap().is_empty(),
+        "no activity.failed metric for a committed Ok outcome"
+    );
+    // The interceptor still ran exactly once over the regular (non-local) activity.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("txn_commit".to_string(), false)],
+        "the interceptor observes the invocation once even though its transform is ignored"
     );
 }

@@ -51,16 +51,42 @@
 //!
 //! Interceptors run only on the worker dispatch path. The deterministic replay
 //! engine never invokes activity handlers — it reads recorded
-//! `ActivityCompleted`/`ActivityFailed` events. The value an interceptor chain
-//! returns *becomes* the recorded activity result, so replay simply reads it
-//! back; interceptors are never re-invoked during replay of a completed
-//! activity.
+//! `ActivityCompleted`/`ActivityFailed` events. For a **non-transactional**
+//! activity the value an interceptor chain returns *becomes* the recorded
+//! activity result, so replay simply reads it back; interceptors are never
+//! re-invoked during replay of a completed activity. (The one exception is a
+//! **transactional** activity, whose handler seals its own recorded outcome
+//! before the chain unwinds — see [Transactional activities](#transactional-activities)
+//! below.)
 //!
 //! Transforming the `input` an interceptor passes to the handler changes only
 //! what the handler *computes*; it does **not** change the `ActivityScheduled`
 //! event, whose `input` is fixed by workflow code at schedule time and recorded
 //! before dispatch ever reaches the interceptor. An input transform therefore
 //! cannot diverge replay — the scheduled input on the record is unaffected.
+//!
+//! # Transactional activities
+//!
+//! An interceptor **observes but cannot transform** the recorded outcome of an
+//! activity that calls [`ActivityContext::run_transactional`](crate::context::ActivityContext::run_transactional).
+//! A transactional activity atomically appends its `ActivityCompleted` event and
+//! marks its task `COMPLETED` *inside the user's transaction* — before an outer
+//! interceptor regains control from [`ActivityInterceptorNext::run`]. The sealed
+//! outcome is immutable, so a result transform (`Ok(V)` → `Ok(V′)`) or an error
+//! transform (`Ok(V)` → `Err(e)`) applied after `next.run` is **silently
+//! discarded from history**: the workflow always observes the committed value
+//! `V`. Result/error transforms therefore take effect only on **non-transactional**
+//! activities.
+//!
+//! For a transactional activity the engine keeps its observability consistent
+//! with the committed (sealed) outcome: metrics record the committed success and
+//! the per-activity circuit breaker is fed `Success`, ignoring any post-`next`
+//! transform — so an interceptor that maps a committed `Ok` to `Err` can never
+//! trip the breaker or record a failure that contradicts the recorded
+//! `ActivityCompleted`. An interceptor may still legitimately *observe* a
+//! transactional activity (logging, metrics, input shaping before `next.run`);
+//! only its attempt to *change the outcome after* the seal is ignored, and such
+//! an attempt is surfaced with a `tracing::warn!`.
 //!
 //! # Input is plaintext
 //!

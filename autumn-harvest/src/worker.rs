@@ -6457,8 +6457,22 @@ async fn process_activity_task(
         other => other,
     };
 
+    // Issue #680: a transactional activity that called `ctx.run_transactional`
+    // and committed has already atomically sealed its `ActivityCompleted` event
+    // and task-COMPLETED transition inside the user's transaction — before an
+    // outer interceptor regained control from `next.run`. Any result/error
+    // transform the interceptor then applied is discarded from history (the seal
+    // is immutable). When a self-commit occurred, the authoritative outcome is
+    // that committed success, so metrics and the circuit breaker must reflect it
+    // rather than the (possibly transformed) post-interceptor `activity_result`.
+    // Reading here (before `activity_future` is dropped) is a shared borrow of
+    // `ctx` alongside the future's own shared borrow — the future has already
+    // resolved. On non-`db` builds `run_transactional` does not exist, so the
+    // flag is always false.
+    let committed_transactionally = ctx.transactional_commit_occurred();
+
     let duration_secs = started_at.elapsed().as_secs_f64();
-    let status = if activity_result.is_ok() {
+    let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
         ActivityStatus::Failed
@@ -6466,11 +6480,16 @@ async fn process_activity_task(
     // Parse the structured payload once and reuse for both the histogram
     // and the per-failure counter (so the `error.type` attribute is
     // consistent across `harvest.activity.duration` and
-    // `harvest.activity.failed`).
-    let failure_info = activity_result
-        .as_ref()
-        .err()
-        .map(|payload| parse_error_payload(payload));
+    // `harvest.activity.failed`). Suppressed for a self-committed activity: its
+    // recorded outcome is a success, so it emits no failure attribute/counter.
+    let failure_info = if committed_transactionally {
+        None
+    } else {
+        activity_result
+            .as_ref()
+            .err()
+            .map(|payload| parse_error_payload(payload))
+    };
     telemetry.metrics.record_activity_completed_with_error_type(
         activity_name,
         &task.queue_name,
@@ -6524,6 +6543,11 @@ async fn process_activity_task(
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
         }
         None
+    } else if committed_transactionally {
+        // Issue #680: the committed transactional outcome is a success, so feed
+        // the breaker `Success` regardless of any interceptor error transform —
+        // a self-committed activity must never trip the circuit.
+        Some(crate::circuit_breaker::AttemptOutcome::Success)
     } else {
         Some(match activity_result.as_ref() {
             Ok(_) => crate::circuit_breaker::AttemptOutcome::Success,
@@ -6549,6 +6573,30 @@ async fn process_activity_task(
                 telemetry.metrics.record_circuit_closed(activity_name);
             }
         }
+    }
+
+    // Issue #680: a self-committed transactional activity has already sealed its
+    // `ActivityCompleted` + task-COMPLETED atomically, so there is nothing left
+    // to persist. Skip the finalize/retry path entirely: `handle_activity_result`
+    // would at best no-op (the task is not RUNNING) and, on a retryable
+    // post-interceptor `Err` with retry budget, would spuriously attempt a
+    // `requeue_for_retry` that logs a NotFound against the already-COMPLETED
+    // task. An outer interceptor cannot un-commit the sealed outcome, so any
+    // result/error transform it applied after `next.run` is ignored; when that
+    // transform turned the committed success into an `Err`, surface the misuse
+    // with a single clear warning (mirroring the previous finalize-path warning).
+    if committed_transactionally {
+        if activity_result.is_err() {
+            tracing::warn!(
+                task_id = %task.id,
+                activity_name = %activity_name,
+                "an interceptor (or post-commit handler code) transformed the outcome of a \
+                 transactional activity to an error; the transform is ignored — the handler \
+                 sealed ActivityCompleted atomically via run_transactional, so the workflow \
+                 observes the committed success"
+            );
+        }
+        return Ok(());
     }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
