@@ -2342,6 +2342,16 @@ impl WorkflowContext {
 
     // ── Accessors ─────────────────────────────────────────────────────
 
+    /// The task queue this workflow execution runs on.
+    ///
+    /// Set by the executor from `WorkflowExecuteSpanMeta.queue_name` (the
+    /// counterpart of [`with_queue_name`](Self::with_queue_name)); empty for
+    /// bare `new_test()` contexts that never went through the executor.
+    #[must_use]
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
+    }
+
     /// Deterministic "wall clock" — returns the `WorkflowStarted` timestamp
     /// so that all replays produce the same result.
     ///
@@ -8687,6 +8697,21 @@ pub struct ActivityContext {
     /// Activity metrics are never suppressed — each invocation (including retries)
     /// emits independently.
     metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    /// Set to `true` when a [`Self::run_transactional`] call on this context
+    /// successfully commits (issue #680).
+    ///
+    /// A transactional activity atomically appends `ActivityCompleted` and marks
+    /// its task `COMPLETED` *inside the user's transaction* — before an outer
+    /// activity interceptor regains control from `next.run`. Any result/error
+    /// transform the interceptor then applies is silently discarded from history
+    /// (the sealed outcome is immutable). The worker reads this flag after the
+    /// interceptor chain resolves and keeps metrics + the circuit breaker
+    /// consistent with the committed outcome, rather than the discarded
+    /// post-interceptor result. Interior-mutable so `run_transactional(&self)`
+    /// can set it; the same context instance the handler borrows is the one the
+    /// worker reads afterward, so no `Arc` is required.
+    #[cfg(feature = "db")]
+    transactional_commit_occurred: std::sync::atomic::AtomicBool,
 }
 
 impl ActivityContext {
@@ -8719,6 +8744,8 @@ impl ActivityContext {
             transactional_state: None,
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            #[cfg(feature = "db")]
+            transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -8755,6 +8782,7 @@ impl ActivityContext {
             transactional_state: None,
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -8780,6 +8808,8 @@ impl ActivityContext {
             transactional_state: None,
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            #[cfg(feature = "db")]
+            transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -8918,6 +8948,23 @@ impl ActivityContext {
     pub(crate) fn with_transactional_state(mut self, state: TransactionalState) -> Self {
         self.transactional_state = Some(state);
         self
+    }
+
+    /// Whether a [`Self::run_transactional`] call on this context has
+    /// successfully committed (issue #680).
+    ///
+    /// The worker reads this after the interceptor chain resolves. A committed
+    /// transactional activity has already atomically sealed its
+    /// `ActivityCompleted` event and marked the task `COMPLETED` inside the
+    /// user's transaction — *before* an outer interceptor regains control from
+    /// `next.run`. Any result/error transform an interceptor applies after that
+    /// point is discarded from history, so when this returns `true` the worker
+    /// treats the outcome as the committed success for metrics and the circuit
+    /// breaker, ignoring the post-interceptor result.
+    #[cfg(feature = "db")]
+    pub(crate) fn transactional_commit_occurred(&self) -> bool {
+        self.transactional_commit_occurred
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The stable idempotency key for this logical activity invocation.
@@ -9268,6 +9315,14 @@ impl ActivityContext {
     ///   regular activities with idempotency keys instead.
     /// * **Heartbeating is unaffected** — `ctx.heartbeat()` still works
     ///   normally outside the `run_transactional` closure.
+    /// * **An outer activity interceptor cannot transform the sealed outcome.**
+    ///   Because the `ActivityCompleted` + task-COMPLETED seal happens inside
+    ///   this transaction — before any interceptor regains control from
+    ///   `next.run` — an interceptor that maps the committed `Ok` to `Err` or to
+    ///   a different `Ok` value has that transform silently discarded from
+    ///   history (the workflow observes the committed value). The engine keeps
+    ///   metrics and the per-activity circuit breaker consistent with the
+    ///   committed success in that case. See the `interceptor` module docs.
     ///
     /// # Errors
     ///
@@ -9297,6 +9352,7 @@ impl ActivityContext {
     /// }
     /// ```
     #[cfg(feature = "db")]
+    #[allow(clippy::too_many_lines)]
     pub async fn run_transactional<T, F>(&self, f: F) -> Result<T, String>
     where
         F: for<'conn> FnOnce(
@@ -9354,94 +9410,109 @@ impl ActivityContext {
                 format!("transactional activity failed to acquire DB connection: {e}")
             })?;
 
-        conn.transaction::<T, TxError, _>(|conn| {
-            async move {
-                // Run user domain writes.
-                let user_result = f(conn).await.map_err(TxError::User)?;
+        let result = conn
+            .transaction::<T, TxError, _>(|conn| {
+                async move {
+                    // Run user domain writes.
+                    let user_result = f(conn).await.map_err(TxError::User)?;
 
-                // Serialize the result for the event log.
-                let output =
-                    serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+                    // Serialize the result for the event log.
+                    let output =
+                        serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
 
-                // Enforce the result-size cap before committing.  The worker's
-                // post-handler cap check runs after the handler returns, which
-                // is too late for transactional activities — the event would
-                // already be committed.  Rolling back here ensures an oversized
-                // result never lands in harvest_events.
-                if max_result_bytes > 0 {
-                    let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                    if observed > max_result_bytes {
-                        use crate::failure::IntoActivityErrorString as _;
-                        let payload = crate::failure::ActivityFailure::non_retryable(
-                            "PayloadTooLarge",
-                            format!(
-                                "transactional activity result exceeds cap: \
+                    // Enforce the result-size cap before committing.  The worker's
+                    // post-handler cap check runs after the handler returns, which
+                    // is too late for transactional activities — the event would
+                    // already be committed.  Rolling back here ensures an oversized
+                    // result never lands in harvest_events.
+                    if max_result_bytes > 0 {
+                        let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                        if observed > max_result_bytes {
+                            use crate::failure::IntoActivityErrorString as _;
+                            let payload = crate::failure::ActivityFailure::non_retryable(
+                                "PayloadTooLarge",
+                                format!(
+                                    "transactional activity result exceeds cap: \
                                  {observed} bytes (cap {max_result_bytes} bytes)"
-                            ),
-                        )
-                        .into_error_payload();
-                        return Err(TxError::Payload(payload));
+                                ),
+                            )
+                            .into_error_payload();
+                            return Err(TxError::Payload(payload));
+                        }
                     }
-                }
 
-                // Lock the execution row first (consistent with the rest of the
-                // codebase: harvest_workflow_executions → harvest_task_queue)
-                // and load history so we can compute the next sequential
-                // event_id before appending.
-                let history = crate::store::lock_and_load_history(conn, exec_id).await?;
+                    // Lock the execution row first (consistent with the rest of the
+                    // codebase: harvest_workflow_executions → harvest_task_queue)
+                    // and load history so we can compute the next sequential
+                    // event_id before appending.
+                    let history = crate::store::lock_and_load_history(conn, exec_id).await?;
 
-                // Idempotency guard: verify the task is still RUNNING before
-                // we commit.  If it's already COMPLETED (e.g. this is a
-                // crash-recovery attempt where the first transaction succeeded)
-                // we roll back the user writes so the caller sees a clean
-                // slate, matching the "exactly-once" contract.
-                match crate::queue::task_state_for_update(conn, task_id).await? {
-                    Some(ref s) if s == "RUNNING" => {}
-                    Some(other) => {
-                        return Err(TxError::Harvest(HarvestError::Config(format!(
-                            "transactional activity task {task_id} is in state '{other}', \
+                    // Idempotency guard: verify the task is still RUNNING before
+                    // we commit.  If it's already COMPLETED (e.g. this is a
+                    // crash-recovery attempt where the first transaction succeeded)
+                    // we roll back the user writes so the caller sees a clean
+                    // slate, matching the "exactly-once" contract.
+                    match crate::queue::task_state_for_update(conn, task_id).await? {
+                        Some(ref s) if s == "RUNNING" => {}
+                        Some(other) => {
+                            return Err(TxError::Harvest(HarvestError::Config(format!(
+                                "transactional activity task {task_id} is in state '{other}', \
                              not RUNNING; rolling back user writes (the ActivityCompleted \
                              event was already committed by a prior attempt)"
-                        ))));
-                    }
-                    None => {
-                        return Err(TxError::Harvest(HarvestError::Config(format!(
-                            "transactional activity task {task_id} no longer exists; \
+                            ))));
+                        }
+                        None => {
+                            return Err(TxError::Harvest(HarvestError::Config(format!(
+                                "transactional activity task {task_id} no longer exists; \
                              rolling back user writes"
-                        ))));
+                            ))));
+                        }
                     }
+
+                    // Append ActivityCompleted within the same transaction.
+                    let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
+                        activity_id,
+                        output: output.clone(),
+                    };
+                    crate::store::append_events(
+                        conn,
+                        exec_id,
+                        &[completion_event],
+                        history.next_event_id,
+                    )
+                    .await?;
+
+                    // Mark the task COMPLETED.
+                    crate::queue::complete_task(conn, task_id, output).await?;
+
+                    // Wake the workflow so it can pick up the ActivityCompleted
+                    // result on its next execution cycle.
+                    crate::queue::wake_workflow_task(conn, exec_id).await?;
+
+                    Ok(user_result)
                 }
+                .scope_boxed()
+            })
+            .await;
 
-                // Append ActivityCompleted within the same transaction.
-                let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
-                    activity_id,
-                    output: output.clone(),
-                };
-                crate::store::append_events(
-                    conn,
-                    exec_id,
-                    &[completion_event],
-                    history.next_event_id,
-                )
-                .await?;
-
-                // Mark the task COMPLETED.
-                crate::queue::complete_task(conn, task_id, output).await?;
-
-                // Wake the workflow so it can pick up the ActivityCompleted
-                // result on its next execution cycle.
-                crate::queue::wake_workflow_task(conn, exec_id).await?;
-
-                Ok(user_result)
+        match result {
+            Ok(value) => {
+                // Commit succeeded (issue #680): the sealed ActivityCompleted +
+                // task-COMPLETED are durable and immutable. Flag the self-commit
+                // so the worker keeps metrics/circuit-breaker consistent with the
+                // committed outcome, ignoring any post-`next` interceptor
+                // transform. Set only here (committed-Ok path); a rolled-back txn
+                // leaves it false so the failure flows through the normal path.
+                self.transactional_commit_occurred
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
             }
-            .scope_boxed()
-        })
-        .await
-        .map_err(|e| match e {
-            TxError::User(s) => s,
-            TxError::Harvest(he) => he.to_string(),
-            TxError::Payload(p) => p,
-        })
+            Err(e) => Err(match e {
+                TxError::User(s) => s,
+                TxError::Harvest(he) => he.to_string(),
+                TxError::Payload(p) => p,
+            }),
+        }
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.

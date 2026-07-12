@@ -35,6 +35,9 @@ pub use crate::handle_typed::{
     TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
 };
 pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+pub use crate::interceptor::{
+    ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
+};
 pub use crate::policy::{
     CircuitBreakerPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy,
     TaskStatus, TriggerRule, WorkflowSchedule,

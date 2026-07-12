@@ -73,6 +73,10 @@ pub struct HarvestBuilder {
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Ordered activity execution interceptor chain (issue #680). Index 0 is the
+    /// OUTERMOST wrapper; the activity handler is innermost. Empty (default) =
+    /// no interceptors.
+    activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
     payload_codecs: PayloadCodecs,
     /// Embedder-supplied external blob store for large-payload offloading (issue #524).
     payload_store: Option<Arc<dyn crate::payload_store::PayloadStore>>,
@@ -151,6 +155,7 @@ impl Default for HarvestBuilder {
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
             history_archiver: None,
+            activity_interceptors: Vec::new(),
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             payload_store: None,
             payload_offload_threshold: DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD,
@@ -239,6 +244,8 @@ pub struct BuiltHarvest {
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Ordered activity execution interceptor chain (issue #680). Index 0 = outermost.
+    activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
     payload_codecs: PayloadCodecs,
     /// Configured large-payload offloader (issue #524). `None` = no store registered.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
@@ -666,6 +673,13 @@ impl BuiltHarvest {
         self.payload_offloader.as_ref()
     }
 
+    /// The configured activity execution interceptor chain (issue #680), in
+    /// registration order (index 0 = outermost).
+    #[must_use]
+    pub fn activity_interceptors(&self) -> &[Arc<dyn crate::interceptor::ActivityInterceptor>] {
+        &self.activity_interceptors
+    }
+
     /// History-size guardrails applied to workflow contexts and workers.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -842,7 +856,8 @@ impl BuiltHarvest {
             )
             .with_current_details_cap(self.max_current_details_bytes)
             .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
-            .with_payload_offloader(self.payload_offloader.clone()),
+            .with_payload_offloader(self.payload_offloader.clone())
+            .with_activity_interceptors(self.activity_interceptors.clone()),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -888,7 +903,8 @@ impl BuiltHarvest {
             )
             .with_current_details_cap(self.max_current_details_bytes)
             .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
-            .with_payload_offloader(self.payload_offloader.clone()),
+            .with_payload_offloader(self.payload_offloader.clone())
+            .with_activity_interceptors(self.activity_interceptors.clone()),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -1170,6 +1186,27 @@ impl HarvestBuilder {
     #[must_use]
     pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
         self.history_archiver = Some(Arc::new(archiver));
+        self
+    }
+
+    /// Register an activity execution interceptor (issue #680).
+    ///
+    /// Interceptors wrap **every** activity execution on the worker — regular
+    /// and local. Call this repeatedly to build an ordered chain: the
+    /// **first-registered interceptor is the OUTERMOST wrapper** (runs first on
+    /// the way in, last on the way out) and the activity handler is innermost.
+    ///
+    /// An interceptor may transform the input, transform the result or error,
+    /// or short-circuit (returning without calling `next.run`, so the handler
+    /// never runs). An interceptor error and panic are contained on the same
+    /// retry / circuit-breaker / dead-letter path as a handler error/panic. See
+    /// [`crate::interceptor`] for the full contract.
+    #[must_use]
+    pub fn activity_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::ActivityInterceptor,
+    ) -> Self {
+        self.activity_interceptors.push(Arc::new(interceptor));
         self
     }
 
@@ -1599,6 +1636,7 @@ impl HarvestBuilder {
             telemetry: telemetry_arc,
             retention: self.retention,
             history_archiver: self.history_archiver,
+            activity_interceptors: self.activity_interceptors,
             payload_codecs: self.payload_codecs.clone(),
             payload_offloader,
             history_policy: self.history_policy,

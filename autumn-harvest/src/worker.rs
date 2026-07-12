@@ -378,6 +378,10 @@ pub struct HandlerRegistry {
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Ordered activity execution interceptor chain (issue #680). Index 0 is
+    /// the OUTERMOST wrapper. Empty (the default) = no interceptors, and the
+    /// dispatch path takes a zero-overhead direct handler call.
+    activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
 }
 
 impl HandlerRegistry {
@@ -515,6 +519,7 @@ impl HandlerRegistry {
             )),
             max_workflow_attempts_ceiling: None,
             payload_offloader: None,
+            activity_interceptors: Vec::new(),
         }
     }
 
@@ -610,6 +615,26 @@ impl HandlerRegistry {
     #[must_use]
     pub fn payload_offloader_arc(&self) -> Option<Arc<crate::payload_store::PayloadOffloader>> {
         self.payload_offloader.clone()
+    }
+
+    /// Install the ordered activity execution interceptor chain (issue #680).
+    ///
+    /// Index 0 is the OUTERMOST wrapper; the activity handler is innermost.
+    /// Applies to every activity execution on the worker — regular and local.
+    #[must_use]
+    pub fn with_activity_interceptors(
+        mut self,
+        interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
+    ) -> Self {
+        self.activity_interceptors = interceptors;
+        self
+    }
+
+    /// Borrow the configured activity interceptor chain (issue #680). Empty when
+    /// none are registered.
+    #[must_use]
+    pub fn activity_interceptors(&self) -> &[Arc<dyn crate::interceptor::ActivityInterceptor>] {
+        &self.activity_interceptors
     }
 
     /// Clone the shared state reference for runtime contexts.
@@ -708,6 +733,10 @@ impl std::fmt::Debug for HandlerRegistry {
                 &self.max_workflow_attempts_ceiling,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
+            .field(
+                "activity_interceptor_count",
+                &self.activity_interceptors.len(),
+            )
             .finish()
     }
 }
@@ -1933,6 +1962,15 @@ async fn run_local_activity_inline(
         None
     };
 
+    // Issue #680: the activity interceptor chain wraps local activities too.
+    // The invocation is `is_local = true`; the queue label is the owning
+    // workflow task's queue. When no interceptors are registered
+    // `dispatch_with_interceptors` is a zero-overhead direct handler call. NOTE:
+    // for local activities the chain runs INSIDE the per-attempt local timeout
+    // below, so interceptor time counts against the effective start_to_close.
+    let interceptors = registry.activity_interceptors();
+    let invocation = crate::interceptor::ActivityInvocation::new(&run.name, true, queue_name);
+
     for attempt in start_attempt..=max_attempts {
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
@@ -1954,7 +1992,15 @@ async fn run_local_activity_inline(
         // escape the poll-time `catch_unwind` below. Both a construction panic and
         // a poll panic converge on the same retryable typed HandlerPanic Err and
         // emit `record_activity_panic` exactly once per panicking attempt.
-        let result = match crate::error::catch_construct(|| (handler)(&ctx, run.input.clone())) {
+        let result = match crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                interceptors,
+                &invocation,
+                &ctx,
+                run.input.clone(),
+                |input| (handler)(&ctx, input),
+            )
+        }) {
             Err(message) => {
                 registry
                     .telemetry()
@@ -6321,9 +6367,33 @@ async fn process_activity_task(
     // emits `record_activity_panic` once by inspecting the envelope's error type,
     // so neither the metric nor the circuit-breaker treatment differs from a
     // poll-phase panic.
+    // Issue #680: build the activity execution future through the configured
+    // interceptor chain. When no interceptors are registered
+    // `dispatch_with_interceptors` is a zero-allocation direct call to the same
+    // `(activity.handler)(&ctx, input)` terminal as before (it constructs a
+    // stack `ActivityInvocation` + slice borrow but boxes nothing extra), so the
+    // dispatch path is functionally unchanged for the default (no-interceptor)
+    // case. The
+    // whole chain — interceptors and handler alike — is constructed inside
+    // `catch_construct` and polled inside `catch_unwind`, so a panic in either
+    // an interceptor or the handler is contained on the identical retryable
+    // HandlerPanic path (issue #782). Interceptors run AFTER the circuit-breaker
+    // admit gate above, so a circuit-open short-circuit never reaches here.
+    let activity_interceptors = registry.activity_interceptors();
+    let invocation =
+        crate::interceptor::ActivityInvocation::new(activity_name, false, &task.queue_name);
+    let activity_handler = activity.handler;
     let mut activity_future = {
         use futures::FutureExt as _;
-        match crate::error::catch_construct(|| (activity.handler)(&ctx, task.input.clone())) {
+        match crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                activity_interceptors,
+                &invocation,
+                &ctx,
+                task.input.clone(),
+                |input| (activity_handler)(&ctx, input),
+            )
+        }) {
             Ok(fut) => std::panic::AssertUnwindSafe(fut)
                 .catch_unwind()
                 .map(|caught| match caught {
@@ -6387,8 +6457,22 @@ async fn process_activity_task(
         other => other,
     };
 
+    // Issue #680: a transactional activity that called `ctx.run_transactional`
+    // and committed has already atomically sealed its `ActivityCompleted` event
+    // and task-COMPLETED transition inside the user's transaction — before an
+    // outer interceptor regained control from `next.run`. Any result/error
+    // transform the interceptor then applied is discarded from history (the seal
+    // is immutable). When a self-commit occurred, the authoritative outcome is
+    // that committed success, so metrics and the circuit breaker must reflect it
+    // rather than the (possibly transformed) post-interceptor `activity_result`.
+    // Reading here (before `activity_future` is dropped) is a shared borrow of
+    // `ctx` alongside the future's own shared borrow — the future has already
+    // resolved. On non-`db` builds `run_transactional` does not exist, so the
+    // flag is always false.
+    let committed_transactionally = ctx.transactional_commit_occurred();
+
     let duration_secs = started_at.elapsed().as_secs_f64();
-    let status = if activity_result.is_ok() {
+    let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
         ActivityStatus::Failed
@@ -6396,11 +6480,16 @@ async fn process_activity_task(
     // Parse the structured payload once and reuse for both the histogram
     // and the per-failure counter (so the `error.type` attribute is
     // consistent across `harvest.activity.duration` and
-    // `harvest.activity.failed`).
-    let failure_info = activity_result
-        .as_ref()
-        .err()
-        .map(|payload| parse_error_payload(payload));
+    // `harvest.activity.failed`). Suppressed for a self-committed activity: its
+    // recorded outcome is a success, so it emits no failure attribute/counter.
+    let failure_info = if committed_transactionally {
+        None
+    } else {
+        activity_result
+            .as_ref()
+            .err()
+            .map(|payload| parse_error_payload(payload))
+    };
     telemetry.metrics.record_activity_completed_with_error_type(
         activity_name,
         &task.queue_name,
@@ -6454,6 +6543,11 @@ async fn process_activity_task(
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
         }
         None
+    } else if committed_transactionally {
+        // Issue #680: the committed transactional outcome is a success, so feed
+        // the breaker `Success` regardless of any interceptor error transform —
+        // a self-committed activity must never trip the circuit.
+        Some(crate::circuit_breaker::AttemptOutcome::Success)
     } else {
         Some(match activity_result.as_ref() {
             Ok(_) => crate::circuit_breaker::AttemptOutcome::Success,
@@ -6479,6 +6573,30 @@ async fn process_activity_task(
                 telemetry.metrics.record_circuit_closed(activity_name);
             }
         }
+    }
+
+    // Issue #680: a self-committed transactional activity has already sealed its
+    // `ActivityCompleted` + task-COMPLETED atomically, so there is nothing left
+    // to persist. Skip the finalize/retry path entirely: `handle_activity_result`
+    // would at best no-op (the task is not RUNNING) and, on a retryable
+    // post-interceptor `Err` with retry budget, would spuriously attempt a
+    // `requeue_for_retry` that logs a NotFound against the already-COMPLETED
+    // task. An outer interceptor cannot un-commit the sealed outcome, so any
+    // result/error transform it applied after `next.run` is ignored; when that
+    // transform turned the committed success into an `Err`, surface the misuse
+    // with a single clear warning (mirroring the previous finalize-path warning).
+    if committed_transactionally {
+        if activity_result.is_err() {
+            tracing::warn!(
+                task_id = %task.id,
+                activity_name = %activity_name,
+                "an interceptor (or post-commit handler code) transformed the outcome of a \
+                 transactional activity to an error; the transform is ignored — the handler \
+                 sealed ActivityCompleted atomically via run_transactional, so the workflow \
+                 observes the committed success"
+            );
+        }
+        return Ok(());
     }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);

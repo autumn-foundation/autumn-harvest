@@ -113,6 +113,10 @@ name = "cancellable_timer_sla"
 name = "signal_aggregator"
 
 [[example]]
+name = "activity_interceptor"
+required-features = ["testing"]
+
+[[example]]
 name = "dag_approval_gate"
 required-features = ["unified-dag-execution"]
 
