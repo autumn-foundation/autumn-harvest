@@ -5307,6 +5307,23 @@ impl WorkflowContext {
     /// command — the child is spawned by this call and no other command may ride
     /// the same batch.
     ///
+    /// # Known limitation — panic before the deadline-cancel is persisted
+    ///
+    /// On the `Ok(None)` (deadline-won) branch the still-running child is
+    /// request-cancelled by a `CancelRaceLosers` bookkeeping command that is
+    /// durably applied when that decision cycle's commands persist — so the
+    /// "never leaks" guarantee holds for every *normal* resolution, including the
+    /// common `None => Ok(fallback)` shape. It does **not** hold when the
+    /// workflow function **panics** after this branch: the issue #782
+    /// panic-containment contract deliberately discards a panicked cycle's entire
+    /// command buffer (untrustworthy) on both the retry and the terminal path, so
+    /// a panic that recurs until the panic-retry budget is exhausted seals the
+    /// parent `FAILED` with the over-deadline child never request-cancelled (an
+    /// awaited child is also not reached by the parent-close cascade). This is the
+    /// same broad, pre-existing class as the child/activity fan-out
+    /// "panicking/failing cycle drops its pending commands" limitation — not
+    /// child-timeout-specific and out of scope for a local fix.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::WorkflowFailed`] if the child fails before the
@@ -5470,13 +5487,29 @@ impl WorkflowContext {
                         // exception: fall through to re-park (which suspends)
                         // rather than reporting a false non-determinism. A
                         // genuine mid-history divergence never reaches this arm
-                        // (it returns `Diverged`); an unresolved race with events
-                        // still after it (position < len — a fixture bug) stays a
-                        // hard error. Strict `WorkflowReplayer` runs (non-canary)
+                        // (it returns `Diverged`); an unresolved race with real
+                        // events still after it (a fixture bug) stays a hard
+                        // error. Strict `WorkflowReplayer` runs (non-canary)
                         // always get complete histories, so an unresolved race
                         // there is still a fixture problem.
+                        //
+                        // "At frontier" must treat trailing transparent update
+                        // events (`UpdateAdmitted`/`UpdateCompleted`/`Update-
+                        // Failed`) exactly as the global unconsumed check does
+                        // (issue #779 Codex P2): the `InProgress` scan above
+                        // skips them via `scan_cursor += 1` WITHOUT consuming
+                        // them, so it leaves the cursor positioned BEFORE them
+                        // and a raw `position() >= len()` check would read false
+                        // for a healthy in-flight race merely woken by an update.
+                        // `has_non_lifecycle_unconsumed` skips update (and
+                        // terminal-lifecycle) events, so it agrees with
+                        // `history_has_unconsumed_events` — the same authority
+                        // the executor uses to decide a suspend is clean.
                         let (position, at_frontier) = self.match_history(|m| {
-                            (i32::try_from(m.position()).ok(), m.position() >= m.len())
+                            (
+                                i32::try_from(m.position()).ok(),
+                                !m.has_non_lifecycle_unconsumed(),
+                            )
                         });
                         if self.strict_replay && !(self.canary_mode && at_frontier) {
                             return Err(self.nd_error(

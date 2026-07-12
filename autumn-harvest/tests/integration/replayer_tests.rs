@@ -18,7 +18,7 @@ use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId};
 use chrono::Utc;
 use serde_json::Value;
 
@@ -5123,6 +5123,66 @@ async fn child_timeout_in_flight_canary_replays_succeeded() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "an in-flight child-timeout race at the history frontier must be a \
          healthy suspend in canary mode, not a false non-determinism:\n{report}"
+    );
+}
+
+/// Codex P2 round 10 (issue #779): an in-flight child-timeout workflow that was
+/// woken by an update (`UpdateAdmitted`/`UpdateCompleted` appended AFTER the
+/// armed race, at the recorded-history frontier). Update events are transparent
+/// to the global unconsumed-history check (`has_non_lifecycle_unconsumed`), but
+/// `match_child_or_timer`'s `InProgress` scan skips them via `scan_cursor += 1`
+/// WITHOUT consuming them, so the matcher cursor is left positioned BEFORE the
+/// trailing updates. A raw `position() >= len()` frontier check therefore reads
+/// `false` (cursor < len), defeating the canary-at-frontier suppression and
+/// producing a FALSE non-determinism for a perfectly healthy suspend. The
+/// frontier check must treat trailing transparent update events the same way the
+/// global unconsumed check does.
+fn child_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    let update_id = UpdateId::new();
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        // Woken by an update while the race is still pending — transparent to
+        // replay, but they sit at the frontier AFTER the armed race.
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: "poke".to_string(),
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: Value::Null,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn child_timeout_in_flight_woken_by_update_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot(
+            "child_or_deadline",
+            exec_id,
+            child_in_flight_woken_by_update_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight child-timeout race whose only trailing history is \
+         transparent update events must still be a healthy suspend in canary \
+         mode, not a false non-determinism:\n{report}"
     );
 }
 
