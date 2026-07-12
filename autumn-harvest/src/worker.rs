@@ -976,6 +976,11 @@ struct SuspendedWorkflowContext<'a> {
     /// Producer spans (`activity.schedule`, `child_workflow.start`) use this as
     /// their explicit parent so they are nested inside the executor cycle.
     execute_span: &'a tracing::Span,
+    /// External-op ids resolved inline this cycle (issue #678). Empty for every
+    /// suspension path except a mixed timer + same-shard external op, where it
+    /// carries the resolution down to [`persist_started_timer`] for an immediate
+    /// self-wake instead of a full timer sleep.
+    resolved_inline_external: ResolvedExternalIds,
 }
 
 #[derive(Clone, Copy)]
@@ -1552,6 +1557,79 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
         }
     }
     items
+}
+
+/// External-op resolution ids that were appended to history INLINE in the
+/// current decision cycle (issue #678).
+///
+/// For a mixed `select!{ timer(..), signal_external_workflow(..) }` batch whose
+/// external target lives on the SAME shard, `persist_external_signal_inline`
+/// resolves the `ExternalSignalDelivered`/`ExternalCancelDelivered` terminal
+/// synchronously and returns it in `new_events`. The remaining `StartTimer`
+/// command then parks the task at `fires_at` (up to an hour away). This value
+/// threads the ids resolved THIS cycle down to [`persist_started_timer`] so it
+/// can mark the parked row wakeable and self-wake immediately, rather than
+/// sleeping out the timer.
+///
+/// It is populated ONLY from terminals appended this cycle — never a blanket
+/// history scan — so a pure `ctx.timer()` sleep in a workflow that did an
+/// earlier, fully-observed external op never false-wakes (see the correctness
+/// note in [`persist_started_timer`]). Every suspension path other than the
+/// mixed timer + external arm threads [`ResolvedExternalIds::default`] (empty),
+/// so their behaviour is byte-for-byte unchanged.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ResolvedExternalIds {
+    signal_ids: Vec<crate::types::ExternalSignalId>,
+    cancel_ids: Vec<crate::types::ExternalCancelId>,
+}
+
+impl ResolvedExternalIds {
+    const fn is_empty(&self) -> bool {
+        self.signal_ids.is_empty() && self.cancel_ids.is_empty()
+    }
+}
+
+/// Scan `new_events` (events appended inline this cycle) for the terminal that
+/// resolves each `Signal`/`Cancel` item in `items`, returning the ids that were
+/// resolved. `Marker` items are ignored; an item with no matching terminal
+/// (still pending → outbox route) is omitted.
+fn resolved_external_ids(
+    items: &[SignalBatchItem],
+    new_events: &[WorkflowEvent],
+) -> ResolvedExternalIds {
+    let mut resolved = ResolvedExternalIds::default();
+    for item in items {
+        match item {
+            SignalBatchItem::Signal(run) => {
+                let is_resolved = new_events.iter().any(|e| {
+                    matches!(
+                        e,
+                        WorkflowEvent::ExternalSignalDelivered { signal_id }
+                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. }
+                            if *signal_id == run.signal_id
+                    )
+                });
+                if is_resolved {
+                    resolved.signal_ids.push(run.signal_id);
+                }
+            }
+            SignalBatchItem::Cancel(run) => {
+                let is_resolved = new_events.iter().any(|e| {
+                    matches!(
+                        e,
+                        WorkflowEvent::ExternalCancelDelivered { cancel_id }
+                            | WorkflowEvent::ExternalCancelFailed { cancel_id, .. }
+                            if *cancel_id == run.cancel_id
+                    )
+                });
+                if is_resolved {
+                    resolved.cancel_ids.push(run.cancel_id);
+                }
+            }
+            SignalBatchItem::Marker(_) => {}
+        }
+    }
+    resolved
 }
 
 /// Split a mixed command batch into signal-batch items and remaining workflow commands.
@@ -4206,6 +4284,14 @@ async fn persist_started_timer(
     commands: &[WorkflowCommand],
     timer: &StartedTimerCommand,
     sticky: Option<queue::StickyHint<'_>>,
+    // Issue #678: external-op ids resolved INLINE this cycle by
+    // `persist_external_signal_inline` (empty for every path except a mixed
+    // timer + same-shard external op). When non-empty this park is a
+    // select!-style race whose external branch already resolved, so the parked
+    // row must be marked wakeable and self-woken below rather than sleeping to
+    // `fires_at`. Never a blanket history scan: a pure timer sleep threads the
+    // empty default and can never false-wake.
+    resolved_inline: &ResolvedExternalIds,
 ) -> HarvestResult<()> {
     use tracing::Instrument;
 
@@ -4360,6 +4446,16 @@ async fn persist_started_timer(
                     is_mixed = true;
                 }
             }
+            // Issue #678: a mixed timer + same-shard external op resolves the
+            // external terminal INLINE this cycle, so the `unresolved_exists`
+            // probe above (which looks for *unresolved* external requests) finds
+            // nothing and would leave `is_mixed = false` — parking the timer for
+            // up to `fires_at` with no wakeable sentinel. Force mixed so the
+            // parked row carries `activity_name = 'mixed_signal_suspension'` and
+            // the post-commit self-wake below can re-pend it.
+            if !resolved_inline.is_empty() {
+                is_mixed = true;
+            }
             let activity_name_val = if is_mixed {
                 Some("mixed_signal_suspension".to_string())
             } else {
@@ -4403,6 +4499,35 @@ async fn persist_started_timer(
     if waits_on_signal {
         let pending = signal::load_pending_signals(conn, exec_id).await?;
         if !pending.is_empty() {
+            queue::wake_workflow_task(conn, exec_id).await?;
+        }
+    }
+
+    // Issue #678: an external signal/cancel this batch raced against was
+    // resolved INLINE this cycle — `persist_external_signal_inline` appended its
+    // `External{Signal,Cancel}Delivered/Failed` terminal to history before this
+    // park. `wake_workflow_task` fired before the park is a no-op, so without
+    // this re-check the workflow would sleep until `fires_at` even though its
+    // `select!` branch already resolved. Mirror `persist_signal_wait_park`'s
+    // step-3 external self-wake, scoped STRICTLY to the ids resolved THIS cycle
+    // (never a blanket history scan) so a pure timer sleep in a workflow that
+    // observed an *earlier*, fully-settled external op can never false-wake.
+    // The terminal is present by construction (it was just appended); the
+    // history re-check is defensive and mirrors the reference.
+    if !resolved_inline.is_empty() {
+        let history = store::load_history(conn, exec_id).await?;
+        let resolved = history.events.iter().any(|ev| match ev {
+            WorkflowEvent::ExternalSignalDelivered { signal_id }
+            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                resolved_inline.signal_ids.contains(signal_id)
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id }
+            | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                resolved_inline.cancel_ids.contains(cancel_id)
+            }
+            _ => false,
+        });
+        if resolved {
             queue::wake_workflow_task(conn, exec_id).await?;
         }
     }
@@ -7524,6 +7649,7 @@ async fn handle_suspended_workflow(
             commands,
             &timer,
             sticky,
+            &context.resolved_inline_external,
         )
         .await;
         if res.is_ok() {
@@ -8021,7 +8147,7 @@ async fn persist_workflow_continue_as_new(
     .await
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -8034,6 +8160,10 @@ async fn persist_workflow_outcome(
     // they must not be called here (a failed counter query inside a Postgres
     // transaction aborts the whole transaction).
     update_schedule_counter: bool,
+    // Issue #678: external-op ids resolved inline this cycle, threaded into the
+    // `Suspended` arm's `SuspendedWorkflowContext` so a mixed timer + same-shard
+    // external op self-wakes immediately. Empty for every other outcome/caller.
+    resolved_inline_external: ResolvedExternalIds,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -8162,6 +8292,7 @@ async fn persist_workflow_outcome(
                 execution,
                 persistence,
                 execute_span,
+                resolved_inline_external,
             },
             &commands,
         )
@@ -8374,6 +8505,9 @@ async fn persist_terminal_outcome_commands(
         outcome,
         execute_span,
         false,
+        // Terminal-with-commands path never suspends, so no inline external
+        // wake is threaded here (issue #678).
+        ResolvedExternalIds::default(),
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -8865,6 +8999,14 @@ async fn process_workflow_task(
     // activity, timer, signal wait, …) breaks out of the loop.
     let mut history_events = prepared.history_events;
     let mut next_event_id = prepared.next_event_id;
+
+    // Issue #678: external-op ids resolved INLINE during this decision cycle.
+    // Set only by the mixed timer + external arm below; every other break arm
+    // leaves it empty. Threaded into the persist transaction so a
+    // `select!{ timer(..), signal_external_workflow(target) }` whose target is
+    // same-shard (resolved inline) self-wakes immediately in
+    // `persist_started_timer` instead of parking the timer until `fires_at`.
+    let mut resolved_inline_external = ResolvedExternalIds::default();
 
     let loop_result = loop {
         // Recompute is_replay each iteration: after local-activity events are
@@ -9400,6 +9542,10 @@ async fn process_workflow_task(
                 );
                 drop(execute_span);
                 let (signal_items, remaining_commands) = split_mixed_signal_batch(commands);
+                // Retain the batch items so we can correlate the inline-resolved
+                // terminals below: `persist_external_signal_inline` consumes
+                // `signal_items` by value (issue #678).
+                let signal_items_for_wake = signal_items.clone();
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
@@ -9422,6 +9568,14 @@ async fn process_workflow_task(
                         .await;
                     }
                 };
+                // Issue #678: capture the external terminals appended INLINE this
+                // cycle BEFORE `new_events` is moved into `history_events`. When
+                // the remaining `StartTimer` parks below, this drives an immediate
+                // self-wake in `persist_started_timer` instead of a full timer
+                // sleep. An item still unresolved (cross-shard / NotFound → outbox)
+                // contributes nothing here.
+                resolved_inline_external =
+                    resolved_external_ids(&signal_items_for_wake, &new_events);
                 let remaining_commands_with_unresolved = remaining_commands;
                 history_events.extend(new_events);
                 let current_history_event_count =
@@ -9913,6 +10067,10 @@ async fn process_workflow_task(
                             outcome,
                             &execute_span,
                             false,
+                            // Issue #678: carries any external-op terminal
+                            // resolved inline this cycle into the Suspended arm
+                            // so a mixed timer + external op self-wakes.
+                            resolved_inline_external,
                         )
                         .await?;
                         (retry_scheduled, deferred_checks, Vec::new())
@@ -14316,6 +14474,112 @@ mod tests {
             details: serde_json::json!(2),
         }];
         assert!(!should_requeue_signal_wait(&commands));
+    }
+
+    // ── resolved_external_ids (issue #678) ──────────────────────────────────
+    //
+    // Pure, no-DB correlation of the external-op terminals a decision cycle
+    // appended INLINE. The mixed timer + external arm feeds the result into
+    // `persist_started_timer` for an immediate self-wake.
+
+    fn sig_item(signal_id: crate::types::ExternalSignalId) -> SignalBatchItem {
+        SignalBatchItem::Signal(SignalExternalWorkflowRun {
+            signal_id,
+            target: ExecutionId::new(),
+            signal_name: "s".to_string(),
+            payload: serde_json::json!({}),
+            already_requested: false,
+            idempotency_key: None,
+        })
+    }
+
+    fn cancel_item(cancel_id: crate::types::ExternalCancelId) -> SignalBatchItem {
+        SignalBatchItem::Cancel(CancelExternalWorkflowRun {
+            cancel_id,
+            target: ExecutionId::new(),
+            already_requested: false,
+        })
+    }
+
+    #[test]
+    fn resolved_external_ids_matches_delivered_signal() {
+        let sid = crate::types::ExternalSignalId::new();
+        let items = vec![sig_item(sid)];
+        let new_events = vec![WorkflowEvent::ExternalSignalDelivered { signal_id: sid }];
+        let resolved = resolved_external_ids(&items, &new_events);
+        assert!(!resolved.is_empty());
+        assert_eq!(resolved.signal_ids, vec![sid]);
+        assert!(resolved.cancel_ids.is_empty());
+    }
+
+    #[test]
+    fn resolved_external_ids_matches_delivered_cancel() {
+        let cid = crate::types::ExternalCancelId::new();
+        let items = vec![cancel_item(cid)];
+        let new_events = vec![WorkflowEvent::ExternalCancelDelivered { cancel_id: cid }];
+        let resolved = resolved_external_ids(&items, &new_events);
+        assert!(!resolved.is_empty());
+        assert_eq!(resolved.cancel_ids, vec![cid]);
+        assert!(resolved.signal_ids.is_empty());
+    }
+
+    #[test]
+    fn resolved_external_ids_ignores_unresolved_item() {
+        // The item's terminal is NOT among the inline events (it is still
+        // pending — cross-shard / NotFound → outbox route), so it contributes
+        // nothing and the timer parks normally.
+        let sid = crate::types::ExternalSignalId::new();
+        let items = vec![sig_item(sid)];
+        // A delivered terminal for a DIFFERENT signal id must not match.
+        let other = crate::types::ExternalSignalId::new();
+        let new_events = vec![WorkflowEvent::ExternalSignalDelivered { signal_id: other }];
+        let resolved = resolved_external_ids(&items, &new_events);
+        assert!(resolved.is_empty(), "unresolved item must not self-wake");
+    }
+
+    #[test]
+    fn resolved_external_ids_counts_failed_terminals() {
+        let sid = crate::types::ExternalSignalId::new();
+        let cid = crate::types::ExternalCancelId::new();
+        let items = vec![sig_item(sid), cancel_item(cid)];
+        let new_events = vec![
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id: sid,
+                reason_code: "target_unknown".to_string(),
+            },
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id: cid,
+                reason_code: "target_unknown".to_string(),
+            },
+        ];
+        let resolved = resolved_external_ids(&items, &new_events);
+        assert_eq!(resolved.signal_ids, vec![sid]);
+        assert_eq!(resolved.cancel_ids, vec![cid]);
+    }
+
+    #[test]
+    fn resolved_external_ids_ignores_markers() {
+        let sid = crate::types::ExternalSignalId::new();
+        let items = vec![
+            SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: serde_json::json!(2),
+            }),
+            sig_item(sid),
+        ];
+        let new_events = vec![WorkflowEvent::ExternalSignalDelivered { signal_id: sid }];
+        let resolved = resolved_external_ids(&items, &new_events);
+        assert_eq!(
+            resolved.signal_ids,
+            vec![sid],
+            "marker items are ignored; the signal item still resolves"
+        );
+    }
+
+    #[test]
+    fn resolved_external_ids_empty_batch_is_empty() {
+        let resolved = resolved_external_ids(&[], &[]);
+        assert!(resolved.is_empty());
     }
 
     // ── cancellable-timer event interleaving (issue #768, FINDING 1) ────────
