@@ -21,37 +21,10 @@ use autumn_harvest::types::ActivityExecId;
 use chrono::Utc;
 use serde_json::{Value, json};
 
-#[test]
-fn harvest_migration_versions_are_unique() {
-    let migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let mut versions = std::collections::BTreeMap::<String, String>::new();
-
-    for entry in std::fs::read_dir(&migration_dir).expect("migrations directory should be readable")
-    {
-        let entry = entry.expect("migration directory entry should be readable");
-        if !entry
-            .file_type()
-            .expect("migration entry file type should be readable")
-            .is_dir()
-        {
-            continue;
-        }
-
-        if !entry.path().join("up.sql").is_file() {
-            continue;
-        }
-
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let version = name
-            .split_once('_')
-            .map_or_else(|| name.clone(), |(version, _)| version.to_owned());
-        if let Some(previous) = versions.insert(version.clone(), name.clone()) {
-            panic!(
-                "migration version {version} is used by both {previous} and {name}; Diesel tracks only the version prefix"
-            );
-        }
-    }
-}
+// The migration-version-uniqueness guard that used to live here was gated
+// `#[cfg(all(feature = "testing", feature = "unified-dag-execution"))]` and so
+// never ran in any CI step. It now lives in `migration_hygiene.rs` as an
+// unconditional submodule, executed by the no-DB CI step on every OS.
 
 // ---------------------------------------------------------------------------
 // Shared activity stubs
