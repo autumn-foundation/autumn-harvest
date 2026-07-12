@@ -112,6 +112,10 @@ name = "cancellable_timer_sla"
 [[example]]
 name = "signal_aggregator"
 
+[[example]]
+name = "dag_approval_gate"
+required-features = ["unified-dag-execution"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

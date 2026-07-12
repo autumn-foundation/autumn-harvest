@@ -327,6 +327,141 @@ nodes as runnable for the purpose of structure validation — it does not
 evaluate condition closures. Use `WorkflowTestEnv` or a real run to verify
 routing behaviour.
 
+## Signal / approval gates
+
+A **gate node** pauses a DAG run until a named signal arrives, then makes the
+signal payload its output so downstream nodes can consume it. It's the
+declarative way to insert a human approval — or any external-event wait —
+*between* graph nodes without rewriting the whole pipeline as a `#[workflow]`.
+
+Gate nodes are **unified-DAG only** (they lower onto the unified
+workflow-execution path). A classic DAG containing a gate is rejected at build
+time with a `DagSignalGateRequiresUnifiedExecution` error naming the DAG and
+signal. Enable the `unified-dag-execution` feature (on by default).
+
+### Declaring a gate
+
+```rust
+use std::time::Duration;
+use autumn_harvest::dag::GateTimeoutAction;
+
+#[dag(default_queue = "approvals")]
+fn order_approval_pipeline(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_order);
+    // Pause until the "approval" signal arrives; fail the run if it doesn't
+    // arrive within 24h.
+    let gate = dag
+        .signal_gate_with_timeout(
+            "approval",
+            Duration::from_secs(24 * 60 * 60),
+            GateTimeoutAction::FailRun,
+        )
+        .upstream(&extract);
+    let _load = dag.activity(load_order).upstream(&gate);
+}
+```
+
+`signal_gate(name)` is the no-timeout form (wait indefinitely).
+`signal_gate_with_timeout(name, timeout, on_timeout)` arms a durable deadline.
+A gate returns a `DagTaskRef`, so it composes exactly like any other node:
+`.upstream(&gate)`, `.map_activity(f).over(&gate)` (fan out over an array
+payload), `.condition(...)`.
+
+### Delivering the signal (unblocking a gate)
+
+Deliver the gate's signal with the ordinary standalone signal route — the gate
+consumes it just like a `wait_for_signal`:
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/harvest/workflows/{exec_id}/signal/approval \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": true, "reviewer": "alice"}'
+```
+
+The JSON body becomes the gate's output. A downstream node reads it via a
+`.condition(...)` predicate or a `.map_activity(...).over(&gate)` fan-out.
+
+### Timeout: fail vs continue
+
+| `on_timeout`                  | when the deadline fires first | gate output   |
+|-------------------------------|-------------------------------|---------------|
+| `GateTimeoutAction::FailRun`  | the DAG run **fails**         | —             |
+| `GateTimeoutAction::Continue` | the run **continues**         | `Value::Null` |
+
+### "Continue to a named branch" is declarative
+
+There is no bespoke branch-target mechanism. Under `Continue`, the gate's
+null-vs-payload output *is* the branch selector — attach a `.condition(...)` to
+each downstream node:
+
+```rust
+#[dag(default_queue = "approvals")]
+fn order_approval_with_fallback(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_order);
+    let gate = dag
+        .signal_gate_with_timeout(
+            "approval",
+            Duration::from_secs(24 * 60 * 60),
+            GateTimeoutAction::Continue,
+        )
+        .upstream(&extract);
+    // Approved: gate output is the (non-null) signal payload.
+    let _fulfil = dag
+        .activity(load_order)
+        .upstream(&gate)
+        .condition(|ups| !ups[0].is_null());
+    // Timed out: gate output is the null sentinel.
+    let _escalate = dag
+        .activity(escalate_to_manager)
+        .upstream(&gate)
+        .condition(|ups| ups[0].is_null());
+}
+```
+
+The condition-skipped branch records a `dag_skip:{N}` marker exactly like any
+other data-dependent skip, and the run still succeeds.
+
+### Durability and replay
+
+Gates reuse the existing signal/timer machinery — no new `WorkflowEvent`
+variant, no migration. A gated run is durable across restarts and replays
+deterministically: whichever of the signal or the deadline is recorded first
+in history wins on every replay. See `examples/dag_approval_gate.rs` for a
+complete, tested walkthrough (signal branch, timeout-fail, and
+timeout-escalate, each with a `WorkflowReplayer` self-check).
+
+### Edge traps
+
+- **A JSON `null` payload looks like a timeout.** Under a `Continue` gate the
+  timed-out output is `Value::Null`, so a downstream `.condition(|ups|
+  ups[0].is_null())` cannot distinguish a timeout from an *approval whose signal
+  body was literally `null`*. If your signal payload can legitimately be `null`,
+  branch on a field instead (e.g. `.condition(|ups| ups[0].get("approved") ==
+  Some(&serde_json::json!(true)))`), not on `.is_null()`.
+- **A `Continue` gate cannot feed `.map` directly.** The null timeout output is
+  not a JSON array, so `.map_activity(f).over(&gate)` fails at runtime with
+  `mapped upstream output is not a JSON array`. Guard the map behind a
+  `.condition(|ups| ups[0].is_array())` (or only map over gates whose signal
+  payload is always an array — an unbounded `signal_gate` or a `FailRun` gate,
+  which never emit the null sentinel).
+- **Independent gates in one level are serialized, not concurrent.** Level
+  isolation splits every gate into its own singleton execution level, so two
+  gates that Kahn-levelling would place together run *sequentially* (the first
+  gate resolves, then the second is reached) — they are **not** two overlapping
+  wait windows. Gate nodes do not model concurrent signal waits.
+- **Only `.upstream()` / `.condition()` / `.trigger_rule()` affect a gate.** A
+  gate dispatches no activity, so the activity-only chained setters
+  `.retry(...)`, `.start_to_close(...)`, `.queue(...)`, and
+  `.map_failure_policy(...)` are accepted by the fluent builder but **silently
+  ignored** on a gate node.
+
+### MCP exposure
+
+A `#[dag(mcp)]` DAG that contains a gate keeps its `signal_{dag}` MCP tool, so
+an agent can unblock the gate by handle; an activity-only DAG suppresses that
+tool.
+
 ## Registering DAGs with the plugin
 
 ```rust
@@ -457,7 +592,7 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
 | Use a **workflow schedule** when… | Use a **DAG** when… |
 |---|---|
 | The work is one ordered sequence with a clear linear shape. | The work is a graph: fan-out, fan-in, parallel branches. |
-| You need signals, durable timers, child workflows, or version gates inside the run. | The run is purely activity orchestration with no human-wait or signal handoff. |
+| You need arbitrary signal handlers, durable timers, child workflows, or version gates inside the run. | The run is activity orchestration — including a **single signal/approval gate** between nodes, which a [signal gate](#signal--approval-gates) handles declaratively without dropping to a workflow. |
 | Failure handling is per-step compensation (saga). | Failure handling is per-task trigger rules (AllDone, OneFailed). |
 | You want to query state mid-run. | The graph is fixed and you want the dashboard's graph view. |
 

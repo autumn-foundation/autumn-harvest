@@ -2130,7 +2130,7 @@
           },
           {
             "name": "nodes",
-            "description": "Array of node entries: node_name, status (succeeded/failed/timed_out/cancelled/running/pending/skipped), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed."
+            "description": "Array of node entries: node_name, kind (activity | gate — a 'gate' is a signal/timer gate node, issue #746, that awaits a named signal instead of dispatching an activity), status (succeeded/failed/timed_out/cancelled/running/pending/skipped/waiting — 'waiting' is a gate that has been reached but not yet resolved by its signal or deadline on a live run), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed. Gate nodes report attempts 0 and no timing/error fields."
           }
         ]
       },

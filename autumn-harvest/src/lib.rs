@@ -258,7 +258,7 @@ pub use context::{
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
-    DagTask, DagTaskRef,
+    DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
 };
 #[cfg(feature = "testing")]
 pub use dag_export::export_profile_mermaid_gantt;
