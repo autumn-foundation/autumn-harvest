@@ -5338,18 +5338,38 @@ impl WorkflowContext {
         });
 
         match history_match {
-            // Child wins. The deadline timer is intentionally left armed (no
-            // TimerCancelled command) — exact parity with `wait_for_signal_timeout`:
-            // the stray `TimerFired` from the still-armed durable timer is a
-            // deliberate parity decision, consumed on replay by
-            // `settle_race_child_won` so it never trips a divergence.
-            ChildOrTimerMatch::ChildCompleted { output } => Ok(Some(output)),
+            // Child wins. Proactively tear down the still-armed deadline timer:
+            // `CancelRaceLosers` durably deletes the `__child_timeout:{seq}` row
+            // via `queue::delete_pending_timer`, mirroring `ctx.race()`'s
+            // `race_timer_signal_impl` signal-won branch. An unfired
+            // `harvest_timers` row (`fired = false`) would otherwise pin the
+            // terminal parent forever — `retention::has_inflight_dependencies`
+            // blocks retention on any such row — and could surface a stray
+            // `TimerFired` on a later wake. The delete appends NO event, so
+            // pushing it on every replay cycle (not just the first) is
+            // strict-replay-safe: there is no marker to gate on for this
+            // bookkeeping-only command.
+            ChildOrTimerMatch::ChildCompleted { output } => {
+                self.push_command(WorkflowCommand::CancelRaceLosers {
+                    activities: Vec::new(),
+                    children: Vec::new(),
+                    timers: vec![TimerId::new(&timer_id)],
+                });
+                Ok(Some(output))
+            }
             ChildOrTimerMatch::ChildFailed {
                 error,
                 error_type,
                 details,
                 non_retryable,
             } => {
+                // Child wins — tear down the deadline timer (see the
+                // `ChildCompleted` branch above for the retention rationale).
+                self.push_command(WorkflowCommand::CancelRaceLosers {
+                    activities: Vec::new(),
+                    children: Vec::new(),
+                    timers: vec![TimerId::new(&timer_id)],
+                });
                 // Mirror the typed decode of `spawn_child_workflow_raw`'s replay
                 // path (issue #767): the `"Error"` sentinel maps back to `None`
                 // typed fields so a legacy child failure surfaces as untyped.
@@ -14465,7 +14485,7 @@ mod tests {
     /// Replay with the child's terminal recorded before the timer fired:
     /// resolves to `Ok(Some(output))` synchronously with NO new commands.
     #[tokio::test]
-    async fn child_timeout_replay_child_completed_returns_some_with_no_commands() {
+    async fn child_timeout_replay_child_completed_cancels_the_deadline_timer() {
         let child_id = ExecutionId::new();
         let timer_id = TimerId::new("__child_timeout:1:process_order");
         let events = vec![
@@ -14495,9 +14515,32 @@ mod tests {
             .await
             .expect("replay resolves");
         assert_eq!(result, Some(serde_json::json!({"processed": true})));
-        assert!(
-            ctx.drain_commands().is_empty(),
-            "a fully resolved replay must emit no new commands"
+
+        // Child-win must proactively cancel the still-armed deadline timer so
+        // the unfired `harvest_timers` row cannot pin the terminal parent
+        // (retention::has_inflight_dependencies). Exactly one bookkeeping-only
+        // CancelRaceLosers targeting the race timer, no children/activities.
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "child-win must push exactly one CancelRaceLosers to tear down the \
+             deadline timer: {commands:?}"
+        );
+        let WorkflowCommand::CancelRaceLosers {
+            activities,
+            children,
+            timers,
+        } = &commands[0]
+        else {
+            panic!("expected CancelRaceLosers, got {:?}", commands[0]);
+        };
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
+        assert_eq!(
+            timers,
+            &vec![timer_id],
+            "the still-armed deadline timer must be targeted for durable deletion"
         );
     }
 
@@ -14652,6 +14695,28 @@ mod tests {
             }
             other => panic!("expected typed WorkflowFailed, got {other:?}"),
         }
+
+        // Child-win (via failure) must also tear down the deadline timer so it
+        // cannot pin the terminal parent — exactly one bookkeeping-only
+        // CancelRaceLosers targeting the race timer, no children/activities.
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "a failed child before the deadline must still push CancelRaceLosers \
+             to tear down the timer: {commands:?}"
+        );
+        let WorkflowCommand::CancelRaceLosers {
+            activities,
+            children,
+            timers,
+        } = &commands[0]
+        else {
+            panic!("expected CancelRaceLosers, got {:?}", commands[0]);
+        };
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
+        assert_eq!(timers, &vec![timer_id]);
     }
 
     /// Two `spawn_child_workflow_timeout` calls draw distinct

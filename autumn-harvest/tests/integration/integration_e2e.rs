@@ -569,7 +569,7 @@ async fn load_tasks_for_execution_from_url(
         .expect("failed to reload task queue rows")
 }
 
-async fn load_timers_for_execution_from_url(
+pub(crate) async fn load_timers_for_execution_from_url(
     database_url: &str,
     exec_id: ExecutionId,
 ) -> Vec<HarvestTimer> {

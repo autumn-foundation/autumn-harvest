@@ -30,7 +30,8 @@ use serde_json::Value;
 use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
     insert_workflow_execution, load_child_executions_from_url, load_history_from_url,
-    setup_test_database_url, spawn_test_worker, wait_for_execution_state,
+    load_timers_for_execution_from_url, setup_test_database_url, spawn_test_worker,
+    wait_for_execution_state,
 };
 
 type WfFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -444,5 +445,61 @@ async fn child_completes_in_park_gap_self_wakes_parent() {
         parent.output.and_then(|o| o.get("outcome").cloned()),
         Some(serde_json::json!("child_done")),
         "after a re-park, the child completion must still resolve the parent to Some"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_win_tears_down_deadline_timer_no_retention_pin() {
+    // Codex P2 (#779): on a child-win the still-armed `__child_timeout:{seq}`
+    // durable timer must be proactively deleted. An unfired `harvest_timers`
+    // row (`fired = false`) is treated as an in-flight dependency by
+    // `retention::has_inflight_dependencies`, so leaving it would pin the
+    // terminal parent forever. Drive a child-win to COMPLETED and assert NO
+    // `__child_timeout:` row survives for the parent execution.
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({"id": 6})).await;
+
+    let reg = registry(
+        wf_info("e2e_test_workflow", parent_await_child),
+        wf_info("timeout_child", fast_child),
+    );
+    let worker = build_runtime_worker("worker-779-timer-cleanup", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    // Sanity: this really was the child-win branch.
+    assert_eq!(
+        parent.output.and_then(|o| o.get("outcome").cloned()),
+        Some(serde_json::json!("child_done")),
+        "child completed before the deadline → child-win branch"
+    );
+
+    // The deadline timer must have been durably deleted (not merely left
+    // unfired): no `__child_timeout:` row may remain for the parent, and in
+    // fact no unfired timer at all should linger to pin retention.
+    let timers = load_timers_for_execution_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        !timers
+            .iter()
+            .any(|t| t.timer_id.starts_with("__child_timeout:")),
+        "child-win must delete the deadline timer row; found: {:?}",
+        timers.iter().map(|t| &t.timer_id).collect::<Vec<_>>()
+    );
+    assert!(
+        !timers.iter().any(|t| !t.fired),
+        "no unfired timer may remain to pin the terminal parent via retention: {:?}",
+        timers
+            .iter()
+            .map(|t| (&t.timer_id, t.fired))
+            .collect::<Vec<_>>()
     );
 }
