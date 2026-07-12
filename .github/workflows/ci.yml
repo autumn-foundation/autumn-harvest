@@ -178,6 +178,9 @@ jobs:
       - name: Run activity_interceptor example tests (issue #680)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_interceptor
+      - name: Run child_with_timeout example tests (issue #779)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example child_with_timeout
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
