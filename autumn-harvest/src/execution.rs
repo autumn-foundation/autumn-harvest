@@ -3395,11 +3395,12 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     request: UpdateWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
-    // Capture the update name for the post-commit update.admitted metric
-    // (issue #684) before `request` is moved into the transaction closure. The
-    // raw name is used for the label — the admission site cannot bound an
-    // unregistered name (Codex P2 residual; see `admit_update_event`).
-    let update_name_for_metric = request.update_name.clone();
+    // Capture the queue for the post-commit update.admitted metric (issue #684)
+    // before `request` is moved into the transaction closure. The update name is
+    // deliberately NOT a label — the admission site cannot bound an unregistered
+    // name (Codex P2; see `admit_update_event`), so the counter is labeled by
+    // `workflow` + `queue` only.
+    let queue_for_metric = request.queue_name.to_owned();
     let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
         .transaction::<(
             UpdateWithStartOutcome,
@@ -3689,7 +3690,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
         // update was actually admitted (an idempotency dedup short-circuit
         // reports update_admitted == false and admits nothing).
         if outcome.update_admitted {
-            m.record_update_admitted(&outcome.workflow_name, &update_name_for_metric);
+            m.record_update_admitted(&outcome.workflow_name, &queue_for_metric);
         }
     }
 

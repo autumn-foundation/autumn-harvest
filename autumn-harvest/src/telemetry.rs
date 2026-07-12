@@ -711,24 +711,25 @@ pub const METRIC_SIGNAL_UNHANDLED: &str = "harvest.signal.unhandled";
 ///
 /// Emitted post-commit at the single admission choke point
 /// (`store::admit_update_event`) for the HTTP, Vantage-UI, and update-with-start
-/// paths. Labeled by `workflow` (workflow name) and `name` (update name); no
-/// queue label is available at the admission site. `execution.id` is span-only
-/// per ADR-0001 §7.
+/// paths. Labeled by `workflow` (workflow name) and `queue`. `execution.id` is
+/// span-only per ADR-0001 §7.
 ///
-/// **`name` cardinality — residual (issue #684, Codex P2):** the raw route
-/// `POST /workflows/{id}/update/{name}` admits ANY name (the validator lookup is
-/// best-effort — an unregistered name falls through and is durably admitted), so
-/// a hostile/buggy caller could create unbounded `admitted` series. Unlike the
-/// terminal [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] counters — which
-/// bound an unregistered name to the [`UNREGISTERED_UPDATE_NAME`] sentinel using
-/// the workflow's handler-not-found *result* — the admission site cannot bound
-/// the name: it has no way to know whether a name resolves to a handler, because
+/// **`name` is deliberately NOT a label — bounded by construction (issue #684,
+/// Codex P2):** the raw route `POST /workflows/{id}/update/{name}` admits ANY
+/// name (the validator lookup is best-effort — an unregistered name falls
+/// through and is durably admitted), so a `name` label would let a hostile/buggy
+/// caller create unbounded `admitted` series. Unlike the terminal
+/// [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] counters — which bound an
+/// unregistered name to the [`UNREGISTERED_UPDATE_NAME`] sentinel using the
+/// workflow's handler-not-found *result* — the admission site cannot bound the
+/// name: it has no way to know whether a name resolves to a handler, because
 /// imperatively-registered handlers (`ctx.register_update_handler`, the common
 /// pattern) are not known until the workflow executes, and bounding against only
 /// the declarative `registry.update_handlers` would mislabel every legitimate
-/// imperatively-registered update. The correlated `failed{name="__unregistered__"}`
-/// series surfaces the hostile-admit vector; watch it if `admitted` cardinality
-/// grows. This admission-site residual is flagged for the spec owner.
+/// imperatively-registered update. Dropping the label is therefore the only way
+/// to bound this counter's cardinality by construction. Per-name update
+/// visibility lives on the post-resolution counters `harvest.update.completed`/
+/// `failed`/`rejected` instead.
 pub const METRIC_UPDATE_ADMITTED: &str = "harvest.update.admitted";
 
 /// Counter: a workflow update was rejected by its registered validator before
@@ -2101,9 +2102,19 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow update was durably admitted (issue #684).
     ///
     /// Maps to the counter [`METRIC_UPDATE_ADMITTED`] with labels `workflow`
-    /// and `name` (update name).
-    fn record_update_admitted(&self, workflow_name: &str, update_name: &str) {
-        let _ = (workflow_name, update_name);
+    /// and `queue`. The update `name` is deliberately NOT a label (issue #684,
+    /// Codex P2): admission happens at the free-form route boundary
+    /// (`POST /workflows/{id}/update/{name}`) where the name has not yet been
+    /// resolved against a registered handler — and update handlers register
+    /// both declaratively (`registry.update_handlers`) and imperatively
+    /// (`ctx.register_update_handler`, not known until the workflow executes),
+    /// so the admission site cannot bound the name against any registry without
+    /// mislabeling legitimate imperatively-registered updates. Dropping the
+    /// label is therefore the only way to bound this counter's cardinality by
+    /// construction. Per-name update visibility lives on the post-resolution
+    /// counters `harvest.update.completed`/`failed`/`rejected` instead.
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
     }
 
     /// A workflow update was rejected by its validator before admission

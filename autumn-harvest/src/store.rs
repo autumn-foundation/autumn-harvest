@@ -468,19 +468,21 @@ pub async fn append_single_event(
 /// Returns [`crate::error::HarvestError::Database`] on query or insert failure.
 ///
 /// When `metrics` is `Some`, `harvest.update.admitted` is emitted **once,
-/// post-commit** (issue #684), labeled by the resolved workflow name and the
-/// update name. Callers that run `admit_update_event` inside a larger outer
-/// transaction (e.g. `update_with_start`) pass `None` and emit at their own
-/// outer-commit boundary instead, so the metric never fires on a rollback.
+/// post-commit** (issue #684), labeled by the resolved workflow name and queue.
+/// Callers that run `admit_update_event` inside a larger outer transaction
+/// (e.g. `update_with_start`) pass `None` and emit at their own outer-commit
+/// boundary instead, so the metric never fires on a rollback.
 ///
-/// The `name` label is the raw update name (issue #684, Codex P2): unlike the
-/// terminal `harvest.update.completed`/`failed` counters — which bound an
+/// The update `name` is deliberately NOT a label (issue #684, Codex P2): unlike
+/// the terminal `harvest.update.completed`/`failed` counters — which bound an
 /// unregistered name to the `__unregistered__` sentinel using the workflow's
 /// handler-not-found result — the admission site has no way to know whether a
 /// name resolves to a handler (imperative `ctx.register_update_handler`
 /// handlers are not known until the workflow executes), so it cannot bound the
-/// name without mislabeling legitimate imperatively-registered updates. See the
-/// changelog residual note for `harvest.update.admitted`.
+/// name without mislabeling legitimate imperatively-registered updates.
+/// Dropping the label bounds this counter's cardinality by construction;
+/// per-name visibility lives on the post-resolution completed/failed/rejected
+/// counters.
 pub async fn admit_update_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -493,12 +495,8 @@ pub async fn admit_update_event(
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
-    // Capture the update name for the post-commit metric before it is moved
-    // into the appended event below.
-    let metric_name = name.clone();
-
-    let workflow_name = conn
-        .transaction::<String, crate::error::HarvestError, _>(|conn| {
+    let (workflow_name, queue_name) = conn
+        .transaction::<(String, String), crate::error::HarvestError, _>(|conn| {
             async move {
                 // Acquire a row-level lock so concurrent appenders serialize their
                 // MAX(event_id) + INSERT pairs and the state check is consistent.
@@ -549,7 +547,7 @@ pub async fn admit_update_event(
                     timestamp: chrono::Utc::now(),
                 };
                 append_events(conn, exec_id, &[event], next_id).await?;
-                Ok(execution.workflow_name)
+                Ok((execution.workflow_name, execution.queue_name))
             }
             .scope_boxed()
         })
@@ -557,7 +555,7 @@ pub async fn admit_update_event(
 
     // Post-commit: emit harvest.update.admitted exactly once (issue #684).
     if let Some(metrics) = metrics {
-        metrics.record_update_admitted(&workflow_name, &metric_name);
+        metrics.record_update_admitted(&workflow_name, &queue_name);
     }
     Ok(())
 }

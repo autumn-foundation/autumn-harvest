@@ -243,12 +243,12 @@ impl MetricsRecorder for RecordingMetrics {
         });
     }
 
-    fn record_update_admitted(&self, workflow_name: &str, update_name: &str) {
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_UPDATE_ADMITTED,
             labels: vec![
                 ("workflow", workflow_name.to_owned()),
-                ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
             ],
         });
     }
@@ -315,7 +315,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_task_dispatched("default");
     rec.record_signal_received("my_workflow", "default");
     rec.record_signal_unhandled("my_workflow", "default");
-    rec.record_update_admitted("my_workflow", "set_priority");
+    rec.record_update_admitted("my_workflow", "default");
     rec.record_update_rejected("my_workflow", "set_priority");
     rec.record_update_completed("my_workflow", "set_priority", "default");
     rec.record_update_failed("my_workflow", "set_priority", "default");
@@ -427,7 +427,7 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_workflow_task_timeout("wf", "default");
     rec.record_signal_received("wf", "default");
     rec.record_signal_unhandled("wf", "default");
-    rec.record_update_admitted("wf", "set_priority");
+    rec.record_update_admitted("wf", "default");
     rec.record_update_rejected("wf", "set_priority");
     rec.record_update_completed("wf", "set_priority", "default");
     rec.record_update_failed("wf", "set_priority", "default");
@@ -455,7 +455,7 @@ fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
     let rec = RecordingMetrics::default();
     rec.record_signal_received("wf", "default");
     rec.record_signal_unhandled("wf", "default");
-    rec.record_update_admitted("wf", "set_priority");
+    rec.record_update_admitted("wf", "default");
     rec.record_update_rejected("wf", "set_priority");
     rec.record_update_completed("wf", "set_priority", "default");
     rec.record_update_failed("wf", "set_priority", "default");
@@ -463,14 +463,17 @@ fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
     let samples = rec.drain();
     assert_eq!(samples.len(), 6);
 
-    // Issue #684 (Codex P2): the signal counters carry NO free-form `name`
-    // label — signal names come from the free-form send route and have no
-    // declared registry to bound them. Update names are kept because they
-    // resolve against the registered/declared handler set.
+    // Issue #684 (Codex P2): the signal counters AND update.admitted carry NO
+    // free-form `name` label — signal names come from the free-form send route,
+    // and admission happens at the free-form update route boundary before the
+    // name is resolved against a handler (declarative OR imperative), so neither
+    // can be bounded by construction. update.rejected/completed/failed keep the
+    // `name` label because it resolves against the registered/declared handler
+    // set (failed buckets an unregistered name to the __unregistered__ sentinel).
     let expected: &[(&str, &[&str])] = &[
         (METRIC_SIGNAL_RECEIVED, &["workflow", "queue"]),
         (METRIC_SIGNAL_UNHANDLED, &["workflow", "queue"]),
-        (METRIC_UPDATE_ADMITTED, &["workflow", "name"]),
+        (METRIC_UPDATE_ADMITTED, &["workflow", "queue"]),
         (METRIC_UPDATE_REJECTED, &["workflow", "name"]),
         (METRIC_UPDATE_COMPLETED, &["workflow", "name", "queue"]),
         (METRIC_UPDATE_FAILED, &["workflow", "name", "queue"]),

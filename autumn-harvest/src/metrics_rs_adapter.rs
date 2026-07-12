@@ -813,11 +813,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
-    fn record_update_admitted(&self, workflow_name: &str, update_name: &str) {
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — admission is at the free-form
+        // update route boundary where the name is not yet resolved against a
+        // registered handler (declarative OR imperative), so it cannot be bounded
+        // by construction. Per-name visibility lives on completed/failed/rejected.
         counter!(
             METRIC_UPDATE_ADMITTED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_NAME => update_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
     }
@@ -1196,7 +1200,7 @@ mod tests {
             let rec = MetricsRsRecorder;
             rec.record_signal_received("wf", "q");
             rec.record_signal_unhandled("wf", "q");
-            rec.record_update_admitted("wf", "set_priority");
+            rec.record_update_admitted("wf", "q");
             rec.record_update_rejected("wf", "set_priority");
             rec.record_update_completed("wf", "set_priority", "q");
             rec.record_update_failed("wf", "set_priority", "q");
@@ -1230,7 +1234,7 @@ mod tests {
             &[
                 (METRIC_SIGNAL_RECEIVED.to_owned(), wf_q("q")),
                 (METRIC_SIGNAL_UNHANDLED.to_owned(), wf_q("q")),
-                (METRIC_UPDATE_ADMITTED.to_owned(), wf_name("set_priority")),
+                (METRIC_UPDATE_ADMITTED.to_owned(), wf_q("q")),
                 (METRIC_UPDATE_REJECTED.to_owned(), wf_name("set_priority")),
                 (
                     METRIC_UPDATE_COMPLETED.to_owned(),
@@ -1241,8 +1245,9 @@ mod tests {
                     wf_name_q("set_priority", "q")
                 ),
             ],
-            "signal bridges register with (workflow, queue) only and the update \
-             bridges with the documented workflow/name/queue constants, values un-swapped"
+            "signal + update.admitted bridges register with (workflow, queue) only \
+             and the completed/failed/rejected update bridges with the documented \
+             workflow/name[/queue] constants, values un-swapped"
         );
     }
 }

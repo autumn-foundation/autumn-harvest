@@ -326,11 +326,11 @@ impl MetricsRecorder for RecordingMetrics {
         );
     }
 
-    fn record_update_admitted(&self, workflow_name: &str, update_name: &str) {
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
         self.push(
             METRIC_UPDATE_ADMITTED,
             vec![
-                ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
                 ("workflow", workflow_name.to_owned()),
             ],
         );

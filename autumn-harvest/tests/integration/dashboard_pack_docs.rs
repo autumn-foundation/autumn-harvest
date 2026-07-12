@@ -214,7 +214,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_saga_compensation_failed", &["workflow", "queue"]),
     ("harvest_signal_received", &["workflow", "queue"]),
     ("harvest_signal_unhandled", &["workflow", "queue"]),
-    ("harvest_update_admitted", &["workflow", "name"]),
+    ("harvest_update_admitted", &["workflow", "queue"]),
     ("harvest_update_rejected", &["workflow", "name"]),
     ("harvest_update_completed", &["workflow", "name", "queue"]),
     ("harvest_update_failed", &["workflow", "name", "queue"]),
