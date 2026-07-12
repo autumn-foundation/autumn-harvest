@@ -1072,3 +1072,112 @@ async fn gate_skips_allow_duplicate_attach_regardless_of_prior_state() {
         );
     }
 }
+
+/// Round 21 (issue #618): the HTTP start route's pure-plain explicit-`workflow_id`
+/// gate decision is now made under the SAME `FOR UPDATE` lock as the
+/// create-vs-attach decision (via `gate_checked_start_or_load`), closing the
+/// round-20 residual TOCTOU. Deterministic race repro with the lock-holding
+/// harness: a holder locks the RUNNING prior and seals it to FAILED (uncommitted),
+/// then we spawn the HTTP start (`AllowDuplicateFailedOnly`). Under the fix the
+/// start queues on the prior's `FOR UPDATE` lock inside the locked primitive and,
+/// after the holder commits, observes FAILED — so the ADFO replacement is a fresh
+/// admission and is BLOCKED + counted, with no replacement created. Pre-fix
+/// (round 20) the unlocked pre-read (a plain SELECT) observed the *committed*
+/// RUNNING state and skipped the gate, letting `start_or_load` replace the
+/// freshly-sealed prior past the active gate uncounted (201, no block, 2 rows).
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn http_start_blocks_a_prior_that_seals_between_read_and_start() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_diesel_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let registry = build_registry(Arc::clone(&metrics));
+    let api_state = build_api_state(&pool, registry);
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+
+    let prior = seed_target_prior(&mut conn, "seal-race", "RUNNING").await;
+    raise_fleet_gate(&mut conn, &api_state, "seal-race-incident").await;
+
+    // Holder: lock the RUNNING prior FOR UPDATE and seal it to FAILED, uncommitted.
+    let mut holder = pool.get().await.unwrap();
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("BEGIN").await.unwrap();
+        diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+            .bind::<diesel::sql_types::Uuid, _>(prior)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET state='FAILED', error='sealed', \
+             completed_at=NOW() WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(prior)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    }
+
+    // Spawn the HTTP start (ADFO). Under the fix it queues on the prior's FOR
+    // UPDATE lock inside `gate_checked_start_or_load`; pre-fix its unlocked
+    // pre-read reads the committed RUNNING state and skips the gate.
+    let app_clone = app.clone();
+    let start_task = tokio::spawn(async move {
+        let body =
+            json!({ "workflow_id": "seal-race", "reuse_policy": "allow_duplicate_failed_only" });
+        let resp = app_clone
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workflows/ag_target_wf/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    });
+
+    // Let the start reach (and, under the fix, block on) its FOR UPDATE lock load.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Holder commits the seal, releasing the lock.
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("COMMIT").await.unwrap();
+    }
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(8), start_task)
+        .await
+        .expect("HTTP start did not complete within 8s")
+        .expect("join start task");
+    set_global_admission_gate_cache(None);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a prior that sealed to FAILED before the start must BLOCK the ADFO replacement"
+    );
+    let blocked = metrics.blocked();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the block must be counted exactly once: {blocked:?}"
+    );
+    assert_eq!(blocked[0].0, "fleet");
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "no fresh replacement slipped the gate (only the sealed prior remains)"
+    );
+}
