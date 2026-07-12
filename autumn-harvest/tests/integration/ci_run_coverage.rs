@@ -699,9 +699,9 @@ fn manifest_is_sorted_and_unique() {
         "\n.github/ci/integration-suites.txt data lines are not sorted+unique — a merge=union \
          artifact (two PRs' additions interleaved or duplicated). This is a benign, one-command \
          fix, never a conflict. Re-sort the DATA lines (keep the header comment on top), e.g.:\n\
-         \x20 sort -o .github/ci/integration-suites.txt \\\n\
+         \x20 LC_ALL=C sort -o .github/ci/integration-suites.txt \\\n\
          \x20   <(grep -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \\\n\
-         \x20   <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | sort -u)"
+         \x20   <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)"
     );
 }
 

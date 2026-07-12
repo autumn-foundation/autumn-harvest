@@ -4,8 +4,8 @@
 # resolution. It does not dedupe or sort, so a duplicate/reorder residue is
 # possible — that is caught deterministically (never a conflict) by
 # `ci_run_coverage.rs::manifest_is_sorted_and_unique`, with a copy-paste
-# `sort -u` fix. See docs/changelog.d and the manifest header.
-.github/ci/integration-suites.txt merge=union
+# `LC_ALL=C sort -u` fix. See docs/changelog.d and the manifest header.
+.github/ci/integration-suites.txt merge=union text eol=lf
 
 # The manifest and runner script are checked out with LF on every OS (the runner
 # is executed by Git Bash on the Windows CI leg; a CRLF-corrupted `.sh` would

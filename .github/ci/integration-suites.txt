@@ -8,10 +8,10 @@
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
 # `manifest_is_sorted_and_unique`, fixed with:
-#   sort -o .github/ci/integration-suites.txt \
+#   LC_ALL=C sort -o .github/ci/integration-suites.txt \
 #     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
-#     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | sort -u)
-# (or simply keep the header on top and `sort -u` the data lines).
+#     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
+# (or simply keep the header on top and `LC_ALL=C sort -u` the data lines).
 #
 # Columns (whitespace-separated; `-` = none/absent):
 #   osclass   crate                    target       features            filter
