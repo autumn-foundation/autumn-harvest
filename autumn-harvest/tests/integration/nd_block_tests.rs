@@ -40,100 +40,17 @@ use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
-    "\n",
-    include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
-    include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
-    include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!("../../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
-    include_str!("../../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
-    include_str!("../../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260624000000_harvest_event_batches/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!("../../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
-    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
-);
+// The migration bundle is the paved-path helper `full_migrations_sql()`,
+// regenerated by build.rs from the whole `migrations/` directory. This
+// replaced a hand-rolled `concat!(include_str!(...))` list (plus inline
+// legal_hold ADD COLUMN patches) that had silently drifted: it was missing
+// `20260704000001_harvest_build_policy_ramp`, so every workflow start here
+// failed `column "target_build_id" does not exist` at plan time — invisible
+// because CI only compiled this suite, never ran it against a DB (issue #603
+// test-infra hardening). The bundle can never drift again.
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 // ── Recording metrics ──────────────────────────────────────────────────────
 
@@ -265,7 +182,7 @@ async fn setup() -> (String, ContainerAsync<Postgres>) {
         .try_init();
 
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -594,6 +511,12 @@ async fn divergent_replay_blocks_instead_of_failing() {
     // Phase 2: the "divergent deploy" — v2 replays the same history and
     // requests an activity where v1 recorded a timer.
     fire_timer_now(&mut conn, exec_id).await;
+    // Backdating `harvest_timers.fires_at` alone is not enough: the parked
+    // workflow task's `scheduled_at` was set to the timer's original
+    // `fires_at` (now + 300s) by `reschedule_task` at suspension, so the
+    // divergent worker cannot re-claim it within the poll window. Make the
+    // task claimable now so worker2 replays the recorded history and blocks.
+    make_task_claimable_now(&mut conn, exec_id).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![wf_info("nd_wf", divergent_v2_handler)],
@@ -694,6 +617,7 @@ async fn blocked_execution_resumes_after_rollback() {
 
     // Divergent v2 blocks it.
     fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![wf_info("nd_wf", divergent_v2_handler)],
@@ -851,6 +775,7 @@ async fn blocked_child_does_not_notify_parent() {
 
     // Divergent deploy for the child only.
     fire_timer_now(&mut conn, child_exec).await;
+    make_task_claimable_now(&mut conn, child_exec).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![
@@ -928,6 +853,7 @@ async fn reblock_increments_count_and_grows_backoff() {
     let _ = handle1.await;
 
     fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![wf_info("nd_wf", divergent_v2_handler)],
@@ -1008,6 +934,7 @@ async fn nd_block_clears_stale_mixed_signal_suspension_sentinel() {
     .expect("stamp mixed_signal_suspension sentinel");
 
     fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![wf_info("nd_wf", divergent_v2_handler)],
@@ -1061,6 +988,7 @@ async fn continue_as_new_successor_does_not_inherit_stale_nd_search_attrs() {
 
     // Divergent v2 blocks it, stamping the ND diagnostic into search_attrs.
     fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![wf_info("nd_can_wf", divergent_v2_handler)],
