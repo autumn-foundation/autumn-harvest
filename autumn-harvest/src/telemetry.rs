@@ -672,13 +672,14 @@ pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
 /// signal-or-deadline race (issue #476) are never counted. Labeled by
 /// `workflow`, `name`, and `queue`.
 ///
-/// **Coverage scope — KNOWN LIMITATION (deliberate):** this counts undrained
-/// signals **only** for a run that reaches a *graceful* terminal
-/// (`Completed`/`Failed` via its own logic). **`TIMED_OUT`, `CANCELLED`,
-/// `TERMINATED`, and parent-close-cascade runs with an undrained signal are NOT
-/// counted** — those terminal transitions are driven by a scanner / operator,
-/// not a workflow drive, so no matcher exists to reconstruct the consumed-set,
-/// and a partial/inaccurate count on a watched SLO metric is worse than none.
+/// **Coverage scope — KNOWN LIMITATION (deliberate):** this is emitted only
+/// from graceful `Completed`/`Failed` terminals reached through the workflow
+/// drive. **Forced-failure / scanner terminal paths — `TIMED_OUT`, `CANCELLED`,
+/// `TERMINATED`, parent-close cascade, and history-cap failure
+/// (`fail_workflow_for_history_cap`) — with an undrained signal are NOT
+/// counted**, because they have no driven matcher to reconstruct the
+/// consumed-set, and a partial/inaccurate count on a watched SLO metric is
+/// worse than none.
 /// This notably **excludes the "stuck workflow that ignored a signal and then
 /// timed out"** case: for that, watch [`METRIC_WORKFLOW_TIMEOUT`] plus the
 /// per-workflow stack API instead. `execution.id` is span-only per ADR-0001 §7.

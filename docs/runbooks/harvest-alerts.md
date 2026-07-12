@@ -1108,12 +1108,12 @@ signal. Signals excused by a lost signal-or-deadline race (issue #476) are
 never counted.
 
 > **Known scope limitation — read this before trusting a *low* number.** This
-> counter fires **only** for runs that reach a **graceful** terminal
-> (`Completed`/`Failed` via their own logic). Runs that are **`TIMED_OUT`,
-> `CANCELLED`, `TERMINATED`, or closed by a parent-close cascade** are driven
-> to termination by a scanner/operator, not a workflow drive, so there is no
-> matcher to reconstruct which signals were consumed — those runs' undrained
-> signals are **NOT counted here**. In particular this **excludes the
+> counter is emitted **only** from graceful `Completed`/`Failed` terminals
+> reached through the workflow drive. Forced-failure / scanner terminal paths —
+> **`TIMED_OUT`, `CANCELLED`, `TERMINATED`, parent-close cascade, and
+> history-cap failure** — are driven to termination without a workflow drive, so
+> there is no matcher to reconstruct which signals were consumed; those runs'
+> undrained signals are **NOT counted here**. In particular this **excludes the
 > motivating "stuck workflow that ignored a signal and then timed out" case**:
 > to catch a run that is wedged past its deadline, watch the
 > `harvest.workflow.timeout` counter and inspect the run with
