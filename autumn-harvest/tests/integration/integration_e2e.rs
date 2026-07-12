@@ -1828,6 +1828,220 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     );
 }
 
+/// Issue #772 (P2 fix): prove the worker threads the row's **authoritative
+/// absolute `deadline_at`** — not a stale `started_at + execution_timeout`
+/// recompute — into `ctx.deadline()`.
+///
+/// A resumed/redriven run's `deadline_at` is pushed forward past
+/// `started_at + execution_timeout` (pause/resume shifts it by the pause span,
+/// #383; redrive re-anchors it to `now + timeout`). Rather than wiring a full
+/// pause/resume with a backdated `paused_at` (heavy, timing-sensitive), this
+/// test directly `UPDATE`s the row's `deadline_at` to a shifted value — exactly
+/// what resume's SQL does — and asserts the worker reads THAT into
+/// `ctx.deadline()`. Deterministic: the workflow returns `ctx.deadline()` as its
+/// output, and we assert it equals the shifted `deadline_at` and is far from the
+/// stale start+timeout value. Before the fix, `ctx.deadline()` recomputed from
+/// the start time and would equal the stale value, failing the assertions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn worker_threads_shifted_deadline_at_into_ctx_deadline() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let timeout = chrono::Duration::minutes(30);
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let request = StartWorkflowParams {
+        workflow_name: "deadline_echo",
+        workflow_id: "deadline-echo-shifted-1",
+        exec_id,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: Some(timeout),
+        memo: None,
+        search_attrs: None,
+        reuse_policy: WorkflowIdReusePolicy::default(),
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+    };
+    let started = start_or_load_workflow_execution(&mut conn, request)
+        .await
+        .expect("start should succeed");
+    assert!(started.created, "start should create a fresh execution");
+
+    // Read the row so we know its exact `started_at` and original `deadline_at`.
+    let before = load_execution_from_url(&database_url, exec_id).await;
+    let original_deadline = before
+        .deadline_at
+        .expect("deadline_at must be set when execution_timeout is set");
+
+    // Simulate a resume/redrive shift: push `deadline_at` forward by 2h, exactly
+    // as `resume_workflow_execution` shifts it by the pause span. The new value
+    // is now well past `started_at + execution_timeout`.
+    let shift = chrono::Duration::hours(2);
+    let shifted_deadline = original_deadline + shift;
+    let updated = diesel::update(
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid())),
+    )
+    .set(harvest_workflow_executions::deadline_at.eq(Some(shifted_deadline)))
+    .execute(&mut conn)
+    .await
+    .expect("shift deadline_at should succeed");
+    assert_eq!(
+        updated, 1,
+        "exactly one row's deadline_at should be shifted"
+    );
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "deadline_echo",
+            module: "integration_e2e",
+            handler: deadline_echo_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-deadline-echo-shifted".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                workflow_task_timeout: Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
+                labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
+                max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
+                shard_notification_database_urls: Vec::new(),
+                sharded_pool: None,
+                slot_tuner: None,
+                max_concurrent_sessions: 0,
+            },
+            registry,
+        )
+        .expect("worker should build"),
+    );
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let execution = load_execution_from_url(&database_url, exec_id).await;
+            if execution.state == "COMPLETED" {
+                break execution;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let execution = completed.expect("workflow should complete within timeout");
+    let post_deadline = execution
+        .deadline_at
+        .expect("deadline_at must still be set after completion");
+    // The shift persisted (the worker never re-derives / overwrites deadline_at).
+    assert!(
+        (post_deadline - shifted_deadline).num_milliseconds().abs() <= 1,
+        "the row's deadline_at should remain the shifted value ({shifted_deadline}), got \
+         {post_deadline}"
+    );
+
+    // The workflow returned ctx.deadline() as its output. Parse it back.
+    let output = execution
+        .output
+        .expect("completed workflow must have an output");
+    assert_ne!(
+        output,
+        serde_json::Value::Null,
+        "ctx.deadline() must not be null — that means the deadline was NOT threaded"
+    );
+    let ctx_deadline: chrono::DateTime<Utc> =
+        serde_json::from_value(output).expect("ctx.deadline() output must be an RFC3339 timestamp");
+
+    // ctx.deadline() must equal the SHIFTED deadline_at the timeout scanner
+    // honours — not a stale start+timeout recompute.
+    assert!(
+        (ctx_deadline - shifted_deadline).num_milliseconds().abs() <= 1,
+        "ctx.deadline() ({ctx_deadline}) must equal the shifted row deadline_at \
+         ({shifted_deadline}), proving the worker reads the effective deadline"
+    );
+
+    // And it must be far from the stale `WorkflowStarted.timestamp + timeout`
+    // value (2h apart), which is what the pre-fix recompute would have produced.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let started_ts = match history.events.as_slice() {
+        [WorkflowEvent::WorkflowStarted { timestamp, .. }, ..] => *timestamp,
+        other => panic!("first event must be WorkflowStarted, got {other:?}"),
+    };
+    let stale_deadline = started_ts + timeout;
+    assert!(
+        (ctx_deadline - stale_deadline).num_seconds().abs() > 3600,
+        "ctx.deadline() ({ctx_deadline}) must NOT be the stale start+timeout value \
+         ({stale_deadline}) — the fix reads the shifted deadline_at, not the recompute"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn worker_completes_workflow_task_and_persists_result() {

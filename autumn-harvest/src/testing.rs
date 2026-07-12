@@ -2773,6 +2773,10 @@ impl WorkflowTestEnv {
                 // Issue #772: thread the deadline budget so a live test run can
                 // exercise deadline-aware continue-as-new.
                 execution_timeout: self.execution_timeout,
+                // The test-env carries only the timeout; `ctx.deadline()` falls
+                // back to `start + execution_timeout` (no resume/redrive shift
+                // to model here).
+                deadline_at: None,
             })
         };
 

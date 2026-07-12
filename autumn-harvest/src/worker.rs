@@ -9975,6 +9975,12 @@ async fn process_workflow_task(
             // `ctx.deadline()` / `ctx.should_continue_as_new()` can reason about
             // the deadline for deadline-aware continue-as-new.
             execution_timeout: prepared.execution.execution_timeout,
+            // Issue #772: thread the authoritative absolute deadline from the
+            // row. Unlike `started_at + execution_timeout`, this is the effective
+            // deadline the timeout scanner enforces — pause/resume (#383) and
+            // redrive push it forward — so `ctx.deadline()` must read it directly
+            // rather than recompute from the (now stale) start + timeout.
+            deadline_at: prepared.execution.deadline_at,
         };
 
         // Filter declarative handlers to those that target this workflow type.

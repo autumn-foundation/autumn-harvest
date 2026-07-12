@@ -179,10 +179,17 @@ pub struct WorkflowExecuteSpanMeta {
     /// The worker build ID of the worker executing this workflow.
     pub build_id: Option<String>,
     /// The effective `execution_timeout` budget for this run (issue #243/#772),
-    /// threaded into the [`WorkflowContext`] so `ctx.deadline()` /
-    /// `ctx.should_continue_as_new()` can reason about the deadline. `None` when
+    /// threaded into the [`WorkflowContext`] as the deadline fallback and as the
+    /// total budget for the deadline-fraction continue-as-new check. `None` when
     /// the workflow has no `execution_timeout`.
     pub execution_timeout: Option<chrono::Duration>,
+    /// The authoritative absolute deadline for this run (issue #772), read live
+    /// from the execution row's `deadline_at` column. Threaded into the
+    /// [`WorkflowContext`] so `ctx.deadline()` / `ctx.should_continue_as_new()`
+    /// reason about the **effective** deadline the timeout scanner enforces —
+    /// which pause/resume (#383) and redrive push forward past
+    /// `started_at + execution_timeout`. `None` = fall back to start + timeout.
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Classification of a bounded, read-only query-replay drive (issue #612).
@@ -977,6 +984,10 @@ pub async fn run_workflow_with_state_advancing_clock(
     // Issue #772: thread the execution-timeout budget so a WorkflowTestEnv run
     // can exercise deadline-aware continue-as-new.
     .with_execution_timeout(span_meta.and_then(|m| m.execution_timeout))
+    // Issue #772: thread the authoritative absolute deadline (the effective,
+    // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
+    // the timeout scanner rather than a stale start+timeout recompute.
+    .with_deadline(span_meta.and_then(|m| m.deadline_at))
     .with_metrics(metrics);
     drive_workflow(ctx, handler, input, span_meta).await
 }
@@ -1051,6 +1062,10 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_execution_timeout(span_meta.and_then(|m| m.execution_timeout))
+    // Issue #772: thread the authoritative absolute deadline (the effective,
+    // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
+    // the timeout scanner rather than a stale start+timeout recompute.
+    .with_deadline(span_meta.and_then(|m| m.deadline_at))
     .with_payload_caps(
         max_activity_input_bytes,
         0,

@@ -1666,10 +1666,21 @@ pub struct WorkflowContext {
     /// History-size thresholds visible to author code.
     history_policy: WorkflowHistoryPolicy,
     /// The effective execution-timeout budget for this run (issue #243/#772), or
-    /// `None` when the workflow has no `execution_timeout`. Used purely to derive
-    /// [`deadline`](Self::deadline) from the recorded `start_time`; records no
-    /// event. Threaded from the execution row by the worker.
+    /// `None` when the workflow has no `execution_timeout`. Used as the *fallback*
+    /// source for [`deadline`](Self::deadline) (`start_time + execution_timeout`)
+    /// when no authoritative absolute deadline is threaded, and as the total
+    /// budget for the deadline-fraction continue-as-new check. Records no event.
+    /// Threaded from the execution row by the worker.
     execution_timeout: Option<chrono::Duration>,
+    /// The authoritative absolute wall-clock deadline for this run (issue #772),
+    /// read live from the execution row's `deadline_at` column at context
+    /// construction. This is the *effective* deadline the timeout scanner
+    /// enforces: pause/resume (#383) and redrive push it forward, so it is NOT
+    /// necessarily `start_time + execution_timeout` for a resumed/redriven run.
+    /// [`deadline`](Self::deadline) prefers this when present, falling back to
+    /// `start_time + execution_timeout` only when no absolute deadline was
+    /// threaded (the replayer / test-env paths). `None` = fall back.
+    deadline_at: Option<DateTime<Utc>>,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Monotonically increasing counter for naming fan-out count markers.
@@ -2050,6 +2061,7 @@ impl WorkflowContext {
             start_time,
             history_policy,
             execution_timeout: None,
+            deadline_at: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2190,6 +2202,7 @@ impl WorkflowContext {
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
+            deadline_at: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2245,6 +2258,7 @@ impl WorkflowContext {
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
+            deadline_at: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2444,6 +2458,25 @@ impl WorkflowContext {
         self
     }
 
+    /// Set the authoritative absolute wall-clock deadline for this run
+    /// (issue #772), read live from the execution row's `deadline_at` column.
+    ///
+    /// Threaded by the executor from the loaded execution row. Because
+    /// pause/resume (#383) and redrive shift `deadline_at` forward past the
+    /// original `start_time + execution_timeout`, this is the *effective*
+    /// deadline the timeout scanner enforces, and it is what
+    /// [`deadline`](Self::deadline) (and therefore
+    /// [`time_until_deadline`](Self::time_until_deadline) /
+    /// [`should_continue_as_new`](Self::should_continue_as_new)) reports when
+    /// present. `None` (the default) leaves [`deadline`](Self::deadline) to fall
+    /// back to `start_time + execution_timeout` — the replayer / test-env paths
+    /// that carry only the timeout.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
+        self.deadline_at = deadline_at;
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// The task queue this workflow execution runs on.
@@ -2477,17 +2510,29 @@ impl WorkflowContext {
         self.start_time
     }
 
-    /// The absolute wall-clock deadline this run must finish by, or `None` when
-    /// the workflow has no `execution_timeout` (issue #772).
+    /// The effective absolute wall-clock deadline this run must finish by, or
+    /// `None` when the workflow has no deadline (issue #772).
     ///
-    /// Derived purely from the recorded `WorkflowStarted` timestamp
-    /// ([`now`](Self::now) with no advancing clock) plus the effective
-    /// `execution_timeout` (issue #243), so it is **pure and replay-safe**: it
-    /// records no event and returns the same value on every replay and every
-    /// worker. `None` is returned when there is no `execution_timeout` or when
-    /// the computed deadline would overflow the representable range.
+    /// Prefers the authoritative absolute `deadline_at` threaded from the
+    /// execution row ([`with_deadline`](Self::with_deadline)) when present — this
+    /// is the exact deadline the timeout scanner enforces, and pause/resume
+    /// (#383) and redrive push it forward past `start_time + execution_timeout`,
+    /// so for a resumed/redriven run it is **not** simply start + timeout.
+    ///
+    /// Falls back to the recorded `WorkflowStarted` timestamp plus the effective
+    /// `execution_timeout` (issue #243) only when **no** absolute deadline was
+    /// threaded (the replayer / test-env paths, which carry just the timeout).
+    ///
+    /// Either way it is **pure and replay-safe**: it records no event and returns
+    /// the same value on every replay and every worker (the threaded value is a
+    /// current column read at construction, not derived from live wall-clock).
+    /// `None` is returned when there is no deadline signal at all, or when the
+    /// fallback computation would overflow the representable range.
     #[must_use]
     pub fn deadline(&self) -> Option<DateTime<Utc>> {
+        if let Some(deadline_at) = self.deadline_at {
+            return Some(deadline_at);
+        }
         self.execution_timeout
             .and_then(|budget| self.start_time.checked_add_signed(budget))
     }
@@ -11152,6 +11197,67 @@ mod tests {
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(t0, vec![], None);
         assert_eq!(ctx.deadline(), None);
+    }
+
+    /// Issue #772 (P2 fix): a resumed/redriven run's effective deadline is the
+    /// row's `deadline_at`, which pause/resume (#383) shifts forward past
+    /// `start + execution_timeout`. When an authoritative absolute deadline is
+    /// threaded, `ctx.deadline()` must return it, NOT the stale start+timeout
+    /// recompute — otherwise a long pause makes `should_continue_as_new()` see a
+    /// past deadline while the timeout scanner honours the shifted one.
+    #[test]
+    fn deadline_prefers_threaded_absolute_over_start_plus_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        // A resume shift of +120s pushes the real deadline past start+timeout.
+        let shift = chrono::Duration::seconds(120);
+        let shifted = t0 + timeout + shift;
+        let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
+        assert_eq!(
+            ctx.deadline(),
+            Some(shifted),
+            "deadline() must return the threaded (resume-shifted) deadline_at"
+        );
+        assert_ne!(
+            ctx.deadline(),
+            Some(t0 + timeout),
+            "deadline() must NOT return the stale start+timeout value"
+        );
+    }
+
+    /// Issue #772 (P2 fix): backward-compat / fallback. When NO absolute deadline
+    /// is threaded (the replayer / test-env paths, which carry only the timeout),
+    /// `ctx.deadline()` falls back to `start + execution_timeout` exactly as
+    /// before, so those paths are unchanged.
+    #[test]
+    fn deadline_falls_back_to_start_plus_timeout_without_absolute() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        // Explicit None threaded — must behave identically to not threading.
+        let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(None);
+        assert_eq!(ctx.deadline(), Some(t0 + timeout));
+    }
+
+    /// Issue #772 (P2 fix): the deadline branch of `should_continue_as_new()`
+    /// reads the *effective* (shifted) deadline. A recorded clock read at
+    /// t0+25s would trip against the stale 30s start+timeout deadline
+    /// (25/30 = 0.83 ≥ 0.8), but must NOT trip when the row's `deadline_at` has
+    /// been shifted an hour into the future by a long pause — the run is nowhere
+    /// near its fraction of the effective deadline.
+    #[test]
+    fn should_continue_as_new_reads_shifted_deadline_not_stale_start_plus_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        let clock = t0 + chrono::Duration::seconds(25);
+        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let ctx =
+            deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout)).with_deadline(Some(shifted));
+        assert_eq!(ctx.deadline(), Some(shifted));
+        assert!(
+            !ctx.should_continue_as_new(),
+            "must not trip: the effective (shifted) deadline is far in the future, \
+             even though 25s/30s of the raw budget looks consumed"
+        );
     }
 
     #[test]
