@@ -472,6 +472,15 @@ pub async fn append_single_event(
 /// update name. Callers that run `admit_update_event` inside a larger outer
 /// transaction (e.g. `update_with_start`) pass `None` and emit at their own
 /// outer-commit boundary instead, so the metric never fires on a rollback.
+///
+/// The `name` label is the raw update name (issue #684, Codex P2): unlike the
+/// terminal `harvest.update.completed`/`failed` counters — which bound an
+/// unregistered name to the `__unregistered__` sentinel using the workflow's
+/// handler-not-found result — the admission site has no way to know whether a
+/// name resolves to a handler (imperative `ctx.register_update_handler`
+/// handlers are not known until the workflow executes), so it cannot bound the
+/// name without mislabeling legitimate imperatively-registered updates. See the
+/// changelog residual note for `harvest.update.admitted`.
 pub async fn admit_update_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,

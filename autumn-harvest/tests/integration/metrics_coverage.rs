@@ -221,23 +221,23 @@ impl MetricsRecorder for RecordingMetrics {
 
     // ── Signal & update lifecycle counters (issue #684) ───────────────────
 
-    fn record_signal_received(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_SIGNAL_RECEIVED,
             labels: vec![
                 ("workflow", workflow_name.to_owned()),
-                ("name", signal_name.to_owned()),
                 ("queue", queue.to_owned()),
             ],
         });
     }
 
-    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_SIGNAL_UNHANDLED,
             labels: vec![
                 ("workflow", workflow_name.to_owned()),
-                ("name", signal_name.to_owned()),
                 ("queue", queue.to_owned()),
             ],
         });
@@ -313,8 +313,8 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_retention_deleted("my_workflow", 50);
     rec.record_workflow_task_timeout("my_workflow", "default");
     rec.record_task_dispatched("default");
-    rec.record_signal_received("my_workflow", "approve", "default");
-    rec.record_signal_unhandled("my_workflow", "approve", "default");
+    rec.record_signal_received("my_workflow", "default");
+    rec.record_signal_unhandled("my_workflow", "default");
     rec.record_update_admitted("my_workflow", "set_priority");
     rec.record_update_rejected("my_workflow", "set_priority");
     rec.record_update_completed("my_workflow", "set_priority", "default");
@@ -425,8 +425,8 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 0, 0, 0.0);
     rec.record_workflow_task_timeout("wf", "default");
-    rec.record_signal_received("wf", "approve", "default");
-    rec.record_signal_unhandled("wf", "approve", "default");
+    rec.record_signal_received("wf", "default");
+    rec.record_signal_unhandled("wf", "default");
     rec.record_update_admitted("wf", "set_priority");
     rec.record_update_rejected("wf", "set_priority");
     rec.record_update_completed("wf", "set_priority", "default");
@@ -453,8 +453,8 @@ fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
     // reachable surface; production label content is pinned by the
     // metrics_rs_adapter bridge test and the context-level tests.
     let rec = RecordingMetrics::default();
-    rec.record_signal_received("wf", "approve", "default");
-    rec.record_signal_unhandled("wf", "approve", "default");
+    rec.record_signal_received("wf", "default");
+    rec.record_signal_unhandled("wf", "default");
     rec.record_update_admitted("wf", "set_priority");
     rec.record_update_rejected("wf", "set_priority");
     rec.record_update_completed("wf", "set_priority", "default");
@@ -463,9 +463,13 @@ fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
     let samples = rec.drain();
     assert_eq!(samples.len(), 6);
 
+    // Issue #684 (Codex P2): the signal counters carry NO free-form `name`
+    // label — signal names come from the free-form send route and have no
+    // declared registry to bound them. Update names are kept because they
+    // resolve against the registered/declared handler set.
     let expected: &[(&str, &[&str])] = &[
-        (METRIC_SIGNAL_RECEIVED, &["workflow", "name", "queue"]),
-        (METRIC_SIGNAL_UNHANDLED, &["workflow", "name", "queue"]),
+        (METRIC_SIGNAL_RECEIVED, &["workflow", "queue"]),
+        (METRIC_SIGNAL_UNHANDLED, &["workflow", "queue"]),
         (METRIC_UPDATE_ADMITTED, &["workflow", "name"]),
         (METRIC_UPDATE_REJECTED, &["workflow", "name"]),
         (METRIC_UPDATE_COMPLETED, &["workflow", "name", "queue"]),

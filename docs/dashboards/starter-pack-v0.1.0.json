@@ -4029,8 +4029,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (workflow, name) (rate(harvest_signal_received_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
-              "legendFormat": "{{workflow}} / {{name}}",
+              "expr": "sum by (workflow, queue) (rate(harvest_signal_received_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -4078,8 +4078,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (workflow, name) (rate(harvest_signal_unhandled_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
-              "legendFormat": "{{workflow}} / {{name}}",
+              "expr": "sum by (workflow, queue) (rate(harvest_signal_unhandled_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

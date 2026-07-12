@@ -3503,6 +3503,20 @@ async fn persist_update_result_commands(
 /// An update whose name cannot be resolved from history (should not happen —
 /// admission always precedes the result) is labeled `"unknown"` rather than
 /// dropped, keeping the label bounded.
+///
+/// The `name` label is bounded to the actual handler set (issue #684, Codex P2)
+/// using the **result** as the discriminator, not the declarative registry: the
+/// raw route `POST /workflows/{id}/update/{name}` can admit an unregistered
+/// name, which then fails the workflow's handler lookup with the exact
+/// `"update handler '<name>' not found"` error (see
+/// [`crate::context::WorkflowContext::execute_admitted_update`]). Only that case
+/// is bucketed to the
+/// [`UNREGISTERED_UPDATE_NAME`](crate::telemetry::UNREGISTERED_UPDATE_NAME)
+/// sentinel; every real handler — whether registered declaratively via
+/// `#[update]` **or** imperatively via `ctx.register_update_handler` — keeps its
+/// name. Bucketing against `registry.update_handlers` would be wrong here: it is
+/// declarative-only and does not capture imperatively-registered handlers (the
+/// common pattern), so it would mislabel legitimate updates as unregistered.
 fn collect_update_result_metrics(
     history_events: &[WorkflowEvent],
     pending_cmds: &[WorkflowCommand],
@@ -3531,11 +3545,28 @@ fn collect_update_result_metrics(
         .filter_map(|cmd| match cmd {
             WorkflowCommand::RecordUpdateResult { update_id, result } => {
                 let name = names.get(update_id).copied().unwrap_or("unknown");
-                Some((name.to_owned(), result.is_ok()))
+                let label = if is_unregistered_update_failure(name, result) {
+                    crate::telemetry::UNREGISTERED_UPDATE_NAME
+                } else {
+                    name
+                };
+                Some((label.to_owned(), result.is_ok()))
             }
             _ => None,
         })
         .collect()
+}
+
+/// Whether a `RecordUpdateResult` is the "update handler not found" failure a
+/// genuinely-unregistered update name produces (issue #684, Codex P2).
+///
+/// The exact error is `format!("update handler '{name}' not found")`, minted by
+/// [`crate::context::WorkflowContext::execute_admitted_update`] when no handler
+/// is registered for the admitted name. Matching the exact string (including the
+/// name) keeps a real handler that happens to return a similar message from
+/// being mislabeled.
+fn is_unregistered_update_failure(name: &str, result: &Result<serde_json::Value, String>) -> bool {
+    matches!(result, Err(error) if *error == format!("update handler '{name}' not found"))
 }
 
 /// Select the command list carrying this cycle's `RecordUpdateResult`s given
@@ -3567,6 +3598,11 @@ fn update_result_command_source<'a>(
 /// `Persisted`-arm terminal/suspend emission and the two inline external-signal
 /// suspension branches, which persist their update results outside the main
 /// transaction and would otherwise leave them uncounted.
+///
+/// The `update_name` is already bounded by `collect_update_result_metrics` (an
+/// unregistered name's handler-not-found failure is bucketed to the
+/// [`UNREGISTERED_UPDATE_NAME`](crate::telemetry::UNREGISTERED_UPDATE_NAME)
+/// sentinel, issue #684 Codex P2), so this helper emits the name verbatim.
 fn emit_update_result_metrics(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     workflow_name: &str,
@@ -3606,6 +3642,14 @@ fn outcome_unhandled_signals(outcome: &WorkflowOutcome) -> std::collections::BTr
 /// Emit `harvest.signal.unhandled` once per unconsumed occurrence from a
 /// terminal outcome's `unhandled_signals` map (issue #684).
 ///
+/// The map is grouped by signal name for the executor's bookkeeping, but the
+/// signal `name` is NOT a metric label (issue #684, Codex P2 — free-form send
+/// route, no declared registry to bound it). This sums the per-name counts and
+/// emits one increment per unconsumed occurrence against the single
+/// `(workflow, queue)` series, so the counter still reflects the terminal
+/// outcome's total unconsumed-signal volume without the unbounded name
+/// dimension.
+///
 /// Called only from the worker's post-commit `Persisted` arm (the same
 /// discipline as `harvest.update.completed/failed`), so the counter represents
 /// DURABLE terminal outcomes only: this arm is reached only after the persist
@@ -3621,10 +3665,9 @@ fn emit_unhandled_signal_metrics(
     queue: &str,
     by_name: &std::collections::BTreeMap<String, u64>,
 ) {
-    for (signal_name, count) in by_name {
-        for _ in 0..*count {
-            metrics.record_signal_unhandled(workflow_name, signal_name, queue);
-        }
+    let total: u64 = by_name.values().sum();
+    for _ in 0..total {
+        metrics.record_signal_unhandled(workflow_name, queue);
     }
 }
 
@@ -8949,12 +8992,12 @@ async fn process_workflow_task(
         // live-only delivery choke point (ingest_due_timers_and_signals) and
         // each signal appears in `signals_delivered` exactly once (marked
         // consumed in harvest_signals), so the counter fires exactly once per
-        // delivery. Never emitted on replay.
-        telemetry.metrics.record_signal_received(
-            &prepared.execution.workflow_name,
-            signal_name,
-            &task.queue_name,
-        );
+        // delivery. Never emitted on replay. The signal name is NOT a metric
+        // label (issue #684, Codex P2 — free-form send route, no declared
+        // registry to bound it); it stays a span-only attribute above.
+        telemetry
+            .metrics
+            .record_signal_received(&prepared.execution.workflow_name, &task.queue_name);
     }
 
     // Emit workflow.started exactly once per execution.  Two independent
@@ -15973,21 +16016,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_update_result_metrics_buckets_only_handler_not_found_to_sentinel() {
+        // Issue #684 (Codex P2): an unregistered update name — admitted via the
+        // free-form raw route — fails with the exact "update handler '<name>'
+        // not found" error; only that case buckets to __unregistered__. A real
+        // handler that fails with any other error keeps its name (a real handler
+        // may be declarative OR imperative, so bucketing against the declarative
+        // registry would mislabel it).
+        let unregistered_id = crate::types::UpdateId::new();
+        let real_id = crate::types::UpdateId::new();
+        let history = vec![
+            admitted(unregistered_id, "totally_random_name"),
+            admitted(real_id, "set_priority"),
+        ];
+        let cmds = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: unregistered_id,
+                result: Err("update handler 'totally_random_name' not found".to_owned()),
+            },
+            WorkflowCommand::RecordUpdateResult {
+                update_id: real_id,
+                result: Err("validation failed".to_owned()),
+            },
+        ];
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            vec![
+                (crate::telemetry::UNREGISTERED_UPDATE_NAME.to_owned(), false),
+                ("set_priority".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_unregistered_update_failure_matches_exact_not_found_error_only() {
+        let ok: Result<Value, String> = Ok(Value::Null);
+        assert!(!is_unregistered_update_failure("set_val", &ok));
+        assert!(is_unregistered_update_failure(
+            "set_val",
+            &Err("update handler 'set_val' not found".to_owned())
+        ));
+        // A different name in the error must not match this update's name.
+        assert!(!is_unregistered_update_failure(
+            "set_val",
+            &Err("update handler 'other' not found".to_owned())
+        ));
+        // An unrelated error from a real handler is not bucketed.
+        assert!(!is_unregistered_update_failure(
+            "set_val",
+            &Err("boom".to_owned())
+        ));
+    }
+
     // ── signal.unhandled post-commit collection (issue #684, Codex P2) ─────
 
     /// A recording sink capturing every `record_signal_unhandled` call so
-    /// `emit_unhandled_signal_metrics` can be asserted directly.
+    /// `emit_unhandled_signal_metrics` can be asserted directly. The signal name
+    /// is not a label (issue #684, Codex P2), so each call carries only
+    /// `(workflow, queue)`.
     #[derive(Default)]
     struct SignalUnhandledSink {
-        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+        calls: std::sync::Mutex<Vec<(String, String)>>,
     }
     impl crate::telemetry::MetricsRecorder for SignalUnhandledSink {
-        fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
-            self.calls.lock().unwrap().push((
-                workflow_name.to_owned(),
-                signal_name.to_owned(),
-                queue.to_owned(),
-            ));
+        fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((workflow_name.to_owned(), queue.to_owned()));
         }
     }
 
@@ -16029,16 +16126,18 @@ mod tests {
     }
 
     #[test]
-    fn emit_unhandled_signal_metrics_fires_once_per_occurrence() {
+    fn emit_unhandled_signal_metrics_sums_the_map_without_a_name_label() {
         let sink = SignalUnhandledSink::default();
         let map =
             std::collections::BTreeMap::from([("a".to_owned(), 2u64), ("b".to_owned(), 1u64)]);
         emit_unhandled_signal_metrics(&sink, "wf", "q", &map);
         let calls = sink.calls.lock().unwrap().clone();
-        // 2 occurrences of "a" + 1 of "b" = 3 emissions, each carrying labels.
+        // 2 occurrences of "a" + 1 of "b" = 3 total emissions, each against the
+        // single (workflow, queue) series — the signal name is not a label
+        // (issue #684, Codex P2), so the map is summed to preserve the total
+        // unconsumed volume while dropping the unbounded name dimension.
         assert_eq!(calls.len(), 3);
-        assert_eq!(calls.iter().filter(|(_, s, _)| s == "a").count(), 2);
-        assert!(calls.iter().all(|(w, _, q)| w == "wf" && q == "q"));
+        assert!(calls.iter().all(|(w, q)| w == "wf" && q == "q"));
     }
 
     #[test]

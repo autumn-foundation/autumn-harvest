@@ -649,10 +649,18 @@ pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 ///
 /// Emitted once per delivered signal at the single durable-delivery choke
 /// point (`ingest_due_timers_and_signals`, live worker path only — never on
-/// replay). Labeled by `workflow` (workflow name), `name` (signal name), and
-/// `queue` (task queue). Both `name` and `workflow` are statically declared
-/// per workflow, so cardinality is bounded; `execution.id` is span-only per
-/// ADR-0001 §7 and must never appear here.
+/// replay). Labeled by `workflow` (workflow name) and `queue` (task queue),
+/// both bounded.
+///
+/// **The signal `name` is deliberately NOT a label (issue #684, Codex P2).**
+/// Signals are delivered via the free-form route
+/// `POST /workflows/{id}/signal/{signal_name}` — the `signal_name` path segment
+/// is caller-controlled and, unlike activity names or `#[update]` handler names,
+/// has no declared registry to bound it. A caller using per-entity / dynamic
+/// signal names would create unbounded metric series, violating the ADR-0001 §7
+/// cardinality contract. Per-signal-name diagnostics are out of scope for this
+/// slice (use the per-workflow stack / open-awaitables API). `execution.id` is
+/// span-only per ADR-0001 §7 and must never appear here.
 pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
 
 /// Counter: a delivered `SignalReceived` was never consumed at a terminal
@@ -686,7 +694,16 @@ pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
 /// worse than none.
 /// This notably **excludes the "stuck workflow that ignored a signal and then
 /// timed out"** case: for that, watch [`METRIC_WORKFLOW_TIMEOUT`] plus the
-/// per-workflow stack API instead. `execution.id` is span-only per ADR-0001 §7.
+/// per-workflow stack API instead.
+///
+/// Labeled by `workflow` and `queue` only, both bounded. **The signal `name`
+/// is deliberately NOT a label (issue #684, Codex P2)** — for the same
+/// free-form-send-route / no-declared-registry reason as
+/// [`METRIC_SIGNAL_RECEIVED`], and most acutely here: an unhandled signal's
+/// name is by definition a mismatched / unlistened-for one. The worker sums
+/// the terminal outcome's per-name unconsumed map and emits one increment per
+/// unconsumed occurrence against the single `(workflow, queue)` series.
+/// `execution.id` is span-only per ADR-0001 §7.
 pub const METRIC_SIGNAL_UNHANDLED: &str = "harvest.signal.unhandled";
 
 /// Counter: a workflow update was durably admitted (`UpdateAdmitted` appended)
@@ -697,6 +714,21 @@ pub const METRIC_SIGNAL_UNHANDLED: &str = "harvest.signal.unhandled";
 /// paths. Labeled by `workflow` (workflow name) and `name` (update name); no
 /// queue label is available at the admission site. `execution.id` is span-only
 /// per ADR-0001 §7.
+///
+/// **`name` cardinality — residual (issue #684, Codex P2):** the raw route
+/// `POST /workflows/{id}/update/{name}` admits ANY name (the validator lookup is
+/// best-effort — an unregistered name falls through and is durably admitted), so
+/// a hostile/buggy caller could create unbounded `admitted` series. Unlike the
+/// terminal [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] counters — which
+/// bound an unregistered name to the [`UNREGISTERED_UPDATE_NAME`] sentinel using
+/// the workflow's handler-not-found *result* — the admission site cannot bound
+/// the name: it has no way to know whether a name resolves to a handler, because
+/// imperatively-registered handlers (`ctx.register_update_handler`, the common
+/// pattern) are not known until the workflow executes, and bounding against only
+/// the declarative `registry.update_handlers` would mislabel every legitimate
+/// imperatively-registered update. The correlated `failed{name="__unregistered__"}`
+/// series surfaces the hostile-admit vector; watch it if `admitted` cardinality
+/// grows. This admission-site residual is flagged for the spec owner.
 pub const METRIC_UPDATE_ADMITTED: &str = "harvest.update.admitted";
 
 /// Counter: a workflow update was rejected by its registered validator before
@@ -714,7 +746,9 @@ pub const METRIC_UPDATE_REJECTED: &str = "harvest.update.rejected";
 ///
 /// Emitted post-commit in the worker's `Persisted` arm, exactly once per
 /// completed update (the `RecordUpdateResult` command is produced once on live
-/// execution). Labeled by `workflow`, `name` (update name), and `queue`.
+/// execution). Labeled by `workflow`, `name` (update name), and `queue`. A
+/// completed update always ran a real handler, so its `name` is inherently
+/// bounded to the app's registered handler set (issue #684, Codex P2).
 /// `execution.id` is span-only per ADR-0001 §7.
 pub const METRIC_UPDATE_COMPLETED: &str = "harvest.update.completed";
 
@@ -722,9 +756,26 @@ pub const METRIC_UPDATE_COMPLETED: &str = "harvest.update.completed";
 /// (`UpdateFailed` appended) (issue #684).
 ///
 /// Emitted post-commit in the worker's `Persisted` arm, exactly once per
-/// failed update. Labeled by `workflow`, `name` (update name), and `queue`.
-/// `execution.id` is span-only per ADR-0001 §7.
+/// failed update. Labeled by `workflow`, `name` (update name), and `queue`. The
+/// `name` label is bounded (issue #684, Codex P2): a genuinely-unregistered
+/// name — admitted via the free-form raw route with no matching handler —
+/// fails the workflow's handler lookup with the exact `"update handler '<name>'
+/// not found"` error, which the worker buckets to the [`UNREGISTERED_UPDATE_NAME`]
+/// sentinel; every real handler (declarative `#[update]` **or** imperative
+/// `ctx.register_update_handler`) keeps its name. `execution.id` is span-only
+/// per ADR-0001 §7.
 pub const METRIC_UPDATE_FAILED: &str = "harvest.update.failed";
+
+/// Sentinel `name` label for a `harvest.update.failed` counter when the admitted
+/// update name resolved to no handler (issue #684, Codex P2).
+///
+/// The raw route `POST /workflows/{id}/update/{name}` admits arbitrary,
+/// caller-controlled names; an unregistered one fails the workflow's handler
+/// lookup with the exact `"update handler '<name>' not found"` error, and the
+/// worker buckets exactly that case to this sentinel — keeping the `name` label
+/// bounded to the app's real handler set plus this one extra series, without
+/// mislabeling any legitimately-registered (declarative or imperative) handler.
+pub const UNREGISTERED_UPDATE_NAME: &str = "__unregistered__";
 
 /// Bounded outcome classification for a worker-session acquisition attempt
 /// (issue #606).
@@ -2026,19 +2077,25 @@ pub trait MetricsRecorder: Send + Sync {
     /// A `SignalReceived` event was durably delivered into a workflow's
     /// history (issue #684).
     ///
-    /// Maps to the counter [`METRIC_SIGNAL_RECEIVED`] with labels `workflow`,
-    /// `name` (signal name), and `queue`.
-    fn record_signal_received(&self, workflow_name: &str, signal_name: &str, queue: &str) {
-        let _ = (workflow_name, signal_name, queue);
+    /// Maps to the counter [`METRIC_SIGNAL_RECEIVED`] with labels `workflow`
+    /// and `queue`. The signal name is deliberately NOT a label (issue #684,
+    /// Codex P2): it comes from the free-form send route and has no declared
+    /// registry to bound it.
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
     }
 
     /// A delivered signal was never consumed by the workflow before it reached
     /// a Completed/Failed terminal outcome (issue #684).
     ///
-    /// Maps to the counter [`METRIC_SIGNAL_UNHANDLED`] with labels `workflow`,
-    /// `name` (signal name), and `queue`.
-    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
-        let _ = (workflow_name, signal_name, queue);
+    /// Maps to the counter [`METRIC_SIGNAL_UNHANDLED`] with labels `workflow`
+    /// and `queue`. The signal name is deliberately NOT a label (issue #684,
+    /// Codex P2): it comes from the free-form send route and has no declared
+    /// registry to bound it. The worker emits one call per unconsumed
+    /// occurrence, so the counter still reflects the terminal outcome's total
+    /// unconsumed-signal volume against the single `(workflow, queue)` series.
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
     }
 
     /// A workflow update was durably admitted (issue #684).

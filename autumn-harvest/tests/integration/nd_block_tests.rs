@@ -144,7 +144,7 @@ struct RecordingMetrics {
     block_labels: Mutex<Vec<(String, String)>>,
     nd_detections: Mutex<usize>,
     terminal_failed: Mutex<usize>,
-    signal_unhandled: Mutex<Vec<(String, String, String)>>,
+    signal_unhandled: Mutex<Vec<(String, String)>>,
 }
 
 impl RecordingMetrics {
@@ -175,13 +175,13 @@ impl MetricsRecorder for RecordingMetrics {
 
     // Issue #684: emitted from the same worker site as record_workflow_terminal
     // (downstream of the #603 ND-block gate), so an ND-blocked cycle must record
-    // zero of these.
-    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
-        self.signal_unhandled.lock().unwrap().push((
-            workflow_name.to_string(),
-            signal_name.to_string(),
-            queue.to_string(),
-        ));
+    // zero of these. No `name` label (issue #684, Codex P2 — free-form send
+    // route), so each call carries only `(workflow, queue)`.
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        self.signal_unhandled
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), queue.to_string()));
     }
 
     fn record_workflow_non_determinism(&self, _workflow_name: &str, _build_id: &str) {
@@ -1228,8 +1228,9 @@ async fn completion_never_touches_search_attrs_on_a_row_that_was_never_nd_blocke
 /// a durable commit.
 /// Issue #684 (FIX 2), positive case: a genuine terminal (Completed) that left
 /// a delivered signal undrained emits exactly one `harvest.signal.unhandled`
-/// with workflow+name+queue labels — the worker emits it post-commit from the
-/// terminal outcome's `unhandled_signals` map.
+/// with workflow+queue labels (no free-form name; issue #684 Codex P2) — the
+/// worker emits it post-commit from the terminal outcome's `unhandled_signals`
+/// map, summed to the `(workflow, queue)` series.
 #[tokio::test]
 async fn genuine_terminal_with_undrained_signal_emits_signal_unhandled() {
     let (url, _c) = setup_env_or_container().await;
@@ -1284,12 +1285,8 @@ async fn genuine_terminal_with_undrained_signal_emits_signal_unhandled() {
     );
     assert_eq!(
         metrics_a.signal_unhandled.lock().unwrap()[0],
-        (
-            "sig_term_wf".to_string(),
-            "late".to_string(),
-            "default".to_string()
-        ),
-        "signal.unhandled must carry workflow+name+queue labels"
+        ("sig_term_wf".to_string(), "default".to_string()),
+        "signal.unhandled must carry workflow+queue labels only (no free-form name; issue #684 Codex P2)"
     );
 }
 

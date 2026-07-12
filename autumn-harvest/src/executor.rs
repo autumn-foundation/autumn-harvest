@@ -1852,16 +1852,15 @@ mod tests {
     /// Recording double: fails the test if the executor ever emits a sample.
     #[derive(Default)]
     struct UnhandledSignalRecorder {
-        samples: std::sync::Mutex<Vec<(String, String, String)>>,
+        samples: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl MetricsRecorder for UnhandledSignalRecorder {
-        fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
-            self.samples.lock().unwrap().push((
-                workflow_name.to_owned(),
-                signal_name.to_owned(),
-                queue.to_owned(),
-            ));
+        fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+            self.samples
+                .lock()
+                .unwrap()
+                .push((workflow_name.to_owned(), queue.to_owned()));
         }
     }
 

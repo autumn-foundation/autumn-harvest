@@ -5471,7 +5471,7 @@ struct SignalUnhandledCounter {
 }
 
 impl autumn_harvest::telemetry::MetricsRecorder for SignalUnhandledCounter {
-    fn record_signal_unhandled(&self, _workflow_name: &str, _signal_name: &str, _queue: &str) {
+    fn record_signal_unhandled(&self, _workflow_name: &str, _queue: &str) {
         self.unhandled
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }

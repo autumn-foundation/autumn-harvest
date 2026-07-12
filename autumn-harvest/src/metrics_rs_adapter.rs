@@ -792,21 +792,22 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
-    fn record_signal_received(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — signal names come from the
+        // free-form send route and have no declared registry to bound them.
         counter!(
             METRIC_SIGNAL_RECEIVED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_NAME => signal_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
     }
 
-    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — see record_signal_received.
         counter!(
             METRIC_SIGNAL_UNHANDLED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_NAME => signal_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
@@ -1193,14 +1194,22 @@ mod tests {
         let capture = CapturingRecorder::default();
         metrics::with_local_recorder(&&capture, || {
             let rec = MetricsRsRecorder;
-            rec.record_signal_received("wf", "approve", "q");
-            rec.record_signal_unhandled("wf", "approve", "q");
+            rec.record_signal_received("wf", "q");
+            rec.record_signal_unhandled("wf", "q");
             rec.record_update_admitted("wf", "set_priority");
             rec.record_update_rejected("wf", "set_priority");
             rec.record_update_completed("wf", "set_priority", "q");
             rec.record_update_failed("wf", "set_priority", "q");
         });
 
+        // Signals carry no `name` label (issue #684, Codex P2): free-form send
+        // route, no declared registry to bound it.
+        let wf_q = |q: &str| {
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), q.to_owned()),
+            ]
+        };
         let wf_name_q = |name: &str, q: &str| {
             vec![
                 (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
@@ -1219,11 +1228,8 @@ mod tests {
         assert_eq!(
             counters.as_slice(),
             &[
-                (METRIC_SIGNAL_RECEIVED.to_owned(), wf_name_q("approve", "q")),
-                (
-                    METRIC_SIGNAL_UNHANDLED.to_owned(),
-                    wf_name_q("approve", "q")
-                ),
+                (METRIC_SIGNAL_RECEIVED.to_owned(), wf_q("q")),
+                (METRIC_SIGNAL_UNHANDLED.to_owned(), wf_q("q")),
                 (METRIC_UPDATE_ADMITTED.to_owned(), wf_name("set_priority")),
                 (METRIC_UPDATE_REJECTED.to_owned(), wf_name("set_priority")),
                 (
@@ -1235,8 +1241,8 @@ mod tests {
                     wf_name_q("set_priority", "q")
                 ),
             ],
-            "the six signal/update bridges must register with the documented \
-             workflow/name/queue label constants, values un-swapped"
+            "signal bridges register with (workflow, queue) only and the update \
+             bridges with the documented workflow/name/queue constants, values un-swapped"
         );
     }
 }

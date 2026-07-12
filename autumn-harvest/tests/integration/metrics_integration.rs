@@ -304,22 +304,22 @@ impl MetricsRecorder for RecordingMetrics {
 
     // ── Signal & update lifecycle counters (issue #684) ───────────────────
 
-    fn record_signal_received(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
         self.push(
             METRIC_SIGNAL_RECEIVED,
             vec![
-                ("name", signal_name.to_owned()),
                 ("queue", queue.to_owned()),
                 ("workflow", workflow_name.to_owned()),
             ],
         );
     }
 
-    fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        // Issue #684 (Codex P2): no `name` label — free-form send route.
         self.push(
             METRIC_SIGNAL_UNHANDLED,
             vec![
-                ("name", signal_name.to_owned()),
                 ("queue", queue.to_owned()),
                 ("workflow", workflow_name.to_owned()),
             ],

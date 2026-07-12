@@ -3396,7 +3396,9 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
     // Capture the update name for the post-commit update.admitted metric
-    // (issue #684) before `request` is moved into the transaction closure.
+    // (issue #684) before `request` is moved into the transaction closure. The
+    // raw name is used for the label — the admission site cannot bound an
+    // unregistered name (Codex P2 residual; see `admit_update_event`).
     let update_name_for_metric = request.update_name.clone();
     let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
         .transaction::<(

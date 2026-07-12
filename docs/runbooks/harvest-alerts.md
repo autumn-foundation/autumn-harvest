@@ -1103,9 +1103,12 @@ being blocked.
 `harvest.signal.unhandled` counter (issue #684) fires once per delivered
 signal a workflow left unconsumed (no `wait_for_signal`/`receive_signal`, no
 push handler) by the time it reached a **Completed or Failed** terminal
-outcome. The `workflow` + `name` labels name the workflow type and the
-signal. Signals excused by a lost signal-or-deadline race (issue #476) are
-never counted.
+outcome. The `workflow` + `queue` labels name the workflow type and its task
+queue. The signal **name is not a label** (issue #684, Codex P2 — signal names
+come from the free-form send route and have no declared registry to bound them,
+so they cannot be a bounded metric label); identify *which* signal was dropped
+from the run's history / stack (below), not from the metric. Signals excused by
+a lost signal-or-deadline race (issue #476) are never counted.
 
 > **Known scope limitation — read this before trusting a *low* number.** This
 > counter is emitted **only** from graceful `Completed`/`Failed` terminals
@@ -1125,8 +1128,9 @@ never counted.
 
 ### Triage steps
 
-1. Read the `workflow` and `name` labels to identify the workflow type and
-   the signal being dropped.
+1. Read the `workflow` (and `queue`) label to identify the workflow type. The
+   signal name is not a label — identify the specific dropped signal from a
+   run's history / stack in step 3.
 2. Confirm whether that workflow is *expected* to consume that signal on every
    run, or whether the signal is a best-effort/late notification the workflow
    deliberately ignores.
