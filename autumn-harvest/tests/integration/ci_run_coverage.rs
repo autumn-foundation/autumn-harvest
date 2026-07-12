@@ -305,6 +305,13 @@ impl SuiteRow {
 }
 
 fn parse_manifest() -> Vec<SuiteRow> {
+    // Fail-closed value allowlists: an unknown `osclass` routes a suite to NO
+    // run-mode (`runs()`/`do_compile` both ignore it) → a silently-never-run
+    // suite, exactly the gap this guard exists to catch; an unknown `crate`
+    // would never match a coverage lookup. Reject either as a typo.
+    // extend this set when a new crate/osclass is introduced.
+    const VALID_OSCLASS: &[&str] = &["linux", "allos", "compileonly"];
+    const VALID_CRATE: &[&str] = &["autumn-harvest", "autumn-harvest-plugin"];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {
         let t = line.trim();
@@ -319,6 +326,19 @@ fn parse_manifest() -> Vec<SuiteRow> {
              (osclass crate target features filter), got {}: {t:?}",
             n + 1,
             cols.len()
+        );
+        // Fail-closed value checks (allowlists hoisted above the loop).
+        assert!(
+            VALID_OSCLASS.contains(&cols[0]),
+            "manifest line {} has unknown osclass {:?} (expected one of {VALID_OSCLASS:?})",
+            n + 1,
+            cols[0]
+        );
+        assert!(
+            VALID_CRATE.contains(&cols[1]),
+            "manifest line {} has unknown crate {:?} (expected one of {VALID_CRATE:?})",
+            n + 1,
+            cols[1]
         );
         out.push(SuiteRow {
             osclass: cols[0].to_string(),
@@ -365,7 +385,8 @@ fn core_covers(rows: &[SuiteRow], module: &str, needs_testing: bool) -> bool {
         if r.filter.contains("::") {
             return false; // partial slice — no whole-module credit
         }
-        let seg = r.filter.split("::").next().unwrap_or(r.filter.as_str());
+        // No `::` here (guarded above), so the whole filter is the module segment.
+        let seg = r.filter.as_str();
         module == seg || module.starts_with(seg)
     })
 }

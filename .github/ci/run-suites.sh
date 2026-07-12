@@ -61,7 +61,7 @@ do_run() {
   local os crate target feats filter
   # Process substitution (not a pipe) so `fail`/`failed` mutations persist in
   # this shell.
-  while read -r os crate target feats filter; do
+  while read -r os crate target feats filter || [ -n "$os" ]; do
     [ -n "$os" ] || continue
     [ "$os" = "$want" ] || continue
 
@@ -132,9 +132,7 @@ do_compile() {
       prev_key="$key"
     fi
     targets="$targets $t"
-  done <<EOF
-$grouped
-EOF
+  done <<< "$grouped"
   # Flush the final group.
   if [ -n "$prev_key" ]; then
     emit_compile "$cur_crate" "$cur_feats" "$targets"
