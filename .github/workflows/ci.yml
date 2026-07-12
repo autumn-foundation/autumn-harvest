@@ -242,7 +242,7 @@ jobs:
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test fail_now_integration -- --test-threads=1
       - name: Run plugin legal-hold integration tests (issue #747)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --test legal_hold_integration -- --test-threads=1
       - name: Run plugin summary-retention integration tests (issue #752)
         if: runner.os == 'Linux'
