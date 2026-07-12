@@ -1420,3 +1420,182 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         "the run proceeds normally after the transient-conflict re-drive"
     );
 }
+
+/// Lock-order regression (issue #779, Codex round-11 review, P2 ABBA claim):
+/// [`materialize_due_child_timeout_deadlines`] MUST acquire the parent
+/// EXECUTION row `FOR UPDATE` **before** it takes the due `harvest_timers` rows
+/// `FOR UPDATE`.
+///
+/// The operator cancel/terminate path
+/// (`execution::notify_awaited_parent_of_child_terminal`) locks the parent
+/// execution row first and then calls the materializer, whereas the worker-wake
+/// (`wake_parent_for_child_completion`/`_failure`) and child-execution-timeout
+/// (`timeout::wake_parent_for_child_timeout`) callers reach the materializer
+/// with **no** outer parent lock. If the materializer took the timer lock
+/// first, those two orderings would invert (ABBA): two concurrent wakes of the
+/// same overdue parent — one via a normal child terminal (timer-first) and one
+/// via an operator cancel/terminate of a sibling child (execution-row first) —
+/// would deadlock, and Postgres would abort a healthy terminal notification.
+///
+/// This proves the unified execution-row → timer order **deterministically**
+/// (no timing-dependent deadlock forcing needed): hold the parent execution row
+/// lock open on a dedicated connection, invoke the materializer on another, wait
+/// until its backend is blocked on a lock (its FIRST acquisition), and — while
+/// it is blocked — assert the timer row is NOT yet locked via a
+/// `SELECT ... FOR UPDATE NOWAIT` probe that must succeed. Under the pre-fix
+/// timer-first order this probe would fail with `lock_not_available`, because
+/// the materializer would already hold the timer `FOR UPDATE` while blocked on
+/// the exec-row append. Releasing the held lock lets the materializer complete
+/// and fire the due deadline exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[allow(clippy::too_many_lines)]
+async fn materializer_locks_execution_row_before_timers_no_abba() {
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::SimpleAsyncConnection;
+
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Waiting {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+    let mut conn_lock = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect lock");
+    let mut conn_probe = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect probe");
+    let mut conn_mat = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect mat");
+
+    // Parent with a single OVERDUE `__child_timeout` deadline the materializer
+    // will want to fire.
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        parent_exec_id,
+        &[WorkflowEvent::workflow_started(
+            serde_json::json!({}),
+            chrono::Utc::now(),
+        )],
+        0,
+    )
+    .await
+    .expect("seed WorkflowStarted");
+    let timer_id_str = "__child_timeout:1:timeout_child";
+    diesel::insert_into(autumn_harvest::schema::harvest_timers::table)
+        .values(&autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: parent_exec_id.as_uuid(),
+            timer_id: timer_id_str,
+            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert overdue deadline timer");
+
+    // Capture the materializer connection's backend PID so we can watch it block.
+    let mat_pid: i32 = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<Pid>(&mut conn_mat)
+        .await
+        .expect("materializer backend pid")
+        .pid;
+
+    // Hold the parent execution row lock open (BEGIN + FOR UPDATE, no commit).
+    conn_lock
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin lock txn");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(parent_exec_id.as_uuid())
+        .execute(&mut conn_lock)
+        .await
+        .expect("lock parent execution row");
+
+    // Run the materializer on its own connection; it must block on the parent
+    // execution row lock as its FIRST acquisition (unified exec-row → timer
+    // order). Move the owned connection into the task.
+    let mat_handle = tokio::spawn(async move {
+        let r = autumn_harvest::worker::materialize_due_child_timeout_deadlines(
+            &mut conn_mat,
+            parent_exec_id,
+        )
+        .await;
+        (conn_mat, r)
+    });
+
+    // Wait until the materializer backend is genuinely blocked on a lock.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = diesel::sql_query(
+            "SELECT COUNT(*)::BIGINT AS n FROM pg_stat_activity \
+             WHERE pid = $1 AND wait_event_type = 'Lock'",
+        )
+        .bind::<diesel::sql_types::Integer, _>(mat_pid)
+        .get_result::<Waiting>(&mut conn_probe)
+        .await
+        .expect("poll pg_stat_activity")
+        .n;
+        if waiting >= 1 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        blocked,
+        "the materializer must block on the parent execution row lock (its first acquisition)"
+    );
+
+    // While the materializer is blocked, the timer row must NOT be locked — proof
+    // it acquires the execution row FIRST. Under the pre-fix timer-first order it
+    // would already hold this row `FOR UPDATE`, so NOWAIT would fail.
+    let probe = diesel::sql_query(
+        "SELECT id FROM harvest_timers \
+         WHERE workflow_exec_id = $1 AND timer_id = $2 FOR UPDATE NOWAIT",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent_exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(timer_id_str)
+    .execute(&mut conn_probe)
+    .await;
+    assert!(
+        probe.is_ok(),
+        "timer row must be unlocked while the materializer blocks on the exec-row lock \
+         (execution-row → timer order); got {probe:?}"
+    );
+
+    // Release the execution row lock; the materializer proceeds and fires the
+    // due deadline exactly once.
+    conn_lock
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("release lock");
+
+    let (mut conn_mat, result) = mat_handle.await.expect("materializer task joins");
+    let fired = result.expect("materialize succeeds");
+    assert_eq!(fired, 1, "the one overdue child-timeout deadline is fired");
+
+    let timer_fired: bool = autumn_harvest::schema::harvest_timers::dsl::harvest_timers
+        .filter(
+            autumn_harvest::schema::harvest_timers::dsl::workflow_exec_id
+                .eq(parent_exec_id.as_uuid()),
+        )
+        .filter(autumn_harvest::schema::harvest_timers::dsl::timer_id.eq(timer_id_str))
+        .select(autumn_harvest::schema::harvest_timers::dsl::fired)
+        .first(&mut conn_mat)
+        .await
+        .expect("load timer fired flag");
+    assert!(
+        timer_fired,
+        "the deadline timer is marked fired after release"
+    );
+}

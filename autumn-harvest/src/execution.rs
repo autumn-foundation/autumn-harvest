@@ -1146,9 +1146,13 @@ async fn notify_awaited_parent_of_child_terminal(
             // -TERMINATED resolves the parent's `spawn_child_workflow_timeout` to
             // the timeout branch (None), not Err. The parent row is already
             // locked FOR UPDATE above; `materialize_due_child_timeout_deadlines`
-            // locks the due timers FOR UPDATE and appends `TimerFired` under the
-            // same parent-row MAX(event_id) discipline as the child terminal
-            // below, so the deadline is ordered chronologically first.
+            // re-locks it (a same-transaction no-op) *before* it takes the due
+            // timers FOR UPDATE — the unified execution-row → timer lock order
+            // (see its convention comment, issue #779 Codex round-11) — so this
+            // operator path and the worker-wake/child-timeout paths cannot ABBA
+            // against each other on the same overdue parent. It then appends
+            // `TimerFired` under the same parent-row MAX(event_id) discipline as
+            // the child terminal below, so the deadline is ordered first.
             crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
             store::append_single_event(
                 conn,

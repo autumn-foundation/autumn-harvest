@@ -5921,6 +5921,44 @@ pub async fn materialize_due_child_timeout_deadlines(
     use diesel::dsl::sql;
     use diesel::sql_types::Timestamptz;
 
+    // ── Per-table lock-ordering convention (issue #779, Codex round-11 review) ──
+    //
+    //   harvest_workflow_executions (parent row) → harvest_timers (FOR UPDATE)
+    //
+    // The execution row is the top-level aggregate lock everywhere in the engine
+    // (every `store::append_single_event` takes it first), and the operator
+    // cancel/terminate path — `execution::notify_awaited_parent_of_child_terminal`
+    // — locks the parent execution row `FOR UPDATE` *before* calling this
+    // materializer. This function's timer `FOR UPDATE` below therefore MUST be
+    // acquired *after* the parent execution row, or it would be an ABBA inversion
+    // against that operator path: the worker-wake and child-execution-timeout
+    // callers reach the materializer *without* an outer parent lock, so if the
+    // materializer took the timer lock first, two concurrent wakes of the same
+    // overdue parent — one via a normal child completion/failure (timer-first)
+    // and one via an operator cancel/terminate of a sibling child (execution-row
+    // first) — would deadlock, and Postgres would abort a healthy terminal
+    // notification. Taking the parent execution row `FOR UPDATE` here first
+    // unifies every call site onto execution-row → timer, so no cycle is
+    // possible. Re-locking a row the operator path already holds in the same
+    // transaction is a no-op. If the parent execution row is gone, there is
+    // nothing to fire a deadline against — return `Ok(0)` and let the caller's
+    // own `append_single_event` surface the `NotFound` (unchanged behaviour).
+    {
+        use crate::models::WorkflowExecution;
+        use crate::schema::harvest_workflow_executions;
+        let parent_row: Option<WorkflowExecution> = harvest_workflow_executions::table
+            .find(parent_exec_id.as_uuid())
+            .for_update()
+            .select(WorkflowExecution::as_select())
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        if parent_row.is_none() {
+            return Ok(0);
+        }
+    }
+
     // Lock + read the parent's DUE child-timeout deadline timers. `FOR UPDATE`
     // makes the `fired = false` predicate exactly-once against the parent-claim
     // ingest (see the double-fire note above). The `\_\_child\_timeout:%`
