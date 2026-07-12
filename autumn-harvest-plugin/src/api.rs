@@ -3110,6 +3110,62 @@ async fn list_gates_handler(
 
 /// `POST /admin/gates` — create an admission gate.
 #[allow(clippy::too_many_lines)]
+/// Reconcile the in-memory admission-gate cache after a create/lift that was
+/// already persisted to the DB and written through to the snapshot
+/// (`apply_created`/`apply_lifted`), given the result of the follow-up full
+/// reload.
+///
+/// On a successful reload, `refresh()` the snapshot — replacing it with the
+/// authoritative active-gate list (reconciling other replicas' concurrent
+/// changes) and setting `initialized = true`, which RECOVERS from any prior
+/// fail-closed. Returns the reloaded active-gate count so the caller can emit the
+/// `admission_gates_active` metric.
+///
+/// On a reload FAILURE, arm fail-closed (issue #618, F-round22, superseding the
+/// F-round16 "do NOT arm fail-closed" decision) and return `None`. While the gate
+/// table is momentarily unreadable, `check()` — the API / fresh-admission path,
+/// which CAN retry — must return the synthetic block until a successful refresh
+/// reconciles ALL active gates, rather than serving fresh admissions from a
+/// snapshot that reflects only this replica's local write-through delta and could
+/// be MISSING another replica's gate (e.g. a Fleet gate created on replica B just
+/// before this replica creates a narrower gate and then fails its own reload — a
+/// non-matching start would otherwise slip past B's gate uncounted). On the lift
+/// path this briefly re-blocks the just-lifted work; that OVER-BLOCK is the correct
+/// conservative behaviour for a safety control during a gate-table outage
+/// (over-block briefly rather than leak), bounded by the <=1s background refresh.
+///
+/// The already-applied write-through delta is retained and load-bearing:
+/// `check_cached` — the completion-trigger / in-flight-continuation path, which
+/// CANNOT retry — ignores the fail-closed flag (round 3) and reads the snapshot,
+/// so the just-created gate is still matched (and the just-lifted gate no longer
+/// matched) there, and no in-flight work is permanently dropped. Fail-closed is
+/// therefore transient: the next successful reload re-arms `initialized = true`.
+fn reconcile_gate_cache_after_mutation<E: std::fmt::Display>(
+    cache: &autumn_harvest::AdmissionGateCache,
+    op: &'static str,
+    reload: Result<Vec<autumn_harvest::AdmissionGate>, E>,
+) -> Option<i64> {
+    match reload {
+        Ok(fresh) => {
+            let count = i64::try_from(fresh.len()).unwrap_or(0);
+            cache.refresh(fresh);
+            Some(count)
+        }
+        Err(e) => {
+            cache.set_fail_closed();
+            tracing::warn!(
+                error = %e,
+                op,
+                "admission gate cache full refresh failed after gate mutation; arming \
+                 fail-closed so check() blocks fresh admissions until the gate table is \
+                 readable again; the write-through delta keeps check_cached accurate for \
+                 the mutated gate (completion triggers unaffected); background refresh recovers"
+            );
+            None
+        }
+    }
+}
+
 async fn create_gate_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -3170,32 +3226,23 @@ async fn create_gate_handler(
             // does NOT retry after a synthetic fail-closed block — a stale-open
             // snapshot here would durably MISS the new gate.
             api_state.gate_cache().apply_created(gate.clone());
-            // Reconcile any OTHER concurrent changes with a full refresh. On failure
-            // we do NOT arm fail-closed: the write-through delta above already made
-            // the snapshot accurate for our change, and the <=1s background refresh
-            // loop reconciles concurrent changes. Arming fail-closed would instead
-            // block ALL admissions on this replica (a self-healing over-block) until
-            // the next successful refresh, for no correctness benefit now that the
-            // delta is applied.
-            match admission_gate_db::load_active_gates(&mut conn).await {
-                Ok(fresh) => {
-                    let count = i64::try_from(fresh.len()).unwrap_or(0);
-                    api_state.gate_cache().refresh(fresh);
-                    if let Ok(rt) = api_state.runtime() {
-                        rt.registry()
-                            .telemetry()
-                            .metrics
-                            .record_admission_gates_active(count);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "admission gate cache full refresh failed after create; the \
-                         write-through delta keeps this replica's snapshot accurate for \
-                         the new gate, background refresh reconciles the rest"
-                    );
-                }
+            // Reconcile any OTHER concurrent changes with a full refresh; on a
+            // reload failure arm fail-closed so check() blocks fresh admissions
+            // until the gate table is readable (issue #618, F-round22 — see
+            // reconcile_gate_cache_after_mutation for the full rationale). The
+            // round-16 write-through above is retained: check_cached ignores the
+            // fail-closed flag (round 3) and keeps honouring the just-created gate,
+            // so completion triggers / in-flight continuation are unaffected.
+            if let Some(count) = reconcile_gate_cache_after_mutation(
+                api_state.gate_cache().as_ref(),
+                "create",
+                admission_gate_db::load_active_gates(&mut conn).await,
+            ) && let Ok(rt) = api_state.runtime()
+            {
+                rt.registry()
+                    .telemetry()
+                    .metrics
+                    .record_admission_gates_active(count);
             }
 
             let gate_id_str = gate.id.to_string();
@@ -3276,31 +3323,27 @@ async fn lift_gate_handler(
             // stale-open snapshot here would keep dropping targets as
             // admission_blocked against a gate the operator already lifted.
             api_state.gate_cache().apply_lifted(id);
-            // Reconcile any OTHER concurrent changes with a full refresh. On failure
-            // we do NOT arm fail-closed: doing so would blanket-block ALL admissions
-            // on this replica via check()'s synthetic sentinel — re-blocking the very
-            // work the operator just unblocked — until the next successful refresh.
-            // The write-through delta already removed the lifted gate; the <=1s
-            // background refresh reconciles the rest.
-            match admission_gate_db::load_active_gates(&mut conn).await {
-                Ok(fresh) => {
-                    let count = i64::try_from(fresh.len()).unwrap_or(0);
-                    api_state.gate_cache().refresh(fresh);
-                    if let Ok(rt) = api_state.runtime() {
-                        rt.registry()
-                            .telemetry()
-                            .metrics
-                            .record_admission_gates_active(count);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "admission gate cache full refresh failed after lift; the \
-                         write-through delta already removed the lifted gate from this \
-                         replica's snapshot, background refresh reconciles the rest"
-                    );
-                }
+            // Reconcile any OTHER concurrent changes with a full refresh; on a
+            // reload failure arm fail-closed so check() blocks fresh admissions
+            // until the gate table is readable (issue #618, F-round22 — see
+            // reconcile_gate_cache_after_mutation for the full rationale). This
+            // briefly OVER-BLOCKS — including re-blocking the just-lifted work —
+            // which is the correct conservative behaviour for a safety control
+            // during a gate-table outage (over-block briefly rather than risk
+            // leaking a start past another replica's still-active gate), bounded by
+            // the <=1s refresh. The round-16 write-through above is retained:
+            // check_cached ignores the fail-closed flag (round 3) and the lifted
+            // gate no longer matches there, so in-flight continuation is unaffected.
+            if let Some(count) = reconcile_gate_cache_after_mutation(
+                api_state.gate_cache().as_ref(),
+                "lift",
+                admission_gate_db::load_active_gates(&mut conn).await,
+            ) && let Ok(rt) = api_state.runtime()
+            {
+                rt.registry()
+                    .telemetry()
+                    .metrics
+                    .record_admission_gates_active(count);
             }
 
             let ar = NewAuditRecord {
@@ -29422,6 +29465,147 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
+    /// different queue does NOT match it — letting us prove `check()` blocks a
+    /// non-matching start only via fail-closed, never because the gate matched.
+    fn queue_gate() -> autumn_harvest::AdmissionGate {
+        autumn_harvest::AdmissionGate {
+            id: autumn_harvest::admission_gate::AdmissionGateId(uuid::Uuid::new_v4()),
+            scope: autumn_harvest::admission_gate::GateScope::Queue("gated-q".to_string()),
+            reason: "reload-fail-incident".to_string(),
+            message: None,
+            created_by: "test".to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    /// issue #618 (F-round22): after a create's post-mutation full reload FAILS,
+    /// `reconcile_gate_cache_after_mutation` arms fail-closed so `check()` (the
+    /// API / fresh-admission path, retryable) blocks EVERY start — including one
+    /// that does not match this replica's local write-through delta — protecting
+    /// against a missing other-replica gate while the gate table is unreadable.
+    /// The round-16 write-through is retained: `check_cached` (completion triggers,
+    /// non-retryable) ignores the fail-closed flag (round 3) and still honours the
+    /// delta, so no in-flight work is permanently dropped. A successful reload
+    /// recovers.
+    #[test]
+    fn reconcile_gate_cache_fails_closed_on_create_reload_error_keeps_check_cached_delta() {
+        use autumn_harvest::admission_gate::sentinel_gate_id;
+        use autumn_harvest::{AdmissionGate, AdmissionGateCache};
+
+        // RED baseline (the round-21 handler Err-arm behaviour: write-through delta
+        // only, NO fail-closed) — check() reads the initialized snapshot and ADMITS
+        // a non-matching start, the leak this round closes.
+        let leak = AdmissionGateCache::new();
+        leak.refresh(vec![]); // initialized, empty
+        leak.apply_created(queue_gate()); // delta only, no set_fail_closed
+        assert!(
+            leak.check("other_wf", "ungated-q", 0, None).is_none(),
+            "precondition (round-21 leak): delta applied but fail-closed NOT armed → \
+             check() admits a start that does not match the local gate"
+        );
+
+        // GREEN: reconcile with a reload FAILURE arms fail-closed.
+        let g = queue_gate();
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![]); // initialized, empty
+        cache.apply_created(g); // handler's write-through delta (create path)
+        let ret = reconcile_gate_cache_after_mutation(
+            &cache,
+            "create",
+            Err::<Vec<AdmissionGate>, _>(autumn_harvest::error::HarvestError::Config(
+                "simulated gate-table read error".to_string(),
+            )),
+        );
+        assert_eq!(ret, None, "a reload failure returns None (no metric count)");
+
+        // check() now fails closed → the synthetic sentinel block for a start that
+        // does NOT match the delta (missing-other-replica-gate protection).
+        let blocked = cache.check("other_wf", "ungated-q", 0, None);
+        assert!(
+            blocked
+                .as_ref()
+                .is_some_and(|(id, _, _)| *id == sentinel_gate_id()),
+            "check() must fail closed (sentinel) after a failed create reload, even for \
+             a non-matching start: {blocked:?}"
+        );
+
+        // check_cached() ignores fail-closed and honours the delta: the just-created
+        // gate MATCHES (real id, not the sentinel), and a non-matching start proceeds.
+        let matched = cache.check_cached("wf", "gated-q", 0, None);
+        assert!(
+            matched.as_ref().is_some_and(|(id, _, _)| *id == gid),
+            "check_cached must match the just-created gate under fail-closed: {matched:?}"
+        );
+        assert!(
+            cache
+                .check_cached("other_wf", "ungated-q", 0, None)
+                .is_none(),
+            "check_cached must let a non-matching start proceed (no permanent block)"
+        );
+
+        // Recovery: a SUCCESSFUL reload re-arms initialized and clears fail-closed.
+        let recovered = reconcile_gate_cache_after_mutation(
+            &cache,
+            "create",
+            Ok::<_, autumn_harvest::error::HarvestError>(vec![queue_gate()]),
+        );
+        assert_eq!(
+            recovered,
+            Some(1),
+            "a successful reload returns the active-gate count"
+        );
+        assert!(
+            cache.check("other_wf", "ungated-q", 0, None).is_none(),
+            "a successful reload recovers check() from fail-closed"
+        );
+    }
+
+    /// issue #618 (F-round22): on the LIFT path, a failed post-mutation reload also
+    /// arms fail-closed — `check()` briefly OVER-BLOCKS (re-blocking even the
+    /// just-lifted target), the correct conservative behaviour for a safety control
+    /// during a gate-table outage. The write-through delta already removed the gate
+    /// from `check_cached`, so in-flight continuation is unaffected (no durable
+    /// false-block).
+    #[test]
+    fn reconcile_gate_cache_lift_fails_closed_but_check_cached_drops_the_lifted_gate() {
+        use autumn_harvest::admission_gate::sentinel_gate_id;
+        use autumn_harvest::{AdmissionGate, AdmissionGateCache};
+
+        let g = queue_gate();
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![g]); // initialized, gate present
+        cache.apply_lifted(gid); // handler's write-through delta (lift path)
+        let ret = reconcile_gate_cache_after_mutation(
+            &cache,
+            "lift",
+            Err::<Vec<AdmissionGate>, _>(autumn_harvest::error::HarvestError::Config(
+                "simulated gate-table read error".to_string(),
+            )),
+        );
+        assert_eq!(ret, None);
+
+        // check() fails closed (conservative over-block: the just-lifted target's
+        // matching start is re-blocked via the sentinel until a refresh recovers).
+        let blocked = cache.check("wf", "gated-q", 0, None);
+        assert!(
+            blocked
+                .as_ref()
+                .is_some_and(|(id, _, _)| *id == sentinel_gate_id()),
+            "check() fails closed after a failed lift reload: {blocked:?}"
+        );
+
+        // check_cached() honours the delta: the lifted gate no longer matches, so an
+        // in-flight completion-trigger start proceeds (no durable false-block).
+        assert!(
+            cache.check_cached("wf", "gated-q", 0, None).is_none(),
+            "check_cached must not match a just-lifted gate (in-flight continuation unaffected)"
+        );
     }
 
     /// A not-found schedule is an authoritative 404 only when every expected
