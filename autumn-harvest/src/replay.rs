@@ -8638,6 +8638,137 @@ mod tests {
         );
     }
 
+    // ── unconsumed_signals_by_name (issue #684) ───────────────────────────
+
+    #[test]
+    fn unconsumed_signals_by_name_counts_an_undrained_signal() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approve".into(),
+            payload: serde_json::json!({"ok": true}),
+        }];
+        let matcher = HistoryMatcher::new(events);
+        let counts = matcher.unconsumed_signals_by_name();
+        assert_eq!(counts.get("approve"), Some(&1));
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[test]
+    fn unconsumed_signals_by_name_omits_a_signal_consumed_by_wait() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approve".into(),
+            payload: serde_json::json!({"ok": true}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        // A wait_for_signal consumes it.
+        assert!(matches!(
+            matcher.match_signal("approve"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(
+            matcher.unconsumed_signals_by_name().is_empty(),
+            "a signal consumed by wait_for_signal must not be reported unhandled"
+        );
+    }
+
+    #[test]
+    fn unconsumed_signals_by_name_omits_a_signal_consumed_by_push_handler() {
+        // Issue #546: a push-based signal handler claims the buffered signal.
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: serde_json::json!({"reason": "fraud"}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = matcher.claim_pending_signal("cancel");
+        assert_eq!(claimed.len(), 1, "the push handler must claim the signal");
+        assert!(
+            matcher.unconsumed_signals_by_name().is_empty(),
+            "a signal claimed by a push handler must not be reported unhandled"
+        );
+    }
+
+    #[test]
+    fn unconsumed_signals_by_name_respects_lost_race_carve_out() {
+        // Issue #476: the timeout branch won; the late-arriving signal is
+        // deliberately never consumed and must not count as unhandled.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300)),
+            SignalOrTimerMatch::TimerWon
+        );
+        assert!(
+            matcher.unconsumed_signals_by_name().is_empty(),
+            "a signal that lost a signal-or-deadline race must not be reported unhandled"
+        );
+    }
+
+    #[test]
+    fn unconsumed_signals_by_name_counts_multiple_same_name_signals() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "tick".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "tick".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "tick".into(),
+                payload: Value::Null,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        let counts = matcher.unconsumed_signals_by_name();
+        assert_eq!(counts.get("tick"), Some(&3));
+    }
+
+    #[test]
+    fn unconsumed_signals_by_name_counts_a_stashed_but_unconsumed_signal() {
+        // A signal drained into pending_signals by a subsequent match that is
+        // never consumed by a wait/push must still be reported unhandled.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "extra".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("done"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        // match_activity's prepare_match drains the leading signal into the
+        // pending stash (index now < cursor), so it is only reachable via the
+        // pending_signals source.
+        assert!(matches!(
+            matcher.match_activity("work"),
+            HistoryMatch::Matched { .. }
+        ));
+        let counts = matcher.unconsumed_signals_by_name();
+        assert_eq!(counts.get("extra"), Some(&1));
+    }
+
     #[test]
     fn late_race_exemption_is_scoped_to_one_occurrence() {
         // One race loss excuses exactly one unconsumed signal of that name. A

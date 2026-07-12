@@ -1066,4 +1066,114 @@ mod tests {
             .record_workflow_started("onboarding", "default");
         telemetry.metrics.record_dlq_entries(0, 0);
     }
+
+    #[test]
+    fn bridges_signal_update_lifecycle_counters_with_bounded_labels() {
+        // Issue #684: a local `metrics::Recorder` captures the registered
+        // counter keys, so a swapped or dropped label value in any of the six
+        // signal/update lifecycle bridges is caught here (not just no-panic).
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_signal_received("wf", "approve", "q");
+            rec.record_signal_unhandled("wf", "approve", "q");
+            rec.record_update_admitted("wf", "set_priority");
+            rec.record_update_rejected("wf", "set_priority");
+            rec.record_update_completed("wf", "set_priority", "q");
+            rec.record_update_failed("wf", "set_priority", "q");
+        });
+
+        let wf_name_q = |name: &str, q: &str| {
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_NAME.to_owned(), name.to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), q.to_owned()),
+            ]
+        };
+        let wf_name = |name: &str| {
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_NAME.to_owned(), name.to_owned()),
+            ]
+        };
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (METRIC_SIGNAL_RECEIVED.to_owned(), wf_name_q("approve", "q")),
+                (METRIC_SIGNAL_UNHANDLED.to_owned(), wf_name_q("approve", "q")),
+                (METRIC_UPDATE_ADMITTED.to_owned(), wf_name("set_priority")),
+                (METRIC_UPDATE_REJECTED.to_owned(), wf_name("set_priority")),
+                (
+                    METRIC_UPDATE_COMPLETED.to_owned(),
+                    wf_name_q("set_priority", "q")
+                ),
+                (
+                    METRIC_UPDATE_FAILED.to_owned(),
+                    wf_name_q("set_priority", "q")
+                ),
+            ],
+            "the six signal/update bridges must register with the documented \
+             workflow/name/queue label constants, values un-swapped"
+        );
+    }
 }

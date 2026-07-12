@@ -1782,4 +1782,145 @@ mod tests {
             other => panic!("expected Completed, got {other:?}"),
         }
     }
+
+    // ── signal.unhandled emission via drive_workflow (issue #684) ─────────
+
+    /// Recording double that captures `record_signal_unhandled` samples.
+    #[derive(Default)]
+    struct UnhandledSignalRecorder {
+        samples: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl MetricsRecorder for UnhandledSignalRecorder {
+        fn record_signal_unhandled(&self, workflow_name: &str, signal_name: &str, queue: &str) {
+            self.samples.lock().unwrap().push((
+                workflow_name.to_owned(),
+                signal_name.to_owned(),
+                queue.to_owned(),
+            ));
+        }
+    }
+
+    fn span_meta(workflow_name: &str, queue_name: &str) -> WorkflowExecuteSpanMeta {
+        WorkflowExecuteSpanMeta {
+            workflow_name: workflow_name.to_owned(),
+            workflow_id: String::new(),
+            shard_id: 0,
+            queue_name: queue_name.to_owned(),
+            is_replay: false,
+            link_traceparent: None,
+            build_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_workflow_emits_signal_unhandled_for_undrained_signal() {
+        // A workflow that completes while a delivered SignalReceived was never
+        // consumed emits exactly one harvest.signal.unhandled, labeled by
+        // workflow + signal name + queue.
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "late_signal".into(),
+                payload: Value::Null,
+            },
+        ];
+        let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
+        let meta = span_meta("notif", "q");
+        let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
+            ExecutionId::new(),
+            history,
+            echo_workflow,
+            Value::Null,
+            empty_shared_state(),
+            Some(&meta),
+            recorder.clone(),
+        )
+        .await;
+        assert!(matches!(outcome, WorkflowOutcome::Completed { .. }));
+        let samples = recorder.samples.lock().unwrap().clone();
+        assert_eq!(
+            samples.as_slice(),
+            &[("notif".to_owned(), "late_signal".to_owned(), "q".to_owned())],
+            "a completed workflow with an undrained signal must emit exactly one \
+             harvest.signal.unhandled with workflow+name+queue labels"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_workflow_emits_signal_unhandled_for_undrained_signal() {
+        // A workflow that FAILS while leaving a signal unconsumed still emits
+        // the unhandled counter (a failed run with leftover signals is
+        // legitimately "unhandled").
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "late_signal".into(),
+                payload: Value::Null,
+            },
+        ];
+        let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
+        let meta = span_meta("notif", "q");
+        let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
+            ExecutionId::new(),
+            history,
+            failing_workflow,
+            Value::Null,
+            empty_shared_state(),
+            Some(&meta),
+            recorder.clone(),
+        )
+        .await;
+        assert!(matches!(outcome, WorkflowOutcome::Failed { .. }));
+        assert_eq!(recorder.samples.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn suspended_workflow_does_not_emit_signal_unhandled() {
+        // The emission lives ONLY in the terminal arms of drive_workflow, never
+        // in the Suspended arm — a workflow that suspends with an unconsumed
+        // signal in history must NOT emit.
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "late_signal".into(),
+                payload: Value::Null,
+            },
+        ];
+        let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
+        let meta = span_meta("notif", "q");
+        let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
+            ExecutionId::new(),
+            history,
+            activity_workflow, // suspends on send_email (not in history)
+            Value::Null,
+            empty_shared_state(),
+            Some(&meta),
+            recorder.clone(),
+        )
+        .await;
+        assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
+        assert!(
+            recorder.samples.lock().unwrap().is_empty(),
+            "a suspended workflow must not emit harvest.signal.unhandled"
+        );
+    }
 }
