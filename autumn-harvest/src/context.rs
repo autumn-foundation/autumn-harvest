@@ -1666,20 +1666,22 @@ pub struct WorkflowContext {
     /// History-size thresholds visible to author code.
     history_policy: WorkflowHistoryPolicy,
     /// The effective execution-timeout budget for this run (issue #243/#772), or
-    /// `None` when the workflow has no `execution_timeout`. Used as the *fallback*
-    /// source for [`deadline`](Self::deadline) (`start_time + execution_timeout`)
-    /// when no authoritative absolute deadline is threaded, and as the total
-    /// budget for the deadline-fraction continue-as-new check. Records no event.
-    /// Threaded from the execution row by the worker.
+    /// `None` when the workflow has no `execution_timeout`. Used as the source
+    /// for the replay-stable nominal [`deadline`](Self::deadline) (`start_time +
+    /// execution_timeout`), and as the total budget for the deadline-fraction
+    /// continue-as-new check. Records no event. Threaded from the execution row
+    /// by the worker.
     execution_timeout: Option<chrono::Duration>,
     /// The authoritative absolute wall-clock deadline for this run (issue #772),
     /// read live from the execution row's `deadline_at` column at context
     /// construction. This is the *effective* deadline the timeout scanner
     /// enforces: pause/resume (#383) and redrive push it forward, so it is NOT
     /// necessarily `start_time + execution_timeout` for a resumed/redriven run.
-    /// [`deadline`](Self::deadline) prefers this when present, falling back to
-    /// `start_time + execution_timeout` only when no absolute deadline was
-    /// threaded (the replayer / test-env paths). `None` = fall back.
+    /// Consumed **only** by the internal continue-as-new budget check
+    /// ([`effective_deadline_live`](Self::effective_deadline_live)), never by the
+    /// public [`deadline`](Self::deadline) accessor (which stays replay-stable
+    /// nominal). Falls back to `start_time + execution_timeout` when no absolute
+    /// deadline was threaded (the replayer / test-env paths). `None` = fall back.
     deadline_at: Option<DateTime<Utc>>,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
@@ -2464,13 +2466,17 @@ impl WorkflowContext {
     /// Threaded by the executor from the loaded execution row. Because
     /// pause/resume (#383) and redrive shift `deadline_at` forward past the
     /// original `start_time + execution_timeout`, this is the *effective*
-    /// deadline the timeout scanner enforces, and it is what
-    /// [`deadline`](Self::deadline) (and therefore
-    /// [`time_until_deadline`](Self::time_until_deadline) /
-    /// [`should_continue_as_new`](Self::should_continue_as_new)) reports when
-    /// present. `None` (the default) leaves [`deadline`](Self::deadline) to fall
-    /// back to `start_time + execution_timeout` — the replayer / test-env paths
-    /// that carry only the timeout.
+    /// deadline the timeout scanner enforces. It is consumed **only** by the
+    /// internal continue-as-new budget check
+    /// ([`should_continue_as_new`](Self::should_continue_as_new)'s deadline
+    /// branch), so a resumed run's budget accounting matches the scanner and a
+    /// healthy run never continues-as-new immediately after a long pause. It is
+    /// **not** exposed through the public [`deadline`](Self::deadline) /
+    /// [`time_until_deadline`](Self::time_until_deadline) accessors — those return
+    /// the replay-stable nominal `start_time + execution_timeout` so author code
+    /// depending on them replays deterministically. `None` (the default) leaves
+    /// the internal check to fall back to `start_time + execution_timeout` — the
+    /// replayer / test-env paths that carry only the timeout.
     #[must_use]
     pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
         self.deadline_at = deadline_at;
@@ -2510,26 +2516,58 @@ impl WorkflowContext {
         self.start_time
     }
 
-    /// The effective absolute wall-clock deadline this run must finish by, or
-    /// `None` when the workflow has no deadline (issue #772).
+    /// The **nominal** absolute wall-clock deadline this run must finish by, or
+    /// `None` when the workflow has no `execution_timeout` (issue #772).
     ///
-    /// Prefers the authoritative absolute `deadline_at` threaded from the
-    /// execution row ([`with_deadline`](Self::with_deadline)) when present — this
-    /// is the exact deadline the timeout scanner enforces, and pause/resume
-    /// (#383) and redrive push it forward past `start_time + execution_timeout`,
-    /// so for a resumed/redriven run it is **not** simply start + timeout.
+    /// This is the recorded `WorkflowStarted` timestamp ([`now`](Self::now) with
+    /// no advancing clock) plus the effective `execution_timeout` (issue #243) —
+    /// a **replay-STABLE** value derived only from immutable inputs: `start_time`
+    /// is fixed in `WorkflowStarted`, and `execution_timeout` is a fixed row
+    /// value that pause/resume (#383) does **not** mutate (pause shifts the
+    /// separate `deadline_at` column, never `execution_timeout`). It records no
+    /// event and returns the **same value on every replay cycle and every
+    /// worker**, so author code may safely branch on it, embed it in an
+    /// activity/child input, or otherwise depend on it without risking a
+    /// non-deterministic divergence after a pause/resume shifts the row's live
+    /// `deadline_at`.
     ///
-    /// Falls back to the recorded `WorkflowStarted` timestamp plus the effective
-    /// `execution_timeout` (issue #243) only when **no** absolute deadline was
-    /// threaded (the replayer / test-env paths, which carry just the timeout).
+    /// This deadline **does not reflect pause extensions**: for a paused/resumed
+    /// or redriven run the run's live hard deadline (`deadline_at`, which the
+    /// timeout scanner enforces) is pushed forward past `start_time +
+    /// execution_timeout`. The engine's internal continue-as-new budget check
+    /// ([`should_continue_as_new`](Self::should_continue_as_new)) *does* account
+    /// for that shift (it reads the live effective deadline), but the public
+    /// accessor intentionally does not — a replay-stable value is the contract
+    /// author code needs.
     ///
-    /// Either way it is **pure and replay-safe**: it records no event and returns
-    /// the same value on every replay and every worker (the threaded value is a
-    /// current column read at construction, not derived from live wall-clock).
-    /// `None` is returned when there is no deadline signal at all, or when the
-    /// fallback computation would overflow the representable range.
+    /// `None` is returned when there is no `execution_timeout`, or when the
+    /// computation would overflow the representable range.
     #[must_use]
     pub fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.execution_timeout
+            .and_then(|budget| self.start_time.checked_add_signed(budget))
+    }
+
+    /// The **live effective** absolute wall-clock deadline the timeout scanner
+    /// enforces for this run (issue #772) — internal only.
+    ///
+    /// Prefers the authoritative absolute `deadline_at` threaded from the
+    /// execution row ([`with_deadline`](Self::with_deadline)) when present, since
+    /// pause/resume (#383) and redrive push it **forward** past `start_time +
+    /// execution_timeout`; falls back to the nominal `start_time +
+    /// execution_timeout` only when no absolute deadline was threaded (the
+    /// replayer / test-env paths that carry just the timeout).
+    ///
+    /// This is used **only** by the internal continue-as-new budget check
+    /// ([`deadline_fraction_reached`](Self::deadline_fraction_reached)), never by
+    /// the public [`deadline`](Self::deadline) accessor, so author code always
+    /// sees the replay-stable nominal deadline. Reading the live value here is
+    /// still replay-safe: pause/redrive only move `deadline_at` **forward**, so a
+    /// live `true` decision terminates the run via `continue_as_new` (no further
+    /// divergent replay), while a live `false` recomputed on any later replay is
+    /// evaluated against an equal-or-larger deadline — a smaller consumed
+    /// fraction — and therefore stays `false`.
+    fn effective_deadline_live(&self) -> Option<DateTime<Utc>> {
         if let Some(deadline_at) = self.deadline_at {
             return Some(deadline_at);
         }
@@ -2537,13 +2575,16 @@ impl WorkflowContext {
             .and_then(|budget| self.start_time.checked_add_signed(budget))
     }
 
-    /// Time remaining until the execution [`deadline`](Self::deadline), or
-    /// `None` when the workflow has no `execution_timeout` (issue #772).
+    /// Time remaining until the **nominal** execution
+    /// [`deadline`](Self::deadline), or `None` when the workflow has no
+    /// `execution_timeout` (issue #772).
     ///
-    /// The remaining time is measured against the replay-safe recorded wall
-    /// clock ([`system_now`](Self::system_now), issue #384) — **never**
-    /// `chrono::Utc::now()` — so it is deterministic across replays. A negative
-    /// duration means the deadline has already passed.
+    /// Measured against the replay-stable nominal `deadline()` (so it does
+    /// **not** reflect pause/resume extensions — see [`deadline`](Self::deadline))
+    /// and the replay-safe recorded wall clock ([`system_now`](Self::system_now),
+    /// issue #384) — **never** `chrono::Utc::now()` — so it is deterministic
+    /// across replays. A negative duration means the nominal deadline has already
+    /// passed.
     ///
     /// A workflow with no deadline records **no** side-effect: the pure
     /// [`deadline`](Self::deadline) check runs first, so `system_now` (which
@@ -2795,7 +2836,17 @@ impl WorkflowContext {
     ///    `execution_timeout` budget. This lets a **long-lived, low-event**
     ///    workflow checkpoint *before* the hard `execution_timeout` (issue #243)
     ///    kills it, even though its history would never approach the event
-    ///    threshold.
+    ///    threshold. Unlike the public [`deadline`](Self::deadline) accessor,
+    ///    this check measures against the **live effective deadline** the timeout
+    ///    scanner enforces (the pause/resume/redrive-shifted `deadline_at`), so a
+    ///    healthy run that was paused for a long time does **not** spuriously
+    ///    checkpoint the moment it resumes.
+    ///
+    /// **Contract:** when this returns `true`, the workflow **must** call
+    /// `continue_as_new` (rather than continuing to run). That is what makes the
+    /// live-deadline read replay-safe — a `true` decision terminates the current
+    /// run, so no later replay re-evaluates the branch against a differently
+    /// shifted deadline (see [`with_deadline`](Self::with_deadline)).
     ///
     /// ## Replay determinism
     ///
@@ -2846,9 +2897,14 @@ impl WorkflowContext {
         if total_ms <= 0 {
             return false;
         }
-        // Resolve the (pure, no-side-effect) deadline first, so an overflowing
-        // deadline short-circuits *before* the clock read is consumed/recorded.
-        let Some(deadline) = self.deadline() else {
+        // Resolve the (pure, no-side-effect) *live effective* deadline first, so
+        // an overflowing deadline short-circuits *before* the clock read is
+        // consumed/recorded. This reads the pause/resume/redrive-shifted
+        // `deadline_at` (the deadline the timeout scanner actually enforces), NOT
+        // the replay-stable nominal `deadline()` the public accessor returns — so
+        // a long pause never makes a healthy run continue-as-new immediately on
+        // resume.
+        let Some(deadline) = self.effective_deadline_live() else {
             return false;
         };
         // Tolerant clock read: `None` => the deadline signal is unavailable for
@@ -11199,29 +11255,31 @@ mod tests {
         assert_eq!(ctx.deadline(), None);
     }
 
-    /// Issue #772 (P2 fix): a resumed/redriven run's effective deadline is the
-    /// row's `deadline_at`, which pause/resume (#383) shifts forward past
-    /// `start + execution_timeout`. When an authoritative absolute deadline is
-    /// threaded, `ctx.deadline()` must return it, NOT the stale start+timeout
-    /// recompute — otherwise a long pause makes `should_continue_as_new()` see a
-    /// past deadline while the timeout scanner honours the shifted one.
+    /// Issue #772 (P2 fix — Finding B): the PUBLIC `ctx.deadline()` is the
+    /// replay-STABLE *nominal* deadline `start + execution_timeout`, and must
+    /// NEVER return the mutable `deadline_at` column (which pause/resume (#383)
+    /// and redrive shift forward). Author code may branch on `deadline()` or
+    /// embed it in an activity/child input, so it must be identical on every
+    /// replay cycle even after a resume shifts `deadline_at`. The *internal*
+    /// continue-as-new budget check reads the live shifted value instead (see
+    /// `should_continue_as_new_uses_live_effective_deadline_not_nominal`).
     #[test]
-    fn deadline_prefers_threaded_absolute_over_start_plus_timeout() {
+    fn deadline_public_accessor_is_nominal_not_shifted_deadline_at() {
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let timeout = chrono::Duration::seconds(30);
-        // A resume shift of +120s pushes the real deadline past start+timeout.
+        // A resume shift of +120s pushes the row's `deadline_at` past start+timeout.
         let shift = chrono::Duration::seconds(120);
         let shifted = t0 + timeout + shift;
         let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
         assert_eq!(
             ctx.deadline(),
-            Some(shifted),
-            "deadline() must return the threaded (resume-shifted) deadline_at"
+            Some(t0 + timeout),
+            "public deadline() must be the replay-stable nominal start+timeout"
         );
         assert_ne!(
             ctx.deadline(),
-            Some(t0 + timeout),
-            "deadline() must NOT return the stale start+timeout value"
+            Some(shifted),
+            "public deadline() must NOT reflect the mutable (resume-shifted) deadline_at"
         );
     }
 
@@ -11238,12 +11296,12 @@ mod tests {
         assert_eq!(ctx.deadline(), Some(t0 + timeout));
     }
 
-    /// Issue #772 (P2 fix): the deadline branch of `should_continue_as_new()`
-    /// reads the *effective* (shifted) deadline. A recorded clock read at
-    /// t0+25s would trip against the stale 30s start+timeout deadline
-    /// (25/30 = 0.83 ≥ 0.8), but must NOT trip when the row's `deadline_at` has
-    /// been shifted an hour into the future by a long pause — the run is nowhere
-    /// near its fraction of the effective deadline.
+    /// Issue #772 (P2 fix): the *internal* deadline branch of
+    /// `should_continue_as_new()` reads the live *effective* (shifted) deadline,
+    /// not the public nominal. A recorded clock read at t0+25s would trip against
+    /// the nominal 30s deadline (25/30 = 0.83 ≥ 0.8), but must NOT trip when the
+    /// row's `deadline_at` has been shifted an hour into the future by a long
+    /// pause — the run is nowhere near its fraction of the effective deadline.
     #[test]
     fn should_continue_as_new_reads_shifted_deadline_not_stale_start_plus_timeout() {
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -11252,11 +11310,50 @@ mod tests {
         let shifted = t0 + timeout + chrono::Duration::hours(1);
         let ctx =
             deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout)).with_deadline(Some(shifted));
-        assert_eq!(ctx.deadline(), Some(shifted));
+        // The public accessor stays nominal ...
+        assert_eq!(ctx.deadline(), Some(t0 + timeout));
+        // ... but the internal budget check uses the live shifted deadline.
         assert!(
             !ctx.should_continue_as_new(),
             "must not trip: the effective (shifted) deadline is far in the future, \
              even though 25s/30s of the raw budget looks consumed"
+        );
+    }
+
+    /// Issue #772 (P2 fix): the internal continue-as-new budget check uses the
+    /// LIVE effective deadline, not the public nominal. When the nominal
+    /// `start + execution_timeout` is already in the PAST (nominal fraction
+    /// ≥ 1.0) but the row's `deadline_at` was shifted well into the FUTURE by a
+    /// long pause, `should_continue_as_new()` must return FALSE — the run is not
+    /// near its real (shifted) deadline, so it must not prematurely
+    /// continue-as-new immediately on resume (the still-open original P2).
+    #[test]
+    fn should_continue_as_new_uses_live_effective_deadline_not_nominal() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        // Recorded clock is PAST the nominal deadline (t0+30s): nominal fraction
+        // is > 1.0, so a nominal-based check would trip.
+        let clock = t0 + chrono::Duration::seconds(40);
+        // But the effective deadline was shifted an hour into the future.
+        let shifted = t0 + timeout + chrono::Duration::hours(1);
+
+        // Control: WITHOUT a threaded deadline_at, the effective deadline IS the
+        // (past) nominal, so the check DOES trip — proving the difference is the
+        // live read, not something else.
+        let nominal_ctx = deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout));
+        assert!(
+            nominal_ctx.should_continue_as_new(),
+            "control: a past nominal deadline must trip when no deadline_at is threaded"
+        );
+
+        // With the shifted deadline_at threaded, the live budget check sees a
+        // future deadline and must NOT trip (no premature continue-as-new).
+        let live_ctx =
+            deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout)).with_deadline(Some(shifted));
+        assert!(
+            !live_ctx.should_continue_as_new(),
+            "must not trip: the live effective deadline is far in the future \
+             even though the nominal budget is fully consumed"
         );
     }
 

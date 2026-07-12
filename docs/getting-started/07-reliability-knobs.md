@@ -131,17 +131,31 @@ async fn subscription_entity(ctx: &WorkflowContext, state: SubState) -> Result<S
 ```
 
 Two replay-safe, event-free accessors back this: `ctx.deadline()` (the
-`WorkflowStarted` timestamp + effective `execution_timeout`, or `None` when
-there is no timeout) and `ctx.time_until_deadline()` (measured against the
-replay-safe recorded clock `ctx.system_now()`, **never** `chrono::Utc::now()`).
-A workflow with **no** `execution_timeout` behaves exactly as before and records
-nothing extra. Tune the fraction with
-`HarvestBuilder::history_continue_as_new_deadline_fraction(f64)` (clamped to
-`[0.0, 1.0]`). **No new event variant, no migration** — the deadline is derived
-from the recorded start time and the clock read reuses the existing
-`SideEffectRecorded{Now}` event, so a history that crossed the deadline replays
-to the same `continue_as_new` on every worker. See
+**nominal** `WorkflowStarted` timestamp + effective `execution_timeout`, or
+`None` when there is no timeout) and `ctx.time_until_deadline()` (remaining time
+to the nominal deadline, measured against the replay-safe recorded clock
+`ctx.system_now()`, **never** `chrono::Utc::now()`). A workflow with **no**
+`execution_timeout` behaves exactly as before and records nothing extra. Tune
+the fraction with `HarvestBuilder::history_continue_as_new_deadline_fraction(f64)`
+(clamped to `[0.0, 1.0]`). **No new event variant, no migration** — the nominal
+deadline is derived from the recorded start time and the clock read reuses the
+existing `SideEffectRecorded{Now}` event, so a history that crossed the deadline
+replays to the same `continue_as_new` on every worker. See
 `examples/long_lived_entity_deadline.rs`.
+
+**Public `deadline()` is nominal; the CAN budget check accounts for pause
+extensions.** For a run that was **paused/resumed** (#383) or redriven, the
+engine pushes the run's *live* hard deadline (`deadline_at`, which the timeout
+scanner enforces) forward past `start + execution_timeout`. The public
+`ctx.deadline()`/`ctx.time_until_deadline()` deliberately stay on the **nominal**
+`start + execution_timeout` — a replay-stable value you can branch on or embed in
+an activity/child input without a non-deterministic divergence after a resume —
+so they do **not** reflect pause extensions. The engine's **internal**
+`should_continue_as_new()` budget check *does* read the live shifted deadline, so
+a healthy run that was paused for a long time is not forced to checkpoint the
+moment it resumes. **Contract:** whenever `should_continue_as_new()` returns
+`true`, call `continue_as_new` (as above) rather than continuing to run — that is
+what keeps the internal live-deadline read replay-safe.
 
 **Call `should_continue_as_new()` once per decision cycle.** When the workflow
 declares an `execution_timeout`, each `should_continue_as_new()` call reads the

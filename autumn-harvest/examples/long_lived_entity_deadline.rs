@@ -20,12 +20,20 @@
 //!
 //! Two new replay-safe, event-free accessors support this:
 //!
-//! - [`WorkflowContext::deadline`] — `WorkflowStarted` timestamp + effective
-//!   `execution_timeout`, or `None` when there is no timeout. Pure; records
-//!   nothing.
-//! - [`WorkflowContext::time_until_deadline`] — measured against the replay-safe
-//!   recorded clock ([`WorkflowContext::system_now`], issue #384), **never**
+//! - [`WorkflowContext::deadline`] — the **nominal** `WorkflowStarted` timestamp
+//!   + effective `execution_timeout`, or `None` when there is no timeout. Pure;
+//!   records nothing. This is replay-STABLE and **does not reflect pause
+//!   extensions** — the engine's internal `should_continue_as_new()` budget check
+//!   *does* account for a paused/resumed run's shifted deadline, but the public
+//!   accessor stays nominal so author code depending on it replays
+//!   deterministically.
+//! - [`WorkflowContext::time_until_deadline`] — remaining time to the nominal
+//!   deadline, measured against the replay-safe recorded clock
+//!   ([`WorkflowContext::system_now`], issue #384), **never**
 //!   `chrono::Utc::now()`.
+//!
+//! Contract: when `should_continue_as_new()` returns `true`, the workflow **must**
+//! call `continue_as_new` (as below) rather than continue running.
 //!
 //! ```rust,ignore
 //! use autumn_harvest::prelude::*;

@@ -629,6 +629,8 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     std::collections::HashMap::new(),
                     std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
                     None,
+                    // Issue #772: no per-execution execution_timeout / live deadline_at.
+                    None,
                 )
                 .await;
             });

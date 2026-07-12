@@ -316,6 +316,11 @@ struct SampledExecution {
     workflow_name: String,
     created_at: chrono::DateTime<chrono::Utc>,
     context_headers: Option<serde_json::Value>,
+    // Issue #772: per-execution deadline-aware CAN inputs, threaded into the
+    // canary replay so the deadline branch is enabled and computed against the
+    // row's own (pause/resume/redrive-shifted) deadline.
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl WorkflowReplayer {
@@ -498,7 +503,28 @@ impl WorkflowReplayer {
     /// Returns a [`ReplayReport`] regardless of outcome.  If
     /// `snapshot.workflow_name` is not registered, the report contains
     /// `ReplayStatus::WorkflowFailed` with a descriptive error.
+    ///
+    /// The deadline-aware continue-as-new budget (issue #772) uses this
+    /// replayer's global [`with_execution_timeout`](Self::with_execution_timeout)
+    /// and no live `deadline_at` (a documented limitation of the file/JSON path).
+    /// [`replay_from_db`](Self::replay_from_db) threads the execution row's own
+    /// `execution_timeout`/`deadline_at` instead.
     pub async fn replay_from_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
+        self.replay_from_snapshot_effective(snapshot, self.execution_timeout, None)
+            .await
+    }
+
+    /// Snapshot replay with an explicit per-execution `execution_timeout` /
+    /// live `deadline_at` (issue #772). The public
+    /// [`replay_from_snapshot`](Self::replay_from_snapshot) delegates here with
+    /// the global timeout and no live deadline; [`replay_from_db`](Self::replay_from_db)
+    /// passes the loaded execution row's own values.
+    async fn replay_from_snapshot_effective(
+        &self,
+        snapshot: HistorySnapshot,
+        execution_timeout: Option<chrono::Duration>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
                 execution_id: snapshot.execution_id,
@@ -544,7 +570,8 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 headers,
                 self.metrics.clone(),
-                self.execution_timeout,
+                execution_timeout,
+                deadline_at,
             )
             .await
         } else {
@@ -556,7 +583,8 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 headers,
                 self.metrics.clone(),
-                self.execution_timeout,
+                execution_timeout,
+                deadline_at,
             )
             .await
         };
@@ -564,7 +592,24 @@ impl WorkflowReplayer {
     }
 
     /// Replay a snapshot in canary mode (used for deploy-time verify).
+    ///
+    /// Uses the global [`with_execution_timeout`](Self::with_execution_timeout)
+    /// and no live `deadline_at` (issue #772); [`run_canary`](Self::run_canary)
+    /// threads each sampled execution row's own values via
+    /// [`replay_canary_snapshot_effective`](Self::replay_canary_snapshot_effective).
     pub async fn replay_canary_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
+        self.replay_canary_snapshot_effective(snapshot, self.execution_timeout, None)
+            .await
+    }
+
+    /// Canary snapshot replay with an explicit per-execution `execution_timeout`
+    /// / live `deadline_at` (issue #772).
+    async fn replay_canary_snapshot_effective(
+        &self,
+        snapshot: HistorySnapshot,
+        execution_timeout: Option<chrono::Duration>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
                 execution_id: snapshot.execution_id,
@@ -595,7 +640,8 @@ impl WorkflowReplayer {
             self.state.clone(),
             headers,
             self.metrics.clone(),
-            self.execution_timeout,
+            execution_timeout,
+            deadline_at,
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -691,6 +737,8 @@ impl WorkflowReplayer {
                 self.context_headers.clone(),
                 self.metrics.clone(),
                 self.execution_timeout,
+                // No per-row live deadline on the raw-events path (issue #772).
+                None,
             )
             .await
         } else {
@@ -703,6 +751,7 @@ impl WorkflowReplayer {
                 self.context_headers.clone(),
                 self.metrics.clone(),
                 self.execution_timeout,
+                None,
             )
             .await
         };
@@ -802,17 +851,24 @@ impl WorkflowReplayer {
         // Load event history.
         let history = load_history(conn, exec_id).await?;
 
-        // Load workflow name and context headers from executions table.
-        let (workflow_name, context_headers) =
-            load_workflow_name_and_headers(conn, exec_id).await?;
+        // Load workflow name, context headers, and the per-execution
+        // deadline-aware CAN inputs (`execution_timeout` + live `deadline_at`)
+        // from the executions table (issue #772). Threading the row's own values
+        // — rather than the replayer-global `self.execution_timeout` — keeps the
+        // deadline branch enabled and computed against the correct deadline, so a
+        // row that recorded a `SideEffectRecorded{Now}` from the deadline branch
+        // replays cleanly instead of surfacing false non-determinism.
+        let meta = load_workflow_name_and_headers(conn, exec_id).await?;
 
         let snapshot = HistorySnapshot {
-            workflow_name,
+            workflow_name: meta.workflow_name,
             execution_id: exec_id,
             events: history.events,
-            context_headers: Some(context_headers),
+            context_headers: Some(meta.headers),
         };
-        Ok(self.replay_from_snapshot(snapshot).await)
+        Ok(self
+            .replay_from_snapshot_effective(snapshot, meta.execution_timeout, meta.deadline_at)
+            .await)
     }
 
     /// Run the replay canary over a sample of running executions.
@@ -844,13 +900,15 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers) in executions {
+            for (id, name, created, headers, exec_timeout, deadline_at) in executions {
                 all_executions.push(SampledExecution {
                     shard_id,
                     execution_id: crate::types::ExecutionId::from_uuid(id),
                     workflow_name: name,
                     created_at: created,
                     context_headers: headers,
+                    execution_timeout: exec_timeout,
+                    deadline_at,
                 });
             }
         }
@@ -900,7 +958,16 @@ impl WorkflowReplayer {
                                 }
                             }; // `conn` is dropped here
 
-                            let report = replayer_ref.replay_canary_snapshot(snapshot).await;
+                            // Issue #772: thread the sampled execution row's own
+                            // `execution_timeout` / live `deadline_at` so the
+                            // deadline-aware CAN branch replays cleanly.
+                            let report = replayer_ref
+                                .replay_canary_snapshot_effective(
+                                    snapshot,
+                                    exec.execution_timeout,
+                                    exec.deadline_at,
+                                )
+                                .await;
                             Ok::<_, crate::error::HarvestError>(report)
                         };
 
@@ -1023,11 +1090,13 @@ async fn query_running_executions(
         String,
         chrono::DateTime<chrono::Utc>,
         Option<serde_json::Value>,
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers, created_at, harvest_workflow_executions, id, queue_name, state,
-        workflow_name,
+        context_headers, created_at, deadline_at, execution_timeout, harvest_workflow_executions,
+        id, queue_name, state, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -1044,7 +1113,15 @@ async fn query_running_executions(
     }
 
     let rows = query
-        .select((id, workflow_name, created_at, context_headers))
+        .select((
+            id,
+            workflow_name,
+            created_at,
+            context_headers,
+            // Issue #772: thread the per-execution deadline-aware CAN inputs.
+            execution_timeout,
+            deadline_at,
+        ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
         .load::<(
@@ -1052,6 +1129,8 @@ async fn query_running_executions(
             String,
             chrono::DateTime<chrono::Utc>,
             Option<serde_json::Value>,
+            Option<chrono::Duration>,
+            Option<chrono::DateTime<chrono::Utc>>,
         )>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1154,14 +1233,27 @@ pub struct ReplayCanaryReport {
 // DB helper (db feature only)
 // ---------------------------------------------------------------------------
 
+/// Loaded per-execution replay metadata for [`WorkflowReplayer::replay_from_db`]
+/// (issue #772): workflow name, context headers, and the deadline-aware
+/// continue-as-new inputs — the row's own `execution_timeout` and live
+/// (pause/resume/redrive-shifted) `deadline_at`.
+#[cfg(feature = "db")]
+struct DbReplayMeta {
+    workflow_name: String,
+    headers: HashMap<String, String>,
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[cfg(feature = "db")]
 async fn load_workflow_name_and_headers(
     conn: &mut diesel_async::AsyncPgConnection,
     exec_id: ExecutionId,
-) -> crate::error::HarvestResult<(String, HashMap<String, String>)> {
+) -> crate::error::HarvestResult<DbReplayMeta> {
     use crate::error::{HarvestError, database_error};
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers as context_headers_col, harvest_workflow_executions, id as id_col,
+        context_headers as context_headers_col, deadline_at as deadline_at_col,
+        execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
         workflow_name,
     };
     use diesel::prelude::*;
@@ -1169,9 +1261,19 @@ async fn load_workflow_name_and_headers(
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers): (String, Option<serde_json::Value>) = harvest_workflow_executions
+    let (name, raw_headers, execution_timeout, deadline_at): (
+        String,
+        Option<serde_json::Value>,
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
-        .select((workflow_name, context_headers_col))
+        .select((
+            workflow_name,
+            context_headers_col,
+            execution_timeout_col,
+            deadline_at_col,
+        ))
         .first(conn)
         .await
         .map_err(|e| match e {
@@ -1190,7 +1292,12 @@ async fn load_workflow_name_and_headers(
         })
         .unwrap_or_default();
 
-    Ok((name, headers))
+    Ok(DbReplayMeta {
+        workflow_name: name,
+        headers,
+        execution_timeout,
+        deadline_at,
+    })
 }
 
 // ---------------------------------------------------------------------------

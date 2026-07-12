@@ -1828,23 +1828,26 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     );
 }
 
-/// Issue #772 (P2 fix): prove the worker threads the row's **authoritative
-/// absolute `deadline_at`** — not a stale `started_at + execution_timeout`
-/// recompute — into `ctx.deadline()`.
+/// Issue #772 (P2 split): prove the public `ctx.deadline()` accessor is the
+/// **replay-stable NOMINAL** deadline (`started_at + execution_timeout`) end to
+/// end through the real worker, and is NOT the mutable, resume-shifted
+/// `deadline_at` column.
 ///
 /// A resumed/redriven run's `deadline_at` is pushed forward past
 /// `started_at + execution_timeout` (pause/resume shifts it by the pause span,
 /// #383; redrive re-anchors it to `now + timeout`). Rather than wiring a full
 /// pause/resume with a backdated `paused_at` (heavy, timing-sensitive), this
 /// test directly `UPDATE`s the row's `deadline_at` to a shifted value — exactly
-/// what resume's SQL does — and asserts the worker reads THAT into
-/// `ctx.deadline()`. Deterministic: the workflow returns `ctx.deadline()` as its
-/// output, and we assert it equals the shifted `deadline_at` and is far from the
-/// stale start+timeout value. Before the fix, `ctx.deadline()` recomputed from
-/// the start time and would equal the stale value, failing the assertions.
+/// what resume's SQL does — and asserts the worker still surfaces the NOMINAL
+/// deadline through `ctx.deadline()`. Deterministic: the workflow returns
+/// `ctx.deadline()` as its output, and we assert it equals `started_at +
+/// execution_timeout` and is far from the (shifted) row `deadline_at`. The
+/// live/effective `deadline_at` is consumed only by the internal continue-as-new
+/// budget check, never by this public accessor, so author code depending on
+/// `deadline()` replays deterministically after a pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-async fn worker_threads_shifted_deadline_at_into_ctx_deadline() {
+async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
@@ -2019,26 +2022,28 @@ async fn worker_threads_shifted_deadline_at_into_ctx_deadline() {
     let ctx_deadline: chrono::DateTime<Utc> =
         serde_json::from_value(output).expect("ctx.deadline() output must be an RFC3339 timestamp");
 
-    // ctx.deadline() must equal the SHIFTED deadline_at the timeout scanner
-    // honours — not a stale start+timeout recompute.
-    assert!(
-        (ctx_deadline - shifted_deadline).num_milliseconds().abs() <= 1,
-        "ctx.deadline() ({ctx_deadline}) must equal the shifted row deadline_at \
-         ({shifted_deadline}), proving the worker reads the effective deadline"
-    );
-
-    // And it must be far from the stale `WorkflowStarted.timestamp + timeout`
-    // value (2h apart), which is what the pre-fix recompute would have produced.
+    // The public ctx.deadline() must equal the NOMINAL `WorkflowStarted.timestamp
+    // + execution_timeout` — the replay-stable value — even though the row's
+    // deadline_at was shifted +2h. (The internal continue-as-new budget check
+    // reads the shifted deadline_at; the public accessor deliberately does not.)
     let history = load_history_from_url(&database_url, exec_id).await;
     let started_ts = match history.events.as_slice() {
         [WorkflowEvent::WorkflowStarted { timestamp, .. }, ..] => *timestamp,
         other => panic!("first event must be WorkflowStarted, got {other:?}"),
     };
-    let stale_deadline = started_ts + timeout;
+    let nominal_deadline = started_ts + timeout;
     assert!(
-        (ctx_deadline - stale_deadline).num_seconds().abs() > 3600,
-        "ctx.deadline() ({ctx_deadline}) must NOT be the stale start+timeout value \
-         ({stale_deadline}) — the fix reads the shifted deadline_at, not the recompute"
+        (ctx_deadline - nominal_deadline).num_milliseconds().abs() <= 1,
+        "public ctx.deadline() ({ctx_deadline}) must equal the nominal start+timeout \
+         ({nominal_deadline}), not the mutable deadline_at"
+    );
+
+    // And it must be far from the SHIFTED row `deadline_at` (2h apart) — proving
+    // the public accessor never surfaces the pause/resume-shifted value.
+    assert!(
+        (ctx_deadline - shifted_deadline).num_seconds().abs() > 3600,
+        "public ctx.deadline() ({ctx_deadline}) must NOT be the shifted row deadline_at \
+         ({shifted_deadline}) — that value is internal to the CAN budget check only"
     );
 }
 

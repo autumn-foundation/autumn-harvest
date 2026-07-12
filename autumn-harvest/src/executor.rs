@@ -528,10 +528,16 @@ pub async fn run_workflow_strict(
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
     execution_timeout: Option<chrono::Duration>,
+    // Issue #772: the per-execution live effective `deadline_at` (pause/resume/
+    // redrive-shifted), threaded so the internal continue-as-new budget check
+    // reasons about the same deadline the timeout scanner enforces. `None` falls
+    // back to `start + execution_timeout` (the file/JSON replay path).
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_execution_timeout(execution_timeout)
+        .with_deadline(deadline_at)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -552,11 +558,15 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
     execution_timeout: Option<chrono::Duration>,
+    // Issue #772: per-execution live effective `deadline_at` (see
+    // [`run_workflow_strict`]).
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_advancing_timer_clock()
         .with_execution_timeout(execution_timeout)
+        .with_deadline(deadline_at)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -751,10 +761,14 @@ pub(crate) async fn run_workflow_canary(
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
     execution_timeout: Option<chrono::Duration>,
+    // Issue #772: per-execution live effective `deadline_at` (see
+    // [`run_workflow_strict`]).
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_execution_timeout(execution_timeout)
+        .with_deadline(deadline_at)
         .with_metrics(metrics);
 
     let span = tracing::info_span!(
