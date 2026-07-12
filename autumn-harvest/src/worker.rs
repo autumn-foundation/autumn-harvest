@@ -5276,7 +5276,6 @@ async fn persist_child_timeout_race(
     registry: &HandlerRegistry,
     task_id: uuid::Uuid,
     parent_execution: &WorkflowExecution,
-    next_event_id: i32,
     commands: &[WorkflowCommand],
     child: &StartedChildWorkflowCommand,
     timer: &StartedTimerCommand,
@@ -5354,11 +5353,26 @@ async fn persist_child_timeout_race(
                 // ChildWorkflowStarted precedes TimerStarted (the positional
                 // matcher relies on this). Tolerated bookkeeping (markers,
                 // side-effects) is interleaved at its position by
-                // build_suspension_events. Both children and timer are new on the
-                // first live run (the only run that appends), so the child cannot
-                // race a concurrent ChildWorkflowCompleted append and a batch
-                // append_events is safe (unlike the re-park path, where nothing
-                // new is appended).
+                // build_suspension_events.
+                //
+                // Use `append_single_event` (parent-row FOR UPDATE + MAX(event_id)
+                // re-read per insert), byte-for-byte like the plain
+                // `persist_all_started_child_workflows` path — NOT a batch
+                // `append_events` at the stale pre-handler `next_event_id`. The
+                // child spawned by *this* batch is new and cannot complete
+                // concurrently, but this same cycle may ALSO carry a
+                // `CancelRaceLosers` for a still-RUNNING race-loser child
+                // (`extract_child_timeout_race` deliberately tolerates it, so a
+                // resolved `ctx.race()` immediately followed by
+                // `spawn_child_workflow_timeout` lands here). That loser child can
+                // append its OWN terminal (`ChildWorkflowCompleted`/`Failed`) onto
+                // the parent via `wake_parent_for_child_completion`'s own
+                // `append_single_event`, concurrently, at the same id. A stale
+                // batch append would then collide on
+                // UNIQUE(workflow_exec_id, event_id) and — routed through
+                // `fail_execution_on_error` — terminally FAIL a healthy parent. The
+                // FOR UPDATE re-read serialises the two appends instead (issue #779,
+                // Codex round-12 P2).
                 let mut timer_event = timer_is_new.then(|| WorkflowEvent::TimerStarted {
                     timer_id: timer.timer_id.clone(),
                     duration_secs: timer.duration_secs,
@@ -5374,15 +5388,18 @@ async fn persist_child_timeout_race(
                     WorkflowCommand::StartTimer { .. } => timer_event.take(),
                     _ => None,
                 });
-                let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
-                if !events.is_empty() {
-                    store::append_events(conn, parent_exec_id, &events, next_event_id).await?;
+                for event in events {
+                    store::append_single_event(conn, parent_exec_id, event).await?;
                 }
 
-                // Defensive: a suspension batch never carries CancelRaceLosers
-                // (those ride the resolution/terminal cycle), but apply them for
-                // symmetry with persist_started_timer. No-op when absent.
-                let mut race_next_event_id = next_event_id.saturating_add(events_len);
+                // Defensive: a suspension batch never carries CancelRaceLosers in
+                // the common case, but a resolved `ctx.race()` in the same cycle
+                // can (see above), so apply them for symmetry with
+                // persist_all_started_child_workflows. No-op when absent. Re-read
+                // the true next id under the same FOR UPDATE lock (the appends
+                // above wrote a variable number of events) so the cursor never
+                // reuses a consumed id.
+                let mut race_next_event_id = store::next_event_id_for(conn, parent_exec_id).await?;
                 let deferred = apply_race_loser_cancellations(
                     conn,
                     parent_exec_id,
@@ -8469,7 +8486,6 @@ async fn handle_suspended_workflow(
             registry,
             context.persistence.task.id,
             context.execution,
-            context.persistence.next_event_id,
             commands,
             &child,
             &timer,

@@ -1178,6 +1178,149 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     );
 }
 
+/// #779 (Codex round-12 P2, HEALTHY-RUN-KILLER): the child-timeout SUSPENSION
+/// persist path ([`persist_child_timeout_race`]) must append its parent events
+/// with `append_single_event` (parent-row `FOR UPDATE` + `MAX(event_id)`
+/// re-read per insert), byte-for-byte like the plain
+/// `persist_all_started_child_workflows` path — NOT a batch `append_events` at
+/// the stale pre-handler `next_event_id`.
+///
+/// A resolved `ctx.race()` over children may push a `CancelRaceLosers` for a
+/// still-RUNNING loser child and, in the SAME cycle, `spawn_child_workflow_timeout`
+/// suspends. `extract_child_timeout_race` deliberately tolerates that
+/// `CancelRaceLosers`, so the batch is routed to `persist_child_timeout_race`.
+/// While that suspension transaction runs, the loser child can complete on its
+/// own worker and append `ChildWorkflowCompleted` onto the PARENT via
+/// `wake_parent_for_child_completion`'s own `append_single_event` (parent-row
+/// lock + MAX re-read). The two appends target the same `event_id`.
+///
+/// RED (pre-fix): the suspension path used
+/// `store::append_events(parent, &events, stale_next_event_id)` with NO
+/// parent-row lock, so the concurrent committer's `event_id` was already taken
+/// and the batch insert hit `UNIQUE(workflow_exec_id, event_id)`. That `Err`
+/// flowed through `fail_execution_on_error` and terminally FAILED an
+/// otherwise-healthy parent. This models the concurrent committer as
+/// already-committed and asserts the pre-fix stale-`append_events` discipline
+/// conflicts and is classified as the transient event-id violation — the exact
+/// input the pre-fix path terminally failed on.
+///
+/// GREEN (post-fix): the same parent events appended via `append_single_event`
+/// (the fixed path's discipline) re-read `MAX(event_id)` under the parent-row
+/// lock and land gap-free PAST the committer — no collision, so the healthy
+/// parent is never failed. This is a store-layer discipline proof of the fix
+/// (mirroring the sibling `race_loser_child_cancel_*` test's approach), since
+/// `persist_child_timeout_race` and its `StartedChildWorkflowCommand` /
+/// `StartedTimerCommand` argument types are private to `worker.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_timeout_suspension_append_uses_single_event_discipline_not_stale_batch() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    // Parent RUNNING with WorkflowStarted at event_id 0 → next_event_id = 1.
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        parent_exec_id,
+        &[WorkflowEvent::workflow_started(
+            serde_json::json!({}),
+            chrono::Utc::now(),
+        )],
+        0,
+    )
+    .await
+    .expect("seed WorkflowStarted");
+
+    // A concurrent race-loser child completed first and appended its terminal
+    // onto the PARENT via append_single_event (MAX+1 = 1) — exactly
+    // wake_parent_for_child_completion. MAX(event_id) is now 1.
+    autumn_harvest::store::append_single_event(
+        &mut conn,
+        parent_exec_id,
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: ExecutionId::new(),
+            output: serde_json::json!({"loser": "done"}),
+        },
+    )
+    .await
+    .expect("concurrent loser-child terminal takes event_id 1");
+
+    // The suspension batch the child-timeout persist path appends:
+    // [ChildWorkflowStarted(new child), TimerStarted(deadline)].
+    let suspension_events = vec![
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: ExecutionId::new(),
+            workflow_name: "timeout_child".to_string(),
+            input: serde_json::json!({}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__child_timeout:1:timeout_child"),
+            duration_secs: 60,
+        },
+    ];
+
+    // RED: the pre-fix discipline — a batch append at the stale next_event_id (1,
+    // computed before the handler ran) — collides with the already-committed
+    // loser terminal on UNIQUE(workflow_exec_id, event_id). This is the exact
+    // Err persist_child_timeout_race fed into fail_execution_on_error, terminally
+    // failing the healthy parent. (Rolls back; nothing committed.)
+    let stale_next_event_id = 1;
+    let red_err = autumn_harvest::store::append_events(
+        &mut conn,
+        parent_exec_id,
+        &suspension_events,
+        stale_next_event_id,
+    )
+    .await
+    .expect_err("stale-id batch append must collide on the committed event_id");
+    assert!(
+        red_err.is_event_id_unique_violation(),
+        "the stale-batch collision is the transient event-id violation the pre-fix \
+         path terminally failed on; got: {red_err}"
+    );
+
+    // GREEN: the fixed discipline — append_single_event per event (parent-row
+    // FOR UPDATE + MAX re-read) — serialises against the loser terminal, lands
+    // gap-free at ids 2 and 3, and never fails the parent.
+    for event in suspension_events {
+        autumn_harvest::store::append_single_event(&mut conn, parent_exec_id, event)
+            .await
+            .expect(
+                "append_single_event re-reads MAX and lands past the concurrent loser \
+                 terminal — no collision, no terminal failure (issue #779 Codex round-12 P2)",
+            );
+    }
+
+    // Gap-free, correctly ordered parent history: the healthy parent survives.
+    let history = load_history_from_url(&database_url, parent_exec_id).await;
+    let names: Vec<&str> = history
+        .events
+        .iter()
+        .map(WorkflowEvent::type_name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "WorkflowStarted",
+            "ChildWorkflowCompleted",
+            "ChildWorkflowStarted",
+            "TimerStarted",
+        ],
+        "the child-timeout suspension append lands gap-free past the concurrent \
+         loser terminal — no UNIQUE collision, no terminal failure: {names:?}"
+    );
+    assert_eq!(history.next_event_id, 4, "four sequential events, ids 0..3");
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "the healthy parent was never terminally failed: {:?}",
+        history.events,
+    );
+}
+
 /// Transient wake-event-ingest event-id conflict → the parent workflow task is
 /// re-driven (park + wake), NOT terminally failed (issue #779 shared-path fix).
 ///

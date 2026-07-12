@@ -4091,34 +4091,70 @@ impl HistoryMatcher {
     /// The skip set mirrors [`Self::drain_early_signals`] so the peek agrees with
     /// where the real match will land even when signals or update events precede
     /// the recorded child start.
+    ///
+    /// The recorded start is **fingerprinted by `expected_timer_id`** (the call's
+    /// `__child_timeout:{seq}:{name}` deadline timer, unique per call site because
+    /// `seq` is a burned per-context counter). Without that fingerprint, a caught
+    /// over-cap call — which records **nothing** — would peek the *next*
+    /// child-timeout call's `ChildWorkflowStarted` at the cursor, wrongly conclude
+    /// it was already dispatched, skip its own payload-cap re-check, and then
+    /// diverge (spurious non-determinism) instead of reproducing the same
+    /// `PayloadTooLarge`. This mirrors exactly how the fan-out's seq-keyed
+    /// `fan_out:{seq}` marker peek keeps a caught call from being miscredited the
+    /// *following* call's marker (issue #779, Codex round-12 P2).
     #[must_use]
-    pub(crate) fn peek_child_start_at_cursor(&self) -> bool {
-        let mut cursor = self.cursor;
-        while cursor < self.events.len() {
-            let ev = &self.events[cursor];
-            // Skip consumed indices and the leading run of early-drainable
-            // signal / external-signal / external-cancel / update events, exactly
-            // as `prepare_match` -> `drain_early_signals` will before reading the
-            // structural event at the cursor.
-            if self.is_consumed(cursor)
-                || matches!(
-                    ev,
-                    WorkflowEvent::SignalReceived { .. }
-                        | WorkflowEvent::ExternalSignalRequested { .. }
-                        | WorkflowEvent::ExternalSignalDelivered { .. }
-                        | WorkflowEvent::ExternalSignalFailed { .. }
-                        | WorkflowEvent::ExternalCancelRequested { .. }
-                        | WorkflowEvent::ExternalCancelDelivered { .. }
-                        | WorkflowEvent::ExternalCancelFailed { .. }
-                )
-                || Self::is_update_event(ev)
-            {
-                cursor += 1;
-                continue;
+    pub(crate) fn peek_child_start_at_cursor(&self, expected_timer_id: &str) -> bool {
+        // Advance `cursor` past consumed indices and the leading run of
+        // early-drainable signal / external-signal / external-cancel / update
+        // events, exactly as `prepare_match` -> `drain_early_signals` will before
+        // reading the structural event at the cursor. Returns `false` when the
+        // history end is reached without a structural event.
+        let skip_to_structural = |cursor: &mut usize| -> bool {
+            while *cursor < self.events.len() {
+                let ev = &self.events[*cursor];
+                if self.is_consumed(*cursor)
+                    || matches!(
+                        ev,
+                        WorkflowEvent::SignalReceived { .. }
+                            | WorkflowEvent::ExternalSignalRequested { .. }
+                            | WorkflowEvent::ExternalSignalDelivered { .. }
+                            | WorkflowEvent::ExternalSignalFailed { .. }
+                            | WorkflowEvent::ExternalCancelRequested { .. }
+                            | WorkflowEvent::ExternalCancelDelivered { .. }
+                            | WorkflowEvent::ExternalCancelFailed { .. }
+                    )
+                    || Self::is_update_event(ev)
+                {
+                    *cursor += 1;
+                    continue;
+                }
+                return true;
             }
-            return matches!(ev, WorkflowEvent::ChildWorkflowStarted { .. });
+            false
+        };
+
+        let mut cursor = self.cursor;
+        if !skip_to_structural(&mut cursor) {
+            return false;
         }
-        false
+        // The structural event at the cursor must be a ChildWorkflowStarted...
+        if !matches!(
+            self.events[cursor],
+            WorkflowEvent::ChildWorkflowStarted { .. }
+        ) {
+            return false;
+        }
+        // ...immediately followed by THIS call's deadline TimerStarted. The worker
+        // persists the `[ChildWorkflowStarted, TimerStarted]` pair adjacently in
+        // one transaction, so the fingerprint check lands on the correct pair.
+        cursor += 1;
+        if !skip_to_structural(&mut cursor) {
+            return false;
+        }
+        matches!(
+            &self.events[cursor],
+            WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str() == expected_timer_id
+        )
     }
 
     /// Match a child-workflow-vs-deadline race against history (issue #779).

@@ -5376,12 +5376,16 @@ impl WorkflowContext {
         // already-recorded child — under-cap at record time — is never
         // re-judged against a possibly-changed cap; for every under-cap input
         // this is byte-identical to the prior behavior (the cap check is a
-        // no-op and the matcher proceeds exactly as before). Scope: the cap
-        // decision depends on the live `payload_max_workflow_input`, so
+        // no-op and the matcher proceeds exactly as before). The peek is
+        // fingerprinted by this call's `timer_id` (`__child_timeout:{seq}:{name}`,
+        // seq burned per call) so a caught over-cap call — which records nothing —
+        // is never miscredited the NEXT call's `ChildWorkflowStarted`, which would
+        // skip its cap re-check and diverge (issue #779, Codex round-12 P2). Scope:
+        // the cap decision depends on the live `payload_max_workflow_input`, so
         // replay-consistency holds when the cap is stable (the normal case) —
         // this does not claim replay-safety across a cap change (see the
         // fan-out `validate_child_payload_caps` note).
-        let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor());
+        let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor(&timer_id));
         if fresh_dispatch {
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {

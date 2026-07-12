@@ -5378,6 +5378,104 @@ async fn child_timeout_oversized_input_propagated_replays_deterministically() {
     );
 }
 
+/// #779 (Codex round-12 P2): a workflow that CATCHES an oversized child-timeout
+/// `PayloadTooLarge` (records NOTHING) and then IMMEDIATELY dispatches a SECOND
+/// child-timeout (recorded). The first (caught, seq 1) call's fresh-dispatch peek
+/// must be fingerprinted by its OWN timer id (`__child_timeout:1:oversized_child`)
+/// so it is never miscredited the SECOND (seq 2) call's `ChildWorkflowStarted` at
+/// the cursor.
+///
+/// RED (pre-fix, unfingerprinted `peek_child_start_at_cursor`): the first call's
+/// peek matched the second call's `ChildWorkflowStarted`, concluded it was already
+/// dispatched, skipped its own cap re-check, then diverged in
+/// `match_child_or_timer` (recorded `second_child` != requested `oversized_child`)
+/// — a spurious non-determinism instead of reproducing `PayloadTooLarge`, so the
+/// workflow failed. GREEN (timer-id fingerprint): the caught call reproduces
+/// `PayloadTooLarge`, the second call resolves child-win, the run completes.
+fn child_timeout_caught_then_second_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Call 1 (seq 1): oversized input → PayloadTooLarge, CAUGHT, records
+        // nothing.
+        let oversized = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        match ctx
+            .spawn_child_workflow_timeout(
+                "oversized_child",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+        {
+            Ok(_) => {
+                return Err("expected PayloadTooLarge on the oversized child".to_string());
+            }
+            Err(HarvestError::PayloadTooLarge { .. }) => { /* degrade gracefully */ }
+            // Any OTHER error (e.g. a spurious Diverged from the peek miscrediting
+            // the second call's child start) propagates and fails the run — so the
+            // RED state is NOT ReplaySucceeded.
+            Err(other) => return Err(other.to_string()),
+        }
+        // Call 2 (seq 2): small input, recorded, child wins before the deadline.
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                "second_child",
+                serde_json::json!({"id": 7}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"second": output}),
+        ))
+    })
+}
+
+#[tokio::test]
+async fn child_timeout_caught_oversized_then_second_child_replays_succeeded() {
+    // The caught first call (seq 1) burns its sequence number, so the recorded
+    // SECOND call is seq 2 — its deadline timer id is `__child_timeout:2:...`.
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:2:second_child");
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "second_child".to_string(),
+            input: serde_json::json!({"id": 7}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"ok": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"second": {"ok": true}}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "child_or_deadline",
+            child_timeout_caught_then_second_child_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a caught oversized child-timeout followed by a SECOND recorded \
+         child-timeout must replay cleanly — the caught call's fresh-dispatch peek \
+         is fingerprinted by its own timer id, so it is never miscredited the \
+         second call's ChildWorkflowStarted at the cursor (issue #779 Codex \
+         round-12 P2):\n{report}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Push-based signal handlers (issue #546)
 // ---------------------------------------------------------------------------
