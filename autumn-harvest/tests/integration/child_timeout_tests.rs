@@ -30,9 +30,9 @@ use serde_json::Value;
 
 use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
-    insert_workflow_execution, load_child_executions_from_url, load_history_from_url,
-    load_timers_for_execution_from_url, setup_test_database_url, spawn_test_worker,
-    wait_for_execution_state,
+    insert_workflow_execution, insert_workflow_execution_with_id, load_child_executions_from_url,
+    load_history_from_url, load_timers_for_execution_from_url, setup_test_database_url_or_env,
+    spawn_test_worker, wait_for_execution_state,
 };
 
 type WfFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -177,7 +177,7 @@ async fn wait_for_child_state(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_completes_before_deadline_parent_gets_some() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -214,7 +214,7 @@ async fn child_completes_before_deadline_parent_gets_some() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_hangs_past_deadline_parent_gets_none_and_child_cancelled() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -262,7 +262,7 @@ async fn child_hangs_past_deadline_parent_gets_none_and_child_cancelled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_fails_before_deadline_parent_gets_typed_err() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -306,7 +306,7 @@ async fn two_sequential_child_timeouts_resolve_independently() {
     // suspension batch — the join! shape is worker-rejected). The seq counter
     // and distinct `__child_timeout:{seq}` ids must both work end-to-end: the
     // first child completes → Some, the second times out → None.
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -381,7 +381,7 @@ async fn child_completes_in_park_gap_self_wakes_parent() {
     // branch is only reachable via a genuine timing race against a stale history
     // snapshot, which the current harness cannot pin without mid-transaction
     // instrumentation. The re-park cycle here executes the exact same re-check.
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -457,7 +457,7 @@ async fn child_win_tears_down_deadline_timer_no_retention_pin() {
     // `retention::has_inflight_dependencies`, so leaving it would pin the
     // terminal parent forever. Drive a child-win to COMPLETED and assert NO
     // `__child_timeout:` row survives for the parent execution.
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -580,7 +580,11 @@ async fn setup_parent_racing_overdue_real_child(
     use diesel::{ExpressionMethods, QueryDsl};
 
     let parent_exec_id = insert_workflow_execution(conn).await;
-    let child_exec_id = insert_workflow_execution(conn).await;
+    // The child is a SEPARATE live execution, so it needs a distinct workflow_id
+    // — reusing `insert_workflow_execution` (hardcoded id) would collide with the
+    // parent on the partial UNIQUE(workflow_name, workflow_id) active index.
+    let child_exec_id =
+        insert_workflow_execution_with_id(conn, &format!("child-{}", uuid::Uuid::new_v4())).await;
 
     // Link child → parent as an AWAITED child (parent_close_policy stays NULL,
     // the invariant notify_awaited_parent_of_child_terminal / the execution
@@ -626,7 +630,7 @@ async fn replay_child_timeout(
 /// primitive resolves to `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_deadline_child_completion_orders_deadline_first_and_resolves_none() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -689,7 +693,7 @@ async fn over_deadline_child_completion_orders_deadline_first_and_resolves_none(
 /// NOT the child's `Err`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_deadline_child_failure_orders_deadline_first_and_resolves_none() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -770,7 +774,7 @@ async fn assert_parent_resolves_none_after_overdue_terminal(
 /// overdue `__child_timeout` deadline first → the parent resolves `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_deadline_child_operator_cancel_orders_deadline_first_and_resolves_none() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -800,7 +804,7 @@ async fn over_deadline_child_operator_cancel_orders_deadline_first_and_resolves_
 /// `notify_awaited_parent_of_child_terminal` path → the parent resolves `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_deadline_child_operator_terminate_orders_deadline_first_and_resolves_none() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -832,7 +836,7 @@ async fn over_deadline_child_operator_terminate_orders_deadline_first_and_resolv
 /// resolves `None`, not the child-timeout `Err`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_deadline_child_execution_timeout_orders_deadline_first_and_resolves_none() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -871,7 +875,7 @@ async fn over_deadline_child_execution_timeout_orders_deadline_first_and_resolve
 async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_timers() {
     use autumn_harvest::schema::harvest_timers::dsl;
 
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -985,7 +989,7 @@ async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_ti
 async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_timerfired() {
     use autumn_harvest::schema::harvest_timers::dsl;
 
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
@@ -1057,6 +1061,123 @@ async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_time
     );
 }
 
+/// #779 (Codex P2): event-id accounting for a race-loser CHILD cancellation that
+/// ALSO materializes a due `__child_timeout` deadline.
+///
+/// When `apply_race_loser_cancellations` cancels a losing child, the REAL
+/// `notify_awaited_parent_of_child_terminal` appends onto the PARENT's OWN
+/// history via self-computed `MAX(event_id)+1` ids. Since the P2-D
+/// deadline-materialization fix, that append is `[TimerFired(overdue deadline),
+/// ChildWorkflowFailed]` — TWO events — not one. The pre-fix caller advanced its
+/// in-memory `next_event_id` cursor by a hardcoded `+1`, leaving it short by the
+/// materialized-deadline count (N), so the winner-terminal
+/// `WorkflowCompleted`/`WorkflowFailed` append that the winner-persist path
+/// performs next reused a consumed id and hit `UNIQUE(workflow_exec_id,
+/// event_id)` — rolling back and wrongly failing the otherwise-healthy
+/// race-winning parent.
+///
+/// Drives the REAL `apply_race_loser_cancellations` against a parent with an
+/// overdue deadline + an awaited RUNNING loser child, then performs the real
+/// subsequent terminal append at the returned cursor. RED (revert the count
+/// re-read → hardcoded `+1`): the cursor is `4` (still pointing AT the
+/// `ChildWorkflowFailed` id) and the terminal append collides. GREEN (re-read
+/// the true next id): the cursor is `5` and the append lands gap-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_all_appends() {
+    use autumn_harvest::WorkflowCommand;
+
+    let (database_url, _guard) = crate::integration_e2e::setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    // Parent (RUNNING) parked on a child-timeout race whose deadline is already
+    // overdue (harvest_timers row `fired = false`), plus a REAL RUNNING awaited
+    // loser child linked to it. History prefix seeds ids 0..2:
+    //   [WorkflowStarted(0), ChildWorkflowStarted(1), TimerStarted(deadline)(2)]
+    let (parent_exec_id, loser_child_exec_id) =
+        setup_parent_racing_overdue_real_child(&mut conn, None).await;
+
+    // The cursor the winner-persist path hands to apply_race_loser_cancellations:
+    // the true next id after the prefix (== DB max + 1 == 3).
+    let entry_next = load_history_from_url(&database_url, parent_exec_id)
+        .await
+        .next_event_id;
+    assert_eq!(entry_next, 3, "prefix seeds event ids 0..2");
+
+    // Resolve the race by cancelling the losing child. It is an awaited child of
+    // the parent, so the REAL cancellation notifies the parent inline,
+    // materializing the overdue `__child_timeout` deadline (TimerFired) BEFORE
+    // the ChildWorkflowFailed — TWO events onto the parent's own history.
+    let commands = vec![WorkflowCommand::CancelRaceLosers {
+        activities: vec![],
+        children: vec![loser_child_exec_id],
+        timers: vec![],
+    }];
+    let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+    let mut next_event_id = entry_next;
+    autumn_harvest::worker::apply_race_loser_cancellations(
+        &mut conn,
+        parent_exec_id,
+        &commands,
+        &mut next_event_id,
+        &registry,
+    )
+    .await
+    .expect("apply race loser cancellations");
+
+    // The cursor must have advanced past BOTH appended events (materialized
+    // TimerFired + ChildWorkflowFailed): entry(3) + 2 = 5 — NOT the pre-fix
+    // entry(3) + 1 = 4, which still points AT the ChildWorkflowFailed id.
+    assert_eq!(
+        next_event_id, 5,
+        "cursor must skip the materialized deadline AND the child terminal that \
+         notify_awaited_parent_of_child_terminal appended (accounting fix)"
+    );
+
+    // The subsequent winner-terminal append the persist path performs at the
+    // returned cursor. RED: at the stale id 4 this collides on
+    // UNIQUE(workflow_exec_id, event_id) and this `.expect` fails. GREEN: id 5 is
+    // free.
+    autumn_harvest::store::append_events(
+        &mut conn,
+        parent_exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"winner": "sibling"}),
+        }],
+        next_event_id,
+    )
+    .await
+    .expect(
+        "winner-terminal append must NOT collide with the materialized deadline / \
+         child terminal (event-id accounting fix, #779 Codex P2)",
+    );
+
+    // Final parent history: gap-free, distinct, correctly ordered.
+    let history = load_history_from_url(&database_url, parent_exec_id).await;
+    let names: Vec<&str> = history
+        .events
+        .iter()
+        .map(WorkflowEvent::type_name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "WorkflowStarted",
+            "ChildWorkflowStarted",
+            "TimerStarted",
+            "TimerFired",
+            "ChildWorkflowFailed",
+            "WorkflowCompleted",
+        ],
+        "parent history must be gap-free and correctly ordered: {names:?}"
+    );
+    assert_eq!(
+        history.next_event_id, 6,
+        "six sequential events (ids 0..5) with no gap"
+    );
+}
+
 /// Transient wake-event-ingest event-id conflict → the parent workflow task is
 /// re-driven (park + wake), NOT terminally failed (issue #779 shared-path fix).
 ///
@@ -1088,7 +1209,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     use diesel::QueryDsl;
     use std::time::Duration;
 
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");

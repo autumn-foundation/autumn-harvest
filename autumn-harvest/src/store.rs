@@ -451,6 +451,54 @@ pub async fn append_single_event(
     Ok(())
 }
 
+/// Read the next event id (`MAX(event_id) + 1`) for an execution's history,
+/// taking the same `FOR UPDATE` row lock [`append_single_event`] uses so the
+/// returned value stays valid for a subsequent append inside the same
+/// transaction. Returns `0` when the execution has no events yet.
+///
+/// Callers that maintain an in-memory event-id cursor must use this (rather
+/// than a fixed increment) to re-synchronise after another code path appended a
+/// **variable** number of events onto the same history within the transaction —
+/// e.g. `notify_awaited_parent_of_child_terminal`, which appends the child
+/// terminal plus zero or more preceding materialized `__child_timeout`
+/// `TimerFired` deadlines (issue #779, Codex P2). Re-reading the true next id
+/// prevents a later append from reusing a consumed id and colliding on the
+/// `UNIQUE(workflow_exec_id, event_id)` constraint.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails, or
+/// [`crate::error::HarvestError::NotFound`] if the execution does not exist.
+pub(crate) async fn next_event_id_for(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<i32> {
+    use crate::models::WorkflowExecution;
+    use crate::schema::harvest_workflow_executions;
+    use diesel::dsl::max;
+
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| {
+            crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
+        })?;
+
+    let max_id: Option<i32> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(max(harvest_events::event_id))
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(max_id.map_or(0, |id| id.saturating_add(1)))
+}
+
 /// Durably admit an update into a workflow's event history.
 ///
 /// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the

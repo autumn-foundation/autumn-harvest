@@ -7768,7 +7768,8 @@ async fn persist_bookkeeping_and_requeue_workflow(
 /// must spawn **after** its outer transaction commits (mirrors the existing
 /// external-cancel delivery pattern, issue #492) — never before, so a rolled
 /// back cancellation cannot have already started trigger workflows.
-async fn apply_race_loser_cancellations(
+#[doc(hidden)] // exposed for the #779 event-id-accounting integration test; not a stable API
+pub async fn apply_race_loser_cancellations(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
@@ -7845,11 +7846,19 @@ async fn apply_race_loser_cancellations(
                         // execution (parent_id = exec_id, parent_close_policy =
                         // None), so a genuine (newly-cancelled) cancellation here
                         // runs `notify_awaited_parent_of_child_terminal` inside the
-                        // same transaction, which appends a `ChildWorkflowFailed`
-                        // event onto *our own* history via a self-computed id.
-                        // Advance the cursor so the winner marker / terminal-
-                        // outcome append that follows doesn't collide with it.
-                        *next_event_id = next_event_id.saturating_add(1);
+                        // same transaction, appending onto *our own* history via
+                        // self-computed ids. That append is the `ChildWorkflowFailed`
+                        // terminal PLUS — since #779's deadline-materialization
+                        // (Codex P2-D) — zero or more preceding `__child_timeout`
+                        // `TimerFired` deadlines. Its event count is therefore
+                        // *variable* (1 + N materialized), not a fixed 1, so a
+                        // hardcoded `+1` here would leave the cursor short by N and
+                        // the winner marker / terminal-outcome / synthetic-loser
+                        // append that follows would reuse a consumed id and fail on
+                        // `UNIQUE(workflow_exec_id, event_id)`. Re-read the true next
+                        // event id under the parent row lock that `notify_awaited_
+                        // parent_of_child_terminal`'s append already holds (Codex P2).
+                        *next_event_id = store::next_event_id_for(conn, exec_id).await?;
                     }
                 }
                 Err(HarvestError::NotFound(_) | HarvestError::Config(_)) => {

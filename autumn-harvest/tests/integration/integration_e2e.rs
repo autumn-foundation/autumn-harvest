@@ -309,6 +309,19 @@ pub(crate) async fn setup_test_database_url() -> (String, ContainerAsync<Postgre
     (database_url, container)
 }
 
+/// Like [`setup_test_database_url`] but honours `HARVEST_TEST_DATABASE_URL` (a
+/// pre-migrated Postgres) so DB tests can run against a local instance when
+/// Docker/testcontainers is unavailable. Returns `None` for the container in
+/// that case; the caller keeps the returned `Option` alive for the test's
+/// duration exactly as it would the container.
+pub(crate) async fn setup_test_database_url_or_env() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
+}
+
 async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_tag("16")
@@ -644,6 +657,60 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
         .execute(conn)
         .await
         .expect("failed to insert workflow execution");
+
+    exec_id
+}
+
+/// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
+/// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
+/// inserts more than one live execution: they would otherwise collide on the
+/// partial `UNIQUE(workflow_name, workflow_id)` active index that
+/// [`insert_workflow_execution`]'s hardcoded id trips on a second call.
+pub(crate) async fn insert_workflow_execution_with_id(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_test_workflow",
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({"test": true}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+    };
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert workflow execution with id");
 
     exec_id
 }
