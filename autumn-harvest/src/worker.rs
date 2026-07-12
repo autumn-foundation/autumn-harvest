@@ -3538,6 +3538,72 @@ fn collect_update_result_metrics(
         .collect()
 }
 
+/// Select the command list carrying this cycle's `RecordUpdateResult`s given
+/// the workflow outcome (issue #684).
+///
+/// On a [`WorkflowOutcome::Suspended`] outcome the update results live **inside
+/// the outcome's `commands`** — the executor returns `(Suspended { commands },
+/// vec![])`, so the worker's second tuple element (`pending_cmds`) is empty.
+/// On every other outcome (terminal-with-commands, continue-as-new) the update
+/// results ride in `pending_cmds`. Reading only `pending_cmds` (as an earlier
+/// cut did) silently undercounts the **common** case: an admitted update
+/// completes and the long-running workflow loops back to a `wait_for_signal` /
+/// activity and suspends. The persist path is the same single main transaction
+/// in both cases (`handle_suspended_workflow` for suspend,
+/// `persist_terminal_outcome_commands` for terminal), so the `Persisted`-arm
+/// emission is post-commit and exactly-once for both once the source is right.
+fn update_result_command_source<'a>(
+    outcome: &'a WorkflowOutcome,
+    pending_cmds: &'a [WorkflowCommand],
+) -> &'a [WorkflowCommand] {
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => commands,
+        _ => pending_cmds,
+    }
+}
+
+/// Emit `harvest.update.completed` / `harvest.update.failed` for each collected
+/// `(update_name, completed)` pair (issue #684). Shared by the worker's
+/// `Persisted`-arm terminal/suspend emission and the two inline external-signal
+/// suspension branches, which persist their update results outside the main
+/// transaction and would otherwise leave them uncounted.
+fn emit_update_result_metrics(
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    workflow_name: &str,
+    queue: &str,
+    results: &[(String, bool)],
+) {
+    for (update_name, completed) in results {
+        if *completed {
+            metrics.record_update_completed(workflow_name, update_name, queue);
+        } else {
+            metrics.record_update_failed(workflow_name, update_name, queue);
+        }
+    }
+}
+
+/// Emit `harvest.signal.unhandled` once per unconsumed occurrence from a
+/// terminal outcome's `unhandled_signals` map (issue #684).
+///
+/// Called only from the worker's `record_workflow_terminal` site (Completed /
+/// Failed arms), so it inherits #519's exact suppression discipline: the #603
+/// ND-block gate and the fast-path pause discard have already returned early,
+/// and Cancel/Terminate/Execution-timeout/Parent-close never carry a driven
+/// matcher (and so never a populated map). The map is empty for every other
+/// path, making this a no-op there.
+fn emit_unhandled_signal_metrics(
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    workflow_name: &str,
+    queue: &str,
+    by_name: &std::collections::BTreeMap<String, u64>,
+) {
+    for (signal_name, count) in by_name {
+        for _ in 0..*count {
+            metrics.record_signal_unhandled(workflow_name, signal_name, queue);
+        }
+    }
+}
+
 /// Apply `UpsertSearchAttributes` patches from `commands` to `base` in memory.
 ///
 /// Returns the patched value, or the original `base` if no patch commands exist.
@@ -8090,7 +8156,7 @@ async fn persist_workflow_outcome(
     let is_detached_child = execution.parent_close_policy.is_some();
 
     match (outcome, parent_exec_id) {
-        (WorkflowOutcome::Completed { output }, Some(parent_id)) if !is_detached_child => {
+        (WorkflowOutcome::Completed { output, .. }, Some(parent_id)) if !is_detached_child => {
             let res = persist_child_workflow_completion(
                 conn,
                 persistence.task.id,
@@ -8104,7 +8170,7 @@ async fn persist_workflow_outcome(
             .await?;
             Ok((false, vec![res]))
         }
-        (WorkflowOutcome::Completed { output }, _) => {
+        (WorkflowOutcome::Completed { output, .. }, _) => {
             // Root workflow or detached child completing — no parent wake.
             let res = persist_workflow_completion(
                 conn,
@@ -9232,6 +9298,16 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Issue #684: the update results just persisted inline (autocommit)
+                // are stripped from the reconstructed suspension below, so they
+                // never reach the main-transaction Persisted-arm emission — emit
+                // here, post-commit, or they would be silently uncounted.
+                emit_update_result_metrics(
+                    telemetry.metrics.as_ref(),
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    &collect_update_result_metrics(&history_events, &commands),
+                );
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
@@ -9427,6 +9503,16 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Issue #684: `split_mixed_signal_batch` below drops
+                // `RecordUpdateResult` from `remaining_commands`, so these
+                // inline-persisted update results never reach the main-transaction
+                // Persisted-arm emission — emit here, post-commit.
+                emit_update_result_metrics(
+                    telemetry.metrics.as_ref(),
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    &collect_update_result_metrics(&history_events, &commands),
+                );
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
                 {
@@ -9784,14 +9870,32 @@ async fn process_workflow_task(
     // Emit the once-per-terminal-outcome counter (issue #519).
     // Suspended is not a terminal state — a workflow that suspends N times
     // and then completes must produce exactly one `completed` increment.
+    //
+    // Issue #684: harvest.signal.unhandled is emitted from the SAME match, from
+    // the terminal outcome's `unhandled_signals` map, so it inherits #519's
+    // exact suppression + exactly-once discipline: this site is downstream of
+    // the #603 ND-block gate (an ND-carrying Failed returned early above) and
+    // the fast-path pause discard, and the residual persist-time
+    // pause-race/persist-failure double-count edge is identical to #519's own.
     match &outcome {
-        WorkflowOutcome::Completed { .. } => telemetry.metrics.record_workflow_terminal(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            WorkflowStatus::Completed,
-        ),
+        WorkflowOutcome::Completed {
+            unhandled_signals, ..
+        } => {
+            telemetry.metrics.record_workflow_terminal(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                WorkflowStatus::Completed,
+            );
+            emit_unhandled_signal_metrics(
+                telemetry.metrics.as_ref(),
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                unhandled_signals,
+            );
+        }
         WorkflowOutcome::Failed {
             non_deterministic_details,
+            unhandled_signals,
             ..
         } => {
             // Defensive (issue #603): an ND-carrying Failed outcome is gated
@@ -9814,6 +9918,14 @@ async fn process_workflow_task(
                 &prepared.execution.workflow_name,
                 &task.queue_name,
                 WorkflowStatus::Failed,
+            );
+            // Issue #684: a failed run with leftover signals is legitimately
+            // "unhandled" — same emission as the completed arm.
+            emit_unhandled_signal_metrics(
+                telemetry.metrics.as_ref(),
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                unhandled_signals,
             );
         }
         WorkflowOutcome::ContinuedAsNew { .. } => telemetry.metrics.record_workflow_terminal(
@@ -9926,10 +10038,17 @@ async fn process_workflow_task(
         !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
     let counter_action = schedule_counter_action(&outcome);
     // Issue #684: collect update.completed/failed metric data now, while
-    // `history_events` and `pending_cmds` are both still in scope (the persist
-    // transaction below moves `pending_cmds` and `task`). Emitted only
-    // post-commit in the `Persisted` arm so a persist failure never over-counts.
-    let update_result_metrics = collect_update_result_metrics(&history_events, &pending_cmds);
+    // `history_events`, `outcome`, and `pending_cmds` are all still in scope
+    // (the persist transaction below moves `outcome`, `pending_cmds`, and
+    // `task`). The `RecordUpdateResult`s live in `outcome.commands` on the
+    // Suspended path (the common case) and in `pending_cmds` on the terminal /
+    // continue-as-new paths — `update_result_command_source` picks the right
+    // one. Emitted only post-commit in the `Persisted` arm so a persist failure
+    // (and the ParkedPaused discard) never over-counts.
+    let update_result_metrics = collect_update_result_metrics(
+        &history_events,
+        update_result_command_source(&outcome, &pending_cmds),
+    );
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -10033,21 +10152,12 @@ async fn process_workflow_task(
 
             // Issue #684: emit update.completed/update.failed post-commit,
             // exactly once per update result (data collected pre-persist above).
-            for (update_name, completed) in &update_result_metrics {
-                if *completed {
-                    telemetry.metrics.record_update_completed(
-                        &prepared.execution.workflow_name,
-                        update_name,
-                        &update_metric_queue,
-                    );
-                } else {
-                    telemetry.metrics.record_update_failed(
-                        &prepared.execution.workflow_name,
-                        update_name,
-                        &update_metric_queue,
-                    );
-                }
-            }
+            emit_update_result_metrics(
+                telemetry.metrics.as_ref(),
+                &prepared.execution.workflow_name,
+                &update_metric_queue,
+                &update_result_metrics,
+            );
         }
         Err(error) => {
             // Preserve per-path error handling: a terminal-with-commands persist
@@ -15562,6 +15672,7 @@ mod tests {
         let outcome = WorkflowOutcome::Failed {
             error: "non-deterministic replay: test".to_string(),
             handler_panic: false,
+            unhandled_signals: std::collections::BTreeMap::new(),
             non_deterministic_details: Some(crate::error::NonDeterministicDetails {
                 event_index: Some(0),
                 expected: None,
@@ -15741,6 +15852,78 @@ mod tests {
                 ("cancel".to_owned(), false)
             ]
         );
+    }
+
+    #[test]
+    fn update_result_command_source_reads_suspended_outcome_commands_not_pending() {
+        // Issue #684 regression: the common suspend path carries its
+        // RecordUpdateResult INSIDE the Suspended outcome's `commands`, while
+        // `pending_cmds` (the executor's second tuple element) is EMPTY. An
+        // earlier cut collected from `pending_cmds` only and silently
+        // undercounted every update that completed and then suspended.
+        let id = crate::types::UpdateId::new();
+        let history = vec![admitted(id, "set_priority")];
+        let suspend_commands = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: id,
+                result: Ok(serde_json::json!("done")),
+            },
+            // A benign bookkeeping command standing in for the wait the workflow
+            // suspends on after the update completes.
+            WorkflowCommand::RecordMarker {
+                name: "m".into(),
+                details: Value::Null,
+            },
+        ];
+        let outcome = WorkflowOutcome::Suspended {
+            commands: suspend_commands,
+        };
+        let pending_cmds: Vec<WorkflowCommand> = Vec::new();
+
+        // The bug: reading only pending_cmds finds nothing.
+        assert!(
+            collect_update_result_metrics(&history, &pending_cmds).is_empty(),
+            "pending_cmds is empty on the suspend path — this is the source of the bug"
+        );
+        // The fix: the source selector reaches into the Suspended commands.
+        let source = update_result_command_source(&outcome, &pending_cmds);
+        assert_eq!(
+            collect_update_result_metrics(&history, source),
+            vec![("set_priority".to_owned(), true)],
+            "the suspend path's update result must be collected from the outcome's commands"
+        );
+    }
+
+    #[test]
+    fn update_result_command_source_reads_pending_cmds_for_terminal_outcomes() {
+        // Terminal (and continue-as-new) outcomes carry their RecordUpdateResult
+        // in pending_cmds, NOT inside the outcome, so the selector must return
+        // pending_cmds there.
+        let id = crate::types::UpdateId::new();
+        let pending_cmds = vec![WorkflowCommand::RecordUpdateResult {
+            update_id: id,
+            result: Err("nope".into()),
+        }];
+        for outcome in [
+            WorkflowOutcome::Completed {
+                output: Value::Null,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            },
+            WorkflowOutcome::Failed {
+                error: "boom".into(),
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            },
+            WorkflowOutcome::ContinuedAsNew { input: Value::Null },
+        ] {
+            let source = update_result_command_source(&outcome, &pending_cmds);
+            assert_eq!(
+                source.len(),
+                1,
+                "terminal/CAN outcomes must read update results from pending_cmds"
+            );
+        }
     }
 
     #[test]

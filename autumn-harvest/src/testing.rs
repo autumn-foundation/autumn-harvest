@@ -2821,7 +2821,7 @@ impl WorkflowTestEnv {
             WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
         );
         let result = match outcome {
-            WorkflowOutcome::Completed { output } => {
+            WorkflowOutcome::Completed { output, .. } => {
                 history.push(WorkflowEvent::WorkflowCompleted {
                     output: output.clone(),
                 });

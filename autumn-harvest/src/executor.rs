@@ -32,6 +32,16 @@ pub enum WorkflowOutcome {
     Completed {
         /// The final result serialized as JSON.
         output: Value,
+        /// Signals delivered into history but never consumed by the workflow
+        /// at this terminal outcome, keyed by signal name → occurrence count
+        /// (issue #684). Computed by the executor's terminal arms from the
+        /// driven matcher (the only place the authoritative consumed-set
+        /// exists) and carried out to the worker, which emits
+        /// `harvest.signal.unhandled` **at the same site and under the same
+        /// suppressions as `record_workflow_terminal`** (#519) — downstream of
+        /// the #603 ND-block gate and the fast-path pause discard. Empty for
+        /// every non-terminal-arm construction.
+        unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
     /// The workflow function returned an error.
     Failed {
@@ -49,6 +59,13 @@ pub enum WorkflowOutcome {
         /// error-type string reaches this variant with `handler_panic == false`
         /// and never triggers the panic-retry loop).
         handler_panic: bool,
+        /// Unconsumed delivered signals at this terminal outcome (issue #684).
+        /// See [`WorkflowOutcome::Completed::unhandled_signals`]. Populated on
+        /// the executor's `Ok(Err)` / deferred-nd-reroute terminal arms; a
+        /// `Failed { non_deterministic_details: Some(_) }` ND-block outcome
+        /// carries it too but is diverted by the worker's #603 gate before the
+        /// emission site, so it is never counted.
+        unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
     /// The workflow suspended awaiting activity results or timer firings.
     /// The accumulated commands describe what the worker needs to schedule.
@@ -560,6 +577,7 @@ async fn run_strict_with_ctx(
                     error: encode_workflow_panic(message),
                     non_deterministic_details: None,
                     handler_panic: true,
+                    unhandled_signals: std::collections::BTreeMap::new(),
                 };
             }
         };
@@ -592,6 +610,7 @@ async fn run_strict_with_ctx(
                                 .to_string(),
                             non_deterministic_details: nd,
                             handler_panic: false,
+                            unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
                         // UpsertSearchAttributes and SetCurrentDetails are pure metadata
@@ -626,9 +645,13 @@ async fn run_strict_with_ctx(
                                 .to_string(),
                             non_deterministic_details: nd,
                             handler_panic: false,
+                            unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else {
-                        WorkflowOutcome::Completed { output }
+                        WorkflowOutcome::Completed {
+                            output,
+                            unhandled_signals: std::collections::BTreeMap::new(),
+                        }
                     }
                 },
                 |nd| {
@@ -637,6 +660,7 @@ async fn run_strict_with_ctx(
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     }
                 },
             ),
@@ -651,11 +675,13 @@ async fn run_strict_with_ctx(
                         error,
                         non_deterministic_details: details.clone(),
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     },
                 )
             }
@@ -670,6 +696,7 @@ async fn run_strict_with_ctx(
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     };
                 }
                 let mut commands = ctx.drain_commands();
@@ -727,6 +754,7 @@ pub(crate) async fn run_workflow_canary(
                     error: encode_workflow_panic(message),
                     non_deterministic_details: None,
                     handler_panic: true,
+                    unhandled_signals: std::collections::BTreeMap::new(),
                 };
             }
         };
@@ -756,6 +784,7 @@ pub(crate) async fn run_workflow_canary(
                                 .to_string(),
                             non_deterministic_details: nd,
                             handler_panic: false,
+                            unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
                         !matches!(
@@ -780,9 +809,13 @@ pub(crate) async fn run_workflow_canary(
                                 .to_string(),
                             non_deterministic_details: nd,
                             handler_panic: false,
+                            unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else {
-                        WorkflowOutcome::Completed { output }
+                        WorkflowOutcome::Completed {
+                            output,
+                            unhandled_signals: std::collections::BTreeMap::new(),
+                        }
                     }
                 },
                 |nd| {
@@ -791,6 +824,7 @@ pub(crate) async fn run_workflow_canary(
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     }
                 },
             ),
@@ -803,11 +837,13 @@ pub(crate) async fn run_workflow_canary(
                         error,
                         non_deterministic_details: details.clone(),
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     },
                 )
             }
@@ -818,6 +854,7 @@ pub(crate) async fn run_workflow_canary(
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     };
                 }
 
@@ -836,6 +873,7 @@ pub(crate) async fn run_workflow_canary(
                         error: "non-deterministic replay: workflow suspended before all history events were replayed".to_string(),
                         non_deterministic_details: nd,
                         handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     };
                 }
 
@@ -1022,6 +1060,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
 /// timeout, and return the outcome.  Shared by all public entry points so the
 /// advancing-clock variant (`run_workflow_with_state_advancing_clock`) does not
 /// duplicate the span/timeout/drain logic.
+#[allow(clippy::too_many_lines)] // one linear span/timeout/drain orchestrator
 async fn drive_workflow(
     ctx: WorkflowContext,
     handler: WorkflowHandlerFn,
@@ -1082,6 +1121,7 @@ async fn drive_workflow(
                         error: encode_workflow_panic(message),
                         non_deterministic_details: None,
                         handler_panic: true,
+                        unhandled_signals: std::collections::BTreeMap::new(),
                     },
                     Vec::new(),
                 );
@@ -1100,22 +1140,26 @@ async fn drive_workflow(
                 // that registers a handler and then completes without ever
                 // awaiting an activity/timer/signal).
                 ctx.flush_pending_signal_handlers();
-                // Issue #684: emit harvest.signal.unhandled for any delivered
-                // signal the workflow left unconsumed at this Completed/Failed
-                // terminal outcome (after the flush above, so push handlers get
-                // their last claim first). Terminal arms only — never Suspended.
-                ctx.report_unhandled_signals();
+                // Issue #684: snapshot the unconsumed signals (after the flush,
+                // so #546 push handlers claim first) and carry them out on the
+                // outcome; the WORKER emits from the map (see `unhandled_signals`
+                // docs — emission moved off the executor's pre-#603-gate path).
+                let unhandled_signals = ctx.unhandled_signals();
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
                 // may have absorbed a replay divergence and recorded it as a
                 // deferred non-determinism error (issue #384). Surface it as a
                 // failure rather than letting the workflow complete silently.
                 let details = ctx.take_nd_details();
                 let outcome = ctx.take_deferred_nd_error().map_or_else(
-                    || WorkflowOutcome::Completed { output },
+                    || WorkflowOutcome::Completed {
+                        output,
+                        unhandled_signals: unhandled_signals.clone(),
+                    },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: unhandled_signals.clone(),
                     },
                 );
                 (outcome, ctx.drain_commands())
@@ -1125,20 +1169,21 @@ async fn drive_workflow(
             Ok(Err(error)) => {
                 // See the `Ok(Ok(output))` arm above (issue #546).
                 ctx.flush_pending_signal_handlers();
-                // Issue #684: a failed run with leftover signals is legitimately
-                // "unhandled" — same terminal-arm emission as the completed path.
-                ctx.report_unhandled_signals();
+                // Issue #684: same terminal-arm snapshot as the completed path.
+                let unhandled_signals = ctx.unhandled_signals();
                 let details = ctx.take_nd_details();
                 let outcome = ctx.take_deferred_nd_error().map_or(
                     WorkflowOutcome::Failed {
                         error,
                         non_deterministic_details: details.clone(),
                         handler_panic: false,
+                        unhandled_signals: unhandled_signals.clone(),
                     },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
                         handler_panic: false,
+                        unhandled_signals: unhandled_signals.clone(),
                     },
                 );
                 (outcome, ctx.drain_commands())
@@ -1160,6 +1205,7 @@ async fn drive_workflow(
                             error: format!("non-deterministic replay: {nd}"),
                             non_deterministic_details: details,
                             handler_panic: false,
+                            unhandled_signals: std::collections::BTreeMap::new(),
                         },
                         ctx.drain_commands(),
                     );
@@ -1299,7 +1345,7 @@ mod tests {
         let outcome = run_workflow(exec_id, history, echo_workflow, input.clone()).await;
 
         match outcome {
-            WorkflowOutcome::Completed { output } => {
+            WorkflowOutcome::Completed { output, .. } => {
                 assert_eq!(output, input);
             }
             other => panic!("expected Completed, got {other:?}"),
@@ -1423,6 +1469,7 @@ mod tests {
                 error,
                 non_deterministic_details,
                 handler_panic,
+                ..
             } => {
                 assert!(
                     handler_panic,
@@ -1473,6 +1520,7 @@ mod tests {
                 error,
                 non_deterministic_details,
                 handler_panic,
+                ..
             } => {
                 assert!(
                     handler_panic,
@@ -1708,7 +1756,7 @@ mod tests {
         let outcome = run_workflow(exec_id, history, activity_workflow, input).await;
 
         match outcome {
-            WorkflowOutcome::Completed { output } => {
+            WorkflowOutcome::Completed { output, .. } => {
                 assert_eq!(output, activity_output);
             }
             other => panic!("expected Completed, got {other:?}"),
@@ -1763,7 +1811,7 @@ mod tests {
         let outcome = run_workflow(exec_id, history, signal_handler_workflow, Value::Null).await;
 
         match outcome {
-            WorkflowOutcome::Completed { output } => {
+            WorkflowOutcome::Completed { output, .. } => {
                 assert_eq!(output, serde_json::json!({"cancelled": true}));
             }
             other => panic!("expected Completed, got {other:?}"),
@@ -1784,16 +1832,24 @@ mod tests {
         let outcome = run_workflow(exec_id, history, signal_handler_workflow, Value::Null).await;
 
         match outcome {
-            WorkflowOutcome::Completed { output } => {
+            WorkflowOutcome::Completed { output, .. } => {
                 assert_eq!(output, serde_json::json!({"cancelled": false}));
             }
             other => panic!("expected Completed, got {other:?}"),
         }
     }
 
-    // ── signal.unhandled emission via drive_workflow (issue #684) ─────────
+    // ── signal.unhandled plumb-through via drive_workflow (issue #684) ─────
+    //
+    // The executor NO LONGER emits harvest.signal.unhandled — it computes the
+    // unconsumed-signal map at the terminal frontier and carries it out on the
+    // Completed/Failed outcome; the worker emits from it (symmetric with #519's
+    // record_workflow_terminal). These tests prove (a) the terminal outcomes
+    // carry the map, (b) Suspended does not, and (c) the executor itself emits
+    // NOTHING (a recorder passed in sees zero samples — the emission moved to
+    // the worker).
 
-    /// Recording double that captures `record_signal_unhandled` samples.
+    /// Recording double: fails the test if the executor ever emits a sample.
     #[derive(Default)]
     struct UnhandledSignalRecorder {
         samples: std::sync::Mutex<Vec<(String, String, String)>>,
@@ -1821,12 +1877,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn completed_workflow_emits_signal_unhandled_for_undrained_signal() {
-        // A workflow that completes while a delivered SignalReceived was never
-        // consumed emits exactly one harvest.signal.unhandled, labeled by
-        // workflow + signal name + queue.
-        let history = vec![
+    fn started_then_late_signal() -> Vec<WorkflowEvent> {
+        vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
@@ -1838,12 +1890,19 @@ mod tests {
                 signal_name: "late_signal".into(),
                 payload: Value::Null,
             },
-        ];
+        ]
+    }
+
+    #[tokio::test]
+    async fn completed_outcome_carries_unhandled_signals_and_executor_does_not_emit() {
+        // A workflow that completes while a delivered SignalReceived was never
+        // consumed CARRIES the unconsumed map on its Completed outcome — and the
+        // executor emits NOTHING itself (the worker emits from the carried map).
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
         let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
             ExecutionId::new(),
-            history,
+            started_then_late_signal(),
             echo_workflow,
             Value::Null,
             empty_shared_state(),
@@ -1851,39 +1910,31 @@ mod tests {
             recorder.clone(),
         )
         .await;
-        assert!(matches!(outcome, WorkflowOutcome::Completed { .. }));
-        let samples = recorder.samples.lock().unwrap().clone();
-        assert_eq!(
-            samples.as_slice(),
-            &[("notif".to_owned(), "late_signal".to_owned(), "q".to_owned())],
-            "a completed workflow with an undrained signal must emit exactly one \
-             harvest.signal.unhandled with workflow+name+queue labels"
+        match outcome {
+            WorkflowOutcome::Completed {
+                unhandled_signals, ..
+            } => {
+                assert_eq!(unhandled_signals.get("late_signal"), Some(&1));
+                assert_eq!(unhandled_signals.len(), 1);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(
+            recorder.samples.lock().unwrap().is_empty(),
+            "the executor must NOT emit harvest.signal.unhandled — the worker does"
         );
     }
 
     #[tokio::test]
-    async fn failed_workflow_emits_signal_unhandled_for_undrained_signal() {
-        // A workflow that FAILS while leaving a signal unconsumed still emits
-        // the unhandled counter (a failed run with leftover signals is
-        // legitimately "unhandled").
-        let history = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "late_signal".into(),
-                payload: Value::Null,
-            },
-        ];
+    async fn failed_outcome_carries_unhandled_signals() {
+        // A workflow that FAILS while leaving a signal unconsumed still carries
+        // the unconsumed map (a failed run with leftover signals is legitimately
+        // "unhandled").
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
         let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
             ExecutionId::new(),
-            history,
+            started_then_late_signal(),
             failing_workflow,
             Value::Null,
             empty_shared_state(),
@@ -1891,33 +1942,24 @@ mod tests {
             recorder.clone(),
         )
         .await;
-        assert!(matches!(outcome, WorkflowOutcome::Failed { .. }));
-        assert_eq!(recorder.samples.lock().unwrap().len(), 1);
+        match outcome {
+            WorkflowOutcome::Failed {
+                unhandled_signals, ..
+            } => assert_eq!(unhandled_signals.get("late_signal"), Some(&1)),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(recorder.samples.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn suspended_workflow_does_not_emit_signal_unhandled() {
-        // The emission lives ONLY in the terminal arms of drive_workflow, never
-        // in the Suspended arm — a workflow that suspends with an unconsumed
-        // signal in history must NOT emit.
-        let history = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "late_signal".into(),
-                payload: Value::Null,
-            },
-        ];
+    async fn suspended_outcome_carries_no_unhandled_signals() {
+        // Suspended is not a terminal arm — it has no unhandled_signals field,
+        // and the executor emits nothing.
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
         let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
             ExecutionId::new(),
-            history,
+            started_then_late_signal(),
             activity_workflow, // suspends on send_email (not in history)
             Value::Null,
             empty_shared_state(),
@@ -1928,7 +1970,7 @@ mod tests {
         assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
         assert!(
             recorder.samples.lock().unwrap().is_empty(),
-            "a suspended workflow must not emit harvest.signal.unhandled"
+            "a suspended workflow must not emit or carry harvest.signal.unhandled"
         );
     }
 }

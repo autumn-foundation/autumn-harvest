@@ -267,7 +267,7 @@ async fn child_fan_out_raw_three_parallel_all_succeed() {
     let outcome = run_workflow(exec_id, history, child_fan_out_three_parallel, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             let results = output["results"].as_array().unwrap();
             assert_eq!(results.len(), 3, "should have 3 results");
             assert_eq!(results[0], json!("result_a"), "slot 0 should be result_a");
@@ -525,7 +525,7 @@ async fn child_fan_out_collect_all_returns_per_slot_results() {
     let outcome = run_workflow(exec_id, history, child_fan_out_collect_all, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             let results = output["results"].as_array().unwrap();
             assert_eq!(results.len(), 3, "collect-all should return all 3 slots");
             assert!(results[0].get("ok").is_some(), "slot 0 should be ok");
@@ -552,7 +552,7 @@ async fn child_fan_out_empty_returns_empty_vec() {
     let outcome = run_workflow(exec_id, history, child_fan_out_empty, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(
                 output["count"],
                 json!(0),
@@ -683,7 +683,7 @@ async fn child_fan_out_dynamic_from_prior_activity_replays_correctly() {
     .await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             let processed = output["processed"].as_array().unwrap();
             assert_eq!(processed.len(), 3, "should process 3 items");
             assert_eq!(processed[0], json!("done_1"));
@@ -830,7 +830,7 @@ async fn child_fan_out_shares_seq_counter_with_activity_fan_out() {
     .await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             let activities = output["activities"].as_array().unwrap();
             let children = output["children"].as_array().unwrap();
             assert_eq!(activities.len(), 2);

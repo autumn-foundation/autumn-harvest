@@ -1213,11 +1213,12 @@ impl HarvestApiState {
         let pool = self.storage_pool()?;
         let runtime = self.runtime()?;
         let urls = self.workflow_result_notification_database_urls()?;
-        Ok(WorkflowHandleClient::new(
-            pool.sharded_pool().clone(),
-            runtime.router().clone(),
-            urls,
-        ))
+        Ok(
+            WorkflowHandleClient::new(pool.sharded_pool().clone(), runtime.router().clone(), urls)
+                // Issue #684: wire the engine recorder so the in-process typed-update
+                // path emits harvest.update.admitted.
+                .with_metrics(runtime.registry.telemetry().metrics.clone()),
+        )
     }
 
     /// Extract the actor identity from request headers using the configured

@@ -816,7 +816,10 @@ async fn start_harvest_runtime(
     .with_query_timeout(query_timeout)
     .with_history_policy(runner.api_runtime().registry().history_policy())
     .with_default_debounce_max_wait(default_debounce_max_wait)
-    .with_max_workflow_attempts(max_workflow_attempts);
+    .with_max_workflow_attempts(max_workflow_attempts)
+    // Issue #684: wire the engine recorder so the in-process typed-update path
+    // emits harvest.update.admitted, matching the HTTP/UI admission paths.
+    .with_metrics(runner.api_runtime().registry().telemetry().metrics.clone());
     state.insert_extension(harvest_db_pool.clone());
     state.insert_extension(runner.api_runtime().registry().clone());
 

@@ -2058,7 +2058,7 @@ async fn pause_defers_timer_then_resume_fires_and_replays_deterministically() {
         .collect();
     let outcome = run_workflow(exec_id, replay_history, timer_wf, Value::Null).await;
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(
                 output,
                 serde_json::json!("done"),

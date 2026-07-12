@@ -241,7 +241,7 @@ impl WorkflowSimulator {
             .await;
 
             match outcome {
-                WorkflowOutcome::Completed { output } => {
+                WorkflowOutcome::Completed { output, .. } => {
                     // Cancellable/renewable timer bookkeeping (issue #768): a
                     // workflow that arms/cancels a timer and then COMPLETES in the
                     // same task emits `ArmTimer`/`CancelTimer` as pending commands

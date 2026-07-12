@@ -662,16 +662,26 @@ pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
 /// claimed it by the time the run reached a **Completed or Failed** terminal
 /// outcome via the worker drive.
 ///
-/// Emitted from the executor's terminal arms, where the driven matcher's
-/// authoritative consumed-set exists. Signals excused by a lost
+/// The consumed-set is computed in the executor's terminal arms (the only place
+/// the driven matcher exists) and **carried out on the terminal
+/// [`WorkflowOutcome`](crate::executor::WorkflowOutcome)**; the **worker** emits
+/// this counter from that map at the same site and under the same suppressions
+/// as [`METRIC_WORKFLOW_TERMINAL`] (issue #519) — downstream of the issue #603
+/// ND-block gate and the fast-path pause discard, so an ND-blocked or
+/// paused-then-discarded cycle never over-counts. Signals excused by a lost
 /// signal-or-deadline race (issue #476) are never counted. Labeled by
 /// `workflow`, `name`, and `queue`.
 ///
-/// **Coverage scope (deliberate):** Cancel / Terminate / Execution-timeout /
-/// Parent-close terminal paths have no driven matcher and are structurally
-/// out of scope — a force-killed run's "unhandled signals" is not a
-/// graceful-completion SLO signal. `execution.id` is span-only per
-/// ADR-0001 §7.
+/// **Coverage scope — KNOWN LIMITATION (deliberate):** this counts undrained
+/// signals **only** for a run that reaches a *graceful* terminal
+/// (`Completed`/`Failed` via its own logic). **`TIMED_OUT`, `CANCELLED`,
+/// `TERMINATED`, and parent-close-cascade runs with an undrained signal are NOT
+/// counted** — those terminal transitions are driven by a scanner / operator,
+/// not a workflow drive, so no matcher exists to reconstruct the consumed-set,
+/// and a partial/inaccurate count on a watched SLO metric is worse than none.
+/// This notably **excludes the "stuck workflow that ignored a signal and then
+/// timed out"** case: for that, watch [`METRIC_WORKFLOW_TIMEOUT`] plus the
+/// per-workflow stack API instead. `execution.id` is span-only per ADR-0001 §7.
 pub const METRIC_SIGNAL_UNHANDLED: &str = "harvest.signal.unhandled";
 
 /// Counter: a workflow update was durably admitted (`UpdateAdmitted` appended)

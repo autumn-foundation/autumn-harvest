@@ -149,7 +149,7 @@ async fn replay_two_sequential_activities() {
     let outcome = run_workflow(exec_id, history, two_activity_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(
                 output,
                 serde_json::json!({"first": "result_1", "second": "result_2"})
@@ -225,7 +225,7 @@ async fn version_gate_routes_code_paths_with_marker() {
     let outcome = run_workflow(exec_id, history, versioned_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output, serde_json::json!({"version": 2}));
         }
         other => panic!("expected Completed with version 2, got {other:?}"),
@@ -249,7 +249,7 @@ async fn version_gate_new_execution_returns_max() {
     let outcome = run_workflow(exec_id, history, versioned_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             // max_version = 3 for our versioned_workflow
             assert_eq!(output, serde_json::json!({"version": 3}));
         }
@@ -431,7 +431,7 @@ async fn local_activity_completes_from_full_history() {
     let outcome = run_workflow(exec_id, history, mixed_local_regular_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output["formatted"], local_out);
             assert_eq!(output["sent"], regular_out);
         }
@@ -510,7 +510,7 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
     let outcome = run_workflow(exec_id, history, all_local_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output["first"], out1);
             assert_eq!(output["second"], out2);
         }
@@ -567,7 +567,7 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
     let outcome = run_workflow(exec_id, history, all_local_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output["first"], final_out);
         }
         other => panic!("expected Completed, got {other:?}"),
@@ -712,7 +712,7 @@ async fn replay_await_condition_happy_path_completes_when_predicate_met() {
     let outcome = run_workflow(exec_id, history, await_condition_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output, serde_json::json!({"done": true}));
         }
         other => panic!("expected Completed when predicate is met, got {other:?}"),
@@ -778,7 +778,7 @@ async fn replay_await_condition_timeout_resolves_true_if_condition_met() {
     .await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output, serde_json::json!({"met": true}));
         }
         other => panic!("expected Completed(true), got {other:?}"),
@@ -816,7 +816,7 @@ async fn replay_await_condition_timeout_resolves_false_if_timer_fires_first() {
     .await;
 
     match outcome {
-        WorkflowOutcome::Completed { output } => {
+        WorkflowOutcome::Completed { output, .. } => {
             assert_eq!(output, serde_json::json!({"met": false}));
         }
         other => panic!("expected Completed(false), got {other:?}"),

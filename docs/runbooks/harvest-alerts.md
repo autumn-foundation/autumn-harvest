@@ -1104,10 +1104,24 @@ being blocked.
 signal a workflow left unconsumed (no `wait_for_signal`/`receive_signal`, no
 push handler) by the time it reached a **Completed or Failed** terminal
 outcome. The `workflow` + `name` labels name the workflow type and the
-signal. Coverage is scoped to the graceful-terminal SLO: cancel / terminate /
-execution-timeout / parent-close outcomes have no driven matcher and are
-structurally out of scope. Signals excused by a lost signal-or-deadline race
-(issue #476) are never counted.
+signal. Signals excused by a lost signal-or-deadline race (issue #476) are
+never counted.
+
+> **Known scope limitation — read this before trusting a *low* number.** This
+> counter fires **only** for runs that reach a **graceful** terminal
+> (`Completed`/`Failed` via their own logic). Runs that are **`TIMED_OUT`,
+> `CANCELLED`, `TERMINATED`, or closed by a parent-close cascade** are driven
+> to termination by a scanner/operator, not a workflow drive, so there is no
+> matcher to reconstruct which signals were consumed — those runs' undrained
+> signals are **NOT counted here**. In particular this **excludes the
+> motivating "stuck workflow that ignored a signal and then timed out" case**:
+> to catch a run that is wedged past its deadline, watch the
+> `harvest.workflow.timeout` counter and inspect the run with
+> `GET /api/harvest/workflows/{execution_id}/stack` (which shows what it is
+> blocked on and any pending, never-consumed signals). A low
+> `harvest.signal.unhandled` rate does **not** imply "no signals are being
+> dropped" — only "no signals are being dropped on runs that finished
+> gracefully."
 
 ### Triage steps
 
