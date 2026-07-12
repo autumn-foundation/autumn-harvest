@@ -14648,6 +14648,116 @@ mod tests {
         );
     }
 
+    /// #779 Codex P1: the post-fix recorded order for an over-deadline child
+    /// **completion** is `[TimerFired, ChildWorkflowCompleted(loser)]` (the wake
+    /// path now orders the due deadline ahead of the out-of-band child terminal
+    /// via `materialize_due_child_timeout_deadlines`). Recorded-order matching
+    /// must therefore resolve the race to `None` (deadline won) and consume the
+    /// loser completion — NOT return `Some`. Asserted deterministic across
+    /// several independent replay cycles.
+    #[tokio::test]
+    async fn child_timeout_replay_timer_won_over_deadline_completion_loser_is_none() {
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 2,
+            },
+            // Deadline fired first (parent claimed late), THEN the over-deadline
+            // child completion landed as the loser terminal.
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+
+        for cycle in 0..3 {
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events.clone());
+            let result = ctx
+                .spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"id": 42}),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .expect("replay resolves");
+            assert_eq!(
+                result, None,
+                "cycle {cycle}: deadline recorded before the over-deadline child \
+                 completion → the deadline must win (None), not the child (Some)"
+            );
+            // The loser child completion is already sealed in history, so the
+            // `child_already_terminal` gate suppresses CancelRaceLosers.
+            assert!(
+                ctx.drain_commands().is_empty(),
+                "cycle {cycle}: an already-sealed loser completion must push no CancelRaceLosers"
+            );
+        }
+    }
+
+    /// #779 Codex P1 failure twin: the post-fix recorded order for an
+    /// over-deadline child **failure** is `[TimerFired, ChildWorkflowFailed(loser)]`,
+    /// which must resolve to `None` — NOT surface the child's `Err`. This proves
+    /// `wake_parent_for_child_failure` received the same deadline-ordering fix.
+    #[tokio::test]
+    async fn child_timeout_replay_timer_won_over_deadline_failure_loser_is_none() {
+        let child_id = ExecutionId::new();
+        let timer_id = TimerId::new("__child_timeout:1:process_order");
+        let events = vec![
+            child_timeout_started_event(),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 2,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "downstream 503".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+
+        for cycle in 0..3 {
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events.clone());
+            let result = ctx
+                .spawn_child_workflow_timeout(
+                    "process_order",
+                    serde_json::json!({"id": 42}),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .expect("replay resolves to None, not the child's Err");
+            assert_eq!(
+                result, None,
+                "cycle {cycle}: deadline recorded before the over-deadline child \
+                 failure → the deadline must win (None), not surface the child Err"
+            );
+            assert!(
+                ctx.drain_commands().is_empty(),
+                "cycle {cycle}: an already-sealed loser failure must push no CancelRaceLosers"
+            );
+        }
+    }
+
     /// Replay with the child FAILED before the deadline: surfaces a typed
     /// `HarvestError::WorkflowFailed` carrying `error_type`/`details`/`non_retryable`
     /// (issue #767 parity with `spawn_child_workflow_raw`).

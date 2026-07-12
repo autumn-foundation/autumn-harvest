@@ -5769,12 +5769,110 @@ async fn finalize_activity_failure(
     .await
 }
 
-async fn wake_parent_for_child_completion(
+/// Materialize any DUE `__child_timeout:` deadline timers into the parent's
+/// history as `TimerFired` events **before** an out-of-band child terminal is
+/// appended (issue #779, Codex P1).
+///
+/// A child that completes/fails **after** its `spawn_child_workflow_timeout`
+/// deadline has passed appends its terminal to the parent history out-of-band
+/// (via [`wake_parent_for_child_completion`] / [`wake_parent_for_child_failure`]).
+/// If the parent is claimed late, that terminal would land in history *before*
+/// the deadline `TimerFired` (which is otherwise only ingested at parent claim,
+/// see [`ingest_due_timers_and_signals`]). [`crate::replay::HistoryMatcher::match_child_or_timer`]
+/// is a pure recorded-order matcher, so it would then declare the child the
+/// winner and the primitive would return `Some`/`Err` instead of `None` —
+/// violating the "deadline reached ⇒ `None`" contract even though the deadline
+/// genuinely elapsed first. Ordering the due deadline **before** the child
+/// terminal restores the #476 signal-or-deadline guarantee for the child case:
+/// a deadline that has passed is observed by every replay regardless of when the
+/// parent is claimed.
+///
+/// Correlation to the completing child is deliberately **not** required:
+/// materializing every currently-due `__child_timeout` deadline before the
+/// child terminal is correct — this child's own due deadline lands before its
+/// terminal (⇒ `None`), and any unrelated sibling race's due deadline that
+/// lands early is simply resolved by that race's own `match_child_or_timer`
+/// scan. Scope is strictly `__child_timeout:` so unrelated `ctx.timer()` rows
+/// are never pulled forward or reordered.
+///
+/// Double-fire safety vs the parent-claim ingest: the due rows are selected
+/// `FOR UPDATE`, so `fired = false` is re-evaluated against the latest
+/// committed row version (Postgres EvalPlanQual). A deadline the ingest path
+/// already fired-and-committed is therefore excluded here, and a deadline this
+/// path fires blocks the ingest's `SET fired = true` until the enclosing wake
+/// transaction commits — so the two paths cannot durably append two
+/// `TimerFired` events for the same timer. When no `__child_timeout` deadline
+/// is due (a plain child-await, or a child that beat its deadline), this
+/// returns `0` and appends nothing — byte-identical to the pre-#779 wake path.
+#[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+pub async fn materialize_due_child_timeout_deadlines(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_timers::dsl;
+    use diesel::TextExpressionMethods;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Timestamptz;
+
+    // Lock + read the parent's DUE child-timeout deadline timers. `FOR UPDATE`
+    // makes the `fired = false` predicate exactly-once against the parent-claim
+    // ingest (see the double-fire note above). The `\_\_child\_timeout:%`
+    // pattern escapes the underscores (default Postgres LIKE escape char) so it
+    // matches the literal `__child_timeout:` prefix and never a sibling prefix
+    // such as `__signal_timeout:`. Database `NOW()` is used to stay consistent
+    // with the ingest/claim clock.
+    let due: Vec<HarvestTimer> = dsl::harvest_timers
+        .filter(dsl::workflow_exec_id.eq(parent_exec_id.as_uuid()))
+        .filter(dsl::fired.eq(false))
+        .filter(dsl::timer_id.like(r"\_\_child\_timeout:%"))
+        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
+        .order(dsl::fires_at.asc())
+        .for_update()
+        .select(HarvestTimer::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if due.is_empty() {
+        return Ok(0);
+    }
+
+    let count = due.len();
+    for timer in due {
+        let timer_row_id = timer.id;
+        // Append `TimerFired` under the same parent-row FOR UPDATE + MAX(event_id)
+        // discipline the child-terminal append uses, so the deadline is ordered
+        // chronologically ahead of the child terminal appended after this call.
+        store::append_single_event(
+            conn,
+            parent_exec_id,
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer.timer_id),
+            },
+        )
+        .await?;
+        diesel::update(dsl::harvest_timers.filter(dsl::id.eq(timer_row_id)))
+            .set(dsl::fired.eq(true))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    Ok(count)
+}
+
+#[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+pub async fn wake_parent_for_child_completion(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    // #779 (Codex P1): order any DUE child-timeout deadline BEFORE the child
+    // terminal so the pure recorded-order `match_child_or_timer` sees the
+    // `TimerFired` first and resolves to the timeout branch (None) even when the
+    // parent is claimed late (see materialize_due_child_timeout_deadlines).
+    materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
     // Use append_single_event (FOR UPDATE + MAX re-read) so concurrent sibling
     // child completions serialise around the parent execution row and cannot
     // collide on (workflow_exec_id, event_id).
@@ -5786,12 +5884,17 @@ async fn wake_parent_for_child_completion(
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
-async fn wake_parent_for_child_failure(
+#[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+pub async fn wake_parent_for_child_failure(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // #779 (Codex P1): order any DUE child-timeout deadline BEFORE the child
+    // terminal (mirrors wake_parent_for_child_completion) so an over-deadline
+    // child FAILURE resolves to None, not Err.
+    materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
     // Decode the typed failure envelope (issue #767) so the parent's
     // `ChildWorkflowFailed` event carries the child's `error_type`/`details`/
     // `non_retryable`. The two seal-path callers pass engine reason strings,

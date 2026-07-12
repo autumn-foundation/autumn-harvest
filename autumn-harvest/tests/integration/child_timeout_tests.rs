@@ -21,10 +21,11 @@ use std::sync::Arc;
 use autumn_harvest::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::WorkflowInfo;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, TimerId};
 use autumn_harvest::worker::HandlerRegistry;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 use serde_json::Value;
 
 use crate::integration_e2e::{
@@ -502,4 +503,280 @@ async fn child_win_tears_down_deadline_timer_no_retention_pin() {
             .map(|t| (&t.timer_id, t.fired))
             .collect::<Vec<_>>()
     );
+}
+
+// ── #779 Codex P1: over-deadline out-of-band child terminal ordering ─────────
+
+const RACE_TIMER_ID: &str = "__child_timeout:1:timeout_child";
+
+/// Build a parent parked on a child-timeout race whose deadline is ALREADY in
+/// the past, WITHOUT the deadline having been ingested yet (the parent was not
+/// claimed at its deadline). Returns `(parent_exec_id, child_exec_id)`.
+///
+/// History prefix: `WorkflowStarted, ChildWorkflowStarted, TimerStarted(deadline)`
+/// matching a first `spawn_child_workflow_timeout("timeout_child", .., 2s)` call
+/// (seq 1 → `__child_timeout:1:timeout_child`). A matching `harvest_timers` row
+/// is inserted OVERDUE (`fires_at = NOW() - 2s`, `fired = false`) — the exact
+/// state a child completing/failing after its deadline races against.
+async fn setup_parent_racing_overdue_child(
+    conn: &mut AsyncPgConnection,
+) -> (ExecutionId, ExecutionId) {
+    let parent_exec_id = insert_workflow_execution(conn).await;
+    let child_exec_id = ExecutionId::new();
+
+    let started_prefix = vec![
+        WorkflowEvent::workflow_started(serde_json::json!({"id": 1}), chrono::Utc::now()),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child_exec_id,
+            workflow_name: "timeout_child".into(),
+            input: serde_json::json!({"id": 1}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new(RACE_TIMER_ID),
+            duration_secs: 2,
+        },
+    ];
+    autumn_harvest::store::append_events(conn, parent_exec_id, &started_prefix, 0)
+        .await
+        .expect("append parent started prefix");
+
+    let overdue = autumn_harvest::models::NewHarvestTimer {
+        workflow_exec_id: parent_exec_id.as_uuid(),
+        timer_id: RACE_TIMER_ID,
+        fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+    };
+    diesel::insert_into(autumn_harvest::schema::harvest_timers::table)
+        .values(&overdue)
+        .execute(conn)
+        .await
+        .expect("insert overdue deadline timer");
+
+    (parent_exec_id, child_exec_id)
+}
+
+/// Replay the child-timeout primitive over a loaded parent history and return
+/// its outcome. Uses the exact call shape the parent workflow made: same
+/// workflow name, input, and (implied) 2s deadline → `__child_timeout:1:...`.
+async fn replay_child_timeout(
+    database_url: &str,
+    parent_exec_id: ExecutionId,
+) -> Result<Option<Value>, String> {
+    let history = load_history_from_url(database_url, parent_exec_id).await;
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), history.events);
+    ctx.spawn_child_workflow_timeout(
+        "timeout_child",
+        serde_json::json!({"id": 1}),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The money test: a child that COMPLETES after its deadline appends its
+/// terminal out-of-band via the REAL `wake_parent_for_child_completion`. The
+/// pre-fix bug recorded `[.., ChildWorkflowCompleted]` with the overdue
+/// deadline never materialized, so the pure recorded-order matcher returned
+/// `Some`. Post-fix, the wake path materializes the due deadline FIRST, so the
+/// recorded order is `[.., TimerFired, ChildWorkflowCompleted]` and the
+/// primitive resolves to `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_deadline_child_completion_orders_deadline_first_and_resolves_none() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let (parent_exec_id, child_exec_id) = setup_parent_racing_overdue_child(&mut conn).await;
+
+    // Drive the REAL out-of-band child-completion wake path (byte-for-byte what
+    // the worker runs when a child completes and notifies its parent).
+    autumn_harvest::worker::wake_parent_for_child_completion(
+        &mut conn,
+        parent_exec_id,
+        child_exec_id,
+        serde_json::json!({"processed": true}),
+    )
+    .await
+    .expect("wake parent for child completion");
+
+    // Post-fix recorded order: the overdue deadline TimerFired precedes the
+    // out-of-band child terminal.
+    let history = load_history_from_url(&database_url, parent_exec_id).await;
+    let tail: Vec<&WorkflowEvent> = history.events.iter().rev().take(2).collect();
+    assert!(
+        matches!(tail.as_slice(), [WorkflowEvent::ChildWorkflowCompleted { .. }, WorkflowEvent::TimerFired { timer_id }] if timer_id.as_str() == RACE_TIMER_ID),
+        "history must end with [TimerFired(deadline), ChildWorkflowCompleted]; got: {:?}",
+        history
+            .events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>()
+    );
+
+    // The overdue deadline row must be marked fired (materialized, not re-fired
+    // later by the parent-claim ingest).
+    let timers = load_timers_for_execution_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        timers
+            .iter()
+            .find(|t| t.timer_id == RACE_TIMER_ID)
+            .is_some_and(|t| t.fired),
+        "the materialized deadline timer must be marked fired: {:?}",
+        timers
+            .iter()
+            .map(|t| (&t.timer_id, t.fired))
+            .collect::<Vec<_>>()
+    );
+
+    // The primitive replays to None: the deadline (recorded first) won.
+    let outcome = replay_child_timeout(&database_url, parent_exec_id).await;
+    assert_eq!(
+        outcome,
+        Ok(None),
+        "an over-deadline child COMPLETION must resolve to None (deadline won), not Some"
+    );
+}
+
+/// Failure twin: a child that FAILS after its deadline appends its terminal via
+/// the REAL `wake_parent_for_child_failure`, which received the same
+/// deadline-ordering fix. Post-fix the recorded order is
+/// `[.., TimerFired, ChildWorkflowFailed]` → the primitive resolves to `None`,
+/// NOT the child's `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_deadline_child_failure_orders_deadline_first_and_resolves_none() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let (parent_exec_id, child_exec_id) = setup_parent_racing_overdue_child(&mut conn).await;
+
+    autumn_harvest::worker::wake_parent_for_child_failure(
+        &mut conn,
+        parent_exec_id,
+        child_exec_id,
+        "downstream 503",
+    )
+    .await
+    .expect("wake parent for child failure");
+
+    let history = load_history_from_url(&database_url, parent_exec_id).await;
+    let tail: Vec<&WorkflowEvent> = history.events.iter().rev().take(2).collect();
+    assert!(
+        matches!(tail.as_slice(), [WorkflowEvent::ChildWorkflowFailed { .. }, WorkflowEvent::TimerFired { timer_id }] if timer_id.as_str() == RACE_TIMER_ID),
+        "history must end with [TimerFired(deadline), ChildWorkflowFailed]; got: {:?}",
+        history
+            .events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>()
+    );
+
+    let outcome = replay_child_timeout(&database_url, parent_exec_id).await;
+    assert_eq!(
+        outcome,
+        Ok(None),
+        "an over-deadline child FAILURE must resolve to None (deadline won), not surface Err"
+    );
+}
+
+/// Focused helper coverage: `materialize_due_child_timeout_deadlines`
+/// (a) fires a DUE `__child_timeout` timer and appends `TimerFired`,
+/// (b) leaves a NOT-yet-due `__child_timeout` timer alone, and
+/// (c) ignores a DUE NON-`__child_timeout` timer (e.g. a plain `ctx.timer`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_timers() {
+    use autumn_harvest::schema::harvest_timers::dsl;
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        parent_exec_id,
+        &[WorkflowEvent::workflow_started(
+            serde_json::json!({}),
+            chrono::Utc::now(),
+        )],
+        0,
+    )
+    .await
+    .expect("seed WorkflowStarted");
+
+    let due_child = "__child_timeout:1:timeout_child"; // (a) due child-timeout
+    let future_child = "__child_timeout:2:timeout_child"; // (b) not-yet-due child-timeout
+    let due_plain = "user_timer:reminder"; // (c) due, but not a child-timeout
+    let rows = vec![
+        autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: parent_exec_id.as_uuid(),
+            timer_id: due_child,
+            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+        },
+        autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: parent_exec_id.as_uuid(),
+            timer_id: future_child,
+            fires_at: chrono::Utc::now() + chrono::Duration::seconds(300),
+        },
+        autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: parent_exec_id.as_uuid(),
+            timer_id: due_plain,
+            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+        },
+    ];
+    diesel::insert_into(dsl::harvest_timers)
+        .values(&rows)
+        .execute(&mut conn)
+        .await
+        .expect("insert timer rows");
+
+    let fired =
+        autumn_harvest::worker::materialize_due_child_timeout_deadlines(&mut conn, parent_exec_id)
+            .await
+            .expect("materialize");
+    assert_eq!(
+        fired, 1,
+        "exactly the one DUE child-timeout deadline is fired"
+    );
+
+    // (a) the due child-timeout timer is marked fired AND a matching TimerFired
+    //     event was appended.
+    let timers = load_timers_for_execution_from_url(&database_url, parent_exec_id).await;
+    let fired_map: std::collections::HashMap<&str, bool> = timers
+        .iter()
+        .map(|t| (t.timer_id.as_str(), t.fired))
+        .collect();
+    assert_eq!(
+        fired_map.get(due_child),
+        Some(&true),
+        "(a) due child-timeout fired"
+    );
+    assert_eq!(
+        fired_map.get(future_child),
+        Some(&false),
+        "(b) not-yet-due child-timeout must be left alone"
+    );
+    assert_eq!(
+        fired_map.get(due_plain),
+        Some(&false),
+        "(c) a due non-child-timeout timer must be ignored"
+    );
+
+    let history = load_history_from_url(&database_url, parent_exec_id).await;
+    let fired_events: Vec<&TimerId> = history
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerFired { timer_id } => Some(timer_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fired_events.len(),
+        1,
+        "exactly one TimerFired appended (the due child-timeout): {fired_events:?}"
+    );
+    assert_eq!(fired_events[0].as_str(), due_child);
 }
