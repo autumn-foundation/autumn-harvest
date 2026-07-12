@@ -5476,7 +5476,20 @@ impl WorkflowContext {
                 // SINGLE mixed batch, then park on both. The worker dedupes the
                 // child row by `child_id` and the timer row by `timer_id`, so
                 // re-emitting on a re-park is safe.
-                let child_id = recorded_child_id.unwrap_or_else(ExecutionId::new);
+                //
+                // Mint the fresh child id with the PARENT's shard (issue #779
+                // Codex P2), exactly as `spawn_child_workflow_detached_raw` does:
+                // the child row is inserted into the parent's shard database
+                // (`persist_child_timeout_race` uses the parent's `conn` and
+                // stamps the parent `shard_id`), so its `ExecutionId` must encode
+                // that shard or a later shard-aware lookup by `child_id.shard()`
+                // (an unencoded sentinel → default shard) would route to the
+                // wrong database on a non-default-shard parent. On replay the
+                // recorded id is reused verbatim (`recorded_child_id`), so
+                // pre-fix in-flight children keep their unencoded ids and replay
+                // unchanged.
+                let child_id = recorded_child_id
+                    .unwrap_or_else(|| ExecutionId::new_for_shard(self.exec_id.shard()));
                 let (child_tx, child_rx) = oneshot::channel();
                 let (timer_tx, timer_rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {

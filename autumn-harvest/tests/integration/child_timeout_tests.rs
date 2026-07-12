@@ -780,3 +780,96 @@ async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_ti
     );
     assert_eq!(fired_events[0].as_str(), due_child);
 }
+
+/// Exactly-once coordination between the two `__child_timeout` deadline-fire
+/// paths (issue #779, Codex P2-A). Since the P1 fix there are two writers that
+/// can fire a due deadline: the parent-claim ingest
+/// (`ingest_due_timers_and_signals`) and the out-of-band materializer
+/// (`materialize_due_child_timeout_deadlines`). Both append `TimerFired` **and**
+/// set `fired = true` atomically in one transaction, so a second attempt for the
+/// same timer is excluded by the `fired = false` predicate — it never appends a
+/// duplicate `TimerFired`. This asserts the exclusion half of that guarantee:
+/// re-invoking the materializer over an already-fired timer returns `0` and
+/// appends nothing.
+///
+/// The complementary collision half — when a concurrent writer's `TimerFired`
+/// has not yet committed, so the second writer's stale-`start_id` append lands
+/// on the same `event_id` — is enforced by the `UNIQUE(workflow_exec_id,
+/// event_id)` constraint (`harvest_events`), which aborts the racing append. A
+/// durable duplicate `TimerFired` is therefore impossible without any
+/// compare-and-set on the shared ingest path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_timerfired() {
+    use autumn_harvest::schema::harvest_timers::dsl;
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        parent_exec_id,
+        &[WorkflowEvent::workflow_started(
+            serde_json::json!({}),
+            chrono::Utc::now(),
+        )],
+        0,
+    )
+    .await
+    .expect("seed WorkflowStarted");
+
+    let due_child = "__child_timeout:1:timeout_child";
+    diesel::insert_into(dsl::harvest_timers)
+        .values(&autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: parent_exec_id.as_uuid(),
+            timer_id: due_child,
+            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert due child-timeout timer");
+
+    // First fire: the due deadline is materialized once.
+    let first =
+        autumn_harvest::worker::materialize_due_child_timeout_deadlines(&mut conn, parent_exec_id)
+            .await
+            .expect("first materialize");
+    assert_eq!(first, 1, "the due child-timeout deadline fires once");
+
+    // Second fire (models a subsequent ingest or a re-run of the materializer
+    // over the same, already-fired timer): the `fired = false` predicate now
+    // excludes it, so nothing is fired and nothing is appended.
+    let second =
+        autumn_harvest::worker::materialize_due_child_timeout_deadlines(&mut conn, parent_exec_id)
+            .await
+            .expect("second materialize");
+    assert_eq!(
+        second, 0,
+        "an already-fired deadline is excluded — no second fire"
+    );
+
+    // Durable state: exactly ONE TimerFired for this timer, timer row fired.
+    let history = load_history_from_url(&database_url, parent_exec_id).await;
+    let fired_events: Vec<&TimerId> = history
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerFired { timer_id } => Some(timer_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fired_events.len(),
+        1,
+        "exactly one durable TimerFired — no duplicate: {fired_events:?}"
+    );
+    assert_eq!(fired_events[0].as_str(), due_child);
+
+    let timers = load_timers_for_execution_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        timers.iter().any(|t| t.timer_id == due_child && t.fired),
+        "the child-timeout timer row is marked fired"
+    );
+}
