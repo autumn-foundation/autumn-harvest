@@ -1,4 +1,4 @@
-## Tooling — Wire 3 previously-never-run DB test suites into CI (PR #1035, follow-up to #1031)
+## Tooling — Wire 3 previously-never-run DB test suites into CI (PR #1037, follow-up to #1031)
 
 **Tooling/testing** (implemented): PR #1031's CI-run-step coverage guard surfaced that three db-gated core integration suites — `workflow_retry_tests`, `completion_callback_tests`, `event_batch_tests` — compiled in CI but never executed against a live Postgres, hiding **5 test-harness bugs** (not production regressions: each failing test was contradicted by a *passing sibling* encoding the real production contract). This slice fixes all 5, wires the three suites into Docker-backed CI run steps, and removes them from the coverage-guard allowlist. **No product-code behavior change** — every fix corrects a test to assert a TRUE production contract already proven by a passing sibling.
 
