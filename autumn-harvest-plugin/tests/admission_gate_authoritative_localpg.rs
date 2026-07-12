@@ -1336,8 +1336,7 @@ async fn throttle_reserved_start_blocked_by_gate_refunds_token_and_counts() {
             .bind::<diesel::sql_types::Text, _>(&bucket)
             .get_result::<TokenRow>(&mut conn)
             .await
-            .map(|r| r.t)
-            .unwrap_or(10.0);
+            .map_or(10.0, |r| r.t);
     assert!(
         (tokens - 10.0).abs() < 1e-6,
         "the reserved token was refunded on the block (tokens = {tokens})"
