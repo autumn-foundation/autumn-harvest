@@ -67,7 +67,7 @@ fn registry(parent: WorkflowInfo, child: WorkflowInfo) -> Arc<HandlerRegistry> {
 // ── Workflow fns ───────────────────────────────────────────────────────────
 
 /// Parent awaits a child with a 300s deadline; reports Some/None distinctly.
-fn parent_await_child<'a>(ctx: &'a WorkflowContext, input: Value) -> WfFuture<'a> {
+fn parent_await_child(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
     Box::pin(async move {
         let outcome: Option<Value> = ctx
             .spawn_child_workflow_timeout(
@@ -86,7 +86,7 @@ fn parent_await_child<'a>(ctx: &'a WorkflowContext, input: Value) -> WfFuture<'a
 
 /// Parent awaits a hanging child with a SHORT (2s) deadline so the durable
 /// timer fires in bounded wall-clock time and the child is cancelled.
-fn parent_short_deadline<'a>(ctx: &'a WorkflowContext, input: Value) -> WfFuture<'a> {
+fn parent_short_deadline(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
     Box::pin(async move {
         let outcome: Option<Value> = ctx
             .spawn_child_workflow_timeout("hanging_child", input, std::time::Duration::from_secs(2))
@@ -99,12 +99,12 @@ fn parent_short_deadline<'a>(ctx: &'a WorkflowContext, input: Value) -> WfFuture
     })
 }
 
-fn fast_child<'a>(_ctx: &'a WorkflowContext, input: Value) -> WfFuture<'a> {
+fn fast_child(_ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
     Box::pin(async move { Ok(serde_json::json!({"echo": input})) })
 }
 
 /// A child that hangs forever waiting for a signal that never arrives.
-fn hanging_child<'a>(ctx: &'a WorkflowContext, _input: Value) -> WfFuture<'a> {
+fn hanging_child(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     Box::pin(async move {
         let _ = ctx
             .wait_for_signal("never")
@@ -114,7 +114,7 @@ fn hanging_child<'a>(ctx: &'a WorkflowContext, _input: Value) -> WfFuture<'a> {
     })
 }
 
-fn failing_child<'a>(_ctx: &'a WorkflowContext, _input: Value) -> WfFuture<'a> {
+fn failing_child(_ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     Box::pin(async move { Err("downstream 503".to_string()) })
 }
 

@@ -4948,7 +4948,7 @@ fn child_win_fixture() -> Vec<WorkflowEvent> {
 }
 
 /// Deadline timer fired first; the loser child was then cancelled (a synthetic
-/// ChildWorkflowFailed terminal recorded after the fire).
+/// `ChildWorkflowFailed` terminal recorded after the fire).
 fn timer_win_fixture() -> Vec<WorkflowEvent> {
     let child_id = ExecutionId::new();
     let timer_id = TimerId::new("__child_timeout:1:process_order");

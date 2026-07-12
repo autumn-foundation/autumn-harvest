@@ -1,4 +1,9 @@
 #![cfg(feature = "db")]
+// Harness helpers are `pub(crate)` so sibling integration test modules (issue
+// #779's child_timeout_tests) can reuse the container/worker setup. The
+// `redundant_pub_crate` nursery lint flags that pattern; the cross-module reuse
+// is intentional.
+#![allow(clippy::redundant_pub_crate)]
 
 //! End-to-end integration tests using testcontainers for a real Postgres instance.
 //!

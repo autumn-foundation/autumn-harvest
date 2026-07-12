@@ -217,6 +217,9 @@ pub enum SignalOrTimerMatch {
 /// resolution event that appears **first in recorded history**, so the outcome
 /// is deterministic across replays regardless of wall-clock timing on the
 /// replaying worker.
+// `serde_json::Value` fields (`output`, `details`) are `PartialEq` but not `Eq`,
+// so `Eq` cannot be derived; silence the false-positive lint suggestion.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChildOrTimerMatch {
     /// The child workflow completed before the deadline timer fired. Carries the

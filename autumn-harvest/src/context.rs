@@ -5300,6 +5300,12 @@ impl WorkflowContext {
     /// deadline, [`HarvestError::PayloadTooLarge`] if the child input exceeds
     /// the configured cap, or [`HarvestError::NonDeterministic`] on replay
     /// divergence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `child_timeout_seq` mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::single_match_else)]
     pub async fn spawn_child_workflow_timeout(
         &self,
         workflow_name: &str,
@@ -14548,7 +14554,7 @@ mod tests {
 
     /// Replay with the deadline timer fired AND the loser child already sealed
     /// (its synthetic terminal recorded): resolves to `Ok(None)` and pushes NO
-    /// CancelRaceLosers — the child_already_terminal gate suppresses the
+    /// `CancelRaceLosers` — the `child_already_terminal` gate suppresses the
     /// bookkeeping command (avoids a spurious command in strict replay).
     #[tokio::test]
     async fn child_timeout_replay_timer_won_child_sealed_pushes_no_cancel() {
@@ -14594,8 +14600,8 @@ mod tests {
     }
 
     /// Replay with the child FAILED before the deadline: surfaces a typed
-    /// `HarvestError::WorkflowFailed` carrying error_type/details/non_retryable
-    /// (issue #767 parity with spawn_child_workflow_raw).
+    /// `HarvestError::WorkflowFailed` carrying `error_type`/`details`/`non_retryable`
+    /// (issue #767 parity with `spawn_child_workflow_raw`).
     #[tokio::test]
     async fn child_timeout_replay_child_failed_surfaces_typed_error() {
         let child_id = ExecutionId::new();
