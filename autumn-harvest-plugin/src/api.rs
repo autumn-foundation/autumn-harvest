@@ -17278,8 +17278,9 @@ async fn list_schedules(
 
     // Best-effort: load the most recent backfill log row for each schedule.
     let recent_backfills = load_recent_backfills(&api_state, &schedule_ids).await;
-    // At-capacity suppression for the overdue field (issue #696 §2).
-    let running = load_running_counts_across_shards(&api_state).await;
+    // Shard-local at-capacity suppression for the overdue field (issue #696 §2),
+    // keyed by schedule id so the read agrees with the gauge and the tick.
+    let at_capacity = load_schedule_at_capacity_by_shard(&api_state).await;
 
     let entries: Vec<ScheduleEntry> = schedules
         .into_iter()
@@ -17288,13 +17289,8 @@ async fn list_schedules(
                 .get(&s.id)
                 .cloned()
                 .map(BackfillSummary::from);
-            let name = s
-                .dag_name
-                .as_deref()
-                .or(s.workflow_name.as_deref())
-                .unwrap_or("");
-            let at_capacity = schedule_at_capacity(&running, name, s.max_active_runs);
-            schedule_entry_from_row(s, last_backfill, at_capacity)
+            let cap = at_capacity.get(&s.id).copied().unwrap_or(false);
+            schedule_entry_from_row(s, last_backfill, cap)
         })
         .collect();
     fanout_list_json("schedules", entries, status, &unavailable_shards)
@@ -17344,6 +17340,9 @@ async fn get_schedule(
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     let mut found: Option<HarvestSchedule> = None;
+    // Computed shard-locally on the schedule's OWN shard (issue #696 §2), so the
+    // read agrees with the gauge and the tick — never a cross-shard sum.
+    let mut at_capacity = false;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let row: Option<HarvestSchedule> = dsl::harvest_schedules
@@ -17354,7 +17353,17 @@ async fn get_schedule(
             .optional()
             .map_err(database_error)
             .map_err(map_error)?;
-        if row.is_some() {
+        if let Some(sched) = &row {
+            let name = sched
+                .dag_name
+                .as_deref()
+                .or(sched.workflow_name.as_deref())
+                .unwrap_or("");
+            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
+            at_capacity = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name)
+                .await
+                .map(|basis| basis >= i64::from(sched.max_active_runs))
+                .unwrap_or(false);
             found = row;
             break;
         }
@@ -17366,15 +17375,6 @@ async fn get_schedule(
         .await
         .remove(&s.id)
         .map(BackfillSummary::from);
-
-    // At-capacity suppression for the overdue field (issue #696 §2).
-    let running = load_running_counts_across_shards(&api_state).await;
-    let name = s
-        .dag_name
-        .as_deref()
-        .or(s.workflow_name.as_deref())
-        .unwrap_or("");
-    let at_capacity = schedule_at_capacity(&running, name, s.max_active_runs);
 
     Ok(Json(schedule_entry_from_row(s, last_backfill, at_capacity)))
 }
@@ -18254,54 +18254,58 @@ fn schedule_entry_from_row(
     }
 }
 
-/// Load a cross-shard-summed running-count map (`workflow_name` → count of
-/// `RUNNING`/`PAUSED` executions) for the overdue read's at-capacity check
-/// (issue #696 §2). A schedule at/over `max_active_runs` deliberately defers
-/// (the tick holds `next_run_at` in the past), so it is never reported overdue.
+/// Build a per-schedule `at_capacity` map (keyed by schedule id) for the overdue
+/// read's §2 suppression, computed **shard-locally** so the read agrees with the
+/// gauge and the tick (issue #696 review BLOCKER 1+2).
 ///
-/// Summed across shards rather than shard-local: this is a conservative
-/// over-suppression that guarantees no read false-positive. In single-shard
-/// deployments (the common case) it equals the shard-local count the gauge
-/// sampler and the tick use, so the read and the gauge agree exactly. A DAG
-/// schedule's executions carry `workflow_name == dag_name`, so one grouped
-/// query per shard covers both kinds. An unreachable shard is skipped (its
-/// running counts are simply absent from the map, which only ever reduces
-/// suppression — never a false negative on the wedge signal).
-async fn load_running_counts_across_shards(
+/// A schedule row lives on exactly one shard, and the scheduler tick enforces
+/// `max_active_runs` shard-locally: it holds `next_run_at` in the past only when
+/// the schedule's OWN shard count reaches capacity. Summing across shards (the
+/// prior approach) over-suppressed and could hide a genuine wedge on the
+/// schedule's own shard behind unrelated same-named executions elsewhere, so the
+/// read disagreed with the alert-source gauge. Here each schedule's `at_capacity`
+/// is computed against the tick's exact basis
+/// (`scheduler::schedule_running_basis` = shard-local `RUNNING`/`PAUSED` count +
+/// #607 pending-throttle backlog) on the connection to its own shard. Iterating
+/// `iter_shards()` and reading each shard's OWN schedule rows keys the result by
+/// schedule id with no cross-shard divergence. An unreachable shard is skipped
+/// (its schedules are simply absent → `unwrap_or(false)` at the read = not
+/// at-capacity = the wedge signal is preserved, never falsely suppressed).
+async fn load_schedule_at_capacity_by_shard(
     api_state: &HarvestApiState,
-) -> std::collections::HashMap<String, i64> {
-    use autumn_harvest::schema::harvest_workflow_executions::dsl as ex;
-    let mut totals: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+) -> std::collections::HashMap<uuid::Uuid, bool> {
+    let mut at_capacity: std::collections::HashMap<uuid::Uuid, bool> =
+        std::collections::HashMap::new();
     let Ok(pool) = api_state.storage_pool() else {
-        return totals;
+        return at_capacity;
     };
     for (_shard, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        let rows: Result<Vec<(String, i64)>, _> = ex::harvest_workflow_executions
-            .filter(ex::state.eq_any(["RUNNING", "PAUSED"]))
-            .group_by(ex::workflow_name)
-            .select((ex::workflow_name, diesel::dsl::count_star()))
+        let schedules: Result<Vec<HarvestSchedule>, _> = harvest_schedules::table
+            .select(HarvestSchedule::as_select())
             .load(&mut conn)
             .await;
-        if let Ok(rows) = rows {
-            for (name, count) in rows {
-                *totals.entry(name).or_insert(0) += count;
-            }
+        let Ok(schedules) = schedules else {
+            continue;
+        };
+        for s in schedules {
+            let name = s
+                .dag_name
+                .as_deref()
+                .or(s.workflow_name.as_deref())
+                .unwrap_or("");
+            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
+            let cap = match autumn_harvest::scheduler::schedule_running_basis(&mut conn, name).await
+            {
+                Ok(basis) => basis >= i64::from(s.max_active_runs),
+                Err(_) => false, // count failed → don't suppress the wedge signal
+            };
+            at_capacity.insert(s.id, cap);
         }
     }
-    totals
-}
-
-/// True when `name` has >= `max_active_runs` executions running/paused (issue
-/// #696 §2). Absent from the map => 0 => never at capacity.
-fn schedule_at_capacity(
-    running: &std::collections::HashMap<String, i64>,
-    name: &str,
-    max_active_runs: i32,
-) -> bool {
-    running.get(name).copied().unwrap_or(0) >= i64::from(max_active_runs)
+    at_capacity
 }
 
 /// `PATCH /admin/schedules/{id}` — partial in-place update of an existing
@@ -18655,14 +18659,14 @@ async fn update_schedule_handler(
                 .remove(&row.id)
                 .map(BackfillSummary::from);
             // A non-cadence patch preserves `next_run_at`, so the row may still
-            // be overdue; compute at-capacity so the field is accurate (#696).
-            let running = load_running_counts_across_shards(&api_state).await;
-            let name = row
-                .dag_name
-                .as_deref()
-                .or(row.workflow_name.as_deref())
-                .unwrap_or("");
-            let at_capacity = schedule_at_capacity(&running, name, row.max_active_runs);
+            // be overdue; compute at-capacity (shard-local, #696 §2) so the field
+            // is accurate. Keyed by id from the same shard-local pass the read
+            // uses, so it agrees with the gauge.
+            let at_capacity = load_schedule_at_capacity_by_shard(&api_state)
+                .await
+                .get(&row.id)
+                .copied()
+                .unwrap_or(false);
             Ok(Json(schedule_entry_from_row(
                 *row,
                 last_backfill,

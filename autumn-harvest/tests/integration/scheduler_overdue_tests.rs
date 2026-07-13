@@ -96,6 +96,7 @@ async fn scrub(conn: &mut AsyncPgConnection) {
     for stmt in [
         "DELETE FROM harvest_schedules",
         "DELETE FROM harvest_workflow_executions",
+        "DELETE FROM harvest_start_throttle",
     ] {
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
     }
@@ -138,13 +139,26 @@ async fn insert_schedule(
 }
 
 /// Insert one RUNNING execution row for `wf_name` (drives the at-capacity guard).
+/// The `workflow_id` is unique per call so multiple RUNNING rows for the same
+/// workflow name do not collide on the active-uniqueness index.
 async fn insert_running_execution(conn: &mut AsyncPgConnection, wf_name: &str) {
     let sql = format!(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, started_at, created_at) \
-         VALUES (gen_random_uuid(), '{wf_name}', '{wf_name}-run', gen_random_uuid(), 0, 'RUNNING', '{{}}'::jsonb, 'default', now(), now())"
+         VALUES (gen_random_uuid(), '{wf_name}', '{wf_name}-' || gen_random_uuid()::text, gen_random_uuid(), 0, 'RUNNING', '{{}}'::jsonb, 'default', now(), now())"
     );
     conn.batch_execute(&sql).await.expect("insert execution");
+}
+
+/// Insert one pending #607 start-throttle row for `wf_name` (drives the
+/// throttle-aware at-capacity guard, matching the tick's basis).
+async fn insert_pending_throttle(conn: &mut AsyncPgConnection, wf_name: &str) {
+    let sql = format!(
+        "INSERT INTO harvest_start_throttle \
+         (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, input, start_options, deferred_at, shard_id, created_at) \
+         VALUES (gen_random_uuid(), '{wf_name}', '', 'start-throttle:{wf_name}:', '{wf_name}-wid', 'default', '{{}}'::jsonb, '{{}}'::jsonb, now(), 0, now())"
+    );
+    conn.batch_execute(&sql).await.expect("insert throttle row");
 }
 
 // ── Unit markers ─────────────────────────────────────────────────────────────
@@ -298,5 +312,78 @@ async fn overdue_schedule_samples_reports_lag() {
     assert!(
         (299..=301).contains(&by),
         "overdue_by_secs should be ~300 (now - next_run_at), got {by}"
+    );
+}
+
+/// AC6 "backfill" term: a HEALTHY schedule (fresh `next_run_at`) with an
+/// in-progress backfill (#337 creates independent RUNNING executions carrying
+/// the schedule's `workflow_name`, and never touches the live `next_run_at`)
+/// reports `overdue: false`. Backfill runs can only inflate the running basis
+/// (pushing toward suppression), never cause a false positive.
+#[tokio::test]
+async fn backfill_in_progress_does_not_flag_overdue() {
+    let (mut conn, _c) = setup_db().await;
+    let now = Utc::now();
+    // Healthy: just fired, within grace. next_run_at is NOT touched by backfill.
+    insert_schedule(
+        &mut conn,
+        "backfill_wf",
+        "interval:60",
+        now - chrono::Duration::seconds(10),
+        false,
+        None,
+        10,
+    )
+    .await;
+    // Three independent backfill-created executions RUNNING for the same name.
+    for _ in 0..3 {
+        insert_running_execution(&mut conn, "backfill_wf").await;
+    }
+
+    let metrics = RecordingMetrics::default();
+    sample_overdue_schedules(&mut conn, now, &metrics)
+        .await
+        .expect("sampler pass");
+
+    assert_eq!(
+        metrics.overdue_for("workflow", "backfill_wf"),
+        Some(false),
+        "a healthy schedule with an in-progress backfill must not be overdue"
+    );
+}
+
+/// BLOCKER 1: the at-capacity basis includes the #607 pending-throttle count,
+/// exactly as the scheduler tick does. A schedule with 0 RUNNING executions but
+/// a pending throttled fire that pushes it to `max_active_runs` (the tick then
+/// deliberately holds `next_run_at` in the past under Skip+catchup) must NOT be
+/// reported overdue — otherwise a throttled schedule pages spuriously.
+#[tokio::test]
+async fn throttle_pending_at_capacity_is_not_overdue() {
+    let (mut conn, _c) = setup_db().await;
+    let now = Utc::now();
+    // Stale next_run_at that WOULD be overdue if the schedule were free.
+    insert_schedule(
+        &mut conn,
+        "throttled_wf",
+        "interval:60",
+        now - chrono::Duration::seconds(5000),
+        false,
+        None,
+        1, // max_active_runs = 1
+    )
+    .await;
+    // 0 RUNNING/PAUSED executions, but 1 pending throttle row => running basis
+    // = 0 + 1 = 1 >= max_active_runs(1) => at capacity (matches the tick).
+    insert_pending_throttle(&mut conn, "throttled_wf").await;
+
+    let metrics = RecordingMetrics::default();
+    sample_overdue_schedules(&mut conn, now, &metrics)
+        .await
+        .expect("sampler pass");
+
+    assert_eq!(
+        metrics.overdue_for("workflow", "throttled_wf"),
+        Some(false),
+        "a throttle-deferred schedule at capacity must not be reported overdue"
     );
 }

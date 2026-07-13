@@ -80,6 +80,14 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Minimum sampling cadence for the overdue-schedule gauge (issue #696).
+///
+/// The overdue signal changes on minute-scale cadence grace, so sampling it at
+/// the sub-second `poll_interval` (which runs an unindexed RUNNING/PAUSED count
+/// per schedule × shards × workers) is wasteful for no benefit. The sampler
+/// runs at `max(poll_interval, SCHEDULE_OVERDUE_SAMPLE_INTERVAL)`.
+pub const SCHEDULE_OVERDUE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Validated, runtime-ready worker configuration.
 ///
 /// Built from [`WorkerConfig`] (the user-facing builder) via `From`, which
@@ -11663,6 +11671,13 @@ fn spawn_schedule_overdue_sampler(
             }
 
             let now = chrono::Utc::now();
+            // Aggregate verdicts across ALL shard pools into one (kind, name) map
+            // (overdue if any shard's same-named schedule is overdue) BEFORE
+            // emitting, mirroring the queue_depth precedent. This closes the
+            // cross-shard last-write-wins masking window a per-pool `.set()`
+            // would leave if a name transiently existed on two shards.
+            let mut by_key: std::collections::BTreeMap<(String, String), bool> =
+                std::collections::BTreeMap::new();
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
@@ -11674,15 +11689,25 @@ fn spawn_schedule_overdue_sampler(
                         continue;
                     }
                 };
-                // Per-shard: a read failure only skips that shard's schedules
-                // (each schedule lives on one shard, so its gauge holds its last
-                // value rather than being zero-filled misleadingly).
-                if let Err(error) =
-                    crate::scheduler::sample_overdue_schedules(&mut conn, now, &*telemetry.metrics)
-                        .await
-                {
-                    tracing::debug!(error = %error, "schedule overdue sample failed");
+                // A read failure only skips that shard's schedules (each schedule
+                // lives on one shard, so its gauge holds its last value rather
+                // than being zero-filled misleadingly).
+                match crate::scheduler::overdue_schedule_samples(&mut conn, now).await {
+                    Ok(samples) => {
+                        for s in samples {
+                            let entry = by_key.entry((s.kind, s.name)).or_insert(false);
+                            *entry = *entry || s.overdue;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "schedule overdue sample failed");
+                    }
                 }
+            }
+            for ((kind, name), overdue) in by_key {
+                telemetry
+                    .metrics
+                    .record_schedule_overdue(&kind, &name, overdue);
             }
 
             if cancel.is_cancelled() {
@@ -13328,13 +13353,17 @@ impl Worker {
         // stalled cron is detected within one cadence grace window. Runs on the
         // worker (not the scheduler tick) and no-ops internally when metrics are
         // disabled. Uses `sampler_pools` so single-shard and multi-shard
-        // deployments both aggregate the full schedule set.
+        // deployments both aggregate the full schedule set. Sampled on a coarse
+        // cadence (>= 30s) since the overdue signal is minute-scale — never the
+        // sub-second poll_interval the busier samplers use.
         #[cfg(feature = "db")]
         let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
             sampler_pools,
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
-            self.config.poll_interval,
+            self.config
+                .poll_interval
+                .max(SCHEDULE_OVERDUE_SAMPLE_INTERVAL),
         ));
         #[cfg(not(feature = "db"))]
         let schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>> = None;

@@ -3828,7 +3828,16 @@ pub fn schedule_overdue(
     let jitter = chrono::Duration::from_std(jitter).unwrap_or_else(|_| chrono::Duration::zero());
     let tick =
         chrono::Duration::from_std(tick_interval).unwrap_or_else(|_| chrono::Duration::zero());
-    let grace = step + jitter + tick;
+    // `chrono::Duration`'s `+` panics on overflow; a pathological (near-i64-ms)
+    // interval + jitter could overflow. Treat an unrepresentable grace as "no
+    // cadence" (never overdue), consistent with how the module treats a
+    // non-representable interval elsewhere.
+    let Some(grace) = step
+        .checked_add(&jitter)
+        .and_then(|partial| partial.checked_add(&tick))
+    else {
+        return OverdueVerdict::NOT_OVERDUE;
+    };
     let lag = now - next_run_at;
     if lag > grace {
         OverdueVerdict {
@@ -3854,89 +3863,112 @@ pub struct OverdueSample {
     pub overdue_by_secs: Option<i64>,
 }
 
+/// The scheduler tick's exact at-capacity running basis for a schedule's
+/// workflow (or DAG) name on **one shard** connection (issue #696).
+///
+/// Replicates `tick_one_workflow_schedule`'s own count byte-for-byte: the
+/// shard-local `COUNT(state IN ('RUNNING','PAUSED') WHERE workflow_name = name)`
+/// **plus** the #607 pending-throttle backlog
+/// (`throttle::pending_throttle_count_for_workflow`) that the tick adds before
+/// comparing against `max_active_runs`. A DAG schedule's executions carry
+/// `workflow_name == dag_name`, and the DAG tick uses the same two-term basis,
+/// so callers pass `dag_name` for a DAG schedule and `workflow_name` for a
+/// workflow schedule. Because the count runs on the schedule's own shard `conn`,
+/// this is shard-local — identical to the tick, which enforces `max_active_runs`
+/// shard-locally. `at_capacity` computed from this basis therefore suppresses
+/// `overdue` *exactly* when the tick would deliberately hold `next_run_at` in
+/// the past.
+///
+/// # Errors
+///
+/// Returns a database error if either count query fails.
+pub async fn schedule_running_basis(
+    conn: &mut AsyncPgConnection,
+    name: &str,
+) -> HarvestResult<i64> {
+    let running: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(name))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let pending = crate::throttle::pending_throttle_count_for_workflow(conn, name).await?;
+    Ok(running.saturating_add(pending))
+}
+
 /// Compute the overdue verdict for every schedule on one shard (issue #696).
 ///
-/// Loads all schedule rows on `conn` plus a shard-local RUNNING/PAUSED
-/// execution count per workflow name (matching the tick's own `running` query,
-/// so the `at_capacity` suppression fires exactly when the tick would hold
-/// `next_run_at`), then runs the pure [`schedule_overdue`] predicate against
+/// Loads all schedule rows on `conn` and, per schedule, computes the tick's
+/// exact shard-local running basis via [`schedule_running_basis`]
+/// (`RUNNING`/`PAUSED` count + #607 pending-throttle backlog), so the
+/// `at_capacity` suppression fires *exactly* when the tick would hold
+/// `next_run_at`. Then runs the pure [`schedule_overdue`] predicate against
 /// `now`. ALL schedules are returned (including paused/exhausted, which resolve
 /// to not-overdue) so the sampler can keep the gauge fresh.
 ///
 /// # Errors
 ///
-/// Returns a database error if the schedule or execution-count query fails.
+/// Returns a database error if any schedule or count query fails.
 pub async fn overdue_schedule_samples(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
 ) -> HarvestResult<Vec<OverdueSample>> {
-    use crate::schema::harvest_workflow_executions::dsl as ex;
-
     let schedules: Vec<HarvestSchedule> = harvest_schedules::table
         .select(HarvestSchedule::as_select())
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
 
-    // Shard-local running count per workflow name (RUNNING/PAUSED), matching the
-    // tick's overlap/max_active_runs count. A DAG schedule's executions carry
-    // workflow_name == dag_name, so a single grouped query covers both kinds.
-    let running_rows: Vec<(String, i64)> = ex::harvest_workflow_executions
-        .filter(ex::state.eq_any(["RUNNING", "PAUSED"]))
-        .group_by(ex::workflow_name)
-        .select((ex::workflow_name, diesel::dsl::count_star()))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    let running: HashMap<String, i64> = running_rows.into_iter().collect();
-
-    let samples = schedules
-        .into_iter()
-        .map(|s| {
-            let (kind, name) = if let Some(dag_name) = s.dag_name {
-                ("dag".to_string(), dag_name)
-            } else {
-                ("workflow".to_string(), s.workflow_name.unwrap_or_default())
-            };
-            let schedule = s
-                .schedule_expr
-                .as_deref()
-                .and_then(parse_schedule_from_expr);
-            let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
-            let at_capacity =
-                running.get(&name).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
-            let verdict = schedule_overdue(
-                schedule.as_ref(),
-                s.next_run_at,
-                now,
-                jitter,
-                SCHEDULER_TICK_INTERVAL,
-                s.is_paused,
-                s.auto_paused_at,
-                s.exhausted_at,
-                at_capacity,
-            );
-            OverdueSample {
-                kind,
-                name,
-                overdue: verdict.overdue,
-                overdue_by_secs: verdict.overdue_by_secs,
-            }
-        })
-        .collect();
+    let mut samples = Vec::with_capacity(schedules.len());
+    for s in schedules {
+        let (kind, name) = if let Some(dag_name) = s.dag_name {
+            ("dag".to_string(), dag_name)
+        } else {
+            ("workflow".to_string(), s.workflow_name.unwrap_or_default())
+        };
+        let schedule = s
+            .schedule_expr
+            .as_deref()
+            .and_then(parse_schedule_from_expr);
+        let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
+        // Shard-local + throttle-aware basis (matches the tick exactly).
+        let at_capacity =
+            schedule_running_basis(conn, &name).await? >= i64::from(s.max_active_runs);
+        let verdict = schedule_overdue(
+            schedule.as_ref(),
+            s.next_run_at,
+            now,
+            jitter,
+            SCHEDULER_TICK_INTERVAL,
+            s.is_paused,
+            s.auto_paused_at,
+            s.exhausted_at,
+            at_capacity,
+        );
+        samples.push(OverdueSample {
+            kind,
+            name,
+            overdue: verdict.overdue,
+            overdue_by_secs: verdict.overdue_by_secs,
+        });
+    }
     Ok(samples)
 }
 
-/// Sample the overdue verdict for every schedule on one shard and emit the
-/// `harvest.schedule.overdue` gauge (issue #696). The per-shard inner function
-/// the worker's overdue sampler calls for each pool.
+/// Sample the overdue verdict for every schedule on **one shard** and emit the
+/// `harvest.schedule.overdue` gauge (issue #696).
 ///
 /// Verdicts are aggregated per `(kind, name)` within the shard (overdue if any
-/// same-named schedule is overdue) before emitting so a healthy same-named
-/// schedule cannot mask an overdue one via last-write-wins. Same-named
-/// schedules on *different* shards still aggregate via gauge last-write-wins
-/// across the worker's per-pool passes (names are effectively unique per
-/// schedule, so this is defensive).
+/// same-named schedule is overdue) before emitting, so a healthy same-named
+/// schedule cannot mask an overdue one via last-write-wins.
+///
+/// This is a single-shard convenience (used by the DB integration tests). The
+/// worker's fleet sampler instead calls [`overdue_schedule_samples`] per shard
+/// and OR-aggregates across **all** shard pools into one `(kind, name)` map
+/// before emitting, so a same-named schedule that transiently exists on two
+/// shards (e.g. a `default_shard`/router reconfiguration) cannot be masked by a
+/// per-pool last-write-wins `.set()`.
 ///
 /// # Errors
 ///
@@ -6465,5 +6497,29 @@ mod tests {
     #[test]
     fn scheduler_tick_interval_reexport_matches_internal() {
         assert_eq!(SCHEDULER_TICK_INTERVAL, DEFAULT_SCHEDULER_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn overdue_grace_overflow_is_not_overdue() {
+        // A pathological interval near chrono's i64-ms bound makes `grace =
+        // step + jitter + tick` overflow; the predicate must treat that as
+        // not-overdue (checked add) rather than panic.
+        let sched = Schedule::Interval(Duration::from_millis(u64::try_from(i64::MAX).unwrap()));
+        let now = dt(2026, 1, 1, 0, 0, 0);
+        let v = schedule_overdue(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(10_000)),
+            now,
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            !v.overdue,
+            "an overflowing grace must be treated as not overdue, never a panic"
+        );
     }
 }

@@ -352,7 +352,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Primary: the precise per-schedule overdue gauge (harvest_schedule_overdue, a gauge, no _total suffix) names the wedged schedule. Secondary: skipped counter for policy skips. Tertiary: absence-of-runs, kept only for total process death where nothing emits the overdue gauge (pair with an `up`/scrape-health signal). Use bounded schedule kind and registered schedule name labels only.",
+        "notes": "Primary: the precise per-schedule overdue gauge (harvest_schedule_overdue, a gauge, no _total suffix) names the wedged schedule. Secondary: skipped counter for policy skips. Tertiary: absence-of-runs, kept only for total process death where nothing emits the overdue gauge (pair with an `up`/scrape-health signal). Use bounded schedule kind and registered schedule name labels only. RECOMMENDED hold: configure the primary overdue rule with `for: 2m` (well above the ~30s sampler cadence and one scheduler tick) so single-scrape transients — a just-resumed long-paused schedule whose next_run_at self-heals within one tick, or short-cadence clock skew — do not page while a genuine wedge (persists many minutes) still fires. A deleted overdue schedule leaves its gauge series stuck at 1 until the emitting worker restarts (standard gauge property); cross-check the read (the schedule is gone) and treat a `for:`-held firing for a non-existent schedule as resolved.",
         "expressions": [
           {
             "kind": "promql",
