@@ -1,4 +1,9 @@
 #![cfg(feature = "db")]
+// Harness helpers are `pub(crate)` so sibling integration test modules (issue
+// #779's child_timeout_tests) can reuse the container/worker setup. The
+// `redundant_pub_crate` nursery lint flags that pattern; the cross-module reuse
+// is intentional.
+#![allow(clippy::redundant_pub_crate)]
 
 //! End-to-end integration tests using testcontainers for a real Postgres instance.
 //!
@@ -283,7 +288,7 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 
 /// Start a Postgres container with the harvest schema applied and return
 /// the database URL plus the live container handle.
-async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
+pub(crate) async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
         .with_tag("16")
@@ -302,6 +307,19 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     (database_url, container)
+}
+
+/// Like [`setup_test_database_url`] but honours `HARVEST_TEST_DATABASE_URL` (a
+/// pre-migrated Postgres) so DB tests can run against a local instance when
+/// Docker/testcontainers is unavailable. Returns `None` for the container in
+/// that case; the caller keeps the returned `Option` alive for the test's
+/// duration exactly as it would the container.
+pub(crate) async fn setup_test_database_url_or_env() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
 }
 
 async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -499,7 +517,7 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
     );
 }
 
-fn build_test_pool(database_url: &str) -> DbPool {
+pub(crate) fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
         // Must comfortably exceed the largest `max_concurrent_workflows` any
@@ -536,7 +554,10 @@ async fn load_task_from_url(database_url: &str, task_id: Uuid) -> TaskQueueItem 
         .expect("failed to reload task queue row")
 }
 
-async fn load_history_from_url(database_url: &str, exec_id: ExecutionId) -> store::EventHistory {
+pub(crate) async fn load_history_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+) -> store::EventHistory {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect fresh Postgres client for history query");
@@ -561,7 +582,7 @@ async fn load_tasks_for_execution_from_url(
         .expect("failed to reload task queue rows")
 }
 
-async fn load_timers_for_execution_from_url(
+pub(crate) async fn load_timers_for_execution_from_url(
     database_url: &str,
     exec_id: ExecutionId,
 ) -> Vec<HarvestTimer> {
@@ -577,7 +598,7 @@ async fn load_timers_for_execution_from_url(
         .expect("failed to reload timer rows")
 }
 
-async fn load_child_executions_from_url(
+pub(crate) async fn load_child_executions_from_url(
     database_url: &str,
     parent_exec_id: ExecutionId,
 ) -> Vec<WorkflowExecution> {
@@ -594,7 +615,7 @@ async fn load_child_executions_from_url(
 }
 
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
-async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
+pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
@@ -636,6 +657,60 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         .execute(conn)
         .await
         .expect("failed to insert workflow execution");
+
+    exec_id
+}
+
+/// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
+/// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
+/// inserts more than one live execution: they would otherwise collide on the
+/// partial `UNIQUE(workflow_name, workflow_id)` active index that
+/// [`insert_workflow_execution`]'s hardcoded id trips on a second call.
+pub(crate) async fn insert_workflow_execution_with_id(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_test_workflow",
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({"test": true}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+    };
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert workflow execution with id");
 
     exec_id
 }
@@ -763,7 +838,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     );
 }
 
-async fn enqueue_started_workflow_task(
+pub(crate) async fn enqueue_started_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     workflow_input: serde_json::Value,
@@ -792,7 +867,7 @@ async fn enqueue_started_workflow_task(
         .expect("enqueue workflow task failed");
 }
 
-fn build_runtime_worker(
+pub(crate) fn build_runtime_worker(
     worker_id: &str,
     max_concurrent_workflows: usize,
     max_concurrent_activities: usize,
@@ -868,13 +943,13 @@ fn build_runtime_worker_with_task_timeout(
     )
 }
 
-fn spawn_test_worker(worker: Arc<Worker>, pool: DbPool) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_test_worker(worker: Arc<Worker>, pool: DbPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         worker.run(&pool).await;
     })
 }
 
-async fn wait_for_execution_state(
+pub(crate) async fn wait_for_execution_state(
     database_url: &str,
     exec_id: ExecutionId,
     expected_state: &str,

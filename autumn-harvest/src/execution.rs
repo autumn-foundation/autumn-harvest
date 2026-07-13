@@ -1140,6 +1140,20 @@ async fn notify_awaited_parent_of_child_terminal(
             .optional()
             .map_err(database_error)?;
         if matches!(parent_state, Some(state) if !crate::erase::is_terminal_state(&state)) {
+            // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the
+            // child terminal (mirrors worker::wake_parent_for_child_completion/
+            // _failure) so an over-deadline child that is operator-CANCELLED or
+            // -TERMINATED resolves the parent's `spawn_child_workflow_timeout` to
+            // the timeout branch (None), not Err. The parent row is already
+            // locked FOR UPDATE above; `materialize_due_child_timeout_deadlines`
+            // re-locks it (a same-transaction no-op) *before* it takes the due
+            // timers FOR UPDATE — the unified execution-row → timer lock order
+            // (see its convention comment, issue #779 Codex round-11) — so this
+            // operator path and the worker-wake/child-timeout paths cannot ABBA
+            // against each other on the same overdue parent. It then appends
+            // `TimerFired` under the same parent-row MAX(event_id) discipline as
+            // the child terminal below, so the deadline is ordered first.
+            crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
             store::append_single_event(
                 conn,
                 parent_exec_id,

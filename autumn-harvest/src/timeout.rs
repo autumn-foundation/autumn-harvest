@@ -661,6 +661,14 @@ async fn wake_parent_for_child_timeout(
     child_exec_id: crate::types::ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the child
+    // terminal (mirrors worker::wake_parent_for_child_completion/_failure) so an
+    // over-deadline child that hits its OWN execution timeout resolves the
+    // parent's `spawn_child_workflow_timeout` to the timeout branch (None), not
+    // Err. Appends the `TimerFired` under the same parent-row FOR UPDATE + MAX
+    // discipline as the child terminal below (see
+    // worker::materialize_due_child_timeout_deadlines).
+    crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
     // Use append_single_event so concurrent sibling timeout/completion paths
     // serialise around the parent execution row and cannot collide on the
     // (workflow_exec_id, event_id) unique constraint.

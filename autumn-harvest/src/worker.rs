@@ -1301,6 +1301,103 @@ fn extract_all_started_child_workflows(
         .collect()
 }
 
+/// Extract the child-timeout race suspension shape (issue #779): **exactly one**
+/// `StartChildWorkflow` **and exactly one** `StartTimer`, with every other command
+/// pure bookkeeping. Returns `Some((child, timer))` for that shape, `None`
+/// otherwise.
+///
+/// This is the deliberate enforcement point for the AC9 caveat "a child-timeout
+/// wait cannot share a suspension batch with a new activity/child": any extra
+/// `ScheduleActivity`, a second `StartChildWorkflow`, a second `StartTimer`, a
+/// `WaitForSignal`, an `ArmTimer`/`CancelTimer`, or a `SpawnDetachedChildWorkflow`
+/// makes this return `None`, so the batch falls through to the generic
+/// "unsupported commands" failure (fail-loud) rather than silently dropping work.
+///
+/// Only pure bookkeeping that the earlier `handle_suspended_workflow` steps and
+/// [`build_suspension_events`] fully handle is tolerated alongside the pair
+/// (markers, side-effects, update results, search-attribute upserts,
+/// current-details breadcrumbs, and `CancelRaceLosers` from a prior sequential
+/// race). It is intentionally *additive*: it does not touch
+/// [`extract_started_timer_for_suspension`] or [`extract_all_started_child_workflows`].
+fn extract_child_timeout_race(
+    commands: &[WorkflowCommand],
+) -> Option<(StartedChildWorkflowCommand, StartedTimerCommand)> {
+    let mut child: Option<StartedChildWorkflowCommand> = None;
+    let mut timer: Option<StartedTimerCommand> = None;
+
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                ..
+            } => {
+                if child.is_some() {
+                    // A second child means this is a plain parallel child fan-out,
+                    // not a child-timeout race.
+                    return None;
+                }
+                child = Some(StartedChildWorkflowCommand {
+                    child_id: *child_id,
+                    workflow_name: workflow_name.clone(),
+                    input: input.clone(),
+                });
+            }
+            WorkflowCommand::StartTimer {
+                timer_id,
+                duration_secs,
+                ..
+            } => {
+                if timer.is_some() {
+                    return None;
+                }
+                // Require the reserved `__child_timeout:` prefix that
+                // `spawn_child_workflow_timeout` stamps on its deadline timer.
+                // Without this, an arbitrary
+                // `tokio::join!(spawn_child_workflow(..), timer("mytimer", n))`
+                // batch (one plain child + one ordinary timer) would be silently
+                // treated as the child-timeout primitive, bypassing the previous
+                // fail-loud "unsupported commands" behavior — and on a child-win
+                // no `spawn_child_workflow_timeout` teardown would run to delete
+                // that ordinary timer row, so the parent could complete with an
+                // unfired `harvest_timers` dependency. Fall through to the generic
+                // path (return None) when the prefix is absent.
+                if !timer_id
+                    .as_str()
+                    .starts_with(crate::context::CHILD_TIMEOUT_TIMER_PREFIX)
+                {
+                    return None;
+                }
+                timer = Some(StartedTimerCommand {
+                    timer_id: timer_id.clone(),
+                    duration_secs: *duration_secs,
+                });
+            }
+            // Pure bookkeeping tolerated alongside the pair. Deliberately excludes
+            // ArmTimer/CancelTimer (would need plan_timer_lifecycle) and
+            // SpawnDetachedChildWorkflow (would need create_detached_child_executions)
+            // — neither is ever emitted in a child-timeout batch, and tolerating
+            // them here would silently drop their events. Fail loud instead.
+            WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::CancelRaceLosers { .. } => {}
+            // Anything else (activity, activity wait, signal wait, external
+            // activity/signal/cancel, detached spawn, arm/cancel timer) → not this
+            // shape.
+            _ => return None,
+        }
+    }
+
+    match (child, timer) {
+        (Some(c), Some(t)) => Some((c, t)),
+        _ => None,
+    }
+}
+
 fn extract_single_schedule_external_activity(
     commands: &[WorkflowCommand],
 ) -> Option<ScheduledExternalActivityCommand> {
@@ -5051,6 +5148,355 @@ async fn persist_all_started_child_workflows(
     Ok(())
 }
 
+/// Insert a single genuinely-new **awaited** child execution row, append its own
+/// `WorkflowStarted` event, and enqueue its workflow task (issue #779).
+///
+/// This is a self-contained clone of the per-child body of
+/// [`persist_all_started_child_workflows`] scoped to exactly one child. It is a
+/// deliberate *addition* — the plain parallel-child persist path is left
+/// byte-identical for merge safety — used only by [`persist_child_timeout_race`].
+/// The parent's own `ChildWorkflowStarted` event is appended by the caller (in
+/// command-emission order with the sibling `TimerStarted`); this helper only
+/// touches the child row, the child's history, and the child's task.
+async fn insert_awaited_child_execution(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    parent_execution: &WorkflowExecution,
+    parent_exec_id: ExecutionId,
+    child: &StartedChildWorkflowCommand,
+    trace_context: Option<TraceContextCarrier>,
+) -> HarvestResult<()> {
+    let shard_id = parent_execution.shard_id;
+    let queue_name = parent_execution.queue_name.clone();
+
+    let child_workflow_id = child.child_id.to_string();
+    let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
+    let (owner, runbook_url, severity, child_sla, child_execution_timeout, child_retry_policy) =
+        child_wf_info.map_or((None, None, None, None, None, None), |w| {
+            (
+                w.owner,
+                w.runbook_url,
+                w.severity,
+                w.sla,
+                w.execution_timeout,
+                w.retry_policy.clone(),
+            )
+        });
+    let child_execution_timeout =
+        child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
+    let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+    let child_row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: child.child_id.as_uuid(),
+        workflow_name: &child.workflow_name,
+        workflow_id: &child_workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id,
+        input: child.input.clone(),
+        parent_id: Some(parent_exec_id.as_uuid()),
+        queue_name: &queue_name,
+        execution_timeout: child_execution_timeout,
+        deadline_at: child_deadline_at,
+        sla: child_sla,
+        sla_deadline_at: child_sla_deadline_at,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: parent_execution.assigned_build_id.clone(),
+        parent_close_policy: None, // awaited child
+        owner,
+        runbook_url,
+        severity,
+        context_headers: parent_execution.context_headers.clone(),
+        schedule_id: None, // child workflows are not scheduled fires
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: child_retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        retry_of_exec_id: None,
+        origin: None, // child workflow, not a schedule fire (issue #534)
+        // Children get only builder-wide default callback targets, resolved at
+        // their own terminal transition (issue #605) — no per-execution override.
+        completion_callbacks: None,
+    };
+    let child_started_event = WorkflowEvent::WorkflowStarted {
+        input: child.input.clone(),
+        timestamp: chrono::Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None, // child workflows are not scheduler-fired
+    };
+    let mut params =
+        queue::EnqueueParams::new(queue_name.clone(), TaskType::Workflow, child.input.clone());
+    params.workflow_exec_id = Some(child.child_id.as_uuid());
+    params.required_build_id = parent_execution.assigned_build_id.clone();
+    (params.concurrency_key, params.max_concurrent) =
+        resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+    params.trace_context = trace_context;
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&child_row)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    store::append_events_offloaded(
+        conn,
+        child.child_id,
+        &[child_started_event],
+        0,
+        registry.payload_offloader(),
+    )
+    .await?;
+    queue::enqueue(conn, &params).await?;
+    Ok(())
+}
+
+/// Persist the child-timeout race suspension batch (issue #779): spawn the child
+/// **and** arm the deadline timer atomically, then park the parent so it is woken
+/// by whichever resolves first.
+///
+/// Mirrors the #476 signal-or-deadline mechanism ([`persist_started_timer`]): the
+/// parent task is rescheduled to `fires_at` (so the durable timer fires it when
+/// due) and stamped `activity_name = 'mixed_signal_suspension'` so an *early*
+/// wake — here a child terminal, delivered by `wake_parent_for_child_completion`
+/// / `wake_parent_for_child_failure` via [`queue::wake_workflow_task`] — re-pends
+/// the future-scheduled `PENDING` row through
+/// `primary_repend_workflow_task_query`'s second arm. Without that sentinel the
+/// child-completion wake would match neither arm and be silently dropped, so the
+/// parent would sleep until the deadline even when the child finished first.
+///
+/// The parent's `ChildWorkflowStarted` is appended **before** `TimerStarted` (the
+/// `StartChildWorkflow` command is emitted first), in one transaction, because
+/// `match_child_or_timer` positionally matches the pair.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+async fn persist_child_timeout_race(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    task_id: uuid::Uuid,
+    parent_execution: &WorkflowExecution,
+    commands: &[WorkflowCommand],
+    child: &StartedChildWorkflowCommand,
+    timer: &StartedTimerCommand,
+    sticky: Option<queue::StickyHint<'_>>,
+    execute_span: &tracing::Span,
+) -> HarvestResult<()> {
+    if !registry.workflows.contains_key(&child.workflow_name) {
+        return Err(HarvestError::Config(format!(
+            "no workflow handler registered for '{}'",
+            child.workflow_name
+        )));
+    }
+
+    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
+    let child_id = child.child_id;
+    let telemetry = registry.telemetry().clone();
+    let execute_span = execute_span.clone();
+
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            let telemetry = telemetry.clone();
+            let execute_span = execute_span.clone();
+            async move {
+                use crate::schema::harvest_task_queue::dsl as queue_dsl;
+
+                // ── child new-vs-existing ──
+                let child_is_new = harvest_workflow_executions::table
+                    .find(child.child_id.as_uuid())
+                    .select(harvest_workflow_executions::id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?
+                    .is_none();
+
+                // ADR-0001 §2.8: emit a harvest.child_workflow.start PRODUCER span
+                // only for a genuinely new child. Parent it to this executor
+                // cycle's execute span (EnteredSpan is !Send, so capture inside
+                // .in_scope before any await).
+                let child_trace_ctx = if child_is_new {
+                    tracing::info_span!(
+                        parent: &execute_span,
+                        "harvest.child_workflow.start",
+                        "otel.kind" = "producer",
+                        { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                        { ATTR_EXECUTION_ID } = %child.child_id,
+                        { ATTR_SHARD_ID } = parent_execution.shard_id,
+                    )
+                    .in_scope(|| telemetry.capture_trace_context())
+                } else {
+                    None
+                };
+
+                // ── timer new-vs-existing + fires_at (DB clock) ──
+                let existing_timer: Option<HarvestTimer> = harvest_timers::table
+                    .filter(harvest_timers::workflow_exec_id.eq(parent_exec_id.as_uuid()))
+                    .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                    .filter(harvest_timers::fired.eq(false))
+                    .first::<HarvestTimer>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                let timer_is_new = existing_timer.is_none();
+                let fires_at = if let Some(ref ext) = existing_timer {
+                    ext.fires_at
+                } else {
+                    let fire_delay =
+                        chrono_duration_from_secs(timer.duration_secs, "child timeout duration")?;
+                    let db_now = db_clock_now(conn).await?;
+                    db_now + fire_delay
+                };
+
+                // ── append parent events in command emission order ──
+                // StartChildWorkflow is pushed first, StartTimer second, so
+                // ChildWorkflowStarted precedes TimerStarted (the positional
+                // matcher relies on this). Tolerated bookkeeping (markers,
+                // side-effects) is interleaved at its position by
+                // build_suspension_events.
+                //
+                // Use `append_single_event` (parent-row FOR UPDATE + MAX(event_id)
+                // re-read per insert), byte-for-byte like the plain
+                // `persist_all_started_child_workflows` path — NOT a batch
+                // `append_events` at the stale pre-handler `next_event_id`. The
+                // child spawned by *this* batch is new and cannot complete
+                // concurrently, but this same cycle may ALSO carry a
+                // `CancelRaceLosers` for a still-RUNNING race-loser child
+                // (`extract_child_timeout_race` deliberately tolerates it, so a
+                // resolved `ctx.race()` immediately followed by
+                // `spawn_child_workflow_timeout` lands here). That loser child can
+                // append its OWN terminal (`ChildWorkflowCompleted`/`Failed`) onto
+                // the parent via `wake_parent_for_child_completion`'s own
+                // `append_single_event`, concurrently, at the same id. A stale
+                // batch append would then collide on
+                // UNIQUE(workflow_exec_id, event_id) and — routed through
+                // `fail_execution_on_error` — terminally FAIL a healthy parent. The
+                // FOR UPDATE re-read serialises the two appends instead (issue #779,
+                // Codex round-12 P2).
+                let mut timer_event = timer_is_new.then(|| WorkflowEvent::TimerStarted {
+                    timer_id: timer.timer_id.clone(),
+                    duration_secs: timer.duration_secs,
+                });
+                let mut child_started_event =
+                    child_is_new.then(|| WorkflowEvent::ChildWorkflowStarted {
+                        child_id: child.child_id,
+                        workflow_name: child.workflow_name.clone(),
+                        input: child.input.clone(),
+                    });
+                let events = build_suspension_events(commands, &mut [], |cmd| match cmd {
+                    WorkflowCommand::StartChildWorkflow { .. } => child_started_event.take(),
+                    WorkflowCommand::StartTimer { .. } => timer_event.take(),
+                    _ => None,
+                });
+                for event in events {
+                    store::append_single_event(conn, parent_exec_id, event).await?;
+                }
+
+                // Defensive: a suspension batch never carries CancelRaceLosers in
+                // the common case, but a resolved `ctx.race()` in the same cycle
+                // can (see above), so apply them for symmetry with
+                // persist_all_started_child_workflows. No-op when absent. Re-read
+                // the true next id under the same FOR UPDATE lock (the appends
+                // above wrote a variable number of events) so the cursor never
+                // reuses a consumed id.
+                let mut race_next_event_id = store::next_event_id_for(conn, parent_exec_id).await?;
+                let deferred = apply_race_loser_cancellations(
+                    conn,
+                    parent_exec_id,
+                    commands,
+                    &mut race_next_event_id,
+                    registry,
+                )
+                .await?;
+
+                // ── insert the child row + enqueue its task (only when new) ──
+                if child_is_new {
+                    insert_awaited_child_execution(
+                        conn,
+                        registry,
+                        parent_execution,
+                        parent_exec_id,
+                        child,
+                        child_trace_ctx,
+                    )
+                    .await?;
+                }
+
+                // ── arm the durable deadline timer (only when new) ──
+                if timer_is_new {
+                    let new_timer = NewHarvestTimer {
+                        workflow_exec_id: parent_exec_id.as_uuid(),
+                        timer_id: timer.timer_id.as_str(),
+                        fires_at,
+                    };
+                    diesel::insert_into(harvest_timers::table)
+                        .values(&new_timer)
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                }
+
+                // ── park the parent: PENDING at fires_at + mixed-signal sentinel ──
+                // reschedule_task defers the row to fires_at (the timer fire). The
+                // sentinel makes a child-terminal wake re-pend it early via the
+                // second arm of primary_repend_workflow_task_query.
+                //
+                // NOTE: a child-timeout parked row deliberately reuses the
+                // `mixed_signal_suspension` sentinel even though it has NO
+                // WaitForSignal command — a future signal-wait edit keyed on this
+                // exact literal must keep re-pending child-timeout rows too, or a
+                // child-terminal wake would silently fail to pull this row forward.
+                queue::reschedule_task(conn, task_id, fires_at).await?;
+                diesel::update(queue_dsl::harvest_task_queue.find(task_id))
+                    .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                if sticky.is_some() {
+                    queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
+                }
+
+                Ok(deferred)
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+
+    // Self-wake re-check (R3): the child-completion wake
+    // (`wake_parent_for_child_completion`/`_failure`) targets the parent task
+    // row via `wake_workflow_task`. On the first live park the child was just
+    // created in this same transaction, so it cannot be terminal yet. On a
+    // re-park (both already started), a concurrent child terminal could commit
+    // between our history check and this park's reschedule UPDATE — its
+    // `wake_workflow_task` would then land on a row we re-parked over. Re-check
+    // now that the park is committed: if the child is already terminal, re-wake
+    // so the parent is not left sleeping until the deadline. If it is not
+    // terminal yet, a later child terminal's own `wake_workflow_task` re-pends
+    // the committed PENDING mixed-signal row — no gap.
+    let child_terminal = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .is_some_and(|s| {
+            matches!(
+                s.as_str(),
+                "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
+            )
+        });
+    if child_terminal {
+        queue::wake_workflow_task(conn, parent_exec_id).await?;
+    }
+
+    Ok(())
+}
+
 /// Chronologically interleave due timer fires and pending signals for a
 /// single wake-up ingest.
 ///
@@ -5107,7 +5553,8 @@ fn merge_wake_events(
 /// (see [`merge_wake_events`]).
 ///
 /// Returns the fired timer IDs and delivered signal names.
-async fn ingest_due_timers_and_signals(
+#[doc(hidden)] // exposed for the #779 transient-conflict integration test; not a stable API
+pub async fn ingest_due_timers_and_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
@@ -5176,6 +5623,95 @@ async fn ingest_due_timers_and_signals(
     .await?;
 
     Ok((fired_timer_ids, signal_names))
+}
+
+/// Re-drive the claimed parent workflow task after a transient wake-event-ingest
+/// event-id conflict (issue #779), instead of terminally failing the run.
+///
+/// The task is currently claimed by this worker (`state = 'RUNNING'`,
+/// `worker_id` set). We first [`park`](queue::park_workflow_task) it to release
+/// the claim, then [`wake`](queue::wake_workflow_task) it to re-pend the row to
+/// `PENDING` with an immediate `scheduled_at` and a `pg_notify`, so an idle
+/// poller re-claims it promptly. This is the exact pause(park)/resume(wake)
+/// mechanism used elsewhere; no event is appended, no state is changed, no
+/// retry attempt is consumed.
+///
+/// `park`'s `wake_requested` return value is intentionally discarded: we always
+/// wake immediately afterward on the same connection, so a wake that raced in
+/// during the claim is subsumed by the wake we issue here.
+async fn requeue_parent_on_transient_ingest_conflict(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+    queue::wake_workflow_task(conn, exec_id).await?;
+    Ok(())
+}
+
+/// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
+/// transient `(workflow_exec_id, event_id)` UNIQUE conflict into a re-drive of
+/// the parent workflow task rather than a terminal failure (issue #779).
+///
+/// Returns:
+/// - `Ok(Some((timers_fired, signals_delivered)))` — the ingest succeeded (or
+///   was a no-op); proceed with this cycle.
+/// - `Ok(None)` — a transient event-id conflict was detected; the parent task
+///   has been re-pended for immediate re-claim and the caller must abandon this
+///   cycle without failing the run.
+/// - `Err(_)` — a genuine (non-conflict) error; the caller fails the execution
+///   exactly as before.
+///
+/// The classification is scoped to the ingest boundary and is precise: only a
+/// UNIQUE violation on the `harvest_events (workflow_exec_id, event_id)`
+/// constraint is treated as transient (see
+/// [`HarvestError::is_event_id_unique_violation`]). A successful ingest and any
+/// genuine error are unaffected.
+///
+/// The retry is provably convergent: the winner's event is already committed, so
+/// the re-driven task's fresh history load advances `next_event_id` past it, and
+/// an already-`fired` timer is excluded from the next ingest — the same conflict
+/// cannot recur, so there is no hot loop even though the re-pend schedules the
+/// task for immediate re-claim.
+#[doc(hidden)] // exposed for the #779 transient-conflict integration test; not a stable API
+pub async fn ingest_wake_events_or_requeue(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+) -> HarvestResult<Option<(Vec<TimerId>, Vec<String>)>> {
+    match ingest_due_timers_and_signals(conn, exec_id, next_event_id).await {
+        Ok(pair) => Ok(Some(pair)),
+        Err(e) if e.is_event_id_unique_violation() => {
+            requeue_parent_on_transient_ingest_conflict(
+                conn,
+                task,
+                worker_id,
+                sticky_timeout,
+                exec_id,
+            )
+            .await?;
+            tracing::warn!(
+                task_id = %task.id,
+                workflow_exec_id = %exec_id,
+                "harvest: transient event-id conflict during wake-event ingest \
+                 (a concurrent append committed the same event_id first); \
+                 re-driving the parent workflow task instead of failing the run \
+                 (issue #779)"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn fail_task_only(
@@ -5357,12 +5893,148 @@ async fn finalize_activity_failure(
     .await
 }
 
-async fn wake_parent_for_child_completion(
+/// Materialize any DUE `__child_timeout:` deadline timers into the parent's
+/// history as `TimerFired` events **before** an out-of-band child terminal is
+/// appended (issue #779, Codex P1).
+///
+/// A child that completes/fails **after** its `spawn_child_workflow_timeout`
+/// deadline has passed appends its terminal to the parent history out-of-band
+/// (via [`wake_parent_for_child_completion`] / [`wake_parent_for_child_failure`]).
+/// If the parent is claimed late, that terminal would land in history *before*
+/// the deadline `TimerFired` (which is otherwise only ingested at parent claim,
+/// see [`ingest_due_timers_and_signals`]). [`crate::replay::HistoryMatcher::match_child_or_timer`]
+/// is a pure recorded-order matcher, so it would then declare the child the
+/// winner and the primitive would return `Some`/`Err` instead of `None` —
+/// violating the "deadline reached ⇒ `None`" contract even though the deadline
+/// genuinely elapsed first. Ordering the due deadline **before** the child
+/// terminal restores the #476 signal-or-deadline guarantee for the child case:
+/// a deadline that has passed is observed by every replay regardless of when the
+/// parent is claimed.
+///
+/// Correlation to the completing child is deliberately **not** required:
+/// materializing every currently-due `__child_timeout` deadline before the
+/// child terminal is correct — this child's own due deadline lands before its
+/// terminal (⇒ `None`), and any unrelated sibling race's due deadline that
+/// lands early is simply resolved by that race's own `match_child_or_timer`
+/// scan. Scope is strictly `__child_timeout:` so unrelated `ctx.timer()` rows
+/// are never pulled forward or reordered.
+///
+/// Double-fire safety vs the parent-claim ingest: the due rows are selected
+/// `FOR UPDATE`, so `fired = false` is re-evaluated against the latest
+/// committed row version (Postgres EvalPlanQual). A deadline the ingest path
+/// already fired-and-committed is therefore excluded here, and a deadline this
+/// path fires blocks the ingest's `SET fired = true` until the enclosing wake
+/// transaction commits — so the two paths cannot durably append two
+/// `TimerFired` events for the same timer. When no `__child_timeout` deadline
+/// is due (a plain child-await, or a child that beat its deadline), this
+/// returns `0` and appends nothing — byte-identical to the pre-#779 wake path.
+#[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+pub async fn materialize_due_child_timeout_deadlines(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_timers::dsl;
+    use diesel::TextExpressionMethods;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Timestamptz;
+
+    // ── Per-table lock-ordering convention (issue #779, Codex round-11 review) ──
+    //
+    //   harvest_workflow_executions (parent row) → harvest_timers (FOR UPDATE)
+    //
+    // The execution row is the top-level aggregate lock everywhere in the engine
+    // (every `store::append_single_event` takes it first), and the operator
+    // cancel/terminate path — `execution::notify_awaited_parent_of_child_terminal`
+    // — locks the parent execution row `FOR UPDATE` *before* calling this
+    // materializer. This function's timer `FOR UPDATE` below therefore MUST be
+    // acquired *after* the parent execution row, or it would be an ABBA inversion
+    // against that operator path: the worker-wake and child-execution-timeout
+    // callers reach the materializer *without* an outer parent lock, so if the
+    // materializer took the timer lock first, two concurrent wakes of the same
+    // overdue parent — one via a normal child completion/failure (timer-first)
+    // and one via an operator cancel/terminate of a sibling child (execution-row
+    // first) — would deadlock, and Postgres would abort a healthy terminal
+    // notification. Taking the parent execution row `FOR UPDATE` here first
+    // unifies every call site onto execution-row → timer, so no cycle is
+    // possible. Re-locking a row the operator path already holds in the same
+    // transaction is a no-op. If the parent execution row is gone, there is
+    // nothing to fire a deadline against — return `Ok(0)` and let the caller's
+    // own `append_single_event` surface the `NotFound` (unchanged behaviour).
+    {
+        use crate::models::WorkflowExecution;
+        use crate::schema::harvest_workflow_executions;
+        let parent_row: Option<WorkflowExecution> = harvest_workflow_executions::table
+            .find(parent_exec_id.as_uuid())
+            .for_update()
+            .select(WorkflowExecution::as_select())
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        if parent_row.is_none() {
+            return Ok(0);
+        }
+    }
+
+    // Lock + read the parent's DUE child-timeout deadline timers. `FOR UPDATE`
+    // makes the `fired = false` predicate exactly-once against the parent-claim
+    // ingest (see the double-fire note above). The `\_\_child\_timeout:%`
+    // pattern escapes the underscores (default Postgres LIKE escape char) so it
+    // matches the literal `__child_timeout:` prefix and never a sibling prefix
+    // such as `__signal_timeout:`. Database `NOW()` is used to stay consistent
+    // with the ingest/claim clock.
+    let due: Vec<HarvestTimer> = dsl::harvest_timers
+        .filter(dsl::workflow_exec_id.eq(parent_exec_id.as_uuid()))
+        .filter(dsl::fired.eq(false))
+        .filter(dsl::timer_id.like(r"\_\_child\_timeout:%"))
+        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
+        .order(dsl::fires_at.asc())
+        .for_update()
+        .select(HarvestTimer::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if due.is_empty() {
+        return Ok(0);
+    }
+
+    let count = due.len();
+    for timer in due {
+        let timer_row_id = timer.id;
+        // Append `TimerFired` under the same parent-row FOR UPDATE + MAX(event_id)
+        // discipline the child-terminal append uses, so the deadline is ordered
+        // chronologically ahead of the child terminal appended after this call.
+        store::append_single_event(
+            conn,
+            parent_exec_id,
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer.timer_id),
+            },
+        )
+        .await?;
+        diesel::update(dsl::harvest_timers.filter(dsl::id.eq(timer_row_id)))
+            .set(dsl::fired.eq(true))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    Ok(count)
+}
+
+#[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+pub async fn wake_parent_for_child_completion(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    // #779 (Codex P1): order any DUE child-timeout deadline BEFORE the child
+    // terminal so the pure recorded-order `match_child_or_timer` sees the
+    // `TimerFired` first and resolves to the timeout branch (None) even when the
+    // parent is claimed late (see materialize_due_child_timeout_deadlines).
+    materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
     // Use append_single_event (FOR UPDATE + MAX re-read) so concurrent sibling
     // child completions serialise around the parent execution row and cannot
     // collide on (workflow_exec_id, event_id).
@@ -5374,12 +6046,17 @@ async fn wake_parent_for_child_completion(
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
-async fn wake_parent_for_child_failure(
+#[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+pub async fn wake_parent_for_child_failure(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // #779 (Codex P1): order any DUE child-timeout deadline BEFORE the child
+    // terminal (mirrors wake_parent_for_child_completion) so an over-deadline
+    // child FAILURE resolves to None, not Err.
+    materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
     // Decode the typed failure envelope (issue #767) so the parent's
     // `ChildWorkflowFailed` event carries the child's `error_type`/`details`/
     // `non_retryable`. The two seal-path callers pass engine reason strings,
@@ -7146,7 +7823,8 @@ async fn persist_bookkeeping_and_requeue_workflow(
 /// must spawn **after** its outer transaction commits (mirrors the existing
 /// external-cancel delivery pattern, issue #492) — never before, so a rolled
 /// back cancellation cannot have already started trigger workflows.
-async fn apply_race_loser_cancellations(
+#[doc(hidden)] // exposed for the #779 event-id-accounting integration test; not a stable API
+pub async fn apply_race_loser_cancellations(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
@@ -7223,11 +7901,19 @@ async fn apply_race_loser_cancellations(
                         // execution (parent_id = exec_id, parent_close_policy =
                         // None), so a genuine (newly-cancelled) cancellation here
                         // runs `notify_awaited_parent_of_child_terminal` inside the
-                        // same transaction, which appends a `ChildWorkflowFailed`
-                        // event onto *our own* history via a self-computed id.
-                        // Advance the cursor so the winner marker / terminal-
-                        // outcome append that follows doesn't collide with it.
-                        *next_event_id = next_event_id.saturating_add(1);
+                        // same transaction, appending onto *our own* history via
+                        // self-computed ids. That append is the `ChildWorkflowFailed`
+                        // terminal PLUS — since #779's deadline-materialization
+                        // (Codex P2-D) — zero or more preceding `__child_timeout`
+                        // `TimerFired` deadlines. Its event count is therefore
+                        // *variable* (1 + N materialized), not a fixed 1, so a
+                        // hardcoded `+1` here would leave the cursor short by N and
+                        // the winner marker / terminal-outcome / synthetic-loser
+                        // append that follows would reuse a consumed id and fail on
+                        // `UNIQUE(workflow_exec_id, event_id)`. Re-read the true next
+                        // event id under the parent row lock that `notify_awaited_
+                        // parent_of_child_terminal`'s append already holds (Codex P2).
+                        *next_event_id = store::next_event_id_for(conn, exec_id).await?;
                     }
                 }
                 Err(HarvestError::NotFound(_) | HarvestError::Config(_)) => {
@@ -7789,6 +8475,33 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await
+    } else if let Some((child, timer)) = extract_child_timeout_race(commands) {
+        // Child-timeout race (issue #779): a single StartChildWorkflow + StartTimer
+        // batch. Must be checked BEFORE the plain timer and plain child branches
+        // so it is not misrouted to persist_started_timer (which would drop the
+        // child) or persist_all_started_child_workflows (which would not arm the
+        // deadline). extract_child_timeout_race rejects any other shape.
+        let res = persist_child_timeout_race(
+            conn,
+            registry,
+            context.persistence.task.id,
+            context.execution,
+            commands,
+            &child,
+            &timer,
+            sticky,
+            context.execute_span,
+        )
+        .await;
+        if res.is_ok() {
+            #[allow(clippy::cast_precision_loss)]
+            let duration_secs = timer.duration_secs as f64;
+            registry
+                .telemetry()
+                .metrics
+                .record_timer_started(duration_secs);
+        }
+        res
     } else if let Some(timer) = extract_started_timer_for_suspension(commands) {
         let res = persist_started_timer(
             conn,
@@ -7920,8 +8633,9 @@ async fn load_workflow_replay_state(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
+    sticky_timeout: Duration,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<(store::EventHistory, Vec<TimerId>, Vec<String>)> {
+) -> HarvestResult<Option<(store::EventHistory, Vec<TimerId>, Vec<String>)>> {
     let history_result = store::load_history_inflated(
         conn,
         exec_id,
@@ -7933,11 +8647,21 @@ async fn load_workflow_replay_state(
 
     // Single chronological ingest: due timer fires and pending signals are
     // appended in occurrence order (signal received before a deadline lands
-    // before that TimerFired) — see merge_wake_events.
-    let ingest_result =
-        ingest_due_timers_and_signals(conn, exec_id, initial_history.next_event_id).await;
-    let (timers_fired, signals_delivered) =
-        fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
+    // before that TimerFired) — see merge_wake_events. A transient event-id
+    // conflict with a concurrent append_single_event committer re-drives the
+    // task instead of failing the run (issue #779).
+    let Some((timers_fired, signals_delivered)) = ingest_wake_events_or_requeue(
+        conn,
+        task,
+        worker_id,
+        sticky_timeout,
+        exec_id,
+        initial_history.next_event_id,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
 
     let final_history_result = store::load_history_inflated(
         conn,
@@ -7948,7 +8672,7 @@ async fn load_workflow_replay_state(
     .await;
     let final_history =
         fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
-    Ok((final_history, timers_fired, signals_delivered))
+    Ok(Some((final_history, timers_fired, signals_delivered)))
 }
 
 /// Prepare the workflow task, checking the in-process LRU cache first.
@@ -7970,7 +8694,7 @@ async fn prepare_workflow_task_with_cache(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     sticky_timeout: Duration,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<PreparedWorkflowTask> {
+) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
         fail_task_only(conn, task.id, &error.to_string()).await?;
@@ -8008,11 +8732,21 @@ async fn prepare_workflow_task_with_cache(
             fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
 
         // Single chronological ingest of due timers + pending signals (see
-        // merge_wake_events for the occurrence-order contract).
-        let ingest_result =
-            ingest_due_timers_and_signals(conn, exec_id, existing_delta.next_event_id).await;
-        let (timers_fired, signals_delivered) =
-            fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
+        // merge_wake_events for the occurrence-order contract). A transient
+        // event-id conflict with a concurrent append_single_event committer
+        // re-drives the task instead of failing the run (issue #779).
+        let Some((timers_fired, signals_delivered)) = ingest_wake_events_or_requeue(
+            conn,
+            task,
+            worker_id,
+            sticky_timeout,
+            exec_id,
+            existing_delta.next_event_id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
 
         // Load events appended by the ingest.
         let after_ingest_result = store::load_history_since_inflated(
@@ -8033,7 +8767,7 @@ async fn prepare_workflow_task_with_cache(
         history_events.extend(after_ingest.events);
         let next_event_id = after_ingest.next_event_id;
 
-        Ok(PreparedWorkflowTask {
+        Ok(Some(PreparedWorkflowTask {
             execution,
             exec_id,
             history_events,
@@ -8041,13 +8775,18 @@ async fn prepare_workflow_task_with_cache(
             timers_fired,
             signals_delivered,
             was_cache_hit: true,
-        })
+        }))
     } else {
-        // Cache miss path: full history load.
-        let (history, timers_fired, signals_delivered) =
-            load_workflow_replay_state(conn, task, worker_id, exec_id, offloader).await?;
+        // Cache miss path: full history load. A transient event-id conflict
+        // re-drives the task (issue #779), surfaced here as `None`.
+        let Some((history, timers_fired, signals_delivered)) =
+            load_workflow_replay_state(conn, task, worker_id, exec_id, sticky_timeout, offloader)
+                .await?
+        else {
+            return Ok(None);
+        };
 
-        Ok(PreparedWorkflowTask {
+        Ok(Some(PreparedWorkflowTask {
             execution,
             exec_id,
             history_events: history.events,
@@ -8055,7 +8794,7 @@ async fn prepare_workflow_task_with_cache(
             timers_fired,
             signals_delivered,
             was_cache_hit: false,
-        })
+        }))
     }
 }
 
@@ -8837,6 +9576,30 @@ async fn suspended_command_event_count(
     if extract_all_activity_waits(commands).is_some() {
         return Ok(bookkeeping_events);
     }
+    // Child-timeout race (issue #779): appends ChildWorkflowStarted + TimerStarted
+    // for a fresh dispatch (both new), nothing on a re-park (both already
+    // recorded). Checked before the plain timer/child branches so the shape is
+    // counted correctly rather than falling through to the +1 default. Mirrors
+    // the dispatch chain ordering.
+    if let Some((child, timer)) = extract_child_timeout_race(commands) {
+        let child_new = new_child_workflow_event_count(conn, std::slice::from_ref(&child)).await?;
+        let timer_new = if let Some(exec_uuid) = workflow_exec_id {
+            let existing: Option<HarvestTimer> = harvest_timers::table
+                .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                .filter(harvest_timers::fired.eq(false))
+                .first::<HarvestTimer>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            u64::from(existing.is_none())
+        } else {
+            1
+        };
+        return Ok(bookkeeping_events
+            .saturating_add(child_new)
+            .saturating_add(timer_new));
+    }
     if let Some(timer) = extract_started_timer_for_suspension(commands) {
         let is_new = if let Some(exec_uuid) = workflow_exec_id {
             let existing: Option<HarvestTimer> = harvest_timers::table
@@ -9031,7 +9794,7 @@ async fn process_workflow_task(
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
 ) -> HarvestResult<()> {
-    let mut prepared = prepare_workflow_task_with_cache(
+    let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
         task,
         worker_id,
@@ -9039,7 +9802,14 @@ async fn process_workflow_task(
         sticky_timeout,
         registry.payload_offloader(),
     )
-    .await?;
+    .await?
+    else {
+        // Issue #779: a transient wake-event-ingest event-id conflict re-drove
+        // the parent task (park + wake). The run was NOT failed; abandon this
+        // cycle and let the re-pended task be re-claimed with a fresh history
+        // load that advances past the winner's committed event.
+        return Ok(());
+    };
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         let error = format!(
             "no workflow handler registered for '{}'",
@@ -15502,6 +16272,154 @@ mod tests {
             timers: vec![],
         };
         assert_eq!(workflow_command_name(&cmd), "CancelRaceLosers");
+    }
+
+    // ── extract_child_timeout_race (issue #779) ──────────────────────────────
+
+    /// Build the canonical child-timeout suspension batch: exactly one
+    /// `StartChildWorkflow` followed by exactly one `StartTimer` — the shape
+    /// `spawn_child_workflow_timeout` emits on the live/re-park path.
+    fn child_timeout_batch() -> Vec<WorkflowCommand> {
+        vec![
+            WorkflowCommand::StartChildWorkflow {
+                child_id: ExecutionId::new(),
+                workflow_name: "timeout_child".to_string(),
+                input: serde_json::json!({"id": 1}),
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: TimerId::new("__child_timeout:1:timeout_child"),
+                duration_secs: 300,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ]
+    }
+
+    #[test]
+    fn extract_child_timeout_race_accepts_one_child_one_timer_plus_bookkeeping() {
+        // The exact shape spawn_child_workflow_timeout emits, plus a tolerated
+        // bookkeeping side-effect (e.g. a prior ctx.system_now()) and a
+        // CancelRaceLosers from a prior sequential race.
+        let mut commands = vec![WorkflowCommand::RecordSideEffect {
+            kind: crate::event::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!("2026-07-11T00:00:00Z"),
+        }];
+        commands.extend(child_timeout_batch());
+        commands.push(WorkflowCommand::CancelRaceLosers {
+            activities: vec![],
+            children: vec![],
+            timers: vec![],
+        });
+
+        let extracted = extract_child_timeout_race(&commands)
+            .expect("one child + one timer + bookkeeping must extract");
+        assert_eq!(extracted.0.workflow_name, "timeout_child");
+        assert_eq!(
+            extracted.1.timer_id.as_str(),
+            "__child_timeout:1:timeout_child"
+        );
+        assert_eq!(extracted.1.duration_secs, 300);
+    }
+
+    #[test]
+    fn extract_child_timeout_race_rejects_extra_activity_or_second_child() {
+        // A new ScheduleActivity riding the batch must NOT match — this is the
+        // AC9 caveat enforced by construction (fall through to fail-loud).
+        let mut with_activity = child_timeout_batch();
+        with_activity.push(WorkflowCommand::ScheduleActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: "send_email".to_string(),
+            input: serde_json::Value::Null,
+            queue: "default".to_string(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+        });
+        assert!(
+            extract_child_timeout_race(&with_activity).is_none(),
+            "a child-timeout batch with an extra activity must not match"
+        );
+
+        // A second StartChildWorkflow means a plain parallel child fan-out, not a
+        // child-timeout race.
+        let mut with_second_child = child_timeout_batch();
+        with_second_child.push(WorkflowCommand::StartChildWorkflow {
+            child_id: ExecutionId::new(),
+            workflow_name: "other_child".to_string(),
+            input: serde_json::Value::Null,
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+        });
+        assert!(
+            extract_child_timeout_race(&with_second_child).is_none(),
+            "a batch with a second child must not match the child-timeout race"
+        );
+    }
+
+    #[test]
+    fn extract_child_timeout_race_rejects_second_timer_or_signal_wait() {
+        // A second StartTimer means this is not the canonical one-child /
+        // one-timer race — fall through to fail-loud rather than silently
+        // dropping the extra timer's event.
+        let mut with_second_timer = child_timeout_batch();
+        with_second_timer.push(WorkflowCommand::StartTimer {
+            timer_id: TimerId::new("__child_timeout:2:timeout_child"),
+            duration_secs: 60,
+            result_tx: oneshot::channel::<()>().0,
+        });
+        assert!(
+            extract_child_timeout_race(&with_second_timer).is_none(),
+            "a batch with a second timer must not match the child-timeout race"
+        );
+
+        // A WaitForSignal riding the batch is the signal-or-deadline shape
+        // (issue #476), not a child-timeout race — it must not match here.
+        let mut with_signal_wait = child_timeout_batch();
+        with_signal_wait.push(WorkflowCommand::WaitForSignal {
+            signal_name: "approval".to_string(),
+            result_tx: oneshot::channel::<serde_json::Value>().0,
+        });
+        assert!(
+            extract_child_timeout_race(&with_signal_wait).is_none(),
+            "a child-timeout batch carrying a WaitForSignal must not match"
+        );
+    }
+
+    #[test]
+    fn extract_child_timeout_race_requires_reserved_timer_prefix() {
+        // (a) A `__child_timeout:`-prefixed timer STILL matches (the real
+        // primitive): child_timeout_batch() uses the reserved prefix.
+        assert!(
+            extract_child_timeout_race(&child_timeout_batch()).is_some(),
+            "the reserved-prefix child-timeout batch must still match"
+        );
+
+        // (b) An ORDINARY timer id (a hand-rolled
+        // `tokio::join!(spawn_child_workflow(..), timer("mytimer", n))` batch)
+        // must be REJECTED — it must fall through to the generic fail-loud
+        // "unsupported commands" path, exactly as before #779, so its ordinary
+        // timer is never silently left undeleted on a child-win.
+        let ordinary = vec![
+            WorkflowCommand::StartChildWorkflow {
+                child_id: ExecutionId::new(),
+                workflow_name: "timeout_child".to_string(),
+                input: serde_json::json!({"id": 1}),
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: TimerId::new("mytimer"),
+                duration_secs: 5,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        assert!(
+            extract_child_timeout_race(&ordinary).is_none(),
+            "a child + ordinary (non-`__child_timeout:`) timer must NOT match the \
+             child-timeout race"
+        );
     }
 
     #[test]
