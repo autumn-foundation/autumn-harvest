@@ -129,6 +129,9 @@ use autumn_harvest::{
 
 use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::schedule_runs;
+use crate::shard_fanout::{
+    self, FanoutRows, FanoutStatus, ShardObservation, UnavailableShard, collect_fanout_rows,
+};
 use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_report};
 use crate::state::HarvestDbPool;
 use crate::usage::{self, UsageParams, UsageResponse};
@@ -1828,11 +1831,10 @@ struct ExternalHandoffShardCoverage {
     unavailable: Vec<UnavailableShard>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct UnavailableShard {
-    shard_id: i32,
-    reason: String,
-}
+// `UnavailableShard` is the shared cross-shard fan-out type from
+// `crate::shard_fanout` (imported at the top of this module). It was previously
+// duplicated here; issue #756 unified the two structurally-identical
+// definitions so the partial-availability shape is single-sourced.
 
 #[derive(Debug, Serialize)]
 struct ExternalHandoffResponse {
@@ -2857,6 +2859,12 @@ pub(crate) struct WorkflowListCursor {
 pub struct WorkflowListPage {
     pub workflows: Vec<StalledWorkflowRow>,
     pub next_cursor: Option<String>,
+    /// Cross-shard completeness of this page (issue #756). Additive: always
+    /// present on the paginated object shape, `complete` on the happy path.
+    pub status: FanoutStatus,
+    /// Shards that could not be queried, named with a reason (issue #756).
+    /// Empty on the happy path.
+    pub unavailable_shards: Vec<UnavailableShard>,
 }
 
 // A parsed query-param bag: each bool is an independent opt-in filter flag
@@ -5619,7 +5627,17 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/dead-letters/aggregate",
-            Some(&["total", "filtered_total", "groups", "truncated"]),
+            // `status` + `unavailable_shards` added additively (issue #756):
+            // an unreachable shard degrades the aggregate to `200 partial`
+            // rather than failing the whole request.
+            Some(&[
+                "total",
+                "filtered_total",
+                "groups",
+                "truncated",
+                "status",
+                "unavailable_shards",
+            ]),
         ),
         (
             "POST",
@@ -5682,7 +5700,18 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workers/health",
-            Some(&["healthy", "stale", "draining", "by_queue", "by_shard"]),
+            // `status` + `unavailable_shards` added additively (issue #756):
+            // an unreachable shard degrades to `200 partial` (totals reflect
+            // the reachable shards) rather than a `500`.
+            Some(&[
+                "healthy",
+                "stale",
+                "draining",
+                "by_queue",
+                "by_shard",
+                "status",
+                "unavailable_shards",
+            ]),
         ),
         ("GET", "/workers/drain-preview", None), // Vec<DrainPreviewItem>
         (
@@ -6690,27 +6719,45 @@ async fn list_workflows(
     use axum::response::IntoResponse as _;
     let filters = parse_workflow_filters(&pairs)?;
     if filters.no_progress_minutes.is_some() {
-        // Stalled-workflow discovery (issue #486) always returns a bare array.
-        // Cursor pagination is not supported for this code path.
-        let rows = load_stalled_workflows_from_shards(&api_state, &filters).await?;
-        return Ok(Json(rows).into_response());
+        // Stalled-workflow discovery (issue #486). On the happy path this is a
+        // bare array (cursor pagination is not supported here); when a shard is
+        // unreachable (issue #756) it degrades to the `{ workflows, status,
+        // unavailable_shards }` envelope instead of a `500`.
+        let page = load_stalled_workflows_from_shards(&api_state, &filters).await?;
+        return Ok(fanout_list_json(
+            "workflows",
+            page.rows,
+            page.status,
+            &page.unavailable_shards,
+        )?
+        .into_response());
     }
-    let (executions, next_cursor) = load_workflows_from_shards(&api_state, &filters).await?;
-    let rows: Vec<StalledWorkflowRow> = executions
+    let page = load_workflows_from_shards(&api_state, &filters).await?;
+    let rows: Vec<StalledWorkflowRow> = page
+        .executions
         .into_iter()
         .map(StalledWorkflowRow::from)
         .collect();
     if filters.paginated {
         // Opt-in envelope: callers that passed cursor/page_size/order get the
-        // paginated response shape { workflows, next_cursor }.
+        // paginated response shape { workflows, next_cursor }. The partial-
+        // availability fields (issue #756) are additive here — the object
+        // already exists — so they are always present (empty on the happy path).
         Ok(Json(WorkflowListPage {
             workflows: rows,
-            next_cursor,
+            next_cursor: page.next_cursor,
+            status: page.status,
+            unavailable_shards: page.unavailable_shards,
         })
         .into_response())
     } else {
-        // Legacy bare-array response for callers using only limit/state/search_attr.
-        Ok(Json(rows).into_response())
+        // Legacy default: bare array on the happy path (byte-for-byte unchanged,
+        // AC3); the `{ workflows, status, unavailable_shards }` envelope only on
+        // shard degradation (issue #756, AC1/AC2).
+        Ok(
+            fanout_list_json("workflows", rows, page.status, &page.unavailable_shards)?
+                .into_response(),
+        )
     }
 }
 
@@ -16746,9 +16793,17 @@ fn schedule_expr_for_summary(schedule: &Schedule) -> String {
 
 async fn list_dags(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<Vec<DagSummary>>, AutumnError> {
+) -> Result<Json<Value>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let schedules = load_schedules_from_shards(&api_state).await?;
+    // Issue #756: degrade to a `200 partial` naming `unavailable_shards` when a
+    // shard is unreachable, rather than `500`. The schedule-derived rows come
+    // only from the reachable shards; the in-memory registered DAGs below are
+    // always present regardless of shard reachability.
+    let FanoutRows {
+        rows: schedules,
+        status,
+        unavailable_shards,
+    } = load_schedules_from_shards(&api_state).await?;
 
     let mut dags = BTreeMap::new();
     for schedule in schedules {
@@ -16784,7 +16839,11 @@ async fn list_dags(
         });
     }
 
-    Ok(Json(dags.into_values().collect()))
+    // Conditional-envelope rule (issue #756): bare array on the happy path
+    // (byte-for-byte unchanged), degraded `{ dags, status, unavailable_shards }`
+    // envelope when a shard was unreachable.
+    let dags: Vec<DagSummary> = dags.into_values().collect();
+    fanout_list_json("dags", dags, status, &unavailable_shards)
 }
 
 async fn list_dag_runs(
@@ -17186,14 +17245,22 @@ fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
 
 async fn list_schedules(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<Vec<ScheduleEntry>>, AutumnError> {
-    let schedules = load_schedules_from_shards(&api_state).await?;
+) -> Result<Json<Value>, AutumnError> {
+    // Issue #756: fan out collect-and-continue so an unreachable shard degrades
+    // to a partial `200` naming `unavailable_shards`, not a `500`. Shared with
+    // `GET /dags` via `load_schedules_from_shards`.
+    let FanoutRows {
+        rows: schedules,
+        status,
+        unavailable_shards,
+    } = load_schedules_from_shards(&api_state).await?;
+
     let schedule_ids: Vec<uuid::Uuid> = schedules.iter().map(|s| s.id).collect();
 
     // Best-effort: load the most recent backfill log row for each schedule.
     let recent_backfills = load_recent_backfills(&api_state, &schedule_ids).await;
 
-    let entries = schedules
+    let entries: Vec<ScheduleEntry> = schedules
         .into_iter()
         .map(|s| {
             let last_backfill = recent_backfills
@@ -17203,7 +17270,41 @@ async fn list_schedules(
             schedule_entry_from_row(s, last_backfill)
         })
         .collect();
-    Ok(Json(entries))
+    fanout_list_json("schedules", entries, status, &unavailable_shards)
+}
+
+/// Merge and sort per-shard schedule observations (pure, no DB) — issue #756.
+///
+/// Sort order matches the pre-#756 `load_schedules_from_shards`: by effective
+/// name (`dag_name` or `workflow_name`), tie-broken on `id`.
+fn build_schedule_fanout(
+    observations: Vec<ShardObservation<HarvestSchedule>>,
+) -> FanoutRows<HarvestSchedule> {
+    let FanoutRows {
+        mut rows,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
+    rows.sort_by(|left, right| {
+        let left_name = left
+            .dag_name
+            .as_deref()
+            .or(left.workflow_name.as_deref())
+            .unwrap_or("");
+        let right_name = right
+            .dag_name
+            .as_deref()
+            .or(right.workflow_name.as_deref())
+            .unwrap_or("");
+        left_name
+            .cmp(right_name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    }
 }
 
 async fn get_schedule(
@@ -21975,13 +22076,18 @@ async fn list_dead_letters(
     Query(query): Query<DeadLetterListQuery>,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
-) -> Result<Json<Vec<DeadLetterResponse>>, AutumnError> {
+) -> Result<Json<Value>, AutumnError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     // Read-path payload decoding (issue #608): the route is admin-gated, so
     // an arriving request passes the same predicate the decoder re-checks.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
-    let mut dead_letters =
-        load_dead_letters_from_shards(&api_state, limit, query.owner.as_deref()).await?;
+    // Issue #756: partial availability — an unreachable shard degrades to a
+    // `200 partial` envelope naming `unavailable_shards` rather than a `500`.
+    let FanoutRows {
+        rows: mut dead_letters,
+        status,
+        unavailable_shards,
+    } = load_dead_letters_from_shards(&api_state, limit, query.owner.as_deref()).await?;
     if let Some(codecs) = decoder.as_ref() {
         // Decode each row's JSONB input and TEXT error on the response copy
         // only; one audit row per request that touched ≥1 envelope.
@@ -22027,14 +22133,22 @@ async fn list_dead_letters(
         for (shard, ids) in by_shard {
             use autumn_harvest::schema::harvest_workflow_executions::dsl as wf_dsl;
             let shard_pool = pool.pool_for(shard);
-            let mut conn = acquire_conn(shard_pool).await?;
-            let rows: Vec<(uuid::Uuid, Option<String>)> = wf_dsl::harvest_workflow_executions
+            // Best-effort runbook enrichment (issue #756): a shard that goes
+            // unreachable between the DLQ load and this secondary lookup must
+            // not `500` the whole request — skip it; the dead-letter rows still
+            // return, just without their runbook links.
+            let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                continue;
+            };
+            let rows: Vec<(uuid::Uuid, Option<String>)> = match wf_dsl::harvest_workflow_executions
                 .filter(wf_dsl::id.eq_any(&ids))
                 .select((wf_dsl::id, wf_dsl::runbook_url))
                 .load::<(uuid::Uuid, Option<String>)>(&mut conn)
                 .await
-                .map_err(HarvestError::from)
-                .map_err(map_error)?;
+            {
+                Ok(rows) => rows,
+                Err(_) => continue,
+            };
             for (id, url) in rows {
                 if let Some(u) = url {
                     runbooks.insert(id, u);
@@ -22056,7 +22170,7 @@ async fn list_dead_letters(
         })
         .collect();
 
-    Ok(Json(responses))
+    fanout_list_json("dead_letters", responses, status, &unavailable_shards)
 }
 
 /// `GET /dead-letters/aggregate` — root-cause aggregation for DLQ triage
@@ -22066,24 +22180,50 @@ async fn list_dead_letters(
 /// `activity_name`, `queue_name`, `task_type`, `time_bucket`, `failure_signature`)
 /// and returns per-group counts plus a handful of representative
 /// `dead_letter_id`s, fanning out across shards and merging the partials.
+///
+/// Partial availability (issue #756): the initial cut hard-`?`d each shard,
+/// turning one unreachable shard into a `500`. It now collects-and-continues —
+/// the merge runs over the reachable shards' partials and the response object
+/// carries additive `status` + `unavailable_shards` fields (empty/`complete`
+/// on the happy path).
 async fn aggregate_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
-) -> Result<Json<dlq::DlqAggregateResponse>, AutumnError> {
+) -> Result<Json<Value>, AutumnError> {
     let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
 
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut partials = Vec::new();
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let partial = dlq::aggregate_dead_letters(&mut conn, &params)
-            .await
-            .map_err(map_error)?;
-        partials.push(partial);
-    }
+    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+        let params = params.clone();
+        async move {
+            dlq::aggregate_dead_letters(&mut conn, &params)
+                .await
+                .map(|partial| vec![partial])
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
 
-    Ok(Json(dlq::merge_dlq_aggregates(&params, partials)))
+    let FanoutRows {
+        rows: partials,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
+
+    let merged = dlq::merge_dlq_aggregates(&params, partials);
+    let mut value = serde_json::to_value(merged).map_err(|e| map_error(HarvestError::from(e)))?;
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "status".to_string(),
+            serde_json::to_value(status).map_err(|e| map_error(HarvestError::from(e)))?,
+        );
+        map.insert(
+            "unavailable_shards".to_string(),
+            serde_json::to_value(unavailable_shards)
+                .map_err(|e| map_error(HarvestError::from(e)))?,
+        );
+    }
+    Ok(Json(value))
 }
 
 async fn replay_dead_letter(
@@ -24369,6 +24509,148 @@ pub(crate) async fn load_workflows(
         .map_err(database_error)
 }
 
+// ── Issue #756: partial-availability for cross-shard fan-out reads ───────────
+//
+// A single unreachable shard used to `?`-propagate into a whole-request `500`
+// on every cross-shard *read* endpoint (`GET /workflows`, `/workers`,
+// `/admin/schedules`, `/dead-letters`, …). These helpers refactor those
+// fan-outs to collect-and-continue: a reachable shard's rows still flow, an
+// unreachable shard is named in `unavailable_shards`, and the endpoint returns
+// `200 OK` with the union plus a `status` verdict rather than failing
+// wholesale. Writes keep strict `?` semantics.
+
+/// Fan out a per-shard query across every shard the router knows about,
+/// collecting each shard's rows or its error into a [`ShardObservation`]
+/// (never propagating a single shard's failure).
+///
+/// Iterates [`shard_fanout::expected_shards`] — every shard with a live pool
+/// *and* every shard the router advertises via `readable_shards`/`default_shard`
+/// — so a shard mid a shard-add rollout that has no pool wired up yet is
+/// reported `unavailable` rather than silently omitted (which would let
+/// `status` read `complete` while a known shard was never queried).
+/// Resolve each expected shard to its EXACT pool (no default fallback).
+///
+/// [`shard_fanout::expected_shards`] deliberately surfaces a shard the router
+/// advertises even when this process has no pool for it yet (mid a shard-add
+/// rollout); that shard resolves to `None` here so the caller folds it into
+/// `unavailable_shards`. Resolving through [`ShardedDbPool::pool_for`] instead
+/// would be a bug: its default-shard fallback would silently query the DEFAULT
+/// shard's DB in the poolless shard's place, duplicating default-shard rows and
+/// letting a completeness `status` read `complete` even though that shard was
+/// never inspected (issue #756 review). This mirrors the exact-resolution
+/// `pools.get(&shard_id)` guard `resolve_workflow_by_business_id` already uses.
+fn resolve_expected_shard_pools<'a>(
+    expected: &std::collections::BTreeSet<i32>,
+    pools: &'a BTreeMap<i32, DbPool>,
+) -> Vec<(i32, Option<&'a DbPool>)> {
+    expected
+        .iter()
+        .map(|&shard_id| (shard_id, pools.get(&shard_id)))
+        .collect()
+}
+
+async fn observe_shards<R, F, Fut>(
+    api_state: &HarvestApiState,
+    query_shard: F,
+) -> Result<Vec<ShardObservation<R>>, AutumnError>
+where
+    F: Fn(i32, PoolConn) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<R>, String>>,
+{
+    // Total storage-layer unavailability (no pool installed at all — a
+    // misconfiguration or the boot window) is an honest 503, NOT "one shard
+    // down": we cannot even enumerate shards, so degrading to a bare `200 []`
+    // would silently mask a whole-storage outage. Trunk `?`-propagated the
+    // `storage_pool()` error here; we keep that fail-closed behavior and make
+    // it an explicit 503 (issue #756 review). Per-SHARD unreachability below
+    // still degrades to `200 partial`.
+    if api_state.storage_pool().is_err() {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest storage pool is not configured".to_string(),
+        ));
+    }
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+
+    let mut observations = Vec::with_capacity(expected.len());
+    for (shard_id, maybe_pool) in resolve_expected_shard_pools(&expected, &pools) {
+        // A shard the router advertises but this process has no pool for yet
+        // (mid a shard-add rollout) is folded into `unavailable_shards` here —
+        // never resolved through `pool_for`'s default-shard fallback, which
+        // would query the wrong DB and falsely read `complete`.
+        let Some(shard_pool) = maybe_pool else {
+            observations.push(ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(format!("shard {shard_id} has no configured storage pool")),
+            });
+            continue;
+        };
+        match acquire_conn(shard_pool).await {
+            Ok(conn) => match query_shard(shard_id, conn).await {
+                Ok(rows) => observations.push(ShardObservation {
+                    shard_id,
+                    rows,
+                    error: None,
+                }),
+                Err(reason) => observations.push(ShardObservation {
+                    shard_id,
+                    rows: Vec::new(),
+                    error: Some(reason),
+                }),
+            },
+            Err(_) => observations.push(ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(format!(
+                    "database connection for shard {shard_id} could not be acquired"
+                )),
+            }),
+        }
+    }
+    Ok(observations)
+}
+
+/// Serialize a list-style cross-shard fan-out result (issue #756).
+///
+/// On the happy path (`status == Complete` — every expected shard inspected)
+/// the **bare array** is returned unchanged, so existing clients and the legacy
+/// response contract are byte-for-byte preserved (AC3). Otherwise a degraded
+/// envelope `{ <items_key>: [...], "status": "...", "unavailable_shards": [...] }`
+/// is returned instead (still `200 OK`, AC1/AC2) — the machine-readable
+/// partiality indicator appears on every degraded response, exactly as AC2
+/// specifies ("*every degraded* response carries [the indicator]").
+///
+/// Keying on `status != Complete` (not `unavailable_shards.is_empty()`) is
+/// deliberate and load-bearing: a `Unavailable` verdict with an *empty*
+/// `unavailable_shards` list (e.g. no expected shard could even be resolved)
+/// must still surface as an envelope rather than a silently-empty bare `[]`
+/// (issue #756 review).
+fn fanout_list_json<T: serde::Serialize>(
+    items_key: &'static str,
+    rows: Vec<T>,
+    status: FanoutStatus,
+    unavailable_shards: &[UnavailableShard],
+) -> Result<Json<Value>, AutumnError> {
+    let arr = serde_json::to_value(rows).map_err(|e| map_error(HarvestError::from(e)))?;
+    if status == FanoutStatus::Complete {
+        Ok(Json(arr))
+    } else {
+        let mut map = serde_json::Map::new();
+        map.insert(items_key.to_string(), arr);
+        map.insert(
+            "status".to_string(),
+            serde_json::to_value(status).map_err(|e| map_error(HarvestError::from(e)))?,
+        );
+        map.insert(
+            "unavailable_shards".to_string(),
+            serde_json::to_value(unavailable_shards)
+                .map_err(|e| map_error(HarvestError::from(e)))?,
+        );
+        Ok(Json(Value::Object(map)))
+    }
+}
+
 /// Load workflows from all shards with keyset pagination support (issue #498).
 ///
 /// Each shard is queried for `limit+1` rows beyond the cursor (the extra row is
@@ -24378,30 +24660,72 @@ pub(crate) async fn load_workflows(
 ///
 /// Cross-shard contract: with N shards, up to `N * (limit+1)` rows are read per
 /// page but at most `limit` rows are returned.
+///
+/// Partial availability (issue #756): a single unreachable shard no longer
+/// fails the whole request — its `unavailable_shards` entry rides on the
+/// returned [`WorkflowFanoutPage`] and reachable shards' rows still merge and
+/// paginate normally.
 pub(crate) async fn load_workflows_from_shards(
     api_state: &HarvestApiState,
     filters: &WorkflowFilters,
-) -> Result<(Vec<WorkflowExecution>, Option<String>), AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut workflows = Vec::new();
-
+) -> Result<WorkflowFanoutPage, AutumnError> {
     // Over-fetch one extra row per shard so the post-merge step can detect
     // whether a next page exists. The probe row is dropped after truncation.
     // `saturating_add` guards against `i64::MAX` overflow.
     let probe_filters = filters.clone().with_limit(filters.limit.saturating_add(1));
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = load_workflows(&mut conn, &probe_filters)
-            .await
-            .map_err(map_error)?;
-        workflows.append(&mut rows);
-    }
+    let observations = observe_shards(api_state, |_shard_id, mut conn| {
+        let probe_filters = probe_filters.clone();
+        async move {
+            load_workflows(&mut conn, &probe_filters)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+
+    Ok(build_workflow_fanout_page(
+        observations,
+        filters.order,
+        filters.limit,
+    ))
+}
+
+/// A merged, paginated page of workflows plus a cross-shard completeness
+/// verdict (issue #756).
+pub(crate) struct WorkflowFanoutPage {
+    /// Merged, sorted, truncated executions.
+    pub(crate) executions: Vec<WorkflowExecution>,
+    /// Keyset cursor for the next page, when more rows exist.
+    pub(crate) next_cursor: Option<String>,
+    /// Cross-shard completeness of this page.
+    pub(crate) status: FanoutStatus,
+    /// Shards that could not be queried (empty on the happy path).
+    pub(crate) unavailable_shards: Vec<UnavailableShard>,
+}
+
+/// Merge, sort, and paginate per-shard workflow observations (pure, no DB).
+///
+/// Ordering, keyset cursor, and truncation are applied over the union of
+/// **reachable** shards' rows — identical to the pre-#756 behavior when every
+/// shard is reachable — while a folded [`FanoutStatus`]/`unavailable_shards`
+/// lets the caller answer `200 partial` instead of `500` on an unreachable
+/// shard.
+pub(crate) fn build_workflow_fanout_page(
+    observations: Vec<ShardObservation<WorkflowExecution>>,
+    order: WorkflowSortOrder,
+    limit_raw: i64,
+) -> WorkflowFanoutPage {
+    let FanoutRows {
+        mut rows,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
 
     // Sort by the requested direction; tie-break on id for total ordering.
-    match filters.order {
+    match order {
         WorkflowSortOrder::Desc => {
-            workflows.sort_by(|left, right| {
+            rows.sort_by(|left, right| {
                 right
                     .created_at
                     .cmp(&left.created_at)
@@ -24409,7 +24733,7 @@ pub(crate) async fn load_workflows_from_shards(
             });
         }
         WorkflowSortOrder::Asc => {
-            workflows.sort_by(|left, right| {
+            rows.sort_by(|left, right| {
                 left.created_at
                     .cmp(&right.created_at)
                     .then_with(|| left.id.cmp(&right.id))
@@ -24417,20 +24741,25 @@ pub(crate) async fn load_workflows_from_shards(
         }
     }
 
-    let limit = usize::try_from(filters.limit).unwrap_or(usize::MAX);
+    let limit = usize::try_from(limit_raw).unwrap_or(usize::MAX);
     // Guard `limit > 0` so a hand-built filter with `limit == 0` can never
     // underflow `limit - 1` (the HTTP path always clamps to >= 1, but this is
     // a `pub(crate)` entry point).
-    let next_cursor = if limit > 0 && workflows.len() > limit {
-        let last_kept = &workflows[limit - 1];
+    let next_cursor = if limit > 0 && rows.len() > limit {
+        let last_kept = &rows[limit - 1];
         let cursor = encode_workflow_list_cursor(last_kept);
-        workflows.truncate(limit);
+        rows.truncate(limit);
         Some(cursor)
     } else {
         None
     };
 
-    Ok((workflows, next_cursor))
+    WorkflowFanoutPage {
+        executions: rows,
+        next_cursor,
+        status,
+        unavailable_shards,
+    }
 }
 
 /// Per-shard stall-discovery query (issue #486).
@@ -24737,20 +25066,38 @@ pub(crate) async fn load_stalled_workflows(
 
 /// Fan-out `load_stalled_workflows` across all configured shards and merge
 /// results sorted oldest-stall-first, truncated to `filters.limit`.
+///
+/// Partial availability (issue #756): an unreachable shard is folded into the
+/// returned [`FanoutRows`] rather than failing the whole request; reachable
+/// shards' rows still merge, sort, and truncate normally.
 pub(crate) async fn load_stalled_workflows_from_shards(
     api_state: &HarvestApiState,
     filters: &WorkflowFilters,
-) -> Result<Vec<StalledWorkflowRow>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut rows: Vec<StalledWorkflowRow> = Vec::new();
+) -> Result<FanoutRows<StalledWorkflowRow>, AutumnError> {
+    let observations = observe_shards(api_state, |_shard_id, mut conn| {
+        let filters = filters.clone();
+        async move {
+            load_stalled_workflows(&mut conn, &filters)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut shard_rows = load_stalled_workflows(&mut conn, filters)
-            .await
-            .map_err(map_error)?;
-        rows.append(&mut shard_rows);
-    }
+    Ok(build_stalled_fanout(observations, filters.limit))
+}
+
+/// Merge, sort oldest-stall-first, and truncate per-shard stalled observations
+/// (pure, no DB) — issue #756.
+pub(crate) fn build_stalled_fanout(
+    observations: Vec<ShardObservation<StalledWorkflowRow>>,
+    limit_raw: i64,
+) -> FanoutRows<StalledWorkflowRow> {
+    let FanoutRows {
+        mut rows,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
 
     // Sort oldest-stall-first: the most actionable workflows appear at the top.
     rows.sort_by(|a, b| {
@@ -24758,8 +25105,12 @@ pub(crate) async fn load_stalled_workflows_from_shards(
             .cmp(&b.last_event_at)
             .then_with(|| a.execution.id.cmp(&b.execution.id))
     });
-    rows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
-    Ok(rows)
+    rows.truncate(usize::try_from(limit_raw).unwrap_or(usize::MAX));
+    FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    }
 }
 
 // `decoder`/`outcome`: read-path payload decoding (issue #608) is applied
@@ -25067,66 +25418,76 @@ fn history_export_error_response(error: HistoryExportError) -> axum::response::R
     }
 }
 
+/// Fan-out the full schedule listing across every shard, merged by effective
+/// name (issue #756).
+///
+/// Partial availability: an unreachable shard is folded into the returned
+/// [`FanoutRows`] rather than failing the whole request — the single source of
+/// truth shared by `GET /admin/schedules` (`list_schedules`) and `GET /dags`
+/// (`list_dags`), so both degrade to `200 partial` instead of `500` and neither
+/// duplicates the query + effective-name sort.
 async fn load_schedules_from_shards(
     api_state: &HarvestApiState,
-) -> Result<Vec<HarvestSchedule>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut schedules = Vec::new();
-
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = harvest_schedules::table
+) -> Result<FanoutRows<HarvestSchedule>, AutumnError> {
+    let observations = observe_shards(api_state, |_shard_id, mut conn| async move {
+        harvest_schedules::table
             .order(harvest_schedules::dag_name.asc())
             .select(HarvestSchedule::as_select())
             .load(&mut conn)
             .await
-            .map_err(database_error)
-            .map_err(map_error)?;
-        schedules.append(&mut rows);
-    }
-
-    schedules.sort_by(|left, right| {
-        let left_name = left
-            .dag_name
-            .as_deref()
-            .or(left.workflow_name.as_deref())
-            .unwrap_or("");
-        let right_name = right
-            .dag_name
-            .as_deref()
-            .or(right.workflow_name.as_deref())
-            .unwrap_or("");
-        left_name
-            .cmp(right_name)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(schedules)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(build_schedule_fanout(observations))
 }
 
+/// Fan-out `dlq::list_dead_letters` across all shards, merged newest-first and
+/// truncated to `limit`.
+///
+/// Partial availability (issue #756): an unreachable shard is folded into the
+/// returned [`FanoutRows`] rather than failing the whole request.
 async fn load_dead_letters_from_shards(
     api_state: &HarvestApiState,
     limit: i64,
     owner: Option<&str>,
-) -> Result<Vec<DeadLetter>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut dead_letters = Vec::new();
+) -> Result<FanoutRows<DeadLetter>, AutumnError> {
+    let owner = owner.map(ToOwned::to_owned);
+    let observations = observe_shards(api_state, |_shard_id, mut conn| {
+        let owner = owner.clone();
+        async move {
+            dlq::list_dead_letters(&mut conn, limit, owner.as_deref())
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = dlq::list_dead_letters(&mut conn, limit, owner)
-            .await
-            .map_err(map_error)?;
-        dead_letters.append(&mut rows);
-    }
+    Ok(build_dead_letter_fanout(observations, limit))
+}
 
-    dead_letters.sort_by(|left, right| {
+/// Merge, sort newest-first, and truncate per-shard dead-letter observations
+/// (pure, no DB) — issue #756.
+fn build_dead_letter_fanout(
+    observations: Vec<ShardObservation<DeadLetter>>,
+    limit: i64,
+) -> FanoutRows<DeadLetter> {
+    let FanoutRows {
+        mut rows,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
+    rows.sort_by(|left, right| {
         right
             .failed_at
             .cmp(&left.failed_at)
             .then_with(|| right.id.cmp(&left.id))
     });
-    dead_letters.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(dead_letters)
+    rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    }
 }
 
 async fn replay_dead_letter_from_shards(
@@ -27081,11 +27442,9 @@ pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> 
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
-) -> Result<Json<Vec<WorkerRow>>, AutumnError> {
+) -> Result<Json<Value>, AutumnError> {
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut results: Vec<WorkerRow> = Vec::new();
 
     // Per-shard load drops the snapshot-dependent filters (status, health,
     // build_id, deployment_name) and applies them globally AFTER dedup
@@ -27104,13 +27463,22 @@ async fn list_workers_handler(
         deployment_name: None,
         ..filters.clone()
     };
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
-            .await
-            .map_err(map_error)?;
-        results.append(&mut rows);
-    }
+    // Issue #756: collect-and-continue so an unreachable shard degrades to a
+    // `200 partial` naming `unavailable_shards` rather than a `500`.
+    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+        let per_shard_filters = per_shard_filters.clone();
+        async move {
+            list_workers(&mut conn, &per_shard_filters, stale_threshold)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+    let FanoutRows {
+        rows: results,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
 
     // A multi-shard worker registers a row in every shard's harvest_workers
     // table. Dedup by worker_id, keeping the freshest per-shard snapshot so each
@@ -27178,7 +27546,9 @@ async fn list_workers_handler(
     // real limit globally.
     results.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
     results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
-    Ok(Json(results))
+    // Issue #756: bare array on the happy path (AC3); degraded envelope naming
+    // `unavailable_shards` when a shard was unreachable (AC1/AC2).
+    fanout_list_json("workers", results, status, &unavailable_shards)
 }
 
 async fn get_worker_handler(
@@ -27259,25 +27629,34 @@ async fn worker_pinned_executions_handler(
 
 async fn workers_health(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<FleetHealth>, AutumnError> {
+) -> Result<Json<Value>, AutumnError> {
     let stale_threshold = api_state.worker_stale_threshold();
-    let pool = api_state.storage_pool().map_err(map_error)?;
-
-    // Collect all worker rows from every shard, then dedup by worker_id so a
-    // multi-shard worker (which registers a row in each of its shard DBs) is
-    // counted exactly once in the healthy/stale/draining totals.
-    let mut all_workers: Vec<WorkerRow> = Vec::new();
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
         ..WorkerFilters::default()
     };
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
-            .await
-            .map_err(map_error)?;
-        all_workers.append(&mut rows);
-    }
+
+    // Collect all worker rows from every shard, then dedup by worker_id so a
+    // multi-shard worker (which registers a row in each of its shard DBs) is
+    // counted exactly once in the healthy/stale/draining totals.
+    //
+    // Issue #756: collect-and-continue — an unreachable shard is named in
+    // `unavailable_shards` and the totals reflect the reachable shards rather
+    // than failing the whole health check with a `500`.
+    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+        let per_shard_filters = per_shard_filters.clone();
+        async move {
+            list_workers(&mut conn, &per_shard_filters, stale_threshold)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+    let FanoutRows {
+        rows: all_workers,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
 
     // Dedup by worker_id, keeping the freshest per-shard snapshot so a stale
     // copy on one shard never masks a healthy heartbeat on another in the
@@ -27319,7 +27698,24 @@ async fn workers_health(
         }
     }
 
-    Ok(Json(combined))
+    // Issue #756: `FleetHealth`'s existing fields (`healthy`/`stale`/…) stay at
+    // the top level (additive, no wrapping); `status` + `unavailable_shards` ride
+    // alongside. `FleetHealth` has none of those field names, so there is no
+    // collision. Empty/`complete` on the happy path.
+    let mut value =
+        serde_json::to_value(&combined).map_err(|e| map_error(HarvestError::from(e)))?;
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "status".to_string(),
+            serde_json::to_value(status).map_err(|e| map_error(HarvestError::from(e)))?,
+        );
+        map.insert(
+            "unavailable_shards".to_string(),
+            serde_json::to_value(unavailable_shards)
+                .map_err(|e| map_error(HarvestError::from(e)))?,
+        );
+    }
+    Ok(Json(value))
 }
 
 /// Parse worker query-string parameters, mapping errors to `400 Bad Request`.
@@ -33882,5 +34278,268 @@ mod tests {
         assert!(out.contains(
             "harvest_queue_active_workers{queue=\"emails_\\\"escaped\\\"_\\\\test\"} 10"
         ));
+    }
+
+    // ── issue #756: cross-shard fan-out pool resolution + merge during
+    // shard degradation ──────────────────────────────────────────────────────
+
+    /// A `WorkflowExecution` stub with a deterministic id + `created_at`.
+    fn exec_at(id_byte: u8, created_at: chrono::DateTime<chrono::Utc>) -> WorkflowExecution {
+        let mut e = stub_workflow_execution();
+        e.id = uuid::Uuid::from_bytes([id_byte; 16]);
+        e.created_at = created_at;
+        e
+    }
+
+    fn dl_at(id_byte: u8, failed_at: chrono::DateTime<chrono::Utc>) -> DeadLetter {
+        DeadLetter {
+            id: uuid::Uuid::from_bytes([id_byte; 16]),
+            original_task_id: uuid::Uuid::nil(),
+            queue_name: "default".to_string(),
+            task_type: "activity".to_string(),
+            workflow_exec_id: None,
+            activity_name: None,
+            input: serde_json::json!({}),
+            error: "boom".to_string(),
+            attempts: 3,
+            failed_at,
+            owner: None,
+            severity: None,
+        }
+    }
+
+    fn sched_named(
+        id_byte: u8,
+        dag_name: Option<&str>,
+        workflow_name: Option<&str>,
+    ) -> HarvestSchedule {
+        let now = chrono::Utc::now();
+        HarvestSchedule {
+            id: uuid::Uuid::from_bytes([id_byte; 16]),
+            dag_name: dag_name.map(ToOwned::to_owned),
+            schedule_expr: Some("@hourly".to_string()),
+            timezone: "UTC".to_string(),
+            catchup: false,
+            max_active_runs: 1,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: None,
+            created_at: now,
+            updated_at: now,
+            workflow_name: workflow_name.map(ToOwned::to_owned),
+            workflow_input: None,
+            queue_name: None,
+            paused_at: None,
+            paused_by: None,
+            pause_reason: None,
+            jitter_secs: 0,
+            overlap_policy: "skip".to_string(),
+            buffered_runs: serde_json::json!([]),
+            buffer_all_max: 0,
+            calendar_name: None,
+            skip_policy: "skip".to_string(),
+            fire_claim_token: None,
+            fire_claimed_until: None,
+            consecutive_failure_limit: None,
+            consecutive_failure_count: 0,
+            auto_paused_at: None,
+            end_at: None,
+            max_runs: None,
+            runs_started: 0,
+            exhausted_at: None,
+            exhausted_reason: None,
+            catchup_policy: None,
+            catchup_window_secs: None,
+            last_catchup_dropped: 0,
+            last_catchup_at: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback() {
+        // Mid a shard-add rollout, `expected_shards` surfaces shard 1 but this
+        // process has no pool for it. Resolution MUST return None for shard 1 —
+        // NOT the default shard's pool (which `ShardedDbPool::pool_for` would
+        // return). A default fallback would query the wrong DB, duplicate
+        // default-shard rows, and let `status` falsely read `complete`
+        // (issue #756 review). The pool never connects; `.build()` is lazy.
+        let live_shard_pool =
+            workflow_result_test_pool("postgres://harvest:harvest@127.0.0.1:1/never");
+        let mut pools = BTreeMap::new();
+        pools.insert(0, live_shard_pool);
+        let expected: std::collections::BTreeSet<i32> = [0, 1].into_iter().collect();
+
+        let resolved = resolve_expected_shard_pools(&expected, &pools);
+        assert_eq!(resolved.len(), 2);
+        let shard0 = resolved
+            .iter()
+            .find(|(s, _)| *s == 0)
+            .expect("shard 0 present");
+        assert!(shard0.1.is_some(), "shard 0 has a configured pool");
+        let shard1 = resolved
+            .iter()
+            .find(|(s, _)| *s == 1)
+            .expect("shard 1 present");
+        assert!(
+            shard1.1.is_none(),
+            "poolless shard 1 must resolve to None, never a default-fallback pool"
+        );
+
+        // Folded through collect_fanout_rows the way observe_shards does, the
+        // poolless shard yields a `partial` verdict naming shard 1 — never a
+        // silent `complete`.
+        let obs: Vec<ShardObservation<i64>> = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![1],
+                error: None,
+            },
+            ShardObservation {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("shard 1 has no configured storage pool".to_string()),
+            },
+        ];
+        let merged = collect_fanout_rows(obs);
+        assert_eq!(merged.status, FanoutStatus::Partial);
+        assert_eq!(merged.unavailable_shards.len(), 1);
+        assert_eq!(merged.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_workflow_fanout_page_paginates_during_degradation() {
+        // shard 0 returns 3 rows (> limit 2); shard 1 is down.
+        let t = chrono::Utc::now();
+        let obs = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![
+                    exec_at(3, t),                                 // newest
+                    exec_at(1, t - chrono::Duration::seconds(20)), // oldest
+                    exec_at(2, t - chrono::Duration::seconds(10)),
+                ],
+                error: None,
+            },
+            ShardObservation::<WorkflowExecution> {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("connection refused".to_string()),
+            },
+        ];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 2);
+        // (a) desc order by created_at (newest first), (b) truncated to limit.
+        assert_eq!(page.executions.len(), 2, "truncated to limit=2");
+        assert_eq!(page.executions[0].created_at, t, "newest first");
+        assert!(page.executions[0].created_at >= page.executions[1].created_at);
+        // (c) next_cursor present because a further page exists (3 > 2).
+        assert!(page.next_cursor.is_some());
+        // (d) partial + shard 1 named.
+        assert_eq!(page.status, FanoutStatus::Partial);
+        assert_eq!(page.unavailable_shards.len(), 1);
+        assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_stalled_fanout_truncates_and_names_down_shard_during_degradation() {
+        let t = chrono::Utc::now();
+        let mut r_old = StalledWorkflowRow::from(exec_at(1, t));
+        r_old.last_event_at = Some(t - chrono::Duration::seconds(30)); // oldest stall
+        let mut r_mid = StalledWorkflowRow::from(exec_at(2, t));
+        r_mid.last_event_at = Some(t - chrono::Duration::seconds(20));
+        let mut r_new = StalledWorkflowRow::from(exec_at(3, t));
+        r_new.last_event_at = Some(t - chrono::Duration::seconds(10));
+        let obs = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![r_new, r_old, r_mid],
+                error: None,
+            },
+            ShardObservation::<StalledWorkflowRow> {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("down".to_string()),
+            },
+        ];
+        let page = build_stalled_fanout(obs, 2);
+        // (a) oldest-stall-first, (b) truncated to limit=2.
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(
+            page.rows[0].last_event_at,
+            Some(t - chrono::Duration::seconds(30))
+        );
+        assert!(page.rows[0].last_event_at <= page.rows[1].last_event_at);
+        // (d) partial + shard 1 named.
+        assert_eq!(page.status, FanoutStatus::Partial);
+        assert_eq!(page.unavailable_shards.len(), 1);
+        assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_dead_letter_fanout_truncates_and_names_down_shard_during_degradation() {
+        let t = chrono::Utc::now();
+        let obs = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![
+                    dl_at(1, t - chrono::Duration::seconds(20)),
+                    dl_at(3, t), // newest
+                    dl_at(2, t - chrono::Duration::seconds(10)),
+                ],
+                error: None,
+            },
+            ShardObservation::<DeadLetter> {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("down".to_string()),
+            },
+        ];
+        let page = build_dead_letter_fanout(obs, 2);
+        // (a) newest-first (failed_at desc), (b) truncated to limit=2.
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].failed_at, t, "newest first");
+        assert!(page.rows[0].failed_at >= page.rows[1].failed_at);
+        // (d) partial + shard 1 named.
+        assert_eq!(page.status, FanoutStatus::Partial);
+        assert_eq!(page.unavailable_shards.len(), 1);
+        assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_schedule_fanout_sorts_and_names_down_shard_during_degradation() {
+        // Reachable shard 0's rows still sort by effective name; shard 1 down.
+        let obs = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![
+                    sched_named(3, Some("zeta"), None),
+                    sched_named(1, Some("alpha"), None),
+                    sched_named(2, None, Some("mid")),
+                ],
+                error: None,
+            },
+            ShardObservation::<HarvestSchedule> {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("down".to_string()),
+            },
+        ];
+        let page = build_schedule_fanout(obs);
+        // (a) sorted ascending by effective name (dag_name or workflow_name).
+        let names: Vec<String> = page
+            .rows
+            .iter()
+            .map(|s| {
+                s.dag_name
+                    .clone()
+                    .or_else(|| s.workflow_name.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+        // (d) partial + shard 1 named (no truncation for schedules).
+        assert_eq!(page.status, FanoutStatus::Partial);
+        assert_eq!(page.unavailable_shards.len(), 1);
+        assert_eq!(page.unavailable_shards[0].shard_id, 1);
     }
 }

@@ -1941,6 +1941,12 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         }
     };
     let rendered = render_response(&cli, &response)?;
+    // Issue #756: a degraded cross-shard read carries its partial-availability
+    // warning on STDERR, keeping STDOUT a clean/parseable body (`-o json | jq`)
+    // on both the happy and degraded paths. The operator still sees the warning.
+    if let Some(notice) = fanout_partial_notice(&response) {
+        eprintln!("{notice}");
+    }
     if let Some(path) = history_output_file(&cli) {
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
             path: path.display().to_string(),
@@ -2297,7 +2303,47 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     } else {
         cli.output
     };
+    // Issue #756: `render_response` returns ONLY the body. When a list read
+    // degraded (a shard was unreachable) the caller emits the partial-
+    // availability notice separately on STDERR via `fanout_partial_notice`, so
+    // STDOUT stays a clean/parseable body on both paths — `workflow list -o
+    // json | jq` is not corrupted by a prepended warning line. (The special
+    // table formatters above, usage/dlq_aggregate, render their own
+    // unavailable-shard block inline.)
     format_output(value, output)
+}
+
+/// Build a human-readable "shard(s) unavailable" notice line from a degraded
+/// cross-shard fan-out envelope (issue #756), or `None` when the body is not a
+/// degraded envelope (a bare array on the happy path, or an object with an
+/// empty/absent `unavailable_shards`).
+fn fanout_partial_notice(value: &Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let unavailable = obj.get("unavailable_shards")?.as_array()?;
+    if unavailable.is_empty() {
+        return None;
+    }
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("partial");
+    let detail: Vec<String> = unavailable
+        .iter()
+        .map(|shard| {
+            let id = cell_number(shard.get("shard_id"));
+            let reason = cell_str(shard.get("reason"));
+            if reason.is_empty() {
+                id
+            } else {
+                format!("{id}: {reason}")
+            }
+        })
+        .collect();
+    Some(format!(
+        "WARNING: cross-shard read is {status}; {} shard(s) unavailable: {}",
+        unavailable.len(),
+        detail.join(", ")
+    ))
 }
 
 fn usage_wants_table(cli: &Cli) -> bool {
@@ -5907,6 +5953,81 @@ mod reuse_policy_tests {
         let rendered = render_response(&cli, &payload).expect("json output should render");
 
         assert_eq!(rendered, r#"{"items":[],"next_cursor":null}"#);
+    }
+
+    // ── issue #756: partial cross-shard read notice ──────────────────────
+
+    #[test]
+    fn fanout_partial_notice_none_for_bare_array() {
+        // The happy path is a bare array; no notice.
+        assert!(fanout_partial_notice(&json!([{"id": "a"}])).is_none());
+    }
+
+    #[test]
+    fn fanout_partial_notice_none_when_unavailable_empty() {
+        assert!(
+            fanout_partial_notice(&json!({
+                "workers": [],
+                "status": "complete",
+                "unavailable_shards": []
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fanout_partial_notice_names_shard_and_reason() {
+        let notice = fanout_partial_notice(&json!({
+            "workflows": [],
+            "status": "partial",
+            "unavailable_shards": [
+                {"shard_id": 1, "reason": "connection refused"}
+            ]
+        }))
+        .expect("degraded envelope must produce a notice");
+        assert!(notice.contains("partial"));
+        assert!(notice.contains("1 shard(s) unavailable"));
+        assert!(notice.contains("1: connection refused"));
+    }
+
+    #[test]
+    fn workflow_list_degraded_body_is_clean_and_notice_is_separate() {
+        // Issue #756: on the degraded path the notice goes to STDERR (via
+        // `fanout_partial_notice`, `eprintln!`'d by the caller), NOT prepended
+        // to the STDOUT body — so `workflow list -o json | jq` stays parseable.
+        let cli = parse(&["workflow", "list"]);
+        let payload = json!({
+            "workflows": [{"id": "00000000-0000-0000-0000-000000000001"}],
+            "status": "partial",
+            "unavailable_shards": [{"shard_id": 2, "reason": "pool missing"}]
+        });
+        // The STDOUT body carries no warning and remains parseable JSON.
+        let rendered = render_response(&cli, &payload).expect("render should succeed");
+        assert!(
+            !rendered.contains("WARNING"),
+            "the STDOUT body must stay clean, got: {rendered}"
+        );
+        let parsed: Value =
+            serde_json::from_str(&rendered).expect("the STDOUT body must remain parseable JSON");
+        assert!(
+            parsed.get("workflows").is_some(),
+            "the data still renders in the body"
+        );
+        // The notice is available separately for the caller to emit on STDERR.
+        let notice =
+            fanout_partial_notice(&payload).expect("degraded payload yields a stderr notice");
+        assert!(notice.starts_with("WARNING: cross-shard read is partial"));
+        assert!(notice.contains("2: pool missing"));
+    }
+
+    #[test]
+    fn workflow_list_happy_path_bare_array_has_no_notice() {
+        let cli = parse(&["workflow", "list"]);
+        let payload = json!([{"id": "00000000-0000-0000-0000-000000000001"}]);
+        let rendered = render_response(&cli, &payload).expect("render should succeed");
+        assert!(!rendered.contains("WARNING"));
+        // No stderr notice on the happy path either.
+        assert!(fanout_partial_notice(&payload).is_none());
     }
 
     #[test]

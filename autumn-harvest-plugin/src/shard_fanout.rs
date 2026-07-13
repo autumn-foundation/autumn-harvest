@@ -150,6 +150,70 @@ pub fn summarize_shard_errors<R>(
     (inspected, unavailable)
 }
 
+/// The union of a fan-out's reachable-shard rows plus a completeness verdict
+/// (issue #756).
+///
+/// This is the shared merge shape for the *list-style* cross-shard read
+/// endpoints (`GET /workflows`, `GET /workers`, `GET /admin/schedules`,
+/// `GET /dead-letters`, …) that turn an unreachable shard into a `partial`
+/// degradation rather than a whole-request `500`. Each caller flattens its
+/// per-shard [`ShardObservation`]s through [`collect_fanout_rows`], then
+/// applies its own sort/truncate/cursor over `rows` and decides whether to
+/// serialize a bare array (happy path — every shard inspected) or a degraded
+/// envelope naming `unavailable_shards`.
+///
+/// Unlike `workflow_count`'s grouped merge, this helper does *not* sort or cap
+/// `rows` — the ordering and pagination contract differs per endpoint and is
+/// applied by the caller after the union.
+#[derive(Debug)]
+pub struct FanoutRows<R> {
+    /// The union of rows from every reachable shard, in per-shard order (the
+    /// caller re-sorts for its own total ordering).
+    pub rows: Vec<R>,
+    /// Cross-shard completeness of this read.
+    pub status: FanoutStatus,
+    /// Shards that could not be queried, named with a reason and sorted by
+    /// `shard_id`. Empty when `status == Complete`; also empty in the
+    /// degenerate `Unavailable`-with-no-observations case (nothing to name).
+    pub unavailable_shards: Vec<UnavailableShard>,
+}
+
+impl<R> FanoutRows<R> {
+    /// `true` when every expected shard was inspected — the happy path on
+    /// which a bare-array endpoint keeps its legacy response shape (issue
+    /// #756, AC3).
+    ///
+    /// Keyed on `status == Complete`, NOT on `unavailable_shards.is_empty()`:
+    /// the two diverge in the `Unavailable`-with-empty-`unavailable_shards`
+    /// case (no expected shard could even be resolved), which is decidedly not
+    /// a happy path and must not be reported complete.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.status, FanoutStatus::Complete)
+    }
+}
+
+/// Flatten per-shard observations into the union of reachable rows plus a
+/// completeness verdict (pure, no DB).
+///
+/// A shard whose observation carries an `error` contributes no rows and is
+/// folded into `unavailable_shards`; a reachable shard's rows are appended in
+/// shard-iteration order. `status` is `complete` only when every shard was
+/// inspected, `partial` when at least one was inspected and at least one was
+/// unavailable, and `unavailable` when none could be inspected — the call
+/// therefore never fails wholesale on a single unreachable shard.
+#[must_use]
+pub fn collect_fanout_rows<R>(observations: Vec<ShardObservation<R>>) -> FanoutRows<R> {
+    let (inspected, unavailable_shards) = summarize_shard_errors(&observations);
+    let status = FanoutStatus::from_counts(inspected, unavailable_shards.len());
+    let rows: Vec<R> = observations.into_iter().flat_map(|o| o.rows).collect();
+    FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +259,63 @@ mod tests {
         let (inspected, unavailable) = summarize_shard_errors(&observations);
         assert_eq!(inspected, 2);
         assert!(unavailable.is_empty());
+    }
+
+    // ── collect_fanout_rows (issue #756) ─────────────────────────────────
+
+    #[test]
+    fn collect_fanout_rows_all_reachable_is_complete_and_unions_rows() {
+        let merged = collect_fanout_rows(vec![
+            obs(0, vec![1, 2], None),
+            obs(1, vec![3], None),
+            obs(2, vec![], None),
+        ]);
+        assert_eq!(merged.status, FanoutStatus::Complete);
+        assert!(merged.is_complete());
+        assert!(merged.unavailable_shards.is_empty());
+        assert_eq!(merged.rows, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn collect_fanout_rows_one_error_is_partial_and_names_the_shard() {
+        let merged = collect_fanout_rows(vec![
+            obs(0, vec![10], None),
+            obs(1, vec![], Some("connection refused")),
+            obs(2, vec![20], None),
+        ]);
+        assert_eq!(merged.status, FanoutStatus::Partial);
+        assert!(!merged.is_complete());
+        // Reachable shards' rows still flow through — the call never fails
+        // wholesale.
+        assert_eq!(merged.rows, vec![10, 20]);
+        assert_eq!(merged.unavailable_shards.len(), 1);
+        assert_eq!(merged.unavailable_shards[0].shard_id, 1);
+        assert_eq!(merged.unavailable_shards[0].reason, "connection refused");
+    }
+
+    #[test]
+    fn collect_fanout_rows_all_error_is_unavailable() {
+        let merged: FanoutRows<i64> = collect_fanout_rows(vec![
+            obs(0, vec![], Some("pool missing")),
+            obs(1, vec![], Some("connection refused")),
+        ]);
+        assert_eq!(merged.status, FanoutStatus::Unavailable);
+        assert!(!merged.is_complete());
+        assert!(merged.rows.is_empty());
+        // Unavailable shards are sorted by shard_id.
+        let ids: Vec<i32> = merged
+            .unavailable_shards
+            .iter()
+            .map(|s| s.shard_id)
+            .collect();
+        assert_eq!(ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn collect_fanout_rows_empty_observations_is_unavailable() {
+        let merged: FanoutRows<i64> = collect_fanout_rows(Vec::new());
+        assert_eq!(merged.status, FanoutStatus::Unavailable);
+        assert!(merged.rows.is_empty());
+        assert!(merged.unavailable_shards.is_empty());
     }
 }

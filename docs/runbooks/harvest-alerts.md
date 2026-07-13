@@ -119,6 +119,46 @@ below (e.g. `dead_letters` → `harvest_dlq_growth`, `queues` /
 `harvest_no_active_workers` / `harvest_worker_saturation`, `shards` →
 `harvest_shard_unready`).
 
+### Partial cross-shard list reads (issue #756)
+
+The cross-shard **list/aggregate read** endpoints — `GET /workflows` (including
+the `?no_progress_minutes` stalled loader), `GET /workers`,
+`GET /workers/health`, `GET /admin/schedules`, `GET /dead-letters`, and
+`GET /dead-letters/aggregate` — **degrade instead of failing** when one shard's
+pool is unreachable. Rather than turning a single down shard into a whole-request
+`500`, they return `200 OK` with the union of the *reachable* shards' results
+plus a machine-readable partiality indicator:
+
+```json
+{
+  "workflows": [ /* … reachable-shard rows … */ ],
+  "status": "partial",
+  "unavailable_shards": [ { "shard_id": 3, "reason": "database connection for shard 3 could not be acquired" } ]
+}
+```
+
+A `status` of `partial` (some shards read) or `unavailable` (none read), and a
+non-empty `unavailable_shards`, is a **healthy degradation, not an error** — the
+data you see is real, just incomplete, and the down shard is *named* rather than
+silently dropped. On the happy path (every shard reachable) these endpoints
+return their unchanged legacy shape (a bare JSON array, or the paginated
+`{ workflows, next_cursor }` object), so there is no change for existing clients.
+
+When you see `status: partial`/`unavailable`, drill into
+**`GET /admin/shards/health`** to identify *why* the named shard is down
+(unreachable pool, mid shard-add rollout, schema-unreadable) and act on the
+`shards` subsystem verdict. The `harvest` CLI's `workflow list` / `worker list` /
+`schedule list` / `dlq list` subcommands surface the same partiality as a
+`WARNING: cross-shard read is partial; N shard(s) unavailable: …` notice line
+above the data.
+
+Note: cross-shard **writes** (batch reset, bulk DLQ replay/discard/redrive,
+schedule pause/delete, completion-trigger create) deliberately keep strict
+failure semantics — a write that could not reach every shard fails loudly rather
+than silently applying to a subset. The single-execution business-id resolver
+(`GET /workflows/by-id/…`, issue #805) likewise keeps returning `503` while a
+shard is down, to avoid a false `404`.
+
 To **halt new workflow starts** fleet-wide (or by name/queue/shard/owner) while
 you investigate — the incident-containment lever above the per-run
 pause/cancel/terminate — raise an admission gate. Which start producers honour a
