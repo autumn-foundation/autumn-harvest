@@ -529,20 +529,27 @@ async fn event_count(pool: &DbPool, exec_id: ExecutionId) -> i64 {
 struct ExecStateRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    row_json: String,
 }
 
-async fn exec_state(pool: &DbPool, exec_id: ExecutionId) -> (String, chrono::DateTime<Utc>) {
+/// Returns the execution's `state` plus a full-row JSON snapshot.
+///
+/// `harvest_workflow_executions` has no `updated_at` column, so the zero-writes
+/// belt snapshots the entire row via `to_jsonb(t.*)` and compares the two
+/// snapshots for byte equality — a stronger "row was not rewritten" check than
+/// any single column, and one that does not depend on a column name.
+async fn exec_state(pool: &DbPool, exec_id: ExecutionId) -> (String, String) {
     let mut conn = pool.get().await.expect("pooled conn");
     let row = diesel::sql_query(
-        "SELECT state, updated_at FROM harvest_workflow_executions WHERE id = $1",
+        "SELECT state, to_jsonb(t.*)::text AS row_json \
+         FROM harvest_workflow_executions t WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .get_result::<ExecStateRow>(&mut conn)
     .await
     .expect("load execution state");
-    (row.state, row.updated_at)
+    (row.state, row.row_json)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -730,7 +737,7 @@ async fn ac4_query_on_terminal_performs_zero_writes() {
     let exec_id = seed_execution(&pool, "progress_wf", "COMPLETED", input, events, false).await;
 
     let events_before = event_count(&pool, exec_id).await;
-    let (state_before, updated_before) = exec_state(&pool, exec_id).await;
+    let (state_before, row_before) = exec_state(&pool, exec_id).await;
 
     let (status, _) = get(&app, &format!("/workflows/{exec_id}/query/progress")).await;
     assert_eq!(status, StatusCode::OK);
@@ -743,11 +750,11 @@ async fn ac4_query_on_terminal_performs_zero_writes() {
     assert_eq!(status, StatusCode::OK);
 
     let events_after = event_count(&pool, exec_id).await;
-    let (state_after, updated_after) = exec_state(&pool, exec_id).await;
+    let (state_after, row_after) = exec_state(&pool, exec_id).await;
 
     assert_eq!(events_before, events_after, "no events appended by a query");
     assert_eq!(state_before, state_after, "execution state unchanged");
-    assert_eq!(updated_before, updated_after, "execution row not rewritten");
+    assert_eq!(row_before, row_after, "execution row not rewritten");
 }
 
 #[tokio::test]
