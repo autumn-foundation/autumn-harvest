@@ -183,6 +183,12 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
 /// robust to path shape (`../migrations/…`, `../../autumn-harvest/migrations/…`,
 /// etc.) while never matching the paved-path helper's own non-migration includes
 /// (e.g. `include_str!("…/ci.yml")`, which lacks both `migrations` and `up.sql`).
+///
+/// Accepted limitation (intentional): the check is per-line, so a bundle written
+/// with EVERY include's path split onto the line after `include_str!(` (as
+/// rustfmt does for very long paths) could evade it. Any single-line include and
+/// any copy-paste reintroduction is still caught, so this residual gap is a
+/// deliberate, low-likelihood trade-off rather than a full-parse detector.
 fn line_is_handrolled_migration_include(line: &str) -> bool {
     line.contains("include_str!") && line.contains("migrations") && line.contains("up.sql")
 }
@@ -208,14 +214,33 @@ fn scanned_test_roots() -> Vec<PathBuf> {
     ]
 }
 
-/// Recursively collect every `.rs` file under `dir` into `out`. A missing dir is
-/// skipped silently (both roots exist in-tree; `ci_run_coverage.rs` reads the
-/// same plugin dir at runtime, so it is present when this test runs).
+/// Recursively collect every `.rs` file under `dir` into `out`. A *missing* dir
+/// is tolerated silently (both roots exist in-tree; `ci_run_coverage.rs` reads
+/// the same plugin dir at runtime, so it is present when this test runs), but any
+/// OTHER `read_dir`/entry error PANICS — a permission or IO error must never be
+/// masked, as that could let the guard silently skip a file it should scan.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A missing directory is fine (documented assumption).
+            return;
+        }
+        Err(e) => panic!(
+            "migration guard: failed to read directory '{}': {e}",
+            dir.display()
+        ),
     };
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        // A DirEntry we just enumerated but then fail to read is unexpected —
+        // panic rather than silently skip it (a skipped file could hide a
+        // reintroduced hand-rolled migration bundle).
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "migration guard: failed to read a directory entry under '{}': {e}",
+                dir.display()
+            )
+        });
         let path = entry.path();
         if path.is_dir() {
             collect_rs_files(&path, out);
