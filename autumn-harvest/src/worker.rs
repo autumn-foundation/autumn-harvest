@@ -11662,7 +11662,8 @@ fn spawn_schedule_overdue_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let now = chrono::Utc::now();            for pool in &pools {
+            let now = chrono::Utc::now();
+            for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
                     Err(error) => {
@@ -13330,7 +13331,7 @@ impl Worker {
         // deployments both aggregate the full schedule set.
         #[cfg(feature = "db")]
         let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
-            sampler_pools.clone(),
+            sampler_pools,
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.poll_interval,

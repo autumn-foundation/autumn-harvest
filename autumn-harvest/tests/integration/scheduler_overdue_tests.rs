@@ -14,8 +14,8 @@
 
 use std::sync::Mutex;
 
-use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::scheduler::{overdue_schedule_samples, sample_overdue_schedules};
+use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_OVERDUE, MetricsRecorder};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -63,8 +63,19 @@ impl MetricsRecorder for RecordingMetrics {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+//
+// Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
+// these against a shared local cluster (Docker-free); otherwise a fresh
+// testcontainers Postgres 16 is started per test. On a shared DB each test
+// `scrub()`s first for isolation.
 
-async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        // Assumed pre-migrated (see module doc); scrub per test isolates it.
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        scrub(&mut conn).await;
+        return (conn, None);
+    }
     let container = Postgres::default()
         .with_tag("16")
         .start()
@@ -77,7 +88,17 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migration");
-    (conn, container)
+    (conn, Some(container))
+}
+
+/// Clear schedules + executions so a shared migrated DB stays per-test isolated.
+async fn scrub(conn: &mut AsyncPgConnection) {
+    for stmt in [
+        "DELETE FROM harvest_schedules",
+        "DELETE FROM harvest_workflow_executions",
+    ] {
+        diesel::sql_query(stmt).execute(conn).await.expect(stmt);
+    }
 }
 
 /// Insert a workflow schedule with an explicit `next_run_at` and AC3 flags.
@@ -248,7 +269,7 @@ async fn at_capacity_schedule_is_not_overdue() {
     );
 }
 
-/// The returning helper surfaces `overdue_by_secs` = now - next_run_at.
+/// The returning helper surfaces `overdue_by_secs` = `now - next_run_at`.
 #[tokio::test]
 async fn overdue_schedule_samples_reports_lag() {
     let (mut conn, _c) = setup_db().await;

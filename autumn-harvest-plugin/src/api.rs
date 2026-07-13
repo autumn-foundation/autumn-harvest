@@ -18657,7 +18657,11 @@ async fn update_schedule_handler(
                 .or(row.workflow_name.as_deref())
                 .unwrap_or("");
             let at_capacity = schedule_at_capacity(&running, name, row.max_active_runs);
-            Ok(Json(schedule_entry_from_row(*row, last_backfill, at_capacity)))
+            Ok(Json(schedule_entry_from_row(
+                *row,
+                last_backfill,
+                at_capacity,
+            )))
         }
         Ok(ScheduleUpdateOutcome::NotFound) => {
             schedule_update_audit_failed(
@@ -32486,6 +32490,8 @@ mod tests {
             catchup_dropped_last_recovery: 0,
             last_catchup_at: None,
             retry_policy: None,
+            overdue: false,
+            overdue_by_secs: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(

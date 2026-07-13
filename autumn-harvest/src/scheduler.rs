@@ -31,9 +31,10 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The scheduler tick interval, re-exported for the overdue-schedule predicate
-/// (issue #696) so read/sampler callers pass the identical "one tick" grace term
-/// the scheduler loop actually sleeps between ticks.
+/// The scheduler tick interval (issue #696).
+///
+/// Re-exported so the overdue-schedule read/sampler callers pass the identical
+/// "one tick" grace term the scheduler loop actually sleeps between ticks.
 pub const SCHEDULER_TICK_INTERVAL: Duration = DEFAULT_SCHEDULER_TICK_INTERVAL;
 
 /// Default upper bound on the number of timestamps a single backfill request may plan.
@@ -3789,7 +3790,7 @@ fn cadence_step(schedule: Option<&Schedule>, anchor: DateTime<Utc>) -> Option<ch
 /// remaining slots when it reaches the cap. In *every other* fire decision
 /// (Skip without catchup, all Buffer/Cancel/Terminate policies, and the normal
 /// dispatch path) `next_run_at` advances forward, and jitter deferral is bounded
-/// by the jitter grace term; end_at/max_runs deferral sets `exhausted_at`. So
+/// by the jitter grace term; `end_at`/`max_runs` deferral sets `exhausted_at`. So
 /// the *only* way `next_run_at` legitimately lags unboundedly without a wedge is
 /// `running >= max_active_runs`, which callers pass as `at_capacity` to suppress
 /// the flag (the schedule is deliberately deferring, not stalled). Backfill
@@ -3824,8 +3825,7 @@ pub fn schedule_overdue(
     let Some(step) = cadence_step(schedule, next_run_at) else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    let jitter =
-        chrono::Duration::from_std(jitter).unwrap_or_else(|_| chrono::Duration::zero());
+    let jitter = chrono::Duration::from_std(jitter).unwrap_or_else(|_| chrono::Duration::zero());
     let tick =
         chrono::Duration::from_std(tick_interval).unwrap_or_else(|_| chrono::Duration::zero());
     let grace = step + jitter + tick;
@@ -3862,6 +3862,10 @@ pub struct OverdueSample {
 /// `next_run_at`), then runs the pure [`schedule_overdue`] predicate against
 /// `now`. ALL schedules are returned (including paused/exhausted, which resolve
 /// to not-overdue) so the sampler can keep the gauge fresh.
+///
+/// # Errors
+///
+/// Returns a database error if the schedule or execution-count query fails.
 pub async fn overdue_schedule_samples(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
@@ -3894,7 +3898,10 @@ pub async fn overdue_schedule_samples(
             } else {
                 ("workflow".to_string(), s.workflow_name.unwrap_or_default())
             };
-            let schedule = s.schedule_expr.as_deref().and_then(parse_schedule_from_expr);
+            let schedule = s
+                .schedule_expr
+                .as_deref()
+                .and_then(parse_schedule_from_expr);
             let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
             let at_capacity =
                 running.get(&name).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
@@ -3930,6 +3937,10 @@ pub async fn overdue_schedule_samples(
 /// schedules on *different* shards still aggregate via gauge last-write-wins
 /// across the worker's per-pool passes (names are effectively unique per
 /// schedule, so this is defensive).
+///
+/// # Errors
+///
+/// Returns a database error if loading schedules or execution counts fails.
 pub async fn sample_overdue_schedules(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
@@ -6115,7 +6126,10 @@ mod tests {
             None,
             false,
         );
-        assert!(v.overdue, "5-min schedule 400s past its slot must be overdue");
+        assert!(
+            v.overdue,
+            "5-min schedule 400s past its slot must be overdue"
+        );
         assert_eq!(
             v.overdue_by_secs,
             Some(400),
@@ -6268,7 +6282,10 @@ mod tests {
             None,
             false,
         );
-        assert!(!within.overdue, "daily schedule 86000s late is still within grace");
+        assert!(
+            !within.overdue,
+            "daily schedule 86000s late is still within grace"
+        );
         // Over a full day + tick => overdue.
         let over = schedule_overdue(
             Some(&sched),
@@ -6409,8 +6426,7 @@ mod tests {
                 2 => (Schedule::Cron("0 * * * *".to_string()), 3600),
                 _ => (Schedule::Cron("*/15 * * * *".to_string()), 900),
             };
-            let jitter_secs = i64::from(i % 60); // 0..59s jitter windows
-            let jitter = Duration::from_secs(jitter_secs as u64);
+            let jitter = Duration::from_secs(u64::from(i % 60)); // 0..59s jitter windows
             // Fresh next_run_at: within [now - 0, now + step] — i.e. either just
             // fired (lag up to jitter+tick) or scheduled slightly ahead. Never
             // more than one cadence past, so grace always absorbs it.

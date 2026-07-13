@@ -7435,6 +7435,16 @@ async fn api_trigger_preserves_dag_metadata() {
 
 // ── Overdue-schedule read fields (issue #696) ────────────────────────────────
 
+/// Prefer a shared migrated Postgres via `HARVEST_TEST_DATABASE_URL` (Docker-free
+/// local runs); otherwise start a fresh testcontainers Postgres 16.
+async fn overdue_read_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
+}
+
 /// Insert a workflow schedule directly with an explicit `next_run_at`.
 async fn insert_overdue_test_schedule(
     database_url: &str,
@@ -7446,6 +7456,11 @@ async fn insert_overdue_test_schedule(
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("connect");
+    // Isolate this schedule name on a possibly-shared DB.
+    diesel::delete(harvest_schedules::table.filter(dsl::workflow_name.eq(wf_name)))
+        .execute(&mut conn)
+        .await
+        .expect("clear prior schedule");
     let id = uuid::Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -7473,7 +7488,7 @@ async fn insert_overdue_test_schedule(
 /// per schedule, computed from the schedule's own `next_run_at` and cadence.
 #[tokio::test]
 async fn schedule_read_reports_overdue_fields() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _container) = overdue_read_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));

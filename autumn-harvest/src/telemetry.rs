@@ -613,10 +613,11 @@ pub const METRIC_SCHEDULE_FIRE_ATTEMPTS: &str = "harvest.schedule.fire_attempts"
 /// window. Each auto-pause event means operator action is required to resume.
 pub const METRIC_SCHEDULE_AUTO_PAUSED: &str = "harvest.schedule.auto_paused";
 
-/// Gauge: per-schedule overdue flag (issue #696). `1` when an *active* schedule
-/// is overdue to fire relative to its own cadence (`now − next_run_at > grace`,
-/// where `grace = cadence step + jitter + scheduler tick interval`), `0`
-/// otherwise.
+/// Gauge: per-schedule overdue flag (issue #696).
+///
+/// `1` when an *active* schedule is overdue to fire relative to its own cadence
+/// (`now − next_run_at > grace`, where `grace = cadence step + jitter +
+/// scheduler tick interval`), `0` otherwise.
 ///
 /// Labels:
 ///   - `"kind"` — `"workflow"` or `"dag"` (bounded).
