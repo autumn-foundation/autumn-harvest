@@ -9372,6 +9372,29 @@ impl WorkflowContext {
         std::mem::take(&mut *cmds)
     }
 
+    /// Non-consuming peek at the pending command buffer: returns `true` if any
+    /// pending command matches `pred`, **without draining it**.
+    ///
+    /// Used by the query-replay driver (issue #612,
+    /// [`executor::drive_query_replay`](crate::executor::drive_query_replay)) to
+    /// distinguish a genuine command-suspension (≥1 replay-significant command
+    /// emitted before parking) from a pure `tokio::task::yield_now()` spin (no
+    /// command emitted) — a distinction the driver can no longer make from waker
+    /// timing, since tokio's `yield_now` defers its wake to the scheduler queue
+    /// inside a runtime. Non-consuming so the driver can keep polling the same
+    /// coroutine after inspecting its emitted commands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal commands mutex is poisoned.
+    pub(crate) fn any_pending_command(&self, pred: impl Fn(&WorkflowCommand) -> bool) -> bool {
+        self.commands
+            .lock()
+            .expect("commands lock poisoned")
+            .iter()
+            .any(pred)
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Generate the next sequential activity execution ID.

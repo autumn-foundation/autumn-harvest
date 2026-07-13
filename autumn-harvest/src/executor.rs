@@ -222,10 +222,45 @@ pub enum QueryReplayOutcome {
     Panicked,
 }
 
-/// Waker used by [`drive_query_replay`] to detect immediate re-wakes (e.g. a
-/// workflow that calls `tokio::task::yield_now()` — the waker fires synchronously,
-/// signalling the driver to re-poll rather than treat the `Pending` as a genuine
-/// workflow-command suspension).
+/// Returns `true` when `cmd` is a **replay-significant** workflow command — i.e.
+/// one that reflects genuine workflow progress or a suspension, as opposed to a
+/// pure-metadata command that does not affect replay determinism.
+///
+/// The pure-metadata exclusions are:
+/// - [`UpsertSearchAttributes`](WorkflowCommand::UpsertSearchAttributes) and
+///   [`SetCurrentDetails`](WorkflowCommand::SetCurrentDetails): operator-facing
+///   metadata, never part of the deterministic command stream.
+/// - [`CancelRaceLosers`](WorkflowCommand::CancelRaceLosers): for the
+///   timer+signal race shape (issue #600) this is a pure, deterministic function
+///   of already-resolved history (the winner is fixed by recorded order), so it
+///   is re-emitted identically on every replay and carries no new information.
+///
+/// This is the **single source of truth** for two callers that must agree, so
+/// the command classification is never re-enumerated by hand:
+/// - the completion-time "new commands emitted beyond recorded history"
+///   non-determinism check in [`run_workflow_with_state`]/[`run_strict_with_ctx`],
+///   and
+/// - the query-replay driver's suspension discriminator
+///   ([`drive_query_replay`]): a `Poll::Pending` cycle that emitted ≥1
+///   replay-significant command is a genuine
+///   [`Suspended`](QueryReplayOutcome::Suspended); one that emitted none is a
+///   pure `tokio::task::yield_now()` spin the driver keeps driving to the
+///   deadline (→ [`TimedOut`](QueryReplayOutcome::TimedOut)).
+pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
+    !matches!(
+        cmd,
+        WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+    )
+}
+
+/// Waker used by [`drive_query_replay`] to detect immediate synchronous re-wakes
+/// (e.g. a workflow that calls `tokio::task::yield_now()` **outside** a tokio
+/// runtime, where the wake fires synchronously). It is only a **fast-path** hint:
+/// inside a runtime (the real HTTP query path) `yield_now` defers its wake to the
+/// scheduler queue, so this flag is NOT the authoritative suspension signal — the
+/// emitted-command check ([`is_replay_significant_command`]) is.
 struct QueryReplayWaker(std::sync::atomic::AtomicBool);
 
 impl futures::task::ArcWake for QueryReplayWaker {
@@ -343,9 +378,30 @@ pub fn drive_query_replay(
                 return QueryReplayOutcome::ReachedTerminal;
             }
             Poll::Pending => {
-                if !flag.0.load(Ordering::Acquire) {
-                    // Not woken → genuine suspension on a workflow command.
-                    // Flush for the same reason: on a run the engine sealed while
+                // Discriminate a genuine command-suspension from a bare
+                // `tokio::task::yield_now()` spin by INSPECTING THE EMITTED
+                // COMMANDS, not waker timing (issue #612). The custom
+                // `QueryReplayWaker` fires `wake_by_ref` synchronously only
+                // OUTSIDE a tokio runtime; inside one (the real HTTP query path)
+                // tokio's `yield_now` DEFERS its wake to the scheduler queue, so
+                // the flag stays false and a genuine spin used to be misread as a
+                // command suspension (→ 410 instead of the #612-documented 408).
+                //
+                // A genuine suspension parks only after pushing ≥1
+                // replay-significant command (WaitForActivity / StartTimer /
+                // WaitForSignal / StartChildWorkflow / ContinueAsNew / ...); a
+                // pure `yield_now` spin pushes none. The command set is
+                // classified by the executor's own shared deny-list
+                // (`is_replay_significant_command`) rather than re-enumerated by
+                // hand. The waker flag is kept as a fast-path: if it fired
+                // synchronously we already know this was a re-wake (no command
+                // lock needed), so only consult the (non-consuming) command peek
+                // when the flag is unset.
+                if !flag.0.load(Ordering::Acquire)
+                    && ctx.any_pending_command(is_replay_significant_command)
+                {
+                    // Genuine suspension on a workflow command. Flush push-based
+                    // signal handlers first: on a run the engine sealed while
                     // parked (CONTINUED_AS_NEW / TIMED_OUT / mid-await cancel), the
                     // drift-guarded `Suspended` arm of `classify_terminal_query`
                     // serves only when no non-lifecycle history remains
@@ -359,7 +415,21 @@ pub fn drive_query_replay(
                     ctx.flush_pending_signal_handlers();
                     return QueryReplayOutcome::Suspended;
                 }
-                // Woken immediately (e.g. yield_now) — keep driving.
+                // Either the waker fired synchronously (out-of-runtime
+                // `yield_now`) OR no replay-significant command was emitted (an
+                // in-runtime spin whose deferred `yield_now` wake we never see) —
+                // keep driving to the deadline (→ `TimedOut` → 408). This sync fn
+                // cannot `.await` a scheduler yield (the pure #612 unit tests call
+                // it without a runtime), but re-polling still makes progress:
+                // `yield_now`'s `Pending` is a one-shot that returns `Ready` on the
+                // very next poll regardless of whether its deferred wake was
+                // delivered, so a workflow that legitimately yields a few times
+                // before completing or suspending-on-command is re-polled and
+                // advances, while a genuine unbounded spin re-polls until the
+                // deadline (re-checked at the top of the loop, so we never poll
+                // past `query_timeout`). Yield the OS thread slice so a spinning
+                // query does not needlessly hard-pin a core for the whole budget.
+                std::thread::yield_now();
             }
         }
     }
@@ -638,22 +708,11 @@ async fn run_strict_with_ctx(
                             handler_panic: false,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
-                    } else if ctx.drain_commands().into_iter().any(|cmd| {
-                        // UpsertSearchAttributes and SetCurrentDetails are pure metadata
-                        // and do not affect replay determinism; exclude from this check.
-                        // CancelRaceLosers is also excluded: for the timer+signal race
-                        // shape (issue #600) it is a pure, deterministic function of
-                        // already-resolved history (signal won -> cancel the now-stale
-                        // timer) with no marker to gate re-emission on, so replaying the
-                        // same complete history always reproduces it identically -- it
-                        // never introduces new, unaccounted-for information.
-                        !matches!(
-                            cmd,
-                            WorkflowCommand::UpsertSearchAttributes { .. }
-                                | WorkflowCommand::SetCurrentDetails { .. }
-                                | WorkflowCommand::CancelRaceLosers { .. }
-                        )
-                    }) {
+                    } else if ctx
+                        .drain_commands()
+                        .iter()
+                        .any(is_replay_significant_command)
+                    {
                         // New commands emitted after history was fully consumed (e.g. a
                         // newly-added version() or side_effect() call on an old history).
                         let nd = ctx.take_nd_details().or_else(|| {
@@ -822,14 +881,11 @@ pub(crate) async fn run_workflow_canary(
                             handler_panic: false,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
-                    } else if ctx.drain_commands().into_iter().any(|cmd| {
-                        !matches!(
-                            cmd,
-                            WorkflowCommand::UpsertSearchAttributes { .. }
-                                | WorkflowCommand::SetCurrentDetails { .. }
-                                | WorkflowCommand::CancelRaceLosers { .. }
-                        )
-                    }) {
+                    } else if ctx
+                        .drain_commands()
+                        .iter()
+                        .any(is_replay_significant_command)
+                    {
                         let nd = ctx.take_nd_details().or_else(|| {
                             Some(crate::error::NonDeterministicDetails {
                                 event_index: i32::try_from(ctx.replay_position()).ok(),
