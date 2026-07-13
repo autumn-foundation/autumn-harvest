@@ -348,7 +348,12 @@ async fn dead_letters_aggregate_partial_carries_status() {
     assert_names_down_shard(&body);
     // Additive object fields — the aggregate object keeps its own shape.
     assert!(body["groups"].is_array());
-    assert!(body["total"].is_number());
+    // The reachable shard's seeded dead-letter actually merged into the count,
+    // proving the partial aggregate is real data and not an empty degradation.
+    assert!(
+        body["total"].as_i64().unwrap_or(0) >= 1,
+        "the reachable shard's dead-letter must be counted in total; got {body}"
+    );
 }
 
 #[tokio::test]

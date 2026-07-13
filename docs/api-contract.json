@@ -21,7 +21,8 @@
       "Adding a new optional request body field",
       "Adding a new read-only route",
       "Narrowing an existing error response to be more specific"
-    ]
+    ],
+    "conditional_shape_note": "Issue #756 partial-availability carve-out to \"Changing the type of a response field\": the cross-shard list read endpoints GET /workflows (non-paginated), GET /workers, GET /admin/schedules, GET /dead-letters, and GET /dags return a CONDITIONAL 200 shape — a bare JSON array when every expected shard is reachable (status == complete), or a degraded object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } when a shard is unavailable. This is NOT a breaking change to any currently-successful response: the all-reachable array is byte-for-byte identical to the pre-#756 shape, and the object form only replaces what was previously a whole-request 500 (a failed, non-successful response), so no client that received a successful response before can observe a changed type. The paginated GET /workflows object shape and the aggregate/health object endpoints (GET /dead-letters/aggregate, GET /workers/health) instead gain status/unavailable_shards as always-present ADDITIVE fields (a non-breaking change)."
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
@@ -124,7 +125,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Without pagination params: bare JSON array of execution objects (backward compatible). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>}. Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
+        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged."
       },
       "error_responses": [
         {
@@ -2038,7 +2039,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": true,
+        "description": "On the happy path (all shards reachable) a bare JSON array of DAG summary objects (backward compatible). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard-derived DAGs as an object { \"dags\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. In-memory-registered DAGs are always present regardless of shard reachability."
       },
       "error_responses": [
         {

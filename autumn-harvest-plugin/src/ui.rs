@@ -82,6 +82,7 @@ use crate::api::{
     load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
     require_harvest_admin,
 };
+use crate::shard_fanout::UnavailableShard;
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
 const DEFAULT_DLQ_PAGE_SIZE: i64 = 50;
@@ -926,10 +927,12 @@ async fn list_workflows_ui(
     filters.exec_id_prefix = exec_id_search.clone();
 
     // Issue #756: an unreachable shard degrades to a partial page rather than
-    // failing the whole render; the UI shows the reachable-shard rows.
-    let workflows = load_workflows_from_shards(&api_state, &filters)
-        .await?
-        .executions;
+    // failing the whole render; the UI shows the reachable-shard rows and a
+    // banner naming the unreachable shard(s) so a partial list is not mistaken
+    // for the authoritative fleet state.
+    let fanout_page = load_workflows_from_shards(&api_state, &filters).await?;
+    let unavailable_shards = fanout_page.unavailable_shards;
+    let workflows = fanout_page.executions;
 
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
@@ -955,6 +958,7 @@ async fn list_workflows_ui(
         started_before,
         exec_id_search.as_deref(),
         active_gate_count,
+        &unavailable_shards,
     ))
 }
 
@@ -3453,9 +3457,30 @@ fn render_workflow_list(
     started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
     active_gate_count: usize,
+    unavailable_shards: &[UnavailableShard],
 ) -> Markup {
+    // Issue #756: name the unreachable shard(s) so a partial list is not read
+    // as the authoritative fleet state.
+    let unavailable_summary = unavailable_shards
+        .iter()
+        .map(|s| s.shard_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let body = html! {
         h2 { "Workflows" }
+
+        // issue #756: partial cross-shard read banner — shown when a shard was
+        // unreachable, so the list below is known to be incomplete.
+        @if !unavailable_shards.is_empty() {
+            div class="banner Warning" {
+                strong { "⚠ Partial results" }
+                " — "
+                (unavailable_shards.len())
+                @if unavailable_shards.len() == 1 { " shard is" } @else { " shards are" }
+                " unreachable; this list may be incomplete. Unavailable shard(s): "
+                (unavailable_summary)
+            }
+        }
 
         // issue #377: admission gate banner — shown when any gate is active.
         @if active_gate_count > 0 {

@@ -1941,6 +1941,12 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         }
     };
     let rendered = render_response(&cli, &response)?;
+    // Issue #756: a degraded cross-shard read carries its partial-availability
+    // warning on STDERR, keeping STDOUT a clean/parseable body (`-o json | jq`)
+    // on both the happy and degraded paths. The operator still sees the warning.
+    if let Some(notice) = fanout_partial_notice(&response) {
+        eprintln!("{notice}");
+    }
     if let Some(path) = history_output_file(&cli) {
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
             path: path.display().to_string(),
@@ -2297,18 +2303,14 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     } else {
         cli.output
     };
-    let rendered = format_output(value, output)?;
-    // Issue #756: when a list read degraded (a shard was unreachable) the body
-    // is the `{ <items>, status, unavailable_shards }` envelope. Surface a clear
-    // notice line above the data so an operator sees the partiality instead of a
-    // silently-short list. The special table formatters above (usage,
-    // dlq_aggregate) already render their own unavailable-shard block, so this
-    // only applies to the plain-JSON fall-through (workflow/worker/schedule/dlq
-    // list).
-    Ok(match fanout_partial_notice(value) {
-        Some(notice) => format!("{notice}\n{rendered}"),
-        None => rendered,
-    })
+    // Issue #756: `render_response` returns ONLY the body. When a list read
+    // degraded (a shard was unreachable) the caller emits the partial-
+    // availability notice separately on STDERR via `fanout_partial_notice`, so
+    // STDOUT stays a clean/parseable body on both paths — `workflow list -o
+    // json | jq` is not corrupted by a prepended warning line. (The special
+    // table formatters above, usage/dlq_aggregate, render their own
+    // unavailable-shard block inline.)
+    format_output(value, output)
 }
 
 /// Build a human-readable "shard(s) unavailable" notice line from a degraded
@@ -5989,21 +5991,33 @@ mod reuse_policy_tests {
     }
 
     #[test]
-    fn workflow_list_renders_partial_notice_above_data() {
-        // A degraded `workflow list` body (issue #756) renders the notice line
-        // above the JSON, so the operator sees the partiality rather than a
-        // silently-short list.
+    fn workflow_list_degraded_body_is_clean_and_notice_is_separate() {
+        // Issue #756: on the degraded path the notice goes to STDERR (via
+        // `fanout_partial_notice`, `eprintln!`'d by the caller), NOT prepended
+        // to the STDOUT body — so `workflow list -o json | jq` stays parseable.
         let cli = parse(&["workflow", "list"]);
         let payload = json!({
             "workflows": [{"id": "00000000-0000-0000-0000-000000000001"}],
             "status": "partial",
             "unavailable_shards": [{"shard_id": 2, "reason": "pool missing"}]
         });
+        // The STDOUT body carries no warning and remains parseable JSON.
         let rendered = render_response(&cli, &payload).expect("render should succeed");
-        assert!(rendered.starts_with("WARNING: cross-shard read is partial"));
-        assert!(rendered.contains("2: pool missing"));
-        // The primary data still follows the notice.
-        assert!(rendered.contains("workflows"));
+        assert!(
+            !rendered.contains("WARNING"),
+            "the STDOUT body must stay clean, got: {rendered}"
+        );
+        let parsed: Value =
+            serde_json::from_str(&rendered).expect("the STDOUT body must remain parseable JSON");
+        assert!(
+            parsed.get("workflows").is_some(),
+            "the data still renders in the body"
+        );
+        // The notice is available separately for the caller to emit on STDERR.
+        let notice =
+            fanout_partial_notice(&payload).expect("degraded payload yields a stderr notice");
+        assert!(notice.starts_with("WARNING: cross-shard read is partial"));
+        assert!(notice.contains("2: pool missing"));
     }
 
     #[test]
@@ -6012,6 +6026,8 @@ mod reuse_policy_tests {
         let payload = json!([{"id": "00000000-0000-0000-0000-000000000001"}]);
         let rendered = render_response(&cli, &payload).expect("render should succeed");
         assert!(!rendered.contains("WARNING"));
+        // No stderr notice on the happy path either.
+        assert!(fanout_partial_notice(&payload).is_none());
     }
 
     #[test]

@@ -173,17 +173,23 @@ pub struct FanoutRows<R> {
     /// Cross-shard completeness of this read.
     pub status: FanoutStatus,
     /// Shards that could not be queried, named with a reason and sorted by
-    /// `shard_id`. Empty exactly when `status == Complete`.
+    /// `shard_id`. Empty when `status == Complete`; also empty in the
+    /// degenerate `Unavailable`-with-no-observations case (nothing to name).
     pub unavailable_shards: Vec<UnavailableShard>,
 }
 
 impl<R> FanoutRows<R> {
     /// `true` when every expected shard was inspected — the happy path on
     /// which a bare-array endpoint keeps its legacy response shape (issue
-    /// #756, AC3). Equivalent to `unavailable_shards.is_empty()`.
+    /// #756, AC3).
+    ///
+    /// Keyed on `status == Complete`, NOT on `unavailable_shards.is_empty()`:
+    /// the two diverge in the `Unavailable`-with-empty-`unavailable_shards`
+    /// case (no expected shard could even be resolved), which is decidedly not
+    /// a happy path and must not be reported complete.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
-        self.unavailable_shards.is_empty()
+        matches!(self.status, FanoutStatus::Complete)
     }
 }
 
