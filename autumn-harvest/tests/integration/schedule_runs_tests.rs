@@ -199,6 +199,7 @@ async fn seed_run(
             origin,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("start");

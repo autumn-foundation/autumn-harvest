@@ -6088,7 +6088,7 @@
       "path": "/admin/gates",
       "category": "admission_gates",
       "read_only": true,
-      "description": "List all active (non-lifted) admission gates.",
+      "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (the cross-shard completion-trigger relay, gated authoritatively at relay time on the target shard's real queue: blocks a matching gate, else counts the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": {

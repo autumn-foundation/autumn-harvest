@@ -539,7 +539,7 @@ async fn test_same_shard_not_found_retry() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -587,7 +587,7 @@ async fn test_same_shard_not_found_retry() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_target_params)
+    start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
         .unwrap();
 
@@ -735,7 +735,7 @@ async fn test_cross_shard_outbox_delivery() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_target_params)
+    start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
         .unwrap();
 
@@ -776,7 +776,7 @@ async fn test_cross_shard_outbox_delivery() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -896,7 +896,7 @@ async fn test_grace_window_expiration() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -1055,7 +1055,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_params)
+    start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
         .unwrap();
 
@@ -1103,7 +1103,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         origin: None,
         completion_callbacks: None,
     };
-    start_or_load_workflow_execution(&mut conn, start_target_params)
+    start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
         .unwrap();
 
@@ -1212,6 +1212,7 @@ async fn test_mixed_timer_suspension_signal_resolves_inline_wakes_immediately() 
             "target-inline-signal-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1237,6 +1238,7 @@ async fn test_mixed_timer_suspension_signal_resolves_inline_wakes_immediately() 
             "caller-inline-signal-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1345,6 +1347,7 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
             "target-inline-cancel-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1370,6 +1373,7 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
             "caller-inline-cancel-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1493,6 +1497,7 @@ async fn test_pure_timer_after_inline_external_does_not_false_wake() {
             "target-pure-timer-guard-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -1518,6 +1523,7 @@ async fn test_pure_timer_after_inline_external_does_not_false_wake() {
             "caller-pure-timer-guard-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();

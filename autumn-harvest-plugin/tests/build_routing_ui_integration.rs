@@ -655,6 +655,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -955,6 +956,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
         )
         .await
         .unwrap();

@@ -106,6 +106,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features mcp,unified-dag-execution -- -D warnings
       - name: Clippy autumn-harvest-plugin (metrics feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
+      - name: Clippy autumn-harvest-plugin (webhooks feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -154,6 +156,9 @@ jobs:
       - name: Run plugin lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --lib
+      - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features webhooks --lib
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests

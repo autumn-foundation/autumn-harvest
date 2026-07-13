@@ -628,11 +628,7 @@ pub async fn resolve_target_queue(
         {
             return q;
         }
-        return GLOBAL_DEFAULT_WORKFLOW_QUEUE
-            .read()
-            .ok()
-            .and_then(|lock| lock.clone())
-            .unwrap_or_else(|| "default".to_string());
+        return default_workflow_queue();
     }
 
     // Otherwise, acquire a connection to the configured default shard to query
@@ -665,6 +661,17 @@ pub async fn resolve_target_queue(
         }
     }
 
+    default_workflow_queue()
+}
+
+/// The shard-independent default start queue: the process-global registered
+/// default (`GLOBAL_DEFAULT_WORKFLOW_QUEUE`), else the literal `"default"`.
+///
+/// This is the correct answer whenever a schedule-level queue override cannot be
+/// read — it depends on no shard's `harvest_schedules` and so can never return a
+/// wrong-shard queue.
+#[cfg(feature = "db")]
+fn default_workflow_queue() -> String {
     GLOBAL_DEFAULT_WORKFLOW_QUEUE
         .read()
         .ok()
@@ -672,10 +679,284 @@ pub async fn resolve_target_queue(
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Resolve the start queue for a **cross-shard** completion-trigger target.
+///
+/// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
+/// time: on a fresh connection to the target shard's own pool, so the inline
+/// admission-gate check (issue #618, F2 re-review) evaluates the exact queue the
+/// deferred start will use.
+///
+/// The source transaction connection is **deliberately not a parameter** (issue
+/// #618, F2 re-review round 2): the schedule-level queue override lives only on
+/// the target shard, and resolving it on the source connection would query the
+/// WRONG shard's `harvest_schedules` — for a target hashing to shard 0,
+/// `resolve_target_queue`'s directly-queryable branch would read the source
+/// connection and could return a wrong queue, silently mis-evaluating a Queue(q)
+/// gate (the exact bug F2 fixed, reintroduced in the connection-failure edge).
+/// When the target-shard pool/connection is unavailable we therefore fall back to
+/// the shard-INDEPENDENT `default_workflow_queue()`, never to the source
+/// connection. Fleet/name/owner/shard gates do not depend on the queue and still
+/// evaluate correctly in the fallback. Bounded double-fault edge (documented): a
+/// `Queue(schedule-override)` gate can be missed only while the target shard is
+/// unreachable — strictly better than returning a wrong-shard queue.
+#[cfg(feature = "db")]
+pub async fn resolve_cross_shard_target_queue(
+    target_workflow_name: &str,
+    target_shard: crate::types::ShardId,
+) -> String {
+    let target_pool = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+        .and_then(|sp| sp.exact_pool_for(target_shard).cloned());
+    if let Some(tp) = target_pool {
+        match tp.get().await {
+            Ok(mut target_conn) => {
+                return resolve_target_queue(&mut target_conn, target_workflow_name, target_shard)
+                    .await;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                target_shard = target_shard.as_i32(),
+                "could not acquire target-shard connection for cross-shard admission-gate \
+                 queue resolution; falling back to the shard-independent default queue"
+            ),
+        }
+    }
+    default_workflow_queue()
+}
+
+/// Outcome of a claimed cross-shard completion-trigger relay attempt, decided
+/// under the source-row `FOR UPDATE SKIP LOCKED` claim (issue #618, F-round19).
+///
+/// Metrics are recorded by [`relay_gate_checked_start`] *after* the claim
+/// transaction commits — never inside it — so a rollback never leaves a phantom
+/// count.
+#[cfg(feature = "db")]
+enum RelayOutcome {
+    /// Another processor (the sibling immediate/scanner path, or a peer replica)
+    /// already owns this outbox row this instant → skip; no metric, no double
+    /// processing.
+    Skipped,
+    /// The target ran (fresh create, idempotent attach, or already-existed) → the
+    /// outbox row was deleted, the fires row left `NULL` (a real fire); count a
+    /// `completion_trigger_outbox` bypass.
+    Delivered,
+    /// A genuinely fresh admission the gate blocked → the outbox row was deleted and
+    /// the fires row marked `admission_blocked`. The core start primitive already
+    /// recorded the `harvest.admission.blocked` count (issue #618, PR #1014), so the
+    /// relay does NOT re-record it — `reason` is kept only for the tracing log.
+    Blocked { reason: String },
+}
+
+/// Run the cross-shard completion-trigger relay's start/block decision through the
+/// existence-aware [`crate::execution::gate_checked_start_or_load`] primitive under
+/// a source-row claim, then apply the source-shard bookkeeping (issue #618,
+/// F-round13/15/18/19).
+///
+/// **Mutual exclusion (F-round19).** Both the immediate `DeferredTriggerStart::spawn()`
+/// relay and the scanner ([`enforce_completion_triggers_outbox`]) — and any two
+/// scanner replicas assigned the same shard — reach this one function. Without
+/// ownership of the source outbox row they could BOTH process it and reach
+/// DIVERGENT decisions: one starts the target (its `execution_exists_by_key` and
+/// gate check saw no target and no gate), the other — a gate having been raised in
+/// the interim, and the first relay's target start not yet visible on the target
+/// shard — BLOCKS it, and whichever wins the source-row delete durably records the
+/// wrong outcome (an `admission_blocked` fire for a target that actually ran). This
+/// function eliminates that race by claiming the source outbox row
+/// `FOR UPDATE SKIP LOCKED` and holding the claim across the ENTIRE relay
+/// (existence check → gate → cross-shard target start → source delete/block): only
+/// one path owns the row and makes the decision; a concurrent path's `SKIP LOCKED`
+/// returns nothing → [`RelayOutcome::Skipped`]. If the owner crashes mid-flight the
+/// claim transaction rolls back → the row stays present + unlocked, and the
+/// round-15 delivered-if-target-exists retry makes the next attempt correct. The
+/// claim is held across the cross-shard target start (a bounded, per-row
+/// source-shard row lock on a tiny transient row); a peer never waits on it
+/// (`SKIP LOCKED`) — it simply retries the row on the next tick.
+///
+/// Under the claim, the decision (rounds 13/15/18 preserved):
+/// - target already exists in ANY state (round 15) → DELIVERED: delete the outbox
+///   row, fires stays `NULL`, count a bypass.
+/// - fresh + `will_create` + matching gate (round 18) → BLOCKED: delete the outbox
+///   row, mark fires `admission_blocked`, count a block.
+/// - fresh + no gate (or an attach `_collect` performs) → DELIVERED: delete + bypass.
+///
+/// Metrics are recorded AFTER the claim transaction commits. The same-shard inline
+/// path in [`evaluate_triggers_for_execution`] is unaffected (it starts the target
+/// directly and never touches the outbox).
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn relay_gate_checked_start(
+    target_conn: &mut diesel_async::AsyncPgConnection,
+    source_conn: &mut diesel_async::AsyncPgConnection,
+    params: crate::execution::StartWorkflowParams<'_>,
+    outbox_id: Uuid,
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> crate::error::HarvestResult<()> {
+    use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use diesel::prelude::*;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use scoped_futures::ScopedFutureExt;
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        #[allow(dead_code)]
+        id: Uuid,
+    }
+
+    // The relay-time gate decision (issue #618, PR #1014) is now enforced
+    // AUTHORITATIVELY inside the core start primitive: the `Some(GateMode::CheckCached)`
+    // argument to `start_or_load_workflow_execution_with_metrics` below makes
+    // `_collect` apply the gate iff it will CREATE a new execution (issue #618,
+    // F-round18). The any-state `execution_exists_by_key` check first short-circuits
+    // a target that exists in ANY state to DELIVERED, so by the time control reaches
+    // the start no target exists → `will_create` is trivially `true` and the gate
+    // always applies to a fresh cross-shard delivery. `CheckCached` honours the
+    // last-known snapshot (never the fail-closed sentinel) — the relay materializes
+    // pre-committed in-flight-continuation work, so the same no-permanent-drop
+    // rationale as the inline path applies. The primitive records the
+    // `harvest.admission.blocked` count itself, so the relay only performs the
+    // fires-row `admission_blocked` bookkeeping + outbox-row drop on a block.
+
+    // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
+    // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
+    // is a separate connection whose own transaction commits independently.
+    let outcome = source_conn
+        .transaction::<RelayOutcome, crate::error::HarvestError, _>(|source_tx| {
+            async move {
+                let claimed: Option<ClaimedId> = diesel::sql_query(
+                    "SELECT id FROM harvest_completion_trigger_outbox \
+                     WHERE id = $1 FOR UPDATE SKIP LOCKED",
+                )
+                .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+                .get_result::<ClaimedId>(source_tx)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+                if claimed.is_none() {
+                    // A sibling relay path / peer replica owns this row right now.
+                    return Ok(RelayOutcome::Skipped);
+                }
+
+                // round-15 any-state existence check on the TARGET shard (separate
+                // connection; the source claim is held throughout). Exists in ANY
+                // state → the fire was already delivered → drop the row, count a
+                // bypass, leave fires `NULL`.
+                if crate::execution::execution_exists_by_key(
+                    target_conn,
+                    params.workflow_name,
+                    params.workflow_id,
+                )
+                .await?
+                {
+                    tracing::debug!(
+                        outbox_id = %outbox_id,
+                        workflow_name = %params.workflow_name,
+                        workflow_id = %params.workflow_id,
+                        "[completion_trigger] cross-shard relay: deterministic target already exists (any state); treating the stale outbox row as delivered"
+                    );
+                    diesel::delete(
+                        outbox_dsl::harvest_completion_trigger_outbox
+                            .filter(outbox_dsl::id.eq(outbox_id)),
+                    )
+                    .execute(source_tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    return Ok(RelayOutcome::Delivered);
+                }
+
+                match crate::execution::start_or_load_workflow_execution_with_metrics(
+                    target_conn,
+                    params,
+                    metrics,
+                    Some(crate::admission_gate::GateMode::CheckCached),
+                )
+                .await
+                {
+                    Err(crate::error::HarvestError::AdmissionBlocked { reason, .. }) => {
+                        // The primitive already recorded the block count; the relay
+                        // only drops the outbox row + marks the fires row.
+                        diesel::delete(
+                            outbox_dsl::harvest_completion_trigger_outbox
+                                .filter(outbox_dsl::id.eq(outbox_id)),
+                        )
+                        .execute(source_tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(source_exec_id))
+                                .filter(fires_dsl::trigger_id.eq(trigger_id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("admission_blocked")))
+                        .execute(source_tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                        Ok(RelayOutcome::Blocked { reason })
+                    }
+                    Err(e) => Err(e),
+                    Ok(_started) => {
+                        // Fresh start OR an idempotent attach to a still-active run:
+                        // either way the target IS started → DELIVERY. Delete the row,
+                        // leave fires `NULL`, count a bypass.
+                        diesel::delete(
+                            outbox_dsl::harvest_completion_trigger_outbox
+                                .filter(outbox_dsl::id.eq(outbox_id)),
+                        )
+                        .execute(source_tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                        Ok(RelayOutcome::Delivered)
+                    }
+                }
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    // Record metrics ONLY after the claim transaction commits (a rollback must not
+    // leave a phantom count).
+    match outcome {
+        RelayOutcome::Skipped => {
+            tracing::debug!(
+                outbox_id = %outbox_id,
+                "[completion_trigger] cross-shard relay: source outbox row already claimed by a sibling path; skipped"
+            );
+        }
+        RelayOutcome::Delivered => {
+            if let Some(m) = metrics {
+                m.record_admission_bypassed(
+                    crate::admission_gate::StartProducer::CompletionTriggerOutbox.as_str(),
+                );
+            }
+        }
+        RelayOutcome::Blocked { reason } => {
+            // The block count was already recorded by the core start primitive
+            // (`record_start_gate_block` inside `_collect`), so the relay does NOT
+            // re-record it here — that would double-count (issue #618, PR #1014).
+            tracing::info!(
+                reason = %reason,
+                "[completion_trigger] cross-shard relay blocked by an admission gate on the real target queue; dropped the outbox row"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "db")]
 #[derive(Debug, Clone)]
 pub struct DeferredTriggerStart {
     pub outbox_id: Uuid,
+    /// Source execution id — the fires-row key `(source_exec_id, trigger_id)` so a
+    /// relay-time block can mark the existing fires row `admission_blocked`
+    /// (issue #618, F-round10).
+    pub source_exec_id: Uuid,
+    /// Trigger id — the other half of the fires-row key.
+    pub trigger_id: Uuid,
     pub source_shard: crate::types::ShardId,
     pub target_shard: crate::types::ShardId,
     pub target_workflow_name: String,
@@ -739,72 +1020,94 @@ impl DeferredTriggerStart {
                 )
                 .await
             };
-            let start_res = crate::execution::start_or_load_workflow_execution(
-                &mut target_conn,
-                crate::execution::StartWorkflowParams {
-                    workflow_name: &self.target_workflow_name,
-                    workflow_id: &self.target_workflow_id,
-                    exec_id: crate::types::ExecutionId::new_for_shard(self.target_shard),
-                    input: self.target_input,
-                    parent_id: None,
-                    queue_name: &queue_name,
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: None,
-                    reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                    trace_context: None,
-                    max_execution_timeout_ceiling: None,
-                    concurrency_key: self.concurrency_key,
-                    concurrency_limit: self.concurrency_limit,
-                    priority: self.priority,
-                    max_workflow_input_bytes: self.max_workflow_input_bytes,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner: self.owner.as_deref(),
-                    runbook_url: self.runbook_url.as_deref(),
-                    severity: self.severity.as_deref(),
-                    context_headers: None,
-                    sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: self.retry_policy.clone(),
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
-                    origin: None,
-                    completion_callbacks: None,
-                },
-            )
-            .await;
-            match start_res {
-                Ok(_) => {
-                    // Delete task from outbox on successful start
-                    if let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
-                        .read()
-                        .ok()
-                        .and_then(|p| p.clone())
-                        .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
-                        && let Ok(mut source_conn) = source_pool.get().await
-                    {
-                        use diesel::prelude::*;
-                        use diesel_async::RunQueryDsl;
-                        let _ =
-                            diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
-                                .filter(
-                                    crate::schema::harvest_completion_trigger_outbox::dsl::id
-                                        .eq(self.outbox_id),
-                                )
-                                .execute(&mut source_conn)
-                                .await;
-                    }
-                }
+
+            // Existence-aware relay-time start/block via the round-12
+            // `gate_checked_start_or_load` (issue #618, F-round13): the target-shard
+            // existence-lock + gate + start are atomic, so a stale outbox row whose
+            // target ALREADY exists (this relay started the target but then failed to
+            // delete the source outbox row) is treated as DELIVERED on retry rather
+            // than wrongly blocked. Uses the process-global recorder (spawn has no
+            // explicit metrics param), mirroring the scanner path.
+            let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
+                .read()
+                .ok()
+                .and_then(|p| p.clone())
+                .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
+            else {
+                tracing::error!(
+                    "[completion_trigger] GLOBAL_SHARDED_POOL missing source shard {:?}; leaving the outbox row for the scanner",
+                    self.source_shard
+                );
+                return;
+            };
+            let mut source_conn = match source_pool.get().await {
+                Ok(c) => c,
                 Err(e) => {
                     tracing::error!(
-                        "[completion_trigger] Failed to start workflow execution cross-shard: {:?}",
+                        "[completion_trigger] Failed to get source-shard connection: {:?}; leaving the outbox row for the scanner",
                         e
                     );
+                    return;
                 }
+            };
+
+            let global_metrics = crate::admission_gate::global_admission_metrics();
+            let metrics_ref = global_metrics
+                .as_ref()
+                .map(|m| m.as_ref() as &(dyn crate::telemetry::MetricsRecorder + Send + Sync));
+
+            let params = crate::execution::StartWorkflowParams {
+                workflow_name: &self.target_workflow_name,
+                workflow_id: &self.target_workflow_id,
+                exec_id: crate::types::ExecutionId::new_for_shard(self.target_shard),
+                input: self.target_input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: self.concurrency_key,
+                concurrency_limit: self.concurrency_limit,
+                priority: self.priority,
+                max_workflow_input_bytes: self.max_workflow_input_bytes,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: self.owner.as_deref(),
+                runbook_url: self.runbook_url.as_deref(),
+                severity: self.severity.as_deref(),
+                context_headers: None,
+                sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: self.retry_policy.clone(),
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
+                origin: None,
+                completion_callbacks: None,
+            };
+
+            if let Err(e) = relay_gate_checked_start(
+                &mut target_conn,
+                &mut source_conn,
+                params,
+                self.outbox_id,
+                self.source_exec_id,
+                self.trigger_id,
+                metrics_ref,
+            )
+            .await
+            {
+                // A start error (e.g. PayloadTooLarge) leaves the outbox row for the
+                // scanner to handle (which deletes an oversized-payload row).
+                tracing::error!(
+                    "[completion_trigger] Failed to start workflow execution cross-shard: {:?}",
+                    e
+                );
             }
         });
     }
@@ -994,6 +1297,171 @@ pub fn evaluate_triggers_for_execution<'a>(
                 }
             }
 
+            // Resolve routing + target metadata BEFORE the fires-row insert so
+            // the admission-gate check (issue #618) can evaluate every scope
+            // (Fleet/WorkflowName/Queue/ShardId/Owner) and record the correct
+            // resolved outcome.
+            let router = crate::shard::GLOBAL_SHARD_ROUTER
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .ok_or_else(|| {
+                    tracing::error!("[completion_trigger] GLOBAL_SHARD_ROUTER is not initialized.");
+                    crate::error::database_error(diesel::result::Error::RollbackTransaction)
+                })?;
+            let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
+            let source_shard = router.shard_for_execution(exec_id);
+
+            // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
+            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
+                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+                lock.as_ref()
+                    .and_then(|guard| guard.as_ref())
+                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
+                    .map_or((None, None, None, None, None), |meta| {
+                        (
+                            meta.owner.clone(),
+                            meta.runbook_url.clone(),
+                            meta.severity.clone(),
+                            meta.sla,
+                            meta.retry_policy.clone(),
+                        )
+                    })
+            };
+
+            // issue #618: completion triggers are an in-process start producer
+            // and MUST honour an active admission gate. This runs INSIDE the
+            // source workflow's terminal-commit transaction, so a block is a
+            // CLEAN SKIP that NEVER rolls back the source's terminal commit —
+            // mirroring the #810 `condition_unmet` resolved-skip shape. The
+            // blocked start is DROPPED, not deferred: identically to a direct
+            // API start being refused during an incident. The resolved skip is
+            // recorded through the same ON CONFLICT DO NOTHING fires-row PK path
+            // a real fire uses (exactly-once, so cascade re-entry dedupes it and
+            // this terminal never retries the start), with the distinct
+            // `admission_blocked` outcome. When no gate cache is installed (the
+            // common path / standalone integrations) the check is skipped and
+            // resolution below is byte-identical to pre-#618.
+            //
+            // Fail-closed handling (issue #618 F3 + Codex P1): consult the
+            // LAST-KNOWN cached snapshot via `check_cached`, which ignores the
+            // fail-closed/initialized flag and returns only a REAL matching gate
+            // (never the nil sentinel). `set_fail_closed()` retains the snapshot,
+            // so a gate loaded before a transient gate-DB read error still blocks
+            // a matching completion-trigger start (block+drop+count) — otherwise
+            // completion triggers would BYPASS an active gate uncounted during
+            // exactly the incident the gate exists for, while direct API starts
+            // still block. When no cached gate matches (empty snapshot in the boot
+            // window, or a transient blip with no gate targeting this start) we
+            // PROCEED rather than permanently dropping in-flight continuation (a
+            // completion-trigger start cannot retry, unlike an API caller). This
+            // is a deliberate, documented divergence from the API path: when
+            // initialized-and-healthy both see identical gates; under fail-closed
+            // the API blocks everything (caller retries) while triggers honour
+            // only known-cached gates. Bounded caveat: a gate ADDED during a
+            // gate-DB outage (never loaded into the snapshot) won't block triggers
+            // until the next successful refresh.
+            // Resolve the target queue at most ONCE per trigger (issue #618, F9):
+            // the gate check below and the same-shard start further down both
+            // need it. `None` = not yet resolved (no gate cache installed, so the
+            // same-shard branch resolves it lazily as before).
+            let mut resolved_queue: Option<String> = None;
+            if let Some(cache) = crate::admission_gate::global_admission_gate_cache() {
+                let gate_queue = if let Some(ref q) = trigger_db.queue_name {
+                    q.clone()
+                } else if target_shard == source_shard {
+                    // Same-shard target: the source transaction connection IS the
+                    // target shard's connection, so resolve directly — no extra
+                    // DB round-trip (preserves the no-gate/same-shard common-case
+                    // property; F9's single-resolution reuse below still applies).
+                    resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
+                } else {
+                    // Cross-shard target (issue #618, F2 re-review): the outbox
+                    // relay resolves the ACTUAL start queue on the TARGET
+                    // connection at fire time (see
+                    // `enforce_completion_triggers_outbox`). Resolve identically
+                    // here — on a fresh target-shard connection — so the inline
+                    // gate check evaluates the SAME queue the start will use.
+                    // `resolve_cross_shard_target_queue` deliberately takes NO
+                    // source connection: for a target hashing to shard 0, querying
+                    // `harvest_schedules` on the source `conn` would read the wrong
+                    // shard and could miss a Queue(q) gate scoped to the real
+                    // target queue. If the target-shard pool is unavailable it
+                    // falls back to the shard-independent default queue (never the
+                    // source connection); Fleet/name gates still match — only a
+                    // schedule-override Queue gate could be missed in that
+                    // double-fault edge.
+                    resolve_cross_shard_target_queue(&trigger_db.target_workflow_name, target_shard)
+                        .await
+                };
+                resolved_queue = Some(gate_queue.clone());
+                if let Some((_gate_id, reason, scope_kind)) = cache.check_cached(
+                    &trigger_db.target_workflow_name,
+                    &gate_queue,
+                    target_shard.as_i32(),
+                    target_owner.as_deref(),
+                ) {
+                    tracing::info!(
+                        trigger_id = %trigger_db.id,
+                        source_exec_id = %exec_id,
+                        target_workflow_name = %trigger_db.target_workflow_name,
+                        scope_kind = %scope_kind,
+                        reason = %reason,
+                        "Completion trigger start blocked by a cached admission gate; \
+                         dropping the trigger start (recorded once, not retried)."
+                    );
+                    let blocked_inserted =
+                        diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
+                            .values(&NewCompletionTriggerFireDb {
+                                source_exec_id: exec_id.as_uuid(),
+                                trigger_id: trigger_db.id,
+                                outcome: Some("admission_blocked".to_string()),
+                            })
+                            .on_conflict_do_nothing()
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                    // Resolve the recorder: the caller's explicit param when
+                    // supplied (worker / timeout paths), else the process-global
+                    // recorder the plugin publishes at boot (issue #618, F-round5).
+                    // The cancel / terminate / parent-close-cascade paths in
+                    // `execution.rs` all call this with `metrics: None`, so without
+                    // the fallback a completion-trigger start blocked by a gate on
+                    // one of those terminal paths would be dropped-and-recorded but
+                    // NEVER counted — a hole in the "zero un-counted blocks" bar.
+                    let fallback_recorder = if metrics.is_none() {
+                        crate::admission_gate::global_admission_metrics()
+                    } else {
+                        None
+                    };
+                    // A tuple `match` (rather than `if let ... else`) so the
+                    // `&dyn MetricsRecorder` -> annotated `+ Send + Sync` coercion
+                    // still applies at the `Some(g.as_ref())` expression site (the
+                    // trait has both supertraits), matching how the worker passes
+                    // `registry.telemetry().metrics.as_ref()`.
+                    let effective_metrics: Option<
+                        &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+                    > = match (metrics, fallback_recorder.as_ref()) {
+                        (Some(m), _) => Some(m),
+                        (None, Some(g)) => Some(g.as_ref()),
+                        (None, None) => None,
+                    };
+                    if let Some(m) = effective_metrics {
+                        // Only count the FIRST resolution of this (source, trigger)
+                        // pair (issue #618, F4): cascade re-entry / multi-terminal-
+                        // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
+                        // and must not double-count. Mirrors the sibling
+                        // `condition_unmet` -> `deduped` shape.
+                        if blocked_inserted > 0 {
+                            m.record_admission_blocked(scope_kind, &reason);
+                        } else {
+                            m.record_completion_trigger_fired(&trigger_name, "deduped");
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let inserted = diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
                 .values(&NewCompletionTriggerFireDb {
                     source_exec_id: exec_id.as_uuid(),
@@ -1013,17 +1481,6 @@ pub fn evaluate_triggers_for_execution<'a>(
                 }
                 continue;
             }
-
-            let router = crate::shard::GLOBAL_SHARD_ROUTER
-                .read()
-                .ok()
-                .and_then(|guard| guard.as_ref().cloned())
-                .ok_or_else(|| {
-                    tracing::error!("[completion_trigger] GLOBAL_SHARD_ROUTER is not initialized.");
-                    crate::error::database_error(diesel::result::Error::RollbackTransaction)
-                })?;
-            let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
-            let source_shard = router.shard_for_execution(exec_id);
 
             // Resolve target concurrency parameters
             let (concurrency_key, concurrency_limit) = {
@@ -1049,28 +1506,15 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
-            // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
-            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
-                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
-                lock.as_ref()
-                    .and_then(|guard| guard.as_ref())
-                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .map_or((None, None, None, None, None), |meta| {
-                        (
-                            meta.owner.clone(),
-                            meta.runbook_url.clone(),
-                            meta.severity.clone(),
-                            meta.sla,
-                            meta.retry_policy.clone(),
-                        )
-                    })
-            };
-
             let max_workflow_attempts_ceiling =
                 GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.read().ok().and_then(|g| *g);
 
             if target_shard == source_shard {
-                let queue_name = if let Some(ref q) = trigger_db.queue_name {
+                // Reuse the queue already resolved for the gate check (issue #618,
+                // F9); only resolve here when no gate cache was installed.
+                let queue_name = if let Some(q) = resolved_queue.take() {
+                    q
+                } else if let Some(ref q) = trigger_db.queue_name {
                     q.clone()
                 } else {
                     resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
@@ -1114,6 +1558,12 @@ pub fn evaluate_triggers_for_execution<'a>(
                         origin: None,
                         completion_callbacks: None,
                     },
+                    // The inline same-shard completion-trigger start keeps its own
+                    // unlocked pre-check gate above (it also performs the fires-row
+                    // `admission_blocked` bookkeeping and the first-time-only block
+                    // counting that the primitive cannot), so it is not gated again
+                    // here — pass `None` to avoid double-counting (issue #618).
+                    None,
                 )
                 .await
                 {
@@ -1183,6 +1633,8 @@ pub fn evaluate_triggers_for_execution<'a>(
 
                 deferred_starts.push(DeferredTriggerStart {
                     outbox_id: outbox_row.id,
+                    source_exec_id: exec_id.as_uuid(),
+                    trigger_id: trigger_db.id,
                     source_shard,
                     target_shard,
                     target_workflow_name: trigger_db.target_workflow_name.clone(),
@@ -1218,6 +1670,7 @@ pub fn evaluate_triggers_for_execution<'a>(
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_completion_triggers_outbox(
     conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
@@ -1294,60 +1747,70 @@ pub async fn enforce_completion_triggers_outbox(
             .read()
             .ok()
             .and_then(|g| *g);
-        let start_res = crate::execution::start_or_load_workflow_execution(
-            &mut target_conn,
-            crate::execution::StartWorkflowParams {
-                workflow_name: &task.target_workflow_name,
-                workflow_id: &task.target_workflow_id,
-                exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
-                input: task.target_input,
-                parent_id: None,
-                queue_name: &queue_name,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                trace_context: None,
-                max_execution_timeout_ceiling: None,
-                concurrency_key: task.concurrency_key,
-                concurrency_limit: task
-                    .concurrency_limit
-                    .map(|l| u32::try_from(l).unwrap_or(0)),
-                priority,
-                max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
-                owner: target_owner.as_deref(),
-                runbook_url: target_runbook_url.as_deref(),
-                severity: target_severity.as_deref(),
-                context_headers: None,
-                sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: target_retry_policy,
-                retry_of_exec_id: None,
-                max_workflow_attempts_ceiling,
-                // Completion-trigger start is not a schedule fire (issue #534).
-                origin: None,
-                // Internal start: only builder-wide default callback targets
-                // apply (issue #605); a completion-trigger target has no
-                // per-execution callback option of its own.
-                completion_callbacks: None,
-            },
-        )
-        .await;
 
-        match start_res {
-            Ok(_) => {
-                // Delete task from outbox on successful start
-                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                    .filter(outbox_dsl::id.eq(task.id))
-                    .execute(conn)
-                    .await;
-                processed_count += 1;
-            }
+        let params = crate::execution::StartWorkflowParams {
+            workflow_name: &task.target_workflow_name,
+            workflow_id: &task.target_workflow_id,
+            exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
+            input: task.target_input,
+            parent_id: None,
+            queue_name: &queue_name,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: task.concurrency_key,
+            concurrency_limit: task
+                .concurrency_limit
+                .map(|l| u32::try_from(l).unwrap_or(0)),
+            priority,
+            max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: target_owner.as_deref(),
+            runbook_url: target_runbook_url.as_deref(),
+            severity: target_severity.as_deref(),
+            context_headers: None,
+            sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: target_retry_policy,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling,
+            // Completion-trigger start is not a schedule fire (issue #534).
+            origin: None,
+            // Internal start: only builder-wide default callback targets apply
+            // (issue #605); a completion-trigger target has no per-execution
+            // callback option of its own.
+            completion_callbacks: None,
+        };
+
+        // Existence-aware relay-time start/block via `gate_checked_start_or_load`
+        // (issue #618, F-round13): identical to the immediate `spawn()` relay, and
+        // now robust to a STALE outbox row whose target ALREADY exists (the
+        // immediate relay started the target but then failed to delete the source
+        // row). On this retry the locked-live target is treated as DELIVERED (delete
+        // outbox + count bypass), never wrongly blocked/dropped. A fresh target with
+        // a matching gate is blocked (drop outbox + mark fires `admission_blocked` +
+        // count block); a fresh target with no gate is a counted bypass. All gated on
+        // the source-shard delete for exactly-once vs the immediate relay. `conn` is
+        // the source shard.
+        match relay_gate_checked_start(
+            &mut target_conn,
+            conn,
+            params,
+            task.id,
+            task.source_exec_id,
+            task.trigger_id,
+            Some(metrics),
+        )
+        .await
+        {
+            Ok(()) => processed_count += 1,
             Err(crate::error::HarvestError::PayloadTooLarge {
                 kind,
                 observed_bytes,

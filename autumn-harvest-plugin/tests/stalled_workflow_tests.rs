@@ -255,6 +255,7 @@ async fn seed_stalled_workflow(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("seed workflow");

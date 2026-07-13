@@ -567,6 +567,19 @@ pub const METRIC_ADMISSION_BLOCKED: &str = "harvest.admission.blocked";
 /// Gauge: current number of active admission gates.
 pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active";
 
+/// Counter: incremented each time a start producer that is **exempt-by-design**
+/// from the admission gate relays a workflow start (issue #618).
+///
+/// Label:
+///   - `"producer"` (= [`METRIC_LABEL_PRODUCER`]) — the exempt producer's
+///     bounded label (e.g. `"outbox"`), from
+///     [`crate::admission_gate::StartProducer::as_str`].
+///
+/// This makes every intentional gate bypass observable so an operator can see
+/// in real time whether anything is slipping the gate. Per ADR-0001 §7,
+/// `execution.id` is never a metric label.
+pub const METRIC_ADMISSION_BYPASSED: &str = "harvest.admission.bypassed";
+
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -914,6 +927,8 @@ pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).
 pub const METRIC_LABEL_SCOPE: &str = "scope";
+/// Metric label: the in-process start producer (issue #618).
+pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
 /// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
@@ -1368,6 +1383,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// The active gate count changed (useful for alerting on nonzero gates).
     fn record_admission_gates_active(&self, count: i64) {
         let _ = count;
+    }
+
+    /// A start producer that is exempt-by-design from the admission gate relayed
+    /// a workflow start (issue #618).
+    ///
+    /// `producer` is the bounded label from
+    /// [`crate::admission_gate::StartProducer::as_str`] (e.g. `"outbox"`).
+    /// Making every intentional bypass observable is how an operator confirms
+    /// nothing is silently slipping an active gate.
+    fn record_admission_bypassed(&self, producer: &str) {
+        let _ = producer;
     }
 
     /// A workflow task entered the executor on a worker.
@@ -2467,6 +2493,9 @@ mod tests {
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
         assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
+        // issue #618: exempt-by-design start producers increment this counter.
+        assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
+        assert_eq!(METRIC_LABEL_PRODUCER, "producer");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
         assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
         assert_eq!(
@@ -3065,6 +3094,14 @@ mod tests {
         rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Acquired);
         rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::TimedOut);
         rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Broken);
+    }
+
+    #[test]
+    fn noop_metrics_implements_admission_bypassed_without_panicking() {
+        // issue #618: the new bypass counter has a no-op default (additive).
+        let rec = NoOpMetrics;
+        rec.record_admission_bypassed("outbox");
+        rec.record_admission_bypassed("api");
     }
 
     #[test]

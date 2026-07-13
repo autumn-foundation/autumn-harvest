@@ -3093,7 +3093,16 @@ async fn list_gates_handler(
     match admission_gate_db::list_gates(&mut conn).await {
         Ok(rows) => {
             let views: Vec<AdmissionGateView> = rows.iter().map(AdmissionGateView::from).collect();
-            (StatusCode::OK, Json(serde_json::json!({ "gates": views }))).into_response()
+            // issue #618 (AC5): surface the discoverable start-producer contract
+            // alongside the active gates so an operator can see which in-process
+            // producers honour a gate and which are exempt-by-design (with a
+            // rationale) without reading source.
+            let producers = autumn_harvest::admission_gate::producer_contract();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "gates": views, "producers": producers })),
+            )
+                .into_response()
         }
         Err(e) => AutumnError::internal_server_error(e).into_response(),
     }
@@ -3101,6 +3110,62 @@ async fn list_gates_handler(
 
 /// `POST /admin/gates` — create an admission gate.
 #[allow(clippy::too_many_lines)]
+/// Reconcile the in-memory admission-gate cache after a create/lift that was
+/// already persisted to the DB and written through to the snapshot
+/// (`apply_created`/`apply_lifted`), given the result of the follow-up full
+/// reload.
+///
+/// On a successful reload, `refresh()` the snapshot — replacing it with the
+/// authoritative active-gate list (reconciling other replicas' concurrent
+/// changes) and setting `initialized = true`, which RECOVERS from any prior
+/// fail-closed. Returns the reloaded active-gate count so the caller can emit the
+/// `admission_gates_active` metric.
+///
+/// On a reload FAILURE, arm fail-closed (issue #618, F-round22, superseding the
+/// F-round16 "do NOT arm fail-closed" decision) and return `None`. While the gate
+/// table is momentarily unreadable, `check()` — the API / fresh-admission path,
+/// which CAN retry — must return the synthetic block until a successful refresh
+/// reconciles ALL active gates, rather than serving fresh admissions from a
+/// snapshot that reflects only this replica's local write-through delta and could
+/// be MISSING another replica's gate (e.g. a Fleet gate created on replica B just
+/// before this replica creates a narrower gate and then fails its own reload — a
+/// non-matching start would otherwise slip past B's gate uncounted). On the lift
+/// path this briefly re-blocks the just-lifted work; that OVER-BLOCK is the correct
+/// conservative behaviour for a safety control during a gate-table outage
+/// (over-block briefly rather than leak), bounded by the <=1s background refresh.
+///
+/// The already-applied write-through delta is retained and load-bearing:
+/// `check_cached` — the completion-trigger / in-flight-continuation path, which
+/// CANNOT retry — ignores the fail-closed flag (round 3) and reads the snapshot,
+/// so the just-created gate is still matched (and the just-lifted gate no longer
+/// matched) there, and no in-flight work is permanently dropped. Fail-closed is
+/// therefore transient: the next successful reload re-arms `initialized = true`.
+fn reconcile_gate_cache_after_mutation<E: std::fmt::Display>(
+    cache: &autumn_harvest::AdmissionGateCache,
+    op: &'static str,
+    reload: Result<Vec<autumn_harvest::AdmissionGate>, E>,
+) -> Option<i64> {
+    match reload {
+        Ok(fresh) => {
+            let count = i64::try_from(fresh.len()).unwrap_or(0);
+            cache.refresh(fresh);
+            Some(count)
+        }
+        Err(e) => {
+            cache.set_fail_closed();
+            tracing::warn!(
+                error = %e,
+                op,
+                "admission gate cache full refresh failed after gate mutation; arming \
+                 fail-closed so check() blocks fresh admissions until the gate table is \
+                 readable again; the write-through delta keeps check_cached accurate for \
+                 the mutated gate (completion triggers unaffected); background refresh recovers"
+            );
+            None
+        }
+    }
+}
+
 async fn create_gate_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -3152,29 +3217,32 @@ async fn create_gate_handler(
 
     match result {
         Ok(gate) => {
-            // Refresh the in-process cache immediately so this replica honours
-            // the gate without waiting for the background refresh cycle.
-            // Fail-closed if the follow-up load fails: the gate was persisted
-            // but we cannot read the updated list, so block all admissions on
-            // this replica rather than leaving it with a stale open snapshot.
-            match admission_gate_db::load_active_gates(&mut conn).await {
-                Ok(fresh) => {
-                    let count = i64::try_from(fresh.len()).unwrap_or(0);
-                    api_state.gate_cache().refresh(fresh);
-                    if let Ok(rt) = api_state.runtime() {
-                        rt.registry()
-                            .telemetry()
-                            .metrics
-                            .record_admission_gates_active(count);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "admission gate cache refresh failed after create; entering fail-closed mode"
-                    );
-                    api_state.gate_cache().set_fail_closed();
-                }
+            // Write-through the just-persisted gate into the in-memory snapshot
+            // (issue #618, F-round16) BEFORE the full refresh, so this replica
+            // honours the new gate even if the follow-up load fails. The gate was
+            // persisted to the DB first (create_gate above), so the snapshot is now
+            // accurate for this change regardless of the refresh outcome. This
+            // matters most for the completion-trigger path (check_cached), which
+            // does NOT retry after a synthetic fail-closed block — a stale-open
+            // snapshot here would durably MISS the new gate.
+            api_state.gate_cache().apply_created(gate.clone());
+            // Reconcile any OTHER concurrent changes with a full refresh; on a
+            // reload failure arm fail-closed so check() blocks fresh admissions
+            // until the gate table is readable (issue #618, F-round22 — see
+            // reconcile_gate_cache_after_mutation for the full rationale). The
+            // round-16 write-through above is retained: check_cached ignores the
+            // fail-closed flag (round 3) and keeps honouring the just-created gate,
+            // so completion triggers / in-flight continuation are unaffected.
+            if let Some(count) = reconcile_gate_cache_after_mutation(
+                api_state.gate_cache().as_ref(),
+                "create",
+                admission_gate_db::load_active_gates(&mut conn).await,
+            ) && let Ok(rt) = api_state.runtime()
+            {
+                rt.registry()
+                    .telemetry()
+                    .metrics
+                    .record_admission_gates_active(count);
             }
 
             let gate_id_str = gate.id.to_string();
@@ -3247,27 +3315,35 @@ async fn lift_gate_handler(
     let id_str = id.to_string();
     match admission_gate_db::lift_gate(&mut conn, id, &actor).await {
         Ok(Some(_gate)) => {
-            // Refresh the in-process cache immediately. After a successful
-            // lift the gate is removed; a load failure leaves the replica
-            // fail-closed (blocking) rather than using the pre-lift snapshot.
-            match admission_gate_db::load_active_gates(&mut conn).await {
-                Ok(fresh) => {
-                    let count = i64::try_from(fresh.len()).unwrap_or(0);
-                    api_state.gate_cache().refresh(fresh);
-                    if let Ok(rt) = api_state.runtime() {
-                        rt.registry()
-                            .telemetry()
-                            .metrics
-                            .record_admission_gates_active(count);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "admission gate cache refresh failed after lift; entering fail-closed mode"
-                    );
-                    api_state.gate_cache().set_fail_closed();
-                }
+            // Write-through the lift into the in-memory snapshot (issue #618,
+            // F-round16) BEFORE the full refresh, so the just-lifted gate stops
+            // matching on this replica even if the follow-up load fails. The lift
+            // was persisted to the DB first (lift_gate above). This is what makes a
+            // lift durable for the completion-trigger path (check_cached): a
+            // stale-open snapshot here would keep dropping targets as
+            // admission_blocked against a gate the operator already lifted.
+            api_state.gate_cache().apply_lifted(id);
+            // Reconcile any OTHER concurrent changes with a full refresh; on a
+            // reload failure arm fail-closed so check() blocks fresh admissions
+            // until the gate table is readable (issue #618, F-round22 — see
+            // reconcile_gate_cache_after_mutation for the full rationale). This
+            // briefly OVER-BLOCKS — including re-blocking the just-lifted work —
+            // which is the correct conservative behaviour for a safety control
+            // during a gate-table outage (over-block briefly rather than risk
+            // leaking a start past another replica's still-active gate), bounded by
+            // the <=1s refresh. The round-16 write-through above is retained:
+            // check_cached ignores the fail-closed flag (round 3) and the lifted
+            // gate no longer matches there, so in-flight continuation is unaffected.
+            if let Some(count) = reconcile_gate_cache_after_mutation(
+                api_state.gate_cache().as_ref(),
+                "lift",
+                admission_gate_db::load_active_gates(&mut conn).await,
+            ) && let Ok(rt) = api_state.runtime()
+            {
+                rt.registry()
+                    .telemetry()
+                    .metrics
+                    .record_admission_gates_active(count);
             }
 
             let ar = NewAuditRecord {
@@ -9782,120 +9858,17 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
-    // issue #377: check admission gates before touching the DB.
-    if !is_debounced_start && !has_batch_policy {
-        let wf_owner = runtime
-            .registry
-            .workflows
-            .get(&workflow_name)
-            .and_then(|i| i.owner);
-        let gates =
-            api_state
-                .gate_cache()
-                .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner);
-        if let Some((gate_id, reason, scope_kind)) = gates {
-            // Idempotent retry bypass: if the caller supplied an explicit
-            // workflow_id, check whether a non-terminal execution already
-            // exists on this shard.  start_or_load_workflow_execution with
-            // AllowDuplicate (or AllowDuplicateFailedOnly for live runs) would
-            // return it without creating new work, so the gate must not block.
-            //
-            // A retry can equally land on an already-pending *throttle* row
-            // (code review, issue #607): `reserve_or_defer`'s own idempotency
-            // shortcut (step 1) would resolve it to that same pending row
-            // without creating anything new -- also not a fresh admission --
-            // so the gate must not block that case either. Checked only when
-            // this workflow actually resolves a throttle policy, to avoid an
-            // extra round-trip for the common non-throttled case.
-            //
-            // issue #808 (Codex P2): a *keyed* replay is handled earlier — a
-            // committed keyed claim short-circuits to the `200` no-op before this
-            // gate is even consulted (see the probe above the gate). So by the
-            // time control reaches here with an idempotency key set, it is a
-            // genuinely fresh keyed start with no live claim, which must pass
-            // through the gate normally. This bypass therefore only covers the
-            // explicit-`workflow_id` idempotent-retry case.
-            let is_idempotent_retry = if explicit_workflow_id {
-                match api_state.storage_pool() {
-                    Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
-                        Ok(mut pre_conn) => {
-                            let has_execution = harvest_workflow_executions::table
-                                .filter(
-                                    harvest_workflow_executions::workflow_name.eq(&workflow_name),
-                                )
-                                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                                .filter(
-                                    harvest_workflow_executions::state
-                                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                                )
-                                .select(harvest_workflow_executions::id)
-                                .first::<uuid::Uuid>(&mut pre_conn)
-                                .await
-                                .optional()
-                                .unwrap_or(None)
-                                .is_some();
-                            has_execution
-                                || (throttle_applies
-                                    && autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
-                                        &mut pre_conn,
-                                        &workflow_name,
-                                        &workflow_id,
-                                    )
-                                    .await
-                                    .unwrap_or(false))
-                        }
-                        Err(_) => false,
-                    },
-                    Err(_) => false,
-                }
-            } else {
-                false
-            };
-            if is_idempotent_retry {
-                // Existing execution found — fall through to start_or_load which
-                // will return it under AllowDuplicate without inserting anything.
-            } else {
-                // Truncate reason to 64 *characters* (not bytes) for bounded metric
-                // cardinality; char_indices avoids splitting a multi-byte code point.
-                let reason_label = match reason.char_indices().nth(64) {
-                    Some((idx, _)) => &reason[..idx],
-                    None => &reason,
-                };
-                runtime
-                    .registry
-                    .telemetry()
-                    .metrics
-                    .record_admission_blocked(scope_kind, reason_label);
-                if let Ok(pool) = api_state.storage_pool()
-                    && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-                {
-                    let ar = NewAuditRecord {
-                        actor: &actor,
-                        operation: OP_WORKFLOW_START,
-                        target_type: TARGET_WORKFLOW,
-                        target_id: Some(workflow_name.as_str()),
-                        route_or_command: route,
-                        request_id: request_id.as_deref(),
-                        idempotency_key: None,
-                        status: STATUS_FAILED,
-                        error_summary: Some("admission blocked by gate"),
-                        shard_id: None,
-                        source: &source,
-                    };
-                    let _ = audit::insert_audit(&mut conn, &ar).await;
-                }
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "admission blocked",
-                        "gate_id": gate_id,
-                        "reason": reason,
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
+    // issue #377 / issue #618 (PR #1014): the admission gate is now enforced
+    // AUTHORITATIVELY inside the core start primitive at the point it decides —
+    // under a `FOR UPDATE` lock on any prior run — that it will CREATE a new
+    // execution. The plain / keyed (#808) start calls below pass
+    // `Some(GateMode::Check)`; a blocked fresh admission returns
+    // `HarvestError::AdmissionBlocked` (recorded once by the primitive) which the
+    // match arms map to `503`. This removed the round-20/21 unlocked pre-read gate
+    // decision (which had a residual seal-under-lock TOCTOU) entirely. The
+    // debounce / batch / throttle mutual-exclusion 400s and the #808 committed-
+    // replay probe above are unaffected. NOTE: the auto-generated-workflow_id and
+    // throttle paths reach the same gated plain/keyed start below.
 
     // issue #373: validate input against the workflow's published JSON Schema (if any).
     // Runs before the delayed-start checks so bad inputs fail fast and never
@@ -10646,6 +10619,14 @@ pub(crate) async fn start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, resolved_key);
 
+        // issue #618 (F12): gate pre-check before acquiring the DB connection, the
+        // same non-atomic check-then-admit shape the debounce path uses. There is
+        // a bounded TOCTOU window between this in-memory check and the batch
+        // upsert during which a gate could be raised. That window does NOT produce
+        // an un-counted admission: a start that slips it is durably deferred, and
+        // its later scanner fire is counted as an exempt bypass
+        // (harvest.admission.bypassed{producer="event_batch"}). Documented in
+        // docs/operations/admission-gate-producers.md.
         if let Some((gate_id, reason, scope_kind)) = {
             let wf_owner = runtime
                 .registry
@@ -11131,6 +11112,11 @@ pub(crate) async fn start_workflow(
             key,
             window_secs,
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            // issue #618 (PR #1014): gate the keyed start under the primitive's
+            // reservation transaction. A fresh keyed start blocked by a gate rolls
+            // back the idempotency reservation (retryable); a committed-replay
+            // short-circuited to `200` above never reaches here.
+            Some(autumn_harvest::admission_gate::GateMode::Check),
         )
         .await;
 
@@ -11254,6 +11240,34 @@ pub(crate) async fn start_workflow(
                 )
                     .into_response()
             }
+            Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+                // A fresh keyed start blocked by an active gate under the primitive's
+                // reservation transaction (issue #618, PR #1014). The primitive
+                // already recorded the block count + rolled back the reservation.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: Some(key.as_str()),
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "admission blocked",
+                        "gate_id": gate_id,
+                        "reason": reason,
+                    })),
+                )
+                    .into_response()
+            }
             Err(e) => {
                 let err_str = e.to_string();
                 let ar = NewAuditRecord {
@@ -11275,54 +11289,99 @@ pub(crate) async fn start_workflow(
         };
     }
 
+    let start_params = StartWorkflowParams {
+        workflow_name: &workflow_name,
+        workflow_id: &workflow_id,
+        exec_id,
+        input,
+        parent_id: None,
+        queue_name: &queue_name,
+        execution_timeout: request
+            .execution_timeout_secs
+            .map(chrono::Duration::seconds)
+            .or_else(|| info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())),
+        memo: request.memo.clone(),
+        search_attrs: request.search_attrs.clone(),
+        reuse_policy,
+        trace_context: trace_ctx,
+        max_execution_timeout_ceiling: api_state
+            .max_workflow_execution_timeout()
+            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+        concurrency_key,
+        concurrency_limit,
+        priority: request.priority.unwrap_or_default(),
+        max_workflow_input_bytes: effective_wf_cap,
+        start_at: request.start_at,
+        delay,
+        max_workflow_start_delay: max_delay_chrono,
+        owner,
+        runbook_url,
+        severity,
+        context_headers: request.context_headers.clone(),
+        sla: effective_sla,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+        origin: None,
+        completion_callbacks,
+    };
+    let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
+        Some(runtime.registry.telemetry().metrics.as_ref());
+
+    // issue #618 (PR #1014): the admission gate is enforced AUTHORITATIVELY inside
+    // the core start primitive. `Some(GateMode::Check)` makes `_collect` apply the
+    // gate at the point — under a `FOR UPDATE` lock on any prior run — where it
+    // decides it will CREATE a new execution, closing the entire unlocked-pre-read
+    // TOCTOU class (incl. the round-20 seal-under-lock race) in one place. A blocked
+    // fresh admission returns `HarvestError::AdmissionBlocked` (recorded once by the
+    // primitive), handled by the `match result` arm below as `503`. An idempotent
+    // attach admits nothing and is never gated (returns the existing run). This path
+    // is reached by every non-debounce / non-batch start (plain, auto-id, and a
+    // throttle-`Reserved` fall-through — its token is refunded on a block below).
     let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
-        StartWorkflowParams {
-            workflow_name: &workflow_name,
-            workflow_id: &workflow_id,
-            exec_id,
-            input,
-            parent_id: None,
-            queue_name: &queue_name,
-            execution_timeout: request
-                .execution_timeout_secs
-                .map(chrono::Duration::seconds)
-                .or_else(|| {
-                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
-                }),
-            memo: request.memo.clone(),
-            search_attrs: request.search_attrs.clone(),
-            reuse_policy,
-            trace_context: trace_ctx,
-            max_execution_timeout_ceiling: api_state
-                .max_workflow_execution_timeout()
-                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
-            concurrency_key,
-            concurrency_limit,
-            priority: request.priority.unwrap_or_default(),
-            max_workflow_input_bytes: effective_wf_cap,
-            start_at: request.start_at,
-            delay,
-            max_workflow_start_delay: max_delay_chrono,
-            owner,
-            runbook_url,
-            severity,
-            context_headers: request.context_headers.clone(),
-            sla: effective_sla,
-            schedule_id: None,
-            scheduled_for: None,
-            workflow_attempt: 1,
-            workflow_retry_policy,
-            retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-            origin: None,
-            completion_callbacks,
-        },
-        Some(runtime.registry.telemetry().metrics.as_ref()),
+        start_params,
+        metrics_ref,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
     .await;
 
     match result {
+        Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            // A genuinely fresh admission blocked by an active gate under the
+            // primitive's `FOR UPDATE` lock (issue #618, PR #1014). The primitive
+            // already recorded the block count. Refund any reserved throttle token,
+            // audit the block, and return 503.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("admission blocked by gate"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response()
+        }
         Err(HarvestError::AlreadyExists {
             existing_exec_id,
             existing_state,
@@ -12251,6 +12310,14 @@ async fn batch_start_workflows(
                 false,
                 item_reject_fresh,
                 Some(runtime.registry.telemetry().metrics.as_ref()),
+                // issue #618 (PR #1014): gate each batch item authoritatively under
+                // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
+                // (Phase 1's policy-blind pre-check can skip the gate for an item
+                // whose prior seals before Phase 2 starts it). A blocked item's
+                // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
+                // `Err(e)` arm below (never a hard batch failure) — the block is
+                // counted once by the primitive.
+                Some(autumn_harvest::admission_gate::GateMode::Check),
             )
             .await;
 
@@ -13245,6 +13312,16 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_info: runtime.registry.workflows.get(&workflow_name),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
+        // primitive's `FOR UPDATE` lock, not just at the unlocked pre-check above.
+        // The pre-check catches the common case (gate already active when the
+        // request lands) and additionally blocks attaches; this closes the
+        // residual request-internal TOCTOU where a gate is raised between that
+        // pre-check and the locked create — mirroring the plain `api` start route,
+        // which was moved off an unlocked pre-read for exactly this window. A
+        // pre-check block short-circuits before this call, so a fresh create is
+        // never double-counted.
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
     .await;
 
@@ -13811,6 +13888,11 @@ async fn update_with_start_workflow(
         &mut conn,
         params,
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
+        // primitive's lock (see the sibling comment on the signal-with-start
+        // route). Closes the residual pre-check→locked-create TOCTOU; a pre-check
+        // block short-circuits before this call, so no double-count.
+        Some(autumn_harvest::admission_gate::GateMode::Check),
     )
     .await;
 
@@ -19052,6 +19134,7 @@ async fn trigger_schedule_now(
             completion_callbacks: None,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        None,
     )
     .await;
 
@@ -20423,6 +20506,7 @@ async fn schedule_backfill(
                         completion_callbacks: None,
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
+                    None,
                 )
                 .await;
                 match result {
@@ -20716,6 +20800,7 @@ async fn schedule_backfill(
                         completion_callbacks: None,
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
+                    None,
                 )
                 .await;
                 match start_result {
@@ -29285,6 +29370,147 @@ mod tests {
             .collect()
     }
 
+    /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
+    /// different queue does NOT match it — letting us prove `check()` blocks a
+    /// non-matching start only via fail-closed, never because the gate matched.
+    fn queue_gate() -> autumn_harvest::AdmissionGate {
+        autumn_harvest::AdmissionGate {
+            id: autumn_harvest::admission_gate::AdmissionGateId(uuid::Uuid::new_v4()),
+            scope: autumn_harvest::admission_gate::GateScope::Queue("gated-q".to_string()),
+            reason: "reload-fail-incident".to_string(),
+            message: None,
+            created_by: "test".to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    /// issue #618 (F-round22): after a create's post-mutation full reload FAILS,
+    /// `reconcile_gate_cache_after_mutation` arms fail-closed so `check()` (the
+    /// API / fresh-admission path, retryable) blocks EVERY start — including one
+    /// that does not match this replica's local write-through delta — protecting
+    /// against a missing other-replica gate while the gate table is unreadable.
+    /// The round-16 write-through is retained: `check_cached` (completion triggers,
+    /// non-retryable) ignores the fail-closed flag (round 3) and still honours the
+    /// delta, so no in-flight work is permanently dropped. A successful reload
+    /// recovers.
+    #[test]
+    fn reconcile_gate_cache_fails_closed_on_create_reload_error_keeps_check_cached_delta() {
+        use autumn_harvest::admission_gate::sentinel_gate_id;
+        use autumn_harvest::{AdmissionGate, AdmissionGateCache};
+
+        // RED baseline (the round-21 handler Err-arm behaviour: write-through delta
+        // only, NO fail-closed) — check() reads the initialized snapshot and ADMITS
+        // a non-matching start, the leak this round closes.
+        let leak = AdmissionGateCache::new();
+        leak.refresh(vec![]); // initialized, empty
+        leak.apply_created(queue_gate()); // delta only, no set_fail_closed
+        assert!(
+            leak.check("other_wf", "ungated-q", 0, None).is_none(),
+            "precondition (round-21 leak): delta applied but fail-closed NOT armed → \
+             check() admits a start that does not match the local gate"
+        );
+
+        // GREEN: reconcile with a reload FAILURE arms fail-closed.
+        let g = queue_gate();
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![]); // initialized, empty
+        cache.apply_created(g); // handler's write-through delta (create path)
+        let ret = reconcile_gate_cache_after_mutation(
+            &cache,
+            "create",
+            Err::<Vec<AdmissionGate>, _>(autumn_harvest::error::HarvestError::Config(
+                "simulated gate-table read error".to_string(),
+            )),
+        );
+        assert_eq!(ret, None, "a reload failure returns None (no metric count)");
+
+        // check() now fails closed → the synthetic sentinel block for a start that
+        // does NOT match the delta (missing-other-replica-gate protection).
+        let blocked = cache.check("other_wf", "ungated-q", 0, None);
+        assert!(
+            blocked
+                .as_ref()
+                .is_some_and(|(id, _, _)| *id == sentinel_gate_id()),
+            "check() must fail closed (sentinel) after a failed create reload, even for \
+             a non-matching start: {blocked:?}"
+        );
+
+        // check_cached() ignores fail-closed and honours the delta: the just-created
+        // gate MATCHES (real id, not the sentinel), and a non-matching start proceeds.
+        let matched = cache.check_cached("wf", "gated-q", 0, None);
+        assert!(
+            matched.as_ref().is_some_and(|(id, _, _)| *id == gid),
+            "check_cached must match the just-created gate under fail-closed: {matched:?}"
+        );
+        assert!(
+            cache
+                .check_cached("other_wf", "ungated-q", 0, None)
+                .is_none(),
+            "check_cached must let a non-matching start proceed (no permanent block)"
+        );
+
+        // Recovery: a SUCCESSFUL reload re-arms initialized and clears fail-closed.
+        let recovered = reconcile_gate_cache_after_mutation(
+            &cache,
+            "create",
+            Ok::<_, autumn_harvest::error::HarvestError>(vec![queue_gate()]),
+        );
+        assert_eq!(
+            recovered,
+            Some(1),
+            "a successful reload returns the active-gate count"
+        );
+        assert!(
+            cache.check("other_wf", "ungated-q", 0, None).is_none(),
+            "a successful reload recovers check() from fail-closed"
+        );
+    }
+
+    /// issue #618 (F-round22): on the LIFT path, a failed post-mutation reload also
+    /// arms fail-closed — `check()` briefly OVER-BLOCKS (re-blocking even the
+    /// just-lifted target), the correct conservative behaviour for a safety control
+    /// during a gate-table outage. The write-through delta already removed the gate
+    /// from `check_cached`, so in-flight continuation is unaffected (no durable
+    /// false-block).
+    #[test]
+    fn reconcile_gate_cache_lift_fails_closed_but_check_cached_drops_the_lifted_gate() {
+        use autumn_harvest::admission_gate::sentinel_gate_id;
+        use autumn_harvest::{AdmissionGate, AdmissionGateCache};
+
+        let g = queue_gate();
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![g]); // initialized, gate present
+        cache.apply_lifted(gid); // handler's write-through delta (lift path)
+        let ret = reconcile_gate_cache_after_mutation(
+            &cache,
+            "lift",
+            Err::<Vec<AdmissionGate>, _>(autumn_harvest::error::HarvestError::Config(
+                "simulated gate-table read error".to_string(),
+            )),
+        );
+        assert_eq!(ret, None);
+
+        // check() fails closed (conservative over-block: the just-lifted target's
+        // matching start is re-blocked via the sentinel until a refresh recovers).
+        let blocked = cache.check("wf", "gated-q", 0, None);
+        assert!(
+            blocked
+                .as_ref()
+                .is_some_and(|(id, _, _)| *id == sentinel_gate_id()),
+            "check() fails closed after a failed lift reload: {blocked:?}"
+        );
+
+        // check_cached() honours the delta: the lifted gate no longer matches, so an
+        // in-flight completion-trigger start proceeds (no durable false-block).
+        assert!(
+            cache.check_cached("wf", "gated-q", 0, None).is_none(),
+            "check_cached must not match a just-lifted gate (in-flight continuation unaffected)"
+        );
+    }
+
     /// A not-found schedule is an authoritative 404 only when every expected
     /// shard was successfully checked; if any expected shard could not be
     /// checked (unreachable, per-shard lookup error, or no configured pool) the
@@ -30630,6 +30856,7 @@ mod tests {
                 completion_callbacks: None,
             },
             None,
+            None,
         )
         .await
         .expect("workflow execution should be seeded");
@@ -30709,6 +30936,7 @@ mod tests {
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
             None,
         )
         .await

@@ -442,6 +442,7 @@ async fn seed_run(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("seed workflow");

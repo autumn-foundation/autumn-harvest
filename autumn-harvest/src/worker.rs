@@ -3530,6 +3530,9 @@ async fn persist_workflow_failure(
                         true,
                         false,
                         metrics,
+                        // Workflow-level retry (#523) is in-flight continuation of an
+                        // existing logical run, not a fresh admission — never gated.
+                        None,
                     )
                     .await
                     {

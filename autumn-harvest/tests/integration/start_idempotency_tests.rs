@@ -301,6 +301,7 @@ async fn same_key_dedups_to_the_same_execution() {
         key,
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("first start");
@@ -320,6 +321,7 @@ async fn same_key_dedups_to_the_same_execution() {
         params(wf, "wid-b", e2, WorkflowIdReusePolicy::AllowDuplicate),
         key,
         window_secs(),
+        None,
         None,
     )
     .await
@@ -357,6 +359,7 @@ async fn distinct_keys_start_distinct_runs() {
             key,
             window_secs(),
             None,
+            None,
         )
         .await
         .expect("start");
@@ -386,6 +389,7 @@ async fn hundred_same_key_reserves_yield_one_execution() {
             ),
             key,
             window_secs(),
+            None,
             None,
         )
         .await
@@ -426,6 +430,7 @@ async fn key_is_reusable_after_the_window_elapses() {
         key,
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("first");
@@ -448,6 +453,7 @@ async fn key_is_reusable_after_the_window_elapses() {
         params(wf, "wid-2", e2, WorkflowIdReusePolicy::AllowDuplicate),
         key,
         window_secs(),
+        None,
         None,
     )
     .await
@@ -482,6 +488,7 @@ async fn reserve_rolls_back_when_the_start_fails() {
         "seed-key",
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("seed run");
@@ -495,6 +502,7 @@ async fn reserve_rolls_back_when_the_start_fails() {
         params(wf, wid, e, WorkflowIdReusePolicy::RejectDuplicate),
         key,
         window_secs(),
+        None,
         None,
     )
     .await;
@@ -524,6 +532,7 @@ async fn dangling_claim_is_reclaimed() {
         params(wf, "wid-1", e1, WorkflowIdReusePolicy::AllowDuplicate),
         key,
         window_secs(),
+        None,
         None,
     )
     .await
@@ -604,6 +613,7 @@ async fn fresh_key_attaching_to_existing_run_repoints_claim() {
         "seed-key",
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("seed run");
@@ -628,6 +638,7 @@ async fn fresh_key_attaching_to_existing_run_repoints_claim() {
         ),
         "fresh-key",
         window_secs(),
+        None,
         None,
     )
     .await
@@ -670,6 +681,7 @@ async fn fresh_key_attaching_to_existing_run_repoints_claim() {
         "fresh-key",
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("retry");
@@ -707,6 +719,7 @@ async fn dedup_hit_short_circuits_reject_duplicate() {
         key,
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("first");
@@ -723,6 +736,7 @@ async fn dedup_hit_short_circuits_reject_duplicate() {
         params(wf, "wid-b", e2, WorkflowIdReusePolicy::RejectDuplicate),
         key,
         window_secs(),
+        None,
         None,
     )
     .await
@@ -760,6 +774,7 @@ async fn purge_deletes_only_expired_rows() {
         "fresh",
         window_secs(),
         None,
+        None,
     )
     .await
     .expect("fresh claim");
@@ -771,6 +786,7 @@ async fn purge_deletes_only_expired_rows() {
         params(wf, "wid-old", e_old, WorkflowIdReusePolicy::AllowDuplicate),
         "expired",
         window_secs(),
+        None,
         None,
     )
     .await

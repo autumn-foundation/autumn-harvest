@@ -475,7 +475,7 @@ impl WorkflowHandleClient {
         conn: &mut AsyncPgConnection,
         request: StartWorkflowParams<'_>,
     ) -> HarvestResult<StartedWorkflowHandle> {
-        let started = start_or_load_workflow_execution(conn, request).await?;
+        let started = start_or_load_workflow_execution(conn, request, None).await?;
         let handle = self.handle(started.exec_id);
         Ok(StartedWorkflowHandle { started, handle })
     }

@@ -6,26 +6,42 @@
 //! plugin restart; the plugin loads active gates before its worker pool starts
 //! so there is no admission window between boot and re-apply.
 //!
-//! ## Known gaps — ungated workflow producers
+//! ## Start-producer contract (issue #618)
 //!
-//! The following code paths call `start_or_load_workflow_execution` without
-//! consulting the admission gate cache. Each is a follow-up candidate.
+//! The admission gate is **authoritative** across every in-process workflow
+//! start producer: each producer either consults the gate before starting, or
+//! is explicitly **exempt-by-design** and increments the observable
+//! `harvest.admission.bypassed{producer}` counter so the exemption is never
+//! silent. The full contract is enumerated by [`producer_contract`] and
+//! surfaced at `GET /admin/gates` (`producers` block) so operators can discover
+//! it without reading source.
 //!
-//! * **Completion triggers** (`completion_trigger.rs`): runs in a background
-//!   task; the `AdmissionGateCache` is not threaded through to it. Pass the
-//!   cache into the completion trigger runner so fleet/name/queue/owner gates
-//!   are honoured for trigger-initiated starts during an incident.
+//! | Producer | Status | How |
+//! |----------|--------|-----|
+//! | [`Api`](StartProducer::Api) | gated | HTTP start route checks the gate before any DB write |
+//! | [`BatchStart`](StartProducer::BatchStart) | gated | each item checks the gate with its resolved target shard |
+//! | [`CompletionTrigger`](StartProducer::CompletionTrigger) | gated | checks the gate inside the source terminal commit before starting the target; fail-closed sentinel proceeds |
+//! | [`WebhookDelegate`](StartProducer::WebhookDelegate) | gated | inbound receiver delegates to the gated HTTP start route; outbound webhook-delivery producer consults the cached gate and blocks on a match |
+//! | [`Scheduler`](StartProducer::Scheduler) | gated | each due schedule slot checks the gate before firing |
+//! | [`Debounce`](StartProducer::Debounce) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
+//! | [`Throttle`](StartProducer::Throttle) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
+//! | [`EventBatch`](StartProducer::EventBatch) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
+//! | [`CompletionTriggerOutbox`](StartProducer::CompletionTriggerOutbox) | gated-at-relay | cross-shard relay, gated authoritatively at relay time on the target shard's real queue: blocks a matching gate (drops the row + counts blocked), else starts + counts the bypass |
+//! | [`Outbox`](StartProducer::Outbox) | exempt-by-design | relays already-committed in-flight work; increments the bypass counter |
 //!
-//! * **Outbox relay** (`outbox.rs` — `spawn_workflow_start_outbox_relay`):
-//!   replays workflow-start events that were durably written to the outbox
-//!   before the gate was raised. Gating outbox relay is semantically
-//!   questionable (the commit already happened) but can be useful for
-//!   rate-limiting recovery after an incident.
+//! **Out of scope — in-flight continuation, not new admission.** The gate governs
+//! *new* workflow starts. It intentionally does NOT block continuation of work
+//! already admitted: workflow-level retry (issue #523), continue-as-new, child /
+//! detached-child spawn, reset forks, and the in-process typed-client handle all
+//! start executions without a gate check because they extend an already-accepted
+//! run rather than admit a new one. See `docs/operations/admission-gate-producers.md`.
 //!
-//! * **Webhook delegate** (`plugin.rs` — `WebhookDelegate`): the Autumn
-//!   webhook integration starts a workflow inline in the HTTP handler path.
-//!   The delegate does not have access to the gate cache today; thread it in
-//!   via `AppState` extension so webhook-triggered starts can be gated.
+//! The core completion-trigger path reaches the shared [`AdmissionGateCache`]
+//! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static (mirroring
+//! `GLOBAL_WORKFLOW_METADATA` / `GLOBAL_CALLBACK_CONFIG`), populated by the
+//! plugin at boot with the same `Arc` the management API uses. When the static
+//! is unset (standalone integrations, or the plugin's brief boot window) the
+//! core gate check is skipped — byte-identical to pre-#618 behaviour.
 //!
 //! ## Standalone router note
 //!
@@ -59,6 +75,7 @@
 
 use chrono::{DateTime, Utc};
 use std::fmt;
+use std::sync::Arc;
 use uuid::Uuid;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -355,6 +372,48 @@ impl AdmissionGateCache {
         }
     }
 
+    /// Write-through: insert (replacing any entry with the same id) `gate` into the
+    /// cached snapshot under the write lock, independent of any background refresh
+    /// (issue #618, F-round16).
+    ///
+    /// The management create handler persists the gate to the DB **first**, then
+    /// calls this so the in-memory snapshot reflects the just-persisted gate even if
+    /// the follow-up full [`load_active_gates`](db::load_active_gates) refresh fails.
+    /// Without this, a failed post-create refresh left the snapshot stale-open and a
+    /// completion-trigger start (which consults [`check_cached`](Self::check_cached)
+    /// and does **not** retry after a synthetic fail-closed block) would durably
+    /// MISS the new gate.
+    ///
+    /// Replacing by id is idempotent against a concurrent background refresh that may
+    /// have already picked the new gate up (the create persists to the DB before this
+    /// call, so the refresh cannot lose it). Does **not** touch the `initialized`
+    /// flag: applying a *known* delta means the snapshot is not blind, so the handler
+    /// no longer arms fail-closed on a post-mutation refresh failure.
+    pub fn apply_created(&self, gate: AdmissionGate) {
+        if let Ok(mut guard) = self.gates.write() {
+            let id = gate.id.0;
+            guard.retain(|g| g.id.0 != id);
+            guard.push(gate);
+        }
+    }
+
+    /// Write-through: remove any cached gate whose id equals `gate_id` from the
+    /// snapshot under the write lock, independent of any background refresh (issue
+    /// #618, F-round16).
+    ///
+    /// The management lift handler soft-deletes the gate in the DB **first**, then
+    /// calls this so a just-lifted gate stops matching on this replica even if the
+    /// follow-up full [`load_active_gates`](db::load_active_gates) refresh fails.
+    /// Without this, a failed post-lift refresh left the lifted gate in the snapshot
+    /// and a completion-trigger start would keep dropping targets as
+    /// `admission_blocked` against a gate the operator already lifted. No-op when the
+    /// id is absent (idempotent). Does **not** touch the `initialized` flag.
+    pub fn apply_lifted(&self, gate_id: Uuid) {
+        if let Ok(mut guard) = self.gates.write() {
+            guard.retain(|g| g.id.0 != gate_id);
+        }
+    }
+
     /// Acquire a read lock and call `check_admission` against the snapshot.
     ///
     /// Returns `(gate_id, reason, scope_kind)` when a gate matches, where
@@ -375,11 +434,39 @@ impl AdmissionGateCache {
             // Cache not yet populated from DB — fail closed so that a transient
             // startup DB error cannot bypass persisted incident gates.
             return Some((
-                Uuid::nil(),
+                sentinel_gate_id(),
                 "admission gate cache not yet initialized (fail-closed)".to_string(),
                 "fleet",
             ));
         }
+        let guard = self.gates.read().ok()?;
+        check_admission(&guard, workflow_name, queue_name, shard_id, owner)
+            .map(|g| (g.id.0, g.reason.clone(), g.scope.kind_str()))
+    }
+
+    /// Match against the **last-known cached gates snapshot**, ignoring the
+    /// fail-closed / initialized flag (issue #618, Codex P1).
+    ///
+    /// Unlike [`check`](Self::check) — which returns the synthetic
+    /// [`sentinel_gate_id`] block for every start while the cache is
+    /// fail-closed/uninitialized — this returns only a **real** matching gate
+    /// (never the sentinel), or `None` when no cached gate matches (including an
+    /// empty snapshot during the boot window).
+    ///
+    /// `set_fail_closed()` retains the gates snapshot, so a gate loaded before a
+    /// transient gate-DB read error is still honoured here. Used by the
+    /// completion-trigger path: a completion-trigger start is in-flight
+    /// continuation of already-committed work and cannot retry, so it honours
+    /// only the gates the cache last knew about (block+count on a match, proceed
+    /// otherwise) rather than the API path's block-everything-under-fail-closed.
+    #[must_use]
+    pub fn check_cached(
+        &self,
+        workflow_name: &str,
+        queue_name: &str,
+        shard_id: i32,
+        owner: Option<&str>,
+    ) -> Option<(Uuid, String, &'static str)> {
         let guard = self.gates.read().ok()?;
         check_admission(&guard, workflow_name, queue_name, shard_id, owner)
             .map(|g| (g.id.0, g.reason.clone(), g.scope.kind_str()))
@@ -390,6 +477,341 @@ impl AdmissionGateCache {
     pub fn active_count(&self) -> usize {
         self.gates.read().map_or(0, |g| g.len())
     }
+}
+
+/// The synthetic gate id [`AdmissionGateCache::check`] returns when the cache is
+/// fail-closed.
+///
+/// The cache is fail-closed while uninitialized, or after `set_fail_closed()` on
+/// a transient gate-DB read error. Callers can distinguish this sentinel from a
+/// real operator gate (issue #618, F3): a completion-trigger start blocked by
+/// the sentinel is in-flight continuation and should PROCEED rather than be
+/// dropped, whereas a real gate (`id != sentinel_gate_id()`) blocks + drops +
+/// counts.
+#[must_use]
+pub const fn sentinel_gate_id() -> Uuid {
+    Uuid::nil()
+}
+
+// ── StartProducer & producer contract (issue #618) ────────────────────────────
+
+/// How a start path consults the admission gate when enforcement is moved into
+/// the core start primitive (issue #618, PR #1014).
+///
+/// The gate is evaluated inside `start_or_load_workflow_execution_collect` at the
+/// point — under a `FOR UPDATE` lock on any prior run — where it decides it will
+/// CREATE a new execution (a fresh admission). The mode selects which cache read
+/// the primitive performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// Fresh admissions (API start, batch, keyed-#808): fail-closed, retryable.
+    ///
+    /// Consults [`AdmissionGateCache::check`], which returns the synthetic
+    /// sentinel block for every start while the cache is uninitialized /
+    /// fail-closed — so a transient startup / gate-DB read error cannot bypass a
+    /// persisted incident gate. A blocked caller retries.
+    Check,
+    /// In-flight continuation / delivery (webhook delegate, completion-trigger
+    /// relay): consults [`AdmissionGateCache::check_cached`].
+    ///
+    /// Honours only the last-known cached gates snapshot — blocks a REAL matching
+    /// gate but NEVER the fail-closed sentinel — so already-committed
+    /// continuation work is not permanently dropped by a boot/DB blip it cannot
+    /// retry past.
+    CheckCached,
+}
+
+/// A bounded enumeration of the in-process code paths that can start a workflow.
+///
+/// Used as the low-cardinality `producer` label on
+/// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] and to render the discoverable
+/// producer contract ([`producer_contract`]) at `GET /admin/gates`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartProducer {
+    /// The HTTP `POST /workflows/{name}/start` route.
+    Api,
+    /// The batch-start API (`POST /workflows/batch-start`).
+    BatchStart,
+    /// A declarative completion trigger firing a target workflow (issue #517).
+    CompletionTrigger,
+    /// An inbound webhook that delegates to the gated start / signal-with-start
+    /// route (issue #344).
+    WebhookDelegate,
+    /// A due schedule slot firing on the scheduler tick.
+    Scheduler,
+    /// A debounced start firing from the debounce scanner (issue #499).
+    Debounce,
+    /// A throttled start firing from the throttle scanner (issue #607).
+    Throttle,
+    /// An event-batch start firing from the event-batch scanner (issue #357).
+    EventBatch,
+    /// The completion-trigger cross-shard outbox relay
+    /// ([`enforce_completion_triggers_outbox`](crate::completion_trigger::enforce_completion_triggers_outbox)).
+    CompletionTriggerOutbox,
+    /// The transactional workflow-start outbox relay.
+    Outbox,
+}
+
+impl StartProducer {
+    /// Every producer, for exhaustive iteration in the contract and tests.
+    pub const ALL: [Self; 10] = [
+        Self::Api,
+        Self::BatchStart,
+        Self::CompletionTrigger,
+        Self::WebhookDelegate,
+        Self::Scheduler,
+        Self::Debounce,
+        Self::Throttle,
+        Self::EventBatch,
+        Self::CompletionTriggerOutbox,
+        Self::Outbox,
+    ];
+
+    /// The stable, low-cardinality label string for metrics and the contract.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::BatchStart => "batch_start",
+            Self::CompletionTrigger => "completion_trigger",
+            Self::WebhookDelegate => "webhook_delegate",
+            Self::Scheduler => "scheduler",
+            Self::Debounce => "debounce",
+            Self::Throttle => "throttle",
+            Self::EventBatch => "event_batch",
+            Self::CompletionTriggerOutbox => "completion_trigger_outbox",
+            Self::Outbox => "outbox",
+        }
+    }
+}
+
+impl fmt::Display for StartProducer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a start producer consults the admission gate before starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerGateStatus {
+    /// The producer checks an active gate synchronously and blocks a matching
+    /// start.
+    Gated,
+    /// A split producer: **gated at HTTP admission time** (the initial request
+    /// checks the gate before the start is durably deferred), and its later
+    /// **scanner fire is exempt-with-bypass-counter** — the deferred fire relays
+    /// a start already admitted through the gate, so gating it again would drop
+    /// already-accepted work. Each scanner fire increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] so the exemption is
+    /// observable.
+    GatedAtAdmission,
+    /// The producer relays already-accepted work and is exempt by design; each
+    /// relayed start increments [`crate::telemetry::METRIC_ADMISSION_BYPASSED`]
+    /// so the exemption is observable.
+    ExemptByDesign,
+    /// **Gated authoritatively at relay time** on the target shard, where the
+    /// real target queue is always known. The cross-shard completion-trigger
+    /// relay re-checks the gate on the resolved queue immediately before starting
+    /// (`check_cached`): a matching gate blocks + drops the outbox row +
+    /// increments [`crate::telemetry::METRIC_ADMISSION_BLOCKED`]; when no gate
+    /// matches the relay starts and increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] (relay of pre-committed
+    /// in-flight-continuation work). The source-side inline check is only a
+    /// best-effort fast path — the relay-time check is authoritative.
+    GatedAtRelay,
+}
+
+/// One discoverable entry in the start-producer contract (issue #618, AC5).
+///
+/// Serialised into the `producers` block of `GET /admin/gates`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProducerContractEntry {
+    /// The producer's stable label (matches [`StartProducer::as_str`]).
+    pub producer: &'static str,
+    /// Whether this producer is gated or exempt-by-design.
+    pub status: ProducerGateStatus,
+    /// One-line human-readable rationale, especially for exempt producers.
+    pub rationale: &'static str,
+}
+
+/// The full, discoverable start-producer contract (issue #618).
+///
+/// Every [`StartProducer`] variant appears exactly once. Surfaced at
+/// `GET /admin/gates` so operators can see which producers honour a gate and
+/// which are exempt-by-design without reading source.
+#[must_use]
+pub fn producer_contract() -> Vec<ProducerContractEntry> {
+    use ProducerGateStatus::{ExemptByDesign, Gated, GatedAtAdmission, GatedAtRelay};
+    vec![
+        ProducerContractEntry {
+            producer: StartProducer::Api.as_str(),
+            status: Gated,
+            rationale: "Checks the gate at the HTTP start route before any DB write.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::BatchStart.as_str(),
+            status: Gated,
+            rationale: "Each item checks the gate with its resolved target shard.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::CompletionTrigger.as_str(),
+            status: Gated,
+            rationale: "Checks the gate inside the source terminal commit before \
+                        starting the target; a blocked start is dropped (not deferred), \
+                        recorded exactly-once and counted as an admission block. A \
+                        transient gate-DB blip (fail-closed sentinel) proceeds rather \
+                        than dropping already-committed in-flight continuation.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::WebhookDelegate.as_str(),
+            status: Gated,
+            rationale: "Two webhook producers, both gated: the INBOUND webhook receiver \
+                        delegates to the gated HTTP start / signal-with-start route; the \
+                        OUTBOUND webhook-delivery producer consults the cached gate \
+                        snapshot before starting `webhook_delivery` and blocks (recording \
+                        an admission block) when a gate matches.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::Scheduler.as_str(),
+            status: Gated,
+            rationale: "Each due schedule slot checks the gate before firing.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::Debounce.as_str(),
+            status: GatedAtAdmission,
+            rationale: "Gated at HTTP admission; the deferred scanner fire relays a \
+                        start already admitted through the gate and is exempt-with-\
+                        bypass-counter (harvest.admission.bypassed{producer=\"debounce\"}).",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::Throttle.as_str(),
+            status: GatedAtAdmission,
+            rationale: "Gated at HTTP admission; the deferred scanner fire relays a \
+                        start already admitted through the gate and is exempt-with-\
+                        bypass-counter (harvest.admission.bypassed{producer=\"throttle\"}).",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::EventBatch.as_str(),
+            status: GatedAtAdmission,
+            rationale: "Gated at HTTP admission; the deferred scanner fire relays a \
+                        start already admitted through the gate and is exempt-with-\
+                        bypass-counter (harvest.admission.bypassed{producer=\"event_batch\"}).",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::CompletionTriggerOutbox.as_str(),
+            status: GatedAtRelay,
+            rationale: "Cross-shard completion-trigger relay, gated AUTHORITATIVELY at \
+                        relay time on the target shard (both the immediate spawn relay and \
+                        the scanner). The real target queue is resolved on the target shard \
+                        and re-checked against the gate (check_cached) immediately before \
+                        starting: a matching gate BLOCKS + drops the outbox row + counts \
+                        harvest.admission.blocked; when no gate matches the relay starts and \
+                        counts harvest.admission.bypassed{producer=\"completion_trigger_outbox\"}. \
+                        The source-side inline check is only a best-effort fast path.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::Outbox.as_str(),
+            status: ExemptByDesign,
+            rationale: "Relays workflow-start requests durably committed before the gate \
+                        was raised; gating would drop already-accepted in-flight work. \
+                        Each relayed start increments harvest.admission.bypassed{producer=\"outbox\"}.",
+        },
+    ]
+}
+
+// ── Global gate cache accessor (issue #618) ───────────────────────────────────
+
+/// Process-global handle to the shared [`AdmissionGateCache`].
+///
+/// Populated by the plugin at boot with the same `Arc` the management API and
+/// the background refresh loop use, so the core completion-trigger start path
+/// observes gate creates/lifts without threading the cache through every
+/// call site. Mirrors `completion_trigger::GLOBAL_WORKFLOW_METADATA` and
+/// `completion_callback::GLOBAL_CALLBACK_CONFIG`.
+///
+/// `None` (the default, and standalone integrations that never set it) means
+/// the core gate check is skipped — byte-identical to pre-#618 behaviour.
+pub static GLOBAL_ADMISSION_GATE_CACHE: std::sync::RwLock<Option<Arc<AdmissionGateCache>>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or clear, with `None`) the process-global admission gate cache.
+///
+/// Called by the plugin at boot with the shared cache `Arc`, and cleared with
+/// `None` in `stop_harvest_runtime` so a stopped plugin's cache (whose refresh
+/// loop is frozen) never leaks into a sibling plugin's completion triggers.
+///
+/// If a *different* non-`None` cache is already installed, a `tracing::warn!` is
+/// emitted before replacing it — two live `HarvestPlugin` builds in one process
+/// (parallel tests, multi-tenant) would otherwise silently share one plugin's
+/// gate state. Mirrors `completion_callback`'s `GLOBAL_CALLBACK_CONFIG` guard.
+/// Recovers a poisoned lock (`into_inner`) rather than silently no-op'ing, so a
+/// prior panic while holding the write lock cannot wedge the global.
+pub fn set_global_admission_gate_cache(cache: Option<Arc<AdmissionGateCache>>) {
+    let mut guard = GLOBAL_ADMISSION_GATE_CACHE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (Some(existing), Some(incoming)) = (guard.as_ref(), cache.as_ref())
+        && !Arc::ptr_eq(existing, incoming)
+    {
+        tracing::warn!(
+            "set_global_admission_gate_cache: replacing an already-installed, \
+             divergent admission gate cache. Two live HarvestPlugin builds in one \
+             process will not share gate state coherently."
+        );
+    }
+    *guard = cache;
+}
+
+/// Read the process-global admission gate cache handle, if installed.
+///
+/// Recovers a poisoned lock (`into_inner`) rather than failing closed to `None`
+/// — a `None` here would silently skip the completion-trigger gate check.
+#[must_use]
+pub fn global_admission_gate_cache() -> Option<Arc<AdmissionGateCache>> {
+    GLOBAL_ADMISSION_GATE_CACHE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Process-global metrics recorder for admission-gate block counting (issue #618).
+///
+/// Published by the plugin at boot alongside [`GLOBAL_ADMISSION_GATE_CACHE`]
+/// (the same `Arc<dyn MetricsRecorder>` the workers/scanners use). The
+/// completion-trigger block path (`evaluate_triggers_for_execution`) falls back
+/// to this recorder when its caller passes `metrics: None` — which the
+/// cancel / terminate / parent-close-cascade paths in `execution.rs` all do — so
+/// a completion-trigger start blocked by an active gate is counted on
+/// `harvest.admission.blocked` regardless of how the source reached terminal.
+/// `None` (standalone integrations, or before boot) means the fallback is
+/// skipped and behaviour is byte-identical to a caller-supplied `None`.
+pub static GLOBAL_ADMISSION_METRICS: std::sync::RwLock<
+    Option<Arc<dyn crate::telemetry::MetricsRecorder>>,
+> = std::sync::RwLock::new(None);
+
+/// Install (or clear, with `None`) the process-global admission metrics recorder.
+///
+/// Called by the plugin at boot with the shared recorder `Arc`, and cleared with
+/// `None` in `stop_harvest_runtime`. Recovers a poisoned lock (`into_inner`)
+/// rather than silently no-op'ing. Mirrors [`set_global_admission_gate_cache`].
+pub fn set_global_admission_metrics(recorder: Option<Arc<dyn crate::telemetry::MetricsRecorder>>) {
+    let mut guard = GLOBAL_ADMISSION_METRICS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = recorder;
+}
+
+/// Read the process-global admission metrics recorder, if installed.
+///
+/// Recovers a poisoned lock (`into_inner`) rather than failing to `None`.
+#[must_use]
+pub fn global_admission_metrics() -> Option<Arc<dyn crate::telemetry::MetricsRecorder>> {
+    GLOBAL_ADMISSION_METRICS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
@@ -762,5 +1184,291 @@ mod tests {
         let (_, reason, scope_kind) = result.unwrap();
         assert_eq!(reason, "incident-42");
         assert_eq!(scope_kind, "fleet");
+    }
+
+    #[test]
+    fn check_cached_honours_snapshot_under_fail_closed() {
+        // issue #618 (Codex P1): a real gate loaded into the snapshot then
+        // fail-closed must still MATCH via check_cached (never the sentinel),
+        // while `check()` returns the block-everything sentinel.
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![fleet_gate("cached-incident")]);
+        cache.set_fail_closed();
+
+        // check() fails closed → synthetic sentinel block.
+        let (sentinel_id, _r, _s) = cache.check("wf", "q", 0, None).expect("fail-closed blocks");
+        assert_eq!(sentinel_id, sentinel_gate_id());
+
+        // check_cached() returns the REAL matched gate (not the sentinel).
+        let (real_id, reason, scope_kind) = cache
+            .check_cached("wf", "q", 0, None)
+            .expect("cached gate matches under fail-closed");
+        assert_ne!(real_id, sentinel_gate_id());
+        assert_eq!(reason, "cached-incident");
+        assert_eq!(scope_kind, "fleet");
+    }
+
+    #[test]
+    fn check_cached_returns_none_on_empty_snapshot() {
+        // An empty snapshot (boot window / never-loaded) matches nothing, so a
+        // completion-trigger start PROCEEDS rather than being dropped.
+        let cache = AdmissionGateCache::new_fail_closed();
+        assert!(cache.check_cached("wf", "q", 0, None).is_none());
+        // And an initialized-but-empty cache also matches nothing.
+        let open = AdmissionGateCache::new();
+        assert!(open.check_cached("wf", "q", 0, None).is_none());
+    }
+
+    #[test]
+    fn apply_created_makes_a_new_gate_matchable_even_under_fail_closed() {
+        // issue #618 (F-round16): write-through the just-persisted gate so a
+        // completion-trigger start (which consults check_cached and does NOT retry
+        // after a synthetic fail-closed block) never MISSES a just-created gate,
+        // even if the follow-up full refresh fails and the cache is fail-closed.
+        let cache = AdmissionGateCache::new();
+        // Simulate the pre-write-through state: an open/empty snapshot that a failed
+        // post-create refresh would leave stale.
+        cache.set_fail_closed();
+        // BEFORE the delta: the new gate is invisible — this is the bug the
+        // write-through closes (a stale-open snapshot misses the new gate).
+        assert!(
+            cache.check_cached("wf", "q", 0, None).is_none(),
+            "precondition: an un-written-through snapshot misses the new gate"
+        );
+
+        cache.apply_created(fleet_gate("new-incident"));
+
+        // AFTER the delta: check_cached matches the REAL gate (never the sentinel),
+        // regardless of the fail-closed flag.
+        let (real_id, reason, scope_kind) = cache
+            .check_cached("wf", "q", 0, None)
+            .expect("write-through gate matches under fail-closed");
+        assert_ne!(real_id, sentinel_gate_id());
+        assert_eq!(reason, "new-incident");
+        assert_eq!(scope_kind, "fleet");
+    }
+
+    #[test]
+    fn apply_lifted_stops_a_gate_matching_even_under_fail_closed() {
+        // issue #618 (F-round16): write-through the lift so a just-lifted gate stops
+        // blocking on this replica even if the follow-up refresh fails (fail-closed).
+        let g = fleet_gate("lift-me");
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![g]);
+        cache.set_fail_closed();
+        // BEFORE the delta: the stale snapshot still contains the lifted gate, so
+        // check_cached keeps matching it (the durable false-block bug).
+        assert!(
+            cache.check_cached("wf", "q", 0, None).is_some(),
+            "precondition: an un-written-through snapshot still honours the lifted gate"
+        );
+
+        cache.apply_lifted(gid);
+
+        assert!(
+            cache.check_cached("wf", "q", 0, None).is_none(),
+            "a lifted gate no longer matches via check_cached, even under fail-closed"
+        );
+    }
+
+    #[test]
+    fn apply_lifted_without_fail_closed_stops_check_blocking_the_lifted_target() {
+        // issue #618 (F-round16): the new handler applies the lift delta and does NOT
+        // arm fail-closed on a refresh failure. So check() (the API path) reads the
+        // delta-applied, still-initialized snapshot and does NOT synthetically block
+        // the target the operator just unblocked. (Contrast the old behavior: a
+        // set_fail_closed() here would make check() return the block-everything
+        // sentinel, re-blocking the just-lifted target until the next refresh.)
+        let g = fleet_gate("lift-me");
+        let gid = g.id.0;
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![g]); // initialized, gate present
+        assert!(
+            cache.check("wf", "q", 0, None).is_some(),
+            "precondition: the gate blocks via check() before the lift"
+        );
+
+        // Handler's post-lift, refresh-failed path: apply the delta, DON'T fail-closed.
+        cache.apply_lifted(gid);
+
+        assert!(
+            cache.check("wf", "q", 0, None).is_none(),
+            "check() must not block a just-lifted target when the delta is written \
+             through and fail-closed is not armed"
+        );
+    }
+
+    #[test]
+    fn apply_created_is_idempotent_by_id() {
+        // A concurrent background refresh may already have picked up the persisted
+        // gate; applying the same gate again must not duplicate it.
+        let g = fleet_gate("dup");
+        let cache = AdmissionGateCache::new();
+        cache.apply_created(g.clone());
+        cache.apply_created(g);
+        assert_eq!(cache.active_count(), 1, "apply_created dedupes by id");
+    }
+
+    #[test]
+    fn apply_lifted_absent_id_is_a_noop() {
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![fleet_gate("keep")]);
+        cache.apply_lifted(Uuid::new_v4()); // unknown id
+        assert_eq!(
+            cache.active_count(),
+            1,
+            "lifting an absent id leaves the snapshot unchanged"
+        );
+    }
+
+    // ── issue #618: StartProducer + producer contract + global cache ──────────
+
+    #[test]
+    fn start_producer_as_str_is_bounded_and_snake_case() {
+        // Every variant maps to a distinct, stable, low-cardinality label.
+        let labels: Vec<&str> = StartProducer::ALL.iter().map(|p| p.as_str()).collect();
+        assert!(labels.contains(&"api"));
+        assert!(labels.contains(&"batch_start"));
+        assert!(labels.contains(&"completion_trigger"));
+        assert!(labels.contains(&"webhook_delegate"));
+        assert!(labels.contains(&"debounce"));
+        assert!(labels.contains(&"throttle"));
+        assert!(labels.contains(&"event_batch"));
+        assert!(labels.contains(&"completion_trigger_outbox"));
+        assert!(labels.contains(&"outbox"));
+        // No duplicates (each label is a distinct metric series).
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "producer labels must be unique");
+    }
+
+    #[test]
+    fn producer_contract_covers_every_producer_and_marks_outbox_exempt() {
+        let contract = producer_contract();
+        // Every StartProducer variant appears exactly once.
+        for p in StartProducer::ALL {
+            let count = contract.iter().filter(|e| e.producer == p.as_str()).count();
+            assert_eq!(
+                count,
+                1,
+                "producer {} must appear exactly once in the contract",
+                p.as_str()
+            );
+        }
+        // The API producer is gated; the outbox producer is exempt-by-design.
+        let api = contract
+            .iter()
+            .find(|e| e.producer == "api")
+            .expect("api entry");
+        assert_eq!(api.status, ProducerGateStatus::Gated);
+        let outbox = contract
+            .iter()
+            .find(|e| e.producer == "outbox")
+            .expect("outbox entry");
+        assert_eq!(outbox.status, ProducerGateStatus::ExemptByDesign);
+        assert!(
+            !outbox.rationale.is_empty(),
+            "exempt producer must state a rationale (AC3/AC5)"
+        );
+        // Completion triggers are now gated (AC1).
+        let ct = contract
+            .iter()
+            .find(|e| e.producer == "completion_trigger")
+            .expect("completion_trigger entry");
+        assert_eq!(ct.status, ProducerGateStatus::Gated);
+        // Deferred-fire producers are split: gated at HTTP admission, scanner fire
+        // exempt-with-bypass-counter (issue #618, F2).
+        for split in ["debounce", "throttle", "event_batch"] {
+            let e = contract
+                .iter()
+                .find(|e| e.producer == split)
+                .unwrap_or_else(|| panic!("{split} entry"));
+            assert_eq!(
+                e.status,
+                ProducerGateStatus::GatedAtAdmission,
+                "{split} must be gated-at-admission"
+            );
+            assert!(!e.rationale.is_empty());
+        }
+        // The cross-shard completion-trigger relay is gated authoritatively at
+        // relay time (issue #618, F-round7).
+        let cto = contract
+            .iter()
+            .find(|e| e.producer == "completion_trigger_outbox")
+            .expect("completion_trigger_outbox entry");
+        assert_eq!(cto.status, ProducerGateStatus::GatedAtRelay);
+        assert!(!cto.rationale.is_empty());
+    }
+
+    #[test]
+    fn sentinel_gate_id_matches_fail_closed_check() {
+        // The fail-closed sentinel a fresh cache returns must equal the documented
+        // sentinel (issue #618, F3) so callers can distinguish it from a real gate.
+        let cache = AdmissionGateCache::new_fail_closed();
+        let (gate_id, _reason, _scope) = cache
+            .check("wf", "q", 0, None)
+            .expect("fail-closed cache blocks");
+        assert_eq!(
+            gate_id,
+            sentinel_gate_id(),
+            "fail-closed check() must return the sentinel gate id"
+        );
+        assert_eq!(sentinel_gate_id(), Uuid::nil());
+    }
+
+    // Serialises the two tests that mutate the process-global gate cache so they
+    // don't race under the default parallel test runner (issue #618 review).
+    static GLOBAL_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn global_gate_cache_round_trips_and_shares_state() {
+        let _g = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Default: unset → None (backward-compat: core producers skip the check).
+        set_global_admission_gate_cache(None);
+        assert!(global_admission_gate_cache().is_none());
+
+        let cache = std::sync::Arc::new(AdmissionGateCache::new());
+        set_global_admission_gate_cache(Some(std::sync::Arc::clone(&cache)));
+        let fetched = global_admission_gate_cache().expect("cache installed");
+        // Same underlying instance: a refresh on one Arc is visible via the other.
+        fetched.refresh(vec![fleet_gate("global-incident")]);
+        let hit = cache.check("wf", "q", 0, None);
+        assert!(hit.is_some(), "shared Arc must observe the refresh");
+        assert_eq!(hit.unwrap().1, "global-incident");
+
+        // Reset so serial tests are unaffected by process-global state.
+        set_global_admission_gate_cache(None);
+    }
+
+    #[test]
+    fn global_gate_cache_divergent_replace_and_clear() {
+        let _g = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // issue #618 (F5): a divergent re-publish replaces (last-write-wins; the
+        // warn is a side effect), and clearing with None fully removes the handle
+        // (teardown semantics mirrored by stop_harvest_runtime).
+        let a = std::sync::Arc::new(AdmissionGateCache::new());
+        let b = std::sync::Arc::new(AdmissionGateCache::new());
+        set_global_admission_gate_cache(Some(std::sync::Arc::clone(&a)));
+        // Re-publishing the SAME Arc is a benign no-op (ptr-eq, no divergence).
+        set_global_admission_gate_cache(Some(std::sync::Arc::clone(&a)));
+        assert!(std::sync::Arc::ptr_eq(
+            &global_admission_gate_cache().expect("installed"),
+            &a
+        ));
+        // A divergent re-publish replaces it.
+        set_global_admission_gate_cache(Some(std::sync::Arc::clone(&b)));
+        assert!(std::sync::Arc::ptr_eq(
+            &global_admission_gate_cache().expect("installed"),
+            &b
+        ));
+        // Clearing removes it entirely.
+        set_global_admission_gate_cache(None);
+        assert!(global_admission_gate_cache().is_none());
     }
 }

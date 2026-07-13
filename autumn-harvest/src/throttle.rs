@@ -62,8 +62,9 @@
 //! HTTP start route and the batch-start handler in `autumn-harvest-plugin`'s
 //! `api.rs`, plus the scheduler-tick and scheduler-buffered/backfill-fire loops
 //! in `scheduler.rs`) rather than from one central choke point. This mirrors —
-//! and does not fix — the same duplication shape the admission-gate feature
-//! (#377, see `admission_gate.rs`'s own "Known gaps" section) already has. A
+//! and does not fix — the same per-producer duplication shape the admission-gate
+//! feature (#377) has (its full producer contract is enumerated by
+//! [`crate::admission_gate::producer_contract`]). A
 //! consolidated design would thread throttle admission into
 //! `execution::start_or_load_workflow_execution_collect` itself so every
 //! current *and future* producer gets it for free; that refactor was judged
@@ -77,8 +78,9 @@
 //!   generate exactly the same kind of start burst an HTTP `POST .../start`
 //!   caller can, with zero pacing.
 //! * **Completion-trigger continuations** (`completion_trigger.rs`): a
-//!   terminal-state trigger that starts a follow-up workflow bypasses the
-//!   throttle the same way it bypasses the admission gate (#377's own gap).
+//!   terminal-state trigger that starts a follow-up workflow does not consult a
+//!   `ThrottlePolicy`. (It DOES honour the admission gate as of #618 — the
+//!   throttle and the gate are independent controls.)
 //! * **The outbox relay** (`autumn-harvest-plugin`'s `outbox.rs`): replays
 //!   workflow-start events durably queued before a bucket was ever consulted.
 //!
@@ -954,7 +956,7 @@ async fn fire_claimed_throttle_row(
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
     // so follow-ups are collected and spawned only after commit.
     match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None,
+        conn, params, true, false, None, None,
     )
     .await
     {
@@ -1189,6 +1191,12 @@ pub async fn fire_due_throttled_starts(
             if is_scheduled_run {
                 metrics.record_schedule_run("workflow", &workflow_name);
             }
+            // issue #618, F1: the throttle scanner relays a start already
+            // admitted through the gate at HTTP time; count the deferred fire as
+            // an exempt bypass so it never slips a gate silently. See
+            // `admission_gate::producer_contract`.
+            metrics
+                .record_admission_bypassed(crate::admission_gate::StartProducer::Throttle.as_str());
             let _ = &queue_name;
         }
         count

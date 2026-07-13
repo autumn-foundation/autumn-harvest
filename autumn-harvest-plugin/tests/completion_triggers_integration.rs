@@ -598,6 +598,7 @@ async fn test_trigger_evaluations_same_shard() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -718,6 +719,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -833,6 +835,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -915,6 +918,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1028,6 +1032,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1185,6 +1190,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1296,6 +1302,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1477,6 +1484,7 @@ async fn test_trigger_cross_shard() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1586,6 +1594,7 @@ async fn test_completion_trigger_via_worker_run() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1709,6 +1718,7 @@ async fn test_trigger_with_custom_queue() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1901,6 +1911,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1941,6 +1952,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
 
     let sweep_res = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &Some(bad_sharded_pool),
         &[ShardId::new(1)], // sweep targets Shard 1
     )
@@ -1961,6 +1973,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
     // 2. Now run outbox sweep with the correct/working sharded pool
     let sweep_res_success = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &Some(sharded_pool),
         &[ShardId::new(1)],
     )
@@ -2121,6 +2134,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -2423,6 +2437,7 @@ async fn test_exact_pool_routing_cross_shard() {
 
     let sweep_count = enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &incomplete_sharded_pool,
         &[ShardId::new(0), ShardId::new(1)],
     )
@@ -2599,6 +2614,7 @@ async fn test_trigger_evaluations_schema_validation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -2676,6 +2692,7 @@ async fn test_trigger_evaluations_schema_validation() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -2795,6 +2812,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -2920,6 +2938,7 @@ async fn start_and_complete_source(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .unwrap();

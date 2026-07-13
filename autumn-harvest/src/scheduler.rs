@@ -802,6 +802,7 @@ pub async fn trigger_unified_dag(
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
         },
+        None,
     )
     .await
 }
@@ -2097,6 +2098,13 @@ pub async fn claim_and_fire_workflow_schedule(
                 "harvest: schedule fire skipped due to admission gate"
             );
             metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+            // issue #618, F-round17: the scheduler is a *gated* producer, so a
+            // schedule fire blocked by an active gate must ALSO appear in
+            // harvest.admission.blocked (the "zero-uncounted gated producer" contract),
+            // in addition to the schedule-domain schedule_skipped signal above. Pass
+            // the matched gate's scope kind + reason, mirroring every other gated
+            // producer's block-count call.
+            metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
             crate::schedule_decision::record_decision_graceful(
                 conn,
                 Some(&**metrics),
@@ -3397,6 +3405,7 @@ async fn tick_one_workflow_schedule(
                 origin: Some(crate::execution::ORIGIN_SCHEDULED),
                 completion_callbacks: None,
             },
+            None,
         )
         .await;
         match scheduled_start_outcome(start_result) {
@@ -4209,6 +4218,11 @@ async fn drain_buffered_schedule_runs(
                     "harvest: buffered drain skipped due to admission gate"
                 );
                 metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+                // issue #618, F-round17: also count the block in
+                // harvest.admission.blocked (see the tick path above) so the
+                // scheduler's buffered/overlap drain blocks appear like every other
+                // gated producer's.
+                metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
                 continue;
             }
         }
@@ -4449,6 +4463,7 @@ async fn drain_buffered_schedule_runs(
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
                     completion_callbacks: None,
                 },
+                None,
             )
             .await;
 

@@ -317,6 +317,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
         )
         .await
         .expect("seed workflow");

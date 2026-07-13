@@ -248,6 +248,49 @@ impl CancelledWorkflowExecution {
     }
 }
 
+/// Evaluate the admission gate for a start against the process-global gate cache
+/// (issue #618, PR #1014). Returns `Some((gate_id, reason, scope_kind))` on a
+/// match, `None` when no gate matches or no cache is installed.
+fn evaluate_start_gate(
+    mode: crate::admission_gate::GateMode,
+    workflow_name: &str,
+    queue_name: &str,
+    shard_id: i32,
+    owner: Option<&str>,
+) -> Option<(uuid::Uuid, String, &'static str)> {
+    let cache = crate::admission_gate::global_admission_gate_cache()?;
+    match mode {
+        crate::admission_gate::GateMode::Check => {
+            cache.check(workflow_name, queue_name, shard_id, owner)
+        }
+        crate::admission_gate::GateMode::CheckCached => {
+            cache.check_cached(workflow_name, queue_name, shard_id, owner)
+        }
+    }
+}
+
+/// Record a `harvest.admission.blocked` count for a gated start (issue #618, PR
+/// #1014). Uses the caller-supplied recorder when present, else the process-global
+/// recorder the plugin publishes at boot — so a block on a metrics-less internal
+/// start path (cancel / terminate / parent-close cascade) is still counted.
+fn record_start_gate_block(
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    scope_kind: &str,
+    reason: &str,
+) {
+    // Truncate to 64 *characters* (not bytes) for bounded metric cardinality;
+    // char_indices avoids splitting a multi-byte code point.
+    let label = match reason.char_indices().nth(64) {
+        Some((i, _)) => &reason[..i],
+        None => reason,
+    };
+    if let Some(m) = metrics {
+        m.record_admission_blocked(scope_kind, label);
+    } else if let Some(g) = crate::admission_gate::global_admission_metrics() {
+        g.record_admission_blocked(scope_kind, label);
+    }
+}
+
 /// Start a workflow execution or load the existing one, returning both the result
 /// and any deferred completion-trigger starts **without spawning them**.
 ///
@@ -287,11 +330,29 @@ impl CancelledWorkflowExecution {
 /// debounce-aware HTTP entry points use to allow attach/idempotent calls while
 /// routing or rejecting true fresh starts without a TOCTOU (issue #499).
 ///
+/// `gate`, when `Some`, enforces the admission gate AUTHORITATIVELY at the point
+/// this function decides — under a `FOR UPDATE` lock on any prior run — that it
+/// will CREATE a new execution (issue #618, PR #1014). This closes the entire
+/// unlocked-pre-read TOCTOU class in one place: a caller no longer needs an
+/// unlocked existence check to decide whether to gate. For a non-`TerminateIfRunning`
+/// policy the prior is locked via [`try_load_active_execution_for_update`] at the
+/// top of the start transaction, its state fed to [`start_will_create_new_execution`],
+/// and the gate applied iff a new execution will be created (an idempotent ATTACH
+/// admits nothing and is never gated). For `TerminateIfRunning` — which always
+/// creates — the gate is applied ONCE, unlocked (a constant decision), *before*
+/// the pre-check cancellation, so a blocked start never cancels a prior. A blocked
+/// start returns [`HarvestError::AdmissionBlocked`] (rolling the transaction back —
+/// no fresh row, no events) and records `harvest.admission.blocked` exactly once.
+/// [`GateMode`](crate::admission_gate::GateMode) selects the cache read (fail-closed
+/// `Check` for fresh admissions, snapshot-only `CheckCached` for continuation).
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
 /// - [`HarvestError::DebounceFreshStart`] when a fresh start is gated by
 ///   `reject_fresh_if_debounced`.
+/// - [`HarvestError::AdmissionBlocked`] when `gate` matches an active gate on a
+///   fresh admission.
 /// - [`HarvestError::Database`] for insert/query failures.
 /// - Propagates queue/event-store failures from the start transaction.
 #[allow(clippy::too_many_lines)]
@@ -301,6 +362,7 @@ pub async fn start_or_load_workflow_execution_collect(
     in_outer_transaction: bool,
     reject_fresh_if_debounced: bool,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<(
     StartedWorkflowExecution,
     Vec<DeferredTriggerStart>,
@@ -377,6 +439,28 @@ pub async fn start_or_load_workflow_execution_collect(
     let mut pre_check_deferred: Vec<DeferredTriggerStart> = Vec::new();
     let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
     let mut pre_check_cancel_metrics: Vec<(String, String)> = Vec::new();
+
+    // POINT 1 (issue #618, PR #1014): TerminateIfRunning ALWAYS creates a
+    // replacement (state-independent), so its `will_create` is a constant `true`
+    // — the gate decision needs no lock. Apply it BEFORE the pre-check
+    // cancellation below so a blocked TerminateIfRunning start never cancels the
+    // prior run first (cancel-then-block). A block records the count once and
+    // returns without touching the DB.
+    if let Some(mode) = gate
+        && request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+        && !reject_fresh_if_debounced
+        && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
+            mode,
+            request.workflow_name,
+            request.queue_name,
+            shard_id_value,
+            request.owner,
+        )
+    {
+        record_start_gate_block(metrics, scope_kind, &reason);
+        return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+    }
+
     if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
@@ -504,8 +588,47 @@ pub async fn start_or_load_workflow_execution_collect(
             let row = row;
             let enqueue = enqueue.clone();
             let request = request.clone();
+            // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the inner
+            // `async move` captures them directly from this closure's environment.
             async move {
                 let mut tx_deferred_checks = Vec::new();
+
+                // Authoritative locked gate (issue #618, PR #1014). For every
+                // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
+                // above), take the `FOR UPDATE` lock on any non-sealed prior
+                // FIRST — before the INSERT — so the create-vs-attach decision the
+                // gate keys on is made on ONE stable, locked state. This is the
+                // move that closes the seal-under-lock TOCTOU: a prior that seals
+                // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
+                // and the start is excluded by the `for_update()` filter, so the
+                // fresh replacement it would otherwise leak is caught here. The
+                // lock is reused by the INSERT / `..._by_key_for_update` load
+                // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
+                // this never runs on the debounce path.
+                if let Some(mode) = gate
+                    && request.reuse_policy != WorkflowIdReusePolicy::TerminateIfRunning
+                    && !reject_fresh_if_debounced
+                {
+                    let prior = try_load_active_execution_for_update(
+                        conn,
+                        request.workflow_name,
+                        request.workflow_id,
+                    )
+                    .await?;
+                    if start_will_create_new_execution(
+                        prior.as_ref().map(|e| e.state.as_str()),
+                        request.reuse_policy,
+                    ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
+                        mode,
+                        request.workflow_name,
+                        request.queue_name,
+                        shard_id_value,
+                        request.owner,
+                    ) {
+                        record_start_gate_block(metrics, scope_kind, &reason);
+                        return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+                    }
+                }
 
                 // `on_conflict_do_nothing()` (no explicit target) lets Postgres
                 // arbitrate against the partial unique index installed by the
@@ -767,12 +890,13 @@ pub async fn start_or_load_workflow_execution_collect(
 pub async fn start_or_load_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     // Top-level caller (`in_outer_transaction = false`): if a TerminateIfRunning
     // pre-check cancellation commits and the replacement start then fails, the
     // collect fn spawns the cancellation's follow-ups itself before returning Err.
     let (result, deferred_starts, deferred_checks, _cancel_metrics) =
-        start_or_load_workflow_execution_collect(conn, request, false, false, None).await?;
+        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate).await?;
     for start in deferred_starts {
         start.spawn();
     }
@@ -786,9 +910,11 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     let (result, deferred_starts, deferred_checks, cancel_metrics) =
-        start_or_load_workflow_execution_collect(conn, request, false, false, metrics).await?;
+        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate)
+            .await?;
     for start in deferred_starts {
         start.spawn();
     }
@@ -856,6 +982,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
     idempotency_key: &str,
     window_secs: f64,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<IdempotentStartOutcome> {
     let new_exec_id = request.exec_id;
     let shard_id = request.shard_id();
@@ -868,6 +995,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
             Vec<(String, String)>,
         ), HarvestError, _>(|conn| {
             let request = request;
+            // `gate` and `metrics` are `Copy`; captured directly by the `async move`.
             async move {
                 match crate::start_idempotency::reserve_start_idempotency(
                     conn,
@@ -896,7 +1024,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
                     crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                         let workflow_name = request.workflow_name;
                         let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
-                            conn, request, true, false, metrics,
+                            conn, request, true, false, metrics, gate,
                         )
                         .await?;
                         // The reserve wrote the claim pointing at `new_exec_id`.
@@ -939,6 +1067,134 @@ pub async fn start_or_load_workflow_execution_idempotent(
         }
     }
     Ok(outcome)
+}
+
+/// Will `start_or_load_workflow_execution_collect` CREATE a new execution (a new
+/// admission), given the locked prior run's state and the reuse policy? (Issue
+/// #618, F-round18.)
+///
+/// Pure mirror of `start_or_load_workflow_execution_collect`'s attach-vs-create
+/// decision — used by [`gate_checked_start_or_load`] to apply the admission gate
+/// exactly when a NEW execution is created, and skip it only for a genuine
+/// idempotent ATTACH to an existing run.
+///
+/// `prior_state` is the state of the `(workflow_name, workflow_id)` row that
+/// occupies the active-uniqueness index — i.e. the value returned by
+/// [`try_load_active_execution_for_update`] /
+/// [`load_workflow_execution_by_key_for_update`], which BOTH exclude the sealed
+/// `CONTINUED_AS_NEW`/`TERMINATED` states. So `None` means "no non-sealed prior"
+/// (no prior at all, or only a sealed one) — the `INSERT` succeeds and a fresh
+/// execution is created. `Some(state)` means the `INSERT` is a no-op and the
+/// reuse policy decides attach-vs-replace.
+///
+/// The matrix mirrors `_collect` exactly (verified against the code, not the
+/// `SignalWithStart` matrix, which escalates terminal-prior attaches to fresh
+/// starts and is NOT what `_collect` — the path this primitive calls — does):
+///
+/// - `None` (no non-sealed prior) → CREATE.
+/// - `AllowDuplicate` + any non-sealed prior → ATTACH (`from_row(existing, false)`,
+///   unconditional — including a terminal `COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`
+///   prior; no new admission).
+/// - `RejectDuplicate` + any non-sealed prior → `Err(AlreadyExists)`: no start at
+///   all, so no admission — treated as "no create" (the gate is irrelevant since
+///   nothing starts).
+/// - `AllowDuplicateFailedOnly` + prior `FAILED`/`CANCELLED` → CREATE
+///   (`replace_execution`); any other non-sealed state → ATTACH.
+/// - `TerminateIfRunning` + any non-sealed prior → CREATE (`replace_execution`,
+///   always; the live-prior pre-check cancels first, then it replaces).
+#[must_use]
+pub fn start_will_create_new_execution(
+    prior_state: Option<&str>,
+    reuse_policy: WorkflowIdReusePolicy,
+) -> bool {
+    // `None` = no non-sealed prior occupies the uniqueness slot → the INSERT
+    // succeeds → a fresh execution is created (covers "no prior" and "sealed prior").
+    prior_state.is_none_or(|state| match reuse_policy {
+        // AllowDuplicate ATTACHES to the existing run (any non-sealed state);
+        // RejectDuplicate errors AlreadyExists — neither creates a new execution.
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::RejectDuplicate => false,
+        // Replace only a FAILED/CANCELLED prior; otherwise attach.
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly => matches!(state, "FAILED" | "CANCELLED"),
+        // Always replaces (cancel-if-live, then replace) → fresh create.
+        WorkflowIdReusePolicy::TerminateIfRunning => true,
+    })
+}
+
+#[cfg(test)]
+mod start_will_create_tests {
+    use super::start_will_create_new_execution as will_create;
+    use crate::types::WorkflowIdReusePolicy::{
+        AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
+    };
+
+    // The four non-sealed terminal states + the three non-sealed active states that
+    // can occupy the uniqueness index (CONTINUED_AS_NEW/TERMINATED are excluded by
+    // the index, so they surface as `None` here).
+    const TERMINAL: [&str; 4] = ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
+    const ACTIVE: [&str; 3] = ["RUNNING", "SUSPENDED", "PAUSED"];
+
+    #[test]
+    fn no_prior_always_creates() {
+        for policy in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            assert!(
+                will_create(None, policy),
+                "no non-sealed prior → INSERT succeeds → CREATE ({policy:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_duplicate_always_attaches_to_a_non_sealed_prior() {
+        // AllowDuplicate returns the existing run unconditionally (created=false) —
+        // for BOTH live and terminal priors. It is NOT the SignalWithStart matrix
+        // (which escalates a terminal-prior attach to a fresh start); this is the
+        // standalone start_or_load path the primitive actually calls.
+        for state in ACTIVE.iter().chain(TERMINAL.iter()) {
+            assert!(
+                !will_create(Some(state), AllowDuplicate),
+                "AllowDuplicate attaches (no create) for prior state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_duplicate_never_creates_when_a_prior_exists() {
+        // Err(AlreadyExists): nothing starts, so nothing is admitted.
+        for state in ACTIVE.iter().chain(TERMINAL.iter()) {
+            assert!(
+                !will_create(Some(state), RejectDuplicate),
+                "RejectDuplicate errors (no create) for prior state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_duplicate_failed_only_replaces_only_failed_or_cancelled() {
+        assert!(will_create(Some("FAILED"), AllowDuplicateFailedOnly));
+        assert!(will_create(Some("CANCELLED"), AllowDuplicateFailedOnly));
+        // Every other non-sealed state attaches (no create).
+        for state in ["RUNNING", "SUSPENDED", "PAUSED", "COMPLETED", "TIMED_OUT"] {
+            assert!(
+                !will_create(Some(state), AllowDuplicateFailedOnly),
+                "AllowDuplicateFailedOnly attaches (no create) for prior state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminate_if_running_always_replaces_a_non_sealed_prior() {
+        for state in ACTIVE.iter().chain(TERMINAL.iter()) {
+            assert!(
+                will_create(Some(state), TerminateIfRunning),
+                "TerminateIfRunning replaces (create) for prior state {state}"
+            );
+        }
+    }
 }
 
 /// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
@@ -2608,6 +2864,37 @@ pub async fn try_load_by_key(
         .map_err(database_error)
 }
 
+/// Any-state existence check keyed on `(workflow_name, workflow_id)`.
+///
+/// Returns `true` when a row exists in ANY state, including the sealed
+/// `CONTINUED_AS_NEW`/`TERMINATED` states that both [`try_load_by_key`] and
+/// [`try_load_active_execution_for_update`] deliberately exclude, and the
+/// terminal `COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT` states that the
+/// active-only lock excludes.
+///
+/// The completion-trigger cross-shard relay (issue #618, F-round15) uses this to
+/// recognise a stale one-shot outbox row whose deterministic target already ran:
+/// a target sealed or completed since it was first started must be treated as
+/// DELIVERED, never as a fresh (gated) admission. Read-only, unlocked (the
+/// relay's exactly-one-path-per-row invariant makes it stable — see
+/// `completion_trigger::relay_gate_checked_start`); do NOT use this as a
+/// create/attach existence lock — that is [`try_load_active_execution_for_update`]'s
+/// job and it must stay active-only for the webhook and fresh-create paths.
+pub async fn execution_exists_by_key(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::workflow_id.eq(workflow_id)),
+    ))
+    .get_result::<bool>(conn)
+    .await
+    .map_err(database_error)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SignalWithStart (issue #244)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2803,7 +3090,7 @@ pub async fn signal_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
 ) -> HarvestResult<SignalWithStartOutcome> {
-    signal_with_start_workflow_execution_with_metrics(conn, request, None).await
+    signal_with_start_workflow_execution_with_metrics(conn, request, None, None).await
 }
 
 /// # Errors
@@ -2815,6 +3102,16 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Admission gate (issue #618, PR #1014). Threaded into the fresh-create start
+    // calls below so a signal-with-start that CREATES a new execution is gated
+    // AUTHORITATIVELY under the primitive's `FOR UPDATE` lock — closing the
+    // request-internal TOCTOU that an unlocked pre-check alone leaves open (the
+    // exact seal-under-lock/gate-raised-mid-request window the plain `api` start
+    // route was moved off an unlocked pre-read to close). `None` for the
+    // continuation/example callers; the HTTP route passes `Some(GateMode::Check)`.
+    // The `reject_fresh_if_debounced` branch stays `None` — debounce owns its own
+    // admission (bypass-counted scanner relay).
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
@@ -2964,6 +3261,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             true,
                             true,
                             metrics,
+                            None,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -2978,6 +3276,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             true,
                             false,
                             metrics,
+                            gate,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -3030,6 +3329,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             true,
                             false,
                             metrics,
+                            gate,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -3400,7 +3700,7 @@ pub async fn update_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: UpdateWithStartParams<'_>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
-    update_with_start_workflow_execution_with_metrics(conn, request, None).await
+    update_with_start_workflow_execution_with_metrics(conn, request, None, None).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3408,6 +3708,13 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: UpdateWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Admission gate (issue #618, PR #1014) — see the sibling doc on
+    // `signal_with_start_workflow_execution_with_metrics`. Threaded into the
+    // fresh-create start calls so an update-with-start that CREATES is gated
+    // authoritatively under the primitive's lock; the HTTP route passes
+    // `Some(GateMode::Check)`, continuation/example callers pass `None`, and the
+    // `reject_fresh_if_debounced` branch stays `None`.
+    gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
     // Capture the queue for the post-commit update.admitted metric (issue #684)
     // before `request` is moved into the transaction closure. The update name is
@@ -3524,6 +3831,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         true,
                         true,
                         metrics,
+                        None,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);
@@ -3537,6 +3845,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         true,
                         false,
                         metrics,
+                        gate,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);
@@ -3576,6 +3885,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         true,
                         false,
                         metrics,
+                        gate,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);

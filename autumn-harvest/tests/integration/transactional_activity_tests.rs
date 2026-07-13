@@ -399,6 +399,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
         )
         .await
         .expect("start workflow")
@@ -487,6 +488,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 origin: None,
                 completion_callbacks: None,
             },
+            None,
         )
         .await
         .expect("start workflow")

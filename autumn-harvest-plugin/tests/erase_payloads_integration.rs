@@ -338,6 +338,7 @@ async fn seed_execution_with_pii(
             origin: None,
             completion_callbacks: None,
         },
+        None,
     )
     .await
     .expect("seed workflow");

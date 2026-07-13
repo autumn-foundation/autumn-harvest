@@ -1136,6 +1136,7 @@ mod db_tests {
         start_or_load_workflow_execution(
             &mut conn,
             start_params("ramped_wf", "ramped-wf-001", exec_id),
+            None,
         )
         .await
         .expect("start_or_load_workflow_execution");
@@ -1164,6 +1165,7 @@ mod db_tests {
         start_or_load_workflow_execution(
             &mut conn,
             start_params("ramped_wf", "ramped-wf-002", exec_id),
+            None,
         )
         .await
         .expect("start_or_load_workflow_execution");
@@ -1195,6 +1197,7 @@ mod db_tests {
         start_or_load_workflow_execution(
             &mut conn,
             start_params("ramped_wf", "ramped-wf-003", first_exec_id),
+            None,
         )
         .await
         .unwrap();
@@ -1212,6 +1215,7 @@ mod db_tests {
         start_or_load_workflow_execution(
             &mut conn,
             start_params("ramped_wf", "ramped-wf-004", second_exec_id),
+            None,
         )
         .await
         .unwrap();
@@ -1249,6 +1253,7 @@ mod db_tests {
         start_or_load_workflow_execution(
             &mut conn,
             start_params("ramped_wf", "ramped-wf-005", exec_id),
+            None,
         )
         .await
         .unwrap();

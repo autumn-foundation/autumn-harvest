@@ -295,6 +295,11 @@ by roughly `pause_duration_secs`.
 
 ## Related
 
+- `docs/operations/admission-gate-producers.md` — pause/cancel/terminate act on
+  a *single* execution. To halt **new** starts fleet-wide (or by
+  name/queue/shard/owner) while in-flight work drains, raise an admission gate
+  instead; that page documents which start producers honour a gate and which are
+  exempt-by-design (with an observable bypass counter).
 - `docs/runbooks/synthetic-incident-drills.md` — the
   `runaway-execution-containment` drill rehearses this runbook end-to-end in
   staging, including the deterministic-resume correctness check.

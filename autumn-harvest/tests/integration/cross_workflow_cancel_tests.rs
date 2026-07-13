@@ -363,6 +363,7 @@ async fn test_same_shard_live_cancel() {
             "cancel-target-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -379,6 +380,7 @@ async fn test_same_shard_live_cancel() {
             "cancel-caller-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -504,6 +506,7 @@ async fn test_already_terminal_target_is_no_op_success() {
             "cancel-terminal-target-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -530,6 +533,7 @@ async fn test_already_terminal_target_is_no_op_success() {
             "cancel-terminal-caller-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -634,6 +638,7 @@ async fn test_grace_window_expiry_unknown_target() {
             "cancel-grace-caller-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -771,6 +776,7 @@ async fn test_cross_shard_cancel_via_outbox() {
             "cross-cancel-target-1",
             serde_json::json!({}),
         ),
+        None,
     )
     .await
     .unwrap();
@@ -786,6 +792,7 @@ async fn test_cross_shard_cancel_via_outbox() {
             "cross-cancel-caller-1",
             serde_json::json!({"target": target_exec_id.to_string()}),
         ),
+        None,
     )
     .await
     .unwrap();

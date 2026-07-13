@@ -175,15 +175,41 @@ async fn drain_workflow_start_outbox_batch(
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
 
+    // issue #618, F-round8: the metrics recorder for the exempt-with-bypass-counter
+    // "outbox" producer. Fetched once; the bypass is counted per row only AFTER the
+    // app outbox row is durably marked delivered (see below).
+    let outbox_metrics = state
+        .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+        .map(|registry| std::sync::Arc::clone(&registry.telemetry().metrics));
+
     let claimed = rows.len();
     let mut delivered = 0usize;
     for row in rows {
         match dispatch_workflow_start_request(state, &row.request()).await {
             Ok(exec_id) => {
-                mark_outbox_row_delivered(&mut app_conn, row.id, &claimant, exec_id)
+                let marked = mark_outbox_row_delivered(&mut app_conn, row.id, &claimant, exec_id)
                     .await
                     .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
                 delivered += 1;
+                // issue #618, F-round8 + F-round11: count the "outbox" bypass EXACTLY
+                // ONCE, gated on THIS claimant actually, durably marking the row
+                // delivered — i.e. the UPDATE affected its own claimed row (`marked ==
+                // 1`). F-round8 gated on the mark returning `Ok`, but the mark's
+                // `WHERE claimed_by = $2` can affect 0 rows (returning `Ok(0)`) when a
+                // concurrent relay reclaimed the row past `claim_ttl_ms`; counting on
+                // that 0-row `Ok` would let both this claimant AND the reclaimer that
+                // actually delivers count the same committed start. Gating on `marked
+                // == 1` makes exactly the claimant whose mark wins the row count it,
+                // so one committed outbox start is one bypass across concurrent
+                // reclaims. Mirrors round 6/7's "gate the count on the delete/UPDATE
+                // actually affecting the row".
+                if outbox_bypass_should_count(marked)
+                    && let Some(metrics) = outbox_metrics.as_ref()
+                {
+                    metrics.record_admission_bypassed(
+                        autumn_harvest::admission_gate::StartProducer::Outbox.as_str(),
+                    );
+                }
             }
             Err(error) => {
                 mark_outbox_row_failed(&mut app_conn, &row, &claimant, &config, &error.to_string())
@@ -346,9 +372,25 @@ pub(crate) async fn dispatch_workflow_start_request(
             r.telemetry().metrics.as_ref()
                 as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
         }),
+        None,
     )
     .await?;
 
+    // issue #618: the outbox relay is EXEMPT-BY-DESIGN from the admission gate.
+    // It replays workflow-start requests that were durably committed to the
+    // outbox before any gate was raised; gating them would drop already-accepted
+    // in-flight work, which is the opposite of the gate contract ("halt NEW
+    // starts while in-flight work drains").
+    //
+    // The `harvest.admission.bypassed{producer="outbox"}` count is recorded by the
+    // CALLER (`drain_workflow_start_outbox_batch`), gated on the app outbox row
+    // being DURABLY marked delivered (issue #618, F-round8) — NOT here. The start
+    // succeeding is not the exactly-once boundary: if `mark_outbox_row_delivered`
+    // then fails, the row stays eligible past its claim TTL and the retry re-enters
+    // this path (`start_or_load` returns the SAME existing execution), so counting
+    // here would report one committed start as multiple bypasses. Counting only
+    // once the mark succeeds mirrors round 6's "gate the count on the row delete
+    // actually removing the row". See `admission_gate::producer_contract`.
     Ok(start.exec_id)
 }
 
@@ -395,12 +437,28 @@ async fn claim_due_outbox_rows(
     .await
 }
 
+/// Whether a `mark_outbox_row_delivered` result should count an "outbox" admission
+/// bypass (issue #618, F-round11). Exactly-once per committed start: count only when
+/// THIS claimant durably marked its own claimed row — i.e. the UPDATE affected
+/// exactly one row (`== 1`). A `0` means the row was reclaimed by a concurrent relay
+/// past `claim_ttl_ms` (the `WHERE claimed_by` guard matched nothing), so the
+/// reclaimer that actually delivers is the one that counts — not this claimant.
+const fn outbox_bypass_should_count(marked_rows: usize) -> bool {
+    marked_rows == 1
+}
+
+/// Marks an outbox row delivered. Returns the number of rows actually updated
+/// (0 or 1 — `id` is the PK). It is **0** when this claimant lost the row to a
+/// concurrent reclaim past `claim_ttl_ms` (the `WHERE claimed_by = $2` guard no
+/// longer matches); the affected count is surfaced (issue #618, F-round11) so the
+/// caller can gate the "outbox" bypass counter on an actual durable delivery
+/// (`== 1`) rather than on a mark that reported `Ok` but updated nothing.
 async fn mark_outbox_row_delivered(
     conn: &mut AsyncPgConnection,
     row_id: i64,
     claimant: &str,
     exec_id: ExecutionId,
-) -> Result<(), diesel::result::Error> {
+) -> Result<usize, diesel::result::Error> {
     diesel::sql_query(
         r"
         UPDATE harvest_workflow_outbox
@@ -419,7 +477,6 @@ async fn mark_outbox_row_delivered(
     .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
     .execute(conn)
     .await
-    .map(|_| ())
 }
 
 async fn mark_outbox_row_failed(
@@ -492,5 +549,91 @@ mod tests {
         };
 
         assert_eq!(retry_delay_ms(&config, &row), 10_000);
+    }
+
+    /// F-round11 (pure, no DB): the "outbox" bypass is counted for EXACTLY a 1-row
+    /// mark, and skipped for a 0-row mark (this claimant lost the row to a concurrent
+    /// reclaim) — so one committed start is one bypass across concurrent reclaims.
+    #[test]
+    fn outbox_bypass_counted_only_for_a_one_row_mark() {
+        assert!(
+            !outbox_bypass_should_count(0),
+            "a 0-row mark (lost the row to a reclaim) must NOT count the bypass"
+        );
+        assert!(
+            outbox_bypass_should_count(1),
+            "the claimant that durably marks its own row (1 row) counts exactly once"
+        );
+        // Defensive: id is the PK so >1 is impossible, but never count it as one start.
+        assert!(!outbox_bypass_should_count(2));
+    }
+
+    /// F-round11 (DB): `mark_outbox_row_delivered` surfaces the affected-row count so
+    /// the caller can gate the bypass counter on an actual durable delivery. A mark by
+    /// a claimant that does NOT own the row (a concurrent reclaimer took it past
+    /// `claim_ttl_ms`) affects 0 rows (the `WHERE claimed_by` guard matches nothing);
+    /// the owning claimant's mark affects exactly 1. Runs against
+    /// `HARVEST_TEST_DATABASE_URL` when set (skips otherwise); executed against a real
+    /// local Postgres in CI's Docker-backed step.
+    #[tokio::test]
+    async fn mark_outbox_row_delivered_reports_affected_rows() {
+        use diesel_async::AsyncConnection;
+
+        #[derive(diesel::QueryableByName)]
+        struct IdRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+        }
+
+        let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+            return;
+        };
+        let mut conn = AsyncPgConnection::establish(&url)
+            .await
+            .expect("connect to test DB");
+
+        // An outbox row already CLAIMED by worker-A.
+        let row_id: i64 = diesel::sql_query(
+            "INSERT INTO harvest_workflow_outbox
+                (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
+             VALUES ('r11_wf', 'r11-mark', 'default', '{}'::jsonb, 'worker-A', NOW())
+             RETURNING id",
+        )
+        .get_result::<IdRow>(&mut conn)
+        .await
+        .expect("insert claimed outbox row")
+        .id;
+
+        let exec = ExecutionId::new();
+
+        // (a) worker-B (a reclaimer that does NOT own the row) → 0 rows affected.
+        let lost = mark_outbox_row_delivered(&mut conn, row_id, "worker-B", exec)
+            .await
+            .expect("mark (non-owner)");
+        assert_eq!(
+            lost, 0,
+            "a mark by a non-owning claimant affects 0 rows (it lost the reclaim)"
+        );
+        assert!(
+            !outbox_bypass_should_count(lost),
+            "a 0-row mark must not count the bypass"
+        );
+
+        // (b) worker-A (the owner) → exactly 1 row affected.
+        let won = mark_outbox_row_delivered(&mut conn, row_id, "worker-A", exec)
+            .await
+            .expect("mark (owner)");
+        assert_eq!(won, 1, "the owning claimant's mark affects exactly 1 row");
+        assert!(
+            outbox_bypass_should_count(won),
+            "a 1-row mark counts the bypass exactly once"
+        );
+
+        diesel::sql_query("DELETE FROM harvest_workflow_outbox WHERE id = $1")
+            .bind::<diesel::sql_types::BigInt, _>(row_id)
+            .execute(&mut conn)
+            .await
+            .expect("cleanup");
     }
 }
