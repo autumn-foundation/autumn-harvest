@@ -3841,6 +3841,31 @@ async fn resume_workflow_by_id(
     finalize_by_id(out, exec_id)
 }
 
+/// Input-validation GUARD for the name-only by-id path (issue #805, AC3).
+///
+/// A bare `/workflows/by-id/{workflow_name}` (missing the `{workflow_id}`
+/// segment) is not a valid business-id address: AC3 requires it be rejected
+/// with a literal `400`, not the structural `404` axum would otherwise return
+/// for a route that matches nothing. This handler always returns `400` with a
+/// helpful body pointing at the two-segment business-id form.
+///
+/// These guard routes are deliberately NOT registered in
+/// `management_api_routes()`, `docs/api-contract.json`, or `audit.rs`: they are
+/// not management operations, just an input-validation 400 — there is no DB
+/// access, no audit event, and nothing for the contract/classification
+/// registries to describe. The contract tests validate the const route lists,
+/// not the live router, so this omission is intentional and consistent.
+async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "workflow_id is required",
+            "detail": "address the business-id form as /workflows/by-id/{workflow_name}/{workflow_id}"
+        })),
+    )
+        .into_response()
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
@@ -3896,6 +3921,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // to keep the block contiguous and collision-free. Each delegates to the
         // exec-id handler after resolving (workflow_name, workflow_id). Admin
         // posture + audit classification mirror the exec-id counterparts exactly.
+        // AC3 guard: a name-only (3-segment) by-id path is missing the required
+        // {workflow_id} and must be rejected with a literal 400, not a
+        // route-not-found 404. Distinct trie depth from the 4-segment by-id
+        // routes below and the 2-segment /workflows/{id}, so no collision.
+        .route(
+            "/workflows/by-id/{workflow_name}",
+            get(by_id_missing_workflow_id).post(by_id_missing_workflow_id),
+        )
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}",
             get(get_workflow_by_id),

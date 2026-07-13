@@ -833,14 +833,16 @@ async fn resolves_to_newest_terminal_across_multiple_terminals() {
     assert_eq!(resp.body["execution"]["state"], json!("COMPLETED"));
 }
 
-// ── FIX 9(a): a bare workflow_id (name-only, 3-segment path) is not addressable
+// ── FIX 9(a): a bare workflow_id (name-only, 3-segment path) is rejected 400
 //
-// The by-id routes require BOTH segments; a 3-segment `/workflows/by-id/{name}`
-// path (no workflow_id) matches no route → 404. Locks in AC3 (a bare id can't
-// address a workflow).
+// The by-id routes require BOTH segments; a name-only `/workflows/by-id/{name}`
+// path (no workflow_id) is an input-validation error and is rejected with a
+// literal 400 (not a structural 404), matching AC3 verbatim ("a bare
+// workflow_id without a name is rejected 400"). Guard routes are registered for
+// both GET and POST so the rejection is uniform.
 
 #[tokio::test]
-async fn name_only_by_id_path_is_not_a_route() {
+async fn name_only_by_id_path_is_rejected_400() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool, true);
@@ -848,8 +850,25 @@ async fn name_only_by_id_path_is_not_a_route() {
     let resp = send(&app, get("/workflows/by-id/order_flow")).await;
     assert_eq!(
         resp.status,
-        StatusCode::NOT_FOUND,
-        "name-only by-id path must not match a route: {}",
+        StatusCode::BAD_REQUEST,
+        "name-only by-id GET must be rejected 400: {}",
         resp.body
     );
+    assert_eq!(resp.body["error"], json!("workflow_id is required"));
+    assert!(
+        resp.body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("/workflows/by-id/{workflow_name}/{workflow_id}")),
+        "detail must point at the two-segment business-id form: {}",
+        resp.body
+    );
+
+    let resp_post = send(&app, post_json("/workflows/by-id/order_flow", &json!({}))).await;
+    assert_eq!(
+        resp_post.status,
+        StatusCode::BAD_REQUEST,
+        "name-only by-id POST must be rejected 400: {}",
+        resp_post.body
+    );
+    assert_eq!(resp_post.body["error"], json!("workflow_id is required"));
 }
