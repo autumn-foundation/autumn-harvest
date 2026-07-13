@@ -327,13 +327,18 @@
     {
       "id": "harvest_schedule_missed_runs",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 schedule counters harvest.schedule.runs and harvest.schedule.skipped plus schedule management API.",
-      "default_threshold": "Page when a required schedule records any skipped run or has zero successful runs across two expected firing windows.",
+      "signal_source": "#696 server-side overdue gauge harvest.schedule.overdue (primary) plus ADR-0001/#138 schedule counters harvest.schedule.runs / harvest.schedule.skipped and the schedule management API. Per-schedule overdue/overdue_by_secs read fields name the wedged schedule and how late.",
+      "default_threshold": "Page when any active schedule reports overdue > 0 (it is past its own cadence grace), or records any skipped run. The overdue gauge is derived per schedule from its own next_run_at + cadence, so no per-schedule interval needs hand-encoding.",
       "severity": "page",
       "owner_persona": "workflow owner",
       "description": "A workflow or DAG schedule is not dispatching at its expected cadence.",
       "first_action": "harvest schedule list --output json",
       "dependencies": [
+        {
+          "ref": "#696",
+          "status": "shipped",
+          "surface": "METRIC_SCHEDULE_OVERDUE gauge + overdue/overdue_by_secs on GET /admin/schedules"
+        },
         {
           "ref": "#138",
           "status": "shipped",
@@ -347,8 +352,12 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Use bounded schedule kind and registered schedule name labels only.",
+        "notes": "Primary: the precise per-schedule overdue gauge (harvest_schedule_overdue, a gauge, no _total suffix) names the wedged schedule. Secondary: skipped counter for policy skips. Tertiary: absence-of-runs, kept only for total process death where nothing emits the overdue gauge (pair with an `up`/scrape-health signal). Use bounded schedule kind and registered schedule name labels only.",
         "expressions": [
+          {
+            "kind": "promql",
+            "expr": "max by (kind, name) (harvest_schedule_overdue) > 0"
+          },
           {
             "kind": "promql",
             "expr": "sum by (kind, name, reason) (increase(harvest_schedule_skipped_total[15m])) > 0"

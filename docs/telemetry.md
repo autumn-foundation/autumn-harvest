@@ -324,6 +324,7 @@ metric is emitted in the source code.
 | `harvest.worker.tuner_decisions` | Counter | `slot_tuner.rs` — `spawn_slot_tuner_loop`, once per control-loop tick, with the decision that actually took effect after band clamping (issue #548) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
+| `harvest.schedule.overdue` | Gauge | `scheduler.rs` — `sample_overdue_schedules`, emitted per schedule by the worker's overdue sampler (`spawn_schedule_overdue_sampler`, on the `poll_interval` cadence, per shard). `1` when an *active* schedule is past its own cadence grace (`now − next_run_at > cadence step + jitter + tick`), `0` otherwise. Runs on the worker, not the scheduler tick, so a wedged tick cannot suppress its own health signal (issue #696). Paused / auto-paused / manual / exhausted / at-capacity schedules read `0`; deleted schedules go stale (standard gauge property). |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `RetentionRuntime` tick, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type so per-type retention overrides are confirmable (issue #737). `sum(harvest.retention.deleted)` equals the aggregate **workflow-history** deletion count for the tick, excluding orphaned `harvest_completion_deliveries` reclaims (issue #921), which have no workflow to attribute. |
 | `harvest.retention.summary_deleted` | Counter | `retention.rs` — summaries deleted by the tiered-retention summary GC pass, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type. A distinct member of the retention metric family from `harvest.retention.deleted` (history rows), so the two tiers are observable independently (issue #752). |
 | `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
@@ -363,6 +364,7 @@ metric is emitted in the source code.
 | `harvest.worker.tuner_decisions` | `slot_type` (`workflow\|activity`), `decision` (`grow\|shrink\|hold`) |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
+| `harvest.schedule.overdue` | `kind` (`workflow\|dag`), `name` |
 | `harvest.retention.deleted` | `workflow` |
 | `harvest.retention.summary_deleted` | `workflow` |
 | `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |

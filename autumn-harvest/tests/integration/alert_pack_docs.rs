@@ -55,6 +55,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_dlq_entries",
     "harvest_schedule_runs_total",
     "harvest_schedule_skipped_total",
+    "harvest_schedule_overdue",
     "harvest_retention_deleted_total",
     "harvest_schedule_fire_attempts_total",
     "harvest_workflow_terminal_total",

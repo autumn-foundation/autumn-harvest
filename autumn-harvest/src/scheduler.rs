@@ -31,6 +31,11 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The scheduler tick interval, re-exported for the overdue-schedule predicate
+/// (issue #696) so read/sampler callers pass the identical "one tick" grace term
+/// the scheduler loop actually sleeps between ticks.
+pub const SCHEDULER_TICK_INTERVAL: Duration = DEFAULT_SCHEDULER_TICK_INTERVAL;
+
 /// Default upper bound on the number of timestamps a single backfill request may plan.
 ///
 /// Chosen to cover a 7-day hourly window (168 slots) with comfortable headroom.
@@ -3719,6 +3724,229 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
             .map(|duration| reference + duration),
         Some(Schedule::Manual) | None => None,
     }
+}
+
+// ── Overdue-schedule detection (issue #696) ──────────────────────────────────
+//
+// A read/observability slice over existing `harvest_schedules` columns: no new
+// `WorkflowEvent` variant, no migration, no change to how schedules fire. The
+// core is the pure `schedule_overdue` predicate (unit-tested without a DB); the
+// per-shard `sample_overdue_schedules` sampler emits the
+// `harvest.schedule.overdue` gauge (issue #696 AC4/AC5).
+
+/// Verdict of the overdue predicate (issue #696).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverdueVerdict {
+    /// Whether the schedule is overdue to fire relative to its own cadence.
+    pub overdue: bool,
+    /// How long past its scheduled fire the schedule is (`now − next_run_at`)
+    /// in whole seconds, or `None` when it is not overdue.
+    pub overdue_by_secs: Option<i64>,
+}
+
+impl OverdueVerdict {
+    const NOT_OVERDUE: Self = Self {
+        overdue: false,
+        overdue_by_secs: None,
+    };
+}
+
+/// The nominal cadence step at `anchor` (the slot that should have fired).
+///
+/// - `Interval` → the fixed interval.
+/// - `Cron`/`CronInTimezone` → the gap to the next occurrence strictly after
+///   `anchor` (so a DST-variable cron step reflects the actual upcoming step
+///   following the missed slot, not a fixed assumption).
+/// - `Manual`/`None`/unparseable → `None` (no cadence; never overdue).
+fn cadence_step(schedule: Option<&Schedule>, anchor: DateTime<Utc>) -> Option<chrono::Duration> {
+    if let Some(period) = interval_period(schedule) {
+        return Some(period);
+    }
+    match schedule {
+        Some(Schedule::Cron(_) | Schedule::CronInTimezone { .. }) => {
+            let next = next_run_after(schedule, anchor)?;
+            let step = next - anchor;
+            (step > chrono::Duration::zero()).then_some(step)
+        }
+        // Interval was handled above; Manual/None have no cadence.
+        _ => None,
+    }
+}
+
+/// Pure overdue predicate (issue #696, AC2). No database.
+///
+/// A schedule is **overdue** iff it is *active* AND `now − next_run_at > grace`,
+/// where `grace = cadence_step + jitter + tick_interval`. The cadence-step term
+/// gives a full extra cadence of slack (so the first missed fire is detected
+/// within ~one more cadence step), the jitter term absorbs jitter-deferred
+/// dispatch, and the tick term absorbs the scheduler's own poll latency — so a
+/// healthy schedule caught mid-tick, or deferred by jitter, is never flagged.
+///
+/// **`at_capacity` suppression (§2 false-positive guard).** The scheduler tick
+/// deliberately holds `next_run_at` at the past due slot while a schedule is at
+/// `max_active_runs` — `OverlapPolicy::Skip` under catchup retains the overdue
+/// slot so it fires once capacity opens, and the catchup dispatch loop defers
+/// remaining slots when it reaches the cap. In *every other* fire decision
+/// (Skip without catchup, all Buffer/Cancel/Terminate policies, and the normal
+/// dispatch path) `next_run_at` advances forward, and jitter deferral is bounded
+/// by the jitter grace term; end_at/max_runs deferral sets `exhausted_at`. So
+/// the *only* way `next_run_at` legitimately lags unboundedly without a wedge is
+/// `running >= max_active_runs`, which callers pass as `at_capacity` to suppress
+/// the flag (the schedule is deliberately deferring, not stalled). Backfill
+/// (#337) creates independent executions and never touches the live schedule's
+/// `next_run_at`, so it is not a source of false positives here.
+///
+/// AC3: intentionally-not-firing states (`is_paused`, `auto_paused_at` set
+/// (#360), `Schedule::Manual`, and `end_at`/`max_runs`-exhausted (#478/#543))
+/// are never overdue.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn schedule_overdue(
+    schedule: Option<&Schedule>,
+    next_run_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    jitter: Duration,
+    tick_interval: Duration,
+    is_paused: bool,
+    auto_paused_at: Option<DateTime<Utc>>,
+    exhausted_at: Option<DateTime<Utc>>,
+    at_capacity: bool,
+) -> OverdueVerdict {
+    // AC3 exclusions + the at-capacity §2 guard: never overdue.
+    if is_paused || auto_paused_at.is_some() || exhausted_at.is_some() || at_capacity {
+        return OverdueVerdict::NOT_OVERDUE;
+    }
+    // No pending fire (Manual, never-scheduled, exhausted-with-nulled-next).
+    let Some(next_run_at) = next_run_at else {
+        return OverdueVerdict::NOT_OVERDUE;
+    };
+    // No cadence (Manual/None/unparseable): nothing to be "overdue" against.
+    let Some(step) = cadence_step(schedule, next_run_at) else {
+        return OverdueVerdict::NOT_OVERDUE;
+    };
+    let jitter =
+        chrono::Duration::from_std(jitter).unwrap_or_else(|_| chrono::Duration::zero());
+    let tick =
+        chrono::Duration::from_std(tick_interval).unwrap_or_else(|_| chrono::Duration::zero());
+    let grace = step + jitter + tick;
+    let lag = now - next_run_at;
+    if lag > grace {
+        OverdueVerdict {
+            overdue: true,
+            overdue_by_secs: Some(lag.num_seconds()),
+        }
+    } else {
+        OverdueVerdict::NOT_OVERDUE
+    }
+}
+
+/// One schedule's overdue verdict, tagged with its bounded `kind` and `name`
+/// (issue #696). Returned by [`overdue_schedule_samples`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverdueSample {
+    /// `"workflow"` or `"dag"`.
+    pub kind: String,
+    /// The registered workflow or DAG name.
+    pub name: String,
+    /// Whether this schedule is overdue.
+    pub overdue: bool,
+    /// `now − next_run_at` in whole seconds when overdue, else `None`.
+    pub overdue_by_secs: Option<i64>,
+}
+
+/// Compute the overdue verdict for every schedule on one shard (issue #696).
+///
+/// Loads all schedule rows on `conn` plus a shard-local RUNNING/PAUSED
+/// execution count per workflow name (matching the tick's own `running` query,
+/// so the `at_capacity` suppression fires exactly when the tick would hold
+/// `next_run_at`), then runs the pure [`schedule_overdue`] predicate against
+/// `now`. ALL schedules are returned (including paused/exhausted, which resolve
+/// to not-overdue) so the sampler can keep the gauge fresh.
+pub async fn overdue_schedule_samples(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+) -> HarvestResult<Vec<OverdueSample>> {
+    use crate::schema::harvest_workflow_executions::dsl as ex;
+
+    let schedules: Vec<HarvestSchedule> = harvest_schedules::table
+        .select(HarvestSchedule::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    // Shard-local running count per workflow name (RUNNING/PAUSED), matching the
+    // tick's overlap/max_active_runs count. A DAG schedule's executions carry
+    // workflow_name == dag_name, so a single grouped query covers both kinds.
+    let running_rows: Vec<(String, i64)> = ex::harvest_workflow_executions
+        .filter(ex::state.eq_any(["RUNNING", "PAUSED"]))
+        .group_by(ex::workflow_name)
+        .select((ex::workflow_name, diesel::dsl::count_star()))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let running: HashMap<String, i64> = running_rows.into_iter().collect();
+
+    let samples = schedules
+        .into_iter()
+        .map(|s| {
+            let (kind, name) = if let Some(dag_name) = s.dag_name {
+                ("dag".to_string(), dag_name)
+            } else {
+                ("workflow".to_string(), s.workflow_name.unwrap_or_default())
+            };
+            let schedule = s.schedule_expr.as_deref().and_then(parse_schedule_from_expr);
+            let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
+            let at_capacity =
+                running.get(&name).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
+            let verdict = schedule_overdue(
+                schedule.as_ref(),
+                s.next_run_at,
+                now,
+                jitter,
+                SCHEDULER_TICK_INTERVAL,
+                s.is_paused,
+                s.auto_paused_at,
+                s.exhausted_at,
+                at_capacity,
+            );
+            OverdueSample {
+                kind,
+                name,
+                overdue: verdict.overdue,
+                overdue_by_secs: verdict.overdue_by_secs,
+            }
+        })
+        .collect();
+    Ok(samples)
+}
+
+/// Sample the overdue verdict for every schedule on one shard and emit the
+/// `harvest.schedule.overdue` gauge (issue #696). The per-shard inner function
+/// the worker's overdue sampler calls for each pool.
+///
+/// Verdicts are aggregated per `(kind, name)` within the shard (overdue if any
+/// same-named schedule is overdue) before emitting so a healthy same-named
+/// schedule cannot mask an overdue one via last-write-wins. Same-named
+/// schedules on *different* shards still aggregate via gauge last-write-wins
+/// across the worker's per-pool passes (names are effectively unique per
+/// schedule, so this is defensive).
+pub async fn sample_overdue_schedules(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) -> HarvestResult<()> {
+    let samples = overdue_schedule_samples(conn, now).await?;
+    // Aggregate per (kind, name): overdue if ANY same-key schedule is overdue.
+    let mut by_key: std::collections::BTreeMap<(String, String), bool> =
+        std::collections::BTreeMap::new();
+    for s in samples {
+        let entry = by_key.entry((s.kind, s.name)).or_insert(false);
+        *entry = *entry || s.overdue;
+    }
+    for ((kind, name), overdue) in by_key {
+        metrics.record_schedule_overdue(&kind, &name, overdue);
+    }
+    Ok(())
 }
 
 fn due_run_plan(

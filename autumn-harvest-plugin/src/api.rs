@@ -2604,6 +2604,18 @@ struct ScheduleEntry {
     /// endpoint without silently clearing the stored policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_policy: Option<autumn_harvest::RetryPolicy>,
+    /// Whether this *active* schedule is overdue to fire relative to its own
+    /// cadence (issue #696): `now − next_run_at > grace`, where `grace` = the
+    /// schedule's own cadence step + configured jitter + the scheduler tick
+    /// interval. Intentionally-not-firing schedules (`is_paused`,
+    /// `auto_paused_at`, `Schedule::Manual`, `end_at`/`max_runs`-exhausted) and
+    /// schedules deliberately deferring because they are at `max_active_runs`
+    /// are never `true`. See the `harvest.schedule.overdue` gauge for the
+    /// alertable fleet-wide signal.
+    overdue: bool,
+    /// How long past its scheduled fire this schedule is (`now − next_run_at`)
+    /// in whole seconds, or `null` when it is not overdue (issue #696).
+    overdue_by_secs: Option<i64>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -17260,6 +17272,8 @@ async fn list_schedules(
 
     // Best-effort: load the most recent backfill log row for each schedule.
     let recent_backfills = load_recent_backfills(&api_state, &schedule_ids).await;
+    // At-capacity suppression for the overdue field (issue #696 §2).
+    let running = load_running_counts_across_shards(&api_state).await;
 
     let entries: Vec<ScheduleEntry> = schedules
         .into_iter()
@@ -17268,7 +17282,13 @@ async fn list_schedules(
                 .get(&s.id)
                 .cloned()
                 .map(BackfillSummary::from);
-            schedule_entry_from_row(s, last_backfill)
+            let name = s
+                .dag_name
+                .as_deref()
+                .or(s.workflow_name.as_deref())
+                .unwrap_or("");
+            let at_capacity = schedule_at_capacity(&running, name, s.max_active_runs);
+            schedule_entry_from_row(s, last_backfill, at_capacity)
         })
         .collect();
     fanout_list_json("schedules", entries, status, &unavailable_shards)
@@ -17341,7 +17361,16 @@ async fn get_schedule(
         .remove(&s.id)
         .map(BackfillSummary::from);
 
-    Ok(Json(schedule_entry_from_row(s, last_backfill)))
+    // At-capacity suppression for the overdue field (issue #696 §2).
+    let running = load_running_counts_across_shards(&api_state).await;
+    let name = s
+        .dag_name
+        .as_deref()
+        .or(s.workflow_name.as_deref())
+        .unwrap_or("");
+    let at_capacity = schedule_at_capacity(&running, name, s.max_active_runs);
+
+    Ok(Json(schedule_entry_from_row(s, last_backfill, at_capacity)))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -17868,8 +17897,10 @@ async fn upsert_workflow_schedule_and_read_back(
         .map_err(database_error)
         .map_err(map_error)?;
     // Newly created/updated via the registration upsert; no backfill history
-    // is loaded here (mirrors the pre-existing behavior).
-    Ok(schedule_entry_from_row(row, None))
+    // is loaded here (mirrors the pre-existing behavior). A freshly created or
+    // re-registered schedule has a fresh `next_run_at` and so is never overdue,
+    // making the at-capacity input moot (issue #696).
+    Ok(schedule_entry_from_row(row, None, false))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -18136,7 +18167,25 @@ fn reanchor_schedule_timezone(existing: &Schedule, tz: &str) -> Schedule {
 fn schedule_entry_from_row(
     s: HarvestSchedule,
     last_backfill: Option<BackfillSummary>,
+    at_capacity: bool,
 ) -> ScheduleEntry {
+    // Overdue detection (issue #696): computed from the schedule's own
+    // `next_run_at` + cadence, never an externally-supplied interval. Rides the
+    // shared read fan-out, so it surfaces on both list and get automatically.
+    let overdue_verdict = autumn_harvest::scheduler::schedule_overdue(
+        s.schedule_expr
+            .as_deref()
+            .and_then(autumn_harvest::scheduler::parse_schedule_from_expr_pub)
+            .as_ref(),
+        s.next_run_at,
+        chrono::Utc::now(),
+        std::time::Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0)),
+        autumn_harvest::scheduler::SCHEDULER_TICK_INTERVAL,
+        s.is_paused,
+        s.auto_paused_at,
+        s.exhausted_at,
+        at_capacity,
+    );
     let (kind, name) = if let Some(ref dag_name) = s.dag_name {
         (ScheduleKind::Dag, dag_name.clone())
     } else if let Some(ref wf_name) = s.workflow_name {
@@ -18194,7 +18243,59 @@ fn schedule_entry_from_row(
             .retry_policy
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        overdue: overdue_verdict.overdue,
+        overdue_by_secs: overdue_verdict.overdue_by_secs,
     }
+}
+
+/// Load a cross-shard-summed running-count map (`workflow_name` → count of
+/// `RUNNING`/`PAUSED` executions) for the overdue read's at-capacity check
+/// (issue #696 §2). A schedule at/over `max_active_runs` deliberately defers
+/// (the tick holds `next_run_at` in the past), so it is never reported overdue.
+///
+/// Summed across shards rather than shard-local: this is a conservative
+/// over-suppression that guarantees no read false-positive. In single-shard
+/// deployments (the common case) it equals the shard-local count the gauge
+/// sampler and the tick use, so the read and the gauge agree exactly. A DAG
+/// schedule's executions carry `workflow_name == dag_name`, so one grouped
+/// query per shard covers both kinds. An unreachable shard is skipped (its
+/// running counts are simply absent from the map, which only ever reduces
+/// suppression — never a false negative on the wedge signal).
+async fn load_running_counts_across_shards(
+    api_state: &HarvestApiState,
+) -> std::collections::HashMap<String, i64> {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl as ex;
+    let mut totals: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let Ok(pool) = api_state.storage_pool() else {
+        return totals;
+    };
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let rows: Result<Vec<(String, i64)>, _> = ex::harvest_workflow_executions
+            .filter(ex::state.eq_any(["RUNNING", "PAUSED"]))
+            .group_by(ex::workflow_name)
+            .select((ex::workflow_name, diesel::dsl::count_star()))
+            .load(&mut conn)
+            .await;
+        if let Ok(rows) = rows {
+            for (name, count) in rows {
+                *totals.entry(name).or_insert(0) += count;
+            }
+        }
+    }
+    totals
+}
+
+/// True when `name` has >= `max_active_runs` executions running/paused (issue
+/// #696 §2). Absent from the map => 0 => never at capacity.
+fn schedule_at_capacity(
+    running: &std::collections::HashMap<String, i64>,
+    name: &str,
+    max_active_runs: i32,
+) -> bool {
+    running.get(name).copied().unwrap_or(0) >= i64::from(max_active_runs)
 }
 
 /// `PATCH /admin/schedules/{id}` — partial in-place update of an existing
@@ -18547,7 +18648,16 @@ async fn update_schedule_handler(
                 .await
                 .remove(&row.id)
                 .map(BackfillSummary::from);
-            Ok(Json(schedule_entry_from_row(*row, last_backfill)))
+            // A non-cadence patch preserves `next_run_at`, so the row may still
+            // be overdue; compute at-capacity so the field is accurate (#696).
+            let running = load_running_counts_across_shards(&api_state).await;
+            let name = row
+                .dag_name
+                .as_deref()
+                .or(row.workflow_name.as_deref())
+                .unwrap_or("");
+            let at_capacity = schedule_at_capacity(&running, name, row.max_active_runs);
+            Ok(Json(schedule_entry_from_row(*row, last_backfill, at_capacity)))
         }
         Ok(ScheduleUpdateOutcome::NotFound) => {
             schedule_update_audit_failed(

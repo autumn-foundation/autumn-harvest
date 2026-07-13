@@ -613,6 +613,32 @@ pub const METRIC_SCHEDULE_FIRE_ATTEMPTS: &str = "harvest.schedule.fire_attempts"
 /// window. Each auto-pause event means operator action is required to resume.
 pub const METRIC_SCHEDULE_AUTO_PAUSED: &str = "harvest.schedule.auto_paused";
 
+/// Gauge: per-schedule overdue flag (issue #696). `1` when an *active* schedule
+/// is overdue to fire relative to its own cadence (`now − next_run_at > grace`,
+/// where `grace = cadence step + jitter + scheduler tick interval`), `0`
+/// otherwise.
+///
+/// Labels:
+///   - `"kind"` — `"workflow"` or `"dag"` (bounded).
+///   - `"name"` — the registered workflow or DAG name (low-cardinality). Per
+///     ADR-0001 §7 the schedule/execution id is NEVER a label.
+///
+/// Emitted per schedule by a periodic background sampler
+/// (`scheduler::sample_overdue_schedules`, run per shard on the worker
+/// monitoring cadence, independent of the scheduler tick so a wedged tick does
+/// not suppress its own health signal). Intentionally-not-firing schedules
+/// (`is_paused`, `auto_paused_at`, `Schedule::Manual`, `end_at`/`max_runs`
+/// exhausted) and at-capacity schedules report `0`. The sampler re-emits every
+/// pass, including `0` for recovered/healthy schedules, so the gauge stays
+/// fresh; a *deleted* schedule's series goes stale (no registry to reset it,
+/// the standard gauge property). Two schedules that share a `name` aggregate on
+/// the gauge (overdue if either is overdue).
+///
+/// Alert on `max by (kind, name) (harvest_schedule_overdue) > 0` — a precise
+/// per-schedule threshold that names the wedged schedule, replacing the fragile
+/// absence-of-`harvest.schedule.runs` inference.
+pub const METRIC_SCHEDULE_OVERDUE: &str = "harvest.schedule.overdue";
+
 /// Gauge: count of *in-flight* (RUNNING/SUSPENDED) executions whose durable
 /// event history has grown past the configured soft
 /// `continue_as_new_threshold` (issue #493).
@@ -1837,6 +1863,19 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter [`METRIC_SCHEDULE_AUTO_PAUSED`].
     fn record_schedule_auto_paused(&self, schedule_name: &str) {
         let _ = schedule_name;
+    }
+
+    /// Per-schedule overdue-to-fire flag (issue #696).
+    ///
+    /// `kind` is `"workflow"` or `"dag"`; `name` is the schedule's workflow or
+    /// DAG name (low-cardinality). `overdue` is `true` when the schedule is
+    /// active and past its own cadence grace, `false` otherwise. A gauge, so
+    /// this must be re-emitted every sampler pass — including `false` for
+    /// healthy schedules — to keep the value fresh.
+    ///
+    /// Maps to the gauge [`METRIC_SCHEDULE_OVERDUE`] set to `1.0`/`0.0`.
+    fn record_schedule_overdue(&self, kind: &str, name: &str, overdue: bool) {
+        let _ = (kind, name, overdue);
     }
 
     /// A query handler invocation completed (issue #234).

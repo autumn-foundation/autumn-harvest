@@ -4406,7 +4406,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), and last_catchup_at (timestamp of most recent recovery tick). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), last_catchup_at (timestamp of most recent recovery tick), overdue (issue #696: true when an active schedule is past its own cadence grace = cadence step + jitter + scheduler tick; false for paused/auto-paused/manual/exhausted/at-capacity schedules), and overdue_by_secs (now - next_run_at in whole seconds when overdue, else null). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
       },
       "error_responses": [
         {
@@ -4450,7 +4450,9 @@
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
-          "last_catchup_at"
+          "last_catchup_at",
+          "overdue",
+          "overdue_by_secs"
         ]
       },
       "error_responses": [

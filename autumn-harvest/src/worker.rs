@@ -11632,6 +11632,65 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
+/// Spawn the overdue-schedule sampler (issue #696).
+///
+/// Emits the `harvest.schedule.overdue` gauge (`1`/`0` per schedule) so a
+/// stalled cron — the scheduler loop not ticking, `next_run_at` wedged in the
+/// past, an HA claim that never released — is detected within one cadence grace
+/// window instead of downstream. Runs on the worker (not the scheduler tick) so
+/// a wedged tick cannot suppress its own health signal; a total scheduler
+/// outage is still caught here as long as any worker is alive, and only a total
+/// process outage falls back to the absence-of-signal alert. Iterates every
+/// shard pool (`pools`) so a schedule wedged on one shard is surfaced while
+/// others are healthy (AC5). Skipped entirely when no metrics recorder is
+/// configured — the per-shard schedule/execution queries are not free.
+#[cfg(feature = "db")]
+fn spawn_schedule_overdue_sampler(
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let now = chrono::Utc::now();            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "schedule overdue sampler could not acquire DB connection"
+                        );
+                        continue;
+                    }
+                };
+                // Per-shard: a read failure only skips that shard's schedules
+                // (each schedule lives on one shard, so its gauge holds its last
+                // value rather than being zero-filled misleadingly).
+                if let Err(error) =
+                    crate::scheduler::sample_overdue_schedules(&mut conn, now, &*telemetry.metrics)
+                        .await
+                {
+                    tracing::debug!(error = %error, "schedule overdue sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 /// Spawn the worker slot-occupancy sampler (issue #531).
 ///
 /// Reads the two dispatch `Semaphore`s' `available_permits()` against the
@@ -12026,6 +12085,9 @@ struct WorkerMonitoringHandles {
     history_oversized_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
+    /// itself no-ops when metrics are disabled); `None` without `db`.
+    schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
@@ -12814,6 +12876,11 @@ impl Worker {
         {
             tracing::warn!(error = %error, "stranded-work sampler failed during shutdown");
         }
+        if let Some(handle) = monitors.schedule_overdue_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "schedule overdue sampler failed during shutdown");
+        }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "slot tuner loop failed during shutdown");
@@ -13086,7 +13153,7 @@ impl Worker {
             })
             .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(
-            sampler_pools,
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.registry.history_policy().continue_as_new_threshold(),
@@ -13255,6 +13322,22 @@ impl Worker {
         #[cfg(not(feature = "db"))]
         let stranded_work_sampler: Option<tokio::task::JoinHandle<()>> = None;
 
+        // Overdue-schedule gauge sampler (issue #696): emits
+        // `harvest.schedule.overdue` per schedule across every shard pool so a
+        // stalled cron is detected within one cadence grace window. Runs on the
+        // worker (not the scheduler tick) and no-ops internally when metrics are
+        // disabled. Uses `sampler_pools` so single-shard and multi-shard
+        // deployments both aggregate the full schedule set.
+        #[cfg(feature = "db")]
+        let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
+            sampler_pools.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        ));
+        #[cfg(not(feature = "db"))]
+        let schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>> = None;
+
         WorkerMonitoringHandles {
             queue_depth_sampler,
             concurrency_sampler,
@@ -13267,6 +13350,7 @@ impl Worker {
             history_oversized_sampler,
             worker_slot_sampler,
             stranded_work_sampler,
+            schedule_overdue_sampler,
             slot_tuners,
             workflow_slot_target,
             activity_slot_target,
@@ -13472,6 +13556,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "stranded-work sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.schedule_overdue_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "schedule overdue sampler failed during shutdown"
             );
         }
         for handle in monitors.slot_tuners {
