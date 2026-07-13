@@ -106,6 +106,7 @@ async fn history_snapshot_context_headers_round_trips() {
         context_headers: Some(headers.clone()),
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize snapshot");

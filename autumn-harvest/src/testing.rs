@@ -247,6 +247,7 @@ impl std::fmt::Display for ReplayReport {
 ///     context_headers: None,
 ///     execution_timeout: None,
 ///     deadline_at: None,
+///     parent_execution_id: None,
 /// };
 /// let json = serde_json::to_string(&snapshot).unwrap();
 /// // Store `json` as a fixture file.
@@ -291,6 +292,18 @@ pub struct HistorySnapshot {
     /// legacy snapshot) falls back to no live deadline (the nominal is used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The spawning parent's execution id (issue #698). `parent_execution_id` is
+    /// sourced from the `harvest_workflow_executions.parent_id` column and lives
+    /// in no `WorkflowEvent`, so a captured fixture cannot recover it from the
+    /// event log alone. When `Some`, both replay paths thread it into the
+    /// `WorkflowContext` (preferring it over the replayer's global
+    /// [`with_parent_execution_id`](WorkflowReplayer::with_parent_execution_id)),
+    /// so a child that branches command-affecting control flow on
+    /// `ctx.info().parent_execution_id` replays deterministically. `None` (the
+    /// field absent — a legacy snapshot, or a top-level run) falls back to the
+    /// replayer's global parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution_id: Option<ExecutionId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +339,16 @@ pub struct WorkflowReplayer {
     /// `continue_as_new`. `None` (the default) matches a workflow with no
     /// execution timeout.
     execution_timeout: Option<chrono::Duration>,
+    /// Effective spawning-parent execution id threaded into the replayed
+    /// `WorkflowContext` (issue #698). `parent_execution_id` lives in no
+    /// `WorkflowEvent`, so a pure-history replay cannot recover it from the fixture
+    /// alone; set it with
+    /// [`with_parent_execution_id`](Self::with_parent_execution_id) so a child
+    /// workflow that branches command-affecting control flow on
+    /// `ctx.info().parent_execution_id` replays deterministically in a CI test.
+    /// A [`HistorySnapshot`] that carries its own `parent_execution_id` overrides
+    /// this global. `None` (the default) models a top-level run.
+    parent_execution_id: Option<ExecutionId>,
 }
 
 impl Default for WorkflowReplayer {
@@ -346,6 +369,10 @@ struct SampledExecution {
     // row's own (pause/resume/redrive-shifted) deadline.
     execution_timeout: Option<chrono::Duration>,
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the sampled row's spawning-parent id (`parent_id` column),
+    // threaded into the canary replay so a parent-aware child does not
+    // false-report non-determinism.
+    parent_execution_id: Option<ExecutionId>,
 }
 
 impl WorkflowReplayer {
@@ -360,6 +387,7 @@ impl WorkflowReplayer {
             use_advancing_clock: false,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             execution_timeout: None,
+            parent_execution_id: None,
         }
     }
 
@@ -373,6 +401,25 @@ impl WorkflowReplayer {
     #[must_use]
     pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
         self.execution_timeout = Some(execution_timeout);
+        self
+    }
+
+    /// Set the spawning-parent execution id threaded into the replayed
+    /// `WorkflowContext` (issue #698).
+    ///
+    /// Required to replay a **child** workflow whose command-affecting control
+    /// flow branches on `ctx.info().parent_execution_id` /
+    /// `ctx.parent_execution_id()`: that id is sourced from the
+    /// `harvest_workflow_executions.parent_id` column and lives in no
+    /// `WorkflowEvent`, so a pure-history fixture cannot carry it. Without it a
+    /// parent-aware child replays with `parent = None` and false-reports
+    /// non-determinism against a history recorded under `parent = Some(P)`.
+    /// A [`HistorySnapshot`](HistorySnapshot::parent_execution_id) that carries
+    /// its own value overrides this global. `None` (the default) models a
+    /// top-level run.
+    #[must_use]
+    pub const fn with_parent_execution_id(mut self, parent: Option<ExecutionId>) -> Self {
+        self.parent_execution_id = parent;
         self
     }
 
@@ -543,20 +590,30 @@ impl WorkflowReplayer {
         // replayer's global timeout for a legacy snapshot that lacks it.
         let execution_timeout = snapshot.execution_timeout.or(self.execution_timeout);
         let deadline_at = snapshot.deadline_at;
-        self.replay_from_snapshot_effective(snapshot, execution_timeout, deadline_at)
-            .await
+        // Issue #698: prefer the snapshot's own parent id; fall back to the
+        // replayer's global (set via `with_parent_execution_id`).
+        let parent_execution_id = snapshot.parent_execution_id.or(self.parent_execution_id);
+        self.replay_from_snapshot_effective(
+            snapshot,
+            execution_timeout,
+            deadline_at,
+            parent_execution_id,
+        )
+        .await
     }
 
     /// Snapshot replay with an explicit per-execution `execution_timeout` /
-    /// live `deadline_at` (issue #772). The public
-    /// [`replay_from_snapshot`](Self::replay_from_snapshot) delegates here with
-    /// the global timeout and no live deadline; [`replay_from_db`](Self::replay_from_db)
-    /// passes the loaded execution row's own values.
+    /// live `deadline_at` (issue #772) / spawning-parent id (issue #698). The
+    /// public [`replay_from_snapshot`](Self::replay_from_snapshot) delegates here
+    /// with the global timeout, no live deadline, and the resolved parent;
+    /// [`replay_from_db`](Self::replay_from_db) passes the loaded execution row's
+    /// own values.
     async fn replay_from_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
         execution_timeout: Option<chrono::Duration>,
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        parent_execution_id: Option<ExecutionId>,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -605,6 +662,7 @@ impl WorkflowReplayer {
                 self.metrics.clone(),
                 execution_timeout,
                 deadline_at,
+                parent_execution_id,
             )
             .await
         } else {
@@ -618,6 +676,7 @@ impl WorkflowReplayer {
                 self.metrics.clone(),
                 execution_timeout,
                 deadline_at,
+                parent_execution_id,
             )
             .await
         };
@@ -634,17 +693,25 @@ impl WorkflowReplayer {
     pub async fn replay_canary_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
         let execution_timeout = snapshot.execution_timeout.or(self.execution_timeout);
         let deadline_at = snapshot.deadline_at;
-        self.replay_canary_snapshot_effective(snapshot, execution_timeout, deadline_at)
-            .await
+        // Issue #698: prefer the snapshot's own parent id; fall back to the global.
+        let parent_execution_id = snapshot.parent_execution_id.or(self.parent_execution_id);
+        self.replay_canary_snapshot_effective(
+            snapshot,
+            execution_timeout,
+            deadline_at,
+            parent_execution_id,
+        )
+        .await
     }
 
     /// Canary snapshot replay with an explicit per-execution `execution_timeout`
-    /// / live `deadline_at` (issue #772).
+    /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698).
     async fn replay_canary_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
         execution_timeout: Option<chrono::Duration>,
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        parent_execution_id: Option<ExecutionId>,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -678,6 +745,7 @@ impl WorkflowReplayer {
             self.metrics.clone(),
             execution_timeout,
             deadline_at,
+            parent_execution_id,
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -775,6 +843,9 @@ impl WorkflowReplayer {
                 self.execution_timeout,
                 // No per-row live deadline on the raw-events path (issue #772).
                 None,
+                // Issue #698: the replayer's global parent id (a raw-events
+                // fixture carries no snapshot to override it).
+                self.parent_execution_id,
             )
             .await
         } else {
@@ -788,6 +859,7 @@ impl WorkflowReplayer {
                 self.metrics.clone(),
                 self.execution_timeout,
                 None,
+                self.parent_execution_id,
             )
             .await
         };
@@ -903,9 +975,17 @@ impl WorkflowReplayer {
             context_headers: Some(meta.headers),
             execution_timeout: meta.execution_timeout,
             deadline_at: meta.deadline_at,
+            // Issue #698: the row's own spawning-parent id, so a parent-aware
+            // child replays deterministically from the store.
+            parent_execution_id: meta.parent_execution_id,
         };
         Ok(self
-            .replay_from_snapshot_effective(snapshot, meta.execution_timeout, meta.deadline_at)
+            .replay_from_snapshot_effective(
+                snapshot,
+                meta.execution_timeout,
+                meta.deadline_at,
+                meta.parent_execution_id,
+            )
             .await)
     }
 
@@ -938,7 +1018,7 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers, exec_timeout, deadline_at) in executions {
+            for (id, name, created, headers, exec_timeout, deadline_at, parent_id) in executions {
                 all_executions.push(SampledExecution {
                     shard_id,
                     execution_id: crate::types::ExecutionId::from_uuid(id),
@@ -947,6 +1027,9 @@ impl WorkflowReplayer {
                     context_headers: headers,
                     execution_timeout: exec_timeout,
                     deadline_at,
+                    // Issue #698: map the nullable `parent_id` column into the
+                    // shard-encoding-preserving `ExecutionId`.
+                    parent_execution_id: parent_id.map(crate::types::ExecutionId::from_uuid),
                 });
             }
         }
@@ -995,17 +1078,21 @@ impl WorkflowReplayer {
                                     context_headers: headers,
                                     execution_timeout: exec.execution_timeout,
                                     deadline_at: exec.deadline_at,
+                                    // Issue #698: the sampled row's own parent id.
+                                    parent_execution_id: exec.parent_execution_id,
                                 }
                             }; // `conn` is dropped here
 
-                            // Issue #772: thread the sampled execution row's own
-                            // `execution_timeout` / live `deadline_at` so the
-                            // deadline-aware CAN branch replays cleanly.
+                            // Issue #772 / #698: thread the sampled execution row's
+                            // own `execution_timeout` / live `deadline_at` / parent
+                            // id so the deadline-aware CAN branch and a parent-aware
+                            // child both replay cleanly.
                             let report = replayer_ref
                                 .replay_canary_snapshot_effective(
                                     snapshot,
                                     exec.execution_timeout,
                                     exec.deadline_at,
+                                    exec.parent_execution_id,
                                 )
                                 .await;
                             Ok::<_, crate::error::HarvestError>(report)
@@ -1132,11 +1219,12 @@ async fn query_running_executions(
         Option<serde_json::Value>,
         Option<chrono::Duration>,
         Option<chrono::DateTime<chrono::Utc>>,
+        Option<uuid::Uuid>,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
         context_headers, created_at, deadline_at, execution_timeout, harvest_workflow_executions,
-        id, queue_name, state, workflow_name,
+        id, parent_id, queue_name, state, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -1161,6 +1249,8 @@ async fn query_running_executions(
             // Issue #772: thread the per-execution deadline-aware CAN inputs.
             execution_timeout,
             deadline_at,
+            // Issue #698: thread the spawning-parent id.
+            parent_id,
         ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
@@ -1171,6 +1261,7 @@ async fn query_running_executions(
             Option<serde_json::Value>,
             Option<chrono::Duration>,
             Option<chrono::DateTime<chrono::Utc>>,
+            Option<uuid::Uuid>,
         )>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1283,9 +1374,16 @@ struct DbReplayMeta {
     headers: HashMap<String, String>,
     execution_timeout: Option<chrono::Duration>,
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the row's spawning-parent id (`parent_id` column), so
+    // `replay_from_db` replays a parent-aware child deterministically.
+    parent_execution_id: Option<ExecutionId>,
 }
 
 #[cfg(feature = "db")]
+// The Diesel `.first()` binding annotation is a flat 5-tuple of column types
+// (issue #698 added the nullable `parent_id`); it is a one-shot select, not a
+// reused shape, so a `type` alias would obscure rather than clarify.
+#[allow(clippy::type_complexity)]
 async fn load_workflow_name_and_headers(
     conn: &mut diesel_async::AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1294,18 +1392,19 @@ async fn load_workflow_name_and_headers(
     use crate::schema::harvest_workflow_executions::dsl::{
         context_headers as context_headers_col, deadline_at as deadline_at_col,
         execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
-        workflow_name,
+        parent_id as parent_id_col, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers, execution_timeout, deadline_at): (
+    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid): (
         String,
         Option<serde_json::Value>,
         Option<chrono::Duration>,
         Option<chrono::DateTime<chrono::Utc>>,
+        Option<uuid::Uuid>,
     ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
         .select((
@@ -1313,6 +1412,7 @@ async fn load_workflow_name_and_headers(
             context_headers_col,
             execution_timeout_col,
             deadline_at_col,
+            parent_id_col,
         ))
         .first(conn)
         .await
@@ -1337,6 +1437,8 @@ async fn load_workflow_name_and_headers(
         headers,
         execution_timeout,
         deadline_at,
+        // Issue #698: map the nullable `parent_id` into an `ExecutionId`.
+        parent_execution_id: parent_uuid.map(ExecutionId::from_uuid),
     })
 }
 
@@ -2263,6 +2365,9 @@ async fn replay_fixture_file(
         use_advancing_clock: false,
         metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         execution_timeout: None,
+        // Issue #698: the directory-fixture path relies on the snapshot's own
+        // `parent_execution_id` (absent for a legacy fixture); no global override.
+        parent_execution_id: None,
     };
 
     let replay_result =
@@ -2374,6 +2479,14 @@ pub struct TestRunOutcome {
     /// as a FALSE non-determinism. `None` (the default / no-timeout run) leaves
     /// the replayer's deadline branch off, matching the live run.
     execution_timeout: Option<chrono::Duration>,
+    /// The spawning-parent execution id carried from the `WorkflowTestEnv` that
+    /// produced this outcome (issue #698). `replay_check` re-applies it so a
+    /// **child** workflow whose command-affecting control flow branches on
+    /// `ctx.info().parent_execution_id` self-checks deterministically — otherwise
+    /// the replayer sees `parent = None` and the child's parent-taken branch is
+    /// reported as a FALSE non-determinism. `None` (the default) models a
+    /// top-level run.
+    parent_execution_id: Option<ExecutionId>,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -2515,6 +2628,10 @@ impl TestRunOutcome {
             // fallback for older callers.
             execution_timeout: self.execution_timeout,
             deadline_at: None,
+            // Issue #698: carry the spawning-parent id onto the snapshot so a
+            // parent-aware child self-checks deterministically (matches the live
+            // run, which received it via span_meta).
+            parent_execution_id: self.parent_execution_id,
         };
         let mut replayer = WorkflowReplayer::new()
             .with_existing_state(self.state.clone())
@@ -3017,6 +3134,8 @@ impl WorkflowTestEnv {
                                 state: self.state.clone(),
                                 start_time,
                                 execution_timeout: self.execution_timeout,
+                                // Issue #698: carry the spawning-parent id for replay_check.
+                                parent_execution_id: self.parent_execution_id,
                             };
                         }
                     };
@@ -3031,6 +3150,8 @@ impl WorkflowTestEnv {
                             state: self.state.clone(),
                             start_time,
                             execution_timeout: self.execution_timeout,
+                            // Issue #698: carry the spawning-parent id for replay_check.
+                            parent_execution_id: self.parent_execution_id,
                         };
                     }
                 }
@@ -3056,6 +3177,8 @@ impl WorkflowTestEnv {
             state: self.state.clone(),
             start_time,
             execution_timeout: self.execution_timeout,
+            // Issue #698: carry the spawning-parent id for replay_check.
+            parent_execution_id: self.parent_execution_id,
         }
     }
 
@@ -3110,6 +3233,8 @@ impl WorkflowTestEnv {
             state: self.state.clone(),
             start_time,
             execution_timeout: self.execution_timeout,
+            // Issue #698: carry the spawning-parent id for replay_check.
+            parent_execution_id: self.parent_execution_id,
         }
     }
 

@@ -1306,6 +1306,7 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
     }
 }
 
@@ -2139,6 +2140,7 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
         context_headers: None,
         execution_timeout: Some(chrono::Duration::seconds(30)),
         deadline_at: None,
+        parent_execution_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     // The exported JSON must carry the deadline budget at the top level so it
@@ -2179,6 +2181,7 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
         // both fields from the JSON, producing a byte-for-byte pre-#772 export.
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     assert!(
@@ -3465,6 +3468,7 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3492,6 +3496,7 @@ async fn replay_from_json_detects_non_determinism() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3684,6 +3689,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -4866,6 +4872,7 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -4898,6 +4905,7 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -4923,6 +4931,7 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -4950,6 +4959,7 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -4994,6 +5004,7 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -5058,6 +5069,7 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -5135,6 +5147,7 @@ async fn replay_succeeds_for_recorded_side_effect() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -5181,6 +5194,7 @@ async fn replay_detects_side_effect_drift() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         })
         .await;
 
@@ -6887,4 +6901,109 @@ async fn live_loop_hitting_increment_twice_emits_exactly_two() {
         2,
         "two legitimate live increments must emit exactly twice — no more (replay double-count), no fewer (over-suppression)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (issue #698 FIX 1) parent_execution_id must be threaded into the replay /
+//   canary tooling. `parent_execution_id` lives in NO WorkflowEvent (it is
+//   sourced only from the harvest_workflow_executions.parent_id column), so a
+//   pure-history replay builds the child's context with parent = None UNLESS the
+//   replayer is told the parent. A child that branches its COMMAND stream on
+//   ctx.info().parent_execution_id (a blessed AC2 "parent-aware child logic"
+//   use) then false-reports non-determinism in the deploy canary / its own
+//   WorkflowReplayer CI test. WorkflowReplayer::with_parent_execution_id closes
+//   that gap for the JSON-fixture path.
+// ---------------------------------------------------------------------------
+
+/// A child workflow whose COMMAND stream depends on its spawning parent:
+/// schedules `child_of_parent` when it HAS a parent, `orphan_step` when it does
+/// not. The scheduled activity NAME is the observable divergence.
+fn parent_branching_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let step = if ctx.info().parent_execution_id.is_some() {
+            "child_of_parent"
+        } else {
+            "orphan_step"
+        };
+        let out = ctx
+            .execute_activity_raw(step, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// History recorded by a run of `parent_branching_child` that HAD a parent
+/// (`P`): it scheduled and completed the `child_of_parent` activity.
+fn parent_taken_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let act_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "child_of_parent".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!("ok"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("ok"),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// (a) With the spawning parent supplied via `with_parent_execution_id`, the
+/// child's parent-taken branch matches the recorded history → `ReplaySucceeded`.
+#[tokio::test]
+async fn parent_aware_child_replays_clean_when_parent_is_threaded() {
+    let parent = ExecutionId::new();
+    let (exec_id, events) = parent_taken_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        .with_parent_execution_id(Some(parent))
+        .replay_from_snapshot(make_snapshot("parent_branching_child", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a parent-aware child must replay clean when the parent is threaded, got: {report}"
+    );
+}
+
+/// (b) WITHOUT the parent, the child takes its `orphan_step` branch, diverging
+/// from the recorded `child_of_parent` schedule → `NonDeterminismDetected`. This
+/// proves the threading is load-bearing: dropping `with_parent_execution_id`
+/// would surface exactly this false non-determinism in the canary / CI.
+#[tokio::test]
+async fn parent_aware_child_diverges_when_parent_is_not_threaded() {
+    let (exec_id, events) = parent_taken_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        // Deliberately DO NOT call with_parent_execution_id — parent = None.
+        .replay_from_snapshot(make_snapshot("parent_branching_child", exec_id, events))
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "without a threaded parent the child must diverge (orphan_step vs recorded \
+             child_of_parent); got: {other:?}\nreport: {report}"
+        ),
+    }
 }

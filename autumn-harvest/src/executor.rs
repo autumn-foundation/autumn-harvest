@@ -538,11 +538,19 @@ pub async fn run_workflow_strict(
     // reasons about the same deadline the timeout scanner enforces. `None` falls
     // back to `start + execution_timeout` (the file/JSON replay path).
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the spawning parent's execution id. `parent_execution_id` lives
+    // in no `WorkflowEvent`, so a pure-history replay cannot recover it — the
+    // replayer (`WorkflowReplayer::with_parent_execution_id`) threads it here so a
+    // child that branches command-affecting control flow on
+    // `ctx.info().parent_execution_id` replays deterministically. `None` models a
+    // top-level run.
+    parent_execution_id: Option<ExecutionId>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
+        .with_parent_execution_id(parent_execution_id)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -566,12 +574,15 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // Issue #772: per-execution live effective `deadline_at` (see
     // [`run_workflow_strict`]).
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the spawning parent's execution id (see [`run_workflow_strict`]).
+    parent_execution_id: Option<ExecutionId>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_advancing_timer_clock()
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
+        .with_parent_execution_id(parent_execution_id)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -769,11 +780,17 @@ pub(crate) async fn run_workflow_canary(
     // Issue #772: per-execution live effective `deadline_at` (see
     // [`run_workflow_strict`]).
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the spawning parent's execution id (see [`run_workflow_strict`]).
+    // `run_canary` sources it from the sampled `harvest_workflow_executions.parent_id`
+    // column so a parent-aware child does not false-report non-determinism in the
+    // deploy replay canary.
+    parent_execution_id: Option<ExecutionId>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
+        .with_parent_execution_id(parent_execution_id)
         .with_metrics(metrics);
 
     let span = tracing::info_span!(

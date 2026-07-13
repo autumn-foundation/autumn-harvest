@@ -19615,9 +19615,16 @@ mod tests {
 
     /// AC3 (`start_time` trap, advancing clock): advancing the virtual timer clock
     /// (`ctx.now()` moves) must NOT change `info().start_time` / `start_time()`.
+    ///
+    /// The clock is advanced GENUINELY by replaying a recorded `TimerFired` through
+    /// `ctx.timer(...)` (context.rs `advance_timer_clock` on a `Matched` fire) —
+    /// merely `start_timer(...)` does NOT move the clock, which made an earlier
+    /// version of this test vacuous (the mutation `info.start_time = self.now()`
+    /// would have survived because `now() == start_time()`). The guard assertion
+    /// below establishes the divergence before checking `start_time` is immune.
     #[cfg(any(test, feature = "testing"))]
-    #[test]
-    fn info_start_time_is_immune_to_advancing_virtual_clock() {
+    #[tokio::test]
+    async fn info_start_time_is_immune_to_advancing_virtual_clock() {
         let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -19634,10 +19641,18 @@ mod tests {
         ];
         let ctx =
             WorkflowContext::for_replay(ExecutionId::new(), events).with_advancing_timer_clock();
-        // Drive the timer so the virtual clock advances.
-        let handle = ctx.start_timer("t", 3600);
-        drop(handle);
-        // now() may have moved, but start_time() must stay frozen.
+        // Replay the recorded 1-hour timer fire so the virtual clock genuinely
+        // advances by its duration.
+        ctx.timer("t", 3600)
+            .await
+            .expect("recorded timer must replay-match");
+        // Guard: if the clock did not advance, this test proves nothing (the
+        // mutation `info().start_time = self.now()` would survive).
+        assert!(
+            ctx.now() > frozen,
+            "guard: virtual clock must have advanced — otherwise this test is vacuous"
+        );
+        // now() moved, but start_time() must stay frozen at the WorkflowStarted ts.
         assert_eq!(ctx.start_time(), frozen, "start_time must stay frozen");
         assert_eq!(ctx.info().start_time, frozen);
     }
@@ -19713,6 +19728,17 @@ mod tests {
             },
         ];
 
+        // AC (nit): a freshly-loaded replay context with unconsumed recorded
+        // history is replaying — assert the `true` case (every other info() test
+        // only ever asserts `is_replaying == false`), which `info()` reports
+        // without consuming the history.
+        assert!(
+            WorkflowContext::for_replay(exec_id, fixture.clone())
+                .info()
+                .is_replaying,
+            "a fresh replay context with unconsumed history must report is_replaying = true"
+        );
+
         let build = || {
             WorkflowContext::for_replay(exec_id, fixture.clone())
                 .with_workflow_name("checkout")
@@ -19730,6 +19756,14 @@ mod tests {
         assert_eq!(baseline.workflow_id, "cart-42");
         assert_eq!(baseline.workflow_type, "checkout");
         assert_eq!(baseline.start_time, frozen);
+        // The fixture has exactly 3 events (WorkflowStarted + TimerStarted +
+        // TimerFired) — assert the loaded size so a constant-0 `history_event_count`
+        // regression cannot survive (every other asserting test uses a 0-event
+        // context).
+        assert_eq!(
+            baseline.history_event_count, 3,
+            "history_event_count must reflect the loaded snapshot size"
+        );
         assert_eq!(baseline.parent_execution_id, Some(parent));
     }
 

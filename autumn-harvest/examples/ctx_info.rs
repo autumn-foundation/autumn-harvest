@@ -71,7 +71,12 @@ async fn place_order(ctx: &WorkflowContext, order: serde_json::Value) -> Result<
     let receipt = ctx
         .execute_activity_raw(
             "charge_payment",
-            serde_json::json!({ "order": order, "idempotency_key": charge_key }),
+            serde_json::json!({
+                "order": order,
+                "idempotency_key": charge_key,
+                // Record the spawning parent (if any) for downstream correlation.
+                "parent": info.parent_execution_id.map(|p| p.to_string()),
+            }),
             "default",
         )
         .await
@@ -165,15 +170,67 @@ mod tests {
     }
 
     /// A run configured with a spawning parent surfaces it via
-    /// `ctx.info().parent_execution_id`; a top-level run reports none.
+    /// `ctx.info().parent_execution_id`; the workflow threads it into the
+    /// activity input for correlation, and it replays deterministically (the
+    /// `WorkflowTestEnv::with_parent_execution_id` value is carried through
+    /// `replay_check`).
     #[tokio::test]
     async fn parent_execution_id_is_visible_when_spawned_as_a_child() {
         let parent = ExecutionId::new();
+        let seen_parent: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = seen_parent.clone();
+
         let outcome = WorkflowTestEnv::new()
             .with_parent_execution_id(Some(parent))
-            .mock_activity("charge_payment", |_| Ok(json!({ "receipt": "rcpt_123" })))
+            .mock_activity("charge_payment", move |input| {
+                *seen_clone.lock().unwrap() = input
+                    .get("parent")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                Ok(json!({ "receipt": "rcpt_123" }))
+            })
+            .run(place_order_info().handler, json!({ "sku": "abc" }))
+            .await;
+        assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+        // The spawning parent is surfaced via ctx.info().parent_execution_id and
+        // threaded into the activity input — exactly the configured id.
+        assert_eq!(
+            seen_parent.lock().unwrap().clone(),
+            Some(parent.to_string()),
+            "child run must observe its spawning parent's execution id"
+        );
+
+        // And a run of the same workflow with the parent threaded replays clean.
+        let report = outcome.replay_check(place_order_info().handler).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "parent-aware run must replay deterministically:\n{report}"
+        );
+    }
+
+    /// A top-level run reports no parent (`None`).
+    #[tokio::test]
+    async fn top_level_run_reports_no_parent() {
+        let seen_parent: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = seen_parent.clone();
+
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("charge_payment", move |input| {
+                *seen_clone.lock().unwrap() = input.get("parent").cloned();
+                Ok(json!({ "receipt": "rcpt_123" }))
+            })
             .run(place_order_info().handler, json!({ "sku": "abc" }))
             .await;
         assert!(outcome.result.is_ok());
+
+        // No parent configured → the correlation field is JSON null.
+        assert_eq!(
+            seen_parent.lock().unwrap().clone(),
+            Some(serde_json::Value::Null),
+            "a top-level run must report no parent"
+        );
     }
 }
