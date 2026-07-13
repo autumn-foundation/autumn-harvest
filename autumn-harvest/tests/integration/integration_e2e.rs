@@ -1692,7 +1692,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         origin: None,
         completion_callbacks: None,
     };
-    let started = start_or_load_workflow_execution(&mut conn, request)
+    let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
         .expect("start should succeed");
     assert!(started.created, "start should create a fresh execution");
@@ -1889,7 +1889,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         origin: None,
         completion_callbacks: None,
     };
-    let started = start_or_load_workflow_execution(&mut conn, request)
+    let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
         .expect("start should succeed");
     assert!(started.created, "start should create a fresh execution");
