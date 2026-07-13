@@ -25,16 +25,17 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME;
 use autumn_harvest::context::{WorkflowContext, WorkflowHistoryPolicy, empty_shared_state};
 use autumn_harvest::erase;
 use autumn_harvest::error::HarvestError;
-use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::executor::{
     QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay,
     history_reached_terminal_seal,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 
 // ── Test workflow handler ─────────────────────────────────────────────────
@@ -666,5 +667,193 @@ fn signal_handler_completed_run_serves_not_gone() {
             .expect("cancelled query must be registered"),
         json!(true),
         "the push handler fired during the flush, so the query reads the mutated state"
+    );
+}
+
+// ── Issue #772 (round 6): deadline-aware continue-as-new × query replay ──────
+//
+// A workflow with an `execution_timeout` that calls `should_continue_as_new()`
+// records a reserved `SideEffectRecorded { kind: Now, name:
+// "__harvest_deadline_probe" }` sentinel on the live frontier (the deadline
+// branch's tolerant clock read, #772). A query replay context that does NOT
+// thread the execution's `execution_timeout`/`deadline_at` returns from the
+// deadline guard *before* the tolerant clock read, so the recorded probe is left
+// UNCONSUMED at the cursor — the next replayed command (or the terminal-query
+// drift check) then treats an otherwise valid history as divergent. These pure
+// tests pin the mechanism the plugin's `hydrate_ctx_for_query` and the
+// in-process `execute_query_in_process` path both depend on: threading the
+// budget makes the probe replay cleanly.
+
+/// Registers a `progress` query, performs the deadline-aware checkpoint check
+/// (recording/consuming the `__harvest_deadline_probe` when the run has an
+/// `execution_timeout`), then processes each item via an activity. Never
+/// actually continues-as-new in these fixtures (the deadline is far in the
+/// future and history is tiny, so `should_continue_as_new()` returns `false`).
+fn deadline_probe_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let processed = Arc::new(Mutex::new(0u64));
+        let state = processed.clone();
+        ctx.register_query_handler::<Value, u64, _>("progress", move |_req: &Value| {
+            Ok(*state.lock().expect("counter lock poisoned"))
+        });
+
+        // Deadline-aware checkpoint: reads (and, when threaded, consumes) the
+        // reserved deadline-probe side-effect. Must not trip in these fixtures.
+        if ctx.should_continue_as_new() {
+            return Err("fixture must not trip continue-as-new".to_string());
+        }
+
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            ctx.execute_activity_raw("process_item", item.clone(), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            *processed.lock().expect("counter lock poisoned") += 1;
+        }
+        Ok(json!({ "processed": *processed.lock().expect("counter lock poisoned") }))
+    })
+}
+
+/// A start time far enough in the past that a 24h budget is nowhere near
+/// consumed, so `should_continue_as_new()`'s deadline branch never trips.
+const fn probe_t0() -> chrono::DateTime<Utc> {
+    let Some(t0) = chrono::DateTime::from_timestamp_millis(1_700_000_000_000) else {
+        panic!("valid probe start instant")
+    };
+    t0
+}
+
+/// `WorkflowStarted` + the reserved deadline probe + one scheduled/completed
+/// pair per item + `WorkflowCompleted` — a terminal history whose replay MUST
+/// consume the probe (via a budget-threaded context) to reach `Poll::Ready`
+/// cleanly. Returns the timeout/deadline the run was recorded with so the caller
+/// can thread them exactly as `hydrate_ctx_for_query` does from the row.
+fn deadline_probe_history(
+    items: &[&str],
+) -> (
+    ExecutionId,
+    Value,
+    Vec<WorkflowEvent>,
+    ChronoDuration,
+    chrono::DateTime<Utc>,
+) {
+    let exec_id = ExecutionId::new();
+    let t0 = probe_t0();
+    let budget = ChronoDuration::hours(24);
+    let deadline = t0 + budget;
+    let recorded_now = t0 + ChronoDuration::seconds(1);
+    let input = json!({ "items": items });
+    let mut events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Now,
+            name: Some(DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: json!(recorded_now.timestamp_millis()),
+        },
+    ];
+    for item in items {
+        let id = ActivityExecId::new();
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "process_item".into(),
+            input: json!(item),
+            queue: "default".into(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: Value::Null,
+        });
+    }
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    });
+    (exec_id, input, events, budget, deadline)
+}
+
+/// Build a replay context that threads the execution row's
+/// `execution_timeout`/`deadline_at` exactly as the fixed query hydration paths
+/// (`hydrate_ctx_for_query`, `execute_query_in_process`) do (#772 round 6).
+fn build_ctx_with_deadline(
+    exec_id: ExecutionId,
+    events: Vec<WorkflowEvent>,
+    execution_timeout: Option<ChronoDuration>,
+    deadline_at: Option<chrono::DateTime<Utc>>,
+) -> WorkflowContext {
+    WorkflowContext::for_replay_with_state_and_history_policy(
+        exec_id,
+        events,
+        empty_shared_state(),
+        WorkflowHistoryPolicy::default(),
+    )
+    .with_execution_timeout(execution_timeout)
+    .with_deadline(deadline_at)
+}
+
+#[test]
+fn deadline_probe_history_replays_and_serves_when_budget_is_threaded() {
+    // GREEN: a context that threads the execution_timeout/deadline_at (the fix)
+    // consumes the recorded __harvest_deadline_probe, drives to Poll::Ready with
+    // no leftover unconsumed history, and serves the reconstructed count.
+    let (exec_id, input, events, budget, deadline) = deadline_probe_history(&["a", "b", "c"]);
+    let sealed = history_reached_terminal_seal(&events);
+    assert!(sealed, "a WorkflowCompleted history is sealed");
+
+    let ctx = build_ctx_with_deadline(exec_id, events, Some(budget), Some(deadline));
+    let outcome = drive_query_replay(&ctx, deadline_probe_workflow, input, QUERY_BUDGET);
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::ReachedTerminal,
+        "with the budget threaded, the deadline probe is consumed and the drive completes"
+    );
+
+    let has_unconsumed = ctx.history_has_unconsumed_events();
+    assert!(
+        !has_unconsumed,
+        "the probe was consumed, so no genuine non-lifecycle history remains unconsumed"
+    );
+    assert_eq!(
+        classify_terminal_query(outcome, sealed, has_unconsumed),
+        TerminalQueryDecision::Serve,
+        "a budget-threaded terminal query with a deadline probe must Serve (200), not 410"
+    );
+    assert_eq!(
+        ctx.execute_query("progress")
+            .expect("progress must be registered"),
+        json!(3),
+        "the query reports the fully reconstructed count across the probe"
+    );
+}
+
+#[test]
+fn deadline_probe_history_diverges_when_budget_is_not_threaded() {
+    // RED (pre-fix behavior): a context that does NOT thread the budget — exactly
+    // what the query hydration paths did before #772 round 6 — leaves the recorded
+    // deadline probe UNCONSUMED, so the terminal-query drift check sees leftover
+    // non-lifecycle history and classifies the otherwise-valid history as 410.
+    // This pins WHY threading is required at the hydration sites.
+    let (exec_id, input, events, _budget, _deadline) = deadline_probe_history(&["a", "b", "c"]);
+    let sealed = history_reached_terminal_seal(&events);
+
+    let ctx = build_ctx(exec_id, events); // no execution_timeout / deadline_at
+    let outcome = drive_query_replay(&ctx, deadline_probe_workflow, input, QUERY_BUDGET);
+    let has_unconsumed = ctx.history_has_unconsumed_events();
+    assert_ne!(
+        classify_terminal_query(outcome, sealed, has_unconsumed),
+        TerminalQueryDecision::Serve,
+        "without the budget threaded, the unconsumed deadline probe must NOT Serve — \
+         this is the divergence the fix eliminates"
     );
 }

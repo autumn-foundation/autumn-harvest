@@ -301,6 +301,105 @@ fn sleep_until_workflow<'a>(
     })
 }
 
+/// Deadline-aware continue-as-new (issue #772): at the top of the run, check
+/// `should_continue_as_new()`; when it trips (event count OR the deadline
+/// fraction), fork a fresh run via `continue_as_new`. Otherwise do a unit of
+/// "work" and complete. Registered with a per-run `execution_timeout` on the
+/// replayer so the deadline branch is exercised.
+fn deadline_can_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if ctx.should_continue_as_new() {
+            let prev = input["cycle"].as_i64().unwrap_or(0);
+            ctx.continue_as_new(serde_json::json!({ "cycle": prev + 1 }))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::json!("done"))
+    })
+}
+
+/// Deadline-aware decision probe (issue #772) whose `should_continue_as_new()`
+/// decision is made **observable through replay determinism**: the trip branch
+/// schedules the `checkpoint_now` activity, the no-trip branch schedules
+/// `keep_working`. Because the recorded history fixes which activity was
+/// scheduled, a *wrong* decision (a broken fraction comparison) schedules the
+/// other activity and diverges — so the 1000× bar actually falsifies a broken
+/// comparison rather than passing regardless of the decision.
+fn deadline_branch_probe_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = if ctx.should_continue_as_new() {
+            "checkpoint_now"
+        } else {
+            "keep_working"
+        };
+        ctx.execute_activity_raw(activity, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Long-lived entity shape (issue #772 Finding 1): `should_continue_as_new()` at
+/// the top, then a durable timer + complete. Used to prove a pre-#772 history
+/// (recorded with NO `SideEffectRecorded{Now}` at the check site) replays
+/// cleanly under the new deadline-aware binary instead of nd-blocking.
+fn should_can_then_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if ctx.should_continue_as_new() {
+            let prev = input["cycle"].as_i64().unwrap_or(0);
+            ctx.continue_as_new(serde_json::json!({ "cycle": prev + 1 }))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(Value::Null);
+        }
+        ctx.timer("renewal", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("done"))
+    })
+}
+
+/// Migration-path shape (issue #772, deadline-probe naming fix): the deadline
+/// check sits immediately before a **user** `ctx.system_now()` call, then a
+/// durable timer. In a pre-#772 history there is NO recorded deadline-probe
+/// `Now` at the check site — but there IS the user's own `system_now()` Now at
+/// the cursor. The deadline probe must NOT consume that user `Now`; it belongs
+/// to `ctx.system_now()`. Before the naming fix, the tolerant matcher treated
+/// any `SideEffectRecorded{Now, name: None}` at the cursor as its own read,
+/// stole the user's `Now`, and the subsequent `ctx.system_now()` then replayed
+/// against the following `TimerStarted` and reported false non-determinism.
+fn should_can_then_user_now_then_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if ctx.should_continue_as_new() {
+            let prev = input["cycle"].as_i64().unwrap_or(0);
+            ctx.continue_as_new(serde_json::json!({ "cycle": prev + 1 }))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(Value::Null);
+        }
+        // A genuine author-side `system_now()` immediately after the deadline
+        // check. Its recorded `Now` must be consumed HERE, not by the probe.
+        let _captured = ctx.system_now();
+        ctx.timer("renewal", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("done"))
+    })
+}
+
 /// Cancellable durable timer (issue #768): arm, then await the outcome.
 fn cancellable_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1076,6 +1175,19 @@ fn build_replayer() -> WorkflowReplayer {
             drain_after_activity_workflow,
         )
         .register_fn("drain_n_signals_workflow", drain_n_signals_workflow)
+        .register_fn("deadline_can_workflow", deadline_can_workflow)
+        .register_fn(
+            "deadline_branch_probe_workflow",
+            deadline_branch_probe_workflow,
+        )
+        .register_fn(
+            "should_can_then_timer_workflow",
+            should_can_then_timer_workflow,
+        )
+        .register_fn(
+            "should_can_then_user_now_then_timer_workflow",
+            should_can_then_user_now_then_timer_workflow,
+        )
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -1192,6 +1304,8 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     }
 }
 
@@ -1851,6 +1965,335 @@ async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
             }
         ),
         "dropping the frozen system_now() capture must surface as SideEffectDrift, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-aware continue-as-new (issue #772)
+// ---------------------------------------------------------------------------
+
+/// Build a history for `deadline_can_workflow` whose recorded wall clock has
+/// consumed `consumed_secs` of the run's execution-timeout budget, then
+/// continued-as-new. `should_continue_as_new()` records the `system_now()`
+/// read as a `SideEffectRecorded{Now}` (because a deadline exists), and the
+/// deadline branch forks a fresh run.
+fn deadline_can_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent> {
+    let mut events = deadline_probe_history(t0_millis, consumed_secs);
+    events.push(WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id: ExecutionId::new(),
+        input: serde_json::json!({ "cycle": 1 }),
+    });
+    events
+}
+
+/// Build the common prefix `WorkflowStarted` + the single `system_now()`
+/// capture that `should_continue_as_new()` records when a deadline exists (the
+/// recorded wall clock is `t0 + consumed_secs`).
+fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent> {
+    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    let recorded_now = t0 + chrono::Duration::seconds(consumed_secs);
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "cycle": 0 }),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(recorded_now.timestamp_millis()),
+        },
+    ]
+}
+
+/// Build a history for `deadline_branch_probe_workflow` whose recorded activity
+/// pins the `should_continue_as_new()` decision: `checkpoint_now` when the run
+/// was expected to trip, `keep_working` otherwise. A broken fraction comparison
+/// schedules the *other* activity on replay and diverges — so a replay that
+/// succeeds actually proves the decision matched, not merely that the workflow
+/// completed.
+fn deadline_branch_history(
+    t0_millis: i64,
+    consumed_secs: i64,
+    expected_trip: bool,
+) -> Vec<WorkflowEvent> {
+    let mut events = deadline_probe_history(t0_millis, consumed_secs);
+    let activity = if expected_trip {
+        "checkpoint_now"
+    } else {
+        "keep_working"
+    };
+    let activity_id = ActivityExecId::new();
+    events.push(WorkflowEvent::ActivityScheduled {
+        activity_id,
+        name: activity.into(),
+        input: Value::Null,
+        queue: "default".into(),
+    });
+    events.push(WorkflowEvent::ActivityCompleted {
+        activity_id,
+        output: serde_json::json!("done"),
+    });
+    events
+}
+
+/// Build a **pre-#772** history for `should_can_then_timer_workflow`: it fired a
+/// durable timer but — recorded under the old binary — carries NO
+/// `SideEffectRecorded{Now}` at the `should_continue_as_new()` call site.
+fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
+    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "cycle": 0 }),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("renewal"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("renewal"),
+        },
+    ]
+}
+
+/// Build a **pre-#772** history for `should_can_then_user_now_then_timer_workflow`:
+/// recorded under the old binary (which had no deadline read), it carries the
+/// author's own `system_now()` capture (`{Now, name: None}`) at the
+/// `should_continue_as_new()` call site, followed by the durable timer. The
+/// probe must leave the user's `Now` for `ctx.system_now()`.
+fn pre_772_user_now_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
+    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    // The user's recorded wall clock, well within the 30s budget so that even
+    // if the (buggy) probe were to consume it, the deadline branch would not
+    // trip — isolating the failure to the stolen-`Now` divergence.
+    let user_now = t0 + chrono::Duration::seconds(1);
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "cycle": 0 }),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(user_now.timestamp_millis()),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("renewal"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("renewal"),
+        },
+    ]
+}
+
+/// AC5: a history that crossed the deadline replays to the same
+/// `ContinueAsNew` command (`ReplaySucceeded`). The `execution_timeout` is
+/// supplied to the replayer, so `should_continue_as_new()`'s deadline branch is
+/// exercised deterministically against the recorded `system_now()` capture.
+#[tokio::test]
+async fn replay_deadline_crossed_history_yields_continue_as_new() {
+    // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ deadline branch trips.
+    let events = deadline_can_history(1_700_000_000_000, 27);
+    let report = build_replayer()
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_snapshot(make_snapshot(
+            "deadline_can_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a deadline-crossed history must replay to ContinueAsNew, got: {report}"
+    );
+}
+
+/// Issue #772 (Codex P2 — carry deadline metadata in JSON replays): a full
+/// history export / `harvest-replay` JSON fixture for a deadline-aware workflow
+/// must carry `execution_timeout` on the snapshot so the JSON path threads the
+/// deadline budget. The metadata lives ONLY on the snapshot here — the replayer
+/// has NO global `with_execution_timeout` — so `replay_from_json` must read it
+/// from the JSON. Before the fix, `replay_from_snapshot` supplied only the
+/// (absent) global timeout, so the recorded `SideEffectRecorded{Now}` deadline
+/// probe was left unconsumed and the deadline-aware history false-reported
+/// non-determinism.
+#[tokio::test]
+async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
+    // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ the deadline branch tripped
+    // (the history recorded a continue-as-new).
+    let events = deadline_can_history(1_700_000_000_000, 27);
+    let snapshot = HistorySnapshot {
+        workflow_name: "deadline_can_workflow".to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        execution_timeout: Some(chrono::Duration::seconds(30)),
+        deadline_at: None,
+    };
+    let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
+    // The exported JSON must carry the deadline budget at the top level so it
+    // round-trips into a HistorySnapshot (and matches a HistoryExportDocument).
+    assert!(
+        json.contains("execution_timeout"),
+        "snapshot JSON must serialise execution_timeout: {json}"
+    );
+
+    // No global with_execution_timeout — the budget must come from the JSON.
+    let report = WorkflowReplayer::new()
+        .register_fn("deadline_can_workflow", deadline_can_workflow)
+        .replay_from_json(&json)
+        .await
+        .expect("snapshot JSON parses");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a deadline-aware history whose execution_timeout is carried on the JSON \
+         snapshot must replay cleanly via replay_from_json (not false-report \
+         non-determinism), got: {report}"
+    );
+}
+
+/// Issue #772 (Codex P2): backward compatibility. A snapshot JSON WITHOUT the
+/// new deadline fields still deserializes (serde `default` ⇒ `None`) — a legacy
+/// export produced before this field. Deserialization must succeed, and the
+/// replayer's global `with_execution_timeout` still enables the deadline branch
+/// (the documented fallback), so a deadline-aware history replays unchanged.
+#[tokio::test]
+async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout() {
+    let events = deadline_can_history(1_700_000_000_000, 27);
+    let snapshot = HistorySnapshot {
+        workflow_name: "deadline_can_workflow".to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        // Legacy snapshot: no deadline metadata. `skip_serializing_if` omits
+        // both fields from the JSON, producing a byte-for-byte pre-#772 export.
+        execution_timeout: None,
+        deadline_at: None,
+    };
+    let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
+    assert!(
+        !json.contains("execution_timeout") && !json.contains("deadline_at"),
+        "a None deadline field must be omitted from the JSON (legacy shape): {json}"
+    );
+
+    // Deserialization tolerates the absent fields; the global fallback enables
+    // the deadline branch so the deadline-aware history replays cleanly.
+    let report = WorkflowReplayer::new()
+        .register_fn("deadline_can_workflow", deadline_can_workflow)
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_json(&json)
+        .await
+        .expect("legacy snapshot JSON (no deadline fields) parses");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a legacy snapshot without deadline fields must deserialize and replay \
+         via the replayer's global with_execution_timeout fallback, got: {report}"
+    );
+}
+
+/// The falsifiable bar for issue #772: the deadline-driven
+/// `should_continue_as_new()` **decision** replays deterministically across
+/// N = 1000 distinct fixtures with zero divergences — and each fixture pins the
+/// decision, so a broken fraction comparison is caught rather than passing
+/// regardless (Finding 3). Each iteration varies the frozen `system_now()`
+/// capture and execution-timeout budget, and **mixes trip (consumed ≥ 0.85 of
+/// budget) and not-yet (consumed ≤ 0.40 of budget) cases**, both well clear of
+/// the 0.8 boundary so only a genuinely broken comparison flips them. The
+/// recorded activity (`checkpoint_now` vs `keep_working`) fixes the expected
+/// decision: a wrong decision schedules the other activity and diverges.
+#[tokio::test]
+async fn deadline_triggered_can_replays_deterministically_1000x() {
+    let base = 1_600_000_000_000_i64;
+    for i in 0..1000_i64 {
+        let budget_secs = 20 + (i % 100);
+        // Alternate trip / not-yet fixtures.
+        let expected_trip = i % 2 == 0;
+        let consumed_secs = if expected_trip {
+            // ≥ 0.85 of budget consumed ⇒ trips at fraction 0.8.
+            (budget_secs * 85) / 100 + 1
+        } else {
+            // ≤ 0.40 of budget consumed ⇒ does not trip at fraction 0.8.
+            (budget_secs * 40) / 100
+        };
+        let t0_millis = base + i * 41_000;
+        let events = deadline_branch_history(t0_millis, consumed_secs, expected_trip);
+        let report = build_replayer()
+            .with_execution_timeout(chrono::Duration::seconds(budget_secs))
+            .replay_from_snapshot(make_snapshot(
+                "deadline_branch_probe_workflow",
+                ExecutionId::new(),
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "deadline replay pass {i} (expected_trip={expected_trip}) must succeed with the \
+             recorded decision, got: {report}"
+        );
+    }
+}
+
+/// Finding 1: a pre-#772 in-flight history (a fired durable timer, NO recorded
+/// `SideEffectRecorded{Now}` at the `should_continue_as_new()` check) resumed
+/// under the new deadline-aware binary must replay cleanly — NOT diverge /
+/// nd-block — and must NOT emit a spurious `ContinueAsNew`. This is the
+/// canonical `should_continue_as_new()`-then-`ctx.timer()` shape (the shipped
+/// example's shape). Before the tolerant-clock-read fix, the deadline branch's
+/// strict `system_now` hit the recorded `TimerStarted` at the cursor and
+/// recorded a non-determinism error, wedging a healthy run on a routine upgrade.
+#[tokio::test]
+async fn should_continue_as_new_tolerates_pre_772_history_without_nd_block() {
+    let events = pre_772_timer_history(1_700_000_000_000);
+    let report = build_replayer()
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_snapshot(make_snapshot(
+            "should_can_then_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a pre-#772 history must replay cleanly under the deadline-aware binary \
+         (no divergence, no spurious ContinueAsNew), got: {report}"
+    );
+}
+
+/// Migration-path bug fix (issue #772): a pre-#772 history where the
+/// `should_continue_as_new()` check sits immediately before a **user**
+/// `ctx.system_now()` call. The recorded `SideEffectRecorded{Now, name: None}`
+/// at the cursor belongs to `ctx.system_now()`, NOT the engine's deadline
+/// probe. Before the naming fix the tolerant matcher stole that `Now`,
+/// advanced the cursor, and the subsequent `ctx.system_now()` diverged against
+/// the following `TimerStarted` — reporting false non-determinism on upgrade.
+/// The probe now records/matches under a reserved sentinel name, so the user's
+/// `Now` is left untouched and the history replays cleanly.
+#[tokio::test]
+async fn deadline_probe_does_not_consume_a_user_system_now() {
+    let events = pre_772_user_now_timer_history(1_700_000_000_000);
+    let report = build_replayer()
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_snapshot(make_snapshot(
+            "should_can_then_user_now_then_timer_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the deadline probe must not consume the user's system_now() Now: a \
+         pre-#772 history with a user Now at the check site must replay cleanly, \
+         got: {report}"
     );
 }
 
@@ -3020,6 +3463,8 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3045,6 +3490,8 @@ async fn replay_from_json_detects_non_determinism() {
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3235,6 +3682,8 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4415,6 +4864,8 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4445,6 +4896,8 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4468,6 +4921,8 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4493,6 +4948,8 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4535,6 +4992,8 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4597,6 +5056,8 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4672,6 +5133,8 @@ async fn replay_succeeds_for_recorded_side_effect() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4716,6 +5179,8 @@ async fn replay_detects_side_effect_drift() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 

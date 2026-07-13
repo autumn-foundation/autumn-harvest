@@ -48,15 +48,32 @@ pub fn empty_shared_state() -> SharedState {
 /// Default soft history-size threshold for recommending `continue_as_new`.
 pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 
+/// Default deadline-fraction trigger for [`WorkflowContext::should_continue_as_new`]
+/// (issue #772).
+///
+/// The fraction of a workflow's `execution_timeout` budget that must be consumed
+/// before a deadline-driven checkpoint is recommended. `0.8` means the workflow
+/// is advised to `continue_as_new` once it is within the final 20% of its
+/// deadline.
+pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
+
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
 pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 
 /// Replay-safe history guardrails made available to workflow code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` (but not `Eq`) because
+/// [`continue_as_new_deadline_fraction`](Self::continue_as_new_deadline_fraction)
+/// is an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkflowHistoryPolicy {
     continue_as_new_threshold: u64,
     event_hard_cap: Option<u64>,
+    /// Fraction of `execution_timeout` consumed at which
+    /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
+    /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
+    continue_as_new_deadline_fraction: f64,
 }
 
 impl Default for WorkflowHistoryPolicy {
@@ -64,6 +81,7 @@ impl Default for WorkflowHistoryPolicy {
         Self {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
             event_hard_cap: None,
+            continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
         }
     }
 }
@@ -81,6 +99,15 @@ impl WorkflowHistoryPolicy {
         self.event_hard_cap
     }
 
+    /// Fraction of the `execution_timeout` budget at which
+    /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
+    /// deadline-driven `continue_as_new` (issue #772). Defaults to
+    /// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`].
+    #[must_use]
+    pub const fn continue_as_new_deadline_fraction(self) -> f64 {
+        self.continue_as_new_deadline_fraction
+    }
+
     /// Override the soft continue-as-new threshold.
     #[must_use]
     pub const fn with_continue_as_new_threshold(mut self, threshold: u64) -> Self {
@@ -92,6 +119,16 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
         self.event_hard_cap = Some(cap);
+        self
+    }
+
+    /// Override the deadline fraction (issue #772). The value is **clamped**
+    /// into `[0.0, 1.0]` — a fraction outside that range is meaningless (a
+    /// value ≤ 0 would recommend checkpointing immediately; ≥ 1 would never
+    /// recommend it before the hard timeout).
+    #[must_use]
+    pub const fn with_continue_as_new_deadline_fraction(mut self, fraction: f64) -> Self {
+        self.continue_as_new_deadline_fraction = fraction.clamp(0.0, 1.0);
         self
     }
 }
@@ -1628,6 +1665,24 @@ pub struct WorkflowContext {
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
     history_policy: WorkflowHistoryPolicy,
+    /// The effective execution-timeout budget for this run (issue #243/#772), or
+    /// `None` when the workflow has no `execution_timeout`. Used as the source
+    /// for the replay-stable nominal [`deadline`](Self::deadline) (`start_time +
+    /// execution_timeout`), and as the total budget for the deadline-fraction
+    /// continue-as-new check. Records no event. Threaded from the execution row
+    /// by the worker.
+    execution_timeout: Option<chrono::Duration>,
+    /// The authoritative absolute wall-clock deadline for this run (issue #772),
+    /// read live from the execution row's `deadline_at` column at context
+    /// construction. This is the *effective* deadline the timeout scanner
+    /// enforces: pause/resume (#383) and redrive push it forward, so it is NOT
+    /// necessarily `start_time + execution_timeout` for a resumed/redriven run.
+    /// Consumed **only** by the internal continue-as-new budget check
+    /// ([`effective_deadline_live`](Self::effective_deadline_live)), never by the
+    /// public [`deadline`](Self::deadline) accessor (which stays replay-stable
+    /// nominal). Falls back to `start_time + execution_timeout` when no absolute
+    /// deadline was threaded (the replayer / test-env paths). `None` = fall back.
+    deadline_at: Option<DateTime<Utc>>,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Monotonically increasing counter for naming fan-out count markers.
@@ -2007,6 +2062,8 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             history_policy,
+            execution_timeout: None,
+            deadline_at: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2146,6 +2203,8 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
+            execution_timeout: None,
+            deadline_at: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2200,6 +2259,8 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
+            execution_timeout: None,
+            deadline_at: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -2383,6 +2444,45 @@ impl WorkflowContext {
         self
     }
 
+    /// Set the effective execution-timeout budget for deadline-aware
+    /// continue-as-new (issue #772).
+    ///
+    /// Threaded by the executor from the execution row's `execution_timeout`
+    /// (issue #243). `None` (the default) leaves [`deadline`](Self::deadline)
+    /// as `None`, so [`should_continue_as_new`](Self::should_continue_as_new)
+    /// behaves exactly as before and records no side-effect.
+    #[must_use]
+    pub const fn with_execution_timeout(
+        mut self,
+        execution_timeout: Option<chrono::Duration>,
+    ) -> Self {
+        self.execution_timeout = execution_timeout;
+        self
+    }
+
+    /// Set the authoritative absolute wall-clock deadline for this run
+    /// (issue #772), read live from the execution row's `deadline_at` column.
+    ///
+    /// Threaded by the executor from the loaded execution row. Because
+    /// pause/resume (#383) and redrive shift `deadline_at` forward past the
+    /// original `start_time + execution_timeout`, this is the *effective*
+    /// deadline the timeout scanner enforces. It is consumed **only** by the
+    /// internal continue-as-new budget check
+    /// ([`should_continue_as_new`](Self::should_continue_as_new)'s deadline
+    /// branch), so a resumed run's budget accounting matches the scanner and a
+    /// healthy run never continues-as-new immediately after a long pause. It is
+    /// **not** exposed through the public [`deadline`](Self::deadline) /
+    /// [`time_until_deadline`](Self::time_until_deadline) accessors — those return
+    /// the replay-stable nominal `start_time + execution_timeout` so author code
+    /// depending on them replays deterministically. `None` (the default) leaves
+    /// the internal check to fall back to `start_time + execution_timeout` — the
+    /// replayer / test-env paths that carry only the timeout.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
+        self.deadline_at = deadline_at;
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// The task queue this workflow execution runs on.
@@ -2414,6 +2514,93 @@ impl WorkflowContext {
             return self.start_time + delta;
         }
         self.start_time
+    }
+
+    /// The **nominal** absolute wall-clock deadline this run must finish by, or
+    /// `None` when the workflow has no `execution_timeout` (issue #772).
+    ///
+    /// This is the recorded `WorkflowStarted` timestamp ([`now`](Self::now) with
+    /// no advancing clock) plus the effective `execution_timeout` (issue #243) —
+    /// a **replay-STABLE** value derived only from immutable inputs: `start_time`
+    /// is fixed in `WorkflowStarted`, and `execution_timeout` is a fixed row
+    /// value that pause/resume (#383) does **not** mutate (pause shifts the
+    /// separate `deadline_at` column, never `execution_timeout`). It records no
+    /// event and returns the **same value on every replay cycle and every
+    /// worker**, so author code may safely branch on it, embed it in an
+    /// activity/child input, or otherwise depend on it without risking a
+    /// non-deterministic divergence after a pause/resume shifts the row's live
+    /// `deadline_at`.
+    ///
+    /// This deadline **does not reflect pause extensions**: for a paused/resumed
+    /// or redriven run the run's live hard deadline (`deadline_at`, which the
+    /// timeout scanner enforces) is pushed forward past `start_time +
+    /// execution_timeout`. The engine's internal continue-as-new budget check
+    /// ([`should_continue_as_new`](Self::should_continue_as_new)) *does* account
+    /// for that shift (it reads the live effective deadline), but the public
+    /// accessor intentionally does not — a replay-stable value is the contract
+    /// author code needs.
+    ///
+    /// `None` is returned when there is no `execution_timeout`, or when the
+    /// computation would overflow the representable range.
+    #[must_use]
+    pub fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.execution_timeout
+            .and_then(|budget| self.start_time.checked_add_signed(budget))
+    }
+
+    /// The **live effective** absolute wall-clock deadline the timeout scanner
+    /// enforces for this run (issue #772) — internal only.
+    ///
+    /// Prefers the authoritative absolute `deadline_at` threaded from the
+    /// execution row ([`with_deadline`](Self::with_deadline)) when present, since
+    /// pause/resume (#383) and redrive push it **forward** past `start_time +
+    /// execution_timeout`; falls back to the nominal `start_time +
+    /// execution_timeout` only when no absolute deadline was threaded (the
+    /// replayer / test-env paths that carry just the timeout).
+    ///
+    /// This is used **only** by the internal continue-as-new budget check
+    /// ([`deadline_fraction_reached`](Self::deadline_fraction_reached)), never by
+    /// the public [`deadline`](Self::deadline) accessor, so author code always
+    /// sees the replay-stable nominal deadline. Reading the live value here is
+    /// still replay-safe: pause/redrive only move `deadline_at` **forward**, so a
+    /// live `true` decision terminates the run via `continue_as_new` (no further
+    /// divergent replay), while a live `false` recomputed on any later replay is
+    /// evaluated against an equal-or-larger deadline — a smaller consumed
+    /// fraction — and therefore stays `false`.
+    fn effective_deadline_live(&self) -> Option<DateTime<Utc>> {
+        if let Some(deadline_at) = self.deadline_at {
+            return Some(deadline_at);
+        }
+        self.execution_timeout
+            .and_then(|budget| self.start_time.checked_add_signed(budget))
+    }
+
+    /// Time remaining until the **nominal** execution
+    /// [`deadline`](Self::deadline), or `None` when the workflow has no
+    /// `execution_timeout` (issue #772).
+    ///
+    /// Measured against the replay-stable nominal `deadline()` (so it does
+    /// **not** reflect pause/resume extensions — see [`deadline`](Self::deadline))
+    /// and the replay-safe recorded wall clock ([`system_now`](Self::system_now),
+    /// issue #384) — **never** `chrono::Utc::now()` — so it is deterministic
+    /// across replays. A negative duration means the nominal deadline has already
+    /// passed.
+    ///
+    /// A workflow with no deadline records **no** side-effect: the pure
+    /// [`deadline`](Self::deadline) check runs first, so `system_now` (which
+    /// records a `SideEffectRecorded` event) is only consulted when a deadline
+    /// actually exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned (via
+    /// [`system_now`](Self::system_now)).
+    #[must_use]
+    pub fn time_until_deadline(&self) -> Option<chrono::Duration> {
+        // Check the pure deadline first so a no-deadline workflow never records
+        // a `system_now` side-effect (AC4).
+        let deadline = self.deadline()?;
+        Some(deadline - self.system_now())
     }
 
     /// The nominal scheduled fire-time (logical slot) this run is responsible for,
@@ -2638,11 +2825,202 @@ impl WorkflowContext {
         self.match_history(|matcher| matcher.event_count())
     }
 
-    /// Returns `true` once [`Self::history_event_count`] exceeds the configured
-    /// soft continue-as-new threshold.
+    /// Returns `true` when the workflow should checkpoint via `continue_as_new`.
+    ///
+    /// Two independent triggers, either of which is sufficient:
+    ///
+    /// 1. **History size** — [`Self::history_event_count`] exceeds the configured
+    ///    soft continue-as-new threshold (the pre-issue-#772 behaviour).
+    /// 2. **Deadline fraction** (issue #772) — the run has consumed at least
+    ///    [`WorkflowHistoryPolicy::continue_as_new_deadline_fraction`] of its
+    ///    `execution_timeout` budget. This lets a **long-lived, low-event**
+    ///    workflow checkpoint *before* the hard `execution_timeout` (issue #243)
+    ///    kills it, even though its history would never approach the event
+    ///    threshold. Unlike the public [`deadline`](Self::deadline) accessor,
+    ///    this check measures against the **live effective deadline** the timeout
+    ///    scanner enforces (the pause/resume/redrive-shifted `deadline_at`), so a
+    ///    healthy run that was paused for a long time does **not** spuriously
+    ///    checkpoint the moment it resumes.
+    ///
+    /// **Contract:** when this returns `true`, the workflow **must** call
+    /// `continue_as_new` (rather than continuing to run). That is what makes the
+    /// live-deadline read replay-safe — a `true` decision terminates the current
+    /// run, so no later replay re-evaluates the branch against a differently
+    /// shifted deadline (see [`with_deadline`](Self::with_deadline)).
+    ///
+    /// ## Replay determinism
+    ///
+    /// The deadline check consults the replay-safe recorded clock via a
+    /// **tolerant** read ([`deadline_clock_read`](Self::deadline_clock_read)),
+    /// so its answer is deterministic across replays and workers. A workflow
+    /// with **no** `execution_timeout` records zero side-effects here and
+    /// behaves exactly as before (AC4). The two triggers are combined without
+    /// short-circuiting the deadline check, so a timeout-bearing workflow reads
+    /// the deadline clock regardless of the event-count branch — keeping the
+    /// recorded side-effect stream a pure function of the recorded history at
+    /// the cursor, not of the (task-varying) event count.
+    ///
+    /// **Cross-version safety (issue #772/#603):** unlike the public
+    /// [`system_now`](Self::system_now), the deadline clock read is *tolerant* —
+    /// an in-flight execution whose history predates #772 (and so carries no
+    /// `SideEffectRecorded{Now}` at this call site) does **not** nd-block; the
+    /// deadline branch degrades to history-count-only for that run's pre-upgrade
+    /// recorded portion and picks the feature up once the run executes live past
+    /// its frontier.
     #[must_use]
     pub fn should_continue_as_new(&self) -> bool {
-        self.history_event_count() > self.history_policy.continue_as_new_threshold()
+        let by_events =
+            self.history_event_count() > self.history_policy.continue_as_new_threshold();
+        // Evaluate the deadline branch unconditionally (bound before the `||`)
+        // so the tolerant clock read it performs is not gated by the
+        // event-count trigger.
+        let by_deadline = self.deadline_fraction_reached();
+        by_events || by_deadline
+    }
+
+    /// Returns `true` when the run has consumed at least the configured fraction
+    /// of its `execution_timeout` budget (issue #772).
+    ///
+    /// Returns `false` — recording **no** side-effect — when the workflow has no
+    /// `execution_timeout`, a non-positive budget, an overflowing deadline, or
+    /// when the deadline signal is unavailable for the recorded history (a
+    /// pre-#772 history — see [`deadline_clock_read`](Self::deadline_clock_read)).
+    /// Otherwise it reads the replay-safe recorded clock (recording at most one
+    /// `Now` side-effect, at the live frontier). A deadline already in the past
+    /// (negative remaining) trips.
+    #[allow(clippy::cast_precision_loss)]
+    fn deadline_fraction_reached(&self) -> bool {
+        let Some(total) = self.execution_timeout else {
+            return false;
+        };
+        let total_ms = total.num_milliseconds();
+        if total_ms <= 0 {
+            return false;
+        }
+        // Resolve the (pure, no-side-effect) *live effective* deadline first, so
+        // an overflowing deadline short-circuits *before* the clock read is
+        // consumed/recorded. This reads the pause/resume/redrive-shifted
+        // `deadline_at` (the deadline the timeout scanner actually enforces), NOT
+        // the replay-stable nominal `deadline()` the public accessor returns — so
+        // a long pause never makes a healthy run continue-as-new immediately on
+        // resume.
+        let Some(deadline) = self.effective_deadline_live() else {
+            return false;
+        };
+        // Tolerant clock read: `None` => the deadline signal is unavailable for
+        // this recorded history (e.g. a pre-#772 history) => degrade to
+        // history-count-only rather than diverge.
+        let Some(now) = self.deadline_clock_read() else {
+            return false;
+        };
+        let remaining = deadline - now;
+        let fraction = self.history_policy.continue_as_new_deadline_fraction();
+        // Trip once at least `fraction` of the budget is consumed, i.e. the
+        // remaining time is at most `(1 - fraction)` of the total. Negative
+        // remaining (past the deadline) trips.
+        (remaining.num_milliseconds() as f64) <= (1.0 - fraction) * (total_ms as f64)
+    }
+
+    /// Tolerant deadline-branch wall-clock read (issue #772).
+    ///
+    /// Returns the wall-clock instant at this point in the workflow, or `None`
+    /// when the deadline signal is unavailable for the recorded history (a
+    /// pre-#772 history whose `should_continue_as_new()` call site recorded no
+    /// `system_now` clock read).
+    ///
+    /// The probe records/matches its clock read under a reserved sentinel name
+    /// ([`DEADLINE_PROBE_SIDE_EFFECT_NAME`](crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME))
+    /// so it is never confused with an author-side [`system_now`](Self::system_now)
+    /// read (recorded with `name: None`) at the same cursor position.
+    ///
+    /// Semantics (peeking the matcher cursor via
+    /// [`HistoryMatcher::match_side_effect_now_tolerant`]):
+    ///
+    /// - **Live frontier**: record a fresh sentinel-named `SideEffectRecorded{Now}`
+    ///   and push the `RecordSideEffect` command (like [`system_now`](Self::system_now),
+    ///   but under the reserved probe name), then return `Some(instant)`.
+    /// - **Cursor holds the probe's own sentinel-named `SideEffectRecorded{Now}`**:
+    ///   consume it and return `Some(recorded_value)` — identical to strict replay.
+    /// - **Cursor holds any OTHER recorded event** (an old-history migration, OR a
+    ///   user `system_now()` Now belonging to author code): return `None` WITHOUT
+    ///   consuming the cursor and WITHOUT diverging.
+    ///
+    /// This is deliberately tolerant, unlike the strict `system_now()` /
+    /// `time_until_deadline()` used by public author code (any direct call to
+    /// those is *new* author code subject to normal versioning rules). It is
+    /// **replay-safe by construction**: for a NEW execution the behavior is
+    /// identical to strict (records live at the frontier, matches on replay);
+    /// for an OLD in-flight execution recorded before #772, the outcome is a
+    /// pure, stable function of the event at the current cursor (a non-`Now`
+    /// event always resolves to `None` → the deadline branch stays off for the
+    /// recorded portion), and once the run executes live past its pre-upgrade
+    /// frontier it records `Now`s normally and picks up the deadline feature —
+    /// all future replays stay deterministic. The only "masking" is that a
+    /// genuine control-flow reordering that lands a deadline clock-read on a
+    /// recorded non-`Now` event degrades to a missed checkpoint *suggestion*
+    /// rather than nd-blocking — fail-safe: it can never produce a wrong
+    /// command, and any real control-flow divergence still nd-errors at the next
+    /// real command mismatch.
+    /// The frontier wall-clock instant (millis) the deadline probe records.
+    ///
+    /// In the test harness with the advancing virtual clock enabled
+    /// ([`with_advancing_timer_clock`](Self::with_advancing_timer_clock)), this
+    /// reads the ADVANCING clock (`start_time + elapsed`, mirroring
+    /// [`now`](Self::now)) so a live test run that consumes its deadline budget
+    /// via durable timers can exercise the deadline-aware continue-as-new branch
+    /// (issue #772 Codex P2). In production builds the virtual-clock arm is
+    /// compiled out and this is `Utc::now()` — the deadline probe's #384
+    /// host-wall-clock behavior is unchanged.
+    fn deadline_frontier_now_millis(&self) -> i64 {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(ref atomic) = self.timer_clock_elapsed_secs {
+            let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            let delta = chrono::Duration::seconds(
+                i64::try_from(elapsed)
+                    .unwrap_or(i64::MAX / 1000)
+                    .min(i64::MAX / 1000),
+            );
+            return (self.start_time + delta).timestamp_millis();
+        }
+        Utc::now().timestamp_millis()
+    }
+
+    fn deadline_clock_read(&self) -> Option<DateTime<Utc>> {
+        match self.match_history(HistoryMatcher::match_side_effect_now_tolerant) {
+            crate::replay::SideEffectNowMatch::Matched { millis } => {
+                Some(DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time))
+            }
+            crate::replay::SideEffectNowMatch::NotRecorded => None,
+            crate::replay::SideEffectNowMatch::Frontier => {
+                // Read the frontier wall clock. In the test harness with the
+                // advancing virtual clock enabled (issue #526/#772 Codex P2),
+                // this reads the context's ADVANCING clock (`start_time +
+                // elapsed`) so a workflow that sleeps past its deadline fraction
+                // via durable timers actually trips the deadline continue-as-new
+                // branch under test. In production (no virtual clock) this is
+                // `Utc::now()` exactly as before — `system_now`'s #384
+                // host-wall-clock contract is untouched (this internal probe is
+                // the only reader that consults the virtual clock).
+                let millis = self.deadline_frontier_now_millis();
+                // Record the fresh clock read like `system_now` does at its
+                // `NoMatch` (frontier) branch — append the value + push the
+                // `RecordSideEffect` bookkeeping command — but under the reserved
+                // deadline-probe name so a later tolerant read matches the
+                // probe's own `Now` and never an author-side `system_now()` Now
+                // (issue #772). Unlike `system_now`, no strict-replay deferred
+                // non-determinism is recorded here — reaching the frontier for
+                // the engine-internal deadline read is expected on a fresh
+                // execution / live continuation, not an author determinism bug.
+                let value = serde_json::to_value(millis)
+                    .expect("i64 millis must serialise to a JSON value");
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Now,
+                    name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+                    value,
+                });
+                Some(DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time))
+            }
+        }
     }
 
     /// Returns `true` if the context is currently replaying recorded history
@@ -8360,6 +8738,14 @@ impl WorkflowContext {
         let workflow_id = self.workflow_id.clone();
         let workflow_name = self.workflow_name.clone();
         let context_headers = std::sync::Arc::clone(&self.context_headers);
+        // Issue #772 (Codex P2): thread the deadline budget into the handler
+        // context so `ctx.deadline()` / `time_until_deadline()` inside a
+        // declarative `#[update]` handler return the real values (not `None`)
+        // for a running workflow that has an `execution_timeout`. Without this,
+        // `new_for_handler` inits both to `None` and the update-handler path —
+        // unlike the workflow body and query handlers — never sees them.
+        let execution_timeout = self.execution_timeout;
+        let deadline_at = self.deadline_at;
         // Carryover is frozen in WorkflowStarted, so a handler on a scheduled workflow
         // must observe the same last_completion_result/last_error as the workflow body
         // (issue #488).
@@ -8386,6 +8772,9 @@ impl WorkflowContext {
                     .clone_from(&last_completion_result);
                 inner.last_error.clone_from(&last_error);
                 inner.metrics = std::sync::Arc::clone(&metrics);
+                // Issue #772 (Codex P2): inherit the parent's deadline budget.
+                inner.execution_timeout = execution_timeout;
+                inner.deadline_at = deadline_at;
             }
             handler_fn(ctx, input)
         });
@@ -8455,6 +8844,10 @@ impl WorkflowContext {
                     .clone_from(&self.last_completion_result);
                 inner.last_error.clone_from(&self.last_error);
                 inner.metrics = std::sync::Arc::clone(&self.metrics);
+                // Issue #772 (Codex P2): inherit the parent's deadline budget so
+                // `ctx.deadline()` works inside the handler.
+                inner.execution_timeout = self.execution_timeout;
+                inner.deadline_at = self.deadline_at;
             }
             h(ctx, input)
         })
@@ -10855,6 +11248,641 @@ mod tests {
 
         assert_eq!(ctx.history_event_count(), 2);
         assert!(!ctx.should_continue_as_new());
+    }
+
+    // ── Deadline-aware continue-as-new (issue #772) ─────────────────────────
+
+    /// Build a replay context whose first event carries `t0` as the
+    /// `WorkflowStarted` timestamp, plus any extra events (e.g. a recorded
+    /// `SideEffectRecorded{Now}` for `system_now`).
+    fn deadline_ctx(
+        t0: DateTime<Utc>,
+        extra: Vec<WorkflowEvent>,
+        execution_timeout: Option<chrono::Duration>,
+    ) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.extend(extra);
+        WorkflowContext::for_replay(ExecutionId::new(), events)
+            .with_execution_timeout(execution_timeout)
+    }
+
+    /// Like [`deadline_ctx`] but with a caller-supplied history policy so tests
+    /// can vary the deadline fraction (issue #772 Finding 3/4).
+    fn deadline_ctx_with_policy(
+        t0: DateTime<Utc>,
+        extra: Vec<WorkflowEvent>,
+        execution_timeout: Option<chrono::Duration>,
+        policy: WorkflowHistoryPolicy,
+    ) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.extend(extra);
+        WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        )
+        .with_execution_timeout(execution_timeout)
+    }
+
+    /// A recorded deadline-probe clock read at the given wall-clock instant —
+    /// recorded under the reserved probe name so the tolerant matcher consumes
+    /// it (issue #772).
+    fn recorded_now(instant: DateTime<Utc>) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Now,
+            name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(instant.timestamp_millis()),
+        }
+    }
+
+    /// A recorded author-side `system_now()` capture (`name: None`) at the given
+    /// instant — the shape the PUBLIC [`system_now`](WorkflowContext::system_now)
+    /// / [`time_until_deadline`](WorkflowContext::time_until_deadline) accessors
+    /// match (strictly), distinct from the tolerant deadline probe (issue #772).
+    fn recorded_user_now(instant: DateTime<Utc>) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(instant.timestamp_millis()),
+        }
+    }
+
+    #[test]
+    fn deadline_returns_start_plus_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+        assert_eq!(ctx.deadline(), Some(t0 + chrono::Duration::seconds(30)));
+    }
+
+    #[test]
+    fn deadline_is_none_without_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(t0, vec![], None);
+        assert_eq!(ctx.deadline(), None);
+    }
+
+    /// Issue #772 (P2 fix — Finding B): the PUBLIC `ctx.deadline()` is the
+    /// replay-STABLE *nominal* deadline `start + execution_timeout`, and must
+    /// NEVER return the mutable `deadline_at` column (which pause/resume (#383)
+    /// and redrive shift forward). Author code may branch on `deadline()` or
+    /// embed it in an activity/child input, so it must be identical on every
+    /// replay cycle even after a resume shifts `deadline_at`. The *internal*
+    /// continue-as-new budget check reads the live shifted value instead (see
+    /// `should_continue_as_new_uses_live_effective_deadline_not_nominal`).
+    #[test]
+    fn deadline_public_accessor_is_nominal_not_shifted_deadline_at() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        // A resume shift of +120s pushes the row's `deadline_at` past start+timeout.
+        let shift = chrono::Duration::seconds(120);
+        let shifted = t0 + timeout + shift;
+        let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
+        assert_eq!(
+            ctx.deadline(),
+            Some(t0 + timeout),
+            "public deadline() must be the replay-stable nominal start+timeout"
+        );
+        assert_ne!(
+            ctx.deadline(),
+            Some(shifted),
+            "public deadline() must NOT reflect the mutable (resume-shifted) deadline_at"
+        );
+    }
+
+    /// Issue #772 (P2 fix): backward-compat / fallback. When NO absolute deadline
+    /// is threaded (the replayer / test-env paths, which carry only the timeout),
+    /// `ctx.deadline()` falls back to `start + execution_timeout` exactly as
+    /// before, so those paths are unchanged.
+    #[test]
+    fn deadline_falls_back_to_start_plus_timeout_without_absolute() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        // Explicit None threaded — must behave identically to not threading.
+        let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(None);
+        assert_eq!(ctx.deadline(), Some(t0 + timeout));
+    }
+
+    /// Issue #772 (P2 fix): the *internal* deadline branch of
+    /// `should_continue_as_new()` reads the live *effective* (shifted) deadline,
+    /// not the public nominal. A recorded clock read at t0+25s would trip against
+    /// the nominal 30s deadline (25/30 = 0.83 ≥ 0.8), but must NOT trip when the
+    /// row's `deadline_at` has been shifted an hour into the future by a long
+    /// pause — the run is nowhere near its fraction of the effective deadline.
+    #[test]
+    fn should_continue_as_new_reads_shifted_deadline_not_stale_start_plus_timeout() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        let clock = t0 + chrono::Duration::seconds(25);
+        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let ctx =
+            deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout)).with_deadline(Some(shifted));
+        // The public accessor stays nominal ...
+        assert_eq!(ctx.deadline(), Some(t0 + timeout));
+        // ... but the internal budget check uses the live shifted deadline.
+        assert!(
+            !ctx.should_continue_as_new(),
+            "must not trip: the effective (shifted) deadline is far in the future, \
+             even though 25s/30s of the raw budget looks consumed"
+        );
+    }
+
+    /// Issue #772 (P2 fix): the internal continue-as-new budget check uses the
+    /// LIVE effective deadline, not the public nominal. When the nominal
+    /// `start + execution_timeout` is already in the PAST (nominal fraction
+    /// ≥ 1.0) but the row's `deadline_at` was shifted well into the FUTURE by a
+    /// long pause, `should_continue_as_new()` must return FALSE — the run is not
+    /// near its real (shifted) deadline, so it must not prematurely
+    /// continue-as-new immediately on resume (the still-open original P2).
+    #[test]
+    fn should_continue_as_new_uses_live_effective_deadline_not_nominal() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        // Recorded clock is PAST the nominal deadline (t0+30s): nominal fraction
+        // is > 1.0, so a nominal-based check would trip.
+        let clock = t0 + chrono::Duration::seconds(40);
+        // But the effective deadline was shifted an hour into the future.
+        let shifted = t0 + timeout + chrono::Duration::hours(1);
+
+        // Control: WITHOUT a threaded deadline_at, the effective deadline IS the
+        // (past) nominal, so the check DOES trip — proving the difference is the
+        // live read, not something else.
+        let nominal_ctx = deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout));
+        assert!(
+            nominal_ctx.should_continue_as_new(),
+            "control: a past nominal deadline must trip when no deadline_at is threaded"
+        );
+
+        // With the shifted deadline_at threaded, the live budget check sees a
+        // future deadline and must NOT trip (no premature continue-as-new).
+        let live_ctx =
+            deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout)).with_deadline(Some(shifted));
+        assert!(
+            !live_ctx.should_continue_as_new(),
+            "must not trip: the live effective deadline is far in the future \
+             even though the nominal budget is fully consumed"
+        );
+    }
+
+    /// Issue #772 (Codex P2): a declarative `#[update]` handler on a workflow
+    /// with an `execution_timeout` must observe `ctx.deadline()` == `Some(..)`
+    /// (not `None`). `new_for_handler` inits the deadline fields to `None`;
+    /// `register_declarative_update_handler` must thread the parent's
+    /// `execution_timeout`/`deadline_at` into the handler context — the
+    /// workflow body and query handlers already see these, update handlers were
+    /// the missed path.
+    #[tokio::test]
+    async fn update_handler_inherits_parent_deadline() {
+        // `UpdateHandlerFn` takes the ctx `Arc` by value; the signature is fixed.
+        #[allow(clippy::needless_pass_by_value)]
+        fn probe_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            let has_deadline = ctx.deadline().is_some();
+            Box::pin(async move { Ok(serde_json::json!(has_deadline)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "probe",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: probe_handler,
+            validator: None,
+            mcp: false,
+        };
+
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let parent = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+        // Sanity: the parent workflow context itself sees the deadline.
+        assert_eq!(parent.deadline(), Some(t0 + chrono::Duration::seconds(30)));
+
+        parent.register_declarative_update_handler(&info);
+        let fut = parent
+            .invoke_update("probe", Value::Null)
+            .expect("handler registered");
+        let result = fut.await;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!(true)),
+            "a declarative update handler must inherit the parent's execution_timeout \
+             so ctx.deadline() returns Some(..)"
+        );
+    }
+
+    /// Issue #772 (Codex P2): the resume-shifted absolute `deadline_at` is also
+    /// threaded into the update-handler context, so a paused/redriven run's
+    /// handler sees the same live deadline the workflow body's internal budget
+    /// check reads.
+    #[tokio::test]
+    async fn update_handler_inherits_parent_shifted_deadline_at() {
+        #[allow(clippy::needless_pass_by_value)]
+        fn deadline_at_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            // The public accessor is the nominal deadline; return its millis so
+            // the test can assert the handler inherited execution_timeout.
+            let nominal = ctx.deadline().map(|d| d.timestamp_millis());
+            Box::pin(async move { Ok(serde_json::json!(nominal)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "deadline_at",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "i64",
+            has_validator: false,
+            handler: deadline_at_handler,
+            validator: None,
+            mcp: false,
+        };
+
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let parent = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
+
+        parent.register_declarative_update_handler(&info);
+        let fut = parent
+            .invoke_update("deadline_at", Value::Null)
+            .expect("handler registered");
+        let result = fut.await;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!((t0 + timeout).timestamp_millis())),
+            "the update handler must inherit execution_timeout (nominal deadline present)"
+        );
+    }
+
+    #[test]
+    fn time_until_deadline_uses_recorded_clock() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let clock = t0 + chrono::Duration::seconds(10);
+        // execution_timeout = 30s, recorded clock = t0+10s ⇒ 20s remaining.
+        // `time_until_deadline()` reads the PUBLIC (strict) `system_now()`, so
+        // the recorded clock must be a bare user `Now` (`name: None`), not the
+        // deadline probe's sentinel-named read (issue #772).
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_user_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert_eq!(
+            ctx.time_until_deadline(),
+            Some(chrono::Duration::seconds(20))
+        );
+    }
+
+    #[test]
+    fn time_until_deadline_is_none_without_deadline() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // No execution_timeout: time_until_deadline must be None AND must not
+        // consult (or record) the wall clock.
+        let ctx = deadline_ctx(t0, vec![], None);
+        assert_eq!(ctx.time_until_deadline(), None);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no side-effect command must be recorded when there is no deadline"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_trips_on_deadline_fraction() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // 25s of a 30s budget consumed (0.83 ≥ 0.8) ⇒ trips, even though the
+        // event count is far under the soft threshold.
+        let clock = t0 + chrono::Duration::seconds(25);
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(ctx.history_event_count() < 10_000);
+        assert!(ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn should_continue_as_new_not_yet_before_fraction() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // Only 10s of a 30s budget consumed (0.33 < 0.8) ⇒ does not trip.
+        let clock = t0 + chrono::Duration::seconds(10);
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(!ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn should_continue_as_new_no_timeout_records_no_event_and_is_false() {
+        // AC4: a workflow with NO execution_timeout behaves exactly as today
+        // and records ZERO new side-effect events.
+        let ctx = WorkflowContext::new_test();
+        assert!(!ctx.should_continue_as_new());
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "should_continue_as_new must not record a side-effect when there is no deadline"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_still_trips_on_history_count() {
+        // Existing behaviour preserved: the event-count trigger fires
+        // independently of the deadline path (no execution_timeout here).
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll".into(),
+                details: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll".into(),
+                details: serde_json::json!({"n": 2}),
+            },
+        ];
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        );
+        assert!(ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn workflow_history_policy_deadline_fraction_default_and_clamp() {
+        let default = WorkflowHistoryPolicy::default();
+        assert!(
+            (default.continue_as_new_deadline_fraction()
+                - DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Clamped to [0.0, 1.0].
+        let over = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(1.5);
+        assert!((over.continue_as_new_deadline_fraction() - 1.0).abs() < f64::EPSILON);
+        let under = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(-0.5);
+        assert!(under.continue_as_new_deadline_fraction().abs() < f64::EPSILON);
+        let mid = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.6);
+        assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
+    }
+
+    // ── Cross-version replay tolerance (issue #772 / #603, Finding 1) ────────
+
+    /// Finding 1: an in-flight execution recorded under a pre-#772 binary has
+    /// NO `SideEffectRecorded{Now}` at the `should_continue_as_new()` call site.
+    /// Resumed under the new binary (which reads the deadline clock there), the
+    /// tolerant read must see the non-`Now` recorded event at the cursor and
+    /// return `None` (deadline branch off) — WITHOUT diverging / nd-blocking and
+    /// WITHOUT recording any command. The canonical shape is
+    /// `should_continue_as_new()` at the top, then `ctx.timer(...)`, so the
+    /// event at the cursor is a `TimerStarted`.
+    #[test]
+    fn deadline_read_tolerates_non_now_cursor_event_no_divergence_no_command() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // execution_timeout is Some, so the deadline branch IS evaluated — but
+        // the cursor holds a TimerStarted (a pre-#772 history recorded no Now
+        // here), so the tolerant read degrades to history-count-only.
+        let ctx = deadline_ctx(
+            t0,
+            vec![WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("renewal"),
+                duration_secs: 3600,
+            }],
+            Some(chrono::Duration::seconds(30)),
+        );
+
+        // Deadline branch is off (returns None → false); event count is far
+        // under the soft threshold, so the whole call is false.
+        assert!(
+            !ctx.should_continue_as_new(),
+            "pre-#772 history must not trip the deadline branch"
+        );
+        // No side-effect command recorded (NotRecorded path).
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "tolerant read must not record a command against a recorded non-Now event"
+        );
+        // Crucially: NO deferred non-determinism error — this is what would
+        // nd-block the run under the strict `system_now` path (the pre-fix bug).
+        assert!(
+            ctx.take_deferred_nd_error().is_none(),
+            "the deadline read must not record a non-determinism error against pre-#772 history"
+        );
+    }
+
+    /// Finding 1: at the live frontier (no more recorded events to match), the
+    /// tolerant deadline read records a fresh `SideEffectRecorded{Now}` exactly
+    /// as `system_now()` does — so a NEW execution behaves identically to strict
+    /// and every future replay of the grown history matches the recorded value.
+    #[test]
+    fn deadline_read_records_live_at_frontier() {
+        // t0 far in the past + a 30s budget ⇒ the frozen live clock (Utc::now())
+        // is well past the deadline, so the branch trips; the load-bearing
+        // assertion is that exactly one Now side-effect command is recorded.
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+
+        assert!(
+            ctx.should_continue_as_new(),
+            "a run past its deadline must trip the deadline branch"
+        );
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            cmds.len(),
+            1,
+            "the frontier read must record exactly one command, got {cmds:?}"
+        );
+        assert!(
+            matches!(
+                &cmds[0],
+                WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Now,
+                    name: Some(name),
+                    ..
+                } if name == crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME
+            ),
+            "the recorded command must be a sentinel-named Now side-effect, got {:?}",
+            cmds[0]
+        );
+    }
+
+    // ── Deadline-fraction config effect (issue #772 Finding 3) ──────────────
+
+    /// The 0.8 default is load-bearing: at 0.6 of the budget consumed, the
+    /// deadline branch must NOT trip. A silent default change to 0.5 would flip
+    /// this to a trip, so this test pins the default boundary's *effect*.
+    #[test]
+    fn default_fraction_does_not_trip_at_0_6_consumed() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // 18s of a 30s budget consumed (0.6). Remaining 12s > (1-0.8)*30 = 6s.
+        let clock = t0 + chrono::Duration::seconds(18);
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(
+            !ctx.should_continue_as_new(),
+            "at 0.6 consumed the DEFAULT 0.8 fraction must not trip"
+        );
+    }
+
+    /// The configured fraction actually shifts the boundary: the SAME 0.6-consumed
+    /// history that does not trip at 0.8 DOES trip at 0.5.
+    #[test]
+    fn configured_fraction_shifts_the_boundary() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let clock = t0 + chrono::Duration::seconds(18); // 0.6 consumed of 30s
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.5);
+        let ctx = deadline_ctx_with_policy(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+            policy,
+        );
+        // Remaining 12s ≤ (1-0.5)*30 = 15s ⇒ trips.
+        assert!(
+            ctx.should_continue_as_new(),
+            "at 0.6 consumed a 0.5 fraction must trip (proving config shifts the boundary)"
+        );
+    }
+
+    // ── Edge cases (issue #772 Finding 4) ───────────────────────────────────
+
+    /// (a) A clock recorded PAST the deadline (consumed > budget ⇒ negative
+    /// remaining) still trips at the default fraction.
+    #[test]
+    fn deadline_in_the_past_still_trips() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // 40s consumed of a 30s budget ⇒ deadline already 10s in the past.
+        let clock = t0 + chrono::Duration::seconds(40);
+        let ctx = deadline_ctx(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(
+            ctx.should_continue_as_new(),
+            "a run past its deadline must trip"
+        );
+    }
+
+    /// (b) Clamp endpoints: fraction 0.0 trips on any consumption; fraction 1.0
+    /// only trips once the deadline is reached (remaining ≤ 0).
+    #[test]
+    fn fraction_clamp_endpoints_behave() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        // fraction 0.0: trips even at 1s consumed of a 30s budget.
+        let clock = t0 + chrono::Duration::seconds(1);
+        let ctx0 = deadline_ctx_with_policy(
+            t0,
+            vec![recorded_now(clock)],
+            Some(chrono::Duration::seconds(30)),
+            WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.0),
+        );
+        assert!(
+            ctx0.should_continue_as_new(),
+            "fraction 0.0 must trip on any consumption"
+        );
+
+        // fraction 1.0, 29s consumed of 30s (still 1s remaining): must NOT trip.
+        let clock_before = t0 + chrono::Duration::seconds(29);
+        let ctx1_before = deadline_ctx_with_policy(
+            t0,
+            vec![recorded_now(clock_before)],
+            Some(chrono::Duration::seconds(30)),
+            WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(1.0),
+        );
+        assert!(
+            !ctx1_before.should_continue_as_new(),
+            "fraction 1.0 must not trip before the deadline is reached"
+        );
+
+        // fraction 1.0, exactly at the deadline (remaining 0): trips.
+        let clock_at = t0 + chrono::Duration::seconds(30);
+        let ctx1_at = deadline_ctx_with_policy(
+            t0,
+            vec![recorded_now(clock_at)],
+            Some(chrono::Duration::seconds(30)),
+            WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(1.0),
+        );
+        assert!(
+            ctx1_at.should_continue_as_new(),
+            "fraction 1.0 must trip once remaining <= 0"
+        );
+    }
+
+    /// (c) An `execution_timeout` so large that `start_time + budget` overflows
+    /// the representable range makes `deadline()` return `None`, and the deadline
+    /// branch degrades to false (never a panic, never an immediate trip).
+    #[test]
+    fn deadline_overflow_returns_none_and_does_not_trip() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // ~547k years — well past chrono's representable date range when added
+        // to a 2023 start, so checked_add_signed returns None.
+        let huge = chrono::Duration::days(200_000_000);
+        let ctx = deadline_ctx(t0, vec![recorded_now(t0)], Some(huge));
+        assert_eq!(ctx.deadline(), None, "an overflowing deadline must be None");
+        assert!(
+            !ctx.should_continue_as_new(),
+            "an overflowing deadline must not trip the deadline branch"
+        );
+        // And it must not have consumed/recorded a clock read (deadline() None
+        // short-circuits before the read).
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    /// (d) Continue-as-new re-anchors the deadline: a successor run whose
+    /// `WorkflowStarted` timestamp is later gets a fresh `deadline()` derived
+    /// from its OWN start time, not the predecessor's.
+    #[test]
+    fn deadline_reanchors_for_continue_as_new_successor() {
+        let predecessor_t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let successor_t0 = predecessor_t0 + chrono::Duration::seconds(100);
+        let budget = chrono::Duration::seconds(30);
+
+        let predecessor = deadline_ctx(predecessor_t0, vec![], Some(budget));
+        // A successor-shaped history: its first event is the successor's own
+        // WorkflowStarted with a later timestamp.
+        let successor = deadline_ctx(successor_t0, vec![], Some(budget));
+
+        assert_eq!(predecessor.deadline(), Some(predecessor_t0 + budget));
+        assert_eq!(successor.deadline(), Some(successor_t0 + budget));
+        assert_ne!(
+            predecessor.deadline(),
+            successor.deadline(),
+            "the successor must not inherit the predecessor's deadline"
+        );
     }
 
     #[tokio::test]

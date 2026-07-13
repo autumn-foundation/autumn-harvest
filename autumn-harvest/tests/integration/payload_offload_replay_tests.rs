@@ -151,6 +151,8 @@ async fn offloaded_history_replays_with_full_byte_fidelity() {
             execution_id: exec_id,
             events: stored_events.clone(),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
     assert!(
@@ -169,6 +171,8 @@ async fn offloaded_history_replays_with_full_byte_fidelity() {
             execution_id: exec_id,
             events: stored_events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
     assert!(

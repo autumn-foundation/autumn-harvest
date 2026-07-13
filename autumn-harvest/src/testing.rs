@@ -245,6 +245,8 @@ impl std::fmt::Display for ReplayReport {
 ///         },
 ///     ],
 ///     context_headers: None,
+///     execution_timeout: None,
+///     deadline_at: None,
 /// };
 /// let json = serde_json::to_string(&snapshot).unwrap();
 /// // Store `json` as a fixture file.
@@ -266,6 +268,29 @@ pub struct HistorySnapshot {
     /// map is not overridden by the replayer's ambient headers.
     #[serde(default)]
     pub context_headers: Option<HashMap<String, String>>,
+    /// The execution's `execution_timeout` budget (issue #772). When `Some`,
+    /// [`replay_from_snapshot`](WorkflowReplayer::replay_from_snapshot) threads
+    /// it into the replayed `WorkflowContext` (preferring it over the replayer's
+    /// global [`with_execution_timeout`](WorkflowReplayer::with_execution_timeout)),
+    /// so a deadline-aware history that recorded a `SideEffectRecorded{Now}`
+    /// deadline probe replays cleanly instead of false-reporting non-determinism.
+    /// Serialised as integer milliseconds; `None` (the field absent — a legacy
+    /// snapshot) falls back to the replayer's global timeout. A full history
+    /// export (`history_export::HistoryExportDocument`) serialises this field at
+    /// the same top-level name, so an exported history round-trips into this
+    /// snapshot verbatim.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::history_export::opt_duration_millis"
+    )]
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
+    /// (issue #772). When `Some`, the internal continue-as-new budget check reads
+    /// this instead of the nominal `start + execution_timeout`. `None` (absent /
+    /// legacy snapshot) falls back to no live deadline (the nominal is used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +321,11 @@ pub struct WorkflowReplayer {
     /// Metrics recorder injected into the replayed `WorkflowContext`.
     /// Defaults to `NoOpMetrics`; inject a counting recorder for replay-safety tests.
     metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    /// Effective `execution_timeout` budget threaded into the replayed
+    /// `WorkflowContext` (issue #772) so replays can exercise deadline-aware
+    /// `continue_as_new`. `None` (the default) matches a workflow with no
+    /// execution timeout.
+    execution_timeout: Option<chrono::Duration>,
 }
 
 impl Default for WorkflowReplayer {
@@ -311,6 +341,11 @@ struct SampledExecution {
     workflow_name: String,
     created_at: chrono::DateTime<chrono::Utc>,
     context_headers: Option<serde_json::Value>,
+    // Issue #772: per-execution deadline-aware CAN inputs, threaded into the
+    // canary replay so the deadline branch is enabled and computed against the
+    // row's own (pause/resume/redrive-shifted) deadline.
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl WorkflowReplayer {
@@ -324,7 +359,21 @@ impl WorkflowReplayer {
             payload_offloader: None,
             use_advancing_clock: false,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            execution_timeout: None,
         }
+    }
+
+    /// Set the effective `execution_timeout` budget threaded into the replayed
+    /// `WorkflowContext` (issue #772).
+    ///
+    /// Required to exercise deadline-aware `continue_as_new`: without it,
+    /// `ctx.deadline()` is `None` and `ctx.should_continue_as_new()` never fires
+    /// on the deadline branch, so a history that continued-as-new because of the
+    /// deadline would replay as a divergence.
+    #[must_use]
+    pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
+        self.execution_timeout = Some(execution_timeout);
+        self
     }
 
     /// Inject a [`MetricsRecorder`](crate::telemetry::MetricsRecorder) into replayed
@@ -479,7 +528,36 @@ impl WorkflowReplayer {
     /// Returns a [`ReplayReport`] regardless of outcome.  If
     /// `snapshot.workflow_name` is not registered, the report contains
     /// `ReplayStatus::WorkflowFailed` with a descriptive error.
+    ///
+    /// The deadline-aware continue-as-new budget (issue #772) prefers the
+    /// snapshot's own [`execution_timeout`](HistorySnapshot::execution_timeout) /
+    /// [`deadline_at`](HistorySnapshot::deadline_at) when the JSON carries them
+    /// (a full history export does), falling back to this replayer's global
+    /// [`with_execution_timeout`](Self::with_execution_timeout) for a legacy
+    /// snapshot without them. This makes a deadline-aware exported history
+    /// replay cleanly through the JSON / `harvest-replay` path instead of
+    /// false-reporting non-determinism. [`replay_from_db`](Self::replay_from_db)
+    /// threads the execution row's own values.
     pub async fn replay_from_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
+        // Prefer the per-snapshot metadata (issue #772); fall back to the
+        // replayer's global timeout for a legacy snapshot that lacks it.
+        let execution_timeout = snapshot.execution_timeout.or(self.execution_timeout);
+        let deadline_at = snapshot.deadline_at;
+        self.replay_from_snapshot_effective(snapshot, execution_timeout, deadline_at)
+            .await
+    }
+
+    /// Snapshot replay with an explicit per-execution `execution_timeout` /
+    /// live `deadline_at` (issue #772). The public
+    /// [`replay_from_snapshot`](Self::replay_from_snapshot) delegates here with
+    /// the global timeout and no live deadline; [`replay_from_db`](Self::replay_from_db)
+    /// passes the loaded execution row's own values.
+    async fn replay_from_snapshot_effective(
+        &self,
+        snapshot: HistorySnapshot,
+        execution_timeout: Option<chrono::Duration>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
                 execution_id: snapshot.execution_id,
@@ -525,6 +603,8 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 headers,
                 self.metrics.clone(),
+                execution_timeout,
+                deadline_at,
             )
             .await
         } else {
@@ -536,6 +616,8 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 headers,
                 self.metrics.clone(),
+                execution_timeout,
+                deadline_at,
             )
             .await
         };
@@ -543,7 +625,27 @@ impl WorkflowReplayer {
     }
 
     /// Replay a snapshot in canary mode (used for deploy-time verify).
+    ///
+    /// Prefers the snapshot's own `execution_timeout`/`deadline_at` when carried,
+    /// falling back to the global [`with_execution_timeout`](Self::with_execution_timeout)
+    /// (issue #772); [`run_canary`](Self::run_canary) threads each sampled
+    /// execution row's own values via
+    /// [`replay_canary_snapshot_effective`](Self::replay_canary_snapshot_effective).
     pub async fn replay_canary_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
+        let execution_timeout = snapshot.execution_timeout.or(self.execution_timeout);
+        let deadline_at = snapshot.deadline_at;
+        self.replay_canary_snapshot_effective(snapshot, execution_timeout, deadline_at)
+            .await
+    }
+
+    /// Canary snapshot replay with an explicit per-execution `execution_timeout`
+    /// / live `deadline_at` (issue #772).
+    async fn replay_canary_snapshot_effective(
+        &self,
+        snapshot: HistorySnapshot,
+        execution_timeout: Option<chrono::Duration>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
                 execution_id: snapshot.execution_id,
@@ -574,6 +676,8 @@ impl WorkflowReplayer {
             self.state.clone(),
             headers,
             self.metrics.clone(),
+            execution_timeout,
+            deadline_at,
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -668,6 +772,9 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 self.context_headers.clone(),
                 self.metrics.clone(),
+                self.execution_timeout,
+                // No per-row live deadline on the raw-events path (issue #772).
+                None,
             )
             .await
         } else {
@@ -679,6 +786,8 @@ impl WorkflowReplayer {
                 self.state.clone(),
                 self.context_headers.clone(),
                 self.metrics.clone(),
+                self.execution_timeout,
+                None,
             )
             .await
         };
@@ -778,17 +887,26 @@ impl WorkflowReplayer {
         // Load event history.
         let history = load_history(conn, exec_id).await?;
 
-        // Load workflow name and context headers from executions table.
-        let (workflow_name, context_headers) =
-            load_workflow_name_and_headers(conn, exec_id).await?;
+        // Load workflow name, context headers, and the per-execution
+        // deadline-aware CAN inputs (`execution_timeout` + live `deadline_at`)
+        // from the executions table (issue #772). Threading the row's own values
+        // — rather than the replayer-global `self.execution_timeout` — keeps the
+        // deadline branch enabled and computed against the correct deadline, so a
+        // row that recorded a `SideEffectRecorded{Now}` from the deadline branch
+        // replays cleanly instead of surfacing false non-determinism.
+        let meta = load_workflow_name_and_headers(conn, exec_id).await?;
 
         let snapshot = HistorySnapshot {
-            workflow_name,
+            workflow_name: meta.workflow_name,
             execution_id: exec_id,
             events: history.events,
-            context_headers: Some(context_headers),
+            context_headers: Some(meta.headers),
+            execution_timeout: meta.execution_timeout,
+            deadline_at: meta.deadline_at,
         };
-        Ok(self.replay_from_snapshot(snapshot).await)
+        Ok(self
+            .replay_from_snapshot_effective(snapshot, meta.execution_timeout, meta.deadline_at)
+            .await)
     }
 
     /// Run the replay canary over a sample of running executions.
@@ -820,13 +938,15 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers) in executions {
+            for (id, name, created, headers, exec_timeout, deadline_at) in executions {
                 all_executions.push(SampledExecution {
                     shard_id,
                     execution_id: crate::types::ExecutionId::from_uuid(id),
                     workflow_name: name,
                     created_at: created,
                     context_headers: headers,
+                    execution_timeout: exec_timeout,
+                    deadline_at,
                 });
             }
         }
@@ -873,10 +993,21 @@ impl WorkflowReplayer {
                                     execution_id: exec.execution_id,
                                     events: history.events,
                                     context_headers: headers,
+                                    execution_timeout: exec.execution_timeout,
+                                    deadline_at: exec.deadline_at,
                                 }
                             }; // `conn` is dropped here
 
-                            let report = replayer_ref.replay_canary_snapshot(snapshot).await;
+                            // Issue #772: thread the sampled execution row's own
+                            // `execution_timeout` / live `deadline_at` so the
+                            // deadline-aware CAN branch replays cleanly.
+                            let report = replayer_ref
+                                .replay_canary_snapshot_effective(
+                                    snapshot,
+                                    exec.execution_timeout,
+                                    exec.deadline_at,
+                                )
+                                .await;
                             Ok::<_, crate::error::HarvestError>(report)
                         };
 
@@ -999,11 +1130,13 @@ async fn query_running_executions(
         String,
         chrono::DateTime<chrono::Utc>,
         Option<serde_json::Value>,
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers, created_at, harvest_workflow_executions, id, queue_name, state,
-        workflow_name,
+        context_headers, created_at, deadline_at, execution_timeout, harvest_workflow_executions,
+        id, queue_name, state, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -1020,7 +1153,15 @@ async fn query_running_executions(
     }
 
     let rows = query
-        .select((id, workflow_name, created_at, context_headers))
+        .select((
+            id,
+            workflow_name,
+            created_at,
+            context_headers,
+            // Issue #772: thread the per-execution deadline-aware CAN inputs.
+            execution_timeout,
+            deadline_at,
+        ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
         .load::<(
@@ -1028,6 +1169,8 @@ async fn query_running_executions(
             String,
             chrono::DateTime<chrono::Utc>,
             Option<serde_json::Value>,
+            Option<chrono::Duration>,
+            Option<chrono::DateTime<chrono::Utc>>,
         )>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1130,14 +1273,27 @@ pub struct ReplayCanaryReport {
 // DB helper (db feature only)
 // ---------------------------------------------------------------------------
 
+/// Loaded per-execution replay metadata for [`WorkflowReplayer::replay_from_db`]
+/// (issue #772): workflow name, context headers, and the deadline-aware
+/// continue-as-new inputs — the row's own `execution_timeout` and live
+/// (pause/resume/redrive-shifted) `deadline_at`.
+#[cfg(feature = "db")]
+struct DbReplayMeta {
+    workflow_name: String,
+    headers: HashMap<String, String>,
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[cfg(feature = "db")]
 async fn load_workflow_name_and_headers(
     conn: &mut diesel_async::AsyncPgConnection,
     exec_id: ExecutionId,
-) -> crate::error::HarvestResult<(String, HashMap<String, String>)> {
+) -> crate::error::HarvestResult<DbReplayMeta> {
     use crate::error::{HarvestError, database_error};
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers as context_headers_col, harvest_workflow_executions, id as id_col,
+        context_headers as context_headers_col, deadline_at as deadline_at_col,
+        execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
         workflow_name,
     };
     use diesel::prelude::*;
@@ -1145,9 +1301,19 @@ async fn load_workflow_name_and_headers(
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers): (String, Option<serde_json::Value>) = harvest_workflow_executions
+    let (name, raw_headers, execution_timeout, deadline_at): (
+        String,
+        Option<serde_json::Value>,
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
-        .select((workflow_name, context_headers_col))
+        .select((
+            workflow_name,
+            context_headers_col,
+            execution_timeout_col,
+            deadline_at_col,
+        ))
         .first(conn)
         .await
         .map_err(|e| match e {
@@ -1166,7 +1332,12 @@ async fn load_workflow_name_and_headers(
         })
         .unwrap_or_default();
 
-    Ok((name, headers))
+    Ok(DbReplayMeta {
+        workflow_name: name,
+        headers,
+        execution_timeout,
+        deadline_at,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2075,6 +2246,15 @@ async fn replay_fixture_file(
     }
 
     // Build a single-use replayer and run with timeout.
+    //
+    // Known limitation (issue #772): `execution_timeout` is hardcoded to `None`
+    // here because the directory-fixture format (`HistorySnapshot` JSON) carries
+    // no execution-timeout field, so this path cannot validate
+    // deadline-triggered `continue_as_new` fixtures — `ctx.deadline()` is always
+    // `None` for directory replays. Follow-up: add an optional timeout field to
+    // the snapshot format if directory-driven deadline fixtures are needed. Tests
+    // that need a deadline use `WorkflowReplayer::with_execution_timeout` directly
+    // (see `tests/integration/replayer_tests.rs`).
     let replayer = WorkflowReplayer {
         handlers: handlers.clone(),
         state,
@@ -2082,6 +2262,7 @@ async fn replay_fixture_file(
         payload_offloader: None,
         use_advancing_clock: false,
         metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        execution_timeout: None,
     };
 
     let replay_result =
@@ -2185,6 +2366,14 @@ pub struct TestRunOutcome {
     /// Construction-time `simulated_now` (= `WorkflowStarted` timestamp), used
     /// to compute `final_now()` and `elapsed()` (issue #526).
     start_time: DateTime<Utc>,
+    /// Effective `execution_timeout` budget carried from the `WorkflowTestEnv`
+    /// that produced this outcome (issue #772). `replay_check` re-applies it to
+    /// the `WorkflowReplayer` it builds so the deadline branch is enabled during
+    /// the self-check — otherwise a deadline-aware history's recorded
+    /// `SideEffectRecorded{Now}` deadline probe is left unconsumed and reported
+    /// as a FALSE non-determinism. `None` (the default / no-timeout run) leaves
+    /// the replayer's deadline branch off, matching the live run.
+    execution_timeout: Option<chrono::Duration>,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -2306,19 +2495,35 @@ impl TestRunOutcome {
     /// The advancing virtual clock is enabled automatically (issue #526) so
     /// that time-branching workflows — those that branch on `ctx.now()` —
     /// replay correctly without a false `ReplayStatus::Failed`.
+    ///
+    /// The effective `execution_timeout` budget the producing
+    /// [`WorkflowTestEnv`] used (issue #772) is carried into the replayer so the
+    /// deadline branch is enabled during the self-check. Without it, a
+    /// deadline-aware history — one whose `should_continue_as_new()` recorded a
+    /// `SideEffectRecorded{Now}` deadline probe — would replay against a
+    /// deadline-disabled context, leave that probe unconsumed, and report a
+    /// FALSE non-determinism.
     pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
         let snapshot = crate::testing::HistorySnapshot {
             workflow_name: "__test__".to_string(),
             execution_id: self.exec_id,
             events: self.events.clone(),
             context_headers: None,
+            // Carry the test env's deadline budget on the snapshot too (issue
+            // #772); `replay_from_snapshot` prefers it, and the global
+            // `with_execution_timeout` below is retained as an equivalent
+            // fallback for older callers.
+            execution_timeout: self.execution_timeout,
+            deadline_at: None,
         };
-        WorkflowReplayer::new()
+        let mut replayer = WorkflowReplayer::new()
             .with_existing_state(self.state.clone())
             .register_fn("__test__", handler)
-            .with_advancing_timer_clock()
-            .replay_from_snapshot(snapshot)
-            .await
+            .with_advancing_timer_clock();
+        if let Some(execution_timeout) = self.execution_timeout {
+            replayer = replayer.with_execution_timeout(execution_timeout);
+        }
+        replayer.replay_from_snapshot(snapshot).await
     }
 }
 
@@ -2400,6 +2605,10 @@ pub struct WorkflowTestEnv {
     /// Task queue name threaded into the `WorkflowContext` so in-context
     /// engine metrics carry a real `queue` label. Defaults to `""`.
     queue_name: String,
+    /// Effective `execution_timeout` budget threaded into the `WorkflowContext`
+    /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
+    /// `None` (the default) matches a workflow with no execution timeout.
+    execution_timeout: Option<chrono::Duration>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -2429,6 +2638,7 @@ impl WorkflowTestEnv {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             workflow_name: String::new(),
             queue_name: String::new(),
+            execution_timeout: None,
         }
     }
 
@@ -2636,6 +2846,16 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the effective `execution_timeout` budget for the contexts this env
+    /// builds (issue #772), so `ctx.deadline()` /
+    /// `ctx.should_continue_as_new()` can reason about deadline-aware
+    /// continue-as-new inside a live test run.
+    #[must_use]
+    pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
+        self.execution_timeout = Some(execution_timeout);
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -2707,7 +2927,10 @@ impl WorkflowTestEnv {
         // the executor's span-meta plumbing, the same path the worker uses)
         // so engine metrics emitted from inside the workflow carry real
         // labels a test can assert on.
-        let span_meta = if self.workflow_name.is_empty() && self.queue_name.is_empty() {
+        let span_meta = if self.workflow_name.is_empty()
+            && self.queue_name.is_empty()
+            && self.execution_timeout.is_none()
+        {
             None
         } else {
             Some(WorkflowExecuteSpanMeta {
@@ -2718,6 +2941,13 @@ impl WorkflowTestEnv {
                 is_replay: false,
                 link_traceparent: None,
                 build_id: None,
+                // Issue #772: thread the deadline budget so a live test run can
+                // exercise deadline-aware continue-as-new.
+                execution_timeout: self.execution_timeout,
+                // The test-env carries only the timeout; `ctx.deadline()` falls
+                // back to `start + execution_timeout` (no resume/redrive shift
+                // to model here).
+                deadline_at: None,
             })
         };
 
@@ -2767,6 +2997,7 @@ impl WorkflowTestEnv {
                                 exec_id,
                                 state: self.state.clone(),
                                 start_time,
+                                execution_timeout: self.execution_timeout,
                             };
                         }
                     };
@@ -2780,6 +3011,7 @@ impl WorkflowTestEnv {
                             exec_id,
                             state: self.state.clone(),
                             start_time,
+                            execution_timeout: self.execution_timeout,
                         };
                     }
                 }
@@ -2804,6 +3036,7 @@ impl WorkflowTestEnv {
             exec_id,
             state: self.state.clone(),
             start_time,
+            execution_timeout: self.execution_timeout,
         }
     }
 
@@ -2857,6 +3090,7 @@ impl WorkflowTestEnv {
             exec_id,
             state: self.state.clone(),
             start_time,
+            execution_timeout: self.execution_timeout,
         }
     }
 

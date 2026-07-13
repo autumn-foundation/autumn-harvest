@@ -545,6 +545,155 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
 }
 
 #[tokio::test]
+async fn batch_export_carries_deadline_metadata_for_replay() {
+    // Issue #772 (Codex Finding B): a batch history export of a deadline-aware
+    // workflow must carry `execution_timeout`/`deadline_at` at the top level so
+    // the exported JSON round-trips the continue-as-new deadline budget into the
+    // `replay_from_json` / `harvest-replay` path — exactly as the single-execution
+    // export already does. Before the fix, the batch candidate query did not
+    // SELECT those columns, so every batch export serialized them as `None`;
+    // replaying such a fixture disabled the deadline branch, left the recorded
+    // `SideEffectRecorded{Now}` deadline probe unconsumed, and false-reported
+    // non-determinism.
+    let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
+        return;
+    };
+
+    // A deadline-aware history whose recorded activity PINS the
+    // `should_continue_as_new()` decision: `checkpoint_now` was scheduled because
+    // the deadline branch tripped (27s of a 30s budget consumed => 0.9 >= 0.8).
+    // On replay WITHOUT the threaded deadline, the branch would instead schedule
+    // `keep_working` and diverge — so a clean replay proves the deadline metadata
+    // was carried, not merely that the export shape parsed.
+    let t0 = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let recorded_now = t0 + Duration::seconds(27);
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: json!({ "cycle": 0 }),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: json!(recorded_now.timestamp_millis()),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "checkpoint_now".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: json!("done"),
+        },
+    ];
+    let exec_id = insert_execution(
+        &database_url,
+        ShardId::new(0),
+        "deadline_branch_probe",
+        "fixture-batch-deadline",
+        "COMPLETED",
+        events,
+    )
+    .await;
+    // Stamp the deadline budget on the execution row: 30s timeout with a live
+    // `deadline_at` at `t0 + 30s`. The batch export must carry BOTH.
+    set_execution_deadline(
+        &database_url,
+        exec_id,
+        Duration::seconds(30),
+        t0 + Duration::seconds(30),
+    )
+    .await;
+
+    let app = build_api_app(
+        HarvestDbPool::from(build_test_pool(&database_url)),
+        ShardRouter::single(),
+    );
+    let (status, json) = get_json(
+        &app,
+        "/admin/history/exports?workflow_name=deadline_branch_probe&state_group=terminal&limit=1000&payload_policy=full",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let export = &json["exports"][0];
+    assert_eq!(export["workflow_name"], "deadline_branch_probe");
+    // The batch export must carry the deadline metadata at the top level.
+    assert_eq!(
+        export["execution_timeout"], 30_000_i64,
+        "execution_timeout must serialise as top-level integer millis (30s = 30000ms)"
+    );
+    assert!(
+        export["deadline_at"].is_string(),
+        "batch export must carry the live deadline_at: {export}"
+    );
+
+    // Round-trip the exported document through the JSON replay path.
+    let fixture_json = serde_json::to_string(export).expect("export renders");
+    let report = WorkflowReplayer::new()
+        .register_fn("deadline_branch_probe", deadline_branch_probe_workflow)
+        .replay_from_json(&fixture_json)
+        .await
+        .expect("batch export should parse as a replay fixture");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a batch-exported deadline-aware history must replay successfully once the \
+         export carries execution_timeout/deadline_at: {report}"
+    );
+}
+
+/// Deadline-aware decision probe (issue #772): the `should_continue_as_new()`
+/// outcome selects which activity is scheduled, so a *wrong* decision (a
+/// disabled deadline branch) schedules the other activity and diverges on
+/// replay — making the batch-export deadline round-trip falsifiable.
+fn deadline_branch_probe_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = if ctx.should_continue_as_new() {
+            "checkpoint_now"
+        } else {
+            "keep_working"
+        };
+        ctx.execute_activity_raw(activity, Value::Null, "default")
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Stamps a deadline budget (`execution_timeout` + live `deadline_at`) onto an
+/// existing execution row (issue #772).
+async fn set_execution_deadline(
+    database_url: &str,
+    exec_id: ExecutionId,
+    execution_timeout: Duration,
+    deadline_at: chrono::DateTime<Utc>,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to test database");
+    diesel::update(
+        autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
+    )
+    .set((
+        autumn_harvest::schema::harvest_workflow_executions::execution_timeout
+            .eq(Some(execution_timeout)),
+        autumn_harvest::schema::harvest_workflow_executions::deadline_at.eq(Some(deadline_at)),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to stamp execution deadline budget");
+}
+
+#[tokio::test]
 async fn batch_updated_window_uses_latest_history_event_timestamp() {
     let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
         return;

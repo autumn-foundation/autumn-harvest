@@ -878,6 +878,8 @@ async fn replay_await_condition_non_deterministic_divergence_fails() {
             execution_id: exec_id,
             events: history,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 

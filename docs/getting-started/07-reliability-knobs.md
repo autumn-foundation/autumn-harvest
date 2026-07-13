@@ -106,6 +106,78 @@ down to `execution_timeout`** at start time. Pause suspends the SLA clock
 (resume pushes `sla_deadline_at` forward by the paused span), so a deliberately
 parked run never false-breaches.
 
+**Checkpoint before the deadline kills you (deadline-aware `continue_as_new`).**
+A long-lived entity workflow (a subscription, a cart, a device) can run for
+weeks while recording only a handful of events — it never approaches the history
+event-count threshold that `ctx.should_continue_as_new()` watches. But if it
+declares an `execution_timeout` for runaway protection, that hard timeout will
+eventually terminate it mid-flight even though it is perfectly healthy. To avoid
+that, `should_continue_as_new()` has a **second trigger** (issue #772): it also
+returns `true` once the run has consumed a configurable fraction (default
+`0.8`) of its `execution_timeout` budget. Checkpoint with `continue_as_new`
+*before* the hard deadline truncates you, carrying state forward into a fresh
+run with a fresh deadline:
+
+```rust
+#[workflow(execution_timeout = "24h")]
+async fn subscription_entity(ctx: &WorkflowContext, state: SubState) -> Result<SubState, String> {
+    // Fires on history size OR ~80% of the execution_timeout budget.
+    if ctx.should_continue_as_new() {
+        ctx.continue_as_new(serde_json::to_value(&state).unwrap()).await?;
+    }
+    // ... one cycle of durable work ...
+    Ok(state)
+}
+```
+
+Two replay-safe, event-free accessors back this: `ctx.deadline()` (the
+**nominal** `WorkflowStarted` timestamp + effective `execution_timeout`, or
+`None` when there is no timeout) and `ctx.time_until_deadline()` (remaining time
+to the nominal deadline, measured against the replay-safe recorded clock
+`ctx.system_now()`, **never** `chrono::Utc::now()`). A workflow with **no**
+`execution_timeout` behaves exactly as before and records nothing extra. Tune
+the fraction with `HarvestBuilder::history_continue_as_new_deadline_fraction(f64)`
+(clamped to `[0.0, 1.0]`). **No new event variant, no migration** — the nominal
+deadline is derived from the recorded start time and the clock read reuses the
+existing `SideEffectRecorded{Now}` event, so a history that crossed the deadline
+replays to the same `continue_as_new` on every worker. See
+`examples/long_lived_entity_deadline.rs`.
+
+**Public `deadline()` is nominal; the CAN budget check accounts for pause
+extensions.** For a run that was **paused/resumed** (#383) or redriven, the
+engine pushes the run's *live* hard deadline (`deadline_at`, which the timeout
+scanner enforces) forward past `start + execution_timeout`. The public
+`ctx.deadline()`/`ctx.time_until_deadline()` deliberately stay on the **nominal**
+`start + execution_timeout` — a replay-stable value you can branch on or embed in
+an activity/child input without a non-deterministic divergence after a resume —
+so they do **not** reflect pause extensions. The engine's **internal**
+`should_continue_as_new()` budget check *does* read the live shifted deadline, so
+a healthy run that was paused for a long time is not forced to checkpoint the
+moment it resumes. **Contract:** whenever `should_continue_as_new()` returns
+`true`, call `continue_as_new` (as above) rather than continuing to run — that is
+what keeps the internal live-deadline read replay-safe.
+
+**Call `should_continue_as_new()` once per decision cycle.** When the workflow
+declares an `execution_timeout`, each `should_continue_as_new()` call reads the
+deadline clock and records **one** `SideEffectRecorded{Now}` event on the live
+frontier (a no-timeout workflow records nothing). Call it once at the top of a
+decision cycle — not in a tight inner loop that fires it dozens of times per
+cycle — or the history grows a `Now` event per call.
+
+**Rollout is graceful — no "upgrade the fleet first" dance.** An in-flight
+execution recorded *before* this feature shipped carries no deadline clock read
+at the `should_continue_as_new()` call site. When it resumes under a
+deadline-aware binary the deadline branch degrades to history-count-only for the
+run's already-recorded portion (it does **not** nd-block), and it picks the
+deadline feature up automatically once it executes live past its pre-upgrade
+frontier. You can deploy the new binary while such runs are in flight without
+any special sequencing. The engine's deadline clock read is recorded under a
+reserved side-effect name, so it never consumes an author-side `ctx.system_now()`
+/ `ctx.sleep_until()` `Now` — even a pre-upgrade history where the
+`should_continue_as_new()` check sits immediately before a `ctx.system_now()`
+call replays cleanly, with that `Now` matched by the workflow's own read rather
+than the deadline probe.
+
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.patched()` — the recommended default for the
 overwhelmingly common two-state (before/after) change — so old executions

@@ -21,9 +21,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
+use autumn_harvest::WorkflowEvent;
+use autumn_harvest::history_export::HistoryExportDocument;
+use autumn_harvest::retention::{
+    ArchiverFuture, HistoryArchiver, RetentionConfig, RetentionRuntime,
+};
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
+use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{Nullable, Text, Timestamptz};
@@ -563,4 +568,190 @@ async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
     assert_eq!(result.deleted_by_workflow.get("global_wf"), Some(&1));
     assert!(!result.deleted_by_workflow.contains_key("archive_wf"));
     assert_eq!(metrics.deleted(), vec![("global_wf".to_string(), 1)]);
+}
+
+// Issue #772 (Codex Finding A): the retention archive writes the LAST cold-storage
+// copy before an execution row is permanently deleted. A completed / continued
+// run can carry a recorded `SideEffectRecorded{Now}` deadline probe (issue #772)
+// before its next command or terminal event, so the archived
+// `HistoryExportDocument` MUST carry `execution_timeout`/`deadline_at` — replaying
+// the archive later with no deadline would leave that probe unconsumed and
+// false-report non-determinism, and after deletion there is no row left from
+// which an operator could recover the missing values.
+//
+// Falsifiable: before the fix the retention `HistoryExportRequest` hardcoded
+// `execution_timeout: None, deadline_at: None`, so the captured archive doc's
+// deadline metadata was absent even though the deleted row carried it.
+#[tokio::test]
+async fn retention_archive_carries_deadline_metadata() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    let two_days_ago = now - chrono::Duration::days(2);
+    // The live effective deadline the timeout scanner enforced for this run.
+    // Whole-second so it round-trips through Postgres `timestamptz` (microsecond
+    // precision) with an exact equality check against the archived document.
+    let deadline_at =
+        DateTime::from_timestamp(two_days_ago.timestamp() + 30, 0).expect("valid deadline");
+    let exec_id = insert_completed_with_deadline(
+        &mut conn,
+        "deadline_wf",
+        "dw1",
+        two_days_ago,
+        30,
+        deadline_at,
+    )
+    .await;
+
+    // Global 1-day age -> the 2-day-old row is eligible for deletion+archival.
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let archiver = Arc::new(CapturingArchiver::default());
+
+    let result = run_one_tick_with_archiver(
+        pool,
+        config,
+        Arc::clone(&metrics),
+        Arc::clone(&archiver) as Arc<dyn HistoryArchiver>,
+    )
+    .await;
+
+    assert_eq!(
+        result.deleted_count, 1,
+        "the eligible row is archived+deleted"
+    );
+    assert!(
+        surviving_names(&mut conn).await.is_empty(),
+        "the archived row is deleted from the primary store"
+    );
+
+    let docs = archiver.docs();
+    assert_eq!(docs.len(), 1, "exactly one execution was archived");
+    let doc = &docs[0];
+    assert_eq!(doc.execution_id, exec_id);
+    // The archive — the last surviving copy — must carry the deadline budget.
+    assert_eq!(
+        doc.execution_timeout.map(|d| d.num_seconds()),
+        Some(30),
+        "archived doc must carry execution_timeout (issue #772 Finding A)"
+    );
+    assert_eq!(
+        doc.deadline_at,
+        Some(deadline_at),
+        "archived doc must carry the live deadline_at (issue #772 Finding A)"
+    );
+    // The archived history genuinely contains the deadline probe the missing
+    // metadata would strand unconsumed on a later replay.
+    assert_eq!(
+        doc.events.len(),
+        2,
+        "WorkflowStarted + deadline probe archived"
+    );
+    assert_eq!(doc.events[1]["type"], "SideEffectRecorded");
+    assert_eq!(
+        doc.events[1]["data"]["name"],
+        autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME
+    );
+}
+
+/// Capturing archiver — records the `HistoryExportDocument` handed to the
+/// retention janitor so a test can assert what the last cold-storage copy
+/// carried (issue #772 Finding A).
+#[derive(Default)]
+struct CapturingArchiver {
+    docs: Mutex<Vec<HistoryExportDocument>>,
+}
+
+impl CapturingArchiver {
+    fn docs(&self) -> Vec<HistoryExportDocument> {
+        self.docs.lock().unwrap().clone()
+    }
+}
+
+impl HistoryArchiver for CapturingArchiver {
+    fn archive(&self, doc: &HistoryExportDocument) -> ArchiverFuture<'_> {
+        self.docs.lock().unwrap().push(doc.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Drives a single retention tick with a registered archiver and returns the
+/// shard-0 result.
+async fn run_one_tick_with_archiver(
+    pool: DbPool,
+    config: RetentionConfig,
+    metrics: Arc<CapturingMetrics>,
+    archiver: Arc<dyn HistoryArchiver>,
+) -> autumn_harvest::retention::RetentionTickResult {
+    let pools = ShardedDbPool::single(pool);
+    let runtime = RetentionRuntime::spawn(pools, config, metrics, Some(archiver), None)
+        .expect("retention runtime should spawn when enabled");
+    runtime.run_now();
+
+    let mut result = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.ran_at.is_some()
+        {
+            result = Some(r.clone());
+            break;
+        }
+    }
+    runtime.shutdown();
+    result.expect("retention tick did not report a result in time")
+}
+
+/// Inserts a terminal (COMPLETED) execution carrying an `execution_timeout` +
+/// live `deadline_at` and a deadline-probe-bearing history (issue #772).
+async fn insert_completed_with_deadline(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    completed_at: DateTime<Utc>,
+    execution_timeout_secs: i32,
+    deadline_at: DateTime<Utc>,
+) -> ExecutionId {
+    let id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
+             execution_timeout, deadline_at)
+         VALUES ($1, $2, 0, 'COMPLETED', '{}'::jsonb, $3, $3,
+             make_interval(secs => $4), $5)
+         RETURNING id",
+    )
+    .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Timestamptz, _>(completed_at)
+    .bind::<diesel::sql_types::Double, _>(f64::from(execution_timeout_secs))
+    .bind::<Timestamptz, _>(deadline_at)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("insert execution")
+    .id;
+
+    let exec_id = ExecutionId::from_uuid(id);
+    let recorded_now = completed_at;
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: completed_at,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(recorded_now.timestamp_millis()),
+        },
+    ];
+    autumn_harvest::store::append_events(conn, exec_id, &events, 0)
+        .await
+        .expect("append probe history");
+    exec_id
 }

@@ -107,6 +107,9 @@ name = "business_metrics"
 name = "sleep_until_renewal_reminder"
 
 [[example]]
+name = "long_lived_entity_deadline"
+
+[[example]]
 name = "cancellable_timer_sla"
 
 [[example]]

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel::prelude::*;
 #[cfg(feature = "db")]
-use diesel::sql_types::{Array, BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{Array, BigInt, Interval, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, RunQueryDsl};
 #[cfg(feature = "db")]
@@ -1010,6 +1010,14 @@ struct CandidateExecution {
     legal_hold_set_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     legal_hold_until: Option<DateTime<Utc>>,
+    /// Deadline-aware replay budget (issue #772), carried into the pre-deletion
+    /// archive document so a completed/continued run whose history recorded a
+    /// `SideEffectRecorded{Now}` deadline probe replays cleanly from cold storage
+    /// (the archive is the last surviving copy; the row is deleted moments after).
+    #[diesel(sql_type = Nullable<Interval>) ]
+    execution_timeout: Option<chrono::Duration>,
+    #[diesel(sql_type = Nullable<Timestamptz>) ]
+    deadline_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(feature = "db")]
@@ -1184,7 +1192,7 @@ async fn run_shard_tick(
                 // is the `'-infinity'` literal and the cursor/limit binds shift
                 // down by one.
                 let sql = if global_fallback.is_some() {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -1203,7 +1211,7 @@ async fn run_shard_tick(
                      LIMIT $6
                      FOR UPDATE SKIP LOCKED"
                 } else {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -1493,6 +1501,15 @@ async fn run_shard_tick(
                                 .context_headers
                                 .as_ref()
                                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            // Issue #772 (Finding A): the archive is the LAST
+                            // surviving copy before the row is deleted. A terminal
+                            // (completed/continued) run can carry a recorded
+                            // `SideEffectRecorded{Now}` deadline probe before its
+                            // next command; carrying the row's execution_timeout /
+                            // live deadline_at lets the archived document replay
+                            // cleanly instead of false-reporting non-determinism.
+                            execution_timeout: candidate.execution_timeout,
+                            deadline_at: candidate.deadline_at,
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {
@@ -2961,6 +2978,8 @@ mod tests {
             context_headers: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
+            execution_timeout: None,
+            deadline_at: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -2971,6 +2990,8 @@ mod tests {
             context_headers: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
+            execution_timeout: None,
+            deadline_at: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,

@@ -178,6 +178,18 @@ pub struct WorkflowExecuteSpanMeta {
     pub link_traceparent: Option<String>,
     /// The worker build ID of the worker executing this workflow.
     pub build_id: Option<String>,
+    /// The effective `execution_timeout` budget for this run (issue #243/#772),
+    /// threaded into the [`WorkflowContext`] as the deadline fallback and as the
+    /// total budget for the deadline-fraction continue-as-new check. `None` when
+    /// the workflow has no `execution_timeout`.
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The authoritative absolute deadline for this run (issue #772), read live
+    /// from the execution row's `deadline_at` column. Threaded into the
+    /// [`WorkflowContext`] so `ctx.deadline()` / `ctx.should_continue_as_new()`
+    /// reason about the **effective** deadline the timeout scanner enforces —
+    /// which pause/resume (#383) and redrive push forward past
+    /// `started_at + execution_timeout`. `None` = fall back to start + timeout.
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Classification of a bounded, read-only query-replay drive (issue #612).
@@ -506,7 +518,7 @@ pub async fn run_workflow(
 /// returning a non-determinism error on any mismatch.  This is used by
 /// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
 /// input-changing code changes before deployment.
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub async fn run_workflow_strict(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -515,9 +527,17 @@ pub async fn run_workflow_strict(
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
+    execution_timeout: Option<chrono::Duration>,
+    // Issue #772: the per-execution live effective `deadline_at` (pause/resume/
+    // redrive-shifted), threaded so the internal continue-as-new budget check
+    // reasons about the same deadline the timeout scanner enforces. `None` falls
+    // back to `start + execution_timeout` (the file/JSON replay path).
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
+        .with_execution_timeout(execution_timeout)
+        .with_deadline(deadline_at)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -528,7 +548,7 @@ pub async fn run_workflow_strict(
 /// `replay_check` on a [`TestRunOutcome`](crate::testing::TestRunOutcome) can
 /// verify time-branching workflows without false non-determinism failures.
 #[cfg(any(test, feature = "testing"))]
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub(crate) async fn run_workflow_strict_advancing_clock(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -537,10 +557,16 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
+    execution_timeout: Option<chrono::Duration>,
+    // Issue #772: per-execution live effective `deadline_at` (see
+    // [`run_workflow_strict`]).
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_advancing_timer_clock()
+        .with_execution_timeout(execution_timeout)
+        .with_deadline(deadline_at)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -721,7 +747,11 @@ async fn run_strict_with_ctx(
 /// context. If execution reaches the end of the recorded history and suspends,
 /// it returns `WorkflowOutcome::Suspended` rather than a non-determinism error.
 /// If it suspends *before* all events in history are processed, it fails.
-#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub(crate) async fn run_workflow_canary(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -730,9 +760,15 @@ pub(crate) async fn run_workflow_canary(
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
+    execution_timeout: Option<chrono::Duration>,
+    // Issue #772: per-execution live effective `deadline_at` (see
+    // [`run_workflow_strict`]).
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
+        .with_execution_timeout(execution_timeout)
+        .with_deadline(deadline_at)
         .with_metrics(metrics);
 
     let span = tracing::info_span!(
@@ -959,6 +995,13 @@ pub async fn run_workflow_with_state_advancing_clock(
     // assert metric label content (issue #801 post-review P3).
     .with_workflow_name(span_meta.map_or("", |m| m.workflow_name.as_str()))
     .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
+    // Issue #772: thread the execution-timeout budget so a WorkflowTestEnv run
+    // can exercise deadline-aware continue-as-new.
+    .with_execution_timeout(span_meta.and_then(|m| m.execution_timeout))
+    // Issue #772: thread the authoritative absolute deadline (the effective,
+    // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
+    // the timeout scanner rather than a stale start+timeout recompute.
+    .with_deadline(span_meta.and_then(|m| m.deadline_at))
     .with_metrics(metrics);
     drive_workflow(ctx, handler, input, span_meta).await
 }
@@ -1032,6 +1075,11 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
     .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
+    .with_execution_timeout(span_meta.and_then(|m| m.execution_timeout))
+    // Issue #772: thread the authoritative absolute deadline (the effective,
+    // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
+    // the timeout scanner rather than a stale start+timeout recompute.
+    .with_deadline(span_meta.and_then(|m| m.deadline_at))
     .with_payload_caps(
         max_activity_input_bytes,
         0,
@@ -1873,6 +1921,8 @@ mod tests {
             is_replay: false,
             link_traceparent: None,
             build_id: None,
+            execution_timeout: None,
+            deadline_at: None,
         }
     }
 

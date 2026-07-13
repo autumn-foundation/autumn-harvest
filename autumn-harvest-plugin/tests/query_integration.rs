@@ -326,6 +326,70 @@ fn continue_as_new_info() -> WorkflowInfo {
     }
 }
 
+/// Issue #772 (round 6): a workflow with an `execution_timeout` that performs
+/// the deadline-aware `should_continue_as_new()` checkpoint check (recording /
+/// consuming the reserved `__harvest_deadline_probe` side-effect) BEFORE
+/// processing each item. Its recorded history therefore carries the probe
+/// event — a query replay context that fails to thread the execution's
+/// `execution_timeout`/`deadline_at` leaves that probe unconsumed and diverges.
+fn deadline_probe_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let processed = Arc::new(std::sync::Mutex::new(0u64));
+        let state = processed.clone();
+        ctx.register_query_handler::<Value, u64, _>("progress", move |_req: &Value| {
+            Ok(*state.lock().expect("counter lock"))
+        });
+
+        // Deadline-aware checkpoint: records/consumes the reserved
+        // __harvest_deadline_probe side-effect when the run has an
+        // execution_timeout (#772). It must not trip in this fixture (the
+        // deadline is 24h out and the history is tiny).
+        if ctx.should_continue_as_new() {
+            return Err("fixture must not trip continue-as-new".to_string());
+        }
+
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            ctx.execute_activity_raw("process_item", item.clone(), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            *processed.lock().expect("counter lock") += 1;
+        }
+        Ok(json!({ "processed": *processed.lock().expect("counter lock") }))
+    })
+}
+
+fn deadline_probe_info() -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name: "deadline_probe_wf",
+        module: "tests",
+        handler: deadline_probe_workflow,
+        execution_timeout: Some(Duration::from_secs(24 * 3600)),
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
 fn spin_info() -> WorkflowInfo {
     WorkflowInfo {
         mcp: false,
@@ -386,7 +450,12 @@ fn build_app_with_query_timeout(pool: &DbPool, query_timeout: Duration) -> Harve
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(
-            vec![progress_info(), continue_as_new_info(), spin_info()],
+            vec![
+                progress_info(),
+                continue_as_new_info(),
+                spin_info(),
+                deadline_probe_info(),
+            ],
             vec![],
         )),
         Arc::new(DagCatalog::default()),
@@ -881,5 +950,168 @@ async fn ac6_spinning_replay_returns_408() {
         status,
         StatusCode::REQUEST_TIMEOUT,
         "a spinning replay → 408: {body:?}"
+    );
+}
+
+// ── Issue #772 (round 6): deadline probe × query hydration ───────────────────
+//
+// A workflow with an `execution_timeout` records a `__harvest_deadline_probe`
+// side-effect whenever it calls `should_continue_as_new()`. The query hydration
+// paths (`hydrate_ctx_for_query` for the HTTP API here, and the in-process
+// `execute_query_in_process` in `handle.rs`) must thread the execution row's
+// `execution_timeout` + `deadline_at` into their replay context, or the probe is
+// left unconsumed and the query diverges (500 during drive, or a spurious 410 on
+// the terminal drift check). These DB-backed tests exercise the real HTTP path.
+
+/// Seed an execution row carrying `execution_timeout` (INTERVAL) and
+/// `deadline_at` (TIMESTAMPTZ) plus a history whose events include the deadline
+/// probe — so `load_execution` in `hydrate_ctx_for_query` surfaces the budget the
+/// fix threads into the replay context.
+async fn seed_execution_with_deadline(
+    pool: &DbPool,
+    workflow_name: &str,
+    state: &str,
+    input: Value,
+    events: Vec<WorkflowEvent>,
+    timeout_secs: f64,
+    deadline_at: chrono::DateTime<Utc>,
+) -> ExecutionId {
+    let mut conn = pool.get().await.expect("pooled conn");
+    let exec_id = ExecutionId::new();
+
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, queue_name, state, \
+          execution_timeout, deadline_at) \
+         VALUES ($1, $2, $3, 0, $4, 'default', $5, make_interval(secs => $6), $7)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+    .bind::<diesel::sql_types::Jsonb, _>(input)
+    .bind::<diesel::sql_types::Text, _>(state)
+    .bind::<diesel::sql_types::Double, _>(timeout_secs)
+    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at)
+    .execute(&mut conn)
+    .await
+    .expect("seed execution with deadline");
+
+    store::append_events(&mut conn, exec_id, &events, 0)
+        .await
+        .expect("seed history");
+    exec_id
+}
+
+/// `WorkflowStarted` + the reserved deadline probe + one scheduled/completed
+/// pair per item. Returns the input, the events, and the 24h-out deadline the
+/// run was recorded against.
+fn deadline_probe_history(
+    items: &[&str],
+    completed: bool,
+) -> (Value, Vec<WorkflowEvent>, chrono::DateTime<Utc>) {
+    let t0 = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let deadline = t0 + chrono::Duration::hours(24);
+    let recorded_now = t0 + chrono::Duration::seconds(1);
+    let input = json!({ "items": items });
+    let mut events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: t0,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
+            value: json!(recorded_now.timestamp_millis()),
+        },
+    ];
+    for item in items {
+        let id = ActivityExecId::new();
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: "process_item".into(),
+            input: json!(item),
+            queue: "default".into(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: Value::Null,
+        });
+    }
+    if completed {
+        events.push(WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        });
+    }
+    (input, events, deadline)
+}
+
+/// The finding (P2): querying a RUNNING workflow whose history contains the
+/// deadline probe must succeed with the reconstructed count — NOT diverge —
+/// once the hydration path threads the `execution_timeout`/`deadline_at`.
+#[tokio::test]
+async fn deadline_probe_running_query_serves_reconstructed_state() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (input, events, deadline) = deadline_probe_history(&["a", "b", "c"], false);
+    let exec_id = seed_execution_with_deadline(
+        &pool,
+        "deadline_probe_wf",
+        "RUNNING",
+        input,
+        events,
+        24.0 * 3600.0,
+        deadline,
+    )
+    .await;
+
+    let (status, body) = get(&app, &format!("/workflows/{exec_id}/query/progress")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a RUNNING query over a deadline-probe history must serve 200, not diverge: {body:?}"
+    );
+    assert_eq!(
+        body,
+        json!(3),
+        "the query reports the fully reconstructed count across the probe: {body:?}"
+    );
+}
+
+/// The finding (P2, terminal drift): querying a TERMINAL (COMPLETED) workflow
+/// whose history contains the deadline probe must serve 200 — NOT a spurious 410
+/// from the drift check that mistakes the unconsumed probe for leftover history.
+#[tokio::test]
+async fn deadline_probe_terminal_query_serves_not_gone() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (input, events, deadline) = deadline_probe_history(&["x", "y"], true);
+    let exec_id = seed_execution_with_deadline(
+        &pool,
+        "deadline_probe_wf",
+        "COMPLETED",
+        input,
+        events,
+        24.0 * 3600.0,
+        deadline,
+    )
+    .await;
+
+    let (status, body) = get(&app, &format!("/workflows/{exec_id}/query/progress")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a terminal query over a deadline-probe history must serve 200, not a spurious 410: {body:?}"
+    );
+    assert_eq!(
+        body,
+        json!(2),
+        "the terminal query reports the final reconstructed count: {body:?}"
     );
 }

@@ -281,10 +281,10 @@ pub use completion_trigger::{
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
 };
 pub use context::{
-    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-    DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder, RaceWinner, Session, SessionOptions,
-    TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy,
-    is_reserved_session_activity_name,
+    ActivityContext, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
+    DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder,
+    RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand,
+    WorkflowContext, WorkflowHistoryPolicy, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -367,8 +367,8 @@ pub use policy::{
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
-    ChildOrTimerMatch, HistoryMatch, HistoryMatcher, PatchMarkerMatch, SagaMarkerMatch,
-    SignalOrTimerMatch, TimerFireMatch,
+    ChildOrTimerMatch, DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher,
+    PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch, TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{

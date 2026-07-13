@@ -237,6 +237,9 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             empty_shared_state(),
             std::collections::HashMap::new(),
             std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            None,
+            // Issue #772: no per-execution execution_timeout / live deadline_at.
+            None,
         ));
 
     // 1. Span must be named correctly.
