@@ -17799,6 +17799,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invoke_update_handler_inherits_context_properties() {
+        let ctx = WorkflowContext::new_test()
+            .with_workflow_id("test-wfid")
+            .with_workflow_name("test-wfname")
+            .with_execution_timeout(Some(chrono::Duration::seconds(100)));
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("trace-id".to_string(), "123".to_string());
+        let ctx = ctx.with_context_headers(headers);
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "test_update",
+            module: "test",
+            workflow: "test_wfname",
+            validator: None,
+            mcp: false,
+            input_type_hint: "()",
+            output_type_hint: "()",
+            has_validator: false,
+            handler: |update_ctx, _input| {
+                Box::pin(async move {
+                    assert_eq!(update_ctx.workflow_id(), "test-wfid");
+                    assert_eq!(update_ctx.workflow_name, "test-wfname");
+                    assert_eq!(update_ctx.header("trace-id"), Some("123"));
+                    // Inherits parent execution timeout
+                    assert!(update_ctx.execution_timeout.is_some());
+                    Ok(serde_json::Value::Null)
+                })
+            },
+        };
+
+        ctx.register_declarative_update_handler(&info);
+
+        let future = ctx
+            .invoke_update("test_update", serde_json::Value::Null)
+            .unwrap();
+        let result = future.await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_await_all_handlers_finished() {
         let update_id = UpdateId::new();
         let events = vec![

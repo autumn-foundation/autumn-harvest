@@ -159,7 +159,9 @@ fn await_condition_workflow<'a>(
 
         // Park forever on a predicate that never holds. `await_condition` pushes
         // no command and never wakes — during a query drive nothing re-polls it.
-        ctx.await_condition(|| false).await.map_err(|e| e.to_string())?;
+        ctx.await_condition(|| false)
+            .await
+            .map_err(|e| e.to_string())?;
         // Unreachable: the predicate is always false.
         Ok(Value::Null)
     })
@@ -696,9 +698,13 @@ async fn async_driver_in_runtime_yield_now_spin_drives_to_deadline() {
     // A small budget bounds the spin; the driver re-checks the deadline at the
     // top of each cycle and yields the runtime between polls, so it never hangs
     // or starves other tasks.
-    let outcome =
-        drive_query_replay_async(&ctx, spinning_query_workflow, input, Duration::from_millis(50))
-            .await;
+    let outcome = drive_query_replay_async(
+        &ctx,
+        spinning_query_workflow,
+        input,
+        Duration::from_millis(50),
+    )
+    .await;
     assert_eq!(
         outcome,
         QueryReplayOutcome::TimedOut,
