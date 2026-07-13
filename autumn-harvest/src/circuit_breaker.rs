@@ -244,6 +244,71 @@ impl BreakerState {
         self.probe_in_flight = false;
         self.bump_generation();
     }
+
+    fn handle_closed_phase_result(
+        &mut self,
+        outcome: AttemptOutcome,
+        now: Instant,
+        policy: &CircuitBreakerPolicy,
+    ) -> Option<CircuitTransition> {
+        match outcome {
+            // A success clears the rolling failure window.
+            AttemptOutcome::Success => {
+                self.failures.clear();
+                None
+            }
+            // A non-retryable (permanent per-request) error is excluded from
+            // trip counts entirely: it is neither downstream sickness nor
+            // proof of health, so it leaves the rolling window untouched.
+            AttemptOutcome::NonRetryableFailure => None,
+            AttemptOutcome::RetryableFailure => {
+                self.failures.push_back(now);
+                self.prune(now, policy.window);
+                if self.failures.len() >= policy.failure_threshold as usize {
+                    self.trip(now);
+                    Some(CircuitTransition::Tripped)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn handle_half_open_phase_result(
+        &mut self,
+        outcome: AttemptOutcome,
+        token: DispatchToken,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        // Only the admitted probe decides the half-open outcome. A
+        // same-generation non-probe (shouldn't normally happen, but be
+        // defensive) must not close the breaker early or restart cooldown.
+        if !token.is_probe {
+            return None;
+        }
+        match outcome {
+            // The probe reached the downstream and it answered: recovered.
+            AttemptOutcome::Success => {
+                self.close();
+                Some(CircuitTransition::Closed)
+            }
+            // The probe failed transiently: the downstream is still down.
+            AttemptOutcome::RetryableFailure => {
+                self.trip(now);
+                Some(CircuitTransition::Tripped)
+            }
+            // A non-retryable per-request error (e.g. bad input) does NOT
+            // prove the downstream recovered — the error may have been
+            // produced before the dependency was even touched. Treat the
+            // probe as inconclusive: release the probe slot and re-arm the
+            // cooldown so a fresh probe is admitted later, but emit no
+            // transition (it is neither a recovery nor a downstream trip).
+            AttemptOutcome::NonRetryableFailure => {
+                self.trip(now);
+                None
+            }
+        }
+    }
 }
 
 /// In-process registry of per-activity circuit breakers.
@@ -420,57 +485,8 @@ impl CircuitBreakerRegistry {
         }
 
         match st.phase {
-            CircuitPhase::Closed => match outcome {
-                // A success clears the rolling failure window.
-                AttemptOutcome::Success => {
-                    st.failures.clear();
-                    None
-                }
-                // A non-retryable (permanent per-request) error is excluded from
-                // trip counts entirely: it is neither downstream sickness nor
-                // proof of health, so it leaves the rolling window untouched.
-                AttemptOutcome::NonRetryableFailure => None,
-                AttemptOutcome::RetryableFailure => {
-                    st.failures.push_back(now);
-                    st.prune(now, policy.window);
-                    if st.failures.len() >= policy.failure_threshold as usize {
-                        st.trip(now);
-                        Some(CircuitTransition::Tripped)
-                    } else {
-                        None
-                    }
-                }
-            },
-            CircuitPhase::HalfOpen => {
-                // Only the admitted probe decides the half-open outcome. A
-                // same-generation non-probe (shouldn't normally happen, but be
-                // defensive) must not close the breaker early or restart cooldown.
-                if !token.is_probe {
-                    return None;
-                }
-                match outcome {
-                    // The probe reached the downstream and it answered: recovered.
-                    AttemptOutcome::Success => {
-                        st.close();
-                        Some(CircuitTransition::Closed)
-                    }
-                    // The probe failed transiently: the downstream is still down.
-                    AttemptOutcome::RetryableFailure => {
-                        st.trip(now);
-                        Some(CircuitTransition::Tripped)
-                    }
-                    // A non-retryable per-request error (e.g. bad input) does NOT
-                    // prove the downstream recovered — the error may have been
-                    // produced before the dependency was even touched. Treat the
-                    // probe as inconclusive: release the probe slot and re-arm the
-                    // cooldown so a fresh probe is admitted later, but emit no
-                    // transition (it is neither a recovery nor a downstream trip).
-                    AttemptOutcome::NonRetryableFailure => {
-                        st.trip(now);
-                        None
-                    }
-                }
-            }
+            CircuitPhase::Closed => st.handle_closed_phase_result(outcome, now, &policy),
+            CircuitPhase::HalfOpen => st.handle_half_open_phase_result(outcome, token, now),
             // A result arriving while fully open (no probe admitted) is a
             // stale straggler; leave the breaker untouched.
             CircuitPhase::Open => None,
