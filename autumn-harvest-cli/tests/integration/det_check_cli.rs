@@ -199,3 +199,40 @@ fn missing_path_is_a_read_error() {
         det_check_report_for_paths(&[PathBuf::from("/nonexistent/definitely/not/here.rs")]);
     assert!(result.is_err(), "a missing path must surface a read error");
 }
+
+// FIX #3 (P2-1): the changed-files CI pattern `det-check f1.rs f2.rs` passes
+// each file as a SEPARATE argument; a cross-file transitive violation must
+// still be caught through the shared index (per-path scanning missed it).
+#[test]
+fn two_separate_file_args_resolve_cross_file_transitive() {
+    let dir = transitive_tree();
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    let report = det_check_report_for_paths(&[a, b]).expect("report should build");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| panic!("cross-file transitive violation must be caught: {report:?}"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("cross_wf"));
+    assert_eq!(finding.via_helper.as_deref(), Some("shared_time"));
+}
+
+// FIX #3 (P2-2): overlapping arguments (a directory plus a file inside it) must
+// not double-count.
+#[test]
+fn overlapping_dir_and_file_args_do_not_double_count() {
+    let dir = transitive_tree();
+    let b = dir.path().join("b.rs");
+    let report =
+        det_check_report_for_paths(&[dir.path().to_path_buf(), b]).expect("report should build");
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET001")
+            .count(),
+        1,
+        "a directory plus a file inside it must yield one finding, got: {report:?}"
+    );
+}

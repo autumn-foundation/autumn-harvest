@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use autumn_harvest::{DetCheckReport, DetSeverity, check_dir, check_file};
+use autumn_harvest::{DetCheckReport, DetSeverity, check_paths};
 use clap::{Parser, Subcommand, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
@@ -2072,32 +2072,23 @@ fn history_output_file(cli: &Cli) -> Option<&Path> {
 
 // ── det-check (issue #778) ──────────────────────────────────────────────────
 
-/// Reads and merges determinism reports from every requested source path.
+/// Builds one determinism report across every requested source path.
 ///
-/// A directory is scanned recursively (resolving one first-party helper hop of
-/// reachability); a file is scanned directly. Findings and suppressions from all
-/// paths are concatenated into one report. Pure — no printing.
+/// A single shared first-party helper index (issue #778) is used, so a
+/// cross-file transitive violation is caught even when the two files are passed
+/// as separate arguments (the changed-files CI pattern). Directories are walked
+/// recursively; files are scanned directly; symlinks are not followed;
+/// overlapping arguments are de-duplicated; a non-UTF-8 file mid-walk is
+/// skipped. Pure — no printing.
 ///
 /// # Errors
-/// Returns [`CliError::InvalidInput`] if any path cannot be read.
+/// Returns [`CliError::InvalidInput`] if a top-level path is missing or a source
+/// path cannot be read.
 pub fn det_check_report_for_paths(paths: &[PathBuf]) -> Result<DetCheckReport, CliError> {
-    let mut report = DetCheckReport::default();
-    for path in paths {
-        let sub = if path.is_dir() {
-            check_dir(path)
-        } else {
-            check_file(path)
-        }
-        .map_err(|source| {
-            CliError::InvalidInput(format!(
-                "det-check: failed to read {}: {source}",
-                path.display()
-            ))
-        })?;
-        report.findings.extend(sub.findings);
-        report.suppressions.extend(sub.suppressions);
-    }
-    Ok(report)
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    check_paths(&refs).map_err(|source| {
+        CliError::InvalidInput(format!("det-check: failed to read source: {source}"))
+    })
 }
 
 /// Formats one finding as `file:line:col DETxxx  (safe alternative: …)`, with a
@@ -2209,6 +2200,17 @@ pub fn det_check_json(report: &DetCheckReport) -> Result<String, CliError> {
     serde_json::to_string_pretty(report).map_err(CliError::SerializeResponse)
 }
 
+/// Serializes the report's active suppressions as pretty JSON for
+/// `--list-suppressions --format json` (the audit inventory as machine-readable
+/// output rather than the text listing).
+///
+/// # Errors
+/// Returns [`CliError::SerializeResponse`] if serialization fails.
+pub fn det_suppressions_json(report: &DetCheckReport) -> Result<String, CliError> {
+    serde_json::to_string_pretty(&json!({ "suppressions": report.suppressions }))
+        .map_err(CliError::SerializeResponse)
+}
+
 /// `(errors, warnings)` counts across a report's findings.
 fn det_check_counts(report: &DetCheckReport) -> (usize, usize) {
     let errors = report
@@ -2250,7 +2252,10 @@ pub fn run_det_check(
     let report = det_check_report_for_paths(paths)?;
 
     if list_suppressions {
-        println!("{}", format_det_suppressions_list(&report));
+        match format {
+            DetCheckFormat::Text => println!("{}", format_det_suppressions_list(&report)),
+            DetCheckFormat::Json => println!("{}", det_suppressions_json(&report)?),
+        }
         return Ok(());
     }
 
@@ -8041,5 +8046,43 @@ fn bad_helper() -> i64 {
         assert!(json.contains("\"rule_id\""));
         assert!(json.contains("DET001"));
         assert!(json.contains("\"severity\": \"error\""));
+    }
+
+    // FIX #5: `--list-suppressions --format json` must emit JSON (not silently
+    // fall back to the text listing). The output must parse as JSON containing
+    // the suppression.
+    #[test]
+    fn det_suppressions_json_is_valid_json_containing_the_suppression() {
+        let r = report(WF_SUPPRESSED);
+        let json = det_suppressions_json(&r).expect("suppressions json");
+        let value: Value = serde_json::from_str(&json).expect("output must be valid JSON");
+        let sups = value["suppressions"]
+            .as_array()
+            .expect("suppressions array");
+        assert!(
+            sups.iter().any(|s| s["rule_id"] == "DET001"),
+            "the suppression must be present in the JSON, got: {json}"
+        );
+        assert!(
+            sups.iter()
+                .any(|s| s["reason"] == "recorded in signal payload"),
+            "the reason must be present in the JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn run_det_check_list_suppressions_json_exits_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sup.rs"), WF_SUPPRESSED).unwrap();
+        let result = run_det_check(
+            &[dir.path().to_path_buf()],
+            DetCheckFormat::Json,
+            false,
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "--list-suppressions --format json must exit Ok, got: {result:?}"
+        );
     }
 }

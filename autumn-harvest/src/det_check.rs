@@ -438,20 +438,63 @@ pub fn check_file(path: &Path) -> std::io::Result<DetCheckReport> {
 /// resolving first-party helper reachability (issue #778) across every file in
 /// the tree.
 ///
-/// Build-output and hidden directories (`target`, and any directory whose name
-/// starts with `.`, e.g. `.git`) are skipped so a scan of a repository root
-/// stays fast and never lints generated code.
+/// Build-output, hidden, and trybuild-fixture directories are skipped so a scan
+/// of a repository root stays fast, never lints generated code, and never lints
+/// the deliberately-broken `compile_fail/` fixtures (see [`skip_scan_dir`]).
 ///
 /// # Errors
 /// Returns an error if the directory cannot be read or any file read fails.
 pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
     let mut sources: Vec<(String, String)> = Vec::new();
     collect_rs_sources(dir, &mut sources)?;
+    Ok(scan_sources(&sources))
+}
 
-    // Build a single first-party function index across every file so a
-    // workflow in one file can resolve a helper defined in another.
+/// Check an explicit set of source paths (files and/or directories) for
+/// determinism violations.
+///
+/// First-party helper reachability (issue #778) is resolved across **every**
+/// file in **all** paths through a single shared index — so a cross-file
+/// transitive violation is caught even when the two files are passed as separate
+/// arguments (the changed-files CI pattern `det-check $(git diff --name-only
+/// '*.rs')`), which per-path scanning misses.
+///
+/// A file argument is scanned directly; a directory argument is walked
+/// recursively with [`skip_scan_dir`] applied. Symlinked files and directories
+/// are **not** followed (a self-referential directory symlink cannot explode the
+/// scan, and a `../..` symlink cannot pull out-of-tree files into the report).
+/// Overlapping arguments (a directory and a file inside it, or a repeated path)
+/// are de-duplicated by canonicalized path, so no file is scanned twice. A
+/// single unreadable / non-UTF-8 `.rs` file discovered during a directory walk
+/// is skipped with a warning naming the file rather than aborting the whole
+/// scan.
+///
+/// # Errors
+/// Returns an error if a top-level path does not exist or cannot be classified,
+/// if a directory cannot be read, or if an explicitly-named file argument cannot
+/// be read.
+pub fn check_paths(paths: &[&Path]) -> std::io::Result<DetCheckReport> {
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    for &path in paths {
+        // Erroring on a missing top-level path (a nonexistent argument) is a
+        // real usage error, distinct from a per-file read error mid-walk.
+        let md = std::fs::metadata(path)?;
+        if md.is_dir() {
+            collect_rs_sources_robust(path, &mut sources, &mut seen)?;
+        } else {
+            add_source_strict(path, &mut sources, &mut seen)?;
+        }
+    }
+    Ok(scan_sources(&sources))
+}
+
+/// Builds a single first-party function index across every collected file (so a
+/// workflow in one file can resolve a helper defined in another) and scans it
+/// once.
+fn scan_sources(sources: &[(String, String)]) -> DetCheckReport {
     let mut all_fns: Vec<FnDef> = Vec::new();
-    for (label, content) in &sources {
+    for (label, content) in sources {
         let lines: Vec<&str> = content.lines().collect();
         let mut fns = extract_all_functions(&lines);
         for f in &mut fns {
@@ -459,7 +502,19 @@ pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
         }
         all_fns.extend(fns);
     }
-    Ok(scan_functions(&all_fns))
+    scan_functions(&all_fns)
+}
+
+/// Whether a directory should be skipped during a recursive scan: build
+/// artifacts (`target`), hidden directories (any name starting with `.`, e.g.
+/// `.git`), and trybuild compile-fail fixtures (`compile_fail`, which hold
+/// deliberately-broken sources with committed `.stderr` snapshots — true
+/// positives that exist to be rejected by the compile-time guardrail and must
+/// never be linted or edited by the text pre-check).
+fn skip_scan_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "target" || n == "compile_fail" || n.starts_with('.'))
 }
 
 fn collect_rs_sources(dir: &Path, sources: &mut Vec<(String, String)>) -> std::io::Result<()> {
@@ -467,12 +522,7 @@ fn collect_rs_sources(dir: &Path, sources: &mut Vec<(String, String)>) -> std::i
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            // Skip build artifacts and hidden directories (target, .git, …).
-            let skip = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n == "target" || n.starts_with('.'));
-            if !skip {
+            if !skip_scan_dir(&path) {
                 collect_rs_sources(&path, sources)?;
             }
         } else if path.extension().is_some_and(|e| e == "rs") {
@@ -483,6 +533,71 @@ fn collect_rs_sources(dir: &Path, sources: &mut Vec<(String, String)>) -> std::i
     Ok(())
 }
 
+/// Symlink-safe, de-duplicating recursive `.rs` collector used by
+/// [`check_paths`]. Symlinked entries are skipped (no cycles, no out-of-tree
+/// escapes); `skip_scan_dir` directories are pruned; a per-file read/UTF-8 error
+/// is warned-and-skipped rather than aborting the walk; each file is added at
+/// most once, keyed by its canonicalized path.
+fn collect_rs_sources_robust(
+    dir: &Path,
+    sources: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        // Do not follow symlinks — a directory symlink can form a cycle
+        // (unbounded recursion) and a `../..` symlink can escape the tree.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            if !skip_scan_dir(&path) {
+                collect_rs_sources_robust(&path, sources, seen)?;
+            }
+        } else if file_type.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            add_source_skip(&path, sources, seen);
+        }
+    }
+    Ok(())
+}
+
+/// Adds a discovered file's source, de-duplicated by canonicalized path. A
+/// read/UTF-8 error skips the file with a warning (a non-UTF-8 file cannot be
+/// valid Rust source anyway) rather than aborting the enclosing scan.
+fn add_source_skip(
+    path: &Path,
+    sources: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(canonical) {
+        return;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => sources.push((path.to_string_lossy().into_owned(), content)),
+        Err(err) => eprintln!("det-check: skipping {}: {err}", path.display()),
+    }
+}
+
+/// Adds an explicitly-named file argument, de-duplicated by canonicalized path.
+/// Unlike [`add_source_skip`], a read error is propagated (an operator who names
+/// a file directly should hear that it could not be read).
+fn add_source_strict(
+    path: &Path,
+    sources: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(canonical) {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path)?;
+    sources.push((path.to_string_lossy().into_owned(), content));
+    Ok(())
+}
+
 // ── Function extraction & reachability (issue #778) ──────────────────────────
 
 /// A top-level function definition captured from one source file. Bodies are
@@ -490,6 +605,11 @@ fn collect_rs_sources(dir: &Path, sources: &mut Vec<(String, String)>) -> std::i
 struct FnDef {
     /// Function name.
     name: String,
+    /// Identifiers bound by the parameter list (over-collected; see
+    /// [`extract_fn_params`]). Used to shadow-suppress a call to a same-named
+    /// fn-pointer / closure parameter so it is never resolved to a same-named
+    /// free helper (#778 review, zero-FP).
+    params: Vec<String>,
     /// `(1-indexed source line, text)` for every non-blank body line.
     body: Vec<(u32, String)>,
     /// Whether the function carries a `#[workflow]` attribute.
@@ -550,8 +670,10 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
         if let Some(name) = fn_decl_name(trimmed)
             && let Some((body, next_i)) = extract_fn_body(lines, i)
         {
+            let params = extract_fn_params(lines, i);
             result.push(FnDef {
                 name,
+                params,
                 body,
                 is_workflow: pending_wf,
                 is_activity: pending_act,
@@ -665,7 +787,13 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         };
         report.merge(check_body(&scope, &view));
 
-        for callee in collect_direct_free_fn_calls(&view, &index) {
+        // Names locally bound in the workflow — parameters (fn-pointer /
+        // closure params) plus body `let` bindings (closures, shadows) — are
+        // shadow-suppressed so a call to one is never resolved to a same-named
+        // free helper (#778 review, zero-FP; #386 excludes fn pointers/closures).
+        let mut shadowed: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
+        collect_body_let_idents(&view, &mut shadowed);
+        for callee in collect_direct_free_fn_calls(&view, &index, &shadowed) {
             if let Some(Some(idx)) = index.get(callee.as_str()).copied() {
                 let helper = &fns[idx];
                 let hview = body_view(&helper.body);
@@ -691,10 +819,17 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
 /// Collects the names of first-party helpers a body calls via a **direct
 /// free-function call** (`helper(`), excluding method calls (`x.helper(`),
 /// path-qualified calls (`m::helper(`), and identifier-continuation. Only names
-/// present in `candidates` are returned.
+/// present in `candidates` and **not** in `locally_bound` are returned: a call
+/// to a name the caller binds itself (a fn-pointer/closure parameter, a local
+/// closure, or a shadowing `let`) is never resolved to a same-named free helper
+/// (#778 review, zero-FP). This is safe-direction: if a body both shadows a
+/// name AND legitimately calls a real free fn of that name (pathological), the
+/// call is conservatively skipped — an accepted false-negative, never a
+/// false-positive.
 fn collect_direct_free_fn_calls(
     body: &[(u32, &str)],
     candidates: &std::collections::HashMap<&str, Option<usize>>,
+    locally_bound: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeSet<String> {
     let mut called = std::collections::BTreeSet::new();
     for &(_, line) in body {
@@ -724,12 +859,84 @@ fn collect_direct_free_fn_calls(
             };
             // Immediate call paren.
             let after_ok = i < bytes.len() && bytes[i] == b'(';
-            if first_ok && before_ok && after_ok && candidates.contains_key(token) {
+            if first_ok
+                && before_ok
+                && after_ok
+                && candidates.contains_key(token)
+                && !locally_bound.contains(token)
+            {
                 called.insert(token.to_string());
             }
         }
     }
     called
+}
+
+/// Collects the identifiers bound by a function's parameter list, so a call to
+/// a same-named local (a fn-pointer / closure parameter) is never resolved to a
+/// same-named free helper (#778 review, zero-FP). The param list is the first
+/// balanced `(...)` after the `fn` keyword (string/comment content is stripped
+/// first); every lowercase-/underscore-initial ident inside it is collected via
+/// [`det010_pattern_mask_idents`]. Over-collection (picking up a lowercase TYPE
+/// ident like `fn`/`i64`) is safe: an extra shadow only ever suppresses a
+/// resolution (a false-negative), never introduces a false-positive.
+fn extract_fn_params(lines: &[&str], fn_idx: usize) -> Vec<String> {
+    // Join signature lines (from the `fn` line) up to the body `{`.
+    let mut sig = String::new();
+    for raw in lines.iter().skip(fn_idx).take(64) {
+        let stripped = strip_unparseable_content(raw);
+        if let Some(brace) = stripped.find('{') {
+            sig.push_str(&stripped[..brace]);
+            break;
+        }
+        sig.push_str(&stripped);
+        sig.push(' ');
+    }
+    let bytes = sig.as_bytes();
+    let Some(open) = sig.find('(') else {
+        return Vec::new();
+    };
+    // Match the param-list `(` to its `)`, accounting for nested parens
+    // (e.g. a `fn(i64)->i64` param type).
+    let mut depth: i32 = 0;
+    let mut close = None;
+    for (k, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(k);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Vec::new();
+    };
+    det010_pattern_mask_idents(&sig[open + 1..close])
+}
+
+/// Collects the identifiers bound by `let` statements in a function body, so a
+/// call to a same-named local (a closure binding, a shadowing `let`) is never
+/// resolved to a same-named free helper (#778 review, zero-FP). Reuses
+/// [`det010_parse_let`] for robust pattern handling (simple, `mut`, annotated,
+/// and destructuring / enum-variant patterns). Single-line handling only; a
+/// multi-line `let` is a safe-direction under-collection.
+fn collect_body_let_idents(body: &[(u32, &str)], idents: &mut std::collections::HashSet<String>) {
+    for &(_, line) in body {
+        let code = strip_unparseable_content(line);
+        for pos in word_positions(&code, "let") {
+            match det010_parse_let(&code[pos + 3..]) {
+                Det010LetBinding::Simple { ident, .. } => {
+                    idents.insert(ident);
+                }
+                Det010LetBinding::PatternMask(ids) => idents.extend(ids),
+            }
+        }
+    }
 }
 
 /// Removes duplicate findings, keeping one per

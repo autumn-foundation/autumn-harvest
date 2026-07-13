@@ -4,7 +4,7 @@
 //! Run with:
 //!   cargo test -p autumn-harvest --test `det_check_tests` --no-default-features
 
-use autumn_harvest::det_check::{DetSeverity, check_source};
+use autumn_harvest::det_check::{DetSeverity, check_dir, check_paths, check_source};
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -2192,4 +2192,406 @@ fn bad_time_helper() -> i64 {
         .as_array()
         .expect("suppressions array");
     assert!(sups.iter().any(|s| s["rule_id"] == "DET003"));
+}
+
+// ── Review hardening (#778): compile_fail exclusion + zero-FP shadowing ─────
+
+/// A minimal `#[workflow]` whose body reads the wall clock (DET001 hard
+/// blocker). Kept as a single-line `\n`-escaped literal so this module-level
+/// const (file brace-depth 0) is fully stripped by the scanner rather than
+/// having its content lexed as code — a bare `det-check .` self-scan must stay
+/// clean (the line-based lexer does not track cross-line string literals).
+const WF_UTC: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = chrono::Utc::now();\n    Ok(())\n}\n";
+
+// P1 FIX #1 (AC8): a bare repo-root scan must exclude the deliberately-broken
+// `compile_fail/` trybuild fixtures (they are not real workflow source and
+// carry committed `.stderr` snapshots that must not be edited).
+#[test]
+fn check_dir_excludes_compile_fail_fixtures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cf = dir.path().join("compile_fail");
+    std::fs::create_dir_all(&cf).unwrap();
+    std::fs::write(cf.join("bad.rs"), WF_UTC).unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("wf.rs"), WF_UTC).unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    let det001: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET001")
+        .collect();
+    assert_eq!(
+        det001.len(),
+        1,
+        "only real/ must be scanned; compile_fail/ must be excluded, got: {report:?}"
+    );
+    let file = &det001[0].location.as_ref().unwrap().file;
+    assert!(
+        file.contains("real"),
+        "finding must be from real/, got: {file}"
+    );
+    assert!(
+        !file.contains("compile_fail"),
+        "compile_fail/ must be excluded, got: {file}"
+    );
+}
+
+// P2 FIX #4: `check_dir` must also skip `target/` and hidden (`.`) directories.
+#[test]
+fn check_dir_skips_target_and_hidden_dirs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for sub in ["target", ".hidden"] {
+        let d = dir.path().join(sub);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("gen.rs"), WF_UTC).unwrap();
+    }
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("wf.rs"), WF_UTC).unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    let det001: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET001")
+        .collect();
+    assert_eq!(
+        det001.len(),
+        1,
+        "target/ and .hidden/ must be skipped; only real/ scanned, got: {report:?}"
+    );
+    assert!(det001[0].location.as_ref().unwrap().file.contains("real"));
+}
+
+// P1 FIX #2 (zero-FP): a call bound to a fn-pointer PARAMETER of the same name
+// must NOT resolve to a same-named first-party free helper (#386 excludes
+// function pointers). Reproducer A.
+#[test]
+fn fn_pointer_param_call_is_not_resolved_to_free_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext, transform: fn(i64) -> i64) -> Result<(), String> {
+    let _ = transform(5);
+    Ok(())
+}
+
+fn transform(n: i64) -> i64 {
+    chrono::Utc::now().timestamp() + n
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a fn-pointer parameter call must not resolve to a same-named free helper, got: {report:?}"
+    );
+}
+
+// P1 FIX #2 (zero-FP): a call bound to a LOCAL closure of the same name must
+// NOT resolve to a same-named first-party free helper (#386 excludes
+// closures). Reproducer B.
+#[test]
+fn local_closure_call_is_not_resolved_to_free_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let compute = |x: i64| x + 1;
+    let _ = compute(5);
+    Ok(())
+}
+
+fn compute(n: i64) -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a local closure call must not resolve to a same-named free helper, got: {report:?}"
+    );
+}
+
+// Zero-FP guard: shadowing must NOT suppress a genuinely-reached helper of a
+// DIFFERENT name — a real transitive violation must still be flagged even when
+// the workflow also binds unrelated locals/params.
+#[test]
+fn shadowing_does_not_suppress_a_genuinely_reached_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext, transform: fn(i64) -> i64) -> Result<(), String> {
+    let compute = |x: i64| x + 1;
+    let _ = transform(compute(1));
+    let _ = bad_time();
+    Ok(())
+}
+
+fn bad_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| panic!("bad_time() must still be flagged, got: {report:?}"));
+    assert_eq!(finding.via_helper.as_deref(), Some("bad_time"));
+}
+
+// ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
+
+// The changed-files CI pattern `det-check f1.rs f2.rs` passes each file as a
+// SEPARATE argument. A cross-file transitive violation must still be caught via
+// the single shared index (per-file scanning misses it).
+#[test]
+fn check_paths_resolves_cross_file_between_two_file_args() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    std::fs::write(
+        &a,
+        "\
+#[workflow]
+async fn cross_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = shared_time();
+    Ok(())
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "\
+pub fn shared_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+
+    let report = check_paths(&[a.as_path(), b.as_path()]).expect("check_paths");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("cross-file transitive violation across two FILE args must be caught, got: {report:?}")
+        });
+    assert_eq!(finding.workflow_name.as_deref(), Some("cross_wf"));
+    assert_eq!(finding.via_helper.as_deref(), Some("shared_time"));
+}
+
+// Overlapping arguments must not double-count: the same file passed twice, or a
+// directory plus a file inside it, yields exactly one finding.
+#[test]
+fn check_paths_dedups_overlapping_args() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = dir.path().join("wf.rs");
+    std::fs::write(&f, WF_UTC).unwrap();
+
+    let same_twice = check_paths(&[f.as_path(), f.as_path()]).expect("check_paths");
+    assert_eq!(
+        same_twice
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "the same file passed twice must yield one finding, got: {same_twice:?}"
+    );
+
+    let dir_and_file = check_paths(&[dir.path(), f.as_path()]).expect("check_paths");
+    assert_eq!(
+        dir_and_file
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "a directory plus a file inside it must yield one finding, got: {dir_and_file:?}"
+    );
+}
+
+// A directory symlink (here self-referential) must NOT be descended: the scan
+// must terminate and the real file must be scanned exactly once.
+#[cfg(unix)]
+#[test]
+fn check_paths_does_not_follow_directory_symlinks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("real.rs"), WF_UTC).unwrap();
+    // A self-referential directory symlink would recurse forever if followed.
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+
+    let report = check_paths(&[dir.path()]).expect("scan must complete without following the loop");
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET001")
+            .count(),
+        1,
+        "the symlinked dir must not be descended (real.rs scanned once), got: {report:?}"
+    );
+}
+
+// A non-UTF-8 `.rs` file discovered during a walk must be skipped (with a
+// warning) rather than aborting the whole scan — the clean file is still
+// analyzed.
+#[test]
+fn check_paths_skips_non_utf8_file_and_continues() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("clean.rs"), WF_UTC).unwrap();
+    std::fs::write(dir.path().join("bad.rs"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+
+    let report = check_paths(&[dir.path()]).expect("scan must complete despite a non-UTF8 file");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "the clean file must still be analyzed, got: {report:?}"
+    );
+}
+
+// A missing top-level path argument is a real usage error (surfaced), distinct
+// from a per-file read error mid-walk (skipped).
+#[test]
+fn check_paths_errors_on_a_missing_top_level_path() {
+    let result = check_paths(&[std::path::Path::new("/nonexistent/definitely/not/here.rs")]);
+    assert!(
+        result.is_err(),
+        "a missing top-level path must surface a read error"
+    );
+}
+
+// ── P2 FIX #4: additional coverage — transitive structural rule, exacts ─────
+
+// A STRUCTURAL rule (DET010) reached through a first-party helper must be
+// attributed with `via_helper` — proving the full rule set (not just the
+// substring classes) applies to reachable helper bodies.
+#[test]
+fn transitive_helper_det010_is_flagged_via_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    fan_out_all(ctx).await;
+    Ok(())
+}
+
+async fn fan_out_all(ctx: &WorkflowContext) {
+    let m: HashMap<String, u64> = HashMap::new();
+    for (k, _v) in &m {
+        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await;
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected a transitive DET010 finding, got: {report:?}"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+    assert_eq!(finding.via_helper.as_deref(), Some("fan_out_all"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+// Exact column: `Utc::now()` in `let _t = chrono::Utc::now();` starts at
+// column 18 (after `let _t = chrono::`).
+#[test]
+fn finding_column_is_exact() {
+    let src = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\nlet _t = chrono::Utc::now();\nOk(())\n}\n";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap();
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(loc.line, 3, "the violation is on line 3");
+    assert_eq!(
+        loc.col, 18,
+        "`Utc::now()` starts at column 18, got: {}",
+        loc.col
+    );
+}
+
+// One bad helper reached by TWO workflows yields two findings with DISTINCT
+// workflow_name, both attributed to the same helper.
+#[test]
+fn one_bad_helper_reached_by_two_workflows_yields_two_findings() {
+    let src = "\
+#[workflow]
+async fn wf_a(ctx: &WorkflowContext) -> Result<(), String> {
+    bad();
+    Ok(())
+}
+
+#[workflow]
+async fn wf_b(ctx: &WorkflowContext) -> Result<(), String> {
+    bad();
+    Ok(())
+}
+
+fn bad() {
+    let _ = chrono::Utc::now();
+}
+";
+    let report = check_source(src, "test.rs");
+    let det001: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET001")
+        .collect();
+    assert_eq!(
+        det001.len(),
+        2,
+        "one helper, two entry points, got: {report:?}"
+    );
+    let names: std::collections::HashSet<_> = det001
+        .iter()
+        .filter_map(|f| f.workflow_name.as_deref())
+        .collect();
+    assert!(
+        names.contains("wf_a") && names.contains("wf_b"),
+        "both entry workflows must be named, got: {names:?}"
+    );
+    assert!(
+        det001
+            .iter()
+            .all(|f| f.via_helper.as_deref() == Some("bad")),
+        "both findings must be attributed to the helper, got: {report:?}"
+    );
+}
+
+// A `harvest-suppress` comment INSIDE a transitively-reached helper body is
+// honored, and echoed into `suppressions` with the helper location.
+#[test]
+fn suppression_inside_transitive_helper_is_honored() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    helper();
+    Ok(())
+}
+
+fn helper() {
+    // harvest-suppress: DET001 \"seed comes from input\"
+    let _ = chrono::Utc::now();
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a suppression inside the reached helper must suppress the finding, got: {report:?}"
+    );
+    let sup = report
+        .suppressions
+        .iter()
+        .find(|s| s.rule_id == "DET001")
+        .unwrap_or_else(|| panic!("suppression must be echoed, got: {report:?}"));
+    assert!(!sup.reason.is_empty());
+    // Location is inside the helper (line 9 of this fixture).
+    assert_eq!(
+        sup.location.line, 9,
+        "suppression location is in the helper"
+    );
 }

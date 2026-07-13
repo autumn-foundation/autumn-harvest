@@ -544,6 +544,23 @@ A hard-blocker call located in a first-party function that a `#[workflow]` body 
 
 The catalog docs continue to own the "you must also avoid this transitively beyond one first-party hop" warning. The compile-time guardrail and `WorkflowReplayer` remain the authoritative backstops.
 
+### Known limitations (conservative, safe-direction)
+
+`det_check` is a fast text pre-filter, not the authoritative gate. Its reachability resolution deliberately errs toward **missing** a transitive violation rather than reporting a false one — every case below is a false-*negative* (never a false-positive), and the compile-time `#[workflow]` HVG guardrail ([issue #386](https://github.com/madmax983/autumn-harvest/issues/386)) is the authoritative backstop that hard-blocks the code regardless. When in doubt, trust the compile-time guardrail and `WorkflowReplayer`.
+
+- **Ambiguity guard.** If two first-party helpers share a name, a call to that name is *not* resolved (a real transitive violation in one of them can be missed) — an ambiguous resolution could otherwise pick the wrong body.
+- **Local shadowing.** A call whose name is bound by the caller — a fn-pointer / closure **parameter**, a local **closure** binding, or a shadowing `let` — is treated as the local, not a same-named free helper. `#[workflow(fn ...)]` fn-pointer params and closures are exactly the forms #386 excludes. (Consequence: if a body both shadows a name *and* legitimately calls a real free fn of that name, that call is conservatively skipped.)
+- **Path-qualified one-hop calls.** `self::helper()`, `crate::mod::helper()`, and `super::helper()` are **not** resolved — only bare-ident calls (`helper()`) and `use`-imported calls are. Resolving qualified / associated-function (`Type::assoc()`) calls would risk associated-function/method false positives, which is exactly the #386 boundary.
+- **Call-form gaps.** Turbofish (`helper::<T>()`) and space-before-paren (`helper ()`) call forms are not matched by the one-hop resolver.
+
+### Flag scope
+
+`det-check` has its **own local** `--format text|json` flag and **ignores** the CLI's global network flags (`--base-url`, `--output`, auth) — it is read-only source analysis that never touches the management API, so those flags do not apply. `--format` controls only how the `DetCheckReport` (or, with `--list-suppressions`, the suppression inventory) is rendered.
+
+### Relationship to DET010 / DET011
+
+`det-check` surfaces the **entire** shared `det_check` engine, including **DET010** (`HashMap`/`HashSet` iteration order, [issue #785](https://github.com/madmax983/autumn-harvest/issues/785)) and **DET011** (`select!` / futures-select combinators, [issue #799](https://github.com/madmax983/autumn-harvest/issues/799)). The `det-check` CLI slice ([issue #778](https://github.com/madmax983/autumn-harvest/issues/778)) adds **no new** `HashMap`/data-structure linting — those rules pre-exist. Listing "HashMap iteration" as out-of-scope for #778 means this slice adds no such *new* rule, **not** that the CLI hides the engine's existing DET010 output — a `HashMap`-iteration hard blocker is reported by `det-check` exactly as DET010.
+
 ### GitHub Actions
 
 ```yaml
@@ -555,12 +572,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Runs the CLI over the source tree and fails the job on any hard blocker.
+      # Runs the CLI over the whole repo (default `.`) and fails the job on any
+      # hard blocker. Build artifacts (`target`), hidden directories, and the
+      # trybuild `compile_fail/` fixtures are skipped automatically.
       - name: harvest det-check
-        run: cargo run -q -p autumn-harvest-cli --bin harvest -- det-check src examples
+        run: cargo run -q -p autumn-harvest-cli --bin harvest -- det-check
 ```
 
-The command exits non-zero on a hard blocker, so the step fails the job automatically — no extra shell plumbing needed. Add `--deny-warnings` to the run line to also fail on warnings.
+The command exits non-zero on a hard blocker, so the step fails the job automatically — no extra shell plumbing needed. Add `--deny-warnings` to the run line to also fail on warnings. The argless form scans the repo root; in a larger downstream workspace where you want to scope the scan, enumerate specific crate `src` directories instead (e.g. `det-check crate-a/src crate-b/src`).
 
 ### Pre-commit hook
 
@@ -569,14 +588,14 @@ Drop this into `.git/hooks/pre-commit` (make it executable with `chmod +x`):
 ```sh
 #!/bin/sh
 # Block commits that introduce a workflow-determinism hard blocker.
-if ! cargo run -q -p autumn-harvest-cli --bin harvest -- det-check src examples; then
+if ! cargo run -q -p autumn-harvest-cli --bin harvest -- det-check; then
     echo "det-check found determinism hard blockers — fix them or add a" >&2
     echo "// harvest-suppress: DETxxx \"reason\" comment (see the guide)." >&2
     exit 1
 fi
 ```
 
-The shipped examples and fixtures pass the check: `harvest det-check autumn-harvest/src autumn-harvest/examples autumn-harvest-plugin/src autumn-harvest-cli/src` reports zero hard-blocker findings. (The deliberately non-deterministic trybuild fixtures under `autumn-harvest/tests/compile_fail/` are *true* positives — they exist to be rejected by the compile-time guardrail — so scan your `src`/`examples`, not the macro-crate test-fixture directories.)
+The shipped tree passes the check: a bare `harvest det-check` at the repo root reports zero hard-blocker findings (the deliberately non-deterministic trybuild fixtures under `autumn-harvest/tests/compile_fail/` are *true* positives that exist to be rejected by the compile-time guardrail — the scanner skips that directory, along with `target` and any hidden directory, automatically).
 
 ---
 
