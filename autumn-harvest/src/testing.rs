@@ -245,6 +245,8 @@ impl std::fmt::Display for ReplayReport {
 ///         },
 ///     ],
 ///     context_headers: None,
+///     execution_timeout: None,
+///     deadline_at: None,
 /// };
 /// let json = serde_json::to_string(&snapshot).unwrap();
 /// // Store `json` as a fixture file.
@@ -266,6 +268,29 @@ pub struct HistorySnapshot {
     /// map is not overridden by the replayer's ambient headers.
     #[serde(default)]
     pub context_headers: Option<HashMap<String, String>>,
+    /// The execution's `execution_timeout` budget (issue #772). When `Some`,
+    /// [`replay_from_snapshot`](WorkflowReplayer::replay_from_snapshot) threads
+    /// it into the replayed `WorkflowContext` (preferring it over the replayer's
+    /// global [`with_execution_timeout`](WorkflowReplayer::with_execution_timeout)),
+    /// so a deadline-aware history that recorded a `SideEffectRecorded{Now}`
+    /// deadline probe replays cleanly instead of false-reporting non-determinism.
+    /// Serialised as integer milliseconds; `None` (the field absent — a legacy
+    /// snapshot) falls back to the replayer's global timeout. A full history
+    /// export (`history_export::HistoryExportDocument`) serialises this field at
+    /// the same top-level name, so an exported history round-trips into this
+    /// snapshot verbatim.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::history_export::opt_duration_millis"
+    )]
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
+    /// (issue #772). When `Some`, the internal continue-as-new budget check reads
+    /// this instead of the nominal `start + execution_timeout`. `None` (absent /
+    /// legacy snapshot) falls back to no live deadline (the nominal is used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -504,13 +529,21 @@ impl WorkflowReplayer {
     /// `snapshot.workflow_name` is not registered, the report contains
     /// `ReplayStatus::WorkflowFailed` with a descriptive error.
     ///
-    /// The deadline-aware continue-as-new budget (issue #772) uses this
-    /// replayer's global [`with_execution_timeout`](Self::with_execution_timeout)
-    /// and no live `deadline_at` (a documented limitation of the file/JSON path).
-    /// [`replay_from_db`](Self::replay_from_db) threads the execution row's own
-    /// `execution_timeout`/`deadline_at` instead.
+    /// The deadline-aware continue-as-new budget (issue #772) prefers the
+    /// snapshot's own [`execution_timeout`](HistorySnapshot::execution_timeout) /
+    /// [`deadline_at`](HistorySnapshot::deadline_at) when the JSON carries them
+    /// (a full history export does), falling back to this replayer's global
+    /// [`with_execution_timeout`](Self::with_execution_timeout) for a legacy
+    /// snapshot without them. This makes a deadline-aware exported history
+    /// replay cleanly through the JSON / `harvest-replay` path instead of
+    /// false-reporting non-determinism. [`replay_from_db`](Self::replay_from_db)
+    /// threads the execution row's own values.
     pub async fn replay_from_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
-        self.replay_from_snapshot_effective(snapshot, self.execution_timeout, None)
+        // Prefer the per-snapshot metadata (issue #772); fall back to the
+        // replayer's global timeout for a legacy snapshot that lacks it.
+        let execution_timeout = snapshot.execution_timeout.or(self.execution_timeout);
+        let deadline_at = snapshot.deadline_at;
+        self.replay_from_snapshot_effective(snapshot, execution_timeout, deadline_at)
             .await
     }
 
@@ -593,12 +626,15 @@ impl WorkflowReplayer {
 
     /// Replay a snapshot in canary mode (used for deploy-time verify).
     ///
-    /// Uses the global [`with_execution_timeout`](Self::with_execution_timeout)
-    /// and no live `deadline_at` (issue #772); [`run_canary`](Self::run_canary)
-    /// threads each sampled execution row's own values via
+    /// Prefers the snapshot's own `execution_timeout`/`deadline_at` when carried,
+    /// falling back to the global [`with_execution_timeout`](Self::with_execution_timeout)
+    /// (issue #772); [`run_canary`](Self::run_canary) threads each sampled
+    /// execution row's own values via
     /// [`replay_canary_snapshot_effective`](Self::replay_canary_snapshot_effective).
     pub async fn replay_canary_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
-        self.replay_canary_snapshot_effective(snapshot, self.execution_timeout, None)
+        let execution_timeout = snapshot.execution_timeout.or(self.execution_timeout);
+        let deadline_at = snapshot.deadline_at;
+        self.replay_canary_snapshot_effective(snapshot, execution_timeout, deadline_at)
             .await
     }
 
@@ -865,6 +901,8 @@ impl WorkflowReplayer {
             execution_id: exec_id,
             events: history.events,
             context_headers: Some(meta.headers),
+            execution_timeout: meta.execution_timeout,
+            deadline_at: meta.deadline_at,
         };
         Ok(self
             .replay_from_snapshot_effective(snapshot, meta.execution_timeout, meta.deadline_at)
@@ -955,6 +993,8 @@ impl WorkflowReplayer {
                                     execution_id: exec.execution_id,
                                     events: history.events,
                                     context_headers: headers,
+                                    execution_timeout: exec.execution_timeout,
+                                    deadline_at: exec.deadline_at,
                                 }
                             }; // `conn` is dropped here
 
@@ -2469,6 +2509,12 @@ impl TestRunOutcome {
             execution_id: self.exec_id,
             events: self.events.clone(),
             context_headers: None,
+            // Carry the test env's deadline budget on the snapshot too (issue
+            // #772); `replay_from_snapshot` prefers it, and the global
+            // `with_execution_timeout` below is retained as an equivalent
+            // fallback for older callers.
+            execution_timeout: self.execution_timeout,
+            deadline_at: None,
         };
         let mut replayer = WorkflowReplayer::new()
             .with_existing_state(self.state.clone())

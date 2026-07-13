@@ -1304,6 +1304,8 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     }
 }
 
@@ -2113,6 +2115,89 @@ async fn replay_deadline_crossed_history_yields_continue_as_new() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a deadline-crossed history must replay to ContinueAsNew, got: {report}"
+    );
+}
+
+/// Issue #772 (Codex P2 — carry deadline metadata in JSON replays): a full
+/// history export / `harvest-replay` JSON fixture for a deadline-aware workflow
+/// must carry `execution_timeout` on the snapshot so the JSON path threads the
+/// deadline budget. The metadata lives ONLY on the snapshot here — the replayer
+/// has NO global `with_execution_timeout` — so `replay_from_json` must read it
+/// from the JSON. Before the fix, `replay_from_snapshot` supplied only the
+/// (absent) global timeout, so the recorded `SideEffectRecorded{Now}` deadline
+/// probe was left unconsumed and the deadline-aware history false-reported
+/// non-determinism.
+#[tokio::test]
+async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
+    // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ the deadline branch tripped
+    // (the history recorded a continue-as-new).
+    let events = deadline_can_history(1_700_000_000_000, 27);
+    let snapshot = HistorySnapshot {
+        workflow_name: "deadline_can_workflow".to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        execution_timeout: Some(chrono::Duration::seconds(30)),
+        deadline_at: None,
+    };
+    let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
+    // The exported JSON must carry the deadline budget at the top level so it
+    // round-trips into a HistorySnapshot (and matches a HistoryExportDocument).
+    assert!(
+        json.contains("execution_timeout"),
+        "snapshot JSON must serialise execution_timeout: {json}"
+    );
+
+    // No global with_execution_timeout — the budget must come from the JSON.
+    let report = WorkflowReplayer::new()
+        .register_fn("deadline_can_workflow", deadline_can_workflow)
+        .replay_from_json(&json)
+        .await
+        .expect("snapshot JSON parses");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a deadline-aware history whose execution_timeout is carried on the JSON \
+         snapshot must replay cleanly via replay_from_json (not false-report \
+         non-determinism), got: {report}"
+    );
+}
+
+/// Issue #772 (Codex P2): backward compatibility. A snapshot JSON WITHOUT the
+/// new deadline fields still deserializes (serde `default` ⇒ `None`) — a legacy
+/// export produced before this field. Deserialization must succeed, and the
+/// replayer's global `with_execution_timeout` still enables the deadline branch
+/// (the documented fallback), so a deadline-aware history replays unchanged.
+#[tokio::test]
+async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout() {
+    let events = deadline_can_history(1_700_000_000_000, 27);
+    let snapshot = HistorySnapshot {
+        workflow_name: "deadline_can_workflow".to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        // Legacy snapshot: no deadline metadata. `skip_serializing_if` omits
+        // both fields from the JSON, producing a byte-for-byte pre-#772 export.
+        execution_timeout: None,
+        deadline_at: None,
+    };
+    let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
+    assert!(
+        !json.contains("execution_timeout") && !json.contains("deadline_at"),
+        "a None deadline field must be omitted from the JSON (legacy shape): {json}"
+    );
+
+    // Deserialization tolerates the absent fields; the global fallback enables
+    // the deadline branch so the deadline-aware history replays cleanly.
+    let report = WorkflowReplayer::new()
+        .register_fn("deadline_can_workflow", deadline_can_workflow)
+        .with_execution_timeout(chrono::Duration::seconds(30))
+        .replay_from_json(&json)
+        .await
+        .expect("legacy snapshot JSON (no deadline fields) parses");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a legacy snapshot without deadline fields must deserialize and replay \
+         via the replayer's global with_execution_timeout fallback, got: {report}"
     );
 }
 
@@ -3378,6 +3463,8 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3403,6 +3490,8 @@ async fn replay_from_json_detects_non_determinism() {
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3593,6 +3682,8 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4773,6 +4864,8 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4803,6 +4896,8 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4826,6 +4921,8 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4851,6 +4948,8 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4893,6 +4992,8 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -4955,6 +5056,8 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -5030,6 +5133,8 @@ async fn replay_succeeds_for_recorded_side_effect() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 
@@ -5074,6 +5179,8 @@ async fn replay_detects_side_effect_drift() {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .await;
 

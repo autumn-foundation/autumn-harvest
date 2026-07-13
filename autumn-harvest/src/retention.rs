@@ -1493,6 +1493,11 @@ async fn run_shard_tick(
                                 .context_headers
                                 .as_ref()
                                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            // Retention archival snapshots a terminal run being
+                            // deleted; deadline-aware replay metadata (issue #772)
+                            // is irrelevant for a finished execution.
+                            execution_timeout: None,
+                            deadline_at: None,
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {

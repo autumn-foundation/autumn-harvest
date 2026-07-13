@@ -24092,6 +24092,11 @@ fn export_history_for_execution(
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
             context_headers,
+            // Issue #772: carry the deadline-aware replay metadata so an
+            // exported history round-trips the continue-as-new budget into the
+            // JSON / `harvest-replay` replay path.
+            execution_timeout: execution.execution_timeout,
+            deadline_at: execution.deadline_at,
         },
         decoder,
         outcome,
@@ -24116,6 +24121,13 @@ fn export_history_for_candidate(
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
             context_headers: None,
+            // Batch export candidates carry no deadline metadata (the batch
+            // candidate query does not select `execution_timeout`/`deadline_at`);
+            // the JSON replay path falls back to the replayer's global
+            // `with_execution_timeout` for these. The single-execution export
+            // (`export_history_for_execution`) carries them (issue #772).
+            execution_timeout: None,
+            deadline_at: None,
         },
         decoder,
         outcome,

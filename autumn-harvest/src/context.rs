@@ -2961,6 +2961,30 @@ impl WorkflowContext {
     /// rather than nd-blocking — fail-safe: it can never produce a wrong
     /// command, and any real control-flow divergence still nd-errors at the next
     /// real command mismatch.
+    /// The frontier wall-clock instant (millis) the deadline probe records.
+    ///
+    /// In the test harness with the advancing virtual clock enabled
+    /// ([`with_advancing_timer_clock`](Self::with_advancing_timer_clock)), this
+    /// reads the ADVANCING clock (`start_time + elapsed`, mirroring
+    /// [`now`](Self::now)) so a live test run that consumes its deadline budget
+    /// via durable timers can exercise the deadline-aware continue-as-new branch
+    /// (issue #772 Codex P2). In production builds the virtual-clock arm is
+    /// compiled out and this is `Utc::now()` — the deadline probe's #384
+    /// host-wall-clock behavior is unchanged.
+    fn deadline_frontier_now_millis(&self) -> i64 {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(ref atomic) = self.timer_clock_elapsed_secs {
+            let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            let delta = chrono::Duration::seconds(
+                i64::try_from(elapsed)
+                    .unwrap_or(i64::MAX / 1000)
+                    .min(i64::MAX / 1000),
+            );
+            return (self.start_time + delta).timestamp_millis();
+        }
+        Utc::now().timestamp_millis()
+    }
+
     fn deadline_clock_read(&self) -> Option<DateTime<Utc>> {
         match self.match_history(HistoryMatcher::match_side_effect_now_tolerant) {
             crate::replay::SideEffectNowMatch::Matched { millis } => {
@@ -2968,7 +2992,16 @@ impl WorkflowContext {
             }
             crate::replay::SideEffectNowMatch::NotRecorded => None,
             crate::replay::SideEffectNowMatch::Frontier => {
-                let millis = Utc::now().timestamp_millis();
+                // Read the frontier wall clock. In the test harness with the
+                // advancing virtual clock enabled (issue #526/#772 Codex P2),
+                // this reads the context's ADVANCING clock (`start_time +
+                // elapsed`) so a workflow that sleeps past its deadline fraction
+                // via durable timers actually trips the deadline continue-as-new
+                // branch under test. In production (no virtual clock) this is
+                // `Utc::now()` exactly as before — `system_now`'s #384
+                // host-wall-clock contract is untouched (this internal probe is
+                // the only reader that consults the virtual clock).
+                let millis = self.deadline_frontier_now_millis();
                 // Record the fresh clock read like `system_now` does at its
                 // `NoMatch` (frontier) branch — append the value + push the
                 // `RecordSideEffect` bookkeeping command — but under the reserved
@@ -8696,6 +8729,14 @@ impl WorkflowContext {
         let workflow_id = self.workflow_id.clone();
         let workflow_name = self.workflow_name.clone();
         let context_headers = std::sync::Arc::clone(&self.context_headers);
+        // Issue #772 (Codex P2): thread the deadline budget into the handler
+        // context so `ctx.deadline()` / `time_until_deadline()` inside a
+        // declarative `#[update]` handler return the real values (not `None`)
+        // for a running workflow that has an `execution_timeout`. Without this,
+        // `new_for_handler` inits both to `None` and the update-handler path —
+        // unlike the workflow body and query handlers — never sees them.
+        let execution_timeout = self.execution_timeout;
+        let deadline_at = self.deadline_at;
         // Carryover is frozen in WorkflowStarted, so a handler on a scheduled workflow
         // must observe the same last_completion_result/last_error as the workflow body
         // (issue #488).
@@ -8722,6 +8763,9 @@ impl WorkflowContext {
                     .clone_from(&last_completion_result);
                 inner.last_error.clone_from(&last_error);
                 inner.metrics = std::sync::Arc::clone(&metrics);
+                // Issue #772 (Codex P2): inherit the parent's deadline budget.
+                inner.execution_timeout = execution_timeout;
+                inner.deadline_at = deadline_at;
             }
             handler_fn(ctx, input)
         });
@@ -8791,6 +8835,10 @@ impl WorkflowContext {
                     .clone_from(&self.last_completion_result);
                 inner.last_error.clone_from(&self.last_error);
                 inner.metrics = std::sync::Arc::clone(&self.metrics);
+                // Issue #772 (Codex P2): inherit the parent's deadline budget so
+                // `ctx.deadline()` works inside the handler.
+                inner.execution_timeout = self.execution_timeout;
+                inner.deadline_at = self.deadline_at;
             }
             h(ctx, input)
         })
@@ -11376,6 +11424,103 @@ mod tests {
             !live_ctx.should_continue_as_new(),
             "must not trip: the live effective deadline is far in the future \
              even though the nominal budget is fully consumed"
+        );
+    }
+
+    /// Issue #772 (Codex P2): a declarative `#[update]` handler on a workflow
+    /// with an `execution_timeout` must observe `ctx.deadline()` == `Some(..)`
+    /// (not `None`). `new_for_handler` inits the deadline fields to `None`;
+    /// `register_declarative_update_handler` must thread the parent's
+    /// `execution_timeout`/`deadline_at` into the handler context — the
+    /// workflow body and query handlers already see these, update handlers were
+    /// the missed path.
+    #[tokio::test]
+    async fn update_handler_inherits_parent_deadline() {
+        // `UpdateHandlerFn` takes the ctx `Arc` by value; the signature is fixed.
+        #[allow(clippy::needless_pass_by_value)]
+        fn probe_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            let has_deadline = ctx.deadline().is_some();
+            Box::pin(async move { Ok(serde_json::json!(has_deadline)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "probe",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: probe_handler,
+            validator: None,
+            mcp: false,
+        };
+
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let parent = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+        // Sanity: the parent workflow context itself sees the deadline.
+        assert_eq!(parent.deadline(), Some(t0 + chrono::Duration::seconds(30)));
+
+        parent.register_declarative_update_handler(&info);
+        let fut = parent
+            .invoke_update("probe", Value::Null)
+            .expect("handler registered");
+        let result = fut.await;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!(true)),
+            "a declarative update handler must inherit the parent's execution_timeout \
+             so ctx.deadline() returns Some(..)"
+        );
+    }
+
+    /// Issue #772 (Codex P2): the resume-shifted absolute `deadline_at` is also
+    /// threaded into the update-handler context, so a paused/redriven run's
+    /// handler sees the same live deadline the workflow body's internal budget
+    /// check reads.
+    #[tokio::test]
+    async fn update_handler_inherits_parent_shifted_deadline_at() {
+        #[allow(clippy::needless_pass_by_value)]
+        fn deadline_at_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            // The public accessor is the nominal deadline; return its millis so
+            // the test can assert the handler inherited execution_timeout.
+            let nominal = ctx.deadline().map(|d| d.timestamp_millis());
+            Box::pin(async move { Ok(serde_json::json!(nominal)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "deadline_at",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "i64",
+            has_validator: false,
+            handler: deadline_at_handler,
+            validator: None,
+            mcp: false,
+        };
+
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let timeout = chrono::Duration::seconds(30);
+        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let parent = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
+
+        parent.register_declarative_update_handler(&info);
+        let fut = parent
+            .invoke_update("deadline_at", Value::Null)
+            .expect("handler registered");
+        let result = fut.await;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!((t0 + timeout).timestamp_millis())),
+            "the update handler must inherit execution_timeout (nominal deadline present)"
         );
     }
 

@@ -10,6 +10,38 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
 
+/// Serde adapter for `Option<chrono::Duration>` as `Option<i64>` milliseconds
+/// (issue #772). `chrono::Duration` (`TimeDelta`) has no serde impl, so the
+/// deadline-aware replay metadata (`execution_timeout`) that both
+/// [`HistoryExportDocument`] and `testing::HistorySnapshot` carry is serialised
+/// as an integer millisecond count — lossless for the `INTERVAL`-backed
+/// `execution_timeout` column and matching the millisecond granularity of the
+/// deadline probe. Both structs use this module so the exported JSON round-trips
+/// into a `HistorySnapshot` verbatim.
+pub(crate) mod opt_duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    // serde `with` dictates the `&Option<T>` signature — `Option<&T>` is not
+    // usable here.
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(
+        value: &Option<chrono::Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .as_ref()
+            .map(chrono::Duration::num_milliseconds)
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<chrono::Duration>, D::Error> {
+        let millis: Option<i64> = Option::deserialize(deserializer)?;
+        Ok(millis.map(chrono::Duration::milliseconds))
+    }
+}
+
 /// Schema identifier for history export documents.
 pub const HISTORY_EXPORT_SCHEMA: &str = "autumn-harvest.history-export";
 
@@ -121,6 +153,26 @@ pub struct HistoryExportDocument {
     /// restore the same ambient headers the workflow saw during live execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_headers: Option<HashMap<String, String>>,
+    /// The execution's `execution_timeout` budget (issue #772), serialised as
+    /// integer milliseconds at the top level so it round-trips into a
+    /// `testing::HistorySnapshot` and the JSON / `harvest-replay` replay path
+    /// threads the deadline-aware continue-as-new budget. `None` for a workflow
+    /// with no execution timeout, or a legacy export produced before this field.
+    /// **Non-payload operational metadata** — never redacted.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration_millis"
+    )]
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
+    /// (issue #772). Serialised at the top level so the JSON replay path can
+    /// compute the deadline against the value the timeout scanner enforces
+    /// rather than the nominal `start + execution_timeout`. `None` when no
+    /// absolute deadline was recorded, or a legacy export. Non-payload
+    /// operational metadata — never redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
 }
 
 /// Input needed to export one workflow execution history.
@@ -147,6 +199,14 @@ pub struct HistoryExportRequest {
     /// the headers are embedded in the export document so replaying the export
     /// restores the same ambient headers the original execution saw.
     pub context_headers: Option<HashMap<String, String>>,
+    /// The execution's `execution_timeout` budget (issue #772), embedded in the
+    /// export so the JSON / `harvest-replay` replay path threads the
+    /// deadline-aware continue-as-new budget. `None` for a workflow with no
+    /// execution timeout.
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
+    /// (issue #772). `None` when no absolute deadline was recorded.
+    pub deadline_at: Option<DateTime<Utc>>,
 }
 
 /// History export failure modes.
@@ -246,6 +306,12 @@ pub fn export_history_decoded(
         } else {
             request.context_headers
         },
+        // Deadline-aware replay metadata (issue #772) — non-payload operational
+        // fields, carried verbatim under BOTH policies (never redacted) so the
+        // exported history round-trips the deadline budget into the JSON /
+        // `harvest-replay` replay path.
+        execution_timeout: request.execution_timeout,
+        deadline_at: request.deadline_at,
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;
@@ -1018,6 +1084,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1037,6 +1105,60 @@ mod tests {
         assert_eq!(document.event_count, 2);
         assert!(document.status.terminal);
         assert!(!document.size_limit.truncated);
+    }
+
+    /// Issue #772 (Codex P2): a full history export must carry the deadline-aware
+    /// replay metadata (`execution_timeout`/`deadline_at`) at the TOP LEVEL, in
+    /// the same wire shape a `testing::HistorySnapshot` expects, so an exported
+    /// history round-trips into a snapshot and the JSON / `harvest-replay`
+    /// replay path threads the deadline budget.
+    #[test]
+    fn full_export_carries_deadline_metadata_round_tripping_into_a_snapshot() {
+        use crate::types::ExecutionId;
+
+        let exec_id = ExecutionId::new();
+        let timeout = chrono::Duration::seconds(1800);
+        let deadline = Utc::now() + chrono::Duration::seconds(3600);
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "wf".to_string(),
+            execution_id: exec_id,
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!(null),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+            execution_timeout: Some(timeout),
+            deadline_at: Some(deadline),
+        })
+        .expect("full export should fit under the limit");
+
+        assert_eq!(document.execution_timeout, Some(timeout));
+        assert_eq!(document.deadline_at, Some(deadline));
+
+        let json = serde_json::to_string(&document).expect("export should serialize");
+        // The duration serialises as integer milliseconds at the top level.
+        assert!(
+            json.contains("\"execution_timeout\":1800000"),
+            "execution_timeout must serialise as top-level integer millis: {json}"
+        );
+
+        // The exported JSON must deserialise into a HistorySnapshot carrying the
+        // deadline metadata verbatim — this is the exact round-trip the JSON /
+        // `harvest-replay` replay path relies on.
+        let snapshot: crate::testing::HistorySnapshot =
+            serde_json::from_str(&json).expect("export JSON parses as a HistorySnapshot");
+        assert_eq!(snapshot.execution_timeout, Some(timeout));
+        assert_eq!(snapshot.deadline_at, Some(deadline));
+        assert_eq!(snapshot.workflow_name, "wf");
+        assert_eq!(snapshot.execution_id, exec_id);
     }
 
     #[test]
@@ -1087,6 +1209,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1144,6 +1268,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1179,6 +1305,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(128),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .expect_err("oversized full export must fail unless limit is raised");
 
@@ -1343,6 +1471,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .expect("an envelope-bearing history must export under Full");
 
@@ -1369,6 +1499,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         })
         .expect("an envelope-bearing history must export under Redacted");
 
@@ -1435,6 +1567,8 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(max_bytes),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         }
     }
 

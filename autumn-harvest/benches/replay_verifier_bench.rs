@@ -63,6 +63,8 @@ fn build_fixture_json(activity_count: usize) -> String {
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }

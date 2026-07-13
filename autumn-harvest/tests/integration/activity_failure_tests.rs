@@ -286,6 +286,8 @@ mod replay_tests {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
         };
 
         let report = WorkflowReplayer::new()

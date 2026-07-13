@@ -3191,3 +3191,71 @@ async fn deadline_aware_run_replay_check_carries_execution_timeout() {
          history replays cleanly, got: {report}"
     );
 }
+
+/// A workflow that consumes 90s of its deadline budget via a durable timer,
+/// then reports whether `should_continue_as_new()` trips.
+fn deadline_trip_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Advancing the virtual clock 90s of a 100s budget consumes 0.9 of it,
+        // past the default 0.8 deadline fraction.
+        ctx.timer("gate", 90).await.map_err(|e| e.to_string())?;
+        Ok(json!(ctx.should_continue_as_new()))
+    })
+}
+
+/// Issue #772 (Codex P2): in a live `WorkflowTestEnv::with_execution_timeout`
+/// run, the deadline probe must read the context's ADVANCING virtual clock —
+/// not the host `Utc::now()` — so a workflow that consumes its deadline budget
+/// via durable timers actually trips the deadline continue-as-new branch under
+/// test. Before the fix the probe read `Utc::now()` (≈ `start_time`, ~zero
+/// elapsed), so almost none of the budget looked consumed and the branch never
+/// tripped in the harness — making the test-env timeout support unable to
+/// validate the long-lived low-event workflows the feature was added for.
+#[tokio::test]
+async fn deadline_probe_reads_advancing_clock_and_trips_in_test_env() {
+    let outcome = WorkflowTestEnv::new()
+        .with_execution_timeout(chrono::Duration::seconds(100))
+        .run(deadline_trip_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!(true)),
+        "advancing the virtual clock past the deadline fraction via a durable timer must \
+         trip should_continue_as_new() in the test env; result: {:?} events: {:?}",
+        outcome.result,
+        outcome.events(),
+    );
+}
+
+/// A workflow that consumes only 10s of its 100s budget.
+fn deadline_no_trip_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.timer("gate", 10).await.map_err(|e| e.to_string())?;
+        Ok(json!(ctx.should_continue_as_new()))
+    })
+}
+
+/// Control (issue #772 Codex P2): a run that consumes only a small fraction of
+/// its deadline budget must NOT trip — proving the deadline branch reads the
+/// advancing clock rather than being unconditionally true. This case passes
+/// both before and after the fix, so it guards against an over-eager change.
+#[tokio::test]
+async fn deadline_probe_does_not_trip_below_fraction_in_test_env() {
+    let outcome = WorkflowTestEnv::new()
+        .with_execution_timeout(chrono::Duration::seconds(100))
+        .run(deadline_no_trip_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!(false)),
+        "consuming only 10s of a 100s budget must NOT trip should_continue_as_new(); \
+         result: {:?}",
+        outcome.result,
+    );
+}
