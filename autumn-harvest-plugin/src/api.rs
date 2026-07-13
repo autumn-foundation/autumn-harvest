@@ -2972,6 +2972,13 @@ struct HistoryExportCandidate {
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     last_history_event_at: chrono::DateTime<chrono::Utc>,
+    // Issue #772: the per-execution deadline-aware replay budget, carried into
+    // the batch export document so `harvest-replay` / `replay_from_json` threads
+    // the continue-as-new deadline (parity with the single-execution export).
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
+    execution_timeout: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -24121,13 +24128,13 @@ fn export_history_for_candidate(
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
             context_headers: None,
-            // Batch export candidates carry no deadline metadata (the batch
-            // candidate query does not select `execution_timeout`/`deadline_at`);
-            // the JSON replay path falls back to the replayer's global
-            // `with_execution_timeout` for these. The single-execution export
-            // (`export_history_for_execution`) carries them (issue #772).
-            execution_timeout: None,
-            deadline_at: None,
+            // Issue #772: carry the deadline-aware replay metadata (the batch
+            // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
+            // batch-exported deadline-aware history round-trips its continue-as-new
+            // budget into the JSON / `harvest-replay` replay path — parity with the
+            // single-execution export (`export_history_for_execution`).
+            execution_timeout: candidate.execution_timeout,
+            deadline_at: candidate.deadline_at,
         },
         decoder,
         outcome,
@@ -24299,13 +24306,16 @@ SELECT
     w.workflow_name AS workflow_name,
     w.shard_id AS shard_id,
     w.state AS state,
-    COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at
+    COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at,
+    w.execution_timeout AS execution_timeout,
+    w.deadline_at AS deadline_at
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
 WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
-GROUP BY w.id, w.workflow_name, w.shard_id, w.state, w.completed_at, w.started_at, w.created_at
+GROUP BY w.id, w.workflow_name, w.shard_id, w.state, w.completed_at, w.started_at, w.created_at,
+         w.execution_timeout, w.deadline_at
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -31119,6 +31129,8 @@ mod tests {
             shard_id,
             state: "COMPLETED".to_string(),
             last_history_event_at,
+            execution_timeout: None,
+            deadline_at: None,
         }
     }
 
