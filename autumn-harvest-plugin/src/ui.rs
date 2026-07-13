@@ -925,7 +925,11 @@ async fn list_workflows_ui(
     filters.started_before = started_before;
     filters.exec_id_prefix = exec_id_search.clone();
 
-    let (workflows, _next_cursor) = load_workflows_from_shards(&api_state, &filters).await?;
+    // Issue #756: an unreachable shard degrades to a partial page rather than
+    // failing the whole render; the UI shows the reachable-shard rows.
+    let workflows = load_workflows_from_shards(&api_state, &filters)
+        .await?
+        .executions;
 
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);

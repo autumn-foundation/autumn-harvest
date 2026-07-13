@@ -2297,7 +2297,51 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     } else {
         cli.output
     };
-    format_output(value, output)
+    let rendered = format_output(value, output)?;
+    // Issue #756: when a list read degraded (a shard was unreachable) the body
+    // is the `{ <items>, status, unavailable_shards }` envelope. Surface a clear
+    // notice line above the data so an operator sees the partiality instead of a
+    // silently-short list. The special table formatters above (usage,
+    // dlq_aggregate) already render their own unavailable-shard block, so this
+    // only applies to the plain-JSON fall-through (workflow/worker/schedule/dlq
+    // list).
+    Ok(match fanout_partial_notice(value) {
+        Some(notice) => format!("{notice}\n{rendered}"),
+        None => rendered,
+    })
+}
+
+/// Build a human-readable "shard(s) unavailable" notice line from a degraded
+/// cross-shard fan-out envelope (issue #756), or `None` when the body is not a
+/// degraded envelope (a bare array on the happy path, or an object with an
+/// empty/absent `unavailable_shards`).
+fn fanout_partial_notice(value: &Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let unavailable = obj.get("unavailable_shards")?.as_array()?;
+    if unavailable.is_empty() {
+        return None;
+    }
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("partial");
+    let detail: Vec<String> = unavailable
+        .iter()
+        .map(|shard| {
+            let id = cell_number(shard.get("shard_id"));
+            let reason = cell_str(shard.get("reason"));
+            if reason.is_empty() {
+                id
+            } else {
+                format!("{id}: {reason}")
+            }
+        })
+        .collect();
+    Some(format!(
+        "WARNING: cross-shard read is {status}; {} shard(s) unavailable: {}",
+        unavailable.len(),
+        detail.join(", ")
+    ))
 }
 
 fn usage_wants_table(cli: &Cli) -> bool {
@@ -5907,6 +5951,67 @@ mod reuse_policy_tests {
         let rendered = render_response(&cli, &payload).expect("json output should render");
 
         assert_eq!(rendered, r#"{"items":[],"next_cursor":null}"#);
+    }
+
+    // ── issue #756: partial cross-shard read notice ──────────────────────
+
+    #[test]
+    fn fanout_partial_notice_none_for_bare_array() {
+        // The happy path is a bare array; no notice.
+        assert!(fanout_partial_notice(&json!([{"id": "a"}])).is_none());
+    }
+
+    #[test]
+    fn fanout_partial_notice_none_when_unavailable_empty() {
+        assert!(
+            fanout_partial_notice(&json!({
+                "workers": [],
+                "status": "complete",
+                "unavailable_shards": []
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fanout_partial_notice_names_shard_and_reason() {
+        let notice = fanout_partial_notice(&json!({
+            "workflows": [],
+            "status": "partial",
+            "unavailable_shards": [
+                {"shard_id": 1, "reason": "connection refused"}
+            ]
+        }))
+        .expect("degraded envelope must produce a notice");
+        assert!(notice.contains("partial"));
+        assert!(notice.contains("1 shard(s) unavailable"));
+        assert!(notice.contains("1: connection refused"));
+    }
+
+    #[test]
+    fn workflow_list_renders_partial_notice_above_data() {
+        // A degraded `workflow list` body (issue #756) renders the notice line
+        // above the JSON, so the operator sees the partiality rather than a
+        // silently-short list.
+        let cli = parse(&["workflow", "list"]);
+        let payload = json!({
+            "workflows": [{"id": "00000000-0000-0000-0000-000000000001"}],
+            "status": "partial",
+            "unavailable_shards": [{"shard_id": 2, "reason": "pool missing"}]
+        });
+        let rendered = render_response(&cli, &payload).expect("render should succeed");
+        assert!(rendered.starts_with("WARNING: cross-shard read is partial"));
+        assert!(rendered.contains("2: pool missing"));
+        // The primary data still follows the notice.
+        assert!(rendered.contains("workflows"));
+    }
+
+    #[test]
+    fn workflow_list_happy_path_bare_array_has_no_notice() {
+        let cli = parse(&["workflow", "list"]);
+        let payload = json!([{"id": "00000000-0000-0000-0000-000000000001"}]);
+        let rendered = render_response(&cli, &payload).expect("render should succeed");
+        assert!(!rendered.contains("WARNING"));
     }
 
     #[test]
