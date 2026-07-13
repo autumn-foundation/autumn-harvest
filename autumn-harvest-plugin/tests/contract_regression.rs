@@ -98,6 +98,97 @@ fn workflow_count_route_is_classified() {
     );
 }
 
+/// Business-id ("latest run") route variants (issue #805) must each be
+/// registered in `management_api_routes()` AND classified with the correct
+/// `RouteClass` in `autumn_harvest::audit::CLASSIFIED_ROUTES` (mirroring their
+/// exec-id counterparts). `audit.rs`'s own exhaustiveness tests only cross-check
+/// `CLASSIFIED_ROUTES` and `ALL_MUTATION_ROUTES` against each other, never
+/// against the live router, so this pins the specific routes this diff adds.
+#[test]
+fn business_id_routes_are_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    // (route, class, excluded?) — mirrors each exec-id counterpart exactly.
+    let expected = [
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+            RouteClass::ReadOnly,
+            true,
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+            RouteClass::ReadOnly,
+            true,
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+            RouteClass::ReadOnly,
+            true,
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+            RouteClass::ReadOnly,
+            true,
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            RouteClass::ReadOnly,
+            true,
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            RouteClass::ReadOnly,
+            true,
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+            RouteClass::Mutating,
+            false,
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+            RouteClass::Mutating,
+            false,
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+            RouteClass::Mutating,
+            false,
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+            RouteClass::Mutating,
+            false,
+        ),
+    ];
+
+    for (route, class, excluded) in expected {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| format!("{m} {p}") == route),
+            "{route} must be registered in management_api_routes()"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == class),
+            "{route} must be classified {class:?} in CLASSIFIED_ROUTES"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES.iter().any(|(r, _)| *r == route),
+            "{route} must appear in ALL_MUTATION_ROUTES"
+        );
+        assert_eq!(
+            EXCLUDED_ROUTES.contains(&route),
+            excluded,
+            "{route} EXCLUDED_ROUTES membership must mirror its exec-id counterpart"
+        );
+    }
+}
+
 /// `GET /admin/status` (issue #679) must be registered in the live route
 /// registry AND classified `ReadOnly` in
 /// `autumn_harvest::audit::CLASSIFIED_ROUTES`.

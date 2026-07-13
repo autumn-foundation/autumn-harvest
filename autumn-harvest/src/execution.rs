@@ -1197,6 +1197,116 @@ mod start_will_create_tests {
     }
 }
 
+#[cfg(test)]
+mod resolve_by_workflow_id_tests {
+    use super::{ResolvedRun, select_resolved_run};
+    use crate::types::ExecutionId;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn run(state: &str, minute: u32) -> ResolvedRun {
+        ResolvedRun {
+            exec_id: ExecutionId::new(),
+            state: state.to_string(),
+            started_at: at(minute),
+        }
+    }
+
+    fn at(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, minute, 0)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn empty_yields_none() {
+        assert_eq!(select_resolved_run(Vec::new()), None);
+    }
+
+    #[test]
+    fn single_terminal_is_returned() {
+        let r = run("COMPLETED", 5);
+        assert_eq!(select_resolved_run(vec![r.clone()]), Some(r));
+    }
+
+    #[test]
+    fn only_active_is_returned() {
+        let active = run("RUNNING", 3);
+        assert_eq!(select_resolved_run(vec![active.clone()]), Some(active));
+    }
+
+    #[test]
+    fn active_wins_over_terminals_regardless_of_started_at() {
+        // The active run is OLDER than a terminal — it must still win (AC2).
+        let active = run("RUNNING", 1);
+        let newer_terminal = run("COMPLETED", 9);
+        let older_terminal = run("FAILED", 2);
+        let picked = select_resolved_run(vec![older_terminal, newer_terminal, active.clone()])
+            .expect("some");
+        assert_eq!(picked, active, "the non-terminal run wins even when older");
+    }
+
+    #[test]
+    fn no_active_picks_most_recent_terminal_by_started_at() {
+        let oldest = run("FAILED", 1);
+        let newest = run("COMPLETED", 8);
+        let middle = run("CANCELLED", 4);
+        let picked = select_resolved_run(vec![oldest, newest.clone(), middle]).expect("some");
+        assert_eq!(picked, newest, "most recent terminal by started_at");
+    }
+
+    #[test]
+    fn paused_counts_as_active() {
+        // PAUSED is a non-terminal active state (issue #383).
+        let paused = run("PAUSED", 2);
+        let terminal = run("COMPLETED", 7);
+        let picked = select_resolved_run(vec![terminal, paused.clone()]).expect("some");
+        assert_eq!(picked, paused);
+    }
+
+    #[test]
+    fn sealed_states_are_terminal() {
+        // CONTINUED_AS_NEW and TERMINATED are terminal (is_terminal_state), so a
+        // fresh RUNNING successor must win over a sealed predecessor.
+        let can = run("CONTINUED_AS_NEW", 1);
+        let terminated = run("TERMINATED", 2);
+        let successor = run("RUNNING", 3);
+        let picked = select_resolved_run(vec![can, terminated, successor.clone()]).expect("some");
+        assert_eq!(picked, successor);
+    }
+
+    #[test]
+    fn two_actives_picks_most_recent_defensively() {
+        // At most one active run should exist per (name,id), but if two are
+        // observed across shards (writable-subset drift), pick the newest.
+        let older = run("RUNNING", 1);
+        let newer = run("PAUSED", 5);
+        let picked = select_resolved_run(vec![older, newer.clone()]).expect("some");
+        assert_eq!(picked, newer);
+    }
+
+    #[test]
+    fn resolve_terminal_states_matches_is_terminal_state() {
+        // Guard against drift between the SQL filter literal list and the pure
+        // classification used by select_resolved_run.
+        for state in super::RESOLVE_TERMINAL_STATES {
+            assert!(
+                crate::erase::is_terminal_state(state),
+                "{state} in RESOLVE_TERMINAL_STATES must be terminal"
+            );
+        }
+        for active in ["RUNNING", "PAUSED"] {
+            assert!(
+                !crate::erase::is_terminal_state(active),
+                "{active} must not be terminal"
+            );
+            assert!(
+                !super::RESOLVE_TERMINAL_STATES.contains(&active),
+                "{active} must not be in RESOLVE_TERMINAL_STATES"
+            );
+        }
+    }
+}
+
 /// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
 /// index slot) then insert `new_row` as a fresh execution with its own
 /// `WorkflowStarted` event and task queue entry.
@@ -2893,6 +3003,131 @@ pub async fn execution_exists_by_key(
     .get_result::<bool>(conn)
     .await
     .map_err(database_error)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Business-id ("latest run") resolution (issue #805)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single candidate run resolved for a `(workflow_name, workflow_id)` pair
+/// on one shard (issue #805).
+///
+/// Deliberately lightweight — only the fields the "latest run" ranking needs —
+/// so business-id resolution never loads a full [`WorkflowExecution`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRun {
+    /// The internal execution id of the resolved run.
+    pub exec_id: ExecutionId,
+    /// The run's execution state (e.g. `RUNNING`, `COMPLETED`).
+    pub state: String,
+    /// When the run started; used to break ties among terminal runs.
+    pub started_at: chrono::DateTime<Utc>,
+}
+
+/// The terminal states used by the SQL ranking filter in
+/// [`resolve_execution_id_by_workflow_id`].
+///
+/// Kept in sync with [`crate::erase::is_terminal_state`] by the
+/// `resolve_terminal_states_matches_is_terminal_state` unit test so the SQL
+/// path and the pure [`select_resolved_run`] ranking can never disagree about
+/// which states are terminal.
+const RESOLVE_TERMINAL_STATES: [&str; 6] = [
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "CONTINUED_AS_NEW",
+    "TERMINATED",
+];
+
+/// Pick the single best "latest run" from per-shard candidates (issue #805).
+///
+/// Ranking, matching the business-id resolution rule: if any candidate is
+/// **non-terminal** (an active run — at most one should exist per
+/// `(workflow_name, workflow_id)`), return the non-terminal one with the
+/// greatest `started_at`; otherwise the **most recent terminal** run by
+/// `started_at`; otherwise `None`.
+///
+/// Pure and no-DB: the plugin resolver fans out across shards, collects each
+/// shard's best candidate, and calls this to pick the global winner. Terminal
+/// classification delegates to [`crate::erase::is_terminal_state`] so it cannot
+/// drift from the rest of the engine.
+#[must_use]
+pub fn select_resolved_run(candidates: Vec<ResolvedRun>) -> Option<ResolvedRun> {
+    // Prefer the most-recently-started non-terminal (active) run.
+    if let Some(active) = candidates
+        .iter()
+        .filter(|c| !crate::erase::is_terminal_state(&c.state))
+        .max_by_key(|c| c.started_at)
+        .cloned()
+    {
+        return Some(active);
+    }
+    // No active run: fall back to the most-recently-started terminal run.
+    candidates.into_iter().max_by_key(|c| c.started_at)
+}
+
+/// Resolve the best "latest run" for `(workflow_name, workflow_id)` on ONE
+/// shard (issue #805).
+///
+/// Returns the shard's single best candidate under the same ranking as
+/// [`select_resolved_run`]: a non-terminal (active) run if one exists on this
+/// shard, otherwise this shard's most-recent run (which is terminal when no
+/// active run exists), otherwise `None`. Read-only.
+///
+/// The plugin fans this out across every shard and merges the per-shard results
+/// with [`select_resolved_run`], so this returning a terminal while another
+/// shard holds an active run still resolves correctly. Both queries hit the
+/// `UNIQUE (workflow_name, workflow_id)` index.
+pub async fn resolve_execution_id_by_workflow_id(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<Option<ResolvedRun>> {
+    // Active-first: a non-terminal run for this key (at most one per shard via
+    // the partial unique index). `started_at DESC` is defensive.
+    let active = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne_all(RESOLVE_TERMINAL_STATES))
+        .order(harvest_workflow_executions::started_at.desc())
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+        ))
+        .first::<(Uuid, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+    if let Some((id, state, started_at)) = active {
+        return Ok(Some(ResolvedRun {
+            exec_id: ExecutionId::from_uuid(id),
+            state,
+            started_at,
+        }));
+    }
+
+    // No active run on this shard: the most-recently-started row is the
+    // most-recent terminal.
+    let terminal = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .order(harvest_workflow_executions::started_at.desc())
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+        ))
+        .first::<(Uuid, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+    Ok(terminal.map(|(id, state, started_at)| ResolvedRun {
+        exec_id: ExecutionId::from_uuid(id),
+        state,
+        started_at,
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

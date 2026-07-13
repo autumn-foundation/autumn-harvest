@@ -464,6 +464,49 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     // Batch reset by semantic point (issue #538): admin-only.
     ("POST /workflows/batch_reset", RouteClass::Mutating),
+    // ── Business-id ("latest run") route variants (issue #805) ────────────────
+    // Each mirrors its exec-id counterpart's class exactly.
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    // POST query accepts typed args but never mutates workflow state.
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+        RouteClass::Mutating,
+    ),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -599,6 +642,14 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /admin/build-routing/retire",
     // Admission gate list is read-only.
     "GET /admin/gates",
+    // Business-id ("latest run") read-only variants (issue #805).
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+    // POST query is read-only (typed args, no state mutation).
+    "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -790,6 +841,47 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ),
     // Batch reset by semantic point (issue #538)
     ("POST /workflows/batch_reset", Some(OP_BATCH_RESET)),
+    // ── Business-id ("latest run") route variants (issue #805) ────────────────
+    // Audit operations mirror the exec-id counterparts (the by-id handlers
+    // delegate to them; the delegated handler writes the audit row under the
+    // exec-id route string with the resolved exec_id as the target).
+    ("GET /workflows/by-id/{workflow_name}/{workflow_id}", None),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+        None,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+        None,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+        None,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        None,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        None,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+        Some(OP_WORKFLOW_SIGNAL),
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+        Some(OP_WORKFLOW_CANCEL),
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+        Some(OP_WORKFLOW_PAUSE),
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+        Some(OP_WORKFLOW_RESUME),
+    ),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────

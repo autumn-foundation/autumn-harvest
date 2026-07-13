@@ -3370,6 +3370,361 @@ async fn lift_gate_handler(
     }
 }
 
+// ── Business-id route variants (issue #805) ──────────────────────────────────
+//
+// Embedders assign a business `(workflow_name, workflow_id)` at start. These
+// routes let them act on the *current* run by that pair — no list-then-act
+// round-trip, and always the live run even after a continue-as-new/reset fork
+// (a cached `exec_id` targets the stale predecessor). Each handler resolves the
+// pair to an `ExecutionId` and DELEGATES to the existing `exec_id` handler so
+// the exec-id surface stays byte-for-byte backward compatible. Every response
+// carries the resolved `execution_id` — always in the `X-Harvest-Execution-Id`
+// header (uniform AC4 guarantee, covers empty-body cases), and in the JSON body
+// wherever there is one.
+
+/// Response header carrying the resolved internal `execution_id` on every
+/// business-id (`/workflows/by-id/...`) response (issue #805, AC4).
+pub(crate) const HEADER_EXECUTION_ID: &str = "x-harvest-execution-id";
+
+/// Attach the resolved `execution_id` to a response via the
+/// `X-Harvest-Execution-Id` header. Uniform across every by-id route so AC4
+/// holds even for empty-body responses (e.g. `/result` 204).
+fn insert_exec_id_header(resp: &mut axum::response::Response, exec_id: ExecutionId) {
+    if let Ok(value) = axum::http::HeaderValue::from_str(&exec_id.to_string()) {
+        resp.headers_mut().insert(
+            axum::http::HeaderName::from_static(HEADER_EXECUTION_ID),
+            value,
+        );
+    }
+}
+
+/// Convert a delegated `Result<T, AutumnError>` into a response and stamp the
+/// resolved `execution_id` header. Used by by-id handlers whose delegate
+/// already carries `execution_id` (or an equivalent id) in its body.
+fn finalize_by_id<T: IntoResponse>(
+    out: Result<T, AutumnError>,
+    exec_id: ExecutionId,
+) -> axum::response::Response {
+    let mut resp = match out {
+        Ok(value) => value.into_response(),
+        Err(error) => error.into_response(),
+    };
+    insert_exec_id_header(&mut resp, exec_id);
+    resp
+}
+
+/// Resolve `(workflow_name, workflow_id)` to the current run's `ExecutionId`
+/// (issue #805). Returns a clean `404` (never `500`) when no run exists.
+///
+/// **Shard strategy — always fan out.** We deliberately query every shard via
+/// `iter_shards()` rather than trusting a single rendezvous-hash fast path:
+/// `ShardRouter::pick_for_new_workflow` can drift from where a run actually
+/// lives once the writable shard subset changes (see the KNOWN LIMITATION on
+/// `pick_for_idempotency_key`), so a fast-path-then-miss design could resolve a
+/// live run to `404`. Resolution is not a hot path, and on the single-shard
+/// default `iter_shards()` yields exactly one query — so fanning out is
+/// unconditionally correct at no cost there. Per-shard candidates are merged by
+/// the pure `select_resolved_run` (active-run-first, else most-recent terminal).
+pub(crate) async fn resolve_workflow_by_business_id(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Result<ExecutionId, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut candidates = Vec::new();
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        if let Some(run) = autumn_harvest::execution::resolve_execution_id_by_workflow_id(
+            &mut conn,
+            workflow_name,
+            workflow_id,
+        )
+        .await
+        .map_err(map_error)?
+        {
+            candidates.push(run);
+        }
+    }
+    autumn_harvest::execution::select_resolved_run(candidates)
+        .map(|run| run.exec_id)
+        .ok_or_else(|| {
+            map_error(HarvestError::NotFound(format!(
+                "no workflow execution for (workflow_name={workflow_name}, \
+                 workflow_id={workflow_id})"
+            )))
+        })
+}
+
+/// `GET /workflows/by-id/{workflow_name}/{workflow_id}` — describe by business id.
+async fn get_workflow_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let out = get_workflow(
+        Extension(api_state),
+        Path(exec_id.to_string()),
+        headers,
+        maybe_session,
+    )
+    .await;
+    finalize_by_id(out, exec_id)
+}
+
+/// `GET /workflows/by-id/{workflow_name}/{workflow_id}/result` — terminal-output
+/// projection by business id (issue #805). Header carries `execution_id` on all
+/// responses; the 200/204/long-poll semantics of the delegate are preserved
+/// unchanged.
+async fn get_workflow_result_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let mut resp = get_workflow_result(
+        Extension(api_state),
+        Path(exec_id.to_string()),
+        Query(pairs),
+        headers,
+        maybe_session,
+    )
+    .await;
+    insert_exec_id_header(&mut resp, exec_id);
+    resp
+}
+
+/// `GET /workflows/by-id/{workflow_name}/{workflow_id}/stack` — pending work by business id.
+async fn get_workflow_stack_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let out = get_workflow_stack(
+        Extension(api_state),
+        Path(exec_id.to_string()),
+        headers,
+        maybe_session,
+    )
+    .await;
+    finalize_by_id(out, exec_id)
+}
+
+/// `GET /workflows/by-id/{workflow_name}/{workflow_id}/children` — child runs by business id.
+async fn list_workflow_children_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let out = list_workflow_children(
+        Extension(api_state),
+        Path(exec_id.to_string()),
+        Query(pairs),
+    )
+    .await;
+    finalize_by_id(out, exec_id)
+}
+
+/// `POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}` —
+/// signal by business id (issue #805). The `SignalAck` body is re-wrapped to
+/// include the resolved `execution_id`.
+async fn signal_workflow_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id, signal_name)): Path<(String, String, String)>,
+    Query(query): Query<SignalQuery>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let result = signal_workflow(
+        Extension(api_state),
+        Path((exec_id.to_string(), signal_name)),
+        Query(query),
+        headers,
+        Json(payload),
+    )
+    .await;
+    match result {
+        Ok((status, Json(ack))) => {
+            let body = serde_json::json!({
+                "execution_id": exec_id.to_string(),
+                "ok": ack.ok,
+                "signal_delivered": ack.signal_delivered,
+            });
+            let mut resp = (status, Json(body)).into_response();
+            insert_exec_id_header(&mut resp, exec_id);
+            resp
+        }
+        Err(error) => {
+            let mut resp = error.into_response();
+            insert_exec_id_header(&mut resp, exec_id);
+            resp
+        }
+    }
+}
+
+/// `GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}` —
+/// query by business id (issue #805). The opaque handler return is wrapped as
+/// `{ "execution_id": ..., "result": <value> }`.
+async fn query_workflow_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id, query_name)): Path<(String, String, String)>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let result = query_workflow(
+        Extension(api_state),
+        Path((exec_id.to_string(), query_name)),
+    )
+    .await;
+    match result {
+        Ok(Json(value)) => {
+            let body = serde_json::json!({
+                "execution_id": exec_id.to_string(),
+                "result": value,
+            });
+            let mut resp = Json(body).into_response();
+            insert_exec_id_header(&mut resp, exec_id);
+            resp
+        }
+        Err(error) => {
+            let mut resp = error.into_response();
+            insert_exec_id_header(&mut resp, exec_id);
+            resp
+        }
+    }
+}
+
+/// `POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}` —
+/// query with typed args by business id (issue #805). Wrapped as
+/// `{ "execution_id": ..., "result": <value> }`.
+async fn query_workflow_post_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id, query_name)): Path<(String, String, String)>,
+    body: Bytes,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let result = query_workflow_post(
+        Extension(api_state),
+        Path((exec_id.to_string(), query_name)),
+        body,
+    )
+    .await;
+    match result {
+        Ok(Json(QueryWorkflowResponse { result })) => {
+            let body = serde_json::json!({
+                "execution_id": exec_id.to_string(),
+                "result": result,
+            });
+            let mut resp = Json(body).into_response();
+            insert_exec_id_header(&mut resp, exec_id);
+            resp
+        }
+        Err(error) => {
+            let mut resp = error.into_response();
+            insert_exec_id_header(&mut resp, exec_id);
+            resp
+        }
+    }
+}
+
+/// `POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel` — cancel by
+/// business id (issue #805). Admin-guarded at the route layer (parity with the
+/// exec-id counterpart). `CancelWorkflowResponse` already carries
+/// `execution_id`; the header is added for AC4 uniformity.
+async fn cancel_workflow_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<CancelWorkflowRequest>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let out = cancel_workflow(
+        Extension(api_state),
+        Path(exec_id.to_string()),
+        headers,
+        Json(request),
+    )
+    .await;
+    finalize_by_id(out, exec_id)
+}
+
+/// `POST /workflows/by-id/{workflow_name}/{workflow_id}/pause` — pause by
+/// business id (issue #805). Admin-guarded at the route layer.
+async fn pause_workflow_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<PauseWorkflowRequest>>,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let out = pause_workflow(
+        Extension(api_state),
+        Path(exec_id.to_string()),
+        headers,
+        request,
+    )
+    .await;
+    finalize_by_id(out, exec_id)
+}
+
+/// `POST /workflows/by-id/{workflow_name}/{workflow_id}/resume` — resume by
+/// business id (issue #805). Admin-guarded at the route layer.
+async fn resume_workflow_by_id(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let exec_id =
+        match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
+            Ok(id) => id,
+            Err(error) => return error.into_response(),
+        };
+    let out = resume_workflow(Extension(api_state), Path(exec_id.to_string()), headers).await;
+    finalize_by_id(out, exec_id)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
@@ -3418,6 +3773,48 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/summaries",
             get(list_workflow_summaries).route_layer(require_admin.clone()),
+        )
+        // Business-id ("latest run") route variants (issue #805). The literal
+        // `by-id` segment is distinct from `{id}`, but these are registered here
+        // alongside the other static /workflows/* routes (before /workflows/{id})
+        // to keep the block contiguous and collision-free. Each delegates to the
+        // exec-id handler after resolving (workflow_name, workflow_id). Admin
+        // posture + audit classification mirror the exec-id counterparts exactly.
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}",
+            get(get_workflow_by_id),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/result",
+            get(get_workflow_result_by_id),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/stack",
+            get(get_workflow_stack_by_id),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/children",
+            get(list_workflow_children_by_id),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+            post(signal_workflow_by_id),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            get(query_workflow_by_id).post(query_workflow_post_by_id),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+            post(cancel_workflow_by_id).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/pause",
+            post(pause_workflow_by_id).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/resume",
+            post(resume_workflow_by_id).route_layer(require_admin.clone()),
         )
         .route(
             "/workflows/{id}/history/export",
@@ -4097,6 +4494,44 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/query/{query_name}"),
         ("POST", "/workflows/{id}/update/{update_name}"),
         ("GET", "/workflows/{id}/update/{update_id}/result"),
+        // ── business-id ("latest run") variants (issue #805) ──────────────────
+        ("GET", "/workflows/by-id/{workflow_name}/{workflow_id}"),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/result",
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/stack",
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/children",
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/pause",
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/resume",
+        ),
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags"),
         ("GET", "/dags/{dag_name}/runs"),
@@ -4333,6 +4768,34 @@ pub const fn management_api_request_fields()
             "POST",
             "/workflows/{id}/query/{query_name}",
             Some(&["args"]),
+        ),
+        // ── business-id ("latest run") variants (issue #805) ──────────────────
+        // Bodies mirror the exec-id counterparts exactly (the by-id handlers
+        // delegate to them after resolving workflow_name/workflow_id).
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+            None, // free-form
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            Some(&["args"]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+            Some(&["reason"]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/pause",
+            Some(&["reason"]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/resume",
+            Some(&[]),
         ),
         (
             "POST",
@@ -4885,6 +5348,83 @@ pub const fn management_api_response_fields()
             "/workflows/{id}/query/{query_name}",
             Some(&["result"]),
         ), // {"result": <value>}
+        // ── business-id ("latest run") variants (issue #805) ──────────────────
+        // describe/result/stack/children delegate an unchanged body; the
+        // resolved execution_id is guaranteed via the X-Harvest-Execution-Id
+        // header (AC4). signal/query re-wrap the body to surface execution_id;
+        // cancel/pause/resume mirror the exec-id body (which already carries it).
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}",
+            None,
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/result",
+            None,
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/stack",
+            None,
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/children",
+            None,
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+            Some(&["execution_id", "ok", "signal_delivered"]),
+        ),
+        (
+            "GET",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            Some(&["execution_id", "result"]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            Some(&["execution_id", "result"]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "newly_cancelled",
+                "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/pause",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "actor",
+                "newly_paused",
+                "paused_at",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/by-id/{workflow_name}/{workflow_id}/resume",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "actor",
+                "pause_duration_secs",
+                "newly_resumed",
+            ]),
+        ),
         ("POST", "/workflows/{id}/update/{update_name}", None), // polymorphic admitted/completed/failed
         ("GET", "/workflows/{id}/update/{update_id}/result", None), // polymorphic completed/failed
         // ── DAGs ─────────────────────────────────────────────────────────────

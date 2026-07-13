@@ -180,6 +180,98 @@ The command exits cleanly when the server sends `event: stream-end`.
 
 ---
 
+## Addressing workflows by business id (`/workflows/by-id/...`)
+
+Embedders assign their own business `workflow_id` at start (e.g. `order-12345`,
+`subscription:user-42`). The act-on-existing management routes accept a
+**business-id form** addressed by `(workflow_name, workflow_id)` in addition to
+the internal `exec_id` form. This removes the list-then-act round-trip and,
+critically, always reaches the **current** run — a cached `exec_id` becomes a
+stale handle after a continue-as-new or reset fork, which mint a **new**
+`exec_id` under the **same** `workflow_id` (issue #805).
+
+The existing `exec_id` routes are unchanged and remain fully supported.
+
+### Routes
+
+All routes are prefixed `P = /workflows/by-id/{workflow_name}/{workflow_id}`:
+
+| Method | Path | Delegates to | Auth |
+|--------|------|--------------|------|
+| `GET`  | `P` | `GET /workflows/{id}` (describe) | read-only |
+| `GET`  | `P/result` | `GET /workflows/{id}/result` | read-only |
+| `GET`  | `P/stack` | `GET /workflows/{id}/stack` | read-only |
+| `GET`  | `P/children` | `GET /workflows/{id}/children` | read-only |
+| `POST` | `P/signal/{signal_name}` | `POST /workflows/{id}/signal/{signal_name}` | audited |
+| `GET`  | `P/query/{query_name}` | `GET /workflows/{id}/query/{query_name}` | read-only |
+| `POST` | `P/query/{query_name}` | `POST /workflows/{id}/query/{query_name}` | read-only |
+| `POST` | `P/cancel` | `POST /workflows/{id}/cancel` | **admin** |
+| `POST` | `P/pause` | `POST /workflows/{id}/pause` | **admin** |
+| `POST` | `P/resume` | `POST /workflows/{id}/resume` | **admin** |
+
+`workflow_name` is **required** — the uniqueness scope is
+`(workflow_name, workflow_id)`, not `workflow_id` alone. Both path segments are
+mandatory, so a bare `workflow_id` is not addressable (a request omitting either
+segment does not match a by-id route). The business-id routes reuse the exact
+admin middleware and audit classification of their `exec_id` counterparts.
+
+### Resolution rule
+
+Given `(workflow_name, workflow_id)`, the resolver returns:
+
+1. the single **active** (non-terminal, i.e. `RUNNING`/`PAUSED`) run if one
+   exists; otherwise
+2. the **most recent terminal** run (by `started_at`); otherwise
+3. `404` (never `500`).
+
+This is well-defined because at most one active run can exist per
+`(workflow_name, workflow_id)` (the per-shard partial unique index). Resolution
+is **read-only** and **shard-aware**: it fans out across every shard and merges
+the per-shard best candidates, so a run that lives on a shard the rendezvous
+hash no longer points at (writable-subset drift) is still found. On the
+single-shard default this is exactly one query.
+
+### The resolved `execution_id` is always returned
+
+Every business-id response includes the resolved `execution_id`, so a caller may
+pin to a specific run if it wants:
+
+- **In the `X-Harvest-Execution-Id` response header** on *every* response
+  (including empty-body cases like `/result`'s `204`).
+- **In the JSON body** wherever one exists: `signal` and `query` responses are
+  re-wrapped to include a top-level `execution_id`; `cancel`/`pause`/`resume`
+  already carry it; `describe`/`stack` carry the id nested in their existing
+  body. `/result` and `/children` surface it via the header.
+
+### Continue-as-new / reset note
+
+After a continue-as-new (or a reset fork), the workflow keeps the **same**
+business `workflow_id` but the engine mints a **new** `exec_id`. A caller that
+cached the old `exec_id` and calls `POST /workflows/{old_exec_id}/signal/...`
+would signal the sealed predecessor. The business-id form always resolves to the
+**live successor** (the active run), so `POST P/signal/...` reaches the current
+run 100% of the time across a fork.
+
+### Examples
+
+```bash
+# Signal the current run of order-12345 by business id (no lookup first):
+curl -X POST "$BASE/workflows/by-id/order_flow/order-12345/signal/approve" \
+  -H 'content-type: application/json' -d '{"approved_by":"alice"}'
+# → 202 { "execution_id": "…", "ok": true, "signal_delivered": true }
+#   + header  X-Harvest-Execution-Id: <resolved exec_id>
+
+# Describe the current run:
+curl "$BASE/workflows/by-id/order_flow/order-12345"
+
+# Cancel the current run (admin):
+curl -X POST "$BASE/workflows/by-id/order_flow/order-12345/cancel" \
+  -H 'x-harvest-admin: true' -H 'content-type: application/json' -d '{"reason":"duplicate"}'
+
+# Unknown (name, id) → 404 (never 500):
+curl -i "$BASE/workflows/by-id/order_flow/does-not-exist"   # HTTP 404
+```
+
 ## Listing workflows (`GET /workflows`)
 
 ### Parameters
