@@ -15796,7 +15796,17 @@ async fn hydrate_ctx_for_query(
         history.events,
         runtime.registry.shared_state(),
         runtime.registry.history_policy(),
-    );
+    )
+    // Issue #772 (round 6): thread the execution row's execution_timeout /
+    // deadline_at into the query replay context. A workflow with an
+    // execution_timeout records a `__harvest_deadline_probe` side-effect whenever
+    // it calls `should_continue_as_new()`; without the budget threaded here,
+    // `ctx.deadline()` is None, the deadline branch returns before its tolerant
+    // clock read, and the recorded probe is left UNCONSUMED at the cursor —
+    // diverging the next replayed command (running/in-process query) or the
+    // terminal-query drift check (`has_unconsumed_history` below → spurious 410).
+    .with_execution_timeout(execution.execution_timeout)
+    .with_deadline(execution.deadline_at);
 
     // Seed declarative query handlers (registered via `.queries(queries![...])`)
     // before replaying, so execute_query_with_args can find them.
