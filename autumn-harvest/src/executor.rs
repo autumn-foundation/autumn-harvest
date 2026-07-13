@@ -1921,6 +1921,8 @@ mod tests {
             is_replay: false,
             link_traceparent: None,
             build_id: None,
+            execution_timeout: None,
+            deadline_at: None,
         }
     }
 
