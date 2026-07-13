@@ -577,7 +577,7 @@
           "checkpoints_truncated_for_budget",
           "last_event_id"
         ],
-        "notes": "Each entry in pending_activities and pending_local_activities carries an optional nested last_failure object (issue #773) — {error_type, error, attempt, non_retryable, failed_at?, details?} — omitted entirely when the activity has never failed, so healthy-run responses stay byte-identical to pre-#773 builds. It answers \"why is this activity retrying?\" alongside the next_retry_at countdown without a second round-trip. Availability of the fields differs by activity kind because retryable failures are not event-sourced (an AC2-vs-AC5 reconciliation; #773 adds no migration): for a backing-off REGULAR (task-queue) activity — the primary case — last_failure is sourced from the harvest_task_queue.error column that queue::requeue_for_retry sets on each retryable failure (no ActivityFailed event is appended), so error and attempt are present, error_type defaults to \"Error\", non_retryable is false, and failed_at/details are omitted (the task row has no failure timestamp or structured detail); for LOCAL activities (and any event-sourced failure) last_failure is sourced from the most recent LocalActivityFailed event and includes failed_at (the event timestamp), with error_type \"Error\", non_retryable false, and no details. When read-path payload decoding (issue #608) is active for the request, last_failure.error is tolerantly decoded like every other payload field."
+        "notes": "Each entry in pending_activities and pending_local_activities carries an optional nested last_failure object (issue #773) \u2014 {error_type, error, attempt, non_retryable, failed_at?, details?} \u2014 omitted entirely when the activity has never failed, so healthy-run responses stay byte-identical to pre-#773 builds. It answers \"why is this activity retrying?\" alongside the next_retry_at countdown without a second round-trip. Availability of the fields differs by activity kind because retryable failures are not event-sourced (an AC2-vs-AC5 reconciliation; #773 adds no migration): for a backing-off REGULAR (task-queue) activity \u2014 the primary case \u2014 last_failure is sourced from the harvest_task_queue.error column that queue::requeue_for_retry sets on each retryable failure (no ActivityFailed event is appended), so error and attempt are present, error_type defaults to \"Error\", non_retryable is false, and failed_at/details are omitted (the task row has no failure timestamp or structured detail); for LOCAL activities (and any event-sourced failure) last_failure is sourced from the most recent LocalActivityFailed event and includes failed_at (the event timestamp), with error_type \"Error\", non_retryable false, and no details. When read-path payload decoding (issue #608) is active for the request, last_failure.error is tolerantly decoded like every other payload field."
       },
       "error_responses": [
         {
@@ -595,7 +595,7 @@
       "path": "/workflows/{id}/timeline",
       "category": "workflow",
       "read_only": true,
-      "description": "Reconstruct a single execution's timeline (per-step durations, busy-vs-wait split, slowest step) purely from recorded history; no new events are appended and no state is recomputed. Surfaces only durations, names, ids, and outcomes — never any input/output/payload/error/value field — so read-path payload decoding (issue #608) is a no-op and is skipped. Classic DAG runs are not on the execution path and return 404; unified DAG runs lower onto the standard execution path and return 200 like any workflow execution. The wait_ms/exec_ms split is present ONLY for regular activity steps that recorded a claim/start timestamp; it is null for child_workflow, local_activity, external activities (issue #92 — these render as activity steps with no split), timer, signal_wait, side_effect, and for activities with no recorded start. total_ms is always present. Rollup attribution: a started activity's queue-wait split goes to rollup.wait_ms and its exec split to rollup.busy_ms; a regular activity (one reporting an attempt) with a null split never started (pending or a schedule-to-start timeout) so its whole total_ms is queue-wait and goes to rollup.wait_ms; external activities, child_workflow, local_activity, and side_effect totals go to rollup.busy_ms; timer and signal_wait totals go to rollup.wait_ms. For a retried activity, wait_ms spans all prior attempts' execution and backoff, not only queue wait — treat it as an upper bound on queue wait. Known limitation: the full event history is loaded with no LIMIT (bounded by workflow continue-as-new discipline, the ≤500-event target), so a run with a very large history makes this read proportionally expensive.",
+      "description": "Reconstruct a single execution's timeline (per-step durations, busy-vs-wait split, slowest step) purely from recorded history; no new events are appended and no state is recomputed. Surfaces only durations, names, ids, and outcomes \u2014 never any input/output/payload/error/value field \u2014 so read-path payload decoding (issue #608) is a no-op and is skipped. Classic DAG runs are not on the execution path and return 404; unified DAG runs lower onto the standard execution path and return 200 like any workflow execution. The wait_ms/exec_ms split is present ONLY for regular activity steps that recorded a claim/start timestamp; it is null for child_workflow, local_activity, external activities (issue #92 \u2014 these render as activity steps with no split), timer, signal_wait, side_effect, and for activities with no recorded start. total_ms is always present. Rollup attribution: a started activity's queue-wait split goes to rollup.wait_ms and its exec split to rollup.busy_ms; a regular activity (one reporting an attempt) with a null split never started (pending or a schedule-to-start timeout) so its whole total_ms is queue-wait and goes to rollup.wait_ms; external activities, child_workflow, local_activity, and side_effect totals go to rollup.busy_ms; timer and signal_wait totals go to rollup.wait_ms. For a retried activity, wait_ms spans all prior attempts' execution and backoff, not only queue wait \u2014 treat it as an upper bound on queue wait. Known limitation: the full event history is loaded with no LIMIT (bounded by workflow continue-as-new discipline, the \u2264500-event target), so a run with a very large history makes this read proportionally expensive.",
       "params": [
         {
           "name": "id",
@@ -1288,7 +1288,7 @@
         },
         {
           "status": 409,
-          "description": "Execution is not in a terminal state, or is under an active legal hold (issue #747) — erasure is rejected until the hold is released or expires."
+          "description": "Execution is not in a terminal state, or is under an active legal hold (issue #747) \u2014 erasure is rejected until the hold is released or expires."
         },
         {
           "status": 500,
@@ -1616,7 +1616,7 @@
           "current_state"
         ],
         "field_notes": {
-          "outcome": "\"redriven\" (202) or \"not_failed\" (200) — the not_failed case reuses this same field list on a 200 response.",
+          "outcome": "\"redriven\" (202) or \"not_failed\" (200) \u2014 the not_failed case reuses this same field list on a 200 response.",
           "current_state": "Only present when outcome=\"not_failed\"; the delivery's actual current state."
         },
         "note": "Status is 202 when outcome=\"redriven\" and 200 when outcome=\"not_failed\"; the field set is identical either way."
@@ -2130,7 +2130,7 @@
           },
           {
             "name": "nodes",
-            "description": "Array of node entries: node_name, kind (activity | gate — a 'gate' is a signal/timer gate node, issue #746, that awaits a named signal instead of dispatching an activity), status (succeeded/failed/timed_out/cancelled/running/pending/skipped/waiting — 'waiting' is a gate that has been reached but not yet resolved by its signal or deadline on a live run), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed. Gate nodes report attempts 0 and no timing/error fields."
+            "description": "Array of node entries: node_name, kind (activity | gate \u2014 a 'gate' is a signal/timer gate node, issue #746, that awaits a named signal instead of dispatching an activity), status (succeeded/failed/timed_out/cancelled/running/pending/skipped/waiting \u2014 'waiting' is a gate that has been reached but not yet resolved by its signal or deadline on a live run), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed. Gate nodes report attempts 0 and no timing/error fields."
           }
         ]
       },
@@ -3669,7 +3669,7 @@
       "path": "/admin/config",
       "category": "admin",
       "read_only": true,
-      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts \u2014 never a value \u2014 so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -4348,7 +4348,7 @@
           {
             "name": "input_mapping",
             "required": false,
-            "description": "Input projection mapping. Adjacently tagged (type/data). One of: Passthrough, Static(value), Projection(dotted-path), or Outcome{projection} (issue #748) which assembles a terminal-outcome envelope {terminal_state, source_exec_id, source_workflow_id, source_workflow_name, output, error} from the recorded source execution — use for failure-routed triggers whose source has a null output; projection optionally plucks one dotted field (e.g. \"error\") from the envelope."
+            "description": "Input projection mapping. Adjacently tagged (type/data). One of: Passthrough, Static(value), Projection(dotted-path), or Outcome{projection} (issue #748) which assembles a terminal-outcome envelope {terminal_state, source_exec_id, source_workflow_id, source_workflow_name, output, error} from the recorded source execution \u2014 use for failure-routed triggers whose source has a null output; projection optionally plucks one dotted field (e.g. \"error\") from the envelope."
           },
           {
             "name": "queue_name",
@@ -6027,7 +6027,7 @@
         },
         {
           "status": 409,
-          "description": "No base build policy is registered for queue_name yet — call POST /admin/build-routing/policies first."
+          "description": "No base build policy is registered for queue_name yet \u2014 call POST /admin/build-routing/policies first."
         },
         {
           "status": 503,
@@ -6241,7 +6241,7 @@
           "shards",
           "shard_errors"
         ],
-        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker — a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
         {
@@ -6284,7 +6284,7 @@
           "ineligible_workers",
           "summary"
         ],
-        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker — a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
         {
@@ -6298,6 +6298,562 @@
         {
           "status": 503,
           "description": "Database or shard unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Describe the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/result",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Compact terminal result for the current run of a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "wait",
+          "in": "query",
+          "required": false,
+          "description": "Optional wait duration (e.g. 5s). Values above the server ceiling are clamped."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid wait duration."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database or listener error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/stack",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Current wait state (what it is blocked on) for the current run of a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/children",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List child executions of the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Filter by child status. May be repeated."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by child workflow name."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Pagination cursor."
+        },
+        {
+          "name": "depth",
+          "in": "query",
+          "required": false,
+          "description": "Maximum recursion depth."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Send a named signal to the current run of a business (workflow_name, workflow_id). Body is the signal payload (free-form JSON). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Same exactly-once semantics as POST /workflows/{id}/signal/{signal_name} (Idempotency-Key header or idempotency_key query param).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "signal_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered signal handler name."
+        },
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": false,
+          "description": "Exactly-once delivery key; wins over the query param."
+        },
+        {
+          "name": "idempotency_key",
+          "in": "query",
+          "required": false,
+          "description": "Exactly-once delivery key (lower precedence than the header)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true,
+        "description": "Optional signal payload passed verbatim to the handler.",
+        "fields": []
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "execution_id",
+          "ok",
+          "signal_delivered"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Invoke a registered no-arg query handler on the current run of a business (workflow_name, workflow_id). Returns {\"execution_id\": ..., \"result\": <value>}. Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "query_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered query handler name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "result"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id), or query handler not registered."
+        },
+        {
+          "status": 408,
+          "description": "Query timed out."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
+        },
+        {
+          "status": 503,
+          "description": "Query handler panicked."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Invoke a registered query handler with typed JSON args on the current run of a business (workflow_name, workflow_id). Returns {\"execution_id\": ..., \"result\": <value>}. POST is used solely to allow a structured body; never writes workflow events. Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Read-only at the workflow level (no events written).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "query_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered query handler name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "args",
+            "required": false,
+            "description": "Arguments passed to the query handler (any JSON value)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "result"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Args failed to deserialize into the handler's request type."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id), or query handler not registered."
+        },
+        {
+          "status": 408,
+          "description": "Query timed out."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
+        },
+        {
+          "status": 503,
+          "description": "Query handler panicked."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Cancel the current run of a business (workflow_name, workflow_id). Admin-guarded (parity with POST /workflows/{id}/cancel). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Idempotent: cancelling an already-cancelled or terminal execution is a no-op.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable cancellation reason recorded in audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "newly_cancelled",
+          "failed_task_count"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 409,
+          "description": "Execution is already in a terminal state."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/pause",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Pause the current run of a business (workflow_name, workflow_id). Admin-guarded (parity with POST /workflows/{id}/pause). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Idempotent: pausing an already-paused execution is a no-op (newly_paused=false).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable pause reason (max 500 chars)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "actor",
+          "newly_paused",
+          "paused_at"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Pause reason exceeds the length cap."
+        },
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 409,
+          "description": "Execution is in a terminal state and cannot be paused."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/resume",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Resume the current (paused) run of a business (workflow_name, workflow_id). Admin-guarded (parity with POST /workflows/{id}/resume). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Idempotent: resuming a non-paused execution is a 200 no-op (newly_resumed=false).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "actor",
+          "pause_duration_secs",
+          "newly_resumed"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
         }
       ]
     }

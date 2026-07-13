@@ -112,17 +112,31 @@ pub fn tombstone_payload_fields(event_value: &mut Value) -> usize {
     count
 }
 
+/// The canonical set of recognised terminal execution states.
+///
+/// This is the single source of truth for terminal-state classification across
+/// the engine: [`is_terminal_state`] is `TERMINAL_STATES.contains(&state)`, and
+/// consumers that need the literal list for a SQL filter (e.g.
+/// `execution::resolve_execution_id_by_workflow_id`, issue #805) reference this
+/// constant directly rather than re-declaring the states, so the two can never
+/// drift.
+pub const TERMINAL_STATES: &[&str] = &[
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "CONTINUED_AS_NEW",
+    "TERMINATED",
+];
+
 /// Returns `true` when `state` is one of the recognised terminal execution
 /// states.
 ///
-/// These are the states for which payload erasure is permitted. The set
-/// mirrors `history_export`'s private `history_state_is_terminal` helper.
+/// These are the states for which payload erasure is permitted. The set is
+/// [`TERMINAL_STATES`], the single source of truth for terminal classification.
 #[must_use]
 pub fn is_terminal_state(state: &str) -> bool {
-    matches!(
-        state,
-        "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "CONTINUED_AS_NEW" | "TERMINATED"
-    )
+    TERMINAL_STATES.contains(&state)
 }
 
 /// Returns `true` if a workflow execution row's payload has been PII-erased

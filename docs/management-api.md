@@ -180,6 +180,147 @@ The command exits cleanly when the server sends `event: stream-end`.
 
 ---
 
+## Addressing workflows by business id (`/workflows/by-id/...`)
+
+Embedders assign their own business `workflow_id` at start (e.g. `order-12345`,
+`subscription:user-42`). The act-on-existing management routes accept a
+**business-id form** addressed by `(workflow_name, workflow_id)` in addition to
+the internal `exec_id` form. This removes the list-then-act round-trip and,
+critically, always reaches the **current** run — a cached `exec_id` becomes a
+stale handle after a continue-as-new or reset fork, which mint a **new**
+`exec_id` under the **same** `workflow_id` (issue #805).
+
+The existing `exec_id` routes are unchanged and remain fully supported.
+
+### Routes
+
+All routes are prefixed `P = /workflows/by-id/{workflow_name}/{workflow_id}`:
+
+| Method | Path | Delegates to | Auth |
+|--------|------|--------------|------|
+| `GET`  | `P` | `GET /workflows/{id}` (describe) | read-only |
+| `GET`  | `P/result` | `GET /workflows/{id}/result` | read-only |
+| `GET`  | `P/stack` | `GET /workflows/{id}/stack` | read-only |
+| `GET`  | `P/children` | `GET /workflows/{id}/children` | read-only |
+| `POST` | `P/signal/{signal_name}` | `POST /workflows/{id}/signal/{signal_name}` | audited |
+| `GET`  | `P/query/{query_name}` | `GET /workflows/{id}/query/{query_name}` | read-only |
+| `POST` | `P/query/{query_name}` | `POST /workflows/{id}/query/{query_name}` | read-only |
+| `POST` | `P/cancel` | `POST /workflows/{id}/cancel` | **admin** |
+| `POST` | `P/pause` | `POST /workflows/{id}/pause` | **admin** |
+| `POST` | `P/resume` | `POST /workflows/{id}/resume` | **admin** |
+
+`workflow_name` is **required** — the uniqueness scope is
+`(workflow_name, workflow_id)`, not `workflow_id` alone. Both path segments are
+mandatory, so a bare `workflow_id` is not addressable (a request omitting either
+segment does not match a by-id route). The business-id routes reuse the exact
+admin middleware and audit classification of their `exec_id` counterparts.
+
+### Resolution rule
+
+Given `(workflow_name, workflow_id)`, the resolver returns:
+
+1. the single **active** (non-terminal, i.e. `RUNNING`/`PAUSED`) run if one
+   exists; otherwise
+2. the **most recent terminal** run (by `started_at`); otherwise
+3. `404` (never `500`).
+
+This is well-defined because at most one active run can exist per
+`(workflow_name, workflow_id)` (the per-shard partial unique index). Resolution
+is **read-only** and **shard-aware**: it fans out across every shard and merges
+the per-shard best candidates, so a run that lives on a shard the rendezvous
+hash no longer points at (writable-subset drift) is still found. On the
+single-shard default this is exactly one query.
+
+#### Multi-shard degraded mode — correctness over availability
+
+If any expected shard cannot be queried — no configured storage pool in this
+process (mid a shard-add rollout) or an unreachable database — by-id resolution
+returns **`503`**, never a false `404`. Because the run could live on the
+un-queried shard, silently skipping it and answering `404` would be a false
+negative; the resolver instead fails closed. This is a deliberate
+correctness-over-availability trade-off scoped to the by-id routes: if one shard
+is down, by-id resolution errors `503` fleet-wide rather than risk targeting the
+wrong run (or falsely reporting "no such run"). The `exec_id` routes are
+**unaffected** — an `exec_id` encodes its owning shard, so an exec-id request
+targets exactly one shard and is not gated on the health of the others. A
+fast-path-shard-first optimization (try the rendezvous-hash shard, fan out only
+on a miss) is a possible future refinement and is out of scope here. On the
+single-shard default this `503` path never triggers.
+
+### The resolved `execution_id` is always returned
+
+Every business-id response includes the resolved `execution_id`, so a caller may
+pin to a specific run if it wants:
+
+- **In the `X-Harvest-Execution-Id` response header** on *every* response
+  (including empty-body cases like `/result`'s `204`).
+- **In the JSON body** wherever one exists: `signal` and `query` responses are
+  re-wrapped to include a top-level `execution_id`; `cancel`/`pause`/`resume`
+  already carry it; `describe`/`stack` carry the id nested in their existing
+  body. `/result` and `/children` surface it via the header.
+
+### GET query response shape differs from the exec-id form
+
+The by-id `GET P/query/{query_name}` returns the handler value **wrapped** as
+`{ "execution_id": …, "result": <value> }` so the resolved run is always
+identifiable, whereas the exec-id `GET /workflows/{id}/query/{query_name}`
+returns the raw handler value directly. This is a deliberate shape difference.
+The `POST` query form already wraps as `{ "result": … }` on the exec-id surface;
+the by-id `POST` form adds `execution_id` to that (`{ "execution_id": …,
+"result": … }`).
+
+### Continue-as-new / reset note
+
+After a continue-as-new (or a reset fork), the workflow keeps the **same**
+business `workflow_id` but the engine mints a **new** `exec_id`. A caller that
+cached the old `exec_id` and calls `POST /workflows/{old_exec_id}/signal/...`
+would signal the sealed predecessor. The business-id form always resolves to the
+**live successor** (the active run), so `POST P/signal/...` reaches the current
+run 100% of the time across a fork.
+
+**Resolve-then-act is a best-effort snapshot.** A by-id mutate resolves
+`(workflow_name, workflow_id)` to an `exec_id` and then delegates to the exec-id
+handler as two steps. Between resolution and the delegated action the run can
+transition (a continue-as-new or reset fork mints a new run), so a by-id mutate
+targets the run that was live **at resolution time**. The "always the live run"
+guarantee therefore holds *at resolution*, not across the resolve→act window —
+which is inherently narrow (a single in-process delegation), but a caller that
+needs a hard guarantee against a concurrent fork should pin to the returned
+`execution_id`.
+
+### Security note — business ids are guessable
+
+Unlike opaque `exec_id` UUIDs, the by-id read and signal routes are addressable
+by human-meaningful `(workflow_name, workflow_id)` pairs (e.g.
+`order_flow/order-12345`), which are frequently sequential or otherwise
+predictable. These routes reuse their exec-id counterparts' auth posture
+exactly: **read** (describe/result/stack/children/query) and **signal** are
+*not* admin-gated, while **cancel/pause/resume** are admin-only. Because the
+guessability of business ids removes the unguessable-`exec_id` defense-in-depth,
+mount the harvest management API **behind your own auth boundary** (e.g.
+`api_with_auth` / your app's authenticated admin surface) rather than relying on
+id opacity to gate read/signal access.
+
+### Examples
+
+```bash
+# Signal the current run of order-12345 by business id (no lookup first):
+curl -X POST "$BASE/workflows/by-id/order_flow/order-12345/signal/approve" \
+  -H 'content-type: application/json' -d '{"approved_by":"alice"}'
+# → 202 { "execution_id": "…", "ok": true, "signal_delivered": true }
+#   + header  X-Harvest-Execution-Id: <resolved exec_id>
+
+# Describe the current run:
+curl "$BASE/workflows/by-id/order_flow/order-12345"
+
+# Cancel the current run (admin):
+curl -X POST "$BASE/workflows/by-id/order_flow/order-12345/cancel" \
+  -H 'x-harvest-admin: true' -H 'content-type: application/json' -d '{"reason":"duplicate"}'
+
+# Unknown (name, id) → 404 (never 500):
+curl -i "$BASE/workflows/by-id/order_flow/does-not-exist"   # HTTP 404
+```
+
 ## Listing workflows (`GET /workflows`)
 
 ### Parameters
