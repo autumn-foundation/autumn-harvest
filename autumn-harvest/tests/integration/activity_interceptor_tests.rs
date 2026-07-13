@@ -28,7 +28,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
-//! `INIT_SQL`. Each test uses a unique `ExecutionId`, a **unique task queue**
+//! the full migration set. Each test uses a unique `ExecutionId`, a **unique task queue**
 //! (its worker polls only that queue, and its workflow + activity tasks all land
 //! on it — activities are dispatched onto `ctx.queue_name()`, never a shared
 //! `"default"`), and its own per-registry recorder captured by the interceptor

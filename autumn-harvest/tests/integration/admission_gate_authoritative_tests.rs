@@ -16,7 +16,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (the process-global gate cache and shard router force
 //! single-threaded execution; each test scrubs first). Otherwise a fresh
-//! testcontainers Postgres is booted with `INIT_SQL`.
+//! testcontainers Postgres is booted with the full migration bundle.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -51,21 +51,22 @@ use uuid::Uuid;
 /// Serialises the process-global gate cache + shard router across tests.
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
-// The COMPLETE migration set, in timestamp order (identical to `diesel migration
-// run`). The CI Docker step boots a fresh Postgres seeded from ONLY this const, so
-// every table/column `start_or_load_workflow_execution` and the completion-trigger
-// path read MUST be present here. A hand-picked subset silently rots as the start
-// path gains column reads (issue #618: `harvest_build_policies` from build_routing
-// AND `legal_hold_set_at` from a much later migration were both missing from an
-// earlier subset), so this suite uses the full set to be drift-proof by
-// construction — the applied superset never over-constrains a test. When a new
-// migration lands, regenerate this block from `ls migrations/*/` in sorted order.
+// The test DB is seeded from `autumn_harvest::full_migrations_sql()` — the
+// build.rs-generated full migration bundle (identical to `diesel migration run`),
+// regenerated automatically from the whole `migrations/` directory. There is
+// nothing to hand-maintain or regenerate here: every table/column
+// `start_or_load_workflow_execution` and the completion-trigger path read is
+// present by construction, so the schema is drift-proof (a hand-picked subset
+// would silently rot as the start path gains column reads — e.g. issue #618, where
+// `harvest_build_policies` from build_routing AND `legal_hold_set_at` from a much
+// later migration were both missing from an earlier subset). The applied superset
+// never over-constrains a test.
 fn init_sql() -> Vec<u8> {
     autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 /// Per-workflow schedule columns the cross-shard test's fresh DBs need. These are
-/// already present in `INIT_SQL` (the full `harvest_schedules`/`schedule_id`
+/// already present in the full migration bundle (the `harvest_schedules`/`schedule_id`
 /// migrations add `workflow_name`/`queue_name`), so the `ADD COLUMN IF NOT EXISTS`
 /// clauses are idempotent no-ops kept for defensive clarity; `resolve_target_queue`
 /// selects `queue_name WHERE workflow_name`.
@@ -171,7 +172,8 @@ async fn scrub(conn: &mut AsyncPgConnection) {
         "DELETE FROM harvest_workflow_executions",
     ] {
         // Ignore "table doesn't exist" only if the migration set omitted it;
-        // all listed tables are in INIT_SQL, so a real error should surface.
+        // all listed tables are in the full migration bundle, so a real error
+        // should surface.
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
     }
 }
@@ -1292,10 +1294,11 @@ async fn boot_load_of_persisted_gate_blocks_completion_trigger() {
 /// mapping `ag_target_wf -> ag_priority_q`; shard 1 (source) has NO such
 /// schedule. It focuses on `harvest_schedules` (no workflow start), so it RUNS
 /// against a real cluster (local Postgres or testcontainers) via two fresh
-/// databases seeded from `INIT_SQL`. The full evaluate → gate → block chain for a
-/// cross-shard target additionally needs `start_or_load_workflow_execution`; that
-/// path is covered by the same-shard block tests above (all now backed by the
-/// full start-path `INIT_SQL`, which includes `harvest_build_policies`).
+/// databases seeded from the full migration bundle. The full evaluate → gate →
+/// block chain for a cross-shard target additionally needs
+/// `start_or_load_workflow_execution`; that path is covered by the same-shard
+/// block tests above (all now backed by the full start-path migration bundle,
+/// which includes `harvest_build_policies`).
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {

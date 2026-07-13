@@ -8,7 +8,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (run this file `--test-threads=1`, since the tests scrub
 //! shared tables); otherwise a fresh testcontainers Postgres is booted with
-//! `INIT_SQL` (requires Docker).
+//! the full migration set (requires Docker).
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
