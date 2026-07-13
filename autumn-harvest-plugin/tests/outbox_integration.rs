@@ -17,140 +17,6 @@ use uuid::Uuid;
 
 const OUTBOX_INIT_SQL: &str =
     include_str!("../migrations/20260409010000_harvest_workflow_outbox/up.sql");
-const HARVEST_INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260708000001_harvest_completion_trigger_condition/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    // issue #523: workflow-level retry policy columns.
-    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql"),
-    "\n",
-    // issue #534: origin column + per-schedule run-history index.
-    include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
-    ),
-    "\n",
-    // Per-execution legal hold (issue #747): WorkflowExecution::as_returning()
-    // now selects these four columns, so the execution insert below fails at
-    // runtime without them.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
-);
-
 #[derive(Debug, QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -391,7 +257,7 @@ async fn setup_split_test_databases(
             .await
             .expect("failed to connect to harvest database");
         harvest_conn
-            .batch_execute(HARVEST_INIT_SQL)
+            .batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply harvest migrations");
     }

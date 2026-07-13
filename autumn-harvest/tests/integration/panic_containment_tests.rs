@@ -29,7 +29,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted
-//! with `INIT_SQL`. Each test uses a unique `ExecutionId` and its own
+//! with the full migration bundle. Each test uses a unique `ExecutionId` and its own
 //! capturing `MetricsRecorder`, so no cross-test scrubbing is required.
 
 use std::collections::HashMap;
@@ -66,121 +66,9 @@ use uuid::Uuid;
 // when HARVEST_TEST_DATABASE_URL is set).
 // ---------------------------------------------------------------------------
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
-    include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
-    include_str!("../../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
-    include_str!("../../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!("../../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
-    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    "\n",
-    // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    // Inlined verbatim from the 20260709000001_harvest_legal_hold migration
-    // (formerly 20260709000000; renamed on trunk-dev) so this test's schema is
-    // self-contained and immune to any future migration directory rename — a
-    // path `include_str!` breaks the CI merge build (PR-head ⊕ trunk-dev) the
-    // moment the referenced directory is renamed.
-    "\n",
-    "ALTER TABLE harvest_workflow_executions
-        ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL,
-        ADD COLUMN IF NOT EXISTS legal_hold_until  TIMESTAMPTZ NULL,
-        ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL,
-        ADD COLUMN IF NOT EXISTS legal_hold_actor  TEXT NULL;
-    CREATE INDEX IF NOT EXISTS idx_harvest_executions_legal_hold
-        ON harvest_workflow_executions (legal_hold_set_at)
-        WHERE legal_hold_set_at IS NOT NULL;",
-    "\n",
-    // issue #701: continue-as-new run-chain back-links
-    // (continued_from_exec_id, first_exec_id) on harvest_workflow_executions.
-    // `NewWorkflowExecution` sets these two fields, so the seed INSERT names
-    // them — without this migration the INSERT fails at runtime with
-    // `column "continued_from_exec_id" ... does not exist`. include_str'd like
-    // every other sibling test's INIT_SQL (the directory is stable; only the
-    // renamed legal_hold migration above is inlined).
-    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 /// Returns a live URL to a migrated Postgres, keeping the container (if any)
 /// alive for the test's duration.
@@ -189,7 +77,7 @@ async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
         return (url, None);
     }
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
