@@ -9372,6 +9372,40 @@ impl WorkflowContext {
         std::mem::take(&mut *cmds)
     }
 
+    /// Non-consuming count of the pending command buffer: returns how many
+    /// pending commands match `pred`, **without draining it**.
+    ///
+    /// Used by the query-replay driver (issue #612,
+    /// [`executor::drive_query_replay`](crate::executor::drive_query_replay)) to
+    /// distinguish a genuine command-suspension from a pure
+    /// `tokio::task::yield_now()` spin (or a command-less cold park such as
+    /// `await_condition`) — a distinction the driver can no longer make from
+    /// waker timing, since tokio's `yield_now` defers its wake to the scheduler
+    /// queue inside a runtime.
+    ///
+    /// The driver reads this as a **per-poll delta**: it snapshots the count
+    /// before each poll and compares against the count after. A *positive* delta
+    /// means the handler emitted a replay-significant command on **this** poll
+    /// (→ a genuine suspension). A **count** (not a bare "any pending" boolean)
+    /// is required precisely because the command buffer is never drained during
+    /// the drive: an "any pending" peek would stay `true` forever once any
+    /// command has been pushed, and would then misread a later command-less cold
+    /// park (e.g. `await_condition`) as still making progress. Non-consuming so
+    /// the driver can keep polling the same coroutine after inspecting its
+    /// emitted commands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal commands mutex is poisoned.
+    pub(crate) fn count_commands(&self, pred: impl Fn(&WorkflowCommand) -> bool) -> usize {
+        self.commands
+            .lock()
+            .expect("commands lock poisoned")
+            .iter()
+            .filter(|c| pred(c))
+            .count()
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Generate the next sequential activity execution ID.

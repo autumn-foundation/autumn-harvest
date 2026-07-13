@@ -222,10 +222,56 @@ pub enum QueryReplayOutcome {
     Panicked,
 }
 
-/// Waker used by [`drive_query_replay`] to detect immediate re-wakes (e.g. a
-/// workflow that calls `tokio::task::yield_now()` — the waker fires synchronously,
-/// signalling the driver to re-poll rather than treat the `Pending` as a genuine
-/// workflow-command suspension).
+/// Returns `true` when `cmd` is a **replay-significant** workflow command — i.e.
+/// one that reflects genuine workflow progress or a suspension, as opposed to a
+/// pure-metadata command that does not affect replay determinism.
+///
+/// The pure-metadata exclusions are:
+/// - [`UpsertSearchAttributes`](WorkflowCommand::UpsertSearchAttributes) and
+///   [`SetCurrentDetails`](WorkflowCommand::SetCurrentDetails): operator-facing
+///   metadata, never part of the deterministic command stream.
+/// - [`CancelRaceLosers`](WorkflowCommand::CancelRaceLosers): for the
+///   timer+signal race shape (issue #600) this is a pure, deterministic function
+///   of already-resolved history (the winner is fixed by recorded order), so it
+///   is re-emitted identically on every replay and carries no new information.
+///
+/// This is the **single source of truth** for two callers that must agree, so
+/// the command classification is never re-enumerated by hand:
+/// - the completion-time "new commands emitted beyond recorded history"
+///   non-determinism check in [`run_workflow_with_state`]/[`run_strict_with_ctx`],
+///   and
+/// - the query-replay drivers' per-poll **delta** suspension discriminator
+///   ([`drive_query_replay`] / [`drive_query_replay_async`]): a `Poll::Pending`
+///   cycle whose replay-significant command count *increased* is a genuine
+///   [`Suspended`](QueryReplayOutcome::Suspended) (case 1); a zero-delta cycle is
+///   either a `tokio::task::yield_now()` spin the driver keeps driving to the
+///   deadline (case 2 → [`TimedOut`](QueryReplayOutcome::TimedOut)) or a
+///   command-less cold park such as `await_condition` that suspends immediately
+///   (case 3 → [`Suspended`](QueryReplayOutcome::Suspended)).
+pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
+    !matches!(
+        cmd,
+        WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+    )
+}
+
+/// Waker used by the query-replay drivers ([`drive_query_replay`] /
+/// [`drive_query_replay_async`]) to detect a self-wake — a workflow calling
+/// `tokio::task::yield_now()`.
+///
+/// **Out of a tokio runtime** (the 16 pure `#[test]` callers of the sync driver)
+/// `yield_now` fires the wake *synchronously* during the poll, so the flag is
+/// readable immediately. **Inside a runtime** (the real HTTP query path)
+/// `yield_now` DEFERS its wake to the scheduler queue, so the flag only flips
+/// after the driver itself cooperatively yields (a single
+/// `tokio::task::yield_now().await` "quiet window" in
+/// [`drive_query_replay_async`]). Either way, the authoritative "genuine
+/// suspension" signal is the per-poll command **delta**
+/// ([`WorkflowContext::count_commands`] over [`is_replay_significant_command`]);
+/// this flag only discriminates the two zero-delta cases (self-wake spin vs.
+/// command-less cold park).
 struct QueryReplayWaker(std::sync::atomic::AtomicBool);
 
 impl futures::task::ArcWake for QueryReplayWaker {
@@ -234,8 +280,159 @@ impl futures::task::ArcWake for QueryReplayWaker {
     }
 }
 
-/// Drive a workflow handler future purely in replay, bounded by `timeout`, and
-/// classify where it stopped (issue #612).
+/// The classification of a single [`poll_query_step`] cycle — the shared,
+/// `!Send`-safe polling primitive both query-replay drivers loop over.
+enum DriveStep {
+    /// The handler future resolved (`Poll::Ready`): the reconstructed context now
+    /// reflects the workflow's final state.
+    Ready,
+    /// The handler panicked (construction is contained separately by
+    /// `catch_construct`); carries the extracted panic message.
+    Panicked(String),
+    /// `Poll::Pending` with a **positive** per-poll command delta: the handler
+    /// emitted ≥1 replay-significant command on this poll, i.e. a genuine
+    /// workflow suspension (case 1).
+    CommandSuspension,
+    /// `Poll::Pending` with a **zero** per-poll command delta: either a
+    /// self-waking `tokio::task::yield_now()` spin (`woken == true`, case 2 —
+    /// keep driving to the deadline) or a command-less cold park such as
+    /// `await_condition` (`woken == false`, case 3 — suspend immediately). In a
+    /// runtime the caller must open a scheduler "quiet window" before trusting
+    /// `woken`, since tokio defers the `yield_now` wake.
+    MaybeSpin { woken: bool },
+}
+
+/// Poll the query-replay handler future exactly once and classify the result
+/// (issue #612).
+///
+/// This helper is **pure and synchronous**: it builds the `!Send`
+/// [`futures::task::waker_ref`] and [`std::task::Context`] internally and drops
+/// them before returning a plain [`DriveStep`]. That is load-bearing for
+/// [`drive_query_replay_async`]: the only values that ever cross its
+/// `yield_now().await` are `Send` (the `Arc<QueryReplayWaker>` flag, the
+/// `Pin<Box<dyn Future + Send>>` handler future, and `&WorkflowContext`), because
+/// the waker/`Context` never escape this function's stack frame.
+///
+/// `before_significant` is the running count of replay-significant commands the
+/// context held *before* this poll; the returned `usize` is the count *after*,
+/// so the caller threads it forward and reads the per-poll delta
+/// (`after > before` ⇒ a command was emitted on this poll ⇒ a genuine
+/// suspension).
+fn poll_query_step(
+    fut: std::pin::Pin<&mut (dyn std::future::Future<Output = Result<Value, String>> + Send)>,
+    flag: &std::sync::Arc<QueryReplayWaker>,
+    before_significant: usize,
+    ctx: &WorkflowContext,
+) -> (DriveStep, usize) {
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    // Reset before polling so `flag` reflects only THIS poll's wake activity.
+    flag.0.store(false, Ordering::Release);
+    let waker = futures::task::waker_ref(flag);
+    let mut poll_cx = std::task::Context::from_waker(&waker);
+    // Issue #782: contain a workflow-handler panic during the read-only replay
+    // drive. Without this, a panicking handler unwinds through the caller (the
+    // plugin's query handler / axum request task) — the process survives but the
+    // request 500s ungracefully. Query replays never emit workflow commands or
+    // append events, so there is nothing to roll back.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.poll(&mut poll_cx))) {
+        Err(panic_payload) => (
+            DriveStep::Panicked(crate::error::panic_message(panic_payload)),
+            before_significant,
+        ),
+        Ok(Poll::Ready(_)) => (DriveStep::Ready, before_significant),
+        Ok(Poll::Pending) => {
+            let after = ctx.count_commands(is_replay_significant_command);
+            if after > before_significant {
+                (DriveStep::CommandSuspension, after)
+            } else {
+                (
+                    DriveStep::MaybeSpin {
+                        woken: flag.0.load(Ordering::Acquire),
+                    },
+                    after,
+                )
+            }
+        }
+    }
+}
+
+/// Compute the finite drive deadline for a `timeout` budget.
+///
+/// `checked_add` guards against a pathologically large `timeout` overflowing
+/// `Instant` (which would panic on `+`). `None` means "no representable
+/// deadline" → never time out (the drivers skip the deadline check).
+fn query_drive_deadline(timeout: Duration) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(timeout)
+}
+
+/// `true` when the finite `deadline` (if any) has already elapsed.
+///
+/// Checked BEFORE each poll so an already-elapsed (or zero) deadline classifies
+/// deterministically as `TimedOut` without a hang. This ordering is intentional
+/// and load-bearing: the pure test
+/// `past_deadline_classifies_as_timed_out_deterministically` passes
+/// `Duration::ZERO` and expects `TimedOut`, so switching to poll-first would
+/// break the deterministic-timeout semantics. (The running-path parity nit — a
+/// zero-timeout running query would classify as `TimedOut` rather than serve
+/// partial state — is intentionally not addressed: the default `query_timeout`
+/// is 5s, so this is unreachable in practice.)
+fn query_deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|d| std::time::Instant::now() >= d)
+}
+
+/// The boxed, `Send` handler future a query-replay drive polls. Aliased to keep
+/// the [`construct_query_handler_fut`] signature under clippy's `type_complexity`
+/// bar; identical in shape to [`WorkflowHandlerFn`]'s return type.
+type QueryHandlerFut<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
+
+/// Construct the handler future for a query-replay drive, containing a
+/// construction-phase panic (issue #782 / PR #1012 review). A hand-written
+/// handler doing synchronous work before returning its boxed future can panic
+/// during construction; the poll-time `catch_unwind` in [`poll_query_step`]
+/// cannot reach that, so the construction call is wrapped too. Query replays
+/// emit no commands and append no events, so there is nothing to roll back.
+fn construct_query_handler_fut(
+    ctx: &WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> Result<QueryHandlerFut<'_>, QueryReplayOutcome> {
+    match crate::error::catch_construct(|| handler(ctx, input)) {
+        Ok(fut) => Ok(fut),
+        Err(message) => {
+            tracing::warn!(
+                panic = %message,
+                "harvest: workflow handler panicked constructing the query replay drive; \
+                 containing as a query error (issue #782)"
+            );
+            Err(QueryReplayOutcome::Panicked)
+        }
+    }
+}
+
+/// Terminal actions shared by both drivers when [`poll_query_step`] resolves the
+/// non-spin cases; kept in one place so the sync and async loops agree.
+///
+/// The `Ready` / `CommandSuspension` / cold-park (`MaybeSpin { woken: false }`)
+/// arms all flush push-based signal handlers before returning (issue #612, Codex
+/// P2 PR #993): a push-based signal handler (issue #546) whose target
+/// `SignalReceived` became claimable but was never picked up by a real
+/// cursor-advancing call this cycle leaves that event stashed. The caller's
+/// `history_has_unconsumed_events()` drift check (`hydrate_ctx_for_query`) runs
+/// *after* the drive returns, so without the flush a truthfully replayed run
+/// would be misclassified as 410. The flush is cursor-bound and
+/// push-handler-only, so it never consumes a signal a genuine pull-based
+/// `wait_for_signal` or an open signal-or-deadline race is still waiting on. A
+/// no-op when no handlers are registered (the common case).
+fn finish_query_drive(ctx: &WorkflowContext, outcome: QueryReplayOutcome) -> QueryReplayOutcome {
+    ctx.flush_pending_signal_handlers();
+    outcome
+}
+
+/// Drive a workflow handler future purely in replay **synchronously**, bounded by
+/// `timeout`, and classify where it stopped (issue #612).
 ///
 /// This is **read-only**: it never persists anything. The provided `ctx` must
 /// already be a replay context (built via
@@ -251,6 +448,28 @@ impl futures::task::ArcWake for QueryReplayWaker {
 /// The `Ok`/`Err` return value of the workflow function is intentionally
 /// ignored — a `FAILED` run still reconstructs its final internal state, which
 /// is exactly what a post-mortem query wants to read.
+///
+/// # Sync vs. async
+///
+/// This synchronous entry point exists for the ~16 pure `#[test]` callers in
+/// `query_terminal_tests.rs`, which run **out of a tokio runtime**. There
+/// `tokio::task::yield_now()` fires its wake *synchronously*, so a self-wake spin
+/// (case 2) is observable directly on the [`QueryReplayWaker`] flag with no
+/// scheduler yield. The real production caller uses
+/// [`drive_query_replay_async`], which opens a scheduler "quiet window" to
+/// observe tokio's *deferred* `yield_now` wake inside a runtime.
+///
+/// Suspension is discriminated by the per-poll **command delta**
+/// ([`poll_query_step`]), not waker timing:
+/// - `CommandSuspension` (≥1 replay-significant command this poll) → `Suspended`.
+/// - `MaybeSpin { woken: true }` (self-wake spin) → keep driving to the deadline
+///   (→ `TimedOut` → 408). Re-polling still makes progress: `yield_now`'s
+///   `Pending` is a one-shot that returns `Ready` on the next poll regardless of
+///   its wake, and the deadline is re-checked at the loop top so we never poll
+///   past `query_timeout`.
+/// - `MaybeSpin { woken: false }` (command-less cold park, e.g.
+///   `await_condition`) → `Suspended` immediately, so a RUNNING query over such a
+///   park serves fast rather than burning the whole budget.
 #[must_use]
 pub fn drive_query_replay(
     ctx: &WorkflowContext,
@@ -258,108 +477,139 @@ pub fn drive_query_replay(
     input: Value,
     timeout: Duration,
 ) -> QueryReplayOutcome {
-    use std::future::Future;
-    use std::sync::atomic::Ordering;
-    use std::task::Poll;
-
     let flag = std::sync::Arc::new(QueryReplayWaker(std::sync::atomic::AtomicBool::new(false)));
-    let waker = futures::task::waker_ref(&flag);
-    let mut poll_cx = std::task::Context::from_waker(&waker);
-    // Issue #782 (PR #1012 review): contain a panic during future *construction*
-    // (a hand-written handler doing synchronous work before returning its boxed
-    // future), mirroring the poll-time containment below. Query replays emit no
-    // commands and append no events, so there is nothing to roll back.
-    let handler_fut = match crate::error::catch_construct(|| handler(ctx, input)) {
+    let mut handler_fut = match construct_query_handler_fut(ctx, handler, input) {
         Ok(fut) => fut,
-        Err(message) => {
-            tracing::warn!(
-                panic = %message,
-                "harvest: workflow handler panicked constructing the query replay drive; \
-                 containing as a query error (issue #782)"
-            );
-            return QueryReplayOutcome::Panicked;
-        }
+        Err(outcome) => return outcome,
     };
-    tokio::pin!(handler_fut);
 
-    // `checked_add` guards against a pathologically large `timeout` overflowing
-    // `Instant` (which would panic on `+`). `None` means "no representable
-    // deadline" → never time out (skip the deadline check entirely below).
-    let deadline = std::time::Instant::now().checked_add(timeout);
+    let deadline = query_drive_deadline(timeout);
+    let mut before = 0usize;
     loop {
-        // Check the deadline BEFORE polling so an already-elapsed (or zero)
-        // deadline classifies deterministically as TimedOut without a hang.
-        // This ordering is intentional and load-bearing: the pure test
-        // `past_deadline_classifies_as_timed_out_deterministically` passes
-        // `Duration::ZERO` and expects `TimedOut`, so switching to poll-first
-        // would break the deterministic-timeout semantics. (The running-path
-        // parity nit — a zero-timeout running query would classify as TimedOut
-        // rather than serve partial state — is intentionally not addressed: the
-        // default `query_timeout` is 5s, so this is unreachable in practice.)
-        if let Some(deadline) = deadline
-            && std::time::Instant::now() >= deadline
-        {
+        if query_deadline_elapsed(deadline) {
             return QueryReplayOutcome::TimedOut;
         }
-        flag.0.store(false, Ordering::Release);
-        // Issue #782: contain a workflow-handler panic during the read-only
-        // replay drive. Without this, a panicking handler unwinds through the
-        // caller (the plugin's query handler / axum request task) — the process
-        // survives but the request 500s ungracefully. Catch it here and report
-        // `Panicked` so the caller returns a clean query error instead. Query
-        // replays never emit workflow commands or append events, so there is
-        // nothing to roll back.
-        let poll = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handler_fut.as_mut().poll(&mut poll_cx)
-        })) {
-            Ok(poll) => poll,
-            Err(panic_payload) => {
+        let (step, after) = poll_query_step(handler_fut.as_mut(), &flag, before, ctx);
+        before = after;
+        match step {
+            DriveStep::Ready => {
+                return finish_query_drive(ctx, QueryReplayOutcome::ReachedTerminal);
+            }
+            DriveStep::Panicked(message) => {
                 tracing::warn!(
-                    panic = %crate::error::panic_message(panic_payload),
+                    panic = %message,
                     "harvest: workflow handler panicked during query replay drive; \
                      containing as a query error (issue #782)"
                 );
                 return QueryReplayOutcome::Panicked;
             }
-        };
-        match poll {
-            Poll::Ready(_) => {
-                // Issue #612 (Codex P2, PR #993): mirror the executor's
-                // completion-time signal-handler flush (see the `run_workflow`
-                // family, which flushes right before its own
-                // `history_has_unconsumed_events()` check) before returning. A
-                // push-based signal handler (issue #546) whose target
-                // `SignalReceived` became claimable but was never picked up by a
-                // real cursor-advancing call this cycle — e.g. a workflow that
-                // registers a handler and then completes with no further
-                // activity/timer/signal wait — leaves that event stashed. The
-                // caller's `history_has_unconsumed_events()` drift check
-                // (`hydrate_ctx_for_query`) runs *after* this returns, so without
-                // the flush a truthfully replayed run would be misclassified as
-                // 410. The flush also completes state reconstruction by invoking
-                // the handler, so the served query reflects the processed signal.
-                // A no-op when no handlers are registered (the common case).
-                ctx.flush_pending_signal_handlers();
-                return QueryReplayOutcome::ReachedTerminal;
+            // Case 1: a genuine workflow suspension on a durable command.
+            DriveStep::CommandSuspension => {
+                return finish_query_drive(ctx, QueryReplayOutcome::Suspended);
             }
-            Poll::Pending => {
-                if !flag.0.load(Ordering::Acquire) {
-                    // Not woken → genuine suspension on a workflow command.
-                    // Flush for the same reason: on a run the engine sealed while
-                    // parked (CONTINUED_AS_NEW / TIMED_OUT / mid-await cancel), the
-                    // drift-guarded `Suspended` arm of `classify_terminal_query`
-                    // serves only when no non-lifecycle history remains
-                    // unconsumed, so a push-handler signal recorded before the
-                    // park point must be claimed here too. The flush is
-                    // cursor-bound and push-handler-only (`claim_pending_signal`
-                    // drains only up to the suspension blocker and respects race
-                    // reservations), so it never consumes a signal a genuine
-                    // pull-based `wait_for_signal` or an open signal-or-deadline
-                    // race is still waiting on.
-                    ctx.flush_pending_signal_handlers();
-                    return QueryReplayOutcome::Suspended;
+            DriveStep::MaybeSpin { woken } => {
+                if woken {
+                    // Case 2: out-of-runtime `yield_now` fired synchronously →
+                    // keep driving to the deadline. Yield the OS thread slice so a
+                    // spinning query does not needlessly hard-pin a core for the
+                    // whole budget.
+                    std::thread::yield_now();
+                } else {
+                    // Case 3: command-less cold park (e.g. `await_condition`) →
+                    // Suspended immediately.
+                    return finish_query_drive(ctx, QueryReplayOutcome::Suspended);
                 }
-                // Woken immediately (e.g. yield_now) — keep driving.
+            }
+        }
+    }
+}
+
+/// Async twin of [`drive_query_replay`] for the single production caller
+/// (`hydrate_ctx_for_query`), which awaits inside an axum request task (issue
+/// #612).
+///
+/// Identical classification to the sync driver except for the zero-command-delta
+/// `MaybeSpin` case: **inside a tokio runtime** `tokio::task::yield_now()` defers
+/// its wake to the scheduler queue rather than firing it synchronously, so this
+/// driver opens a **quiet window** — exactly one `tokio::task::yield_now().await`
+/// — before trusting the [`QueryReplayWaker`] flag. One scheduler tick flushes
+/// the deferred wake queue:
+/// - if the flag then reads set, the workflow is a self-waking spin (case 2) →
+///   keep driving to the deadline (→ `TimedOut` → 408);
+/// - if it stays cold, the workflow parked command-less on an external re-poll
+///   that never comes during a query drive (case 3, `await_condition`) →
+///   `Suspended` immediately.
+///
+/// A raw `tokio::time::sleep(d)` in workflow code registers a *timer* waker (not
+/// the deferred queue), which one `yield_now().await` does not fire, so it too
+/// classifies case 3 → `Suspended` immediately rather than blocking the query for
+/// `d`. That is correct and desirable (it is a determinism bug regardless).
+///
+/// # Send-safety
+///
+/// The `!Send` waker/`Context` are built and dropped inside the synchronous
+/// [`poll_query_step`], so the only values live across the `yield_now().await`
+/// are `Send`: the `Arc<QueryReplayWaker>` flag, the `Pin<Box<dyn Future + Send>>`
+/// handler future, `&WorkflowContext`, and a couple of `Copy` scalars. This keeps
+/// the returned future `Send`, as the axum handler requires.
+#[must_use]
+pub async fn drive_query_replay_async(
+    ctx: &WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    timeout: Duration,
+) -> QueryReplayOutcome {
+    let flag = std::sync::Arc::new(QueryReplayWaker(std::sync::atomic::AtomicBool::new(false)));
+    let mut handler_fut = match construct_query_handler_fut(ctx, handler, input) {
+        Ok(fut) => fut,
+        Err(outcome) => return outcome,
+    };
+
+    let deadline = query_drive_deadline(timeout);
+    let mut before = 0usize;
+    loop {
+        if query_deadline_elapsed(deadline) {
+            return QueryReplayOutcome::TimedOut;
+        }
+        let (step, after) = poll_query_step(handler_fut.as_mut(), &flag, before, ctx);
+        before = after;
+        match step {
+            DriveStep::Ready => {
+                return finish_query_drive(ctx, QueryReplayOutcome::ReachedTerminal);
+            }
+            DriveStep::Panicked(message) => {
+                tracing::warn!(
+                    panic = %message,
+                    "harvest: workflow handler panicked during query replay drive; \
+                     containing as a query error (issue #782)"
+                );
+                return QueryReplayOutcome::Panicked;
+            }
+            // Case 1: a genuine workflow suspension on a durable command.
+            DriveStep::CommandSuspension => {
+                return finish_query_drive(ctx, QueryReplayOutcome::Suspended);
+            }
+            DriveStep::MaybeSpin { woken } => {
+                if !woken {
+                    // Quiet window: one cooperative scheduler tick flushes tokio's
+                    // deferred `yield_now` wake queue so an in-runtime spin's wake
+                    // reaches our flag. Nothing `!Send` is live here — the
+                    // waker/`Context` were built and dropped inside
+                    // `poll_query_step`, and `handler_fut`'s borrow ended when it
+                    // returned.
+                    tokio::task::yield_now().await;
+                }
+                if flag.0.load(std::sync::atomic::Ordering::Acquire) {
+                    // Case 2: self-waking spin (`tokio::task::yield_now()` in
+                    // workflow code) → keep driving to the deadline (→ 408). The
+                    // `yield_now().await` above already yielded the runtime this
+                    // cycle, so a spinning query never starves other tasks.
+                    continue;
+                }
+                // Case 3: command-less cold park (e.g. `await_condition`) that
+                // never self-wakes during a query drive → Suspended immediately,
+                // so a RUNNING query serves fast rather than burning the budget.
+                return finish_query_drive(ctx, QueryReplayOutcome::Suspended);
             }
         }
     }
@@ -638,22 +888,11 @@ async fn run_strict_with_ctx(
                             handler_panic: false,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
-                    } else if ctx.drain_commands().into_iter().any(|cmd| {
-                        // UpsertSearchAttributes and SetCurrentDetails are pure metadata
-                        // and do not affect replay determinism; exclude from this check.
-                        // CancelRaceLosers is also excluded: for the timer+signal race
-                        // shape (issue #600) it is a pure, deterministic function of
-                        // already-resolved history (signal won -> cancel the now-stale
-                        // timer) with no marker to gate re-emission on, so replaying the
-                        // same complete history always reproduces it identically -- it
-                        // never introduces new, unaccounted-for information.
-                        !matches!(
-                            cmd,
-                            WorkflowCommand::UpsertSearchAttributes { .. }
-                                | WorkflowCommand::SetCurrentDetails { .. }
-                                | WorkflowCommand::CancelRaceLosers { .. }
-                        )
-                    }) {
+                    } else if ctx
+                        .drain_commands()
+                        .iter()
+                        .any(is_replay_significant_command)
+                    {
                         // New commands emitted after history was fully consumed (e.g. a
                         // newly-added version() or side_effect() call on an old history).
                         let nd = ctx.take_nd_details().or_else(|| {
@@ -822,14 +1061,11 @@ pub(crate) async fn run_workflow_canary(
                             handler_panic: false,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
-                    } else if ctx.drain_commands().into_iter().any(|cmd| {
-                        !matches!(
-                            cmd,
-                            WorkflowCommand::UpsertSearchAttributes { .. }
-                                | WorkflowCommand::SetCurrentDetails { .. }
-                                | WorkflowCommand::CancelRaceLosers { .. }
-                        )
-                    }) {
+                    } else if ctx
+                        .drain_commands()
+                        .iter()
+                        .any(is_replay_significant_command)
+                    {
                         let nd = ctx.take_nd_details().or_else(|| {
                             Some(crate::error::NonDeterministicDetails {
                                 event_index: i32::try_from(ctx.replay_position()).ok(),

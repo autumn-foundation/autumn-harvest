@@ -70,7 +70,7 @@ use autumn_harvest::dlq;
 use autumn_harvest::erase;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::executor::{
-    QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay,
+    QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay_async,
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
@@ -16569,12 +16569,13 @@ async fn hydrate_ctx_for_query(
     // resolve via pre-sent oneshot channels so the entire history replays
     // synchronously; this is read-only and appends no events / performs no
     // writes (issue #612 AC4).
-    let outcome = drive_query_replay(
+    let outcome = drive_query_replay_async(
         &ctx,
         workflow.handler,
         execution.input.clone(),
         api_state.query_timeout(),
-    );
+    )
+    .await;
 
     if terminal {
         // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
