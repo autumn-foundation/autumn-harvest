@@ -66,7 +66,10 @@ use std::path::Path;
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Severity of a determinism finding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes as `"error"` / `"warning"` (issue #778 `--format json`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DetSeverity {
     /// Breaks replay determinism; counted as a hard blocker by [`DetCheckReport::has_hard_blockers`].
     Error,
@@ -75,22 +78,30 @@ pub enum DetSeverity {
 }
 
 /// Source location reported in a finding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DetLocation {
     /// Path (or label) of the file being analysed, as passed to [`check_source`].
     pub file: String,
     /// 1-indexed line number within that file.
     pub line: u32,
+    /// 1-indexed column of the matched pattern within the source line.
+    ///
+    /// Best-effort: a real column is computed from the matched substring for the
+    /// substring-table rules (DET001–DET009, DET011); the bespoke DET010 pass
+    /// and any site lacking an offset report `1`. Always `> 0`.
+    pub col: u32,
 }
 
 /// A single determinism violation found in a workflow function body.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DetFinding {
     /// Stable rule identifier (e.g. `"DET001"`).
     pub rule_id: &'static str,
     /// How serious the violation is.
     pub severity: DetSeverity,
-    /// Name of the `#[workflow]` function where the violation was found.
+    /// Name of the `#[workflow]` function the violation is reachable from (the
+    /// entry point). For a transitive finding this is the workflow that reaches
+    /// the offending helper, not the helper itself.
     pub workflow_name: Option<String>,
     /// Source location, when available.
     pub location: Option<DetLocation>,
@@ -98,10 +109,16 @@ pub struct DetFinding {
     pub message: String,
     /// A deterministic Harvest-shaped alternative.
     pub alternative: &'static str,
+    /// For a transitive finding (issue #778, one first-party hop): the name of
+    /// the first-party helper function — reachable via a direct call from the
+    /// `workflow_name` entry point — that contains the offending call. `None`
+    /// for a direct-in-body finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_helper: Option<String>,
 }
 
 /// An active suppression comment found in the source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DetSuppression {
     /// The rule ID that was suppressed.
     pub rule_id: String,
@@ -112,7 +129,7 @@ pub struct DetSuppression {
 }
 
 /// The result of checking one or more source files.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct DetCheckReport {
     /// Violations that were *not* suppressed.
     pub findings: Vec<DetFinding>,
@@ -385,20 +402,26 @@ const RULES: &[Rule] = &[
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Check Rust source code text for determinism violations inside `#[workflow]` functions.
+/// Check Rust source code text for determinism violations reachable from
+/// `#[workflow]` functions.
+///
+/// Each `#[workflow]` body is scanned directly, and — one first-party hop
+/// (issue #778) — every same-source plain helper function it calls directly is
+/// scanned too, attributing any finding to the workflow entry point via
+/// [`DetFinding::via_helper`]. `#[activity]` bodies are never scanned (activities
+/// are allowed to be non-deterministic by design), and neither are the bodies of
+/// helpers a workflow does not reach.
 ///
 /// `file` is used only for source-location reporting; no file is read.
 /// The function always returns a report; it never panics on malformed input.
 #[must_use]
 pub fn check_source(source: &str, file: &str) -> DetCheckReport {
-    let mut report = DetCheckReport::default();
     let lines: Vec<&str> = source.lines().collect();
-
-    for (wf_name, body) in extract_workflow_bodies(&lines) {
-        report.merge(check_body(&wf_name, &body, file));
+    let mut fns = extract_all_functions(&lines);
+    for f in &mut fns {
+        f.file = file.to_string();
     }
-
-    report
+    scan_functions(&fns)
 }
 
 /// Check a single `.rs` file for determinism violations.
@@ -411,122 +434,316 @@ pub fn check_file(path: &Path) -> std::io::Result<DetCheckReport> {
     Ok(check_source(&source, &file))
 }
 
-/// Recursively check all `.rs` files under `dir` for determinism violations.
+/// Recursively check all `.rs` files under `dir` for determinism violations,
+/// resolving first-party helper reachability (issue #778) across every file in
+/// the tree.
+///
+/// Build-output and hidden directories (`target`, and any directory whose name
+/// starts with `.`, e.g. `.git`) are skipped so a scan of a repository root
+/// stays fast and never lints generated code.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be read or any file read fails.
 pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
-    let mut report = DetCheckReport::default();
-    collect_rs_files(dir, &mut report)?;
-    Ok(report)
+    let mut sources: Vec<(String, String)> = Vec::new();
+    collect_rs_sources(dir, &mut sources)?;
+
+    // Build a single first-party function index across every file so a
+    // workflow in one file can resolve a helper defined in another.
+    let mut all_fns: Vec<FnDef> = Vec::new();
+    for (label, content) in &sources {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut fns = extract_all_functions(&lines);
+        for f in &mut fns {
+            f.file.clone_from(label);
+        }
+        all_fns.extend(fns);
+    }
+    Ok(scan_functions(&all_fns))
 }
 
-fn collect_rs_files(dir: &Path, report: &mut DetCheckReport) -> std::io::Result<()> {
+fn collect_rs_sources(dir: &Path, sources: &mut Vec<(String, String)>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_rs_files(&path, report)?;
+            // Skip build artifacts and hidden directories (target, .git, …).
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "target" || n.starts_with('.'));
+            if !skip {
+                collect_rs_sources(&path, sources)?;
+            }
         } else if path.extension().is_some_and(|e| e == "rs") {
-            report.merge(check_file(&path)?);
+            let content = std::fs::read_to_string(&path)?;
+            sources.push((path.to_string_lossy().into_owned(), content));
         }
     }
     Ok(())
 }
 
-// ── Workflow body extraction ───────────────────────────────────────────────────
+// ── Function extraction & reachability (issue #778) ──────────────────────────
 
-/// Returns `(workflow_name, body_lines)` for every `#[workflow]`-annotated
-/// `async fn` in the source.  Each body line carries its 1-indexed line number.
-/// `#[activity]` bodies are not returned.
-fn extract_workflow_bodies<'a>(lines: &[&'a str]) -> Vec<(String, Vec<(u32, &'a str)>)> {
+/// A top-level function definition captured from one source file. Bodies are
+/// owned so a cross-file index can outlive the per-file line buffers.
+struct FnDef {
+    /// Function name.
+    name: String,
+    /// `(1-indexed source line, text)` for every non-blank body line.
+    body: Vec<(u32, String)>,
+    /// Whether the function carries a `#[workflow]` attribute.
+    is_workflow: bool,
+    /// Whether the function carries an `#[activity]` attribute.
+    is_activity: bool,
+    /// File label the function was extracted from (set by the caller).
+    file: String,
+}
+
+/// The (entry-point workflow, optional via-helper, file) a body is scanned under.
+struct BodyScope<'a> {
+    /// The `#[workflow]` function the finding is attributed to.
+    entry_workflow: &'a str,
+    /// For a transitive finding, the helper containing the offending call.
+    via_helper: Option<&'a str>,
+    /// File label for the location.
+    file: &'a str,
+}
+
+/// Returns every **top-level** (file brace depth 0) function definition, with a
+/// flag for whether it carries `#[workflow]` / `#[activity]`. Methods inside
+/// `impl`/`trait` blocks (depth > 0) are deliberately not captured, so they can
+/// never be mistaken for free-function helper callees.
+fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
     let mut result = Vec::new();
+    let mut depth: i32 = 0;
+    let mut pending_wf = false;
+    let mut pending_act = false;
     let mut i = 0;
 
     while i < lines.len() {
+        if depth != 0 {
+            depth = (depth + code_brace_delta(lines[i])).max(0);
+            i += 1;
+            continue;
+        }
+
         let trimmed = lines[i].trim();
 
-        if !is_workflow_attr(trimmed) {
+        // Accumulate the workflow/activity attribute state, keeping it across
+        // intervening attributes, doc comments, and blank lines.
+        if is_workflow_attr(trimmed) {
+            pending_wf = true;
+            i += 1;
+            continue;
+        }
+        if is_activity_attr(trimmed) {
+            pending_act = true;
+            i += 1;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
             i += 1;
             continue;
         }
 
-        // Found `#[workflow]` — skip forward past any intermediate attributes / doc comments
+        if let Some(name) = fn_decl_name(trimmed)
+            && let Some((body, next_i)) = extract_fn_body(lines, i)
+        {
+            result.push(FnDef {
+                name,
+                body,
+                is_workflow: pending_wf,
+                is_activity: pending_act,
+                file: String::new(),
+            });
+            pending_wf = false;
+            pending_act = false;
+            i = next_i;
+            continue;
+        }
+
+        // A depth-0 line that is not a fn declaration (`impl … {`, `struct …`,
+        // `use …;`, `const …`) — reset pending attributes and track depth.
+        pending_wf = false;
+        pending_act = false;
+        depth = (depth + code_brace_delta(lines[i])).max(0);
         i += 1;
-        while i < lines.len() {
-            let t = lines[i].trim();
-            if t.starts_with("//") || t.starts_with("#[") || t.is_empty() {
-                i += 1;
-            } else {
-                break;
-            }
-        }
-
-        if i >= lines.len() {
-            break;
-        }
-
-        // Extract function name from `(pub)? async fn NAME`
-        let fn_line = lines[i].trim();
-        let Some(name) = extract_fn_name(fn_line) else {
-            i += 1;
-            continue;
-        };
-
-        // Scan forward to find the opening `{` of the function body.
-        // The signature may span multiple lines.
-        let mut j = i;
-        let brace_line = loop {
-            if lines[j].contains('{') {
-                break j;
-            }
-            j += 1;
-            if j >= lines.len() {
-                break usize::MAX; // sentinel: not found
-            }
-        };
-        if brace_line == usize::MAX {
-            i += 1;
-            continue;
-        }
-
-        // Start collecting from brace_line itself so that code on the same line
-        // as `{` is included (e.g. single-line `fn wf() { expr }`).
-        let brace_pos = lines[brace_line].find('{').unwrap_or(0);
-        let mut depth = 1u32;
-        let mut body: Vec<(u32, &'a str)> = Vec::new(); // (1-indexed line, text)
-
-        j = brace_line;
-        let mut on_brace_line = true;
-
-        while j < lines.len() && depth > 0 {
-            // On the opening-brace line only scan content after the `{`.
-            let line: &'a str = if on_brace_line {
-                on_brace_line = false;
-                &lines[j][brace_pos + 1..]
-            } else {
-                lines[j]
-            };
-            let line_num = u32::try_from(j + 1).unwrap_or(u32::MAX);
-
-            if let Some(pos) = scan_braces_outside_literals(line, &mut depth) {
-                // Include any code on the closing-brace line that precedes the `}`
-                let before = &line[..pos];
-                if !before.trim().is_empty() {
-                    body.push((line_num, before));
-                }
-            } else if !line.trim().is_empty() {
-                body.push((line_num, line));
-            }
-
-            j += 1;
-        }
-
-        result.push((name, body));
-        i = j;
     }
 
     result
+}
+
+/// Extracts a function body starting at `fn_idx` (the line carrying the `fn`
+/// keyword). Returns the owned `(line, text)` body lines and the index just past
+/// the closing brace, or `None` if no body brace is found.
+fn extract_fn_body(lines: &[&str], fn_idx: usize) -> Option<(Vec<(u32, String)>, usize)> {
+    // Scan forward for the opening `{` (the signature may span lines).
+    let mut j = fn_idx;
+    let brace_line = loop {
+        if lines[j].contains('{') {
+            break j;
+        }
+        j += 1;
+        if j >= lines.len() {
+            return None;
+        }
+    };
+
+    let brace_pos = lines[brace_line].find('{').unwrap_or(0);
+    let mut depth = 1u32;
+    let mut body: Vec<(u32, String)> = Vec::new();
+
+    j = brace_line;
+    let mut on_brace_line = true;
+
+    while j < lines.len() && depth > 0 {
+        let line: &str = if on_brace_line {
+            on_brace_line = false;
+            &lines[j][brace_pos + 1..]
+        } else {
+            lines[j]
+        };
+        let line_num = u32::try_from(j + 1).unwrap_or(u32::MAX);
+
+        if let Some(pos) = scan_braces_outside_literals(line, &mut depth) {
+            let before = &line[..pos];
+            if !before.trim().is_empty() {
+                body.push((line_num, before.to_string()));
+            }
+        } else if !line.trim().is_empty() {
+            body.push((line_num, line.to_string()));
+        }
+
+        j += 1;
+    }
+
+    Some((body, j))
+}
+
+/// Net brace delta of a source line, ignoring braces inside string/char
+/// literals and comments (via [`strip_unparseable_content`]).
+fn code_brace_delta(line: &str) -> i32 {
+    strip_unparseable_content(line)
+        .chars()
+        .fold(0i32, |acc, c| match c {
+            '{' => acc + 1,
+            '}' => acc - 1,
+            _ => acc,
+        })
+}
+
+/// Scans every extracted `#[workflow]` body directly, then follows one hop of
+/// direct first-party helper calls into plain (non-workflow, non-activity)
+/// helpers and scans those too, attributing findings to the workflow entry
+/// point. Findings are deduped by `(rule_id, entry-workflow, file, line)`.
+fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
+    use std::collections::HashMap;
+
+    // Candidate helper index: only plain helpers are eligible callees. A name
+    // defined by more than one plain helper is marked ambiguous (`None`) and is
+    // never resolved, so an ambiguous resolution can never introduce a false
+    // positive.
+    let mut index: HashMap<&str, Option<usize>> = HashMap::new();
+    for (i, f) in fns.iter().enumerate() {
+        if f.is_workflow || f.is_activity {
+            continue;
+        }
+        index
+            .entry(&f.name)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(i));
+    }
+
+    let mut report = DetCheckReport::default();
+    for wf in fns.iter().filter(|f| f.is_workflow) {
+        let view = body_view(&wf.body);
+        let scope = BodyScope {
+            entry_workflow: &wf.name,
+            via_helper: None,
+            file: &wf.file,
+        };
+        report.merge(check_body(&scope, &view));
+
+        for callee in collect_direct_free_fn_calls(&view, &index) {
+            if let Some(Some(idx)) = index.get(callee.as_str()).copied() {
+                let helper = &fns[idx];
+                let hview = body_view(&helper.body);
+                let hscope = BodyScope {
+                    entry_workflow: &wf.name,
+                    via_helper: Some(&helper.name),
+                    file: &helper.file,
+                };
+                report.merge(check_body(&hscope, &hview));
+            }
+        }
+    }
+
+    dedupe_findings(&mut report.findings);
+    report
+}
+
+/// Borrows an owned body as the `&[(u32, &str)]` view the per-body analysis expects.
+fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
+    body.iter().map(|(n, s)| (*n, s.as_str())).collect()
+}
+
+/// Collects the names of first-party helpers a body calls via a **direct
+/// free-function call** (`helper(`), excluding method calls (`x.helper(`),
+/// path-qualified calls (`m::helper(`), and identifier-continuation. Only names
+/// present in `candidates` are returned.
+fn collect_direct_free_fn_calls(
+    body: &[(u32, &str)],
+    candidates: &std::collections::HashMap<&str, Option<usize>>,
+) -> std::collections::BTreeSet<String> {
+    let mut called = std::collections::BTreeSet::new();
+    for &(_, line) in body {
+        let code = strip_unparseable_content(line);
+        let bytes = code.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !is_ident_byte(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let token = &code[start..i];
+            // Must start with a letter or `_` (not a number literal).
+            let first_ok = token
+                .as_bytes()
+                .first()
+                .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_');
+            // Preceding boundary: not part of a longer ident, not a method call
+            // (`.`) and not a path-qualified call (`:`).
+            let before_ok = start == 0 || {
+                let b = bytes[start - 1];
+                !is_ident_byte(b) && b != b'.' && b != b':'
+            };
+            // Immediate call paren.
+            let after_ok = i < bytes.len() && bytes[i] == b'(';
+            if first_ok && before_ok && after_ok && candidates.contains_key(token) {
+                called.insert(token.to_string());
+            }
+        }
+    }
+    called
+}
+
+/// Removes duplicate findings, keeping one per
+/// `(rule_id, entry-workflow, file, line)`.
+fn dedupe_findings(findings: &mut Vec<DetFinding>) {
+    let mut seen = std::collections::HashSet::new();
+    findings.retain(|f| {
+        let key = (
+            f.rule_id,
+            f.workflow_name.clone(),
+            f.location.as_ref().map(|l| (l.file.clone(), l.line)),
+        );
+        seen.insert(key)
+    });
 }
 
 /// Returns `true` for `#[workflow]` and `#[workflow(...)]` attribute lines.
@@ -534,20 +751,70 @@ fn is_workflow_attr(s: &str) -> bool {
     s == "#[workflow]" || s.starts_with("#[workflow(") || s.starts_with("#[workflow ]")
 }
 
-/// Extracts the function name from a line like `pub async fn my_wf(`.
-fn extract_fn_name(line: &str) -> Option<String> {
-    let pos = line.find("fn ")?;
-    let after = &line[pos + 3..];
-    let name: String = after
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if name.is_empty() { None } else { Some(name) }
+/// Returns `true` for `#[activity]` and `#[activity(...)]` attribute lines.
+fn is_activity_attr(s: &str) -> bool {
+    s == "#[activity]" || s.starts_with("#[activity(") || s.starts_with("#[activity ]")
+}
+
+/// Extracts the function name from a top-level function declaration line such as
+/// `pub(crate) async fn my_wf(` after stripping visibility and fn qualifiers.
+/// Returns `None` when the line is not a function definition.
+fn fn_decl_name(trimmed: &str) -> Option<String> {
+    let mut s = trimmed;
+
+    // Optional visibility: `pub`, `pub(crate)`, `pub(super)`, …
+    if let Some(rest) = s.strip_prefix("pub") {
+        match rest.chars().next() {
+            Some('(') => {
+                let close = rest.find(')')?;
+                s = rest[close + 1..].trim_start();
+            }
+            Some(c) if c.is_whitespace() => s = rest.trim_start(),
+            _ => {} // `public`/`pubfoo` — not a visibility modifier.
+        }
+    }
+
+    // Fn qualifiers, in any order, plus an optional `extern "ABI"`.
+    loop {
+        let mut advanced = false;
+        for kw in ["const ", "async ", "unsafe ", "extern "] {
+            if let Some(rest) = s.strip_prefix(kw) {
+                s = rest.trim_start();
+                advanced = true;
+            }
+        }
+        if s.starts_with('"')
+            && let Some(end) = s[1..].find('"')
+        {
+            s = s[end + 2..].trim_start();
+            advanced = true;
+        }
+        if !advanced {
+            break;
+        }
+    }
+
+    let after = s.strip_prefix("fn")?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let after = after.trim_start();
+    let name: String = after.chars().take_while(|c| is_ident_char(*c)).collect();
+    if name.is_empty() {
+        return None;
+    }
+    // Sanity: the name must be followed by `(`, `<` (generics), or nothing.
+    let tail = after[name.len()..].trim_start();
+    if tail.is_empty() || tail.starts_with('(') || tail.starts_with('<') {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 // ── Body checker ──────────────────────────────────────────────────────────────
 
-fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheckReport {
+fn check_body(scope: &BodyScope, body_lines: &[(u32, &str)]) -> DetCheckReport {
     let mut report = DetCheckReport::default();
 
     for (idx, &(source_line, line)) in body_lines.iter().enumerate() {
@@ -570,30 +837,36 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
                     continue;
                 }
 
+                // Best-effort 1-based column of the matched pattern in the raw line.
+                let col = det_col(line, pattern);
+
                 // Pattern matched — check for a suppression comment.
                 if let Some(reason) = find_suppression(rule.id, line, prev_line) {
                     report.suppressions.push(DetSuppression {
                         rule_id: rule.id.to_string(),
                         reason,
                         location: DetLocation {
-                            file: file.to_string(),
+                            file: scope.file.to_string(),
                             line: source_line,
+                            col,
                         },
                     });
                 } else {
                     report.findings.push(DetFinding {
                         rule_id: rule.id,
                         severity: rule.severity.clone(),
-                        workflow_name: Some(wf_name.to_string()),
+                        workflow_name: Some(scope.entry_workflow.to_string()),
                         location: Some(DetLocation {
-                            file: file.to_string(),
+                            file: scope.file.to_string(),
                             line: source_line,
+                            col,
                         }),
                         message: format!(
                             "[{}] {} (matched pattern: `{}`)",
                             rule.id, rule.message, pattern
                         ),
                         alternative: rule.alternative,
+                        via_helper: scope.via_helper.map(str::to_string),
                     });
                 }
                 continue 'rules; // one finding per rule per line
@@ -605,9 +878,20 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
     // above, so a report's findings are grouped by pass, not strictly sorted
     // by source line across rules. Consumers needing line order should sort
     // on `location.line`.
-    report.merge(check_hash_iteration(wf_name, body_lines, file));
+    report.merge(check_hash_iteration(scope, body_lines));
 
     report
+}
+
+/// Best-effort 1-based **column** of `pattern` within the raw source `line`.
+/// The pattern is located in the raw line (not the stripped form) so the column
+/// aligns with what an operator sees; a byte offset is converted to a 1-based
+/// character column. Falls back to `1` when the pattern is not found in the raw
+/// line (e.g. it only survives in the stripped form). Always `> 0`.
+fn det_col(line: &str, pattern: &str) -> u32 {
+    line.find(pattern).map_or(1, |byte| {
+        u32::try_from(line[..byte].chars().count() + 1).unwrap_or(1)
+    })
 }
 
 // ── DET010: HashMap/HashSet iteration order (issue #785) ─────────────────────
@@ -707,7 +991,7 @@ enum Det010LetBinding {
 /// that *looks like* a `let`/`for`/brace can perturb binding tracking. Keep
 /// multi-line strings out of workflow bodies (they are almost always test
 /// fixtures) or suppress the resulting finding.
-fn check_hash_iteration(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheckReport {
+fn check_hash_iteration(scope_ctx: &BodyScope, body_lines: &[(u32, &str)]) -> DetCheckReport {
     use std::collections::HashMap;
 
     let mut report = DetCheckReport::default();
@@ -785,8 +1069,7 @@ fn check_hash_iteration(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -
                     };
                     det010_emit_for_finding(
                         &mut report,
-                        wf_name,
-                        file,
+                        scope_ctx,
                         source_line,
                         (raw_line, prev_line),
                         &ident,
@@ -825,13 +1108,14 @@ fn det010_line_events(code: &str) -> Vec<(usize, Det010Event)> {
 /// echoed with the exact id the author wrote.
 fn det010_emit_for_finding(
     report: &mut DetCheckReport,
-    wf_name: &str,
-    file: &str,
+    scope: &BodyScope,
     source_line: u32,
     (raw_line, prev_line): (&str, &str),
     ident: &str,
     severity: DetSeverity,
 ) {
+    // The bespoke DET010 pass has no per-match byte offset, so it reports col 1.
+    let col = 1;
     let suppression = find_suppression(DET010_ID, raw_line, prev_line)
         .map(|reason| (DET010_ID.to_string(), reason))
         .or_else(|| {
@@ -843,8 +1127,9 @@ fn det010_emit_for_finding(
             rule_id,
             reason,
             location: DetLocation {
-                file: file.to_string(),
+                file: scope.file.to_string(),
                 line: source_line,
+                col,
             },
         });
         return;
@@ -853,13 +1138,15 @@ fn det010_emit_for_finding(
     report.findings.push(DetFinding {
         rule_id: DET010_ID,
         severity,
-        workflow_name: Some(wf_name.to_string()),
+        workflow_name: Some(scope.entry_workflow.to_string()),
         location: Some(DetLocation {
-            file: file.to_string(),
+            file: scope.file.to_string(),
             line: source_line,
+            col,
         }),
         message: format!("[{DET010_ID}] {DET010_MESSAGE} (iterated hash-typed binding: `{ident}`)"),
         alternative: DET010_ALTERNATIVE,
+        via_helper: scope.via_helper.map(str::to_string),
     });
 }
 
@@ -1831,20 +2118,34 @@ mod tests {
     }
 
     #[test]
-    fn extract_fn_name_handles_visibility_and_async() {
+    fn fn_decl_name_handles_visibility_and_async() {
+        assert_eq!(fn_decl_name("async fn my_wf("), Some("my_wf".to_string()));
         assert_eq!(
-            extract_fn_name("async fn my_wf("),
-            Some("my_wf".to_string())
-        );
-        assert_eq!(
-            extract_fn_name("pub async fn billing("),
+            fn_decl_name("pub async fn billing("),
             Some("billing".to_string())
         );
         assert_eq!(
-            extract_fn_name("pub(crate) async fn inner("),
+            fn_decl_name("pub(crate) async fn inner("),
             Some("inner".to_string())
         );
-        assert_eq!(extract_fn_name("let x = 1;"), None);
+        assert_eq!(
+            fn_decl_name("const fn helper() -> i64 {"),
+            Some("helper".to_string())
+        );
+        assert_eq!(
+            fn_decl_name("fn plain<T>(x: T) {"),
+            Some("plain".to_string())
+        );
+        assert_eq!(fn_decl_name("let x = 1;"), None);
+        assert_eq!(fn_decl_name("impl Foo {"), None);
+        assert_eq!(fn_decl_name("struct Bar {"), None);
+    }
+
+    #[test]
+    fn is_activity_attr_matches_bare_and_parameterised() {
+        assert!(is_activity_attr("#[activity]"));
+        assert!(is_activity_attr("#[activity(start_to_close = \"30s\")]"));
+        assert!(!is_activity_attr("#[workflow]"));
     }
 
     #[test]

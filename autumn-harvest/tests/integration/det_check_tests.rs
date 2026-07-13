@@ -1846,3 +1846,350 @@ fn det011_self_scan_of_harvest_src_is_clean() {
         "autumn-harvest/src must have zero DET011 findings, got: {det011:?}"
     );
 }
+
+// ── Transitive reachability (issue #778, one first-party hop) ──────────────
+//
+// A hard-blocker call located in a first-party helper function that a
+// `#[workflow]` body calls directly must be flagged, naming both the offending
+// site and the workflow entry point. Boundary mirrors #386: activity callees,
+// method calls, and two-hop chains are NOT covered.
+
+#[test]
+fn transitive_same_file_flags_helper_violation() {
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = bad_time_helper();
+    Ok(())
+}
+
+fn bad_time_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a Utc::now() inside a first-party helper called from a workflow must be flagged, got: {report:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn transitive_two_hop_is_not_flagged() {
+    // workflow -> helper_a (clean) -> helper_b (violation): one hop only, so
+    // helper_b must NOT be reached.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    helper_a();
+    Ok(())
+}
+
+fn helper_a() {
+    helper_b();
+}
+
+fn helper_b() {
+    let _ = chrono::Utc::now();
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a two-hop violation must NOT be flagged (one hop only), got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_activity_callee_is_not_flagged() {
+    // A workflow calling an #[activity] free function whose body reads the clock
+    // must NOT be flagged — activities may be non-deterministic by design.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = do_side_effect();
+    Ok(())
+}
+
+#[activity(start_to_close = \"30s\")]
+async fn do_side_effect() -> Result<i64, String> {
+    Ok(chrono::Utc::now().timestamp())
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an #[activity] callee must never be scanned via reachability, got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_method_call_helper_is_not_resolved() {
+    // `x.helper()` is a method call; even though a free `helper` with a violation
+    // exists, the method call must NOT resolve to it.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = thing.helper();
+    Ok(())
+}
+
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a method call must not resolve to a same-named free helper, got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_clean_helper_produces_no_finding() {
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = pure_helper(2);
+    Ok(())
+}
+
+fn pure_helper(x: i64) -> i64 {
+    x * 2
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.is_empty(),
+        "a violation-free helper must produce no finding, got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_cross_file_via_check_dir_is_flagged() {
+    // The workflow lives in file A and calls a first-party helper defined in
+    // file B; `check_dir` must build a cross-file index and flag it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "\
+#[workflow]
+async fn cross_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = shared_time();
+    Ok(())
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.rs"),
+        "\
+pub fn shared_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+
+    let report = autumn_harvest::det_check::check_dir(dir.path()).expect("check_dir");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a cross-file first-party helper violation must be flagged, got: {report:?}"
+    );
+}
+
+// ── Success metric: 14-workflow fixture (7 classes x {direct, one-hop}) ────
+
+/// Builds a single source containing, for each of 7 hard-blocker rule classes,
+/// a direct-in-body workflow, a transitive (helper-reachable) workflow, and the
+/// offending helper.
+fn fourteen_workflow_fixture() -> String {
+    use std::fmt::Write as _;
+    // (violation-expression, rule_id)
+    let classes = [
+        ("let _ = chrono::Utc::now();", "DET001"),
+        ("let _: u64 = rand::random();", "DET002"),
+        ("let _ = uuid::Uuid::new_v4();", "DET003"),
+        ("let _ = std::env::var(\"X\");", "DET004"),
+        (
+            "tokio::time::sleep(std::time::Duration::from_secs(1)).await;",
+            "DET006",
+        ),
+        ("tokio::spawn(async {});", "DET007"),
+        ("let _ = std::fs::read(\"/tmp/x\");", "DET008"),
+    ];
+    let mut src = String::new();
+    for (i, (violation, _)) in classes.iter().enumerate() {
+        // direct-in-body workflow
+        let _ = write!(
+            src,
+            "#[workflow]\nasync fn wf_direct_{i}(ctx: &WorkflowContext) -> Result<(), String> {{\n    {violation}\n    Ok(())\n}}\n\n"
+        );
+        // transitive workflow (calls the helper)
+        let _ = write!(
+            src,
+            "#[workflow]\nasync fn wf_via_{i}(ctx: &WorkflowContext) -> Result<(), String> {{\n    bad_helper_{i}();\n    Ok(())\n}}\n\n"
+        );
+        // offending helper
+        let _ = write!(src, "fn bad_helper_{i}() {{\n    {violation}\n}}\n\n");
+    }
+    src
+}
+
+#[test]
+fn fourteen_fixture_flags_all_direct_and_transitive() {
+    let src = fourteen_workflow_fixture();
+    let report = check_source(&src, "fixture.rs");
+    let expected = [
+        "DET001", "DET002", "DET003", "DET004", "DET006", "DET007", "DET008",
+    ];
+
+    for rule in expected {
+        let count = report.findings.iter().filter(|f| f.rule_id == rule).count();
+        assert_eq!(
+            count, 2,
+            "{rule} must be flagged exactly twice (direct + transitive), got {count}: {report:?}"
+        );
+    }
+
+    // Exactly 14 findings, no false positives on the fixture.
+    let total = report
+        .findings
+        .iter()
+        .filter(|f| expected.contains(&f.rule_id))
+        .count();
+    assert_eq!(total, 14, "expected 14 findings, got: {report:?}");
+    assert_eq!(
+        report.findings.len(),
+        14,
+        "fixture must produce zero false-positive findings beyond the 14 expected, got: {report:?}"
+    );
+
+    // The 7 helper-reachable (transitive) violations must be exactly the ones
+    // the macro lint + body scanner miss — 100% via_helper coverage.
+    let transitive = report
+        .findings
+        .iter()
+        .filter(|f| f.via_helper.is_some())
+        .count();
+    let direct = report
+        .findings
+        .iter()
+        .filter(|f| f.via_helper.is_none())
+        .count();
+    assert_eq!(
+        transitive, 7,
+        "all 7 transitive violations must be flagged, got: {report:?}"
+    );
+    assert_eq!(
+        direct, 7,
+        "all 7 direct violations must be flagged, got: {report:?}"
+    );
+}
+
+// ── Finding metadata: via_helper, column, serde (issue #778) ──────────────
+
+#[test]
+fn transitive_finding_names_helper_and_entry_point() {
+    let src = "\
+#[workflow]
+async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = bad_time_helper();
+    Ok(())
+}
+
+fn bad_time_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .expect("DET001 finding");
+    assert_eq!(
+        finding.workflow_name.as_deref(),
+        Some("entry_wf"),
+        "a transitive finding names the workflow entry point"
+    );
+    assert_eq!(
+        finding.via_helper.as_deref(),
+        Some("bad_time_helper"),
+        "a transitive finding names the offending helper"
+    );
+    // The location must be inside the helper, not the workflow body.
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(
+        loc.line, 8,
+        "location must be the offending line in the helper"
+    );
+}
+
+#[test]
+fn direct_finding_has_no_via_helper() {
+    let src = wf("let _t = std::time::SystemTime::now();");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap();
+    assert!(
+        finding.via_helper.is_none(),
+        "a direct-in-body finding must not carry via_helper"
+    );
+}
+
+#[test]
+fn finding_carries_column() {
+    // The pattern `SystemTime::now()` starts at a positive column.
+    let src = wf("let _t = std::time::SystemTime::now();");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap();
+    let loc = finding.location.as_ref().expect("location");
+    assert!(loc.col > 0, "column must be > 0, got: {}", loc.col);
+}
+
+#[test]
+fn report_serializes_to_json() {
+    let src = "\
+#[workflow]
+async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = bad_time_helper();
+    // harvest-suppress: DET003 \"seed comes from input\"
+    let _id = uuid::Uuid::new_v4();
+    Ok(())
+}
+
+fn bad_time_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let json =
+        autumn_harvest::serde_json::to_string(&report).expect("report must serialize to JSON");
+    let value: autumn_harvest::serde_json::Value =
+        autumn_harvest::serde_json::from_str(&json).expect("JSON must parse");
+
+    let findings = value["findings"].as_array().expect("findings array");
+    assert!(!findings.is_empty());
+    let det001 = findings
+        .iter()
+        .find(|f| f["rule_id"] == "DET001")
+        .expect("DET001 in JSON");
+    assert_eq!(det001["severity"], "error", "severity serializes lowercase");
+    assert!(det001["location"]["col"].as_u64().unwrap() > 0);
+    assert_eq!(det001["via_helper"], "bad_time_helper");
+
+    // A suppression is echoed into the machine-readable output.
+    let sups = value["suppressions"]
+        .as_array()
+        .expect("suppressions array");
+    assert!(sups.iter().any(|s| s["rule_id"] == "DET003"));
+}

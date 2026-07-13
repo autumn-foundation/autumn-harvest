@@ -500,6 +500,86 @@ assert_eq!(err, GuardrailSuppressionError::EmptyRuleId);
 
 ---
 
+## Running the check in CI
+
+The `det_check` engine ships behind a runnable front door: the **`harvest det-check`** CLI subcommand ([issue #778](https://github.com/madmax983/autumn-harvest/issues/778)). It statically flags non-deterministic API calls reachable from your `#[workflow]` bodies — including through **one hop** of first-party helper functions the body calls directly — so you catch replay foot-guns at PR/CI time instead of post-deploy when in-flight executions DLQ.
+
+```console
+# Scan the current directory (default). Directories are scanned recursively;
+# `target` and hidden directories (`.git`, …) are skipped.
+$ harvest det-check
+
+# Scan specific paths (files or directories).
+$ harvest det-check src examples
+
+# Machine-readable output for CI consumption.
+$ harvest det-check --format json src
+
+# Also fail on warnings (DET005/DET009 and command-free DET010).
+$ harvest det-check --deny-warnings src
+
+# Audit the escape-hatch inventory: list every active suppression.
+$ harvest det-check --list-suppressions src
+```
+
+### Flags and exit-code contract
+
+| Flag | Effect |
+|------|--------|
+| `[PATHS...]` | Source paths to scan. Default: `.` (current directory). |
+| `--format text\|json` | Output format. `text` (default) prints `file:line:col DETxxx  (safe alternative: …)`, one line per finding, with a transitive finding also naming `[in helper `H` reached from workflow `W`]`, followed by a `suppressed:` audit footer. `json` emits a full `DetCheckReport` (findings + suppressions). |
+| `--deny-warnings` | Also gate (exit `1`) when any warning-severity finding is present. |
+| `--list-suppressions` | Print every active `harvest-suppress` with its reason and location, then exit `0`. |
+
+Exit codes: **`0`** when there are no hard-blocker findings; **`1`** when any `Error`-severity finding is present. Warning-severity findings (DET005 process reads, DET009 bare tracing, and a command-free DET010 loop) never fail the build unless `--deny-warnings` is passed. The findings (or JSON) are always printed to stdout *before* the non-zero exit, so CI logs are self-explanatory.
+
+### Transitive coverage and its boundary
+
+A hard-blocker call located in a first-party function that a `#[workflow]` body reaches **via a direct free-function call** is flagged, naming both the offending site and the workflow entry point. The boundary deliberately mirrors the `#[workflow]` compile-time lint ([issue #386](https://github.com/madmax983/autumn-harvest/issues/386)) — the following are **out of scope** and are *not* detected:
+
+- **`#[activity]` bodies** — activities are allowed to be non-deterministic by design and are never scanned (directly or via reachability).
+- **Method calls** (`x.helper()`) and path-qualified calls (`m::helper()`) — only bare free-function calls (`helper()`) are resolved. This is the trait-dispatch / receiver boundary #386 also draws.
+- **Two or more hops** — reachability follows exactly one hop. A workflow → `helper_a` → `helper_b` (violation) chain is *not* flagged.
+- Third-party crates, trait-object dispatch, function pointers, and closures captured by reference.
+
+The catalog docs continue to own the "you must also avoid this transitively beyond one first-party hop" warning. The compile-time guardrail and `WorkflowReplayer` remain the authoritative backstops.
+
+### GitHub Actions
+
+```yaml
+name: determinism
+on: [pull_request]
+jobs:
+  det-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Runs the CLI over the source tree and fails the job on any hard blocker.
+      - name: harvest det-check
+        run: cargo run -q -p autumn-harvest-cli --bin harvest -- det-check src examples
+```
+
+The command exits non-zero on a hard blocker, so the step fails the job automatically — no extra shell plumbing needed. Add `--deny-warnings` to the run line to also fail on warnings.
+
+### Pre-commit hook
+
+Drop this into `.git/hooks/pre-commit` (make it executable with `chmod +x`):
+
+```sh
+#!/bin/sh
+# Block commits that introduce a workflow-determinism hard blocker.
+if ! cargo run -q -p autumn-harvest-cli --bin harvest -- det-check src examples; then
+    echo "det-check found determinism hard blockers — fix them or add a" >&2
+    echo "// harvest-suppress: DETxxx \"reason\" comment (see the guide)." >&2
+    exit 1
+fi
+```
+
+The shipped examples and fixtures pass the check: `harvest det-check autumn-harvest/src autumn-harvest/examples autumn-harvest-plugin/src autumn-harvest-cli/src` reports zero hard-blocker findings. (The deliberately non-deterministic trybuild fixtures under `autumn-harvest/tests/compile_fail/` are *true* positives — they exist to be rejected by the compile-time guardrail — so scan your `src`/`examples`, not the macro-crate test-fixture directories.)
+
+---
+
 ## Composing with the release playbook
 
 The determinism rule catalog is an early-stage guardrail, not the final proof of replay safety. The recommended release sequence:
