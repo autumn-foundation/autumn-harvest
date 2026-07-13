@@ -3414,25 +3414,56 @@ fn finalize_by_id<T: IntoResponse>(
 }
 
 /// Resolve `(workflow_name, workflow_id)` to the current run's `ExecutionId`
-/// (issue #805). Returns a clean `404` (never `500`) when no run exists.
+/// (issue #805). Returns a clean `404` (never `500`) when the key is genuinely
+/// unknown, and `503` (never a false `404`) when a shard cannot be queried.
 ///
-/// **Shard strategy — always fan out.** We deliberately query every shard via
-/// `iter_shards()` rather than trusting a single rendezvous-hash fast path:
+/// **Shard strategy — fan out across every *expected* shard.** We deliberately
+/// query every shard rather than trusting a single rendezvous-hash fast path:
 /// `ShardRouter::pick_for_new_workflow` can drift from where a run actually
 /// lives once the writable shard subset changes (see the KNOWN LIMITATION on
 /// `pick_for_idempotency_key`), so a fast-path-then-miss design could resolve a
-/// live run to `404`. Resolution is not a hot path, and on the single-shard
-/// default `iter_shards()` yields exactly one query — so fanning out is
-/// unconditionally correct at no cost there. Per-shard candidates are merged by
-/// the pure `select_resolved_run` (active-run-first, else most-recent terminal).
+/// live run to `404`. The shard set comes from
+/// [`shard_fanout::expected_shards`], which unions this process's live pools
+/// with the router's `readable_shards`/`default_shard` — so a shard the router
+/// knows about but for which this process has no pool yet (mid a shard-add
+/// rollout) is not silently skipped.
+///
+/// **Correctness over availability (multi-shard degraded mode).** An *expected*
+/// shard with no pool in this process, or one whose connection cannot be
+/// acquired, yields a `503` for the whole resolution rather than a silent skip:
+/// we cannot rule out that the run lives on the un-queried shard, so returning
+/// `404` would be a false negative. On the single-shard default this never
+/// triggers (the one shard always has a pool), and `expected_shards` yields
+/// exactly one shard so this reduces to one query at no cost. A future
+/// refinement could try the rendezvous-hash shard first and only fan out on a
+/// miss, but that is out of scope for this slice.
+///
+/// The fan-out is **sequential** — one connection held at a time — so it is
+/// safe against a pool sized down to a single connection. Per-shard candidates
+/// are merged by the pure `select_resolved_run` (active-run-first, else
+/// most-recent terminal).
 pub(crate) async fn resolve_workflow_by_business_id(
     api_state: &HarvestApiState,
     workflow_name: &str,
     workflow_id: &str,
 ) -> Result<ExecutionId, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let mut candidates = Vec::new();
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for shard_id in &expected {
+        let Some(shard_pool) = pools.get(shard_id) else {
+            // The router knows this shard but this process has no pool for it
+            // yet (mid a shard-add rollout). We cannot query it, so we cannot
+            // rule out that the run lives there — fail closed with 503 rather
+            // than risk a false 404.
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "shard {shard_id} has no configured storage pool; cannot resolve \
+                 (workflow_name={workflow_name}, workflow_id={workflow_id}) \
+                 without risking a false 404"
+            )));
+        };
+        // `acquire_conn` maps a pool/connection failure to 503, so a genuinely
+        // unreachable shard also fails closed rather than being silently skipped.
         let mut conn = acquire_conn(shard_pool).await?;
         if let Some(run) = autumn_harvest::execution::resolve_execution_id_by_workflow_id(
             &mut conn,
@@ -3453,6 +3484,47 @@ pub(crate) async fn resolve_workflow_by_business_id(
                  workflow_id={workflow_id})"
             )))
         })
+}
+
+/// Write a `STATUS_FAILED` audit row for a *mutating* by-id handler whose
+/// `(workflow_name, workflow_id)` resolution failed (issue #805, review FIX 4).
+///
+/// Mirrors the exec-id handlers' failed-attempt audit posture (e.g.
+/// `cancel_workflow`'s malformed-id and cancel-error paths, which both write a
+/// `STATUS_FAILED` row before returning): without this, a signal/cancel/pause/
+/// resume against an unresolvable business id left no audit trail, an
+/// asymmetry with the exec-id surface. Best-effort — a failed audit write never
+/// fails the request. The audit `target_id` is the unresolved business id
+/// (`"{workflow_name}/{workflow_id}"`) and `route_or_command` is the by-id
+/// route so the failed attempt's provenance is accurate.
+async fn audit_by_id_resolution_failure(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    operation: &str,
+    route: &str,
+    workflow_name: &str,
+    workflow_id: &str,
+) {
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let target_id = format!("{workflow_name}/{workflow_id}");
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(target_id.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some("business-id resolution failed"),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 }
 
 /// `GET /workflows/by-id/{workflow_name}/{workflow_id}` — describe by business id.
@@ -3560,7 +3632,18 @@ async fn signal_workflow_by_id(
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
-            Err(error) => return error.into_response(),
+            Err(error) => {
+                audit_by_id_resolution_failure(
+                    &api_state,
+                    &headers,
+                    OP_WORKFLOW_SIGNAL,
+                    "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+                    &workflow_name,
+                    &workflow_id,
+                )
+                .await;
+                return error.into_response();
+            }
         };
     let result = signal_workflow(
         Extension(api_state),
@@ -3674,7 +3757,18 @@ async fn cancel_workflow_by_id(
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
-            Err(error) => return error.into_response(),
+            Err(error) => {
+                audit_by_id_resolution_failure(
+                    &api_state,
+                    &headers,
+                    OP_WORKFLOW_CANCEL,
+                    "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+                    &workflow_name,
+                    &workflow_id,
+                )
+                .await;
+                return error.into_response();
+            }
         };
     let out = cancel_workflow(
         Extension(api_state),
@@ -3697,7 +3791,18 @@ async fn pause_workflow_by_id(
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
-            Err(error) => return error.into_response(),
+            Err(error) => {
+                audit_by_id_resolution_failure(
+                    &api_state,
+                    &headers,
+                    OP_WORKFLOW_PAUSE,
+                    "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+                    &workflow_name,
+                    &workflow_id,
+                )
+                .await;
+                return error.into_response();
+            }
         };
     let out = pause_workflow(
         Extension(api_state),
@@ -3719,7 +3824,18 @@ async fn resume_workflow_by_id(
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
-            Err(error) => return error.into_response(),
+            Err(error) => {
+                audit_by_id_resolution_failure(
+                    &api_state,
+                    &headers,
+                    OP_WORKFLOW_RESUME,
+                    "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+                    &workflow_name,
+                    &workflow_id,
+                )
+                .await;
+                return error.into_response();
+            }
         };
     let out = resume_workflow(Extension(api_state), Path(exec_id.to_string()), headers).await;
     finalize_by_id(out, exec_id)

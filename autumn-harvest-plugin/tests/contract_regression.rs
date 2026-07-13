@@ -110,61 +110,67 @@ fn business_id_routes_are_classified() {
         ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
     };
 
-    // (route, class, excluded?) — mirrors each exec-id counterpart exactly.
+    // (by-id route, class, exec-id counterpart) — each by-id route mirrors its
+    // exec-id counterpart's class AND its EXCLUDED_ROUTES membership. The
+    // `excluded?` expectation is DERIVED from the exec-id counterpart's actual
+    // EXCLUDED_ROUTES membership (not hardcoded per route) so the mirror is
+    // correct-by-construction: e.g. `.../result`'s counterpart
+    // (`GET /workflows/{id}/result`) is ReadOnly but NOT excluded, so the by-id
+    // variant must not be excluded either.
     let expected = [
         (
             "GET /workflows/by-id/{workflow_name}/{workflow_id}",
             RouteClass::ReadOnly,
-            true,
+            "GET /workflows/{id}",
         ),
         (
             "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
             RouteClass::ReadOnly,
-            true,
+            "GET /workflows/{id}/result",
         ),
         (
             "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
             RouteClass::ReadOnly,
-            true,
+            "GET /workflows/{id}/stack",
         ),
         (
             "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
             RouteClass::ReadOnly,
-            true,
+            "GET /workflows/{id}/children",
         ),
         (
             "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
             RouteClass::ReadOnly,
-            true,
+            "GET /workflows/{id}/query/{query_name}",
         ),
         (
             "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
             RouteClass::ReadOnly,
-            true,
+            "POST /workflows/{id}/query/{query_name}",
         ),
         (
             "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
             RouteClass::Mutating,
-            false,
+            "POST /workflows/{id}/signal/{signal_name}",
         ),
         (
             "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
             RouteClass::Mutating,
-            false,
+            "POST /workflows/{id}/cancel",
         ),
         (
             "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
             RouteClass::Mutating,
-            false,
+            "POST /workflows/{id}/pause",
         ),
         (
             "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
             RouteClass::Mutating,
-            false,
+            "POST /workflows/{id}/resume",
         ),
     ];
 
-    for (route, class, excluded) in expected {
+    for (route, class, exec_id_counterpart) in expected {
         assert!(
             management_api_routes()
                 .iter()
@@ -181,10 +187,15 @@ fn business_id_routes_are_classified() {
             ALL_MUTATION_ROUTES.iter().any(|(r, _)| *r == route),
             "{route} must appear in ALL_MUTATION_ROUTES"
         );
+        // The by-id route's EXCLUDED membership must exactly mirror its exec-id
+        // counterpart's — derived, so it can never silently diverge.
+        let counterpart_excluded = EXCLUDED_ROUTES.contains(&exec_id_counterpart);
         assert_eq!(
             EXCLUDED_ROUTES.contains(&route),
-            excluded,
-            "{route} EXCLUDED_ROUTES membership must mirror its exec-id counterpart"
+            counterpart_excluded,
+            "{route} EXCLUDED_ROUTES membership ({}) must mirror its exec-id \
+             counterpart {exec_id_counterpart} ({counterpart_excluded})",
+            EXCLUDED_ROUTES.contains(&route)
         );
     }
 }

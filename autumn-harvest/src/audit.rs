@@ -642,9 +642,13 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /admin/build-routing/retire",
     // Admission gate list is read-only.
     "GET /admin/gates",
-    // Business-id ("latest run") read-only variants (issue #805).
+    // Business-id ("latest run") read-only variants (issue #805). Each mirrors
+    // its exec-id counterpart's EXCLUDED_ROUTES membership exactly. Note the
+    // `.../result` variant is deliberately absent — its exec-id counterpart
+    // (`GET /workflows/{id}/result`) is classified ReadOnly and appears in
+    // ALL_MUTATION_ROUTES with `None` (both mean "not audited") but is NOT in
+    // EXCLUDED_ROUTES, so the by-id variant must not be either.
     "GET /workflows/by-id/{workflow_name}/{workflow_id}",
-    "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",

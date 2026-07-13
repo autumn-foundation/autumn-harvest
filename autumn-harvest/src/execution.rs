@@ -1286,12 +1286,44 @@ mod resolve_by_workflow_id_tests {
 
     #[test]
     fn resolve_terminal_states_matches_is_terminal_state() {
-        // Guard against drift between the SQL filter literal list and the pure
-        // classification used by select_resolved_run.
+        // The SQL filter list and the pure classification used by
+        // select_resolved_run both derive from crate::erase::TERMINAL_STATES, so
+        // they are equal *by construction* (RESOLVE_TERMINAL_STATES is an alias
+        // for that constant). This test asserts that identity plus exact set
+        // equality against is_terminal_state in both directions, so any future
+        // refactor that reintroduces a second literal list is caught.
+        assert!(
+            std::ptr::eq(
+                super::RESOLVE_TERMINAL_STATES,
+                crate::erase::TERMINAL_STATES
+            ),
+            "RESOLVE_TERMINAL_STATES must alias crate::erase::TERMINAL_STATES \
+             (single source of truth)"
+        );
+        // Every state in the list is terminal.
         for state in super::RESOLVE_TERMINAL_STATES {
             assert!(
                 crate::erase::is_terminal_state(state),
                 "{state} in RESOLVE_TERMINAL_STATES must be terminal"
+            );
+        }
+        // Every terminal state (per is_terminal_state) is in the list — the
+        // reverse direction, so the two sets are exactly equal.
+        for state in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ] {
+            assert!(
+                crate::erase::is_terminal_state(state),
+                "{state} must be terminal per is_terminal_state"
+            );
+            assert!(
+                super::RESOLVE_TERMINAL_STATES.contains(&state),
+                "{state} must be in RESOLVE_TERMINAL_STATES"
             );
         }
         for active in ["RUNNING", "PAUSED"] {
@@ -3027,18 +3059,14 @@ pub struct ResolvedRun {
 /// The terminal states used by the SQL ranking filter in
 /// [`resolve_execution_id_by_workflow_id`].
 ///
-/// Kept in sync with [`crate::erase::is_terminal_state`] by the
-/// `resolve_terminal_states_matches_is_terminal_state` unit test so the SQL
-/// path and the pure [`select_resolved_run`] ranking can never disagree about
-/// which states are terminal.
-const RESOLVE_TERMINAL_STATES: [&str; 6] = [
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMED_OUT",
-    "CONTINUED_AS_NEW",
-    "TERMINATED",
-];
+/// This is an alias for [`crate::erase::TERMINAL_STATES`], the single source of
+/// truth for terminal-state classification. Because the SQL filter and the pure
+/// [`select_resolved_run`] ranking (which delegates to
+/// [`crate::erase::is_terminal_state`], itself a `TERMINAL_STATES.contains`)
+/// both derive from the same constant, the two can never disagree about which
+/// states are terminal — the drift is eliminated by construction rather than
+/// merely guarded by a test.
+const RESOLVE_TERMINAL_STATES: &[&str] = crate::erase::TERMINAL_STATES;
 
 /// Pick the single best "latest run" from per-shard candidates (issue #805).
 ///
