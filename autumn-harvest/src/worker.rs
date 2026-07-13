@@ -10011,6 +10011,10 @@ async fn process_workflow_task(
             // redrive push it forward — so `ctx.deadline()` must read it directly
             // rather than recompute from the (now stale) start + timeout.
             deadline_at: prepared.execution.deadline_at,
+            // Issue #698: thread the spawning parent's execution id from the
+            // execution row so a child workflow can read it via `ctx.info()` /
+            // `ctx.parent_execution_id()`. `None` for a top-level run.
+            parent_execution_id: prepared.execution.parent_id.map(ExecutionId::from_uuid),
         };
 
         // Filter declarative handlers to those that target this workflow type.

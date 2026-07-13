@@ -190,6 +190,11 @@ pub struct WorkflowExecuteSpanMeta {
     /// which pause/resume (#383) and redrive push forward past
     /// `started_at + execution_timeout`. `None` = fall back to start + timeout.
     pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The execution id of the parent workflow that spawned this run, or `None`
+    /// for a top-level run (issue #698). The worker populates it from the
+    /// execution row's `parent_id` column so a child workflow can identify its
+    /// spawner via `ctx.info()` / `ctx.parent_execution_id()`.
+    pub parent_execution_id: Option<ExecutionId>,
 }
 
 /// Classification of a bounded, read-only query-replay drive (issue #612).
@@ -1002,6 +1007,9 @@ pub async fn run_workflow_with_state_advancing_clock(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #698: thread the spawning parent's execution id so a child workflow
+    // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
+    .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
     .with_metrics(metrics);
     drive_workflow(ctx, handler, input, span_meta).await
 }
@@ -1080,6 +1088,9 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #698: thread the spawning parent's execution id so a child workflow
+    // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
+    .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
     .with_payload_caps(
         max_activity_input_bytes,
         0,
@@ -1923,6 +1934,7 @@ mod tests {
             build_id: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
         }
     }
 

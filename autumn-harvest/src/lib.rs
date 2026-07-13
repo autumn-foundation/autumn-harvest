@@ -284,7 +284,8 @@ pub use context::{
     ActivityContext, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
     DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder,
     RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand,
-    WorkflowContext, WorkflowHistoryPolicy, is_reserved_session_activity_name,
+    WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
+    is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{

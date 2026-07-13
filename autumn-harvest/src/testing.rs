@@ -2609,6 +2609,10 @@ pub struct WorkflowTestEnv {
     /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
     /// `None` (the default) matches a workflow with no execution timeout.
     execution_timeout: Option<chrono::Duration>,
+    /// Spawning parent's execution id threaded into the `WorkflowContext`
+    /// (issue #698) so a no-DB test can prove `ctx.info().parent_execution_id` /
+    /// `ctx.parent_execution_id()`. `None` (the default) models a top-level run.
+    parent_execution_id: Option<ExecutionId>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -2639,6 +2643,7 @@ impl WorkflowTestEnv {
             workflow_name: String::new(),
             queue_name: String::new(),
             execution_timeout: None,
+            parent_execution_id: None,
         }
     }
 
@@ -2846,6 +2851,16 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the spawning parent's execution id for the contexts this env builds
+    /// (issue #698), so a no-DB test can prove `ctx.info().parent_execution_id`
+    /// / `ctx.parent_execution_id()` report the configured parent. `None` (the
+    /// default) models a top-level run with no parent.
+    #[must_use]
+    pub const fn with_parent_execution_id(mut self, parent: Option<ExecutionId>) -> Self {
+        self.parent_execution_id = parent;
+        self
+    }
+
     /// Set the effective `execution_timeout` budget for the contexts this env
     /// builds (issue #772), so `ctx.deadline()` /
     /// `ctx.should_continue_as_new()` can reason about deadline-aware
@@ -2930,6 +2945,7 @@ impl WorkflowTestEnv {
         let span_meta = if self.workflow_name.is_empty()
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
+            && self.parent_execution_id.is_none()
         {
             None
         } else {
@@ -2948,6 +2964,9 @@ impl WorkflowTestEnv {
                 // back to `start + execution_timeout` (no resume/redrive shift
                 // to model here).
                 deadline_at: None,
+                // Issue #698: thread the configured parent so `ctx.info()` /
+                // `ctx.parent_execution_id()` report it inside the test run.
+                parent_execution_id: self.parent_execution_id,
             })
         };
 
