@@ -177,20 +177,65 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     "autumn-harvest-plugin/tests/outbox_integration.rs",
 ];
 
-/// True when a source line reintroduces a hand-rolled migration bundle: a single
-/// `include_str!("…/migrations/…/up.sql")` reference. Each bundle is one such
-/// include per line inside a `concat!`, so a per-line all-three-tokens test is
-/// robust to path shape (`../migrations/…`, `../../autumn-harvest/migrations/…`,
+/// True when a single source line reintroduces a hand-rolled migration bundle: a
+/// one-line `include_str!("…/migrations/…/up.sql")` reference. The all-three-tokens
+/// test is robust to path shape (`../migrations/…`, `../../autumn-harvest/migrations/…`,
 /// etc.) while never matching the paved-path helper's own non-migration includes
 /// (e.g. `include_str!("…/ci.yml")`, which lacks both `migrations` and `up.sql`).
 ///
-/// Accepted limitation (intentional): the check is per-line, so a bundle written
-/// with EVERY include's path split onto the line after `include_str!(` (as
-/// rustfmt does for very long paths) could evade it. Any single-line include and
-/// any copy-paste reintroduction is still caught, so this residual gap is a
-/// deliberate, low-likelihood trade-off rather than a full-parse detector.
+/// The offender scan itself uses the whole-file
+/// [`detects_handrolled_migration_include`], which also catches the rustfmt-wrapped
+/// form where `include_str!(` and its path string land on different lines; this
+/// single-line predicate is retained for its focused unit test.
 fn line_is_handrolled_migration_include(line: &str) -> bool {
     line.contains("include_str!") && line.contains("migrations") && line.contains("up.sql")
+}
+
+/// True when `contents` (a whole `.rs` file) reintroduces a hand-rolled migration
+/// bundle. Robust to rustfmt wrapping the `include_str!` argument onto the next
+/// line — the exact gap the per-line scan missed:
+///
+/// ```text
+/// concat!(
+///     include_str!(
+///         "../../migrations/20260101000000_foo/up.sql",
+///     ),
+/// )
+/// ```
+///
+/// Here `include_str!(` and the `"…/migrations/…/up.sql"` literal are on different
+/// lines, so no single line carries all three tokens. This detector collapses all
+/// whitespace and then structurally checks each `include_str!` occurrence: it must
+/// be followed (across any newlines/indent) by `(` and a string literal whose value
+/// contains `migrations` and ends in `up.sql`. It catches both the one-line and the
+/// rustfmt-wrapped shapes, and is STRICTLY MORE PRECISE than a per-line substring
+/// test — the tokens must belong to one real `include_str!` argument — so
+/// prose/doc comments merely mentioning `migrations/.../up.sql`, or a
+/// `full_migrations_sql()` reference, are never flagged.
+fn detects_handrolled_migration_include(contents: &str) -> bool {
+    // Collapse every run of whitespace (incl. newlines/indent) to a single space
+    // so a wrapped `include_str!(\n  "..."\n)` becomes `include_str!( "..." )`, and
+    // a one-line `include_str!("...")` is handled by the same scan. Paths carry no
+    // internal whitespace, so their content is unaffected.
+    let normalized = contents.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (idx, _) in normalized.match_indices("include_str!") {
+        let rest = normalized[idx + "include_str!".len()..].trim_start();
+        let Some(after_paren) = rest.strip_prefix('(') else {
+            continue;
+        };
+        let Some(after_quote) = after_paren.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        // A path literal has no embedded quotes, so it ends at the next `"`.
+        let Some(end) = after_quote.find('"') else {
+            continue;
+        };
+        let literal = &after_quote[..end];
+        if literal.contains("migrations") && literal.ends_with("up.sql") {
+            return true;
+        }
+    }
+    false
 }
 
 /// The workspace root — the parent of this crate's `CARGO_MANIFEST_DIR` — that
@@ -270,6 +315,38 @@ fn line_detector_flags_a_handrolled_include_and_ignores_others() {
     ));
 }
 
+#[test]
+fn whole_file_detector_flags_a_rustfmt_wrapped_include() {
+    // rustfmt wraps a long `include_str!` argument onto the next line, so
+    // `include_str!(` and the "…/migrations/…/up.sql" string literal land on
+    // DIFFERENT lines. The per-line scan alone MISSES this (asserted below); the
+    // whole-file detector the offender scan uses must catch it.
+    let wrapped = "concat!(\n    include_str!(\n        \"../../migrations/20260101000000_foo/up.sql\",\n    ),\n)";
+    // Guard-of-the-guard: the per-line scan genuinely cannot see it — proving the
+    // whole-file detector is doing real work, not shadowing the fast path.
+    assert!(
+        !wrapped.lines().any(line_is_handrolled_migration_include),
+        "sanity: the wrapped form must be invisible to the per-line scan"
+    );
+    assert!(
+        detects_handrolled_migration_include(wrapped),
+        "the whole-file detector must flag a rustfmt-wrapped include_str! bundle"
+    );
+
+    // A single-line include is still caught (the fast path).
+    assert!(detects_handrolled_migration_include(
+        r#"    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),"#
+    ));
+    // No false positives: a non-migration wrapped include, and prose/doc comments
+    // merely mentioning the path, must NOT be flagged.
+    assert!(!detects_handrolled_migration_include(
+        "const CI: &str = include_str!(\n    \"../../../.github/workflows/ci.yml\"\n);"
+    ));
+    assert!(!detects_handrolled_migration_include(
+        "// this fixture used to include_str! a migrations/foo/up.sql bundle; now paved.\nlet sql = autumn_harvest::full_migrations_sql();"
+    ));
+}
+
 /// The self-enforcing guard: no file under `autumn-harvest/tests/**` or
 /// `autumn-harvest-plugin/tests/**` may reintroduce a hand-rolled migration
 /// bundle outside `ALLOWED_HANDROLLED_MIGRATION_INCLUDES`, and every allowlisted
@@ -301,7 +378,7 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
         }
         let src = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        if !src.lines().any(line_is_handrolled_migration_include) {
+        if !detects_handrolled_migration_include(&src) {
             continue;
         }
         let key = path
