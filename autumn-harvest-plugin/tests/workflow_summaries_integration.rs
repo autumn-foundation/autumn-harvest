@@ -9,7 +9,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (run this file `--test-threads=1`, since the tests scrub
 //! shared tables); otherwise a fresh testcontainers Postgres is booted with
-//! `INIT_SQL` (requires Docker).
+//! the full migration set (requires Docker).
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
@@ -41,24 +41,16 @@ use tower::ServiceExt;
 
 type HarvestApiApp = axum::Router;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260709000001_harvest_legal_hold/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260710000001_harvest_execution_summaries/up.sql"
-    ),
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
     }
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await

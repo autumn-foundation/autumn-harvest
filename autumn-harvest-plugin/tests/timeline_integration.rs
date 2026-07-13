@@ -43,6 +43,13 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+// DELIBERATE PARTIAL-SCHEMA FIXTURE — do NOT convert to `full_migrations_sql()`.
+// `timeline_classic_dag_run_returns_404` inserts a classic DAG run row directly
+// into `harvest_dag_runs`, but migration 20260514000000_drop_harvest_dag_runs
+// (included in the full bundle) drops that table. This hand-rolled subset
+// intentionally applies the initial migration (which creates harvest_dag_runs)
+// WITHOUT the later drop, so the table remains available for the classic-DAG
+// timeline 404 assertion.
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",

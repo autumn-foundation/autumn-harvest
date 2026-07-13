@@ -14,7 +14,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (single-threaded; each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with `INIT_SQL`.
+//! fresh testcontainers Postgres is booted with the full migration bundle.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,23 +33,9 @@ use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 /// Capturing metrics recorder — records `(workflow, count)` from
 /// `record_retention_deleted` (issue #737 AC8). All other methods no-op.
@@ -78,7 +64,7 @@ async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
         return (url, None);
     }
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
