@@ -5969,6 +5969,8 @@ pub const fn management_api_response_fields()
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
                 "last_catchup_at",
+                "overdue",
+                "overdue_by_secs",
             ]),
         ),
         (
@@ -5993,6 +5995,8 @@ pub const fn management_api_response_fields()
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
                 "last_catchup_at",
+                "overdue",
+                "overdue_by_secs",
             ]),
         ),
         (
@@ -6017,6 +6021,8 @@ pub const fn management_api_response_fields()
                 "catchup_window_secs",
                 "catchup_dropped_last_recovery",
                 "last_catchup_at",
+                "overdue",
+                "overdue_by_secs",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["ok"])),

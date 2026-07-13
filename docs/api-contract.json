@@ -4555,7 +4555,9 @@
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
-          "last_catchup_at"
+          "last_catchup_at",
+          "overdue",
+          "overdue_by_secs"
         ]
       },
       "error_responses": [
@@ -4695,7 +4697,9 @@
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
-          "last_catchup_at"
+          "last_catchup_at",
+          "overdue",
+          "overdue_by_secs"
         ]
       },
       "error_responses": [
