@@ -11,13 +11,14 @@ use std::future::Future;
 use std::pin::Pin;
 
 use autumn_harvest::context::{SessionOptions, WorkflowContext};
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure, decode_workflow_failure};
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId};
 use chrono::Utc;
 use serde_json::Value;
 
@@ -4883,6 +4884,595 @@ async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeede
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "timeout branch with an ignored late signal must replay:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// execute_child_workflow_timeout — child-or-deadline race (issue #779)
+// ---------------------------------------------------------------------------
+
+/// Awaits a child workflow with a deadline, then branches on the outcome. A
+/// child failure before the deadline propagates as an Err (mapped to a String).
+fn child_or_deadline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+fn child_timeout_started() -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+/// Child completed before the deadline fired.
+fn child_win_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"ok": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"child": {"ok": true}}),
+        },
+    ]
+}
+
+/// Deadline timer fired first; the loser child was then cancelled (a synthetic
+/// `ChildWorkflowFailed` terminal recorded after the fire).
+fn timer_win_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 300,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+        WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: "lost race to a sibling branch".to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"timed_out": true}),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn child_timeout_child_win_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(child_win_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "child-win branch must replay:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn child_timeout_timer_win_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(timer_win_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "timer-win branch (with the sealed loser child terminal) must replay:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn child_timeout_both_branches_replay_succeeded_across_randomized_orderings() {
+    // Issue #779 success metric (parallel to #476): a fixture exercising both
+    // branches replays with ReplaySucceeded 100% of the time across 1,000
+    // randomized orderings. Winner is decided strictly by recorded history
+    // index, never wall-clock — so a deterministic pick per iteration must
+    // always replay clean.
+    let mut seed: u64 = 0x5DEE_CE66;
+    for i in 0..1_000 {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let events = if seed & 1 == 0 {
+            child_win_fixture()
+        } else {
+            timer_win_fixture()
+        };
+
+        let report = WorkflowReplayer::new()
+            .register_fn("child_or_deadline", child_or_deadline_workflow)
+            .replay_from_events(events)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "iteration {i} must replay:\n{report}"
+        );
+    }
+}
+
+/// A child that FAILED before the deadline replays deterministically to the
+/// Err branch: the workflow maps the typed failure to a String and returns it
+/// via `?`, so — like every self-failing workflow — it surfaces as
+/// `ReplayStatus::WorkflowFailed` (it did not complete successfully), mirroring
+/// `replay_typed_workflow_failed_round_trips_with_identical_typed_fields`. The
+/// *determinism* is the point: the same failure is reproduced on every cycle.
+#[tokio::test]
+async fn child_timeout_child_fails_before_deadline_replays_deterministically() {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: "child-workflow:process_order: downstream 503".to_string(),
+            error_type: Some("UpstreamUnavailable".to_string()),
+            details: None,
+            non_retryable: Some(true),
+        },
+        WorkflowEvent::WorkflowFailed {
+            error: "child-workflow:process_order: downstream 503".to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
+
+    let mut reproduced = Vec::new();
+    for _ in 0..2 {
+        let report = WorkflowReplayer::new()
+            .register_fn("child_or_deadline", child_or_deadline_workflow)
+            .replay_from_events(events.clone())
+            .await;
+        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
+            panic!("a child failure before the deadline surfaces as WorkflowFailed:\n{report}");
+        };
+        reproduced.push(error);
+    }
+    assert_eq!(
+        reproduced[0], reproduced[1],
+        "the child failure must reproduce byte-identically across replay cycles"
+    );
+}
+
+/// A still-running child-timeout workflow: the child started and the deadline
+/// timer is armed, but neither has resolved yet. This is the exact shape of a
+/// live execution parked on `spawn_child_workflow_timeout` — the history ends
+/// at the recorded frontier with the race `InProgress`.
+fn child_in_flight_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+    ]
+}
+
+/// Codex P2 (issue #779): a healthy in-flight child-timeout workflow sampled by
+/// the deploy replay canary reaches the recorded-history frontier with the race
+/// still `InProgress` and then *suspends* — it must report `ReplaySucceeded`,
+/// not a false non-determinism. Mirrors `check_strict_replay_no_match`'s
+/// canary-at-frontier exception, which the `InProgress` arm previously ignored.
+#[tokio::test]
+async fn child_timeout_in_flight_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot(
+            "child_or_deadline",
+            exec_id,
+            child_in_flight_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight child-timeout race at the history frontier must be a \
+         healthy suspend in canary mode, not a false non-determinism:\n{report}"
+    );
+}
+
+/// Codex P2 round 10 (issue #779): an in-flight child-timeout workflow that was
+/// woken by an update (`UpdateAdmitted`/`UpdateCompleted` appended AFTER the
+/// armed race, at the recorded-history frontier). Update events are transparent
+/// to the global unconsumed-history check (`has_non_lifecycle_unconsumed`), but
+/// `match_child_or_timer`'s `InProgress` scan skips them via `scan_cursor += 1`
+/// WITHOUT consuming them, so the matcher cursor is left positioned BEFORE the
+/// trailing updates. A raw `position() >= len()` frontier check therefore reads
+/// `false` (cursor < len), defeating the canary-at-frontier suppression and
+/// producing a FALSE non-determinism for a perfectly healthy suspend. The
+/// frontier check must treat trailing transparent update events the same way the
+/// global unconsumed check does.
+fn child_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    let update_id = UpdateId::new();
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        // Woken by an update while the race is still pending — transparent to
+        // replay, but they sit at the frontier AFTER the armed race.
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: "poke".to_string(),
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: Value::Null,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn child_timeout_in_flight_woken_by_update_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot(
+            "child_or_deadline",
+            exec_id,
+            child_in_flight_woken_by_update_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight child-timeout race whose only trailing history is \
+         transparent update events must still be a healthy suspend in canary \
+         mode, not a false non-determinism:\n{report}"
+    );
+}
+
+/// Regression guard for the fix above: the canary exception must NOT weaken
+/// STRICT (non-canary) replay. `WorkflowReplayer::replay_from_events` runs
+/// strict replay, where an unresolved race at the end of a fixture is still a
+/// fixture problem and must report non-determinism.
+#[tokio::test]
+async fn child_timeout_in_flight_strict_still_reports_nondeterminism() {
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_from_events(child_in_flight_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "strict (non-canary) replay of an unresolved race must still be a \
+         non-determinism error — the canary exception must not weaken it:\n{report}"
+    );
+}
+
+/// Mandatory guardrail: the canary-at-frontier exception must ONLY cover a
+/// genuinely-suspending in-flight race. A real code-vs-history divergence (here
+/// the handler passes a different child input than history recorded) resolves
+/// as `Diverged`, never `InProgress`, so it must STILL be reported as
+/// non-determinism even in canary mode.
+#[tokio::test]
+async fn child_timeout_genuine_divergence_still_detected_in_canary() {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    // Recorded child input `{"id": 7}` diverges from the handler's `{"id": 42}`.
+    let divergent = vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 7}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+    ];
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot("child_or_deadline", exec_id, divergent))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a genuine mid-history divergence must still be detected in canary mode \
+         — the frontier exception must not mask it:\n{report}"
+    );
+}
+
+/// A child-timeout whose serialized input exceeds the workflow-input cap on a
+/// FRESH dispatch, PROPAGATING the resulting `PayloadTooLarge` via `?`. The
+/// live over-cap run records no child/timer events — the child was never
+/// dispatched — so the terminal history is just `WorkflowFailed`.
+fn child_timeout_oversized_propagate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // >2 MiB (DEFAULT_MAX_WORKFLOW_INPUT_BYTES) — exceeds the replay cap.
+        let oversized = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+/// Same fresh over-cap child-timeout, but CATCHES the `PayloadTooLarge` and
+/// degrades gracefully, then completes. The live run records no child/timer
+/// events, so the terminal history is `WorkflowCompleted` — on replay the
+/// cursor sits on that event, NOT a recorded child start.
+fn child_timeout_oversized_catch_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let oversized = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        let outcome = match ctx
+            .spawn_child_workflow_timeout(
+                "process_order",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+        {
+            Ok(o) => o,
+            // Degrade gracefully on an oversized sub-orchestration input; any
+            // OTHER error (e.g. a genuine non-determinism) still propagates, so
+            // a spurious `Diverged` from mis-ordering the cap check would NOT be
+            // swallowed and this workflow would fail instead of completing.
+            Err(HarvestError::PayloadTooLarge { .. }) => {
+                return Ok(serde_json::json!({"skipped_oversized": true}));
+            }
+            Err(other) => return Err(other.to_string()),
+        };
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+/// Codex P2 (issue #779): a fresh child-timeout over-cap input records NO
+/// child/timer events, so on replay the cursor sits on the next real event
+/// (here a caught-and-continued `WorkflowCompleted`). The payload-cap pre-check
+/// must run BEFORE `match_child_or_timer`, so replay reproduces the same
+/// `PayloadTooLarge` (which the workflow catches and continues) instead of
+/// diverging against the non-child event at the cursor. Before the fix this
+/// history replayed as a non-determinism / `WorkflowFailed`.
+#[tokio::test]
+async fn child_timeout_oversized_input_caught_replays_succeeded() {
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"skipped_oversized": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_timeout_oversized_catch_workflow)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a caught cap-failure child-timeout history must replay cleanly — the \
+         cap pre-check must reproduce PayloadTooLarge before the matcher \
+         diverges on the WorkflowCompleted at the cursor:\n{report}"
+    );
+}
+
+/// Companion to the catch case: a fresh over-cap child-timeout that PROPAGATES
+/// the `PayloadTooLarge` records only a terminal `WorkflowFailed`. On replay the
+/// cursor sits on that `WorkflowFailed`; the cap pre-check must reproduce the
+/// same `PayloadTooLarge` deterministically rather than a spurious
+/// non-determinism. Mirrors
+/// `child_timeout_child_fails_before_deadline_replays_deterministically`.
+#[tokio::test]
+async fn child_timeout_oversized_input_propagated_replays_deterministically() {
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::WorkflowFailed {
+            error: "child workflow input payload too large".to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
+
+    let mut reproduced = Vec::new();
+    for _ in 0..2 {
+        let report = WorkflowReplayer::new()
+            .register_fn(
+                "child_or_deadline",
+                child_timeout_oversized_propagate_workflow,
+            )
+            .replay_from_events(events.clone())
+            .await;
+        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
+            panic!(
+                "a propagated cap failure must surface as WorkflowFailed, not a \
+                 spurious non-determinism:\n{report}"
+            );
+        };
+        assert!(
+            error.contains("too large") || error.to_lowercase().contains("payload"),
+            "the reproduced error must be the PayloadTooLarge, not a \
+             non-determinism message: {error}"
+        );
+        assert!(
+            !error.to_lowercase().contains("non-deterministic")
+                && !error.contains("mismatch")
+                && !error.contains("ChildWorkflowStarted"),
+            "the cap failure must NOT be masked by a history-matcher divergence: \
+             {error}"
+        );
+        reproduced.push(error);
+    }
+    assert_eq!(
+        reproduced[0], reproduced[1],
+        "the cap failure must reproduce byte-identically across replay cycles"
+    );
+}
+
+/// #779 (Codex round-12 P2): a workflow that CATCHES an oversized child-timeout
+/// `PayloadTooLarge` (records NOTHING) and then IMMEDIATELY dispatches a SECOND
+/// child-timeout (recorded). The first (caught, seq 1) call's fresh-dispatch peek
+/// must be fingerprinted by its OWN timer id (`__child_timeout:1:oversized_child`)
+/// so it is never miscredited the SECOND (seq 2) call's `ChildWorkflowStarted` at
+/// the cursor.
+///
+/// RED (pre-fix, unfingerprinted `peek_child_start_at_cursor`): the first call's
+/// peek matched the second call's `ChildWorkflowStarted`, concluded it was already
+/// dispatched, skipped its own cap re-check, then diverged in
+/// `match_child_or_timer` (recorded `second_child` != requested `oversized_child`)
+/// — a spurious non-determinism instead of reproducing `PayloadTooLarge`, so the
+/// workflow failed. GREEN (timer-id fingerprint): the caught call reproduces
+/// `PayloadTooLarge`, the second call resolves child-win, the run completes.
+fn child_timeout_caught_then_second_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Call 1 (seq 1): oversized input → PayloadTooLarge, CAUGHT, records
+        // nothing.
+        let oversized = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        match ctx
+            .spawn_child_workflow_timeout(
+                "oversized_child",
+                oversized,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+        {
+            Ok(_) => {
+                return Err("expected PayloadTooLarge on the oversized child".to_string());
+            }
+            Err(HarvestError::PayloadTooLarge { .. }) => { /* degrade gracefully */ }
+            // Any OTHER error (e.g. a spurious Diverged from the peek miscrediting
+            // the second call's child start) propagates and fails the run — so the
+            // RED state is NOT ReplaySucceeded.
+            Err(other) => return Err(other.to_string()),
+        }
+        // Call 2 (seq 2): small input, recorded, child wins before the deadline.
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                "second_child",
+                serde_json::json!({"id": 7}),
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"second": output}),
+        ))
+    })
+}
+
+#[tokio::test]
+async fn child_timeout_caught_oversized_then_second_child_replays_succeeded() {
+    // The caught first call (seq 1) burns its sequence number, so the recorded
+    // SECOND call is seq 2 — its deadline timer id is `__child_timeout:2:...`.
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:2:second_child");
+    let events = vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "second_child".to_string(),
+            input: serde_json::json!({"id": 7}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"ok": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"second": {"ok": true}}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "child_or_deadline",
+            child_timeout_caught_then_second_child_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a caught oversized child-timeout followed by a SECOND recorded \
+         child-timeout must replay cleanly — the caught call's fresh-dispatch peek \
+         is fingerprinted by its own timer id, so it is never miscredited the \
+         second call's ChildWorkflowStarted at the cursor (issue #779 Codex \
+         round-12 P2):\n{report}"
     );
 }
 

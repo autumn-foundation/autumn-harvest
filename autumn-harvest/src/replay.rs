@@ -208,6 +208,75 @@ pub enum SignalOrTimerMatch {
     },
 }
 
+/// Result of observing a child-workflow-vs-deadline race against recorded
+/// history (issue #779: `ctx.execute_child_workflow_timeout`).
+///
+/// The race composes the existing
+/// `ChildWorkflowStarted`/`ChildWorkflowCompleted`/`ChildWorkflowFailed` and
+/// `TimerStarted`/`TimerFired` events — no new event variant. The winner is the
+/// resolution event that appears **first in recorded history**, so the outcome
+/// is deterministic across replays regardless of wall-clock timing on the
+/// replaying worker.
+// `serde_json::Value` fields (`output`, `details`) are `PartialEq` but not `Eq`,
+// so `Eq` cannot be derived; silence the false-positive lint suggestion.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildOrTimerMatch {
+    /// The child workflow completed before the deadline timer fired. Carries the
+    /// recorded child output.
+    ChildCompleted {
+        /// The JSON output from the winning `ChildWorkflowCompleted` event.
+        output: Value,
+    },
+    /// The child workflow failed before the deadline timer fired. Carries the
+    /// child's typed failure fields (issue #767); a legacy / untyped child
+    /// failure decodes to the `"Error"` sentinel with no details and
+    /// `non_retryable = false`.
+    ChildFailed {
+        /// Human-readable failure message from `ChildWorkflowFailed`.
+        error: String,
+        /// Stable error-type name; `"Error"` for a legacy / untyped failure.
+        error_type: String,
+        /// Structured details from a typed failure, if any.
+        details: Option<Value>,
+        /// Advisory non-retryable classification hint.
+        non_retryable: bool,
+    },
+    /// The deadline timer fired before the child terminated. Carries the losing
+    /// child's `ExecutionId` (so the caller can durably request-cancel it) and
+    /// `child_already_terminal`, which is `true` iff the loser child's terminal
+    /// is already recorded in history (the caller then suppresses re-pushing
+    /// `CancelRaceLosers`).
+    TimerFired {
+        /// The `ExecutionId` of the losing child workflow.
+        child_id: ExecutionId,
+        /// Whether the loser child's terminal is already recorded.
+        child_already_terminal: bool,
+    },
+    /// `ChildWorkflowStarted` and `TimerStarted` are both recorded but neither a
+    /// child terminal nor `TimerFired` exists yet. The caller re-emits the race
+    /// commands (the worker dedupes the child by `child_id` and the timer row by
+    /// `timer_id`) and suspends again. Carries the recorded `child_id` so the
+    /// re-emitted `StartChildWorkflow` reuses it.
+    InProgress {
+        /// The `ExecutionId` recorded in `ChildWorkflowStarted`.
+        child_id: ExecutionId,
+    },
+    /// Cursor is past the end of history — this is the first live execution of
+    /// the race.
+    NoMatch,
+    /// The recorded history does not match the requested race, indicating
+    /// non-determinism in the workflow code.
+    Diverged {
+        /// What the history matcher expected to find based on recorded events.
+        expected: String,
+        /// What the workflow actually requested.
+        actual: String,
+        /// The event index where the divergence occurred.
+        event_index: Option<i32>,
+    },
+}
+
 /// Result of observing a cancellable durable timer's outcome against recorded
 /// history (issue #768: `TimerHandle::await_fire`).
 ///
@@ -3936,6 +4005,457 @@ impl HistoryMatcher {
         self.cursor = start_cursor + 1;
         self.advance_to_next_unconsumed_event();
         HistoryMatch::ChildInProgress { child_id }
+    }
+
+    /// Settle a child-vs-deadline race won by the child (issue #779).
+    ///
+    /// Marks the winning child terminal consumed (it is matched out of order),
+    /// strays the race's deadline `TimerFired` if it was recorded after the
+    /// child won (so a subsequent match does not diverge against it and the
+    /// strict unconsumed check passes), and advances the cursor. Mirrors
+    /// [`Self::settle_race_signal_won`] with the winner role swapped from a
+    /// signal to a child terminal.
+    fn settle_race_child_won(
+        &mut self,
+        terminal_pos: usize,
+        resume_pos: usize,
+        first_interleaved_command: Option<usize>,
+        timer_id: &str,
+    ) {
+        self.consumed_out_of_order_events.insert(terminal_pos);
+        let mut fired_scan = terminal_pos + 1;
+        while fired_scan < self.events.len() {
+            if !self.is_consumed(fired_scan)
+                && let WorkflowEvent::TimerFired { timer_id: id } = &self.events[fired_scan]
+                && id.as_str() == timer_id
+            {
+                self.consumed_out_of_order_events.insert(fired_scan);
+                break;
+            }
+            fired_scan += 1;
+        }
+        // Intentional divergence from `settle_race_signal_won`, which resumes at
+        // `signal_pos + 1` (just past the winning signal). Here the child/timer
+        // start pair was matched positionally, so the cursor rewinds to
+        // `resume_pos` (the first event after the started pair) and
+        // `advance_to_next_unconsumed_event` then skips the just-consumed winning
+        // terminal (marked above) plus any consumed interleaved events. Verified
+        // equivalent: the winning terminal is `consumed_out_of_order_events`, so
+        // both forms land the cursor at the same next-unconsumed event.
+        self.cursor = first_interleaved_command.unwrap_or(resume_pos);
+        self.advance_to_next_unconsumed_event();
+    }
+
+    /// Scan forward from `from` for the losing child's terminal
+    /// (`ChildWorkflowCompleted`/`ChildWorkflowFailed` with `child_id`) after a
+    /// deadline timer won the race (issue #779). Marks it consumed (a losing
+    /// child terminal is deliverable to nobody, so it must be transparent to
+    /// [`Self::has_non_lifecycle_unconsumed`]) and returns whether it was found.
+    fn consume_loser_child_terminal(&mut self, from: usize, child_id: ExecutionId) -> bool {
+        let mut scan = from;
+        while scan < self.events.len() {
+            if !self.is_consumed(scan)
+                && matches!(
+                    &self.events[scan],
+                    WorkflowEvent::ChildWorkflowCompleted { child_id: id, .. }
+                        | WorkflowEvent::ChildWorkflowFailed { child_id: id, .. }
+                        if *id == child_id
+                )
+            {
+                self.consumed_out_of_order_events.insert(scan);
+                return true;
+            }
+            scan += 1;
+        }
+        false
+    }
+
+    /// Read-only peek: does a recorded `ChildWorkflowStarted` already sit at the
+    /// cursor a [`Self::match_child_or_timer`] call would land on (issue #779)?
+    ///
+    /// Used by [`crate::context::WorkflowContext::spawn_child_workflow_timeout`]
+    /// to decide, *before* calling `match_child_or_timer`, whether this call is a
+    /// **fresh dispatch** (no recorded child-timeout start yet) so the
+    /// payload-cap pre-check can run first — mirroring the fan-out's
+    /// [`peek_fan_out_count`](crate::context::WorkflowContext) marker peek. On a
+    /// live over-cap call the child is never dispatched, so no child/timer events
+    /// are recorded; on replay of that history the matcher would otherwise see
+    /// the next real event (`WorkflowFailed`, or a caught-and-continued activity)
+    /// at the cursor and report a spurious non-determinism instead of
+    /// reproducing the same `PayloadTooLarge`. Gating the cap check to a fresh
+    /// dispatch also keeps an already-recorded child (under-cap at record time)
+    /// from being re-judged against a possibly-changed cap.
+    ///
+    /// It never mutates the cursor and never consumes anything —
+    /// `match_child_or_timer` remains the sole authority for resolving the race.
+    /// The skip set mirrors [`Self::drain_early_signals`] so the peek agrees with
+    /// where the real match will land even when signals or update events precede
+    /// the recorded child start.
+    ///
+    /// The recorded start is **fingerprinted by `expected_timer_id`** (the call's
+    /// `__child_timeout:{seq}:{name}` deadline timer, unique per call site because
+    /// `seq` is a burned per-context counter). Without that fingerprint, a caught
+    /// over-cap call — which records **nothing** — would peek the *next*
+    /// child-timeout call's `ChildWorkflowStarted` at the cursor, wrongly conclude
+    /// it was already dispatched, skip its own payload-cap re-check, and then
+    /// diverge (spurious non-determinism) instead of reproducing the same
+    /// `PayloadTooLarge`. This mirrors exactly how the fan-out's seq-keyed
+    /// `fan_out:{seq}` marker peek keeps a caught call from being miscredited the
+    /// *following* call's marker (issue #779, Codex round-12 P2).
+    #[must_use]
+    pub(crate) fn peek_child_start_at_cursor(&self, expected_timer_id: &str) -> bool {
+        // Advance `cursor` past consumed indices and the leading run of
+        // early-drainable signal / external-signal / external-cancel / update
+        // events, exactly as `prepare_match` -> `drain_early_signals` will before
+        // reading the structural event at the cursor. Returns `false` when the
+        // history end is reached without a structural event.
+        let skip_to_structural = |cursor: &mut usize| -> bool {
+            while *cursor < self.events.len() {
+                let ev = &self.events[*cursor];
+                if self.is_consumed(*cursor)
+                    || matches!(
+                        ev,
+                        WorkflowEvent::SignalReceived { .. }
+                            | WorkflowEvent::ExternalSignalRequested { .. }
+                            | WorkflowEvent::ExternalSignalDelivered { .. }
+                            | WorkflowEvent::ExternalSignalFailed { .. }
+                            | WorkflowEvent::ExternalCancelRequested { .. }
+                            | WorkflowEvent::ExternalCancelDelivered { .. }
+                            | WorkflowEvent::ExternalCancelFailed { .. }
+                    )
+                    || Self::is_update_event(ev)
+                {
+                    *cursor += 1;
+                    continue;
+                }
+                return true;
+            }
+            false
+        };
+
+        let mut cursor = self.cursor;
+        if !skip_to_structural(&mut cursor) {
+            return false;
+        }
+        // The structural event at the cursor must be a ChildWorkflowStarted...
+        if !matches!(
+            self.events[cursor],
+            WorkflowEvent::ChildWorkflowStarted { .. }
+        ) {
+            return false;
+        }
+        // ...immediately followed by THIS call's deadline TimerStarted. The worker
+        // persists the `[ChildWorkflowStarted, TimerStarted]` pair adjacently in
+        // one transaction, so the fingerprint check lands on the correct pair.
+        cursor += 1;
+        if !skip_to_structural(&mut cursor) {
+            return false;
+        }
+        matches!(
+            &self.events[cursor],
+            WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str() == expected_timer_id
+        )
+    }
+
+    /// Match a child-workflow-vs-deadline race against history (issue #779).
+    ///
+    /// Mirrors [`Self::match_signal_or_timer`] with the winner/loser roles
+    /// swapped: a child terminal (`ChildWorkflowCompleted`/`ChildWorkflowFailed`)
+    /// is the winner and `TimerFired` is the loser, or vice versa. The race
+    /// composes the existing child-workflow and timer events — no new event
+    /// variant. The winner is the resolution event that appears **first in
+    /// recorded history**.
+    ///
+    /// Positional invariant: the worker persists `ChildWorkflowStarted`
+    /// immediately followed by `TimerStarted` in one transaction, so both are
+    /// matched positionally (Diverge on mismatch) before the forward scan for
+    /// the first resolution event. Interleaved concurrent-sibling events are
+    /// stashed / rewound exactly as in [`Self::match_signal_or_timer`].
+    #[allow(clippy::too_many_lines)]
+    pub fn match_child_or_timer(
+        &mut self,
+        workflow_name: &str,
+        input: &Value,
+        timer_id: &str,
+        expected_duration: Option<u64>,
+    ) -> ChildOrTimerMatch {
+        if !self.prepare_match() {
+            return ChildOrTimerMatch::NoMatch;
+        }
+
+        let child_pos = self.cursor;
+        let WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: recorded_name,
+            input: recorded_input,
+        } = &self.events[self.cursor]
+        else {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        };
+        let child_id = *child_id;
+        if recorded_name != workflow_name {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: format!("ChildWorkflowStarted({recorded_name})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+        if recorded_input != input {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("ChildWorkflowInput({input})"),
+                actual: format!("ChildWorkflowInput({recorded_input})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+
+        // The deadline timer must be recorded immediately after the child start
+        // (both appended in one worker transaction).
+        let timer_pos = child_pos + 1;
+        let Some(WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            duration_secs: recorded_duration,
+        }) = self.events.get(timer_pos)
+        else {
+            let actual = self
+                .events
+                .get(timer_pos)
+                .map_or_else(|| "<end of history>".to_string(), Self::actual_event_name);
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual,
+                event_index: i32::try_from(timer_pos).ok(),
+            };
+        };
+        if recorded_id.as_str() != timer_id {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: format!("TimerStarted({recorded_id})"),
+                event_index: i32::try_from(timer_pos).ok(),
+            };
+        }
+        if let Some(expected) = expected_duration
+            && *recorded_duration != expected
+        {
+            return ChildOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
+                actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
+                event_index: i32::try_from(timer_pos).ok(),
+            };
+        }
+
+        // Advance past the started pair, then scan for the first resolution.
+        let resume_pos = timer_pos + 1;
+        let mut scan_cursor = resume_pos;
+        let mut first_interleaved_command = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                // Child wins: its terminal was recorded before the deadline fired.
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: id,
+                    output,
+                } if *id == child_id => {
+                    let output = output.clone();
+                    self.settle_race_child_won(
+                        scan_cursor,
+                        resume_pos,
+                        first_interleaved_command,
+                        timer_id,
+                    );
+                    return ChildOrTimerMatch::ChildCompleted { output };
+                }
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: id,
+                    error,
+                    error_type,
+                    details,
+                    non_retryable,
+                } if *id == child_id => {
+                    // Carry the child's typed failure fields (issue #767); a
+                    // legacy / untyped child failure decodes to the `"Error"`
+                    // sentinel — identical to `match_child_workflow`.
+                    let error = error.clone();
+                    let error_type = error_type.clone().unwrap_or_else(|| "Error".to_string());
+                    let details = details.clone();
+                    let non_retryable = non_retryable.unwrap_or(false);
+                    self.settle_race_child_won(
+                        scan_cursor,
+                        resume_pos,
+                        first_interleaved_command,
+                        timer_id,
+                    );
+                    return ChildOrTimerMatch::ChildFailed {
+                        error,
+                        error_type,
+                        details,
+                        non_retryable,
+                    };
+                }
+
+                // Timer wins: the deadline fired before the child terminated.
+                WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
+                    // A loser child terminal recorded after the fire (the
+                    // synthetic `ChildWorkflowFailed` from the race-loser
+                    // cancellation) is deliverable to nobody, so consume it and
+                    // report `child_already_terminal` so the caller pushes
+                    // `CancelRaceLosers` only on the one live cycle the child is
+                    // still running.
+                    let child_already_terminal =
+                        self.consume_loser_child_terminal(scan_cursor + 1, child_id);
+                    if let Some(command_cursor) = first_interleaved_command {
+                        self.consumed_out_of_order_events.insert(scan_cursor);
+                        self.cursor = command_cursor;
+                    } else {
+                        self.cursor = scan_cursor + 1;
+                    }
+                    self.advance_to_next_unconsumed_event();
+                    return ChildOrTimerMatch::TimerFired {
+                        child_id,
+                        child_already_terminal,
+                    };
+                }
+
+                // Concurrent sibling commands (tokio::join!) can interleave with
+                // the pending race. Keep the first as the next replay cursor and
+                // scan past it so a resolution recorded later is still found.
+                WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                // Signals arriving while the race is pending are stashed for
+                // later signal waits.
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+
+                // Progress and terminal events of concurrent siblings (foreign
+                // timer fires, terminals of other children) are transparent to
+                // the race scan — their own matchers consume them after a rewind.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
+                    scan_cursor += 1;
+                }
+
+                // ExternalSignal event triplets can be interleaved; stash them
+                // for later match_external_signal.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target,
+                    signal_name: sn,
+                    payload,
+                    idempotency_key,
+                } => {
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        sn.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Delivered,
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Failed(reason_code.clone()),
+                    );
+                    scan_cursor += 1;
+                }
+
+                // ExternalCancel events are transparent to the race scan (#492).
+                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                    self.pending_external_cancels.push(StashedExternalCancel {
+                        cancel_id: *cancel_id,
+                        target: *target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                    if let Some(s) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|s| s.cancel_id == *cancel_id)
+                    {
+                        s.terminal = Some(StashedCancelTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalCancelFailed {
+                    cancel_id,
+                    reason_code,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|s| s.cancel_id == *cancel_id)
+                    {
+                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                _ => break,
+            }
+        }
+
+        // Both started but neither resolution event is recorded yet. Rewind to
+        // the first interleaved command so a concurrent sibling's matcher still
+        // finds its own events.
+        self.cursor = first_interleaved_command.unwrap_or(resume_pos);
+        self.advance_to_next_unconsumed_event();
+        ChildOrTimerMatch::InProgress { child_id }
     }
 
     /// Match a detached child workflow spawn against history.
@@ -9028,6 +9548,598 @@ mod tests {
                 result,
                 SignalOrTimerMatch::SignalWon {
                     payload: serde_json::json!({"approved": true})
+                }
+            );
+        }
+    }
+
+    // ── match_child_or_timer (issue #779) ─────────────────────────────────
+    //
+    // Deadline-bounded child-workflow awaits, mirroring match_signal_or_timer.
+    // The race composes ChildWorkflowStarted/Completed/Failed with
+    // TimerStarted/TimerFired — no new event variant. Winner = earliest
+    // recorded history index. RED PHASE: ChildOrTimerMatch and
+    // HistoryMatcher::match_child_or_timer do not exist yet.
+
+    fn child_timer_id() -> TimerId {
+        TimerId::new("__child_timeout:1:process_order")
+    }
+
+    fn child_started_event(child_id: ExecutionId) -> WorkflowEvent {
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".into(),
+            input: serde_json::json!({"id": 42}),
+        }
+    }
+
+    #[test]
+    fn child_or_timer_child_completes_before_timer_fired_wins() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_win_consumes_stray_timer_fired() {
+        // The durable deadline timer fires after the child already won. The
+        // stray TimerFired must be consumed so subsequent matches do not
+        // diverge and the strict unconsumed check passes.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "stray deadline TimerFired must be consumed after the child wins"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_terminal_only_wins() {
+        // A completed child with no timer ever fired resolves to ChildCompleted.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!("done"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!("done")
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_timer_wins_when_fired_before_child_terminal() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal: false,
+            },
+            "timer wins and the still-running child is not yet terminal, so the \
+             caller must push CancelRaceLosers on this cycle"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_timer_win_consumes_loser_child_terminal() {
+        // Timer fired first, then the losing child's terminal (a synthetic
+        // ChildWorkflowFailed from the race-loser cancellation) was recorded.
+        // The matcher must genuinely consume that loser terminal (it is
+        // deliverable to nobody) and report child_already_terminal = true so
+        // the caller does NOT re-push CancelRaceLosers.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "lost race to a sibling branch".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal: true,
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "the losing child terminal must be genuinely consumed on timer-win"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_late_child_terminal_after_timer_win_is_preserved_not_corrupted() {
+        // The timer wins; a child terminal recorded AFTER the fire is the
+        // losing child being sealed. It is consumed (transparent), and the
+        // race still resolves to TimerFired — the late terminal must not flip
+        // the winner or trip a divergence.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!("raced-but-lost"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::TimerFired {
+                child_id,
+                child_already_terminal: true,
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "a late losing child terminal after timer-win must be consumed, not left dangling"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_fails_before_deadline_returns_typed_fields() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "downstream 503".into(),
+                error_type: Some("UpstreamUnavailable".into()),
+                details: Some(serde_json::json!({"retry_after": 30})),
+                non_retryable: Some(true),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildFailed {
+                error: "downstream 503".into(),
+                error_type: "UpstreamUnavailable".into(),
+                details: Some(serde_json::json!({"retry_after": 30})),
+                non_retryable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_legacy_child_failure_maps_error_type_sentinel() {
+        // A pre-#767 / untyped child failure decodes to the "Error" sentinel
+        // with no details and not non-retryable, mirroring match_child_workflow.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "boom".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildFailed {
+                error: "boom".into(),
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_no_match_on_empty_history() {
+        // Child not started yet — first live execution of the race.
+        let mut matcher = HistoryMatcher::new(vec![]);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            "__child_timeout:1:process_order",
+            Some(300),
+        );
+        assert_eq!(result, ChildOrTimerMatch::NoMatch);
+    }
+
+    #[test]
+    fn child_or_timer_in_progress_when_both_started_but_neither_resolved() {
+        // ChildWorkflowStarted + TimerStarted recorded, but no terminal and no
+        // TimerFired yet: the caller must re-park. InProgress carries the
+        // recorded child_id so the re-emitted StartChildWorkflow reuses it.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::InProgress { child_id },
+            "InProgress must return the recorded child_id for the re-park"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_wrong_child_start() {
+        let events = vec![WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "send_email".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            "__child_timeout:1:process_order",
+            Some(300),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_wrong_timer_id() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__child_timeout:99:process_order"),
+                duration_secs: 300,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            "__child_timeout:1:process_order",
+            Some(300),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_duration_change() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(600),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_diverges_on_wrong_child_input() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 999}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert!(matches!(result, ChildOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn child_or_timer_child_win_across_interleaved_sibling_activity() {
+        // A concurrent sibling activity's events are interleaved between the
+        // child/timer start pair and the child's terminal. The scan must skip
+        // them (transparent) instead of reporting the race in progress, and
+        // rewind to the interleaved command so the sibling's own matcher runs.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "audit_log".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("logged"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        // The interleaved sibling activity must still be matchable afterwards.
+        let activity = matcher.match_activity("audit_log");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!("logged")
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_child_win_across_interleaved_signal_is_transparent() {
+        // A signal recorded between the child/timer start pair and the child's
+        // terminal must be STASHED (transparent to the race scan) — the #476
+        // "ignored late signal" analog — so the race still resolves to
+        // ChildCompleted and the signal remains observable by a later
+        // signal-wait. It must NOT flip the winner or trip a divergence.
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            },
+            "an interleaved signal must not flip the child-win outcome"
+        );
+        // The stashed signal is still deliverable to a later signal wait.
+        assert_eq!(
+            matcher.match_signal("approval"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            },
+            "the interleaved signal must remain observable after the race resolves"
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "no dangling unconsumed events after the race + signal are matched"
+        );
+    }
+
+    #[test]
+    fn child_or_timer_replays_same_branch_when_both_events_exist() {
+        // Whichever resolution event was recorded first wins on every replay,
+        // regardless of wall-clock timing (R4: deterministic by history index).
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+
+        for _ in 0..3 {
+            let mut matcher = HistoryMatcher::new(events.clone());
+            let result = matcher.match_child_or_timer(
+                "process_order",
+                &serde_json::json!({"id": 42}),
+                timer_id.as_str(),
+                Some(300),
+            );
+            assert_eq!(
+                result,
+                ChildOrTimerMatch::ChildCompleted {
+                    output: serde_json::json!({"processed": true})
                 }
             );
         }
