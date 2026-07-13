@@ -827,6 +827,10 @@ enum WorkflowCommand {
     Timeline {
         /// Workflow execution ID.
         execution_id: String,
+
+        /// Export timeline to Chrome Trace Format JSON instead of human-readable output.
+        #[arg(long)]
+        export_trace: bool,
     },
     /// Reconstruct the ordered continue-as-new run chain a workflow execution
     /// belongs to, resolvable from any member (origin, middle, or tail).
@@ -2284,6 +2288,18 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         return Ok(format_usage_table(value));
     }
 
+    if matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Timeline {
+                export_trace: true,
+                ..
+            }
+        }
+    ) {
+        return Ok(format_timeline_trace(value));
+    }
+
     let output = if workflow_children_wants_raw_json(cli)
         || workflow_summaries_wants_raw_json(cli)
         || run_chain_wants_raw_json(cli)
@@ -2307,6 +2323,44 @@ fn usage_wants_table(cli: &Cli) -> bool {
 
 const fn usage_wants_raw_json(cli: &Cli) -> bool {
     matches!(&cli.command, Commands::Usage { json: true, .. })
+}
+
+fn format_timeline_trace(value: &Value) -> String {
+    // If we're exporting trace, output must be valid JSON anyway,
+    // so we attempt to map the API response.
+    let mut events = Vec::new();
+
+    if let Some(steps) = value.get("steps").and_then(Value::as_array) {
+        for step in steps {
+            let name = step
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let kind = step
+                .get("step_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            // use scheduled_at because start_time is missing for timeline steps
+            let start_ts = step
+                .get("scheduled_at")
+                .and_then(Value::as_str)
+                .and_then(|s| autumn_harvest::chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map_or(0, |d| u64::try_from(d.timestamp_micros()).unwrap_or(0));
+
+            let dur_ms = step.get("total_ms").and_then(Value::as_u64).unwrap_or(0);
+
+            events.push(serde_json::json!({
+                "name": format!("{} ({})", name, kind),
+                "cat": "timeline_step",
+                "ph": "X",
+                "ts": start_ts,
+                "dur": dur_ms * 1000,
+                "pid": 1,
+                "tid": 1,
+            }));
+        }
+    }
+    serde_json::to_string_pretty(&events).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Render the `GET /admin/usage` response as a human-readable table
@@ -3961,7 +4015,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/stack",
             path_segment(execution_id)
         ))),
-        WorkflowCommand::Timeline { execution_id } => Ok(ApiRequest::get(format!(
+        WorkflowCommand::Timeline {
+            execution_id,
+            export_trace: _,
+        } => Ok(ApiRequest::get(format!(
             "/workflows/{}/timeline",
             path_segment(execution_id)
         ))),
@@ -7437,5 +7494,47 @@ mod usage_cli_tests {
         });
         let rendered = format_usage_table(&value);
         assert!(rendered.contains("No usage groups found."));
+    }
+}
+
+#[cfg(test)]
+mod tests_nova {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_format_timeline_trace_converts_api_response() {
+        let value = json!({
+            "steps": [
+                {
+                    "name": "my_activity",
+                    "step_kind": "activity",
+                    "scheduled_at": "2024-01-01T12:00:00Z",
+                    "total_ms": 150
+                },
+                {
+                    "step_kind": "timer",
+                    "scheduled_at": "2024-01-01T12:00:01Z",
+                    "total_ms": 500
+                }
+            ]
+        });
+
+        let trace = format_timeline_trace(&value);
+        let parsed: Vec<Value> = serde_json::from_str(&trace).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+
+        // Activity step
+        assert_eq!(parsed[0]["name"], "my_activity (activity)");
+        assert_eq!(parsed[0]["cat"], "timeline_step");
+        assert_eq!(parsed[0]["ph"], "X");
+        assert_eq!(parsed[0]["ts"], 1_704_110_400_000_000_u64);
+        assert_eq!(parsed[0]["dur"], 150_000);
+
+        // Timer step with missing name
+        assert_eq!(parsed[1]["name"], "unknown (timer)");
+        assert_eq!(parsed[1]["ts"], 1_704_110_401_000_000_u64);
+        assert_eq!(parsed[1]["dur"], 500_000);
     }
 }
