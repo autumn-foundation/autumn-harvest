@@ -1,13 +1,13 @@
 #![cfg(feature = "db")]
 
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
+    ActivityContext, HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
 
@@ -329,6 +329,150 @@ fn external_then_timer_workflow<'a>(
 
         Ok(serde_json::json!({"status": "done"}))
     })
+}
+
+// ── Issue #1034: mixed NON-timer suspension + inline external op ────────────
+//
+// The #678 fix wired the inline-external self-wake only into the TIMER
+// remaining-command shape (`persist_started_timer`). These three workflow
+// bodies mirror the #678 `mixed_suspension_workflow` construction EXACTLY, but
+// replace the timer branch with the two OTHER remaining-command shapes:
+// a `receive_signal` wait (→ persist_signal_wait_park) and an `execute_activity`
+// (→ persist_scheduled_activities). Neither receives `resolved_inline_external`,
+// so the parent never self-wakes on the inline external terminal (issue #1034):
+// the signal-wait shape HANGS; the activity shape wakes only when the (slow)
+// activity finishes.
+
+// select! { receive_signal (never sent) , signal_external_workflow(target) }.
+// Batch = [WaitForSignal, SignalExternalWorkflow]. After inline resolution +
+// split, remaining = [WaitForSignal] → persist_signal_wait_park (no
+// resolved_inline_external) → the caller's own signal never arrives and the
+// stripped external id is not in `commands`, so NO self-wake → HANGS.
+fn mixed_signal_wait_external_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        let wait_fut = ctx.receive_signal::<serde_json::Value>("parent_never_arrives");
+        let signal_fut =
+            ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
+
+        tokio::select! {
+            res = wait_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "signal_received"}))
+            }
+            res = signal_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "external_signal_sent"}))
+            }
+        }
+    })
+}
+
+// select! { receive_signal (never sent) , request_cancel_external_workflow(target) }.
+// Same signal-wait remaining shape as above, on the external-CANCEL primitive.
+fn mixed_signal_wait_external_cancel_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        let wait_fut = ctx.receive_signal::<serde_json::Value>("parent_never_arrives");
+        let cancel_fut = ctx.request_cancel_external_workflow(target);
+
+        tokio::select! {
+            res = wait_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "signal_received"}))
+            }
+            res = cancel_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "external_cancel_sent"}))
+            }
+        }
+    })
+}
+
+// A deliberately slow activity (sleeps 20s) with NO start_to_close, so the
+// timeout scanner never fails it early. On the buggy code the parent's activity
+// park (persist_scheduled_activities) is only woken when this activity
+// completes, so the parent cannot finish before ~20s.
+fn slow_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        Ok(serde_json::json!({"status": "slow_done"}))
+    })
+}
+
+// select! { execute_activity("slow_noop") , signal_external_workflow(target) }.
+// Batch = [ScheduleActivity, SignalExternalWorkflow]. After inline resolution +
+// split, remaining = [ScheduleActivity] → persist_scheduled_activities (no
+// resolved_inline_external) → the inline external terminal is durable but
+// nothing self-wakes → parent only wakes when the 20s activity finishes.
+fn mixed_activity_external_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        let activity_fut = ctx.execute_activity_raw("slow_noop", serde_json::json!({}), "default");
+        let signal_fut =
+            ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
+
+        tokio::select! {
+            res = activity_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "activity_done"}))
+            }
+            res = signal_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "external_signal_sent"}))
+            }
+        }
+    })
+}
+
+// Compact ActivityInfo builder (all timeouts None so the slow activity is never
+// timed out by the enforcement scanner spawned in Worker::run).
+fn slow_act_info() -> ActivityInfo {
+    ActivityInfo {
+        name: "slow_noop",
+        module: "cross_workflow_signal_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("default"),
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler: slow_activity,
+    }
 }
 
 // Compact WorkflowInfo builder mirroring the exact field set used by the inline
@@ -1558,6 +1702,450 @@ async fn test_pure_timer_after_inline_external_does_not_false_wake() {
         completed.output.unwrap()["status"].as_str(),
         Some("done"),
         "caller must complete via the pure timer branch"
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── Issue #1034: mixed NON-timer suspension + inline external op self-wake ───
+//
+// The #678 fix wired the inline-external self-wake ONLY into the timer
+// remaining-command shape (`persist_started_timer`). The two other shapes —
+// a signal-wait park and a scheduled-activities park — never receive
+// `resolved_inline_external`, so a caller that races `receive_signal` /
+// `execute_activity` against a same-shard `signal_external_workflow` /
+// `request_cancel_external_workflow` resolves the external terminal INLINE but
+// is never self-woken. These three tests mirror the #678 inline tests exactly
+// (target started FIRST → inline resolution; select! in a raw handler) but on
+// the non-timer shapes.
+
+// AC1: signal-wait + same-shard external SIGNAL. Batch = [WaitForSignal,
+// SignalExternalWorkflow] → remaining [WaitForSignal] → persist_signal_wait_park.
+// The caller's own "parent_never_arrives" signal is NEVER sent, so the ONLY
+// resolvable branch is the external signal. Without the fix the caller never
+// self-wakes on the inline ExternalSignalDelivered → HANGS → the 15s bound
+// trips → RED.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mixed_signal_wait_suspension_external_signal_resolves_inline_wakes_immediately() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external signal resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info(
+                "mixed_signal_wait_external_signal_workflow",
+                mixed_signal_wait_external_signal_workflow,
+            ),
+            wf_info("target_workflow", target_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-1034-signal-wait-signal".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on receive_signal),
+    // so the caller's signal_external_workflow resolves inline this cycle.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "target_workflow",
+            "target-1034-signal-wait-1",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING (parked on signal) before caller starts");
+
+    // Now start the CALLER pointed at the already-running target.
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "mixed_signal_wait_external_signal_workflow",
+            "caller-1034-signal-wait-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Tight 15s bound: proves the caller woke on the inline ExternalSignalDelivered
+    // rather than hanging forever on its own never-arriving signal.
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if completed.is_err() {
+        let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+        let target = load_execution_from_url(&database_url, target_exec_id).await;
+        let caller_history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
+            .await
+            .unwrap();
+        println!("TIMEOUT DIAGNOSTICS (1034 signal-wait + external signal):");
+        println!(
+            "Caller State: {}, output: {:?}",
+            caller.state, caller.output
+        );
+        println!("Caller History: {:?}", caller_history.events);
+        println!(
+            "Target State: {}, output: {:?}",
+            target.state, target.output
+        );
+        panic!(
+            "caller must wake immediately on the inline ExternalSignalDelivered; \
+             a signal-wait remaining shape currently HANGS (issue #1034)"
+        );
+    }
+
+    let caller = completed.unwrap();
+    assert_eq!(caller.state, "COMPLETED");
+    assert_eq!(
+        caller.output.unwrap()["status"].as_str(),
+        Some("external_signal_sent"),
+        "caller must resolve on the external-signal branch (its own signal never arrives)"
+    );
+
+    // The target actually received the signal (it only COMPLETES if it did).
+    let target = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "COMPLETED" {
+                break target;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should COMPLETE after receiving the inline signal");
+    assert_eq!(target.state, "COMPLETED");
+    assert_eq!(
+        target.output.unwrap()["data"].as_str(),
+        Some("hello"),
+        "target must have received the signal payload"
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// AC2 / AC4: signal-wait + same-shard external CANCEL. Same remaining shape
+// ([WaitForSignal] → persist_signal_wait_park) but on the external-cancel
+// primitive. Without the fix the caller HANGS → 15s bound trips → RED.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mixed_signal_wait_suspension_external_cancel_resolves_inline_wakes_immediately() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external cancel resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info(
+                "mixed_signal_wait_external_cancel_workflow",
+                mixed_signal_wait_external_cancel_workflow,
+            ),
+            wf_info("cancel_target_workflow", cancel_target_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-1034-signal-wait-cancel".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on a signal that
+    // never arrives), so the caller's cancel resolves inline against a live run.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "cancel_target_workflow",
+            "target-1034-signal-wait-cancel-1",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING before caller starts");
+
+    // Now start the CALLER pointed at the already-running target.
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "mixed_signal_wait_external_cancel_workflow",
+            "caller-1034-signal-wait-cancel-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if completed.is_err() {
+        let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+        let target = load_execution_from_url(&database_url, target_exec_id).await;
+        let caller_history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
+            .await
+            .unwrap();
+        println!("TIMEOUT DIAGNOSTICS (1034 signal-wait + external cancel):");
+        println!(
+            "Caller State: {}, output: {:?}",
+            caller.state, caller.output
+        );
+        println!("Caller History: {:?}", caller_history.events);
+        println!(
+            "Target State: {}, output: {:?}",
+            target.state, target.output
+        );
+        panic!(
+            "caller must wake immediately on the inline ExternalCancelDelivered; \
+             a signal-wait remaining shape currently HANGS (issue #1034)"
+        );
+    }
+
+    let caller = completed.unwrap();
+    assert_eq!(caller.state, "COMPLETED");
+    assert_eq!(
+        caller.output.unwrap()["status"].as_str(),
+        Some("external_cancel_sent"),
+        "caller must resolve on the external-cancel branch (its own signal never arrives)"
+    );
+
+    // The inline cancel must actually have cancelled the target.
+    let target = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "CANCELLED" {
+                break target;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cancel target should reach CANCELLED after the inline cancel");
+    assert_eq!(target.state, "CANCELLED");
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// AC3: activity + same-shard external SIGNAL. Batch = [ScheduleActivity,
+// SignalExternalWorkflow] → remaining [ScheduleActivity] →
+// persist_scheduled_activities (no resolved_inline_external). The inline
+// ExternalSignalDelivered is durable, but nothing self-wakes the parked
+// activity task — so on the buggy code the caller cannot complete until the
+// deliberately-slow (20s) activity finishes. The 10s bound proves the fix wakes
+// the caller on the external branch immediately; without it → RED (~20s > 10s).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mixed_activity_suspension_external_signal_resolves_inline_wakes_immediately() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Both on the same shard (0) so the external signal resolves inline.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info(
+                "mixed_activity_external_signal_workflow",
+                mixed_activity_external_signal_workflow,
+            ),
+            wf_info("target_workflow", target_workflow),
+        ])
+        .activities(vec![slow_act_info()])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-1034-activity-signal".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start the TARGET FIRST and confirm it is RUNNING (parked on receive_signal),
+    // so the caller's signal_external_workflow resolves inline this cycle.
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            target_exec_id,
+            "target_workflow",
+            "target-1034-activity-1",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if target.state == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target should be RUNNING (parked on signal) before caller starts");
+
+    // Now start the CALLER pointed at the already-running target.
+    let start = std::time::Instant::now();
+    start_or_load_workflow_execution(
+        &mut conn,
+        mk_start_params(
+            caller_exec_id,
+            "mixed_activity_external_signal_workflow",
+            "caller-1034-activity-1",
+            serde_json::json!({"target": target_exec_id.to_string()}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Tight 10s bound: the slow activity sleeps 20s, so the ONLY way to complete
+    // within 10s is by self-waking on the inline external terminal. Without the
+    // fix the caller cannot finish until ~20s → this bound trips → RED.
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            if caller.state == "COMPLETED" {
+                break caller;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if completed.is_err() {
+        let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+        let caller_history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
+            .await
+            .unwrap();
+        println!(
+            "TIMEOUT DIAGNOSTICS (1034 activity + external signal), elapsed {:?}:",
+            start.elapsed()
+        );
+        println!(
+            "Caller State: {}, output: {:?}",
+            caller.state, caller.output
+        );
+        println!("Caller History: {:?}", caller_history.events);
+        panic!(
+            "caller must wake immediately on the inline ExternalSignalDelivered; \
+             a scheduled-activity remaining shape currently waits out the slow \
+             activity (~20s) before waking (issue #1034)"
+        );
+    }
+
+    let caller = completed.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(caller.state, "COMPLETED");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "caller must complete well before the 20s activity finishes (elapsed {elapsed:?})"
+    );
+    assert_eq!(
+        caller.output.unwrap()["status"].as_str(),
+        Some("external_signal_sent"),
+        "caller must resolve on the external-signal branch (activity still sleeping)"
     );
 
     worker.shutdown();

@@ -4772,15 +4772,12 @@ async fn persist_started_timer(
         }
     }
 
-    if !resolved_inline_external.is_empty() {
-        // A sibling external op resolved inline this decision cycle; its terminal is
-        // already durable (committed by persist_external_signal_inline on this conn,
-        // this decision). We force-marked the task mixed_signal_suspension above, so
-        // self-wake it now so the workflow re-runs and observes the terminal instead
-        // of sleeping to fires_at. (#678; mirrors persist_signal_wait_park's #492 wake,
-        // but here the terminal is guaranteed-present so no history re-check is needed.)
-        queue::wake_workflow_task(conn, exec_id).await?;
-    }
+    // Issue #1034: the inline-resolved external self-wake is now applied
+    // UNIFORMLY at the `Suspended` arm of persist_workflow_outcome (once, for
+    // every suspension shape) rather than here. This function still force-marks
+    // the parked row `mixed_signal_suspension` above (via the
+    // `resolved_inline_external` stamp) so the arm-level wake's primary re-pend
+    // query re-pends the timer's PENDING row; only the redundant wake CALL moved.
     Ok(())
 }
 
@@ -9177,19 +9174,43 @@ async fn persist_workflow_outcome(
             }
             Ok((retry_scheduled, vec![res]))
         }
-        (WorkflowOutcome::Suspended { commands }, _) => handle_suspended_workflow(
-            conn,
-            registry,
-            SuspendedWorkflowContext {
-                execution,
-                persistence,
-                execute_span,
-                resolved_inline_external,
-            },
-            &commands,
-        )
-        .await
-        .map(|()| (false, Vec::new())),
+        (WorkflowOutcome::Suspended { commands }, _) => {
+            // Issue #1034: apply the inline-resolved external self-wake UNIFORMLY
+            // here — once, for every suspension shape (timer, signal-wait,
+            // scheduled-activity) — instead of special-casing it inside
+            // persist_started_timer (#678). When an external op
+            // (signal_external_workflow / request_cancel_external_workflow)
+            // targets a same-shard execution, persist_external_signal_inline
+            // appended its terminal INLINE this decision cycle (recorded in
+            // `resolved_inline_external`). Each shape's park leaves the workflow
+            // task wake_workflow_task-eligible: RUNNING-parked for
+            // signal-wait/activity, and mixed_signal_suspension-stamped (still,
+            // by persist_started_timer) for the timer shape — so a single
+            // arm-level wake re-pends all three via the primary re-pend query.
+            // Gated on !is_empty() so a pure suspension (or a cycle whose
+            // externals routed to the outbox / were already observed) never
+            // false-wakes. Runs inside the enclosing persist transaction, so park
+            // + re-pend commit atomically and the NOTIFY defers to the outer
+            // commit — no crash window.
+            let wake_inline_external = !resolved_inline_external.is_empty();
+            let exec_id = persistence.exec_id;
+            let result = handle_suspended_workflow(
+                conn,
+                registry,
+                SuspendedWorkflowContext {
+                    execution,
+                    persistence,
+                    execute_span,
+                    resolved_inline_external,
+                },
+                &commands,
+            )
+            .await;
+            if result.is_ok() && wake_inline_external {
+                queue::wake_workflow_task(conn, exec_id).await?;
+            }
+            result.map(|()| (false, Vec::new()))
+        }
         (WorkflowOutcome::ContinuedAsNew { input }, _) => {
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
