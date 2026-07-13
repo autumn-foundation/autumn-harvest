@@ -5352,6 +5352,156 @@ async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeede
     );
 }
 
+/// A parked (unresolved) signal-or-deadline race: the timer is armed but
+/// neither `SignalReceived` nor `TimerFired` is recorded yet. `signal_branch_fixture`
+/// truncated to drop the resolution + completion.
+fn signal_in_flight_fixture() -> Vec<WorkflowEvent> {
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:1:approval"),
+            duration_secs: 300,
+        },
+    ]
+}
+
+/// Lead 2 (issue #476 parity): a healthy in-flight signal-timeout workflow
+/// sampled by the deploy replay canary reaches the recorded-history frontier
+/// with the race still `InProgress` and then *suspends* — it must report
+/// `ReplaySucceeded`, not a false non-determinism. Mirrors the child-timeout
+/// twin's `child_timeout_in_flight_canary_replays_succeeded` and
+/// `check_strict_replay_no_match`'s canary-at-frontier exception, which the
+/// `InProgress` arm previously ignored.
+#[tokio::test]
+async fn signal_timeout_in_flight_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_or_deadline", signal_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot(
+            "signal_or_deadline",
+            exec_id,
+            signal_in_flight_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight signal-timeout race at the history frontier must be a \
+         healthy suspend in canary mode, not a false non-determinism:\n{report}"
+    );
+}
+
+/// Lead 2 update-transparency guard (mirrors the child twin's
+/// `child_timeout_in_flight_woken_by_update_canary_replays_succeeded`): an
+/// in-flight signal-timeout race whose only trailing history is transparent
+/// update events. `match_signal_or_timer`'s `InProgress` scan skips updates via
+/// `scan_cursor += 1` WITHOUT consuming them, leaving the matcher cursor BEFORE
+/// them, so a raw `position() >= len()` frontier check reads `false` for a
+/// perfectly healthy suspend. The `at_frontier` check must use
+/// `has_non_lifecycle_unconsumed`, which treats update (and terminal-lifecycle)
+/// events as transparent, agreeing with the global unconsumed check.
+fn signal_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
+    let update_id = UpdateId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:1:approval"),
+            duration_secs: 300,
+        },
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: "poke".to_string(),
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: Value::Null,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn signal_timeout_in_flight_woken_by_update_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_or_deadline", signal_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot(
+            "signal_or_deadline",
+            exec_id,
+            signal_in_flight_woken_by_update_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight signal-timeout race whose only trailing history is \
+         transparent update events must still be a healthy suspend in canary \
+         mode, not a false non-determinism:\n{report}"
+    );
+}
+
+/// Regression guard: the canary-at-frontier exception must NOT weaken STRICT
+/// (non-canary) replay. `WorkflowReplayer::replay_from_events` runs strict
+/// replay, where an unresolved race at the end of a fixture is still a fixture
+/// problem and must report non-determinism.
+#[tokio::test]
+async fn signal_timeout_in_flight_strict_still_reports_nondeterminism() {
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_or_deadline", signal_or_deadline_workflow)
+        .replay_from_events(signal_in_flight_fixture())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "strict (non-canary) replay of an unresolved race must still be a \
+         non-determinism error — the canary exception must not weaken it:\n{report}"
+    );
+}
+
+/// Mandatory guardrail: the canary-at-frontier exception must ONLY cover a
+/// genuinely-suspending in-flight race. A real code-vs-history divergence
+/// (here the recorded deadline timer has a different duration than the handler
+/// arms) resolves as `Diverged`, never `InProgress`, so it must STILL be
+/// reported as non-determinism even in canary mode.
+#[tokio::test]
+async fn signal_timeout_genuine_divergence_still_detected_in_canary() {
+    // The handler arms `__signal_timeout:1:approval` with a 300s deadline;
+    // history records 60s — a genuine duration divergence.
+    let divergent = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:1:approval"),
+            duration_secs: 60,
+        },
+    ];
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_or_deadline", signal_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot("signal_or_deadline", exec_id, divergent))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a genuine mid-history divergence must still be detected in canary mode \
+         — the frontier exception must not mask it:\n{report}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // execute_child_workflow_timeout — child-or-deadline race (issue #779)
 // ---------------------------------------------------------------------------
