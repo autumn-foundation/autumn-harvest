@@ -5855,4 +5855,371 @@ mod tests {
             "round-trip failed: {parsed:?}"
         );
     }
+
+    // ── Overdue-schedule detection (issue #696) ──────────────────────────────
+    //
+    // Pure predicate table tests (AC2/AC3/AC6). No database. `grace = cadence
+    // step + jitter + tick`, so a healthy schedule caught mid-tick, deferred by
+    // jitter, or deliberately not firing is never flagged.
+
+    /// Build a fixed UTC instant (avoids `Utc::now()` non-determinism).
+    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).single().unwrap()
+    }
+
+    const TICK: Duration = Duration::from_secs(1);
+    const NO_JITTER: Duration = Duration::from_secs(0);
+
+    #[test]
+    fn overdue_interval_flagged_past_grace() {
+        let sched = Schedule::Interval(Duration::from_secs(300)); // 5-min cadence
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // grace = 300 + 0 + 1 = 301. lag = 400 > 301 => overdue.
+        let next_run_at = now - chrono::Duration::seconds(400);
+        let v = schedule_overdue(
+            Some(&sched),
+            Some(next_run_at),
+            now,
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(v.overdue, "5-min schedule 400s past its slot must be overdue");
+        assert_eq!(
+            v.overdue_by_secs,
+            Some(400),
+            "overdue_by_secs is now - next_run_at, not lag - grace"
+        );
+    }
+
+    #[test]
+    fn overdue_interval_not_flagged_within_grace() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // lag = 200 <= 301 grace => not overdue (caught mid-cadence).
+        let v = schedule_overdue(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(200)),
+            now,
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(!v.overdue);
+        assert_eq!(v.overdue_by_secs, None);
+    }
+
+    #[test]
+    fn overdue_interval_boundary_exactly_at_grace_is_not_overdue() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // lag == grace (301) => strictly-greater predicate => not overdue.
+        let at = schedule_overdue(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(301)),
+            now,
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(!at.overdue, "lag == grace must not flag (strict >)");
+        // One second past the boundary flips it.
+        let past = schedule_overdue(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(302)),
+            now,
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(past.overdue);
+        assert_eq!(past.overdue_by_secs, Some(302));
+    }
+
+    #[test]
+    fn overdue_jitter_absorbed_by_grace() {
+        // A schedule deferred for jitter holds next_run_at at the slot until
+        // `now >= slot + jitter_offset`; grace's jitter term absorbs it.
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let jitter = Duration::from_secs(120);
+        // lag = 300 + 100 = 400. grace = 300 + 120 + 1 = 421 => not overdue.
+        let v = schedule_overdue(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(400)),
+            now,
+            jitter,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(!v.overdue, "jitter window must be absorbed by grace");
+    }
+
+    #[test]
+    fn overdue_cron_hourly_cadence_step() {
+        let sched = Schedule::Cron("0 * * * *".to_string()); // top of every hour
+        let slot = dt(2026, 1, 1, 0, 0, 0); // a valid occurrence
+        // grace = 3600 + 0 + 1 = 3601.
+        let just_over = slot + chrono::Duration::seconds(3700);
+        let v = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            just_over,
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(v.overdue, "hourly cron 3700s past its slot is overdue");
+        assert_eq!(v.overdue_by_secs, Some(3700));
+        // Within one cadence step => not overdue.
+        let within = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(3500),
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(!within.overdue);
+    }
+
+    #[test]
+    fn overdue_cron_every_five_minutes_cadence_step() {
+        let sched = Schedule::Cron("*/5 * * * *".to_string()); // 300s step
+        let slot = dt(2026, 1, 1, 0, 0, 0);
+        // grace = 300 + 0 + 1 = 301. 400s past => overdue.
+        let v = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(400),
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(v.overdue);
+        assert_eq!(v.overdue_by_secs, Some(400));
+    }
+
+    #[test]
+    fn overdue_cron_daily_cadence_step() {
+        let sched = Schedule::Cron("0 0 * * *".to_string()); // midnight, 86400s step
+        let slot = dt(2026, 1, 1, 0, 0, 0);
+        // Just under one day past => not overdue (grace ~= 1 day + 1s).
+        let within = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(86_000),
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(!within.overdue, "daily schedule 86000s late is still within grace");
+        // Over a full day + tick => overdue.
+        let over = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(86_500),
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(over.overdue);
+    }
+
+    #[test]
+    fn overdue_cron_weekly_cadence_step() {
+        let sched = Schedule::Cron("0 0 * * 0".to_string()); // Sunday midnight
+        // 2026-01-04 is a Sunday.
+        let slot = dt(2026, 1, 4, 0, 0, 0);
+        // 6 days late is still < one weekly step (604800s) => not overdue.
+        let within = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(6 * 86_400),
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(!within.overdue, "weekly cadence step must be ~604800s");
+        // 8 days late exceeds one weekly step => overdue.
+        let over = schedule_overdue(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(8 * 86_400),
+            NO_JITTER,
+            TICK,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(over.overdue);
+    }
+
+    #[test]
+    fn overdue_ac3_exclusions_never_flagged() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // A next_run_at well past grace that WOULD be overdue if active.
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let base = |is_paused, auto_paused, exhausted, at_capacity| {
+            schedule_overdue(
+                Some(&sched),
+                stale,
+                now,
+                NO_JITTER,
+                TICK,
+                is_paused,
+                auto_paused,
+                exhausted,
+                at_capacity,
+            )
+        };
+        // Sanity: with none of the exclusions it IS overdue.
+        assert!(base(false, None, None, false).overdue);
+        // is_paused (#229).
+        assert!(!base(true, None, None, false).overdue);
+        // auto_paused_at set (#360).
+        assert!(!base(false, Some(now), None, false).overdue);
+        // exhausted_at set (#478/#543).
+        assert!(!base(false, None, Some(now), false).overdue);
+        // at_capacity (running >= max_active_runs): the tick deliberately holds
+        // next_run_at in the past while a run is in flight — never a wedge.
+        assert!(!base(false, None, None, true).overdue);
+    }
+
+    #[test]
+    fn overdue_manual_and_none_never_flagged() {
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        // Manual schedule: no cadence => never overdue.
+        assert!(
+            !schedule_overdue(
+                Some(&Schedule::Manual),
+                stale,
+                now,
+                NO_JITTER,
+                TICK,
+                false,
+                None,
+                None,
+                false,
+            )
+            .overdue
+        );
+        // Unparseable/absent schedule (None) => never overdue.
+        assert!(
+            !schedule_overdue(None, stale, now, NO_JITTER, TICK, false, None, None, false).overdue
+        );
+    }
+
+    #[test]
+    fn overdue_next_run_at_none_never_flagged() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        assert!(
+            !schedule_overdue(
+                Some(&sched),
+                None,
+                now,
+                NO_JITTER,
+                TICK,
+                false,
+                None,
+                None,
+                false,
+            )
+            .overdue
+        );
+    }
+
+    #[test]
+    fn overdue_fleet_of_100_healthy_reports_zero_false_positives() {
+        // AC6 companion test: N=100 healthy schedules under varied cadence,
+        // jitter, overlap and an at-capacity (backfill/long-running) case must
+        // ALL report not-overdue.
+        let now = dt(2026, 1, 1, 12, 0, 0);
+        let mut flagged = Vec::new();
+        for i in 0..100u32 {
+            // Vary the cadence across interval and cron shapes.
+            let (sched, step_secs): (Schedule, i64) = match i % 4 {
+                0 => (Schedule::Interval(Duration::from_secs(300)), 300),
+                1 => (Schedule::Interval(Duration::from_secs(3600)), 3600),
+                2 => (Schedule::Cron("0 * * * *".to_string()), 3600),
+                _ => (Schedule::Cron("*/15 * * * *".to_string()), 900),
+            };
+            let jitter_secs = i64::from(i % 60); // 0..59s jitter windows
+            let jitter = Duration::from_secs(jitter_secs as u64);
+            // Fresh next_run_at: within [now - 0, now + step] — i.e. either just
+            // fired (lag up to jitter+tick) or scheduled slightly ahead. Never
+            // more than one cadence past, so grace always absorbs it.
+            let lag = i64::from(i % 30); // 0..29s late — well inside grace
+            let next_run_at = now - chrono::Duration::seconds(lag);
+            // Every 10th schedule is an overlap=Skip long-running case at
+            // capacity, with next_run_at also held stale — the exact tick
+            // retain-at-logical_date scenario. It must still report healthy.
+            let at_capacity = i % 10 == 0;
+            let next_run_at = if at_capacity {
+                now - chrono::Duration::seconds(step_secs * 5) // deep in the past
+            } else {
+                next_run_at
+            };
+            let v = schedule_overdue(
+                Some(&sched),
+                Some(next_run_at),
+                now,
+                jitter,
+                TICK,
+                false,
+                None,
+                None,
+                at_capacity,
+            );
+            if v.overdue {
+                flagged.push((i, v.overdue_by_secs));
+            }
+        }
+        assert!(
+            flagged.is_empty(),
+            "healthy fleet must report 0 overdue; false positives: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_interval_reexport_matches_internal() {
+        assert_eq!(SCHEDULER_TICK_INTERVAL, DEFAULT_SCHEDULER_TICK_INTERVAL);
+    }
 }

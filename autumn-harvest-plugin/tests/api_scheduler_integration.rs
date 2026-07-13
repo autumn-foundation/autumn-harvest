@@ -7432,3 +7432,101 @@ async fn api_trigger_preserves_dag_metadata() {
     assert_eq!(execution.runbook_url.as_deref(), Some("http://dev-runbook"));
     assert_eq!(execution.severity.as_deref(), Some("sev1"));
 }
+
+// ── Overdue-schedule read fields (issue #696) ────────────────────────────────
+
+/// Insert a workflow schedule directly with an explicit `next_run_at`.
+async fn insert_overdue_test_schedule(
+    database_url: &str,
+    wf_name: &str,
+    next_run_at: chrono::DateTime<chrono::Utc>,
+    is_paused: bool,
+) -> uuid::Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect");
+    let id = uuid::Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:60"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(is_paused),
+            dsl::next_run_at.eq(next_run_at),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("skip"),
+            dsl::buffered_runs.eq(serde_json::json!([])),
+            dsl::buffer_all_max.eq(100),
+            dsl::skip_policy.eq("skip"),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert schedule");
+    id
+}
+
+/// AC1: `GET /admin/schedules` and `/{id}` report `overdue` + `overdue_by_secs`
+/// per schedule, computed from the schedule's own `next_run_at` and cadence.
+#[tokio::test]
+async fn schedule_read_reports_overdue_fields() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let now = chrono::Utc::now();
+    // interval:60 => grace = 61s. 300s past its slot => overdue.
+    let wedged_id = insert_overdue_test_schedule(
+        &database_url,
+        "overdue_read_wedged",
+        now - chrono::Duration::seconds(300),
+        false,
+    )
+    .await;
+    // Just fired => healthy.
+    insert_overdue_test_schedule(
+        &database_url,
+        "overdue_read_healthy",
+        now - chrono::Duration::seconds(10),
+        false,
+    )
+    .await;
+
+    // List endpoint — a complete fan-out returns a bare array.
+    let (status, body) = get_json(&app, "/admin/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body.as_array().expect("schedules list is an array");
+    let wedged = entries
+        .iter()
+        .find(|e| e["name"] == "overdue_read_wedged")
+        .expect("wedged schedule present in list");
+    assert_eq!(
+        wedged["overdue"], true,
+        "wedged schedule must report overdue=true in the list"
+    );
+    let by = wedged["overdue_by_secs"]
+        .as_i64()
+        .expect("overdue_by_secs is an integer for an overdue schedule");
+    assert!(by > 0, "overdue_by_secs must be positive, got {by}");
+
+    let healthy = entries
+        .iter()
+        .find(|e| e["name"] == "overdue_read_healthy")
+        .expect("healthy schedule present in list");
+    assert_eq!(healthy["overdue"], false);
+    assert!(
+        healthy["overdue_by_secs"].is_null(),
+        "a non-overdue schedule reports null overdue_by_secs"
+    );
+
+    // Single-schedule endpoint.
+    let (status, single) = get_json(&app, format!("/admin/schedules/{wedged_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(single["overdue"], true);
+    assert!(single["overdue_by_secs"].as_i64().unwrap_or(0) > 0);
+}
