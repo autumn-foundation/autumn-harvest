@@ -1,43 +1,43 @@
-#
-#
-#
-#
-#
-#                            OS (plugin rows via `compile` mode; core rows via
-#                            `--no-default-features` (strips the default `db`,
-#                            `autumn-harvest` `integration` rows the runner adds
-#                            executed (env-gated or all-`#[ignore]`d).
-#                            live Docker Postgres; also compile-checked on every
-#                            since allos has no Postgres).
-#                            the blanket core `--no-run` step in ci.yml).
-#              allos       -> run on all 3 OSes, parallel, no live DB. For
-#              compileonly -> `--no-run` compile-check on all OSes, never
-#              credit the whole module in the coverage guard).
-#              partial `module::test` filter is allowed verbatim (it does NOT
-#     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
-#     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
-#   LC_ALL=C sort -o .github/ci/integration-suites.txt \
-#   crate    = autumn-harvest | autumn-harvest-plugin
-#   features = comma-list passed as `--features <v>`, or `-`.
-#   filter   = positional filter after `--`, or `-` for the whole target. A
-#   osclass   crate                    target       features            filter
-#   osclass  = linux       -> run on Linux, serial (`--test-threads=1`) against
-#   target   = the `--test <target>` binary (core suites use `integration`).
-# (or simply keep the header on top and `LC_ALL=C sort -u` the data lines).
-# Adding a suite = add ONE sorted line here. No `ci.yml` edit, no ALLOWLIST
 # CI integration-suite manifest — the single source of truth for which
-# Columns (whitespace-separated; `-` = none/absent):
-# `--test-threads=1` and `--no-run` are DERIVED from `osclass` by the runner and
-# `.github/ci/run-suites.sh` (which the `test` job invokes) and cross-checked
-# `manifest_is_sorted_and_unique`, fixed with:
-# are never written here — this is what keeps the `--test-threads=1`-after-`--`
-# by `autumn-harvest/tests/integration/ci_run_coverage.rs`.
-# edit for a wired suite. This file is `merge=union` (see `.gitattributes`), so
-# ordering correct by construction.
-# osclass      crate                    target                           features                   filter
 # per-suite `cargo test` runs CI executes. One suite per line. Read by
+# `.github/ci/run-suites.sh` (which the `test` job invokes) and cross-checked
+# by `autumn-harvest/tests/integration/ci_run_coverage.rs`.
+#
+# Adding a suite = add ONE sorted line here. No `ci.yml` edit, no ALLOWLIST
+# edit for a wired suite. This file is `merge=union` (see `.gitattributes`), so
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
+# `manifest_is_sorted_and_unique`, fixed with:
+#   LC_ALL=C sort -o .github/ci/integration-suites.txt \
+#     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
+#     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
+# (or simply keep the header on top and `LC_ALL=C sort -u` the data lines).
+#
+# Columns (whitespace-separated; `-` = none/absent):
+#   osclass   crate                    target       features            filter
+#
+#   osclass  = linux       -> run on Linux, serial (`--test-threads=1`) against
+#                            live Docker Postgres; also compile-checked on every
+#                            OS (plugin rows via `compile` mode; core rows via
+#                            the blanket core `--no-run` step in ci.yml).
+#              allos       -> run on all 3 OSes, parallel, no live DB. For
+#                            `autumn-harvest` `integration` rows the runner adds
+#                            `--no-default-features` (strips the default `db`,
+#                            since allos has no Postgres).
+#              compileonly -> `--no-run` compile-check on all OSes, never
+#                            executed (env-gated or all-`#[ignore]`d).
+#   crate    = autumn-harvest | autumn-harvest-plugin
+#   target   = the `--test <target>` binary (core suites use `integration`).
+#   features = comma-list passed as `--features <v>`, or `-`.
+#   filter   = positional filter after `--`, or `-` for the whole target. A
+#              partial `module::test` filter is allowed verbatim (it does NOT
+#              credit the whole module in the coverage guard).
+#
+# `--test-threads=1` and `--no-run` are DERIVED from `osclass` by the runner and
+# are never written here — this is what keeps the `--test-threads=1`-after-`--`
+# ordering correct by construction.
+#
+# osclass      crate                    target                           features                   filter
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
