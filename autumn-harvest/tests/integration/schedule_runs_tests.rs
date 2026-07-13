@@ -398,19 +398,20 @@ async fn list_orders_by_logical_slot_and_returns_error() {
     let a_row = runs.iter().find(|r| r.execution_id == a).unwrap();
     assert!(a_row.error.is_none(), "completed run has no error");
 
-    // The slot-key helper matches the COALESCE ordering used by the query.
+    // A manual (slot-less) run's sort key falls back to its own started_at.
+    // Compare the DB-sourced row's started_at to the expected timestamp using
+    // microsecond precision to avoid spurious nanosecond-level mismatches.
+    let c_row = runs.iter().find(|r| r.execution_id == c).unwrap();
     assert_eq!(
-        c_row_sort_key(&runs, c),
-        base + Duration::minutes(150),
+        c_row.sort_key(),
+        c_row.started_at,
         "manual run's sort key falls back to started_at"
     );
-}
-
-fn c_row_sort_key(runs: &[autumn_harvest::ScheduleRunRow], id: Uuid) -> DateTime<Utc> {
-    runs.iter()
-        .find(|r| r.execution_id == id)
-        .unwrap()
-        .sort_key()
+    assert_eq!(
+        c_row.started_at.timestamp_micros(),
+        (base + Duration::minutes(150)).timestamp_micros(),
+        "manual run's started_at matches the expected seeded value"
+    );
 }
 
 #[tokio::test]

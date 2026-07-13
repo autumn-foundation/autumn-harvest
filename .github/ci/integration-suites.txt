@@ -53,6 +53,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          event_batch_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          integration_e2e
+linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests

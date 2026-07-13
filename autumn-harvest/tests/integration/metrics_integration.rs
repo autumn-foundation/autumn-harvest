@@ -386,6 +386,25 @@ async fn wait_for_state(
     .unwrap_or_else(|_| panic!("workflow did not reach {expected} within timeout"))
 }
 
+/// Wait until an engine-detected replay divergence has non-terminally blocked
+/// the execution (issue #603): the run stays `RUNNING` while `nd_blocked_at`
+/// and the `search_attrs` diagnostic are stamped. On the block path the run
+/// never reaches `FAILED`, so this is the state to poll for rather than a
+/// terminal state.
+async fn wait_for_nd_block(database_url: &str, exec_id: ExecutionId) -> WorkflowExecution {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let ex = load_execution(database_url, exec_id).await;
+            if ex.nd_blocked_at.is_some() {
+                break ex;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("execution did not non-terminally block on non-determinism within timeout")
+}
+
 fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
@@ -2481,8 +2500,14 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         runner.run(&pool_for_run).await;
     });
 
-    // Wait for the workflow execution to fail.
-    let ex = wait_for_state(&database_url, exec_id, "FAILED").await;
+    // Wait for the engine-detected divergence to non-terminally BLOCK the run
+    // (issue #603): the execution stays RUNNING with `nd_blocked_at` and the
+    // `search_attrs` diagnostic stamped, rather than reaching FAILED.
+    let ex = wait_for_nd_block(&database_url, exec_id).await;
+    assert_eq!(
+        ex.state, "RUNNING",
+        "engine non-determinism now blocks non-terminally (#603); the run does not FAIL"
+    );
 
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
