@@ -11631,14 +11631,23 @@ pub(crate) async fn start_workflow(
         // this check a fresh throttled start would silently slip an armed gate.
         // Mirror the batch route: check the gate here, before `reserve_or_defer`,
         // and reject a genuinely-fresh admission with `503`. An idempotent retry —
-        // an explicit caller-supplied `workflow_id` whose start already committed
-        // (an active execution) OR is already durably deferred (a pending throttle
-        // row) — is NOT a fresh admission (`reserve_or_defer` resolves it to the
-        // existing run / same pending row without inserting anything new), so the
-        // gate must not block it (preserves #808 keyed-replay and the round-7
-        // pending-throttle-row bypass). We already know this workflow resolves a
-        // throttle policy (the enclosing `if let`), so the batch route's extra
-        // `workflow_resolving_throttle(...).is_some()` guard is redundant here.
+        // an explicit caller-supplied `workflow_id` whose resolved reuse policy
+        // ATTACHES to an existing prior (or errors `AlreadyExists`) rather than
+        // creating a fresh execution, OR that is already durably deferred (a
+        // pending throttle row) — is NOT a fresh admission (`reserve_or_defer`
+        // resolves it to the existing run / same pending row without inserting
+        // anything new), so the gate must not block it (preserves #808
+        // keyed-replay and the round-7 pending-throttle-row bypass). The bypass
+        // is reuse-policy-AWARE (Codex P1): a policy that genuinely CREATES a
+        // fresh execution on retry — `AllowDuplicateFailedOnly` over a
+        // FAILED/CANCELLED prior, or `TerminateIfRunning` — is a real admission
+        // and must face the gate, or the token-empty `Deferred` path would let a
+        // fresh replacement start slip an armed gate. This keys the decision on
+        // the SAME `start_will_create_new_execution` predicate the authoritative
+        // core locked gate uses (see `execution.rs`). We already know this
+        // workflow resolves a throttle policy (the enclosing `if let`), so the
+        // batch route's extra `workflow_resolving_throttle(...).is_some()` guard
+        // is redundant here.
         if let Some((gate_id, gate_reason, scope_kind)) = {
             let wf_owner = runtime
                 .registry
@@ -11655,22 +11664,36 @@ pub(crate) async fn start_workflow(
             // the already-held shard connection `conn` (the batch route acquires a
             // fresh one only because it holds no per-item shard connection yet).
             let is_idempotent_retry = explicit_workflow_id && {
-                let has_execution = harvest_workflow_executions::table
+                // Load the prior run's STATE using the SAME non-sealed filter the
+                // authoritative locked gate applies (`try_load_active_execution_for_update`
+                // in `execution.rs`). The partial unique index guarantees at most
+                // one non-sealed row per `(workflow_name, workflow_id)`, so
+                // `.first()` is deterministic (there is no active-vs-terminal
+                // ambiguity to resolve).
+                let prior_state = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
                     .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                     .filter(
-                        // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
-                        // or TERMINATED is returned without inserting a new one.
                         harvest_workflow_executions::state
                             .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                     )
-                    .select(harvest_workflow_executions::id)
-                    .first::<uuid::Uuid>(&mut conn)
+                    .select(harvest_workflow_executions::state)
+                    .first::<String>(&mut conn)
                     .await
                     .optional()
-                    .unwrap_or(None)
-                    .is_some();
-                has_execution
+                    .unwrap_or(None);
+                // Bypass the gate only when the resolved reuse policy would NOT
+                // create a fresh execution (attach, or `AlreadyExists`) — the
+                // exact question the core gate keys on. A `None` prior, or a
+                // create-on-retry policy (`AllowDuplicateFailedOnly` +
+                // FAILED/CANCELLED prior, `TerminateIfRunning`), returns `true`
+                // here, so `attaches_to_existing` is `false` and the gate blocks.
+                let attaches_to_existing =
+                    !autumn_harvest::execution::start_will_create_new_execution(
+                        prior_state.as_deref(),
+                        reuse_policy,
+                    );
+                attaches_to_existing
                     || autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
                         &mut conn,
                         &workflow_name,

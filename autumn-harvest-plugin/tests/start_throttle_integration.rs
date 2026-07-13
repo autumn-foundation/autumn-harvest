@@ -351,6 +351,31 @@ async fn seed_empty_bucket(
     .expect("seed empty bucket");
 }
 
+/// Directly seed a prior `harvest_workflow_executions` row (shard 0 — the
+/// single-shard `ShardRouter::default()` used by these tests) in a given
+/// terminal/active `state`, so the reuse-policy matrix has a real prior to
+/// resolve against. Used to prove the throttle admission-gate bypass is
+/// reuse-policy-aware (Codex P1, PR #1051).
+async fn seed_execution(
+    conn: &mut diesel_async::AsyncPgConnection,
+    wf_name: &str,
+    workflow_id: &str,
+    state: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, queue_name, state) \
+         VALUES ($1, $2, $3, 0, '{}'::jsonb, 'default', $4)",
+    )
+    .bind::<SqlUuid, _>(uuid::Uuid::new_v4())
+    .bind::<Text, _>(wf_name)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Text, _>(state)
+    .execute(conn)
+    .await
+    .expect("seed prior execution");
+}
+
 /// Issue #607 round 4: `schedule_backfill`'s workflow branch previously
 /// admitted every backfilled slot immediately, bypassing throttle pacing
 /// entirely -- an operator backfilling hundreds of slots for a throttled
@@ -956,6 +981,110 @@ async fn retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
         status3,
         StatusCode::SERVICE_UNAVAILABLE,
         "a genuinely fresh start must still be blocked by the gate: {body3:?}"
+    );
+}
+
+/// Codex P1 (PR #1051): the throttle admission-gate bypass must be
+/// reuse-policy-AWARE. A retry carrying an explicit `workflow_id` whose
+/// resolved reuse policy CREATES a fresh execution — `allow_duplicate_failed_only`
+/// over a FAILED/CANCELLED prior, or `terminate_if_running` — is a genuinely
+/// fresh admission and must be blocked by an armed gate, NOT slip through the
+/// token-empty `Deferred` path and persist a gate-less pending throttle row.
+///
+/// Before the fix, the committed-prior bypass treated ANY non-sealed prior as
+/// an idempotent retry, so these two policies (which replace the prior with a
+/// fresh run) deferred `202` under an armed gate and wrote a pending row that
+/// later fired gate-less — a fresh replacement start slipping the gate.
+#[tokio::test]
+async fn armed_gate_blocks_fresh_creating_start_under_reuse_policy_on_empty_bucket() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, api_state) = build_app_with_state(&pool, throttled_info("100/m", 1.0));
+    let mut conn = raw_connect(&url).await;
+
+    // Empty bucket so any admission that REACHES `reserve_or_defer` DEFERS (202)
+    // — isolating "blocked by the gate" from "no token available".
+    seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
+
+    // Arm a fleet-wide admission gate blocking all new admissions.
+    api_state.initialize_gate_cache(vec![autumn_harvest::AdmissionGate {
+        id: autumn_harvest::AdmissionGateId(uuid::Uuid::new_v4()),
+        scope: autumn_harvest::GateScope::Fleet,
+        reason: "incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        expires_at: None,
+    }]);
+
+    // --- Scenario A: allow_duplicate_failed_only over a FAILED prior CREATES. ---
+    seed_execution(&mut conn, "sync_tenant", "failed-job", "FAILED").await;
+    let (status_a, body_a) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({
+            "workflow_id": "failed-job",
+            "reuse_policy": "allow_duplicate_failed_only",
+            "input": { "tenant_id": "acme" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status_a,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "allow_duplicate_failed_only over a FAILED prior CREATES a fresh execution \
+         and must be blocked by the armed gate, not deferred: {body_a:?}"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        0,
+        "a gate-blocked fresh-creating start must NOT persist a pending throttle row"
+    );
+
+    // --- Scenario B: terminate_if_running over a RUNNING prior CREATES. ---
+    seed_execution(&mut conn, "sync_tenant", "running-job", "RUNNING").await;
+    let (status_b, body_b) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({
+            "workflow_id": "running-job",
+            "reuse_policy": "terminate_if_running",
+            "input": { "tenant_id": "acme" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status_b,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "terminate_if_running over a RUNNING prior CREATES a fresh execution \
+         and must be blocked by the armed gate, not deferred: {body_b:?}"
+    );
+    assert_eq!(
+        throttle_row_count(&mut conn, "sync_tenant").await,
+        0,
+        "no pending throttle row for either gate-blocked fresh-creating start"
+    );
+
+    // --- No over-block: allow_duplicate over the SAME FAILED prior ATTACHES ---
+    // (does NOT create), so it is NOT a fresh admission and the reuse-policy-aware
+    // predicate must still bypass the gate — proving the fix discriminates in
+    // both directions, not a blanket "any prior -> block". The gate blocked
+    // Scenario A before any mutation, so "failed-job" is still FAILED here.
+    let (status_c, body_c) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({
+            "workflow_id": "failed-job",
+            "reuse_policy": "allow_duplicate",
+            "input": { "tenant_id": "acme" }
+        }),
+    )
+    .await;
+    assert_ne!(
+        status_c,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "allow_duplicate over a non-sealed prior ATTACHES (no create) and must NOT \
+         be blocked by the gate: {body_c:?}"
     );
 }
 
