@@ -76,6 +76,7 @@ linux        autumn-harvest-plugin  read_path_decode_integration     -          
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  start_idempotency_integration    -                          -
+linux        autumn-harvest-plugin  start_throttle_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -

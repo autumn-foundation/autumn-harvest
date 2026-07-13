@@ -232,7 +232,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
         ALLOWLIST_DEBT_REASON,
     ),
     ("plugin:stalled_workflow_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:start_throttle_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:telemetry_propagation_tests", ALLOWLIST_DEBT_REASON),
     ("plugin:terminate_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:usage_integration", ALLOWLIST_DEBT_REASON),
