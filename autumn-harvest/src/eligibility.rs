@@ -33,6 +33,13 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
         return Ok(Vec::new());
     }
 
+    tokenize_requirements(s)?
+        .into_iter()
+        .map(|token| parse_single_requirement(&token))
+        .collect()
+}
+
+fn tokenize_requirements(s: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_brackets = false;
@@ -79,12 +86,7 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
         tokens.push(trimmed.to_string());
     }
 
-    let mut requirements = Vec::new();
-    for token in tokens {
-        requirements.push(parse_single_requirement(&token)?);
-    }
-
-    Ok(requirements)
+    Ok(tokens)
 }
 
 fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
