@@ -42,6 +42,47 @@ use uuid::Uuid;
 
 type HarvestApiApp = axum::Router;
 
+/// Derive a per-shard database URL from the admin/base URL, replacing the
+/// database-name path segment with `dbname` while preserving any query string
+/// (e.g. `?sslmode=require`). The query is split off *before* the path segment
+/// is swapped so it is never lost. A URL with no query yields
+/// `{prefix}/{dbname}`, byte-identical to the previous `rsplit_once('/')` build.
+fn shard_url(base_url: &str, dbname: &str) -> String {
+    let (base, query) = match base_url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (base_url, None),
+    };
+    let prefix = base.rsplit_once('/').map_or(base, |(prefix, _)| prefix);
+    query.map_or_else(
+        || format!("{prefix}/{dbname}"),
+        |q| format!("{prefix}/{dbname}?{q}"),
+    )
+}
+
+#[test]
+fn shard_url_preserves_query_params() {
+    // No query — byte-identical to the old `rsplit_once('/')` construction.
+    assert_eq!(
+        shard_url("postgres://u:p@host:5432/postgres", "shard0"),
+        "postgres://u:p@host:5432/shard0"
+    );
+    // Query params (sslmode, application_name, ...) must survive the swap.
+    assert_eq!(
+        shard_url(
+            "postgres://u:p@host:5432/postgres?sslmode=require",
+            "shard0"
+        ),
+        "postgres://u:p@host:5432/shard0?sslmode=require"
+    );
+    assert_eq!(
+        shard_url(
+            "postgres://u:p@host:5432/postgres?sslmode=require&application_name=harvesttest",
+            "shard1"
+        ),
+        "postgres://u:p@host:5432/shard1?sslmode=require&application_name=harvesttest"
+    );
+}
+
 /// Two independent shard databases plus an optional container guard.
 ///
 /// With `HARVEST_TEST_DATABASE_URL` set, two fresh databases are created and
@@ -75,13 +116,11 @@ async fn setup_two_shards() -> ((String, String), Option<ContainerAsync<Postgres
             .expect("create db");
     }
 
-    // Rebuild the base URL (strip the trailing `/<dbname>`) so we can address
-    // the freshly-created shard databases.
-    let base = admin_url
-        .rsplit_once('/')
-        .map_or_else(|| admin_url.clone(), |(prefix, _)| prefix.to_string());
-    let url0 = format!("{base}/{s0}");
-    let url1 = format!("{base}/{s1}");
+    // Address the freshly-created shard databases by swapping the database-name
+    // path segment, preserving any query string (e.g. `?sslmode=require`) that
+    // the admin URL may carry.
+    let url0 = shard_url(&admin_url, &s0);
+    let url1 = shard_url(&admin_url, &s1);
     for url in [&url0, &url1] {
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
             .await
