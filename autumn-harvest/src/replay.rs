@@ -2724,6 +2724,26 @@ impl HistoryMatcher {
         false
     }
 
+    /// Pure, read-only scan: does recorded history contain **any**
+    /// `TimerStarted` event for `timer_id`?
+    ///
+    /// Used by `wait_for_signal_timeout`'s signal-win branch (issue #476) to
+    /// decide whether a durable deadline-timer row was ever armed and therefore
+    /// needs a `CancelRaceLosers` teardown. When a signal arrived *before* the
+    /// race started on the live run, `match_signal_or_timer` short-circuits to
+    /// `SignalWon` without ever recording a `TimerStarted` — no timer row exists,
+    /// so no teardown must be emitted. Does not touch the cursor or any
+    /// consumption state.
+    #[must_use]
+    pub fn history_contains_timer_started(&self, timer_id: &str) -> bool {
+        self.events.iter().any(|ev| {
+            matches!(
+                ev,
+                WorkflowEvent::TimerStarted { timer_id: id, .. } if id.as_str() == timer_id
+            )
+        })
+    }
+
     /// Match a timer command against history.
     ///
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
@@ -7174,6 +7194,48 @@ mod tests {
         assert!(
             matcher.is_timer_started_next("condition-timeout"),
             "timer peek should skip an unconsumed detached-spawn event"
+        );
+    }
+
+    #[test]
+    fn matcher_history_contains_timer_started_scans_whole_history() {
+        // Present regardless of cursor position or consumption.
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("__signal_timeout:1:approval"),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.history_contains_timer_started("__signal_timeout:1:approval"),
+            "the armed deadline timer must be found anywhere in history"
+        );
+        assert!(
+            !matcher.history_contains_timer_started("__signal_timeout:1:other"),
+            "a different timer id must not match"
+        );
+    }
+
+    #[test]
+    fn matcher_history_contains_timer_started_false_when_never_armed() {
+        // The stashed-signal short-circuit case: a signal arrived before the
+        // race started, so no TimerStarted was ever recorded.
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approval".into(),
+            payload: serde_json::json!({"approved": false}),
+        }];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.history_contains_timer_started("__signal_timeout:1:approval"),
+            "no teardown target exists when the deadline timer was never armed"
         );
     }
 

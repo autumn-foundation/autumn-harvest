@@ -6331,6 +6331,52 @@ impl WorkflowContext {
     /// `timeout` is rounded **up** to whole seconds (durable timers are
     /// second-granular).
     ///
+    /// # Deadline-timer teardown on signal-win
+    ///
+    /// When the signal wins, the still-armed deadline timer is proactively torn
+    /// down by a `CancelRaceLosers` bookkeeping command that durably deletes the
+    /// `__signal_timeout:{seq}` row from `harvest_timers` (issue #476 parity with
+    /// the child-timeout twin, `spawn_child_workflow_timeout`). An unfired timer
+    /// row (`fired = false`) would otherwise pin the completed workflow forever
+    /// — `retention::should_skip_candidate` blocks retention on any pending timer,
+    /// and the completed run's task is terminal so no later claim ever fires it.
+    ///
+    /// # Deadline-ordering asymmetry vs the child-timeout twin
+    ///
+    /// Unlike `spawn_child_workflow_timeout` (which needs
+    /// `worker::materialize_due_child_timeout_deadlines` because a child terminal
+    /// can be appended to the parent history *out-of-band* before an overdue
+    /// `TimerFired`), the signal race needs no such deadline-materialization: a
+    /// `SignalReceived` event is **never** appended out-of-band. `send_signal`
+    /// only queues a `harvest_signals` row (with a DB-clock `received_at`) and
+    /// wakes the task; the `SignalReceived` event is materialized **solely** at
+    /// the target workflow's own claim time by `worker::ingest_due_timers_and_signals`,
+    /// which atomically interleaves due timers and pending signals by DB clock
+    /// (`received_at < fires_at` ⇒ signal-first, ties ⇒ timer). So a signal that
+    /// arrived at or after the deadline is always recorded *after* the
+    /// `TimerFired` in the same atomic ingest, and the over-deadline reorder
+    /// hazard is structurally unreachable here (see
+    /// `signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeeded`,
+    /// which pins the late-signal-loses contract).
+    ///
+    /// # Known limitation — panic / hard-cap before the teardown is persisted
+    ///
+    /// The signal-win teardown is a `CancelRaceLosers` bookkeeping command that
+    /// is durably applied when that decision cycle's commands persist — so the
+    /// "no leaked timer" guarantee holds for every *normal* resolution. It does
+    /// **not** hold when the workflow function **panics** after the signal-win
+    /// branch: the issue #782 panic-containment contract deliberately discards a
+    /// panicked cycle's entire command buffer (untrustworthy) on both the retry
+    /// and the terminal path, so a panic that recurs until the panic-retry budget
+    /// is exhausted seals the workflow with the deadline timer row un-deleted.
+    /// Similarly, if the workflow hits its event-history hard cap on the same
+    /// cycle the signal-win resolves, the hard-cap seal
+    /// (`fail_workflow_for_history_cap`) bypasses the pending-command persist path
+    /// and drops the `CancelRaceLosers` cleanup. Both are the same broad,
+    /// pre-existing "terminal-seal / panicked-cycle drops pending commands" class
+    /// shared by the child-timeout twin and the #601 fan-out limitation — not
+    /// signal-timeout-specific and out of scope for a local fix.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::NonDeterministic`] if replay history diverges
@@ -6385,7 +6431,40 @@ impl WorkflowContext {
         });
 
         let result = match history_match {
-            SignalOrTimerMatch::SignalWon { payload } => Some(payload),
+            SignalOrTimerMatch::SignalWon { payload } => {
+                // Signal wins. Proactively tear down the still-armed deadline
+                // timer: `CancelRaceLosers` durably deletes the
+                // `__signal_timeout:{seq}` row via `queue::delete_pending_timer`,
+                // mirroring the child-timeout twin
+                // (`spawn_child_workflow_timeout`) and `ctx.race()`'s own signal
+                // wrapper (`race_timer_signal_impl`, which now delegates this
+                // teardown here rather than duplicating it). An unfired
+                // `harvest_timers` row (`fired = false`) would otherwise pin the
+                // terminal workflow forever — `retention::should_skip_candidate`
+                // blocks retention on any pending timer, and the completed run's
+                // task is terminal so no later claim ever fires it — and could
+                // surface a stray `TimerFired` on an unrelated later wake. The
+                // delete appends NO event, so pushing it on every replay cycle
+                // (not just the first) is strict-replay-safe: there is no marker
+                // to gate on for this bookkeeping-only command.
+                //
+                // Gate on whether the deadline timer was ever armed in recorded
+                // history: when a signal arrived *before* the race started on the
+                // live run, `match_signal_or_timer` short-circuits to `SignalWon`
+                // without ever recording a `TimerStarted` — no `harvest_timers`
+                // row exists, so emitting a teardown for it would be a spurious
+                // (if idempotent) command. (The child-timeout twin has no such
+                // case: its child and timer are always armed together in one
+                // mixed batch.)
+                if self.match_history(|m| m.history_contains_timer_started(&timer_id)) {
+                    self.push_command(WorkflowCommand::CancelRaceLosers {
+                        activities: Vec::new(),
+                        children: Vec::new(),
+                        timers: vec![TimerId::new(&timer_id)],
+                    });
+                }
+                Some(payload)
+            }
             SignalOrTimerMatch::TimerWon => {
                 // Advance the virtual clock (same coupling as timer() above).
                 // Signal-won path advances nothing — no TimerStarted event recorded.
@@ -6410,15 +6489,50 @@ impl WorkflowContext {
                     self.check_strict_replay_no_match(&format!(
                         "SignalOrTimer({signal_name}, {timer_id})"
                     ))?;
-                } else if self.strict_replay {
-                    // Strict replay (WorkflowReplayer) always gets complete
-                    // histories — an unresolved race is a fixture problem.
-                    return Err(self.nd_error(
-                        format!("signal-or-timeout race '{signal_name}' started but unresolved in history"),
-                        self.match_history(|m| i32::try_from(m.position()).ok()),
-                        Some("SignalOrTimerResolved".to_string()),
-                        Some("SignalOrTimerInProgress".to_string()),
-                    ));
+                } else {
+                    // InProgress: a running workflow parked on this race replays
+                    // to `InProgress` at the recorded-history frontier. The deploy
+                    // canary samples exactly such executions and expects them to
+                    // *suspend* (ReplaySucceeded), so mirror
+                    // `check_strict_replay_no_match`'s canary-at-end exception (and
+                    // the child-timeout twin, `spawn_child_workflow_timeout`): fall
+                    // through to re-park (which suspends) rather than reporting a
+                    // false non-determinism. A genuine mid-history divergence never
+                    // reaches this arm (it returns `Diverged`); an unresolved race
+                    // with real events still after it (a fixture bug) stays a hard
+                    // error. Strict `WorkflowReplayer` runs (non-canary) always get
+                    // complete histories, so an unresolved race there is still a
+                    // fixture problem.
+                    //
+                    // "At frontier" must treat trailing transparent update events
+                    // (`UpdateAdmitted`/`UpdateCompleted`/`UpdateFailed`) exactly
+                    // as the global unconsumed check does (mirrors the twin, issue
+                    // #779 Codex P2): `match_signal_or_timer`'s `InProgress` scan
+                    // skips them via `scan_cursor += 1` WITHOUT consuming them, so
+                    // it leaves the cursor positioned BEFORE them and a raw
+                    // `position() >= len()` check would read false for a healthy
+                    // in-flight race merely woken by an update.
+                    // `has_non_lifecycle_unconsumed` skips update (and terminal-
+                    // lifecycle) events, so it agrees with
+                    // `history_has_unconsumed_events` — the same authority the
+                    // executor uses to decide a suspend is clean.
+                    let (position, at_frontier) = self.match_history(|m| {
+                        (
+                            i32::try_from(m.position()).ok(),
+                            !m.has_non_lifecycle_unconsumed(),
+                        )
+                    });
+                    if self.strict_replay && !(self.canary_mode && at_frontier) {
+                        return Err(self.nd_error(
+                            format!(
+                                "signal-or-timeout race '{signal_name}' started but \
+                                 unresolved in history"
+                            ),
+                            position,
+                            Some("SignalOrTimerResolved".to_string()),
+                            Some("SignalOrTimerInProgress".to_string()),
+                        ));
+                    }
                 }
 
                 // First live run (NoMatch) or re-park after a spurious wake
@@ -8018,8 +8132,11 @@ impl WorkflowContext {
     /// Thin wrapper around [`wait_for_signal_timeout`](Self::wait_for_signal_timeout)
     /// (issue #476) for the exactly-one-timer + exactly-one-signal race shape.
     /// A losing signal simply stays observable (nothing to durably cancel); a
-    /// losing timer's durable row is removed by the worker exactly as it is
-    /// today for `wait_for_signal_timeout`'s signal-won branch.
+    /// losing timer's durable row is torn down by the direct
+    /// `wait_for_signal_timeout` API's own signal-won branch (which this wrapper
+    /// delegates to via `wait_for_signal_timeout_with_timer_id`), so this
+    /// wrapper adds no teardown of its own — doing so would double-push an
+    /// (idempotent but redundant) `CancelRaceLosers`.
     async fn race_timer_signal_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
         // Fixed, role-based indices (NOT each branch's position in the builder
         // chain): the winner for this shape is decided entirely by
@@ -8052,27 +8169,14 @@ impl WorkflowContext {
             .expect("validated by caller: exactly one timer branch");
 
         let timeout = std::time::Duration::from_secs(duration_secs);
-        let (payload, timer_id) = self
+        // On signal-win, `wait_for_signal_timeout_with_timer_id` itself pushes
+        // the `CancelRaceLosers` that durably deletes the now-stale deadline
+        // timer row (issue #476 parity fix, mirroring the child-timeout twin).
+        // This wrapper therefore adds no teardown of its own — re-pushing here
+        // would be a redundant (idempotent) double-cancel.
+        let (payload, _timer_id) = self
             .wait_for_signal_timeout_with_timer_id(&signal_name, timeout)
             .await?;
-        if payload.is_some() {
-            // Signal won: the durable timer row armed above is now a stale
-            // loser that would otherwise sit PENDING until its original
-            // deadline -- blocking retention (`harvest_timers.fired = false`
-            // rows keep an otherwise-terminal execution alive) and risking an
-            // unrelated stray `TimerFired` on a later wake. `CancelRaceLosers`
-            // already knows how to durably delete a losing timer row
-            // (mirroring the activity/child-workflow shapes' loser cleanup);
-            // reuse it here with no activities/children. Unlike those shapes
-            // this never appends an event, so it is safe to push on every
-            // resolution of this race, not just the first (there is no
-            // marker to gate on for this shape).
-            self.push_command(WorkflowCommand::CancelRaceLosers {
-                activities: Vec::new(),
-                children: Vec::new(),
-                timers: vec![TimerId::new(&timer_id)],
-            });
-        }
         Ok(payload.map_or_else(
             || RaceWinner {
                 index: TIMER_INDEX,
@@ -14858,7 +14962,93 @@ mod tests {
             .await
             .expect("race should replay");
         assert_eq!(result, Some(serde_json::json!({"approved": true})));
-        assert!(ctx.drain_commands().is_empty());
+
+        // Signal-win must proactively tear down the still-armed deadline timer
+        // (issue #476 parity with the child-timeout twin): exactly one
+        // bookkeeping-only CancelRaceLosers targeting the race timer.
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "signal-win must push exactly one CancelRaceLosers to tear down the \
+             deadline timer: {commands:?}"
+        );
+        let WorkflowCommand::CancelRaceLosers {
+            activities,
+            children,
+            timers,
+        } = &commands[0]
+        else {
+            panic!("expected CancelRaceLosers, got {:?}", commands[0]);
+        };
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
+        assert_eq!(
+            timers,
+            &vec![TimerId::new("__signal_timeout:1:approval")],
+            "the still-armed deadline timer must be targeted for durable deletion"
+        );
+    }
+
+    /// Lead 1 (issue #476 parity): the signal-win branch of
+    /// `wait_for_signal_timeout` must durably cancel the still-armed deadline
+    /// timer, mirroring the child-timeout twin
+    /// (`spawn_child_workflow_timeout`). An unfired `harvest_timers` row
+    /// (`fired = false`) would otherwise pin the terminal workflow forever —
+    /// `retention::should_skip_candidate` blocks retention on any pending
+    /// timer, and a completed run's task is terminal so no later claim ever
+    /// fires it. Exactly one bookkeeping-only `CancelRaceLosers` targeting the
+    /// race timer, no children/activities.
+    #[tokio::test]
+    async fn wait_for_signal_timeout_signal_win_cancels_the_deadline_timer() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, Some(serde_json::json!({"approved": true})));
+
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "signal-win must push exactly one CancelRaceLosers to tear down the \
+             deadline timer: {commands:?}"
+        );
+        let WorkflowCommand::CancelRaceLosers {
+            activities,
+            children,
+            timers,
+        } = &commands[0]
+        else {
+            panic!("expected CancelRaceLosers, got {:?}", commands[0]);
+        };
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
+        assert_eq!(
+            timers,
+            &vec![timer_id],
+            "the still-armed deadline timer must be targeted for durable deletion"
+        );
     }
 
     #[tokio::test]
@@ -15045,6 +15235,48 @@ mod tests {
         assert!(
             ctx.drain_commands().is_empty(),
             "no timer must be started when the signal already won"
+        );
+    }
+
+    /// Lead 1 gate guard (issue #476 parity): the stashed-signal-before-race
+    /// short-circuit records no `TimerStarted`, so there is no armed deadline
+    /// timer to tear down — the signal-win teardown push is gated on
+    /// `history_contains_timer_started`, and this path must emit **zero**
+    /// `CancelRaceLosers`. This locks the API-level gate against a future
+    /// unconditional-push regression (the matcher-level false case is covered
+    /// in `replay.rs`).
+    #[tokio::test]
+    async fn wait_for_signal_timeout_stashed_signal_before_race_emits_no_teardown() {
+        let payload = serde_json::json!({"approved": false});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: payload.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, Some(payload));
+
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::CancelRaceLosers { .. }))
+                .count(),
+            0,
+            "no timer was armed, so no CancelRaceLosers teardown must be emitted: {commands:?}"
         );
     }
 
@@ -18148,6 +18380,16 @@ mod tests {
             )),
             "the now-stale still-armed timer must be queued for durable \
              deletion so it doesn't block retention or fire later: {commands:?}"
+        );
+        // Length-guard the wrapper path against a double-push regression: the
+        // signal-win teardown must be emitted exactly once.
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::CancelRaceLosers { .. }))
+                .count(),
+            1,
+            "exactly one CancelRaceLosers teardown must be pushed on signal-win: {commands:?}"
         );
         Ok(())
     }
