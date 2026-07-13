@@ -32,7 +32,7 @@ use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::executor::{
     QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay,
-    history_reached_terminal_seal,
+    drive_query_replay_async, history_reached_terminal_seal,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -124,6 +124,63 @@ fn construction_panicking_query_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     panic!("boom constructing query workflow future");
+}
+
+/// Like [`progress_workflow`], but after processing every item it parks on
+/// `ctx.await_condition(|| false)` — a **command-less cold park**: its
+/// `Future::poll` returns `Pending` without pushing any workflow command and
+/// **without registering the waker** (it ignores `_cx`), so it never self-wakes.
+/// This is the exact case the three-way suspension discriminator (issue #612)
+/// must classify as an immediate `Suspended` (case 3), *not* busy-drive to the
+/// deadline: a RUNNING query over such a park must serve fast, and a terminal run
+/// sealed while parked on it must serve its partial state (200), not 408/410.
+fn await_condition_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let processed = Arc::new(Mutex::new(0u64));
+        let state = processed.clone();
+        ctx.register_query_handler::<Value, u64, _>("progress", move |_req: &Value| {
+            Ok(*state.lock().expect("counter lock poisoned"))
+        });
+
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            ctx.execute_activity_raw("process_item", item.clone(), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            *processed.lock().expect("counter lock poisoned") += 1;
+        }
+
+        // Park forever on a predicate that never holds. `await_condition` pushes
+        // no command and never wakes — during a query drive nothing re-polls it.
+        ctx.await_condition(|| false).await.map_err(|e| e.to_string())?;
+        // Unreachable: the predicate is always false.
+        Ok(Value::Null)
+    })
+}
+
+/// A workflow that spins forever via `tokio::task::yield_now()` — the in-runtime
+/// case the old waker-only heuristic misclassified. Inside a tokio runtime
+/// `yield_now` DEFERS its wake to the scheduler queue, so the async driver
+/// ([`drive_query_replay_async`]) must open its quiet window to observe the wake
+/// and keep driving to the deadline (case 2 → `TimedOut` → 408), rather than
+/// misread the first `Poll::Pending` as a suspension.
+fn spinning_query_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.register_query_handler::<Value, u64, _>("progress", |_req: &Value| Ok(0u64));
+        loop {
+            tokio::task::yield_now().await;
+        }
+    })
 }
 
 // ── History builders ──────────────────────────────────────────────────────
@@ -494,6 +551,159 @@ fn running_partial_history_still_serves_query_without_error() {
         result,
         json!(2),
         "running path serves partial internal state"
+    );
+}
+
+#[test]
+fn running_await_condition_park_suspends_fast_and_serves_partial_state() {
+    // Issue #612 core bug proof (RED against the old `any_pending_command` guard).
+    // A RUNNING workflow that processed all its recorded activities and then
+    // parked on `ctx.await_condition(|| false)` — a COMMAND-LESS COLD PARK: it
+    // pushes no workflow command and never registers its waker, so nothing
+    // re-polls it during a query drive. The three-way discriminator must classify
+    // it as an immediate `Suspended` (case 3) so the query serves the partial
+    // state FAST, rather than busy-driving to `query_timeout` (which the old
+    // `!flag && any_pending_command(...)` guard did: no command was ever pushed,
+    // so the peek was false, and the drive fell to the deadline).
+    let (exec_id, input, events) = complete_history(&["a", "b", "c"], false);
+    assert!(
+        !history_reached_terminal_seal(&events),
+        "no terminal event → this is the RUNNING path"
+    );
+    let ctx = build_ctx(exec_id, events);
+
+    let started = std::time::Instant::now();
+    let outcome = drive_query_replay(&ctx, await_condition_workflow, input, QUERY_BUDGET);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::Suspended,
+        "a command-less `await_condition` cold park must classify Suspended \
+         immediately (case 3), not drive to the deadline"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the drive must return fast (well under the {QUERY_BUDGET:?} budget); \
+         the old any_pending_command guard would busy-drive the full budget — \
+         elapsed was {elapsed:?}"
+    );
+
+    // Running path: a Suspended outcome still serves the reconstructed partial
+    // state (the query is answerable; it is NEVER turned into a 410 here).
+    let result = ctx
+        .execute_query("progress")
+        .expect("progress must be registered before await_condition parks");
+    assert_eq!(
+        result,
+        json!(3),
+        "query reads the count reached at the await_condition park point"
+    );
+}
+
+#[test]
+fn terminal_sealed_while_await_condition_parked_serves_partial_state() {
+    // Issue #612: a run the engine sealed (TIMED_OUT) while its function was
+    // parked command-less on `await_condition`. The drive parks at
+    // await_condition → Suspended, but the history carries a terminal lifecycle
+    // seal and all non-lifecycle history is consumed, so the terminal-query
+    // classifier must Serve (200) the reconstructed partial state — NOT 408
+    // (which the old any_pending_command guard produced by driving to the
+    // deadline) and NOT 410.
+    let (exec_id, input, mut events) = complete_history(&["a", "b"], false);
+    events.push(WorkflowEvent::WorkflowExecutionTimedOut {
+        deadline: Utc::now() - ChronoDuration::seconds(1),
+        timed_out_at: Utc::now(),
+    });
+    let sealed = history_reached_terminal_seal(&events);
+    assert!(sealed, "a WorkflowExecutionTimedOut history is sealed");
+    let ctx = build_ctx(exec_id, events);
+
+    let outcome = drive_query_replay(&ctx, await_condition_workflow, input, QUERY_BUDGET);
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::Suspended,
+        "await_condition parks forever → Suspended, not ReachedTerminal"
+    );
+    assert_eq!(
+        classify_terminal_query(outcome, sealed, ctx.history_has_unconsumed_events()),
+        TerminalQueryDecision::Serve,
+        "Suspended + terminal seal (TIMED_OUT), only the lifecycle seal \
+         unconsumed → serve (200), never 408/410"
+    );
+    assert_eq!(
+        ctx.execute_query("progress").expect("progress registered"),
+        json!(2),
+        "partial count at the recorded terminal point (both activities completed)"
+    );
+}
+
+#[test]
+fn genuine_command_suspension_serves_partial_state() {
+    // Case 1 of the three-way discriminator: the workflow parks on an UNRECORDED
+    // activity, which pushes a replay-significant command on THAT poll (a positive
+    // per-poll command delta). This must classify Suspended and remain answerable
+    // — distinct from the zero-delta cold-park (case 3) and spin (case 2) paths.
+    let (exec_id, input, events) = insufficient_history(&["a", "b", "c"], 1);
+    let ctx = build_ctx(exec_id, events);
+
+    let outcome = drive_query_replay(&ctx, progress_workflow, input, QUERY_BUDGET);
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::Suspended,
+        "an unrecorded activity emits a command this poll → CommandSuspension"
+    );
+    assert_eq!(
+        ctx.execute_query("progress").expect("progress registered"),
+        json!(1),
+        "one recorded activity processed before the command-suspension"
+    );
+}
+
+#[tokio::test]
+async fn async_driver_await_condition_cold_park_classifies_suspended_in_runtime() {
+    // Async-driver counterpart to the sync cold-park test, run INSIDE a tokio
+    // runtime. `drive_query_replay_async` opens a `yield_now().await` quiet window
+    // on a zero-delta poll to observe tokio's deferred `yield_now` wake; a
+    // command-less `await_condition` park never wakes, so after the quiet window
+    // the flag is still cold → case 3 → Suspended immediately (fast serve), NOT
+    // misread as a self-wake spin.
+    let (exec_id, input, events) = complete_history(&["a", "b"], false);
+    let ctx = build_ctx(exec_id, events);
+
+    let outcome =
+        drive_query_replay_async(&ctx, await_condition_workflow, input, QUERY_BUDGET).await;
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::Suspended,
+        "in a runtime, a command-less await_condition park classifies Suspended \
+         (case 3), not busy-driven to the deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_driver_in_runtime_yield_now_spin_drives_to_deadline() {
+    // The exact in-runtime scenario the old waker-only PR-D heuristic got wrong,
+    // now covered WITHOUT testcontainers. `spinning_query_workflow` loops on
+    // `tokio::task::yield_now()`, whose wake tokio DEFERS to the scheduler queue
+    // inside a runtime. The async driver's quiet-window `yield_now().await`
+    // flushes that deferred queue → the flag flips → case 2 → keep driving to the
+    // deadline → TimedOut (→ 408). A `multi_thread` runtime also makes the drive
+    // future's `Send`-ness a compile-time regression guard.
+    let (exec_id, input, events) = complete_history(&["a"], false);
+    let ctx = build_ctx(exec_id, events);
+
+    // A small budget bounds the spin; the driver re-checks the deadline at the
+    // top of each cycle and yields the runtime between polls, so it never hangs
+    // or starves other tasks.
+    let outcome =
+        drive_query_replay_async(&ctx, spinning_query_workflow, input, Duration::from_millis(50))
+            .await;
+    assert_eq!(
+        outcome,
+        QueryReplayOutcome::TimedOut,
+        "an in-runtime yield_now spin must drive to the deadline (case 2 → 408), \
+         not classify Suspended (which the old waker-only heuristic did → 410)"
     );
 }
 
