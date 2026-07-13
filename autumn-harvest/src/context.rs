@@ -5324,6 +5324,15 @@ impl WorkflowContext {
     /// "panicking/failing cycle drops its pending commands" limitation — not
     /// child-timeout-specific and out of scope for a local fix.
     ///
+    /// Similarly, if the parent hits its event-history hard cap on the same cycle
+    /// the deadline branch resolves, the hard-cap seal
+    /// (`fail_workflow_for_history_cap`) bypasses the pending-command persist path
+    /// and drops the deadline `CancelRaceLosers` cleanup (the over-deadline child
+    /// is left un-cancelled and its `__child_timeout:` timer row un-deleted) — the
+    /// same terminal-seal-drops-pending-commands class as the panic case above and
+    /// the #601 fan-out limitation, only reachable on a run already being
+    /// force-killed at the hard cap.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::WorkflowFailed`] if the child fails before the
