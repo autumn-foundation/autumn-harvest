@@ -17902,11 +17902,28 @@ async fn upsert_workflow_schedule_and_read_back(
         .await
         .map_err(database_error)
         .map_err(map_error)?;
-    // Newly created/updated via the registration upsert; no backfill history
-    // is loaded here (mirrors the pre-existing behavior). A freshly created or
-    // re-registered schedule has a fresh `next_run_at` and so is never overdue,
-    // making the at-capacity input moot (issue #696).
-    Ok(schedule_entry_from_row(row, None, false))
+    // Compute the tick-exact, shard-local `at_capacity` for the returned row on
+    // its own shard (`conn` is already the schedule's shard connection — it was
+    // used for the register + read-back). A same-cadence re-register preserves
+    // the existing `next_run_at` (`apply_workflow_schedule_update` only recomputes
+    // it on a cadence change), so a wedged-in-the-past Skip+catchup schedule at
+    // capacity would otherwise report `overdue == true` here (the hardcoded
+    // `false` skipped the at-capacity suppression) while the list/get reads and
+    // the `harvest.schedule.overdue` gauge correctly suppress it to `false` —
+    // breaking the read == gauge == tick invariant (issue #696, Codex round 2).
+    // Reuse the single-source `scheduler::schedule_running_basis` (shard-local
+    // `RUNNING`/`PAUSED` count + #607 pending-throttle backlog) that list/get use;
+    // a count failure falls back to `false` (don't suppress the wedge signal).
+    let name = row
+        .dag_name
+        .as_deref()
+        .or(row.workflow_name.as_deref())
+        .unwrap_or("");
+    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name)
+        .await
+        .map(|basis| basis >= i64::from(row.max_active_runs))
+        .unwrap_or(false);
+    Ok(schedule_entry_from_row(row, None, at_capacity))
 }
 
 #[allow(clippy::too_many_lines)]

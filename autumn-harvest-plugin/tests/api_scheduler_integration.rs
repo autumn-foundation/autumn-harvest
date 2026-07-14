@@ -7545,3 +7545,168 @@ async fn schedule_read_reports_overdue_fields() {
     assert_eq!(single["overdue"], true);
     assert!(single["overdue_by_secs"].as_i64().unwrap_or(0) > 0);
 }
+
+/// Insert a `RUNNING` workflow execution for `wf_name` with a unique
+/// `workflow_id`, so the schedule's shard-local capacity basis
+/// (`scheduler::schedule_running_basis` = `RUNNING`/`PAUSED` count) counts it.
+async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for running execution seed");
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&autumn_harvest::models::NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: wf_name,
+            workflow_id: &workflow_id,
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            input: Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert running execution");
+}
+
+/// AC (issue #696, Codex round 2): the create/upsert HTTP **response** must
+/// report the same tick-exact, shard-local `at_capacity` as the list/get reads
+/// and the `harvest.schedule.overdue` gauge. A same-cadence re-register preserves
+/// the existing `next_run_at` (`apply_workflow_schedule_update` recomputes it only
+/// on a cadence change), so a wedged-in-the-past `next_run_at` survives the
+/// re-register. When the schedule is `Skip` + catchup AND at capacity, the tick
+/// legitimately holds `next_run_at` in the past (a deferred fire, not a wedge), so
+/// it must report `overdue == false`. Before the fix the response hardcoded
+/// `at_capacity = false`, so it reported `overdue == true` — disagreeing with the
+/// read == gauge == tick invariant.
+#[tokio::test]
+async fn schedule_create_response_at_capacity_is_not_overdue() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "overdue_upsert_at_capacity_wf";
+
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: true,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
+        catchup_policy: None,
+        retry_policy: None,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect for initial register");
+        // Isolate the name on a possibly-shared DB.
+        diesel::delete(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
+            .execute(&mut conn)
+            .await
+            .expect("clear prior schedule");
+        diesel::delete(
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(name)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("clear prior executions");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("register schedule");
+        // Simulate a wedge: force next_run_at 300s into the past (> 61s grace for
+        // interval:60). A same-cadence re-register preserves this value.
+        diesel::update(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(chrono::Utc::now() - chrono::Duration::seconds(300)),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("wedge next_run_at");
+    }
+    // At capacity: one RUNNING execution (>= max_active_runs = 1).
+    insert_running_execution_for(&database_url, name).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    // Re-register via the create/upsert route with the SAME cadence, Skip+catchup.
+    // Same cadence => next_run_at preserved (still 300s in the past).
+    let (status, body) = post_json(
+        &app,
+        "/admin/schedules/workflow",
+        json!({
+            "workflow_name": name,
+            "schedule_expr": "interval:60",
+            "queue_name": "default",
+            "catchup": true,
+            "overlap_policy": "skip",
+            "max_active_runs": 1
+        }),
+    )
+    .await;
+
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "create/upsert should succeed, got {status}: {body}"
+    );
+    assert_eq!(
+        body["overdue"], false,
+        "an at-capacity Skip+catchup schedule with a preserved past next_run_at must report \
+         overdue=false in the create/upsert response (matching read == gauge == tick): {body}"
+    );
+    assert!(
+        body["overdue_by_secs"].is_null(),
+        "a non-overdue schedule reports null overdue_by_secs in the response: {body}"
+    );
+}
