@@ -17510,8 +17510,7 @@ async fn get_schedule(
             // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
             at_capacity = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name)
                 .await
-                .map(|basis| basis >= i64::from(sched.max_active_runs))
-                .unwrap_or(false);
+                .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
             effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
                 &mut conn,
                 sched.calendar_name.as_deref(),
@@ -18083,8 +18082,7 @@ async fn upsert_workflow_schedule_and_read_back(
         .unwrap_or("");
     let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name)
         .await
-        .map(|basis| basis >= i64::from(row.max_active_runs))
-        .unwrap_or(false);
+        .is_ok_and(|basis| basis >= i64::from(row.max_active_runs));
     // Calendar-adjusted fire time (Codex round 3), resolved on the same shard
     // conn, so a re-registered calendar-deferred schedule is not falsely flagged.
     let effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
