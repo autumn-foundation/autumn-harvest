@@ -946,9 +946,13 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         // closure params) plus body `let` bindings (closures, shadows) — are
         // shadow-suppressed so a call to one is never resolved to a same-named
         // free helper (#778 review, zero-FP; #386 excludes fn pointers/closures).
-        let mut shadowed: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
-        collect_body_let_idents(&view, &mut shadowed);
-        for callee in collect_direct_free_fn_calls(&view, &index, &shadowed) {
+        // Suppression is **source-order-aware**: a `let` shadow only suppresses
+        // a call that comes AFTER it (a call before the binding resolves to the
+        // free helper, matching Rust); params bind for the whole body (#778,
+        // Codex P2).
+        let params: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
+        let let_binding_lines = collect_body_let_binding_lines(&view);
+        for callee in collect_direct_free_fn_calls(&view, &index, &params, &let_binding_lines) {
             if let Some(cands) = index.get(callee.as_str())
                 && let Some(idx) = resolve_helper(cands, fns, wf)
             {
@@ -1023,20 +1027,32 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
 /// Collects the names of first-party helpers a body calls via a **direct
 /// free-function call** (`helper(`), excluding method calls (`x.helper(`),
 /// path-qualified calls (`m::helper(`), and identifier-continuation. Only names
-/// present in `candidates` and **not** in `locally_bound` are returned: a call
-/// to a name the caller binds itself (a fn-pointer/closure parameter, a local
-/// closure, or a shadowing `let`) is never resolved to a same-named free helper
-/// (#778 review, zero-FP). This is safe-direction: if a body both shadows a
-/// name AND legitimately calls a real free fn of that name (pathological), the
-/// call is conservatively skipped — an accepted false-negative, never a
-/// false-positive.
+/// present in `candidates` and **not shadowed in scope at the call site** are
+/// returned: a call to a name the caller binds itself (a fn-pointer/closure
+/// parameter, a local closure, or a shadowing `let`) is never resolved to a
+/// same-named free helper (#778 review, zero-FP; #386 excludes fn
+/// pointers/closures).
+///
+/// Shadow suppression is **source-order-aware** (#778, Codex P2): `params` bind
+/// for the whole body and always suppress, but a `let` shadow (in
+/// `let_binding_lines`, name → earliest binding line) suppresses a call only
+/// when the binding's source line strictly PRECEDES the call — a call that runs
+/// before any same-name binding resolves to the free helper (matching Rust, and
+/// correct even for `let bad = bad();`, where the RHS call sees the outer fn).
+///
+/// The suppression is safe-direction: it only ever suppresses LESS than the old
+/// whole-body set, so it introduces no new false-positive. A shadow bound in an
+/// inner block that has already closed before an outer call is still treated as
+/// in scope (source-order, not full brace-scope tracking); that over-suppresses
+/// the outer call, an accepted false-negative — never a false-positive.
 fn collect_direct_free_fn_calls(
     body: &[(u32, &str)],
     candidates: &std::collections::HashMap<&str, Vec<usize>>,
-    locally_bound: &std::collections::HashSet<String>,
+    params: &std::collections::HashSet<String>,
+    let_binding_lines: &std::collections::HashMap<String, u32>,
 ) -> std::collections::BTreeSet<String> {
     let mut called = std::collections::BTreeSet::new();
-    for &(_, line) in body {
+    for &(src_line, line) in body {
         let code = strip_unparseable_content(line);
         let bytes = code.as_bytes();
         let mut i = 0;
@@ -1071,11 +1087,13 @@ fn collect_direct_free_fn_calls(
                 Some(i)
             };
             let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
-            if first_ok
-                && before_ok
-                && after_ok
-                && candidates.contains_key(token)
-                && !locally_bound.contains(token)
+            // Shadowed in scope at this call site? A param shadows everywhere; a
+            // `let` binding shadows only calls on a strictly-later source line.
+            let shadowed_here = params.contains(token)
+                || let_binding_lines
+                    .get(token)
+                    .is_some_and(|&bind_line| bind_line < src_line);
+            if first_ok && before_ok && after_ok && candidates.contains_key(token) && !shadowed_here
             {
                 called.insert(token.to_string());
             }
@@ -1154,24 +1172,36 @@ fn extract_fn_params(lines: &[&str], fn_idx: usize) -> Vec<String> {
     det010_pattern_mask_idents(&sig[open + 1..close])
 }
 
-/// Collects the identifiers bound by `let` statements in a function body, so a
-/// call to a same-named local (a closure binding, a shadowing `let`) is never
-/// resolved to a same-named free helper (#778 review, zero-FP). Reuses
-/// [`det010_parse_let`] for robust pattern handling (simple, `mut`, annotated,
-/// and destructuring / enum-variant patterns). Single-line handling only; a
-/// multi-line `let` is a safe-direction under-collection.
-fn collect_body_let_idents(body: &[(u32, &str)], idents: &mut std::collections::HashSet<String>) {
-    for &(_, line) in body {
+/// Collects the identifiers bound by `let` statements in a function body,
+/// mapping each to the **earliest** source line on which it is bound, so a call
+/// to a same-named local (a closure binding, a shadowing `let`) is never
+/// resolved to a same-named free helper (#778 review, zero-FP) — but only for
+/// calls that come after the binding (source-order suppression, #778 Codex P2).
+/// Reuses [`det010_parse_let`] for robust pattern handling (simple, `mut`,
+/// annotated, and destructuring / enum-variant patterns). Single-line handling
+/// only; a multi-line `let` is a safe-direction under-collection.
+fn collect_body_let_binding_lines(body: &[(u32, &str)]) -> std::collections::HashMap<String, u32> {
+    let mut lines: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut record = |ident: String, src_line: u32| {
+        lines
+            .entry(ident)
+            .and_modify(|l| *l = (*l).min(src_line))
+            .or_insert(src_line);
+    };
+    for &(src_line, line) in body {
         let code = strip_unparseable_content(line);
         for pos in word_positions(&code, "let") {
             match det010_parse_let(&code[pos + 3..]) {
-                Det010LetBinding::Simple { ident, .. } => {
-                    idents.insert(ident);
+                Det010LetBinding::Simple { ident, .. } => record(ident, src_line),
+                Det010LetBinding::PatternMask(ids) => {
+                    for id in ids {
+                        record(id, src_line);
+                    }
                 }
-                Det010LetBinding::PatternMask(ids) => idents.extend(ids),
             }
         }
     }
+    lines
 }
 
 /// Removes duplicate findings, keeping one per

@@ -2339,6 +2339,65 @@ fn bad_time() -> i64 {
     assert_eq!(finding.via_helper.as_deref(), Some("bad_time"));
 }
 
+// ── Source-order shadow tracking (issue #778, Codex P2) ─────────────────────
+
+// A call to a free helper that PRECEDES a later same-name `let` binding is
+// resolved by Rust to the FREE helper (the binding is not yet in scope). The
+// whole-body shadow set wrongly suppressed it; source-order tracking restores
+// the (genuine, in-scope) transitive violation. AC4 coverage.
+#[test]
+fn pre_shadow_call_resolves_to_free_helper_not_the_later_binding() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = bad();
+    let bad = |x: i64| x + 1;
+    let _ = bad(5);
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("the pre-shadow bad() call must resolve to the free helper, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+// Documented safe-direction residual FN: source-order tracking (not full
+// scope-awareness) means a shadow bound in an inner/sibling block that has
+// already CLOSED before an outer call still suppresses that call. Rust would
+// resolve the outer call to the free helper, so this is an accepted
+// false-negative (never a false-positive). Pinned so the residual is explicit.
+#[test]
+fn block_confined_shadow_before_call_is_a_documented_false_negative() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    { let bad = 5; let _ = bad; }
+    let _ = bad();
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "documented safe-direction FN: an already-closed inner-block shadow \
+         before the call still suppresses it (source-order, not scope-aware), got: {report:?}"
+    );
+}
+
 // ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
 
 // The changed-files CI pattern `det-check f1.rs f2.rs` passes each file as a
