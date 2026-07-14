@@ -2754,3 +2754,264 @@ mod workflows {
         "a module-scoped workflow's DET010 hazard must be flagged, got: {report:?}"
     );
 }
+
+// ── scope-aware same-name helper resolution (issue #778, Codex P1) ───────────
+// When two plain free helpers share an identifier, the caller's own in-scope
+// sibling (same module, else same file) is the Rust-correct resolution target.
+// Only the genuinely-undisambiguable case (multiple candidates, none in the
+// caller's module/file scope) is conservatively skipped.
+
+#[test]
+fn same_module_helper_resolves_over_unrelated_same_name() {
+    // A workflow in `mod a` calling a bare `stamp()` must resolve to its OWN
+    // module sibling `a::stamp` (which reads the clock) even though an unrelated
+    // `b::stamp` of the same name exists — exactly what Rust resolves the bare
+    // call to. Previously the shared name was marked globally ambiguous and the
+    // reachable hard-blocker in `a::stamp` was skipped (false negative).
+    let src = "\
+mod a {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = stamp();
+        Ok(())
+    }
+    fn stamp() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+mod b {
+    fn stamp() -> String {
+        String::new()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "the same-module sibling `a::stamp` must resolve and flag DET001, got: {report:?}"
+            )
+        });
+    assert_eq!(
+        finding.via_helper.as_deref(),
+        Some("stamp"),
+        "the finding must be attributed to the caller's in-scope `stamp`, got: {report:?}"
+    );
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn same_file_different_module_helper_disambiguates() {
+    // Rule 2: the caller's OWN module has no `helper`, but exactly one `helper`
+    // is defined in the same FILE (at file root). An unrelated same-named helper
+    // lives in a DIFFERENT file. The in-file one must resolve, the cross-file one
+    // must not make it ambiguous.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "\
+mod inner {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+}
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.rs"),
+        "\
+fn helper() -> String {
+    String::new()
+}
+",
+    )
+    .unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("the same-file `helper` must resolve despite a cross-file same-name, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn genuinely_ambiguous_same_name_helper_is_skipped() {
+    // Rule 4 (safe-FN boundary): two `stamp` helpers in two unrelated modules,
+    // and the workflow lives in a THIRD module with no same-module/same-file
+    // `stamp` to disambiguate its bare call. The call is conservatively skipped
+    // (a safe false-negative), never resolved to an arbitrary candidate.
+    let src = "\
+mod a {
+    fn stamp() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+mod b {
+    fn stamp() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+mod c {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = stamp();
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a genuinely-ambiguous bare call must be conservatively skipped, got: {report:?}"
+    );
+}
+
+#[test]
+fn same_name_impl_method_is_not_resolved_via_method_call() {
+    // NEGATIVE guard: a `stamp` free helper (clean) coexists with an impl method
+    // `stamp(&self)` that reads the clock. A workflow calling `obj.stamp()` (a
+    // METHOD call) must never be resolved to either — the method is not indexed
+    // (#386 boundary) and the method-call `.` before-guard excludes it.
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let obj = Clock;
+    let _ = obj.stamp();
+    Ok(())
+}
+
+fn stamp() -> i64 {
+    0
+}
+
+struct Clock;
+
+impl Clock {
+    fn stamp(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an impl method reached via `obj.stamp()` must never be resolved, got: {report:?}"
+    );
+}
+
+// ── turbofish call form (issue #778, Codex P2) ──────────────────────────────
+// A generic first-party helper called with a turbofish (`helper::<T>()`) must
+// still have its body scanned; the byte after the ident is `:` (not `(`), so the
+// call-paren matcher must skip an optional `::<…>` segment before requiring `(`.
+
+#[test]
+fn turbofish_helper_call_is_resolved() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _: i64 = bad::<u64>();
+    Ok(())
+}
+
+fn bad<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("a turbofish free-fn call `bad::<u64>()` must resolve and flag, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+#[test]
+fn nested_generic_turbofish_helper_call_is_resolved() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _: i64 = bad::<Vec<u8>>();
+    Ok(())
+}
+
+fn bad<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a nested-generic turbofish call `bad::<Vec<u8>>()` must resolve, got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+#[test]
+fn method_and_assoc_turbofish_are_not_resolved() {
+    // NEGATIVE guard: a METHOD turbofish (`x.method::<T>()`) and an ASSOCIATED
+    // turbofish (`Type::assoc::<T>()`) must never be resolved to a free helper —
+    // the `.`/`:` before-guard still excludes both, turbofish or not. `method`
+    // and `assoc` free helpers (which read the clock) exist to prove they are NOT
+    // reached via the qualified/method call forms.
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let x = Holder;
+    let _ = x.method::<u64>();
+    let _ = Type::assoc::<u64>();
+    Ok(())
+}
+
+fn method<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn assoc<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+struct Holder;
+impl Holder {
+    fn method<T>(&self) -> i64 {
+        0
+    }
+}
+
+struct Type;
+impl Type {
+    fn assoc<T>() -> i64 {
+        0
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "method/associated turbofish calls must never resolve to a free helper, got: {report:?}"
+    );
+}

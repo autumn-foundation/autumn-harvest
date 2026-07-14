@@ -618,6 +618,11 @@ struct FnDef {
     is_activity: bool,
     /// File label the function was extracted from (set by the caller).
     file: String,
+    /// `mod`-nesting path the function is declared in, joined by `::` (empty at
+    /// file root). Used for Rust-accurate scope-aware resolution of a bare call
+    /// to a same-named free helper (#778, Codex P1): the caller's own module
+    /// sibling wins over an unrelated same-named helper elsewhere.
+    module_path: String,
 }
 
 /// The (entry-point workflow, optional via-helper, file) a body is scanned under.
@@ -654,19 +659,31 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
     // item-scanning (`Module`/empty) or skipping (`Opaque`). `fn` bodies are
     // consumed wholesale by [`extract_fn_body`] and never pushed here.
     let mut scopes: Vec<ScopeKind> = Vec::new();
+    // Names of the `mod NAME` blocks we are currently nested inside, maintained
+    // in lockstep with the `Module` entries of `scopes` (#778, Codex P1).
+    let mut mod_stack: Vec<String> = Vec::new();
     let mut pending_wf = false;
     let mut pending_act = false;
     // A `mod NAME` declaration whose opening `{` is on a later line — the next
     // `{` we open should be a transparent `Module` scope, not an `Opaque` one.
     let mut pending_mod = false;
+    // The name of a `pending_mod` block, carried until its `{` is seen.
+    let mut pending_mod_name: Option<String> = None;
     let mut i = 0;
 
     while i < lines.len() {
         // Inside an opaque scope: skip the line, only tracking brace balance so
         // we know when the opaque (and any nested) scope closes and item
-        // scanning resumes.
+        // scanning resumes. A closing `}` may pop past the opaque suffix into an
+        // enclosing module on the same line, so `mod_stack` is maintained here too.
         if matches!(scopes.last(), Some(ScopeKind::Opaque)) {
-            apply_line_braces(lines[i], &mut scopes, false);
+            apply_line_braces_scoped(
+                &strip_unparseable_content(lines[i]),
+                &mut scopes,
+                &mut mod_stack,
+                false,
+                None,
+            );
             i += 1;
             continue;
         }
@@ -701,10 +718,12 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
                 is_workflow: pending_wf,
                 is_activity: pending_act,
                 file: String::new(),
+                module_path: mod_stack.join("::"),
             });
             pending_wf = false;
             pending_act = false;
             pending_mod = false;
+            pending_mod_name = None;
             i = next_i;
             continue;
         }
@@ -718,15 +737,49 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
         pending_wf = false;
         pending_act = false;
         let stripped = strip_unparseable_content(lines[i]);
-        let mod_first = pending_mod || is_mod_block_decl(stripped.trim());
-        apply_line_braces_stripped(&stripped, &mut scopes, mod_first);
+        let trimmed_stripped = stripped.trim();
+        // Resolve the module name for a `Module` scope this line may open: either
+        // continuing a `pending_mod` from a prior line, or a fresh `mod NAME {`.
+        let (mod_first, mod_name) = if pending_mod {
+            (true, pending_mod_name.take())
+        } else if is_mod_block_decl(trimmed_stripped) {
+            (true, extract_mod_name(trimmed_stripped))
+        } else {
+            (false, None)
+        };
+        apply_line_braces_scoped(
+            &stripped,
+            &mut scopes,
+            &mut mod_stack,
+            mod_first,
+            mod_name.as_deref(),
+        );
         // A `mod NAME` line whose `{` has not appeared yet keeps the pending flag
-        // so the next line's `{` opens the module scope.
-        pending_mod = mod_first && !stripped.contains('{');
+        // (and its name) so the next line's `{` opens the module scope.
+        if mod_first && !stripped.contains('{') {
+            pending_mod = true;
+            pending_mod_name = mod_name;
+        } else {
+            pending_mod = false;
+            pending_mod_name = None;
+        }
         i += 1;
     }
 
     result
+}
+
+/// Extracts the module name from an inline `mod NAME { … }` declaration line
+/// (already whitespace-trimmed). Returns `None` if no identifier follows `mod`.
+/// Assumes [`is_mod_block_decl`] has confirmed the line is an inline module.
+fn extract_mod_name(trimmed: &str) -> Option<String> {
+    let s = strip_leading_visibility(trimmed);
+    let rest = s.strip_prefix("mod")?.trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Extracts a function body starting at `fn_idx` (the line carrying the `fn`
@@ -776,31 +829,36 @@ fn extract_fn_body(lines: &[&str], fn_idx: usize) -> Option<(Vec<(u32, String)>,
     Some((body, j))
 }
 
-/// Updates the module-awareness scope stack for one raw source line, stripping
-/// string/char literals and comments first. See [`apply_line_braces_stripped`].
-fn apply_line_braces(line: &str, scopes: &mut Vec<ScopeKind>, mod_first: bool) {
-    apply_line_braces_stripped(&strip_unparseable_content(line), scopes, mod_first);
-}
-
 /// Pushes/pops the scope stack for each brace on an already-literal-stripped
-/// line. The **first** `{` on the line opens a transparent [`ScopeKind::Module`]
-/// scope when `mod_first` is true (a `mod NAME { … }` opener); every other `{`
-/// opens an [`ScopeKind::Opaque`] scope. Each `}` pops the innermost scope. A
-/// `}` with no matching open (a stray close, or the strip-caveat of a
-/// multi-line block comment) is a harmless no-op.
-fn apply_line_braces_stripped(stripped: &str, scopes: &mut Vec<ScopeKind>, mut mod_first: bool) {
+/// line, maintaining `mod_stack` in lockstep with the `Module` entries of
+/// `scopes` (#778). The **first** `{` on the line opens a transparent
+/// [`ScopeKind::Module`] scope (pushing `mod_name`) when `mod_first` is true (a
+/// `mod NAME { … }` opener); every other `{` opens an [`ScopeKind::Opaque`]
+/// scope. Each `}` pops the innermost scope, popping `mod_stack` only when the
+/// popped scope was a `Module`. A `}` with no matching open (a stray close, or
+/// the strip-caveat of a multi-line block comment) is a harmless no-op.
+fn apply_line_braces_scoped(
+    stripped: &str,
+    scopes: &mut Vec<ScopeKind>,
+    mod_stack: &mut Vec<String>,
+    mut mod_first: bool,
+    mod_name: Option<&str>,
+) {
     for c in stripped.chars() {
         match c {
             '{' => {
-                scopes.push(if mod_first {
-                    ScopeKind::Module
+                if mod_first {
+                    scopes.push(ScopeKind::Module);
+                    mod_stack.push(mod_name.unwrap_or("").to_string());
+                    mod_first = false;
                 } else {
-                    ScopeKind::Opaque
-                });
-                mod_first = false;
+                    scopes.push(ScopeKind::Opaque);
+                }
             }
             '}' => {
-                scopes.pop();
+                if matches!(scopes.pop(), Some(ScopeKind::Module)) {
+                    mod_stack.pop();
+                }
             }
             _ => {}
         }
@@ -860,19 +918,18 @@ fn strip_leading_visibility(trimmed: &str) -> &str {
 fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
     use std::collections::HashMap;
 
-    // Candidate helper index: only plain helpers are eligible callees. A name
-    // defined by more than one plain helper is marked ambiguous (`None`) and is
-    // never resolved, so an ambiguous resolution can never introduce a false
-    // positive.
-    let mut index: HashMap<&str, Option<usize>> = HashMap::new();
+    // Candidate helper index: only plain helpers are eligible callees. A name may
+    // map to more than one plain helper (same name in different modules/files);
+    // resolution of a bare call is deferred to [`resolve_helper`], which prefers
+    // the caller's own in-scope sibling (Rust-accurate) and only skips the
+    // genuinely-undisambiguable case — so an ambiguous resolution can never
+    // introduce a false positive (#778, Codex P1).
+    let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, f) in fns.iter().enumerate() {
         if f.is_workflow || f.is_activity {
             continue;
         }
-        index
-            .entry(&f.name)
-            .and_modify(|slot| *slot = None)
-            .or_insert(Some(i));
+        index.entry(&f.name).or_default().push(i);
     }
 
     let mut report = DetCheckReport::default();
@@ -892,7 +949,9 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         let mut shadowed: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
         collect_body_let_idents(&view, &mut shadowed);
         for callee in collect_direct_free_fn_calls(&view, &index, &shadowed) {
-            if let Some(Some(idx)) = index.get(callee.as_str()).copied() {
+            if let Some(cands) = index.get(callee.as_str())
+                && let Some(idx) = resolve_helper(cands, fns, wf)
+            {
                 let helper = &fns[idx];
                 let hview = body_view(&helper.body);
                 let hscope = BodyScope {
@@ -907,6 +966,53 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
 
     dedupe_findings(&mut report.findings);
     report
+}
+
+/// Resolves a bare call to a same-named free helper from `caller`'s scope, using
+/// Rust-accurate nearest-scope preference (#778, Codex P1):
+///
+/// 1. a candidate in the **same module** (same file + same `module_path`) as the
+///    caller — what Rust resolves a bare call to first;
+/// 2. else a candidate in the **same file** (any module), if exactly one;
+/// 3. else the candidate if it is **globally unique**;
+/// 4. else (multiple candidates, none disambiguated by the caller's module/file
+///    scope) — conservatively skipped (a safe false-negative, never a
+///    false-positive).
+///
+/// A unique name is resolved directly (step 3). Preferring the same-module /
+/// same-file definition is exactly what the compiler resolves a bare call to, so
+/// this is a strict accuracy improvement with no added false-positive risk.
+fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option<usize> {
+    match candidates {
+        [] => return None,
+        [only] => return Some(*only),
+        _ => {}
+    }
+    // 1. Same module (same file + same module path).
+    let same_module: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&i| fns[i].file == caller.file && fns[i].module_path == caller.module_path)
+        .collect();
+    if let [only] = same_module.as_slice() {
+        return Some(*only);
+    }
+    // Two helpers of the same name in one module is not valid Rust; if seen, skip.
+    if !same_module.is_empty() {
+        return None;
+    }
+    // 2. Same file (any module) — resolve only if exactly one.
+    let same_file: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&i| fns[i].file == caller.file)
+        .collect();
+    if let [only] = same_file.as_slice() {
+        return Some(*only);
+    }
+    // 3/4. Multiple candidates, none in the caller's module/file scope to
+    // disambiguate — conservatively skip (safe false-negative).
+    None
 }
 
 /// Borrows an owned body as the `&[(u32, &str)]` view the per-body analysis expects.
@@ -926,7 +1032,7 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
 /// false-positive.
 fn collect_direct_free_fn_calls(
     body: &[(u32, &str)],
-    candidates: &std::collections::HashMap<&str, Option<usize>>,
+    candidates: &std::collections::HashMap<&str, Vec<usize>>,
     locally_bound: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeSet<String> {
     let mut called = std::collections::BTreeSet::new();
@@ -955,8 +1061,16 @@ fn collect_direct_free_fn_calls(
                 let b = bytes[start - 1];
                 !is_ident_byte(b) && b != b'.' && b != b':'
             };
-            // Immediate call paren.
-            let after_ok = i < bytes.len() && bytes[i] == b'(';
+            // Immediate call paren, allowing an optional turbofish `::<…>` between
+            // the ident and the `(` — e.g. `bad::<u64>()` / `bad::<Vec<u8>>()`
+            // (#778, Codex P2). The `.`/`:` before-guard above already excludes
+            // method (`x.m::<T>()`) and associated (`Type::a::<T>()`) turbofish.
+            let call_at = if code[i..].starts_with("::<") {
+                skip_balanced_angles(bytes, i + 2)
+            } else {
+                Some(i)
+            };
+            let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
             if first_ok
                 && before_ok
                 && after_ok
@@ -968,6 +1082,29 @@ fn collect_direct_free_fn_calls(
         }
     }
     called
+}
+
+/// Given `open_lt` pointing at the `<` opening a turbofish (or generic) segment,
+/// returns the byte index just past the matching balanced `>` (accounting for
+/// nested generics like `::<Vec<u8>>`), or `None` if unbalanced. Used to skip an
+/// optional turbofish between an ident and its call `(` (#778, Codex P2).
+fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut k = open_lt;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k + 1);
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
 }
 
 /// Collects the identifiers bound by a function's parameter list, so a call to
@@ -2487,18 +2624,69 @@ mod tests {
     #[test]
     fn apply_line_braces_classifies_module_vs_opaque() {
         let mut scopes: Vec<ScopeKind> = Vec::new();
-        // `mod NAME {` opens a transparent module scope.
-        apply_line_braces("mod workflows {", &mut scopes, true);
+        let mut mods: Vec<String> = Vec::new();
+        // `mod NAME {` opens a transparent module scope, pushing its name.
+        apply_line_braces_scoped(
+            "mod workflows {",
+            &mut scopes,
+            &mut mods,
+            true,
+            Some("workflows"),
+        );
         assert_eq!(scopes, vec![ScopeKind::Module]);
-        // A nested `impl` opens an opaque scope.
-        apply_line_braces("impl Foo {", &mut scopes, false);
+        assert_eq!(mods, vec!["workflows".to_string()]);
+        // A nested `impl` opens an opaque scope (no module name).
+        apply_line_braces_scoped("impl Foo {", &mut scopes, &mut mods, false, None);
         assert_eq!(scopes, vec![ScopeKind::Module, ScopeKind::Opaque]);
-        // Closing the impl pops back to module scope.
-        apply_line_braces("}", &mut scopes, false);
+        assert_eq!(mods, vec!["workflows".to_string()]);
+        // Closing the impl pops back to module scope (mod stack unchanged).
+        apply_line_braces_scoped("}", &mut scopes, &mut mods, false, None);
         assert_eq!(scopes, vec![ScopeKind::Module]);
-        // Closing the module empties the stack.
-        apply_line_braces("}", &mut scopes, false);
+        assert_eq!(mods, vec!["workflows".to_string()]);
+        // Closing the module empties both stacks.
+        apply_line_braces_scoped("}", &mut scopes, &mut mods, false, None);
         assert!(scopes.is_empty());
+        assert!(mods.is_empty());
+    }
+
+    #[test]
+    fn apply_line_braces_scoped_pops_module_when_impl_and_mod_close_on_one_line() {
+        // `} }` closing an impl (opaque) then the enclosing module on one line —
+        // the mod stack must pop exactly once (for the Module), not for the impl.
+        let mut scopes = vec![ScopeKind::Module, ScopeKind::Opaque];
+        let mut mods = vec!["outer".to_string()];
+        apply_line_braces_scoped("} }", &mut scopes, &mut mods, false, None);
+        assert!(scopes.is_empty());
+        assert!(mods.is_empty());
+    }
+
+    #[test]
+    fn extract_mod_name_reads_the_module_identifier() {
+        assert_eq!(
+            extract_mod_name("mod workflows {"),
+            Some("workflows".into())
+        );
+        assert_eq!(extract_mod_name("pub mod a {"), Some("a".into()));
+        assert_eq!(
+            extract_mod_name("pub(crate) mod inner_2 {"),
+            Some("inner_2".into())
+        );
+        // No identifier after `mod` → None.
+        assert_eq!(extract_mod_name("mod {"), None);
+    }
+
+    #[test]
+    fn skip_balanced_angles_matches_nested_generics() {
+        // `::<u64>(` — open `<` at index 2, close `>` at index 6, `(` follows.
+        let s = b"::<u64>(";
+        assert_eq!(skip_balanced_angles(s, 2), Some(7));
+        assert_eq!(s[7], b'(');
+        // Nested `::<Vec<u8>>(` — the outer `>` is the second-to-last.
+        let s = b"::<Vec<u8>>(";
+        let end = skip_balanced_angles(s, 2).unwrap();
+        assert_eq!(s[end], b'(');
+        // Unbalanced → None.
+        assert_eq!(skip_balanced_angles(b"::<u64", 2), None);
     }
 
     #[test]
