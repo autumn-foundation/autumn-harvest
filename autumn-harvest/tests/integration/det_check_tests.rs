@@ -2595,3 +2595,162 @@ fn helper() {
         "suppression location is in the helper"
     );
 }
+
+// ── module-scoped workflows (issue #778, Codex P1) ──────────────────────────
+// A `#[workflow]` declared inside a Rust module (`mod name { … }`, including
+// nested modules) is a valid entry point and MUST be scanned for direct and
+// one-hop transitive violations, exactly like a top-level workflow. The #386
+// method-exclusion boundary (impl/trait method bodies are not free helpers)
+// must remain intact.
+
+#[test]
+fn module_scoped_workflow_direct_violation_is_flagged() {
+    let src = "\
+mod workflows {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = chrono::Utc::now();
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a direct violation inside a module-scoped #[workflow] must be flagged, got: {report:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn module_scoped_workflow_transitive_helper_violation_is_flagged() {
+    let src = "\
+mod workflows {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        stamp();
+        Ok(())
+    }
+    fn stamp() {
+        let _ = chrono::Utc::now();
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "transitive violation in a module-scoped helper must be flagged, got: {report:?}"
+            )
+        });
+    assert_eq!(
+        finding.via_helper.as_deref(),
+        Some("stamp"),
+        "the finding must be attributed to the module-scope helper via `via_helper`, got: {report:?}"
+    );
+}
+
+#[test]
+fn module_scoped_activity_violation_is_not_flagged() {
+    // NEGATIVE guard: a module-nested #[activity] may read the clock — its body
+    // must never be scanned, at any nesting.
+    let src = "\
+mod acts {
+    use autumn_harvest::prelude::*;
+    #[activity(start_to_close = \"30s\")]
+    pub async fn nested_act(_ctx: &ActivityContext) -> Result<(), String> {
+        let _ = chrono::Utc::now();
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a module-nested #[activity] must never be scanned, got: {report:?}"
+    );
+}
+
+#[test]
+fn impl_method_callee_is_not_resolved_as_helper() {
+    // NEGATIVE guard (#386 boundary): a `#[workflow]` calling an inherent /
+    // associated METHOD whose body reads the clock must NOT be flagged — methods
+    // inside `impl` blocks are not free-function helpers and must never be indexed
+    // or resolved. Covers both `self.foo()` and `Type::foo()` dispatch.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let clock = Clock;
+    let _ = clock.stamp();
+    let _ = Clock::stamp_assoc();
+    Ok(())
+}
+
+struct Clock;
+
+impl Clock {
+    fn stamp(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+    fn stamp_assoc() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an impl-method callee must never be indexed or resolved as a free helper, got: {report:?}"
+    );
+}
+
+#[test]
+fn nested_module_workflow_direct_violation_is_flagged() {
+    // A workflow two module levels deep must still be scanned.
+    let src = "\
+mod a {
+    mod b {
+        use autumn_harvest::prelude::*;
+        #[workflow]
+        pub async fn deep(ctx: &WorkflowContext) -> Result<(), String> {
+            let _ = chrono::Utc::now();
+            Ok(())
+        }
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a workflow nested two modules deep must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn module_scoped_det010_hashmap_iteration_is_flagged() {
+    // The bespoke DET010 pass shares the same body-extraction path, so a
+    // module-scoped workflow's HashMap-iteration hazard must also be caught.
+    let src = "\
+mod workflows {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        for x in m.iter() {
+            ctx.execute_activity_raw(\"a\", serde_json::json!(1), \"q\").await?;
+        }
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a module-scoped workflow's DET010 hazard must be flagged, got: {report:?}"
+    );
+}

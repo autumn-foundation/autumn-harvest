@@ -630,20 +630,43 @@ struct BodyScope<'a> {
     file: &'a str,
 }
 
-/// Returns every **top-level** (file brace depth 0) function definition, with a
-/// flag for whether it carries `#[workflow]` / `#[activity]`. Methods inside
-/// `impl`/`trait` blocks (depth > 0) are deliberately not captured, so they can
-/// never be mistaken for free-function helper callees.
+/// A brace scope the extractor is currently nested inside. A `Module` brace is
+/// transparent — its items are module scope and are scanned; every other brace
+/// (`impl`/`trait`/`struct`/`fn` body / bare block) is `Opaque` and its contents
+/// are skipped for item extraction (the #386 method-exclusion boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    Module,
+    Opaque,
+}
+
+/// Returns every **module-scope** function definition (top level and inside
+/// `mod NAME { … }` blocks, at any nesting), with a flag for whether it carries
+/// `#[workflow]` / `#[activity]`. Methods inside `impl`/`trait` blocks are
+/// deliberately not captured, so they can never be mistaken for free-function
+/// helper callees (#386 boundary). Module-nested `#[workflow]` entry points and
+/// their module-scope helpers are scanned (issue #778, Codex P1).
 fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
     let mut result = Vec::new();
-    let mut depth: i32 = 0;
+    // Brace scopes we are currently inside, innermost last. Once an `Opaque`
+    // scope is entered it forms a contiguous suffix (an `impl`/`trait`/`fn`/block
+    // never contains a module), so the innermost scope decides whether we are
+    // item-scanning (`Module`/empty) or skipping (`Opaque`). `fn` bodies are
+    // consumed wholesale by [`extract_fn_body`] and never pushed here.
+    let mut scopes: Vec<ScopeKind> = Vec::new();
     let mut pending_wf = false;
     let mut pending_act = false;
+    // A `mod NAME` declaration whose opening `{` is on a later line — the next
+    // `{` we open should be a transparent `Module` scope, not an `Opaque` one.
+    let mut pending_mod = false;
     let mut i = 0;
 
     while i < lines.len() {
-        if depth != 0 {
-            depth = (depth + code_brace_delta(lines[i])).max(0);
+        // Inside an opaque scope: skip the line, only tracking brace balance so
+        // we know when the opaque (and any nested) scope closes and item
+        // scanning resumes.
+        if matches!(scopes.last(), Some(ScopeKind::Opaque)) {
+            apply_line_braces(lines[i], &mut scopes, false);
             i += 1;
             continue;
         }
@@ -681,15 +704,25 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
             });
             pending_wf = false;
             pending_act = false;
+            pending_mod = false;
             i = next_i;
             continue;
         }
 
-        // A depth-0 line that is not a fn declaration (`impl … {`, `struct …`,
-        // `use …;`, `const …`) — reset pending attributes and track depth.
+        // A module-scope line that is not a fn declaration — reset pending
+        // attributes and classify its braces. The first `{` opened on a
+        // `mod NAME { … }` line (or continuing a `pending_mod` from a prior line)
+        // pushes a transparent `Module` scope so items inside keep being scanned;
+        // every other `{` (`impl … {`, `struct … {`, a bare block) pushes an
+        // `Opaque` scope whose contents are skipped.
         pending_wf = false;
         pending_act = false;
-        depth = (depth + code_brace_delta(lines[i])).max(0);
+        let stripped = strip_unparseable_content(lines[i]);
+        let mod_first = pending_mod || is_mod_block_decl(stripped.trim());
+        apply_line_braces_stripped(&stripped, &mut scopes, mod_first);
+        // A `mod NAME` line whose `{` has not appeared yet keeps the pending flag
+        // so the next line's `{` opens the module scope.
+        pending_mod = mod_first && !stripped.contains('{');
         i += 1;
     }
 
@@ -743,16 +776,81 @@ fn extract_fn_body(lines: &[&str], fn_idx: usize) -> Option<(Vec<(u32, String)>,
     Some((body, j))
 }
 
-/// Net brace delta of a source line, ignoring braces inside string/char
-/// literals and comments (via [`strip_unparseable_content`]).
-fn code_brace_delta(line: &str) -> i32 {
-    strip_unparseable_content(line)
-        .chars()
-        .fold(0i32, |acc, c| match c {
-            '{' => acc + 1,
-            '}' => acc - 1,
-            _ => acc,
-        })
+/// Updates the module-awareness scope stack for one raw source line, stripping
+/// string/char literals and comments first. See [`apply_line_braces_stripped`].
+fn apply_line_braces(line: &str, scopes: &mut Vec<ScopeKind>, mod_first: bool) {
+    apply_line_braces_stripped(&strip_unparseable_content(line), scopes, mod_first);
+}
+
+/// Pushes/pops the scope stack for each brace on an already-literal-stripped
+/// line. The **first** `{` on the line opens a transparent [`ScopeKind::Module`]
+/// scope when `mod_first` is true (a `mod NAME { … }` opener); every other `{`
+/// opens an [`ScopeKind::Opaque`] scope. Each `}` pops the innermost scope. A
+/// `}` with no matching open (a stray close, or the strip-caveat of a
+/// multi-line block comment) is a harmless no-op.
+fn apply_line_braces_stripped(stripped: &str, scopes: &mut Vec<ScopeKind>, mut mod_first: bool) {
+    for c in stripped.chars() {
+        match c {
+            '{' => {
+                scopes.push(if mod_first {
+                    ScopeKind::Module
+                } else {
+                    ScopeKind::Opaque
+                });
+                mod_first = false;
+            }
+            '}' => {
+                scopes.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `trimmed` (a module-scope line, already whitespace-trimmed) begins an
+/// **inline** module declaration `mod NAME { … }` (which opens a transparent
+/// scope) as opposed to an external module `mod NAME;` (no inline body) or a
+/// non-module item. Only an optional leading visibility (`pub`, `pub(crate)`,
+/// `pub(in …)`) is accepted before `mod`; the presence of a `;` before any body
+/// brace marks an external module and returns `false`.
+fn is_mod_block_decl(trimmed: &str) -> bool {
+    let s = strip_leading_visibility(trimmed);
+    let Some(rest) = s.strip_prefix("mod") else {
+        return false;
+    };
+    // `mod` must be a whole keyword followed by whitespace, then an identifier.
+    match rest.chars().next() {
+        Some(c) if c.is_whitespace() => {}
+        _ => return false,
+    }
+    let rest = rest.trim_start();
+    // An external module (`mod foo;`) has a `;` before any body `{` — not inline.
+    let body_at = rest.find('{');
+    let semi_at = rest.find(';');
+    if let Some(semi) = semi_at
+        && body_at.is_none_or(|b| semi < b)
+    {
+        return false;
+    }
+    rest.chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+}
+
+/// Strips an optional leading Rust visibility modifier (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in path)`) from a trimmed line, returning the remainder.
+fn strip_leading_visibility(trimmed: &str) -> &str {
+    let Some(rest) = trimmed.strip_prefix("pub") else {
+        return trimmed;
+    };
+    match rest.chars().next() {
+        Some('(') => rest
+            .find(')')
+            .map_or(trimmed, |close| rest[close + 1..].trim_start()),
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        // `public` / `pubfoo` — not a visibility modifier.
+        _ => trimmed,
+    }
 }
 
 /// Scans every extracted `#[workflow]` body directly, then follows one hop of
@@ -2353,6 +2451,54 @@ mod tests {
         assert!(is_activity_attr("#[activity]"));
         assert!(is_activity_attr("#[activity(start_to_close = \"30s\")]"));
         assert!(!is_activity_attr("#[workflow]"));
+    }
+
+    #[test]
+    fn is_mod_block_decl_matches_inline_modules_only() {
+        // Inline module blocks (transparent scopes).
+        assert!(is_mod_block_decl("mod workflows {"));
+        assert!(is_mod_block_decl("pub mod workflows {"));
+        assert!(is_mod_block_decl("pub(crate) mod workflows {"));
+        assert!(is_mod_block_decl("pub(in crate::a) mod m {"));
+        // Brace on a later line — still an inline module opener.
+        assert!(is_mod_block_decl("mod workflows"));
+        // External modules (`mod foo;`) have no inline body.
+        assert!(!is_mod_block_decl("mod external;"));
+        assert!(!is_mod_block_decl("pub mod external;"));
+        // Non-module items / statements.
+        assert!(!is_mod_block_decl("impl Foo {"));
+        assert!(!is_mod_block_decl("struct S {"));
+        assert!(!is_mod_block_decl("fn helper() {"));
+        assert!(!is_mod_block_decl("let model = 1;"));
+        assert!(!is_mod_block_decl("modify(x);"));
+    }
+
+    #[test]
+    fn strip_leading_visibility_handles_pub_forms() {
+        assert_eq!(strip_leading_visibility("pub mod m"), "mod m");
+        assert_eq!(strip_leading_visibility("pub(crate) fn f()"), "fn f()");
+        assert_eq!(strip_leading_visibility("pub(in crate::x) mod m"), "mod m");
+        // No visibility modifier — unchanged.
+        assert_eq!(strip_leading_visibility("mod m"), "mod m");
+        // `public`/`pubfoo` are not visibility modifiers.
+        assert_eq!(strip_leading_visibility("public_fn()"), "public_fn()");
+    }
+
+    #[test]
+    fn apply_line_braces_classifies_module_vs_opaque() {
+        let mut scopes: Vec<ScopeKind> = Vec::new();
+        // `mod NAME {` opens a transparent module scope.
+        apply_line_braces("mod workflows {", &mut scopes, true);
+        assert_eq!(scopes, vec![ScopeKind::Module]);
+        // A nested `impl` opens an opaque scope.
+        apply_line_braces("impl Foo {", &mut scopes, false);
+        assert_eq!(scopes, vec![ScopeKind::Module, ScopeKind::Opaque]);
+        // Closing the impl pops back to module scope.
+        apply_line_braces("}", &mut scopes, false);
+        assert_eq!(scopes, vec![ScopeKind::Module]);
+        // Closing the module empties the stack.
+        apply_line_braces("}", &mut scopes, false);
+        assert!(scopes.is_empty());
     }
 
     #[test]

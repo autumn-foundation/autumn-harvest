@@ -236,3 +236,36 @@ fn overlapping_dir_and_file_args_do_not_double_count() {
         "a directory plus a file inside it must yield one finding, got: {report:?}"
     );
 }
+
+// Codex P1 (issue #778): a `#[workflow]` declared inside a Rust module must be
+// scanned end to end — a module-scoped workflow with a direct hard-blocker must
+// trip the gate, not silently pass.
+#[test]
+fn module_scoped_workflow_direct_violation_trips_the_gate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("workflows.rs"),
+        "\
+mod workflows {
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = chrono::Utc::now();
+        Ok(())
+    }
+}
+",
+    )
+    .unwrap();
+    let report =
+        det_check_report_for_paths(&[dir.path().to_path_buf()]).expect("report should build");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| panic!("module-scoped workflow violation must be caught: {report:?}"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("nested"));
+    assert!(
+        det_check_gate(&report, false).is_some(),
+        "a module-scoped hard-blocker must trip the gate: {report:?}"
+    );
+}

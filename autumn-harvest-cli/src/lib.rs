@@ -7846,30 +7846,17 @@ mod det_check_cli_tests {
         autumn_harvest::check_source(src, "test.rs")
     }
 
-    const WF_TIME: &str = "\
-#[workflow]
-async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
-    let _ = std::time::SystemTime::now();
-    Ok(())
-}
-";
+    // NOTE: these fixtures embed `#[workflow]` source and MUST be single-line
+    // string literals (with `\n` escapes), not multi-line `"\`-continuation
+    // strings — a multi-line literal containing `#[workflow]` at a line start is
+    // misread as a real workflow by the line-based det_check scanner (the
+    // documented multi-line-string lexer caveat), producing a self-scan false
+    // positive on this very file. Single-line literals are stripped correctly.
+    const WF_TIME: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
 
-    const WF_WARN: &str = "\
-#[workflow]
-async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
-    let _ = std::process::id();
-    Ok(())
-}
-";
+    const WF_WARN: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::process::id();\n    Ok(())\n}\n";
 
-    const WF_SUPPRESSED: &str = "\
-#[workflow]
-async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
-    // harvest-suppress: DET001 \"recorded in signal payload\"
-    let _ = std::time::SystemTime::now();
-    Ok(())
-}
-";
+    const WF_SUPPRESSED: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    // harvest-suppress: DET001 \"recorded in signal payload\"\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
 
     #[test]
     fn det_check_parses_paths_and_flags() {
