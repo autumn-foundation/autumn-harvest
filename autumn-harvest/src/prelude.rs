@@ -14,7 +14,7 @@ pub use crate::circuit_breaker::{
 };
 pub use crate::context::{
     ActivityContext, DEFAULT_SESSION_ACQUISITION_TIMEOUT, Session, SessionOptions, TimerHandle,
-    TimerOutcome, WorkflowContext,
+    TimerOutcome, WorkflowContext, WorkflowExecutionInfo,
 };
 pub use crate::dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,

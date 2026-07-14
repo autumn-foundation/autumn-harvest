@@ -1306,6 +1306,8 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     }
 }
 
@@ -2139,6 +2141,8 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
         context_headers: None,
         execution_timeout: Some(chrono::Duration::seconds(30)),
         deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     // The exported JSON must carry the deadline budget at the top level so it
@@ -2179,6 +2183,8 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
         // both fields from the JSON, producing a byte-for-byte pre-#772 export.
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     assert!(
@@ -3465,6 +3471,8 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3492,6 +3500,8 @@ async fn replay_from_json_detects_non_determinism() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -3684,6 +3694,8 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -4866,6 +4878,8 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -4898,6 +4912,8 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -4923,6 +4939,8 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -4950,6 +4968,8 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -4994,6 +5014,8 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -5058,6 +5080,8 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -5135,6 +5159,8 @@ async fn replay_succeeds_for_recorded_side_effect() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -5181,6 +5207,8 @@ async fn replay_detects_side_effect_drift() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 
@@ -6887,4 +6915,532 @@ async fn live_loop_hitting_increment_twice_emits_exactly_two() {
         2,
         "two legitimate live increments must emit exactly twice — no more (replay double-count), no fewer (over-suppression)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (issue #698 FIX 1) parent_execution_id must be threaded into the replay /
+//   canary tooling. `parent_execution_id` lives in NO WorkflowEvent (it is
+//   sourced only from the harvest_workflow_executions.parent_id column), so a
+//   pure-history replay builds the child's context with parent = None UNLESS the
+//   replayer is told the parent. A child that branches its COMMAND stream on
+//   ctx.info().parent_execution_id (a blessed AC2 "parent-aware child logic"
+//   use) then false-reports non-determinism in the deploy canary / its own
+//   WorkflowReplayer CI test. WorkflowReplayer::with_parent_execution_id closes
+//   that gap for the JSON-fixture path.
+// ---------------------------------------------------------------------------
+
+/// A child workflow whose COMMAND stream depends on its spawning parent:
+/// schedules `child_of_parent` when it HAS a parent, `orphan_step` when it does
+/// not. The scheduled activity NAME is the observable divergence.
+fn parent_branching_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let step = if ctx.info().parent_execution_id.is_some() {
+            "child_of_parent"
+        } else {
+            "orphan_step"
+        };
+        let out = ctx
+            .execute_activity_raw(step, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// History recorded by a run of `parent_branching_child` that HAD a parent
+/// (`P`): it scheduled and completed the `child_of_parent` activity.
+fn parent_taken_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let act_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "child_of_parent".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!("ok"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("ok"),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// (a) With the spawning parent supplied via `with_parent_execution_id`, the
+/// child's parent-taken branch matches the recorded history → `ReplaySucceeded`.
+#[tokio::test]
+async fn parent_aware_child_replays_clean_when_parent_is_threaded() {
+    let parent = ExecutionId::new();
+    let (exec_id, events) = parent_taken_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        .with_parent_execution_id(Some(parent))
+        .replay_from_snapshot(make_snapshot("parent_branching_child", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a parent-aware child must replay clean when the parent is threaded, got: {report}"
+    );
+}
+
+/// (b) WITHOUT the parent, the child takes its `orphan_step` branch, diverging
+/// from the recorded `child_of_parent` schedule → `NonDeterminismDetected`. This
+/// proves the threading is load-bearing: dropping `with_parent_execution_id`
+/// would surface exactly this false non-determinism in the canary / CI.
+#[tokio::test]
+async fn parent_aware_child_diverges_when_parent_is_not_threaded() {
+    let (exec_id, events) = parent_taken_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        // Deliberately DO NOT call with_parent_execution_id — parent = None.
+        .replay_from_snapshot(make_snapshot("parent_branching_child", exec_id, events))
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "without a threaded parent the child must diverge (orphan_step vs recorded \
+             child_of_parent); got: {other:?}\nreport: {report}"
+        ),
+    }
+}
+
+/// (c) Issue #698 (Codex P2 @ testing.rs:306) — the DB `export_history` ->
+/// `HistoryExportDocument` -> JSON -> `replay_from_json` path (retention
+/// archives / offline replay). The `HistoryExportRequest` carries the row's
+/// `parent_id`, which `export_history` embeds at the TOP LEVEL of the document
+/// so it deserialises into `HistorySnapshot.parent_execution_id`. The child
+/// then replays clean through `replay_from_json` WITHOUT any manual
+/// `with_parent_execution_id` override — proving the parent survives the
+/// export-document round-trip, exactly like `execution_timeout`/`deadline_at`.
+#[tokio::test]
+async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
+    use autumn_harvest::history_export::{
+        HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    };
+
+    let parent = ExecutionId::new();
+    let (exec_id, events) = parent_taken_history();
+
+    // Build the DB-export request the way retention / the HTTP export route
+    // does, sourcing the parent from the row's `parent_id` column.
+    let document = export_history(HistoryExportRequest {
+        workflow_name: "parent_branching_child".to_string(),
+        execution_id: exec_id,
+        shard_id: 0,
+        state: "COMPLETED".to_string(),
+        events,
+        exported_at: Utc::now(),
+        payload_policy: HistoryPayloadPolicy::Full,
+        max_bytes: Some(64 * 1024),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: Some(parent),
+        workflow_id: None,
+    })
+    .expect("full export should fit under the limit");
+    let json = serde_json::to_string(&document).expect("export serialises");
+
+    // Replay the exported JSON directly — NO with_parent_execution_id override.
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        .replay_from_json(&json)
+        .await
+        .expect("exported document must be accepted by replay_from_json");
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a parent-aware child exported through the DB export document must replay \
+         clean via replay_from_json with no manual parent override, got: {report}"
+    );
+}
+
+/// (d) The negative control for (c): when the export request carries no parent
+/// (`parent_execution_id: None`), the exported document deserialises to
+/// parent = `None`, so the child takes its `orphan_step` branch and diverges
+/// from the recorded `child_of_parent` schedule — proving the export document
+/// is the load-bearing carrier of the parent through this path.
+#[tokio::test]
+async fn parent_aware_child_diverges_through_export_document_without_parent() {
+    use autumn_harvest::history_export::{
+        HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    };
+
+    let (exec_id, events) = parent_taken_history();
+
+    let document = export_history(HistoryExportRequest {
+        workflow_name: "parent_branching_child".to_string(),
+        execution_id: exec_id,
+        shard_id: 0,
+        state: "COMPLETED".to_string(),
+        events,
+        exported_at: Utc::now(),
+        payload_policy: HistoryPayloadPolicy::Full,
+        max_bytes: Some(64 * 1024),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+    })
+    .expect("full export should fit under the limit");
+    let json = serde_json::to_string(&document).expect("export serialises");
+
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        .replay_from_json(&json)
+        .await
+        .expect("exported document must be accepted by replay_from_json");
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "an export document without a parent must replay the orphan branch and diverge; \
+             got: {other:?}\nreport: {report}"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (issue #698 FIX 2) workflow_id / workflow_type must be threaded into EVERY
+//   replay path. `ctx.info().workflow_type` (= the workflow_name column /
+//   handler key) and `ctx.info().workflow_id` (the business id column) live in
+//   NO WorkflowEvent — the LIVE worker sets them on the context via span_meta,
+//   but the strict/canary/export/JSON replay paths build the context without
+//   them, so a pure-history replay reports "" for both. A workflow that branches
+//   command-affecting logic on either — or, as here, embeds them in an activity
+//   INPUT (which the ctx.info() docs promise is replay-safe) — then false-reports
+//   non-determinism under export/DB/canary/JSON replay. These tests are the
+//   falsifiable bar: pre-fix they RED (divergence: recorded input carries the
+//   real identity, replay computes ""), post-fix they GREEN.
+//
+//   `workflow_type` uses mechanism 1 (apply the already-carried workflow_name);
+//   `workflow_id` uses mechanism 2 (an added HistorySnapshot/HistoryExportDocument
+//   field). The strict-input round-trip below is simultaneously the DIRECT
+//   assertion the census calls for: the activity input IS `ctx.info()`, so a clean
+//   strict replay proves the replay-path context reports the real values, not "".
+// ---------------------------------------------------------------------------
+
+/// A workflow that embeds its own `ctx.info().workflow_type` and
+/// `ctx.info().workflow_id` into the input of a single activity. Under STRICT
+/// replay (the `WorkflowReplayer` default) the emitted activity input is compared
+/// byte-for-byte against the recorded `ActivityScheduled.input`, so a replay that
+/// computed the wrong (empty) identity diverges. This is the strongest, most
+/// direct assertion that the replay-path context reports the real identity.
+fn identity_into_activity_input<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let info = ctx.info();
+        let payload = serde_json::json!({
+            "workflow_type": info.workflow_type,
+            "workflow_id": info.workflow_id,
+        });
+        let out = ctx
+            .execute_activity_raw("record_identity", payload, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// History recorded by a live run of `identity_into_activity_input`: the
+/// `record_identity` activity input carries the REAL `(workflow_type, workflow_id)`
+/// the live context observed via `span_meta`.
+fn identity_taken_history(wf_type: &str, wf_id: &str) -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let act_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "record_identity".into(),
+            input: serde_json::json!({
+                "workflow_type": wf_type,
+                "workflow_id": wf_id,
+            }),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!("ok"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("ok"),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// (e) THE MONEY TEST. A history recorded under a real workflow type
+/// (`identity_wf`) and business id (`cart-42`) is exported through the DB export
+/// document (the way retention / the HTTP export route does) and replayed via
+/// `replay_from_json` with NO manual override. The export document carries
+/// `workflow_name` (→ `workflow_type`, mechanism 1) and the new `workflow_id`
+/// field (mechanism 2), so both round-trip into the replay context and the strict
+/// activity-input comparison passes → `ReplaySucceeded`. Pre-fix the replay
+/// computed `("", "")` and diverged.
+#[tokio::test]
+async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() {
+    use autumn_harvest::history_export::{
+        HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    };
+
+    let (exec_id, events) = identity_taken_history("identity_wf", "cart-42");
+
+    let document = export_history(HistoryExportRequest {
+        workflow_name: "identity_wf".to_string(),
+        // Issue #698: the business id rides the export document (mechanism 2).
+        workflow_id: Some("cart-42".to_string()),
+        execution_id: exec_id,
+        shard_id: 0,
+        state: "COMPLETED".to_string(),
+        events,
+        exported_at: Utc::now(),
+        payload_policy: HistoryPayloadPolicy::Full,
+        max_bytes: Some(64 * 1024),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+    })
+    .expect("full export should fit under the limit");
+    let json = serde_json::to_string(&document).expect("export serialises");
+
+    // Replay the exported JSON directly — NO manual override of type/id.
+    let report = WorkflowReplayer::new()
+        .register_fn("identity_wf", identity_into_activity_input)
+        .replay_from_json(&json)
+        .await
+        .expect("exported document must be accepted by replay_from_json");
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a workflow that embeds ctx.info().workflow_type / workflow_id in an \
+         activity input must replay clean through the export document round-trip \
+         (both identity fields threaded), got: {report}"
+    );
+}
+
+/// (f) The negative control for `workflow_id` (mechanism 2): when the export
+/// request carries no `workflow_id`, the exported document deserialises to
+/// `workflow_id = ""`, so the replayed activity input `{"workflow_id": ""}`
+/// diverges from the recorded `"cart-42"` — proving the export document's
+/// `workflow_id` field is the load-bearing carrier through this path.
+#[tokio::test]
+async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
+    use autumn_harvest::history_export::{
+        HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    };
+
+    let (exec_id, events) = identity_taken_history("identity_wf", "cart-42");
+
+    let document = export_history(HistoryExportRequest {
+        workflow_name: "identity_wf".to_string(),
+        // Deliberately drop the business id: the recorded input still says
+        // "cart-42", so replay must diverge.
+        workflow_id: None,
+        execution_id: exec_id,
+        shard_id: 0,
+        state: "COMPLETED".to_string(),
+        events,
+        exported_at: Utc::now(),
+        payload_policy: HistoryPayloadPolicy::Full,
+        max_bytes: Some(64 * 1024),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+    })
+    .expect("full export should fit under the limit");
+    let json = serde_json::to_string(&document).expect("export serialises");
+
+    let report = WorkflowReplayer::new()
+        .register_fn("identity_wf", identity_into_activity_input)
+        .replay_from_json(&json)
+        .await
+        .expect("exported document must be accepted by replay_from_json");
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "an export document without a workflow_id must diverge (recorded \
+             \"cart-42\" vs replayed \"\"); got: {other:?}\nreport: {report}"
+        ),
+    }
+}
+
+/// (g) `workflow_type` load-bearing proof for the raw-events path (mechanism 1):
+/// `replay_from_events` applies the single registered handler's KEY as the
+/// context's `workflow_type`. The recorded activity input carries that same type
+/// (and an empty id, since a raw-events fixture has no business id), so a clean
+/// strict replay proves the handler key is applied as `ctx.info().workflow_type`
+/// rather than left "".
+#[tokio::test]
+async fn workflow_type_is_applied_from_handler_key_on_raw_events_path() {
+    let (_exec_id, events) = identity_taken_history("identity_wf", "");
+
+    let report = WorkflowReplayer::new()
+        .register_fn("identity_wf", identity_into_activity_input)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the handler key must be applied as ctx.info().workflow_type on the \
+         raw-events path, got: {report}"
+    );
+}
+
+/// (h) `workflow_id` global-override proof (mechanism 2, raw-events path):
+/// `WorkflowReplayer::with_workflow_id` supplies the business id a raw-events
+/// fixture cannot carry, so a workflow that embeds it in an activity input
+/// replays clean.
+#[tokio::test]
+async fn workflow_id_is_applied_from_replayer_global_on_raw_events_path() {
+    let (_exec_id, events) = identity_taken_history("identity_wf", "cart-99");
+
+    let report = WorkflowReplayer::new()
+        .register_fn("identity_wf", identity_into_activity_input)
+        .with_workflow_id("cart-99")
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "with_workflow_id must thread the business id into the raw-events replay \
+         context, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (issue #698, Codex P2 @ testing.rs:903) execution_id must be threadable into
+//   the raw `replay_from_events` path. `ctx.info().execution_id` is documented
+//   as replay-safe (the production / DB / snapshot / canary replay paths all
+//   recover the real id), but a raw-events fixture carries no HistorySnapshot to
+//   source it from, so `replay_from_events` mints a FRESH id. A workflow that
+//   recorded its own `ctx.info().execution_id` in a command-affecting value
+//   (here, an activity INPUT — which the docs promise is replay-safe) then
+//   false-reports non-determinism: the random replay id vs the recorded original
+//   run id. `WorkflowReplayer::with_execution_id` closes that last raw-path gap.
+// ---------------------------------------------------------------------------
+
+/// A workflow that embeds its own `ctx.info().execution_id` into the input of a
+/// single activity. Under STRICT replay the emitted input is compared
+/// byte-for-byte against the recorded `ActivityScheduled.input`, so a replay that
+/// computed a DIFFERENT `execution_id` diverges — the strongest, most direct
+/// assertion that the raw-path context reports the supplied id.
+fn exec_id_into_activity_input<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let info = ctx.info();
+        let payload = serde_json::json!({ "execution_id": info.execution_id.to_string() });
+        let out = ctx
+            .execute_activity_raw("record_exec_id", payload, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// History recorded by a live run of `exec_id_into_activity_input`: the
+/// `record_exec_id` activity input carries the REAL `execution_id` the live
+/// context observed.
+fn exec_id_taken_history(exec_id: ExecutionId) -> Vec<WorkflowEvent> {
+    let act_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "record_exec_id".into(),
+            input: serde_json::json!({ "execution_id": exec_id.to_string() }),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!("ok"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("ok"),
+        },
+    ]
+}
+
+/// (i) THE MONEY TEST for the raw-events `execution_id` gap: with the captured run
+/// id supplied via `with_execution_id`, the replayed activity input matches the
+/// recorded one → `ReplaySucceeded`. Pre-fix `replay_from_events` minted a fresh
+/// random id and this diverged.
+#[tokio::test]
+async fn execution_id_is_applied_from_replayer_global_on_raw_events_path() {
+    let exec_id = ExecutionId::new();
+    let events = exec_id_taken_history(exec_id);
+
+    let report = WorkflowReplayer::new()
+        .register_fn("exec_id_wf", exec_id_into_activity_input)
+        .with_execution_id(exec_id)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "with_execution_id must thread the captured run id into the raw-events \
+         replay context, got: {report}"
+    );
+}
+
+/// (j) The load-bearing negative control for (i): WITHOUT `with_execution_id`,
+/// `replay_from_events` mints a fresh random id, so the replayed activity input
+/// carries a DIFFERENT `execution_id` than the recorded one → divergence. This is
+/// exactly the false non-determinism the builder closes.
+#[tokio::test]
+async fn execution_id_diverges_on_raw_events_path_without_the_builder() {
+    let exec_id = ExecutionId::new();
+    let events = exec_id_taken_history(exec_id);
+
+    let report = WorkflowReplayer::new()
+        .register_fn("exec_id_wf", exec_id_into_activity_input)
+        // Deliberately DO NOT call with_execution_id — a fresh random id is minted.
+        .replay_from_events(events)
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "without a threaded execution_id the raw-events replay mints a fresh id \
+             and must diverge from the recorded one; got: {other:?}\nreport: {report}"
+        ),
+    }
 }

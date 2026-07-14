@@ -821,6 +821,33 @@ All six lower onto the single append-only `WorkflowEvent::SideEffectRecorded { k
 
 `ctx.sleep_until(timer_id, deadline)` is the absolute-instant companion to the relative, whole-second `ctx.timer(timer_id, secs)` — durably wait *until* a `DateTime<Utc>`, then resolve. It is the blessed, replay-safe form of the hand-rolled `ctx.timer(id, (deadline - ctx.system_now()).num_seconds() as u64)` pattern, with both foot-guns closed inside the engine: the wall clock is captured **once** via the deterministic `system_now` (frozen into history as a `SideEffectRecorded { kind: Now }` event — an **existing** variant, **no new event variant, no migration**), so every replay recomputes the identical remaining duration and resolves at the same instant on every worker; and a `deadline` at or before the captured "now" clamps the remaining duration to **zero** (fires on the next poll — never a wrapped multi-year sleep from an `as u64` underflow). Any positive sub-second remainder rounds **up** to the engine's whole-second timer granularity (nanosecond-precise, matching `wait_for_signal_timeout`), so the wait never resolves *before* `deadline`. It lowers onto the existing `TimerStarted`/`TimerFired` events and suspension path — a `sleep_until` timer is byte-identical to a `ctx.timer` timer of the same computed duration, so a non-deterministic author-supplied `deadline` surfaces as ordinary timer non-determinism (not a panic), and like `ctx.timer` exactly one timer suspends per call and it cannot share a suspension batch with activity/child-workflow/signal commands. Derive `deadline` from deterministic state (a workflow input, a prior activity output, or `ctx.system_now()`) — never `chrono::Utc::now()` directly; prefer `ctx.timer(id, secs)` for a purely *relative* wait (it skips the redundant `system_now()` capture); and note that in `WorkflowTestEnv` the internal `system_now()` reads the real wall clock rather than the virtual `ctx.now()`. See `autumn-harvest/examples/sleep_until_renewal_reminder.rs`.
 
+### Run metadata — `ctx.info()` (issue #698)
+
+`ctx.info()` is the replay-safe, zero-footprint accessor for a workflow run's own **system** metadata — the identifiers operators and traces already key on, which author code previously could not see. It returns a `WorkflowExecutionInfo` bundling seven fields: `execution_id`, `workflow_id`, `workflow_type`, `start_time`, `history_event_count`, `is_replaying`, and `parent_execution_id`.
+
+```rust
+#[workflow]
+async fn checkout(ctx: &WorkflowContext, cart: Cart) -> Result<(), String> {
+    let info = ctx.info();
+    // One-hop correlation: this IS the management-API path key —
+    // GET /api/harvest/workflows/{info.execution_id} opens this exact run.
+    tracing::info!(execution_id = %info.execution_id, "starting checkout");
+    // Mint a run-scoped idempotency key so a charge is never double-applied
+    // across worker-level retries of this run:
+    let charge_key = format!("charge-{}", info.execution_id);
+    // A child workflow can identify the parent that spawned it:
+    if let Some(parent) = info.parent_execution_id {
+        tracing::info!(%parent, "spawned by parent");
+    }
+    // ...
+    Ok(())
+}
+```
+
+`execution_id` is the exact identifier the management API path (`/api/harvest/workflows/{exec_id}/...`), the DLQ, reset/pause/cancel, and the ADR-0001 `execution.id` span attribute all use — so a log line carrying `ctx.info().execution_id` opens that run with **zero** directory lookups. `parent_execution_id` is `None` for a top-level run and the spawning parent's id for a child (threaded by the worker from the execution row's `parent_id`). Two sibling `const fn` accessors also exist: `ctx.start_time()` (the **raw** frozen `WorkflowStarted` timestamp — deliberately **not** the advancing virtual clock that `ctx.now()` moves under the test harness) and `ctx.parent_execution_id()`.
+
+**Guarantees:** every field derives from already-recorded state (the `WorkflowStarted` event + the execution row the executor already loads), so `info()` is **replay-deterministic** (byte-identical on every worker and every replay pass) and **leaves zero footprint** — it appends no `harvest_events` and emits no `WorkflowCommand`, the same leave-no-trace property as a query handler. Usable from any `#[workflow]` body with **no feature flag**. **No new `WorkflowEvent` variant, no migration.** One exception to the byte-identical/branch-safe claim: `is_replaying` is **observability-only** — it intentionally differs live-vs-replay (it *is* the replay indicator), so do not branch command-affecting logic on it or include it in an activity input (doing so records different commands live vs replay → non-determinism). See `autumn-harvest/examples/ctx_info.rs`.
+
 ### Patched / Code Evolution (issue #687)
 
 `ctx.patched(id)` / `ctx.deprecate_patch(id)` are the recommended default for evolving in-flight workflow logic — a boolean two-state gate over the same `MarkerRecorded` event `ctx.version()` uses (`patch:{id}`, no new event variant, no migration).

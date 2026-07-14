@@ -576,6 +576,90 @@ async fn retention_archive_carries_deadline_metadata() {
     );
 }
 
+// Issue #698 (Codex P2): the pre-deletion archive — the last surviving copy of
+// a workflow's history — must carry the spawning `parent_execution_id`, sourced
+// from the row's `parent_id` column (present in no `WorkflowEvent`), so a
+// parent-aware child archived to cold storage replays cleanly instead of
+// false-reporting non-determinism on `ctx.info().parent_execution_id`.
+//
+// Falsifiable: before the fix the retention `HistoryExportRequest` had no
+// parent field, so the archived document deserialised parent = None even though
+// the deleted row carried it.
+#[tokio::test]
+async fn retention_archive_carries_parent_execution_id() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    // A phantom spawning parent (no FK on `parent_id`, so no parent row is
+    // needed). Using a phantom parent keeps the child the SOLE retention
+    // candidate, so the deleted-parent orphan-nulling path never touches its
+    // `parent_id` and the test isolates the candidate.parent_id ->
+    // doc.parent_execution_id thread.
+    let parent = ExecutionId::new();
+
+    // A completed CHILD row whose `parent_id` points at the phantom parent.
+    let child_id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at, parent_id)
+         VALUES ($1, $2, 0, 'COMPLETED', '{}'::jsonb, $3, $3, $4)
+         RETURNING id",
+    )
+    .bind::<Text, _>("child_wf")
+    .bind::<Text, _>("cw1")
+    .bind::<Timestamptz, _>(two_days_ago)
+    .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
+    .get_result::<IdRow>(&mut conn)
+    .await
+    .expect("insert child execution")
+    .id;
+    // Append a well-formed history via the store (the archiver path loads it via
+    // `load_history`; a malformed raw event would be skipped, not archived).
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(child_id),
+        &[WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: two_days_ago,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append child history");
+
+    // Global 1-day age -> the 2-day-old child is eligible for deletion+archival.
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let archiver = Arc::new(CapturingArchiver::default());
+
+    let result = run_one_tick_with_archiver(
+        pool,
+        config,
+        Arc::clone(&metrics),
+        Arc::clone(&archiver) as Arc<dyn HistoryArchiver>,
+    )
+    .await;
+    assert_eq!(
+        result.deleted_count, 1,
+        "the eligible child is archived+deleted"
+    );
+
+    let docs = archiver.docs();
+    assert_eq!(docs.len(), 1, "exactly one execution was archived");
+    let child_doc = &docs[0];
+    assert_eq!(child_doc.execution_id, ExecutionId::from_uuid(child_id));
+    assert_eq!(
+        child_doc.parent_execution_id,
+        Some(parent),
+        "archived child doc must carry parent_execution_id sourced from parent_id (issue #698)"
+    );
+}
+
 /// Capturing archiver — records the `HistoryExportDocument` handed to the
 /// retention janitor so a test can assert what the last cold-storage copy
 /// carried (issue #772 Finding A).

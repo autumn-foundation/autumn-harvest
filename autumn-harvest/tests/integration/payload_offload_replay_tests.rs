@@ -153,6 +153,8 @@ async fn offloaded_history_replays_with_full_byte_fidelity() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
     assert!(
@@ -173,6 +175,8 @@ async fn offloaded_history_replays_with_full_byte_fidelity() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
     assert!(

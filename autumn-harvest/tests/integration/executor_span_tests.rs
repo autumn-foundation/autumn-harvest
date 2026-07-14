@@ -240,6 +240,11 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             None,
             // Issue #772: no per-execution execution_timeout / live deadline_at.
             None,
+            // Issue #698: no spawning parent (top-level run).
+            None,
+            // Issue #698: workflow type name / business workflow_id.
+            "echo_workflow".to_string(),
+            None,
         ));
 
     // 1. Span must be named correctly.

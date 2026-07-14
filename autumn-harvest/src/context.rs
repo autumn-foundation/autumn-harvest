@@ -1839,6 +1839,107 @@ pub struct WorkflowContext {
     /// [`metrics()`](Self::metrics) returns a suppressed handle while
     /// `is_replaying()` is `true`.
     metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    /// The execution id of the parent workflow that spawned this run, or `None`
+    /// for a top-level run (issue #698). Threaded from the execution row's
+    /// `parent_id` column by the worker (via
+    /// [`WorkflowExecuteSpanMeta`](crate::executor::WorkflowExecuteSpanMeta)) so
+    /// a child workflow can identify its spawner via [`info()`](Self::info) /
+    /// [`parent_execution_id()`](Self::parent_execution_id). Records no event and
+    /// is replay-stable (it is a fixed row value). Left `None` for the
+    /// query/update throwaway (`new_for_handler`), replayer, and test contexts
+    /// that never went through the worker.
+    parent_execution_id: Option<ExecutionId>,
+}
+
+/// A read-only, replay-safe snapshot of a workflow run's system metadata
+/// (issue #698).
+///
+/// Returned by [`WorkflowContext::info`]. Every field is derived from
+/// already-recorded state — the `WorkflowStarted` event and the execution row
+/// the executor already loads — so reading it appends **no** `harvest_events`
+/// and emits **no** [`WorkflowCommand`]. All fields are replay-safe — replaying
+/// the same recorded history yields identical values across workers and across
+/// replay passes — and safe to log, embed in a run-scoped idempotency key,
+/// branch on, or include in an activity input, **with one exception:**
+/// [`is_replaying`](Self::is_replaying), which is the replay indicator itself
+/// and is intentionally **not** byte-identical live-vs-replay (see its field
+/// doc). Do not branch command-affecting logic on `is_replaying` or include it
+/// in an activity input.
+///
+/// This is the workflow-side counterpart of the `execution.id` span attribute
+/// (ADR-0001) and the management-API `{exec_id}` path key: the
+/// [`execution_id`](Self::execution_id) here is the exact identifier an operator
+/// pages on.
+///
+/// # Field census — replay-safety (issue #698)
+///
+/// Every field is classified into exactly one category, and each `(a)` field is
+/// threaded through **all** replay paths (JSON/export/DB-canary/query/live). See
+/// the PR body for the full per-path table.
+///
+/// - `execution_id` → **(a)** threaded — the constructor `exec_id` arg on every path.
+/// - `workflow_id` → **(a)** threaded — added field on `HistorySnapshot` /
+///   `HistoryExportDocument` (mechanism 2); applied via `with_workflow_id`.
+/// - `workflow_type` → **(a)** threaded — the already-carried `workflow_name`
+///   (handler key / row column, mechanism 1); applied via `with_workflow_name`.
+/// - `start_time` → **(b)** by construction — extracted from the `WorkflowStarted`
+///   event in `for_replay`; reproduced with no threading.
+/// - `history_event_count` → **(b)** by construction — the matcher cursor position.
+/// - `is_replaying` → **(c)** observability-only — the replay indicator itself
+///   (carved out of the branch-safe guarantee below).
+/// - `parent_execution_id` → **(a)** threaded — the row `parent_id` column.
+///
+/// ```rust,ignore
+/// #[workflow]
+/// async fn checkout(ctx: &WorkflowContext, cart: Cart) -> Result<(), String> {
+///     let info = ctx.info();
+///     tracing::info!(execution_id = %info.execution_id, "starting checkout");
+///     let key = format!("charge-{}", info.execution_id); // run-scoped idempotency key
+///     // ...
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WorkflowExecutionInfo {
+    /// The system-generated execution (run) id — the exact identifier the
+    /// management API path (`/api/harvest/workflows/{execution_id}/...`), the
+    /// DLQ, reset/pause/cancel, and the ADR-0001 `execution.id` span attribute
+    /// all key on. Round-trips through [`ExecutionId`]'s `Display`/`FromStr`.
+    pub execution_id: ExecutionId,
+    /// The business-level workflow identifier set at start (e.g.
+    /// `"subscription-123"`). Empty when not set (bare test contexts).
+    pub workflow_id: String,
+    /// The logical workflow type name (the `#[workflow]` function name). Empty
+    /// when not set (update/query handler contexts).
+    pub workflow_type: String,
+    /// The `WorkflowStarted` timestamp — the deterministic run start instant,
+    /// frozen in history. **Not** the advancing virtual clock ([`now`] moves
+    /// under the test harness; this does not).
+    ///
+    /// [`now`]: WorkflowContext::now
+    pub start_time: DateTime<Utc>,
+    /// The number of history events consumed/processed up to the current point
+    /// (the matcher's cursor position) — replay-stable across workers and replay
+    /// passes, since it is a pure function of how far the workflow's own code has
+    /// advanced through history at the call site. This is **not** the total
+    /// loaded history snapshot length (which grows across workflow tasks), and it
+    /// is **not** suitable for continue-as-new history-size decisions — use
+    /// [`WorkflowContext::should_continue_as_new`] for that.
+    pub history_event_count: u64,
+    /// Whether the executor is currently replaying recorded history.
+    /// **Observability-only.** Unlike the other fields, this intentionally
+    /// differs between the initial live execution (`false` at the frontier) and
+    /// replay of the same code position (`true`) — it *is* the replay indicator,
+    /// so it is **not** byte-identical live-vs-replay. Do **not** branch
+    /// command-affecting logic on it, include it in an activity input, or
+    /// otherwise derive workflow commands from it: doing so records different
+    /// commands on the live run vs replay and triggers non-determinism. (It is
+    /// still identical between two *replay* passes of the same history.)
+    pub is_replaying: bool,
+    /// The execution id of the parent workflow that spawned this run, or `None`
+    /// for a top-level run ("no parent").
+    pub parent_execution_id: Option<ExecutionId>,
 }
 
 impl WorkflowContext {
@@ -2102,6 +2203,7 @@ impl WorkflowContext {
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            parent_execution_id: None,
         }
     }
 
@@ -2243,6 +2345,7 @@ impl WorkflowContext {
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            parent_execution_id: None,
         })
     }
 
@@ -2299,6 +2402,7 @@ impl WorkflowContext {
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            parent_execution_id: None,
         }
     }
 
@@ -2441,6 +2545,21 @@ impl WorkflowContext {
     #[must_use]
     pub fn with_build_id(mut self, build_id: Option<String>) -> Self {
         self.build_id = build_id;
+        self
+    }
+
+    /// Set the execution id of the parent workflow that spawned this run
+    /// (issue #698).
+    ///
+    /// Threaded by the executor from
+    /// [`WorkflowExecuteSpanMeta::parent_execution_id`](crate::executor::WorkflowExecuteSpanMeta),
+    /// which the worker populates from the execution row's `parent_id` column.
+    /// `None` (the default) means a top-level run with no spawning parent.
+    /// Surfaced to author code via [`info()`](Self::info) /
+    /// [`parent_execution_id()`](Self::parent_execution_id).
+    #[must_use]
+    pub const fn with_parent_execution_id(mut self, parent: Option<ExecutionId>) -> Self {
+        self.parent_execution_id = parent;
         self
     }
 
@@ -2658,6 +2777,95 @@ impl WorkflowContext {
         self.build_id.as_deref()
     }
 
+    /// The deterministic run start instant — the `WorkflowStarted` timestamp
+    /// frozen in history (issue #698).
+    ///
+    /// This is the **raw** start time. Unlike [`now`](Self::now), it is **not**
+    /// moved by the test harness's advancing virtual clock (issue #526), so it
+    /// is safe to compare across replay cycles and workers.
+    #[must_use]
+    pub const fn start_time(&self) -> DateTime<Utc> {
+        self.start_time
+    }
+
+    /// The execution id of the parent workflow that spawned this run, or `None`
+    /// for a top-level run (issue #698).
+    #[must_use]
+    pub const fn parent_execution_id(&self) -> Option<ExecutionId> {
+        self.parent_execution_id
+    }
+
+    /// A read-only, replay-safe snapshot of this run's system metadata
+    /// (issue #698).
+    ///
+    /// Bundles [`execution_id`](Self::execution_id),
+    /// [`workflow_id`](Self::workflow_id), [`workflow_type`](Self::workflow_type),
+    /// [`start_time`](Self::start_time),
+    /// [`history_event_count`](Self::history_event_count),
+    /// [`is_replaying`](Self::is_replaying), and
+    /// [`parent_execution_id`](Self::parent_execution_id) into one
+    /// [`WorkflowExecutionInfo`]. It is the single source of truth built from the
+    /// existing accessors, so it stays consistent with each of them.
+    ///
+    /// Every field is derived from already-recorded state, so calling `info()`
+    /// appends **no** `harvest_events` and emits **no** [`WorkflowCommand`] — the
+    /// same leave-no-trace property as a query handler. All fields return
+    /// byte-identical values on every replay pass and every worker **except**
+    /// [`is_replaying`](Self::is_replaying), which is observability-only and
+    /// intentionally differs live-vs-replay (see its field doc — do not branch
+    /// command-affecting logic on it or include it in an activity input). Use it
+    /// for logging, run-scoped idempotency keys
+    /// (`format!("charge-{}", ctx.info().execution_id)`), and parent-aware child
+    /// logic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal history matcher mutex is poisoned (via
+    /// [`history_event_count`](Self::history_event_count) /
+    /// [`is_replaying`](Self::is_replaying)).
+    #[must_use]
+    pub fn info(&self) -> WorkflowExecutionInfo {
+        // `history_event_count` and `is_replaying` are read by locking the
+        // matcher directly, deliberately bypassing
+        // [`match_history`](Self::match_history)'s `pump_signal_handlers`
+        // post-hook. `info()` is a read-only snapshot (issue #698 AC5
+        // zero-footprint contract): it must never dispatch a push signal
+        // handler (issue #546), claim a reachable `SignalReceived`, advance the
+        // cursor, push a command, or append an event. The public
+        // [`history_event_count`](Self::history_event_count) accessor *does* run
+        // that post-hook, so it cannot be reused here.
+        //
+        // `history_event_count` here is the matcher's **consumed cursor
+        // position** (`matcher.position()`), NOT the total loaded history
+        // snapshot length (`matcher.event_count()`). The total grows across
+        // workflow tasks — a run replayed on task 2 loads a larger history than
+        // it did live on task 1 — so reporting the total would make `info()`
+        // return a different value live vs replay at the same code position,
+        // violating the issue #698 AC3 replay-stability contract. The cursor
+        // position is a pure function of how far the workflow's own code has
+        // consumed history at the call site, so it is byte-identical across
+        // replay passes and workers. (The public
+        // [`history_event_count`](Self::history_event_count) accessor stays the
+        // total, because [`should_continue_as_new`](Self::should_continue_as_new)
+        // needs the whole-history size for its checkpoint decision.)
+        let (history_event_count, is_replaying) = {
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
+            (
+                u64::try_from(matcher.position()).unwrap_or(u64::MAX),
+                matcher.is_replaying(),
+            )
+        };
+        WorkflowExecutionInfo {
+            execution_id: self.execution_id(),
+            workflow_id: self.workflow_id().to_string(),
+            workflow_type: self.workflow_type().to_string(),
+            start_time: self.start_time(),
+            history_event_count,
+            is_replaying,
+            parent_execution_id: self.parent_execution_id(),
+        }
+    }
+
     /// Returns `true` if all admitted update handlers have completed or failed.
     ///
     /// # Panics
@@ -2820,6 +3028,13 @@ impl WorkflowContext {
     /// This is replay-safe: it is computed from the in-memory history snapshot
     /// loaded before the current workflow task, not from a side-effecting
     /// counter maintained by author code.
+    ///
+    /// **Note:** this routes through [`match_history`](Self::match_history), so
+    /// its `pump_signal_handlers` post-hook runs — a call here can dispatch a
+    /// newly-claimable push signal handler (issue #546). This is fine for
+    /// author code that consults history alongside its normal flow, but if you
+    /// need a purely read-only event count with no dispatch side effect (as
+    /// [`info`](Self::info) does), lock the matcher directly instead.
     #[must_use]
     pub fn history_event_count(&self) -> u64 {
         self.match_history(|matcher| matcher.event_count())
@@ -3030,6 +3245,11 @@ impl WorkflowContext {
     /// an email or writing to a file), because the workflow code runs multiple times
     /// as it recovers state. You can check this flag to skip logging or local
     /// non-deterministic side-effects during recovery.
+    ///
+    /// Observability-only: use it to gate side effects, never to derive workflow
+    /// commands. Branching command-affecting logic on it records different
+    /// commands live vs replay and triggers non-determinism (see
+    /// [`WorkflowExecutionInfo::is_replaying`]).
     ///
     /// ## Examples
     ///
@@ -8856,6 +9076,11 @@ impl WorkflowContext {
         let last_completion_result = self.last_completion_result.clone();
         let last_error = self.last_error.clone();
         let metrics = std::sync::Arc::clone(&self.metrics);
+        // Issue #698: inherit the spawning parent's execution id so an update
+        // handler invoked on a child run observes `ctx.info().parent_execution_id`.
+        // `new_for_handler` inits it to `None`; without this the update-handler
+        // path (unlike the workflow body) would never see the parent.
+        let parent_execution_id = self.parent_execution_id;
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -8879,6 +9104,8 @@ impl WorkflowContext {
                 // Issue #772 (Codex P2): inherit the parent's deadline budget.
                 inner.execution_timeout = execution_timeout;
                 inner.deadline_at = deadline_at;
+                // Issue #698: inherit the spawning parent's execution id.
+                inner.parent_execution_id = parent_execution_id;
             }
             handler_fn(ctx, input)
         });
@@ -8952,6 +9179,9 @@ impl WorkflowContext {
                 // `ctx.deadline()` works inside the handler.
                 inner.execution_timeout = self.execution_timeout;
                 inner.deadline_at = self.deadline_at;
+                // Issue #698: inherit the spawning parent's execution id so
+                // `ctx.info().parent_execution_id` is visible inside the handler.
+                inner.parent_execution_id = self.parent_execution_id;
             }
             h(ctx, input)
         })
@@ -11668,6 +11898,57 @@ mod tests {
             result,
             Ok(serde_json::json!((t0 + timeout).timestamp_millis())),
             "the update handler must inherit execution_timeout (nominal deadline present)"
+        );
+    }
+
+    /// Issue #698 (Codex parent-threading sweep, #B): a declarative `#[update]`
+    /// handler invoked on a child run must observe the spawning parent via
+    /// `ctx.info().parent_execution_id`. `new_for_handler` inits it to `None`;
+    /// `register_declarative_update_handler` (and the `invoke_update` fallback)
+    /// must thread the parent's `parent_execution_id` into the handler context —
+    /// same class as the `execution_timeout`/`deadline_at` threading above.
+    #[tokio::test]
+    async fn update_handler_inherits_parent_execution_id() {
+        #[allow(clippy::needless_pass_by_value)]
+        fn parent_probe_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            // The handler reads the parent id via the exact accessor issue #698
+            // exposes to author code.
+            let parent = ctx.info().parent_execution_id.map(|p| p.to_string());
+            Box::pin(async move { Ok(serde_json::json!(parent)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "parent_probe",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "string",
+            has_validator: false,
+            handler: parent_probe_handler,
+            validator: None,
+            mcp: false,
+        };
+
+        let parent_id = ExecutionId::new();
+        let child_ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()])
+            .with_parent_execution_id(Some(parent_id));
+        // Sanity: the child workflow context itself reports the parent.
+        assert_eq!(child_ctx.info().parent_execution_id, Some(parent_id));
+
+        child_ctx.register_declarative_update_handler(&info);
+        let fut = child_ctx
+            .invoke_update("parent_probe", Value::Null)
+            .expect("handler registered");
+        let result = fut.await;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!(parent_id.to_string())),
+            "a declarative update handler must inherit the spawning parent's execution id \
+             so ctx.info().parent_execution_id is Some(parent) inside the handler"
         );
     }
 
@@ -19455,5 +19736,349 @@ mod tests {
             ctx.unhandled_signals().is_empty(),
             "a consumed signal must not be reported as unhandled"
         );
+    }
+
+    // ── Run metadata: ctx.info() (issue #698) ──────────────────────────────
+
+    /// AC1 + AC4 (core): `info()` returns the documented fields for a bare
+    /// `new_test()` context, and the returned `execution_id` string equals the
+    /// context's own `execution_id()`.
+    #[test]
+    fn info_reports_all_fields_for_new_test_context() {
+        let ctx = WorkflowContext::new_test();
+        let info = ctx.info();
+
+        assert_eq!(info.execution_id, ctx.execution_id());
+        assert_eq!(info.workflow_id, ""); // empty for a bare test context
+        assert_eq!(info.workflow_type, "");
+        assert_eq!(info.start_time, ctx.start_time());
+        assert_eq!(info.history_event_count, 0);
+        assert!(!info.is_replaying);
+        assert_eq!(info.parent_execution_id, None);
+    }
+
+    /// AC1: `info()` on a query/update throwaway `new_for_handler` context does
+    /// not panic and reports empty ids / no parent (graceful).
+    #[test]
+    fn info_is_graceful_for_new_for_handler_context() {
+        let exec_id = ExecutionId::new();
+        let ctx = WorkflowContext::new_for_handler(exec_id, Utc::now(), None, empty_shared_state());
+        let info = ctx.info();
+        assert_eq!(info.execution_id, exec_id);
+        assert_eq!(info.workflow_id, "");
+        assert_eq!(info.workflow_type, "");
+        assert_eq!(info.parent_execution_id, None);
+    }
+
+    /// AC3 (`start_time` trap): `start_time()` / `info().start_time` returns the
+    /// RAW frozen `WorkflowStarted` timestamp, not the advancing virtual clock.
+    #[test]
+    fn start_time_returns_raw_frozen_start_not_virtual_clock() {
+        let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
+        let events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: frozen,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(ctx.start_time(), frozen);
+        assert_eq!(ctx.info().start_time, frozen);
+    }
+
+    /// AC3 (`start_time` trap, advancing clock): advancing the virtual timer clock
+    /// (`ctx.now()` moves) must NOT change `info().start_time` / `start_time()`.
+    ///
+    /// The clock is advanced GENUINELY by replaying a recorded `TimerFired` through
+    /// `ctx.timer(...)` (context.rs `advance_timer_clock` on a `Matched` fire) —
+    /// merely `start_timer(...)` does NOT move the clock, which made an earlier
+    /// version of this test vacuous (the mutation `info.start_time = self.now()`
+    /// would have survived because `now() == start_time()`). The guard assertion
+    /// below establishes the divergence before checking `start_time` is immune.
+    #[cfg(any(test, feature = "testing"))]
+    #[tokio::test]
+    async fn info_start_time_is_immune_to_advancing_virtual_clock() {
+        let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: frozen,
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            timer_started_event("t", 3600),
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t"),
+            },
+        ];
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), events).with_advancing_timer_clock();
+        // Replay the recorded 1-hour timer fire so the virtual clock genuinely
+        // advances by its duration.
+        ctx.timer("t", 3600)
+            .await
+            .expect("recorded timer must replay-match");
+        // Guard: if the clock did not advance, this test proves nothing (the
+        // mutation `info().start_time = self.now()` would survive).
+        assert!(
+            ctx.now() > frozen,
+            "guard: virtual clock must have advanced — otherwise this test is vacuous"
+        );
+        // now() moved, but start_time() must stay frozen at the WorkflowStarted ts.
+        assert_eq!(ctx.start_time(), frozen, "start_time must stay frozen");
+        assert_eq!(ctx.info().start_time, frozen);
+    }
+
+    /// AC2: a threaded parent is reported; the default is `None` ("no parent");
+    /// and the parent is replay-stable across two rebuilds of the same fixture.
+    #[test]
+    fn info_reports_configured_parent_execution_id() {
+        let parent = ExecutionId::new();
+        let ctx = WorkflowContext::new_test().with_parent_execution_id(Some(parent));
+        assert_eq!(ctx.info().parent_execution_id, Some(parent));
+        assert_eq!(ctx.parent_execution_id(), Some(parent));
+
+        // Default is None.
+        let orphan = WorkflowContext::new_test();
+        assert_eq!(orphan.info().parent_execution_id, None);
+        assert_eq!(orphan.parent_execution_id(), None);
+    }
+
+    /// AC5/AC6 (zero footprint): calling `info()` emits no commands and leaves
+    /// the event history unchanged — the same leave-no-trace property as queries.
+    #[test]
+    fn info_emits_no_commands_and_no_events() {
+        let ctx = WorkflowContext::new_test();
+        let before = ctx.history_event_count();
+        let _ = ctx.info();
+        let _ = ctx.info();
+        let cmds = ctx.drain_commands();
+        assert!(cmds.is_empty(), "info() must not emit any commands");
+        assert_eq!(
+            ctx.history_event_count(),
+            before,
+            "info() must not append events"
+        );
+    }
+
+    /// AC5 (zero footprint, hardening): `info()` must NOT dispatch a
+    /// registered push signal handler (issue #546) nor claim a reachable
+    /// `SignalReceived`. Before the non-pumping read path, `info()` routed
+    /// through `history_event_count()` → `match_history()` →
+    /// `pump_signal_handlers()`, so a read-only `info()` would fire the handler
+    /// and consume the signal, mutating handler-captured state and control
+    /// flow. The pre-existing `info_emits_no_commands_and_no_events` test used a
+    /// context with NO handlers, so it passed vacuously.
+    #[test]
+    fn info_does_not_pump_signal_handlers_or_claim_signals() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "user_requested"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let fired: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let fired_clone = fired.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            fired_clone.lock().unwrap().push(payload);
+        });
+
+        // Read-only snapshot: must not fire the handler.
+        let _ = ctx.info();
+        let _ = ctx.info();
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "info() must not dispatch a registered signal handler"
+        );
+
+        // The signal must still be reachable: a subsequent flush (the trigger
+        // every other history-consulting call provides) delivers it exactly
+        // once — proving info() did not consume/claim it.
+        ctx.flush_pending_signal_handlers();
+        assert_eq!(
+            *fired.lock().unwrap(),
+            vec![serde_json::json!({"reason": "user_requested"})],
+            "info() must not consume the signal — it stays claimable for a later dispatch"
+        );
+    }
+
+    /// AC4: the `execution_id` a workflow reads via `info()` is exactly the
+    /// string the management API `{exec_id}` path key uses, round-tripping
+    /// through `ExecutionId`'s `FromStr`.
+    #[test]
+    fn info_execution_id_string_round_trips_to_the_same_id() {
+        let exec_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(exec_id, vec![started_event()]);
+        let info = ctx.info();
+        assert_eq!(info.execution_id.to_string(), exec_id.to_string());
+        let parsed: ExecutionId = info
+            .execution_id
+            .to_string()
+            .parse()
+            .expect("execution id string must parse back");
+        assert_eq!(parsed, exec_id);
+    }
+
+    /// AC3 + Success Metric: rebuilding the context N = 1,000 times from ONE
+    /// fixture with identical threaded metadata yields byte-identical `info()`
+    /// every time (0 divergences).
+    #[test]
+    fn info_is_replay_deterministic_across_1000_rebuilds() {
+        let exec_id = ExecutionId::new();
+        let parent = ExecutionId::new();
+        let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
+        let fixture = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({"cart": "cart-42"}),
+                timestamp: frozen,
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            timer_started_event("t", 1),
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t"),
+            },
+        ];
+
+        // AC (nit): a freshly-loaded replay context with unconsumed recorded
+        // history is replaying — assert the `true` case (every other info() test
+        // only ever asserts `is_replaying == false`), which `info()` reports
+        // without consuming the history.
+        assert!(
+            WorkflowContext::for_replay(exec_id, fixture.clone())
+                .info()
+                .is_replaying,
+            "a fresh replay context with unconsumed history must report is_replaying = true"
+        );
+
+        let build = || {
+            WorkflowContext::for_replay(exec_id, fixture.clone())
+                .with_workflow_name("checkout")
+                .with_workflow_id("cart-42")
+                .with_parent_execution_id(Some(parent))
+                .info()
+        };
+
+        let baseline = build();
+        for _ in 0..1000 {
+            assert_eq!(build(), baseline, "info() must be replay-deterministic");
+        }
+        // Sanity: the fixture-derived fields are what we threaded.
+        assert_eq!(baseline.execution_id, exec_id);
+        assert_eq!(baseline.workflow_id, "cart-42");
+        assert_eq!(baseline.workflow_type, "checkout");
+        assert_eq!(baseline.start_time, frozen);
+        // `history_event_count` is the matcher's CONSUMED cursor position, not the
+        // loaded total. `for_replay` advances the cursor past the leading
+        // `WorkflowStarted` lifecycle event at construction, so a fresh replay
+        // context (before the workflow consumes any command event) is at position
+        // 1 — replay-stable regardless of the total loaded history length. Its
+        // full replay-stability across differently-sized histories is guarded by
+        // `info_history_event_count_is_consumed_position_replay_stable` below.
+        assert_eq!(
+            baseline.history_event_count, 1,
+            "history_event_count is the consumed cursor position (1 after WorkflowStarted)"
+        );
+        assert_eq!(baseline.parent_execution_id, Some(parent));
+    }
+
+    /// AC3 (replay-stability, Codex P2): `info().history_event_count` is the
+    /// matcher's CONSUMED cursor position, NOT the total loaded history snapshot
+    /// length. The total grows across workflow tasks — a run replayed on task 2
+    /// loads a larger history than it did live on task 1 — so reporting the total
+    /// would make `info()` return a different value live vs replay at the same
+    /// code position, a false non-determinism. This is the decisive repro: two
+    /// contexts for the SAME execution at the SAME cursor position, one loaded
+    /// from a short history and one from a longer history, must report EQUAL
+    /// `history_event_count`.
+    #[cfg(any(test, feature = "testing"))]
+    #[tokio::test]
+    async fn info_history_event_count_is_consumed_position_replay_stable() {
+        let exec_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let started = WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+        let sched = WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        };
+        let completed = WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("done"),
+        };
+
+        // Task 1 ("live"): minimal history — just the started event and the
+        // in-flight activity scheduled/completed pair the workflow consumes.
+        let short = vec![started.clone(), sched.clone(), completed.clone()];
+        // Task 2 ("replay"): the SAME prefix plus a larger tail (a second
+        // scheduled activity not yet consumed) — the growing-history case.
+        let activity_id2 = ActivityExecId::new();
+        let long = vec![
+            started,
+            sched,
+            completed,
+            WorkflowEvent::ActivityScheduled {
+                activity_id: activity_id2,
+                name: "step2".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let ctx_short = WorkflowContext::for_replay(exec_id, short);
+        let ctx_long = WorkflowContext::for_replay(exec_id, long);
+
+        // Drive BOTH to the identical cursor position: replay the single "step"
+        // activity, advancing the cursor past WorkflowStarted + the activity pair.
+        ctx_short
+            .execute_activity_raw("step", Value::Null, "default")
+            .await
+            .expect("short replay must match");
+        ctx_long
+            .execute_activity_raw("step", Value::Null, "default")
+            .await
+            .expect("long replay must match");
+
+        let short_count = ctx_short.info().history_event_count;
+        let long_count = ctx_long.info().history_event_count;
+        assert_eq!(
+            short_count, long_count,
+            "history_event_count must be the consumed cursor position, equal at the \
+             same code point regardless of total loaded history length"
+        );
+        // And it must be the consumed position, not the total: > 0 (some history
+        // consumed) and < the long history's total length (4).
+        assert!(
+            short_count > 0,
+            "expected a non-zero consumed position after replaying one activity, got {short_count}"
+        );
+        assert!(
+            long_count < 4,
+            "consumed position ({long_count}) must be below the long history total (4), \
+             i.e. the total was not reported"
+        );
+    }
+
+    /// `WorkflowExecutionInfo` derives `Clone`/`PartialEq` so tests and author
+    /// code can compare and stash it.
+    #[test]
+    fn workflow_execution_info_is_clone_and_eq() {
+        let ctx = WorkflowContext::new_test();
+        let info = ctx.info();
+        let cloned = info.clone();
+        assert_eq!(info, cloned);
     }
 }

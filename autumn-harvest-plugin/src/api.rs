@@ -2974,6 +2974,12 @@ struct HistoryExportCandidate {
     id: uuid::Uuid,
     #[diesel(sql_type = diesel::sql_types::Text)]
     workflow_name: String,
+    // Issue #698: the business `workflow_id`, carried into the batch export
+    // document so `harvest-replay` / `replay_from_json` reports the real
+    // `ctx.info().workflow_id` (parity with the single-execution export). The
+    // column lives in no `WorkflowEvent`.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_id: String,
     #[diesel(sql_type = diesel::sql_types::Int4)]
     shard_id: i32,
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -2987,6 +2993,12 @@ struct HistoryExportCandidate {
     execution_timeout: Option<chrono::Duration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the spawning parent's execution id, carried into the batch
+    // export document so `harvest-replay` / `replay_from_json` threads the
+    // child's spawner into the replayed `WorkflowContext` (parity with the
+    // single-execution export). `parent_id` lives in no `WorkflowEvent`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    parent_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Default)]
@@ -16667,7 +16679,22 @@ async fn hydrate_ctx_for_query(
     // diverging the next replayed command (running/in-process query) or the
     // terminal-query drift check (`has_unconsumed_history` below → spurious 410).
     .with_execution_timeout(execution.execution_timeout)
-    .with_deadline(execution.deadline_at);
+    .with_deadline(execution.deadline_at)
+    // Issue #698: thread the execution row's parent id so a query replayed on a
+    // child run reports the spawning parent via `ctx.info().parent_execution_id`.
+    // Same class as execution_timeout/deadline_at above — the column lives on the
+    // execution row, absent from history, so this context (which sources those
+    // from the row) must source parent from the row too.
+    .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+    // Issue #698: thread the execution row's workflow type name and business
+    // `workflow_id` so a query replayed on this run reports the real values via
+    // `ctx.info().workflow_type` / `ctx.info().workflow_id`. Both live on the
+    // execution row (`workflow_name` is the handler-lookup key, `workflow_id` the
+    // business id) and are absent from history, so this row-sourced context must
+    // apply them here — otherwise a query handler that reads them, or a workflow
+    // that branched on them during the drive, sees "".
+    .with_workflow_name(execution.workflow_name.clone())
+    .with_workflow_id(execution.workflow_id.clone());
 
     // Seed declarative query handlers (registered via `.queries(queries![...])`)
     // before replaying, so execute_query_with_args can find them.
@@ -25250,6 +25277,11 @@ fn export_history_for_execution(
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
+            // Issue #698: carry the business `workflow_id` so an exported history
+            // round-trips `ctx.info().workflow_id` into the JSON / `harvest-replay`
+            // replay path (mirrors `parent_execution_id`; the column lives in no
+            // `WorkflowEvent`).
+            workflow_id: Some(execution.workflow_id.clone()),
             execution_id: ExecutionId::from_uuid(execution.id),
             shard_id: execution.shard_id,
             state: execution.state.clone(),
@@ -25263,6 +25295,11 @@ fn export_history_for_execution(
             // JSON / `harvest-replay` replay path.
             execution_timeout: execution.execution_timeout,
             deadline_at: execution.deadline_at,
+            // Issue #698: carry the spawning parent's execution id so an exported
+            // child history round-trips its parent into the JSON / `harvest-replay`
+            // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
+            // lives in no `WorkflowEvent`). `None` for a top-level run.
+            parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
         outcome,
@@ -25279,6 +25316,11 @@ fn export_history_for_candidate(
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: candidate.workflow_name.clone(),
+            // Issue #698: carry the business `workflow_id` (the batch candidate
+            // query now SELECTs `workflow_id`) so a batch-exported history
+            // round-trips `ctx.info().workflow_id` into the replay path — parity
+            // with the single-execution export.
+            workflow_id: Some(candidate.workflow_id.clone()),
             execution_id: ExecutionId::from_uuid(candidate.id),
             shard_id: candidate.shard_id,
             state: candidate.state.clone(),
@@ -25294,6 +25336,11 @@ fn export_history_for_candidate(
             // single-execution export (`export_history_for_execution`).
             execution_timeout: candidate.execution_timeout,
             deadline_at: candidate.deadline_at,
+            // Issue #698: carry the spawning parent's execution id (the batch
+            // candidate query now SELECTs `parent_id`) so a batch-exported child
+            // history round-trips its parent into the JSON / `harvest-replay`
+            // replay path — parity with the single-execution export.
+            parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
         outcome,
@@ -25463,18 +25510,20 @@ const HISTORY_EXPORT_CANDIDATES_SQL: &str = r"
 SELECT
     w.id AS id,
     w.workflow_name AS workflow_name,
+    w.workflow_id AS workflow_id,
     w.shard_id AS shard_id,
     w.state AS state,
     COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at,
     w.execution_timeout AS execution_timeout,
-    w.deadline_at AS deadline_at
+    w.deadline_at AS deadline_at,
+    w.parent_id AS parent_id
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
 WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
-GROUP BY w.id, w.workflow_name, w.shard_id, w.state, w.completed_at, w.started_at, w.created_at,
-         w.execution_timeout, w.deadline_at
+GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
+         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -32330,11 +32379,13 @@ mod tests {
         HistoryExportCandidate {
             id,
             workflow_name: "billing_checkout".to_string(),
+            workflow_id: "billing_checkout-1".to_string(),
             shard_id,
             state: "COMPLETED".to_string(),
             last_history_event_at,
             execution_timeout: None,
             deadline_at: None,
+            parent_id: None,
         }
     }
 

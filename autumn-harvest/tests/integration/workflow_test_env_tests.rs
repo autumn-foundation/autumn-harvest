@@ -3259,3 +3259,181 @@ async fn deadline_probe_does_not_trip_below_fraction_in_test_env() {
         outcome.result,
     );
 }
+
+// ─────────────────────── ctx.info() run metadata (issue #698) ──────────────
+
+/// A workflow that returns its own `info()` as JSON so a no-DB test can assert
+/// on the replay-safe run metadata (issue #698). It does one `.await`-ing
+/// history-consulting call first so `info()` is read on a real replay frontier.
+fn info_echo_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let out = ctx
+            .execute_activity_raw("noop", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let info = ctx.info();
+        Ok(json!({
+            "execution_id": info.execution_id.to_string(),
+            "workflow_id": info.workflow_id,
+            "workflow_type": info.workflow_type,
+            "history_event_count": info.history_event_count,
+            "is_replaying": info.is_replaying,
+            "parent": info.parent_execution_id.map(|id| id.to_string()),
+            "noop": out,
+        }))
+    })
+}
+
+/// AC2 + AC3 (child-parent + replay-safe): a workflow reading
+/// `ctx.info().parent_execution_id` observes the parent configured on the env,
+/// and the recorded history replays deterministically (`ReplaySucceeded`).
+#[tokio::test]
+async fn test_info_reports_configured_parent_and_replays_deterministically() {
+    let parent = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_workflow_name("child_flow")
+        .with_parent_execution_id(Some(parent))
+        .mock_activity("noop", |_input| Ok(json!("ok")))
+        .run(info_echo_workflow, json!(null))
+        .await;
+
+    let out = outcome.result.clone().expect("workflow should complete");
+    assert_eq!(
+        out.get("parent").and_then(Value::as_str),
+        Some(parent.to_string().as_str()),
+        "child must report the configured parent execution id"
+    );
+    assert_eq!(
+        out.get("workflow_type").and_then(Value::as_str),
+        Some("child_flow")
+    );
+
+    // AC3: recorded history replays deterministically.
+    let report = outcome.replay_check(info_echo_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "info()-reading workflow must replay deterministically:\n{report}"
+    );
+}
+
+/// AC2 (default "no parent"): a top-level run (no parent configured) reports
+/// `parent == null`.
+#[tokio::test]
+async fn test_info_reports_no_parent_for_top_level_run() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("noop", |_input| Ok(json!("ok")))
+        .run(info_echo_workflow, json!(null))
+        .await;
+    let out = outcome.result.expect("workflow should complete");
+    assert_eq!(
+        out.get("parent"),
+        Some(&Value::Null),
+        "a top-level run must report no parent"
+    );
+}
+
+/// A workflow that records its `ctx.info()` run metadata (`workflow_type`,
+/// `workflow_id`, `parent`) into an **activity input** — the position that is a
+/// matched replay command, so a live-vs-replay mismatch on `ctx.info()` surfaces
+/// as an activity-input divergence. (Contrast `info_echo_workflow`, which only
+/// puts them in the terminal output, where the replayer never compares them —
+/// which is why the pre-fix hardcoded `"__test__"` snapshot name went unnoticed.)
+fn info_metadata_in_activity_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let info = ctx.info();
+        let out = ctx
+            .execute_activity_raw(
+                "record_meta",
+                json!({
+                    "workflow_type": info.workflow_type,
+                    "workflow_id": info.workflow_id,
+                    "parent": info.parent_execution_id.map(|id| id.to_string()),
+                }),
+                "default",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "recorded": out }))
+    })
+}
+
+/// Codex P2 (issue #698): a `WorkflowTestEnv` configured via `with_workflow_name`
+/// / `with_workflow_id` / `with_parent_execution_id` that records `ctx.info()`
+/// metadata into an **activity input** must self-check clean. `replay_check` now
+/// threads the producing env's configured metadata into BOTH the replay snapshot
+/// and the handler-registration key — previously it hardcoded `"__test__"` /
+/// `None`, so the replay context reported `workflow_type == "__test__"` /
+/// `workflow_id == ""` and false-flagged non-determinism on a correct workflow.
+#[tokio::test]
+async fn test_configured_workflow_metadata_in_activity_input_replays_clean() {
+    let parent = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_workflow_name("cart_flow")
+        .with_workflow_id("cart-42")
+        .with_parent_execution_id(Some(parent))
+        .mock_activity("record_meta", move |input| {
+            // Sanity: the LIVE run recorded the CONFIGURED metadata into the input.
+            assert_eq!(
+                input.get("workflow_type").and_then(Value::as_str),
+                Some("cart_flow"),
+                "live run must record the configured workflow_type into the activity input"
+            );
+            assert_eq!(
+                input.get("workflow_id").and_then(Value::as_str),
+                Some("cart-42"),
+                "live run must record the configured workflow_id into the activity input"
+            );
+            assert_eq!(
+                input.get("parent").and_then(Value::as_str),
+                Some(parent.to_string().as_str()),
+                "live run must record the configured parent into the activity input"
+            );
+            Ok(json!("ok"))
+        })
+        .run(info_metadata_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(info_metadata_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a WorkflowTestEnv configured with workflow_name/workflow_id/parent that records \
+         ctx.info() into an activity input must replay clean (Codex P2):\n{report}"
+    );
+}
+
+/// Regression guard: a default `WorkflowTestEnv` (NO `with_workflow_name` /
+/// `with_workflow_id`) recording `ctx.info()` metadata into an activity input
+/// still self-checks clean — the default `""` metadata is used consistently on
+/// both the live and replay sides, so they match whatever the value.
+#[tokio::test]
+async fn test_default_env_metadata_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("record_meta", |input| {
+            // Default env: empty workflow_type / workflow_id, no parent.
+            assert_eq!(input.get("workflow_type").and_then(Value::as_str), Some(""));
+            assert_eq!(input.get("workflow_id").and_then(Value::as_str), Some(""));
+            assert_eq!(input.get("parent"), Some(&Value::Null));
+            Ok(json!("ok"))
+        })
+        .run(info_metadata_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(info_metadata_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a default WorkflowTestEnv recording ctx.info() into an activity input must replay \
+         clean:\n{report}"
+    );
+}

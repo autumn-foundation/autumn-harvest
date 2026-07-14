@@ -65,6 +65,8 @@ fn build_fixture_json(activity_count: usize) -> String {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }

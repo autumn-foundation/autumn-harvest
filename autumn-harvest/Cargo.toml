@@ -126,6 +126,9 @@ required-features = ["unified-dag-execution"]
 [[example]]
 name = "child_with_timeout"
 
+[[example]]
+name = "ctx_info"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

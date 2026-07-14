@@ -1029,7 +1029,20 @@ impl WorkflowHandle {
         )
         // #772 round 6: thread the deadline budget (see `hydrate_ctx_for_query`).
         .with_execution_timeout(execution.execution_timeout)
-        .with_deadline(execution.deadline_at);
+        .with_deadline(execution.deadline_at)
+        // #698: thread the spawning-parent id (mirrors the deadline budget) so a
+        // query handler running against a loaded execution reads the correct
+        // `ctx.info().parent_execution_id` for a child workflow.
+        .with_parent_execution_id(
+            execution
+                .parent_id
+                .map(crate::types::ExecutionId::from_uuid),
+        )
+        // #698: thread the workflow type name / business `workflow_id` from the
+        // loaded execution row so `ctx.info().workflow_type` / `workflow_id` are the
+        // real values (not "") for a query handler running against this run.
+        .with_workflow_name(execution.workflow_name.clone())
+        .with_workflow_id(execution.workflow_id.clone());
         for q_info in &self.client.inner.query_handlers {
             if q_info.workflow == workflow_info.name {
                 ctx.register_declarative_query_handler(q_info);

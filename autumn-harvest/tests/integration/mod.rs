@@ -23,6 +23,8 @@ mod context_headers_tests;
 mod cross_workflow_cancel_tests;
 #[cfg(feature = "db")]
 mod cross_workflow_signal_tests;
+#[cfg(feature = "db")]
+mod ctx_info_tests;
 mod dag_builder;
 mod dag_mapping_tests;
 mod dag_signal_gate_tests;

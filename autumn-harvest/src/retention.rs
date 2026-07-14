@@ -1018,6 +1018,14 @@ struct CandidateExecution {
     execution_timeout: Option<chrono::Duration>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     deadline_at: Option<DateTime<Utc>>,
+    /// Spawning-parent id (issue #698), carried into the pre-deletion archive
+    /// document (mirrors `execution_timeout`/`deadline_at`) so a parent-aware
+    /// child's archived history round-trips its `parent_execution_id` and
+    /// replays cleanly from cold storage instead of false-reporting
+    /// non-determinism. `parent_id` lives in no `WorkflowEvent`, so the archive
+    /// is the last surviving copy of it before the row is deleted.
+    #[diesel(sql_type = Nullable<SqlUuid>) ]
+    parent_id: Option<uuid::Uuid>,
 }
 
 #[cfg(feature = "db")]
@@ -1192,7 +1200,7 @@ async fn run_shard_tick(
                 // is the `'-infinity'` literal and the cursor/limit binds shift
                 // down by one.
                 let sql = if global_fallback.is_some() {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -1211,7 +1219,7 @@ async fn run_shard_tick(
                      LIMIT $6
                      FOR UPDATE SKIP LOCKED"
                 } else {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -1490,6 +1498,11 @@ async fn run_shard_tick(
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
                             workflow_name: candidate.workflow_name.clone(),
+                            // Issue #698: carry the business `workflow_id` (already
+                            // on the retention candidate) so a parent-aware /
+                            // id-branching workflow's archived history round-trips
+                            // `ctx.info().workflow_id` into the JSON replay path.
+                            workflow_id: Some(candidate.workflow_id.clone()),
                             execution_id: exec_id,
                             shard_id: shard.as_i32(),
                             state: candidate.state.clone(),
@@ -1510,6 +1523,13 @@ async fn run_shard_tick(
                             // cleanly instead of false-reporting non-determinism.
                             execution_timeout: candidate.execution_timeout,
                             deadline_at: candidate.deadline_at,
+                            // Issue #698: carry the spawning-parent id (mirrors
+                            // the deadline metadata above) so a parent-aware
+                            // child's archived history round-trips its
+                            // `parent_execution_id` into the JSON replay path.
+                            parent_execution_id: candidate
+                                .parent_id
+                                .map(crate::types::ExecutionId::from_uuid),
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {
@@ -2980,6 +3000,7 @@ mod tests {
             legal_hold_until: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_id: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -2992,6 +3013,7 @@ mod tests {
             legal_hold_until: None,
             execution_timeout: None,
             deadline_at: None,
+            parent_id: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,
