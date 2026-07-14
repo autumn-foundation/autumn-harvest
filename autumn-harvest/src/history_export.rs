@@ -129,6 +129,22 @@ pub struct HistoryExportDocument {
     pub version: u32,
     /// Registered workflow handler name.
     pub workflow_name: String,
+    /// The business-level workflow identifier (issue #698), sourced from the
+    /// `harvest_workflow_executions.workflow_id` column. Like `parent_execution_id`
+    /// / `execution_timeout`, it lives in no `WorkflowEvent`, so it must ride the
+    /// top-level export document for an exported history (retention archive /
+    /// offline `replay_from_json`) to replay `ctx.info().workflow_id` without
+    /// false-reporting non-determinism when a workflow branches on it or embeds it
+    /// in an activity input. Serialised at the same top-level name as
+    /// [`testing::HistorySnapshot::workflow_id`], so an exported history round-trips
+    /// into that snapshot verbatim. `None` for a run without an explicit id or a
+    /// legacy export produced before this field. Non-payload operational metadata
+    /// — never redacted. The workflow **type** name rides
+    /// [`workflow_name`](Self::workflow_name).
+    ///
+    /// [`testing::HistorySnapshot::workflow_id`]: crate::testing::HistorySnapshot::workflow_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     /// Workflow execution whose history was exported.
     pub execution_id: ExecutionId,
     /// Shard that owns the execution.
@@ -195,6 +211,12 @@ pub struct HistoryExportDocument {
 pub struct HistoryExportRequest {
     /// Registered workflow handler name.
     pub workflow_name: String,
+    /// The business-level workflow identifier (issue #698), embedded in the export
+    /// so the JSON / `harvest-replay` replay path threads it into the replayed
+    /// `WorkflowContext`. `None` for a run without an explicit id. Mirrors
+    /// `execution_timeout`/`parent_execution_id`: the value lives in no
+    /// `WorkflowEvent`, so it must be carried explicitly on the request.
+    pub workflow_id: Option<String>,
     /// Workflow execution whose history should be exported.
     pub execution_id: ExecutionId,
     /// Shard that owns the execution.
@@ -305,6 +327,11 @@ pub fn export_history_decoded(
         schema: HISTORY_EXPORT_SCHEMA.to_string(),
         version: HISTORY_EXPORT_VERSION,
         workflow_name: request.workflow_name,
+        // Issue #698: business `workflow_id` — non-payload operational metadata,
+        // carried verbatim under BOTH policies (never redacted) so an exported
+        // history round-trips its `workflow_id` into the JSON replay path, exactly
+        // like the deadline/parent metadata below.
+        workflow_id: request.workflow_id,
         execution_id: request.execution_id,
         shard_id: request.shard_id,
         exported_at: request.exported_at,
@@ -1114,6 +1141,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1166,6 +1194,7 @@ mod tests {
             execution_timeout: Some(timeout),
             deadline_at: Some(deadline),
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1222,6 +1251,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: Some(parent),
+            workflow_id: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1314,6 +1344,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1374,6 +1405,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1412,6 +1444,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect_err("oversized full export must fail unless limit is raised");
 
@@ -1579,6 +1612,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("an envelope-bearing history must export under Full");
 
@@ -1608,6 +1642,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("an envelope-bearing history must export under Redacted");
 
@@ -1677,6 +1712,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         }
     }
 

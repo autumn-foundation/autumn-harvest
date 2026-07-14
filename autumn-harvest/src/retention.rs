@@ -1498,6 +1498,11 @@ async fn run_shard_tick(
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
                             workflow_name: candidate.workflow_name.clone(),
+                            // Issue #698: carry the business `workflow_id` (already
+                            // on the retention candidate) so a parent-aware /
+                            // id-branching workflow's archived history round-trips
+                            // `ctx.info().workflow_id` into the JSON replay path.
+                            workflow_id: Some(candidate.workflow_id.clone()),
                             execution_id: exec_id,
                             shard_id: shard.as_i32(),
                             state: candidate.state.clone(),

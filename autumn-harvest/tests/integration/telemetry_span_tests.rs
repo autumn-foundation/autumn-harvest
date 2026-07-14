@@ -545,6 +545,9 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     None,
                     // Issue #698: no spawning parent (top-level run).
                     None,
+                    // Issue #698: workflow type name / business workflow_id.
+                    "telemetry_master_workflow".to_string(),
+                    None,
                 )
                 .await;
             });

@@ -1037,7 +1037,12 @@ impl WorkflowHandle {
             execution
                 .parent_id
                 .map(crate::types::ExecutionId::from_uuid),
-        );
+        )
+        // #698: thread the workflow type name / business `workflow_id` from the
+        // loaded execution row so `ctx.info().workflow_type` / `workflow_id` are the
+        // real values (not "") for a query handler running against this run.
+        .with_workflow_name(execution.workflow_name.clone())
+        .with_workflow_id(execution.workflow_id.clone());
         for q_info in &self.client.inner.query_handlers {
             if q_info.workflow == workflow_info.name {
                 ctx.register_declarative_query_handler(q_info);

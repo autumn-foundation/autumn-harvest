@@ -159,3 +159,55 @@ intentionally differs live-vs-replay and must never drive workflow commands or b
 included in an activity input (doing so records different commands live vs replay →
 non-determinism). It remains identical between two replay passes of the same
 history. No runtime-logic change.
+(G) **`workflow_id` / `workflow_type` threaded through ALL replay/handler-context
+paths (closing the Codex P2 replay-safety surface, `context.rs:1897`).** The exact
+same class as finding (E)'s `parent_execution_id`: `ctx.info().workflow_type` (=
+the `workflow_name` column / handler-lookup key) and `ctx.info().workflow_id` (the
+business `workflow_id` column) live in **no** `WorkflowEvent` — the LIVE worker
+sets them on the context via `WorkflowExecuteSpanMeta`, but the
+strict/canary/export/JSON/query replay paths built the context **without** them, so
+a pure-history replay reported `""` for both. A workflow that branched
+command-affecting control flow on either — or embedded either in an activity input,
+which the `ctx.info()` docs promise is replay-safe — then false-reported
+non-determinism under export/DB/canary/JSON replay. **Two mechanisms:**
+`workflow_type` uses **mechanism 1** (the workflow type name is the handler-lookup
+key already carried on every replay path — `HistorySnapshot.workflow_name`,
+`HistoryExportDocument.workflow_name`, `SampledExecution`/`DbReplayMeta`, the
+execution row — so it is now *applied* to the replayed context via
+`.with_workflow_name(...)`, no new field); `workflow_id` uses **mechanism 2** (a
+new additive `workflow_id: Option<String>` field, `#[serde(default,
+skip_serializing_if = "Option::is_none")]`, on `HistorySnapshot` and
+`HistoryExportDocument`/`HistoryExportRequest`, populated in **all** producers and
+threaded into the replayed context via `.with_workflow_id(...)`). Threaded at
+**every** replay/handler-context site: the three executor replay functions
+(`run_workflow_strict`/`run_workflow_strict_advancing_clock`/`run_workflow_canary`
+gain `workflow_name: String` + `workflow_id: Option<String>` params);
+`WorkflowReplayer` (new `with_workflow_id` global + `workflow_id` field, resolved
+snapshot-first-then-global mirroring the parent pattern) across
+`replay_from_snapshot`/`replay_from_events`/`replay_from_db`/`run_canary`; both DB
+queries (`query_running_executions`, `load_workflow_name_and_headers` now SELECT
+`workflow_id`, and `SampledExecution`/`DbReplayMeta` carry it); the history-export
+document + retention archive (`candidate.workflow_id`) + **both** plugin HTTP export
+producers (`export_history_for_execution` from `execution.workflow_id`,
+`export_history_for_candidate` from the new `HistoryExportCandidate.workflow_id`
+field — the batch candidate SELECT `HISTORY_EXPORT_CANDIDATES_SQL` now selects
+`w.workflow_id` and adds it to the `GROUP BY`); the plugin `hydrate_ctx_for_query`
+query-replay context and the `handle.rs` typed-query context (both apply
+`execution.workflow_name`/`execution.workflow_id` from the loaded row); and the
+WorkflowTestEnv advancing-clock path. The declarative `#[update]` handler contexts
+already inherit `inner.workflow_id`/`inner.workflow_name` from the parent context,
+so once the parent replay context is fixed the inheritance propagates (no change
+needed there). With this, `ctx.info().workflow_id` / `ctx.info().workflow_type` are
+the **real** values under export/DB/canary/JSON replay, not `""`. New falsifiable
+tests in `replayer_tests.rs` (mirroring the parent export round-trip):
+`workflow_type_and_id_replay_clean_through_export_document_round_trip` (the money
+test — a workflow embedding both identity fields in an activity input replays
+`ReplaySucceeded` through the export→`replay_from_json` round trip; **RED pre-fix**:
+recorded input `{"workflow_id":"cart-42","workflow_type":"identity_wf"}` vs replayed
+`{"workflow_id":"","workflow_type":""}` → `NonDeterminismDetected`, the
+strict-input comparison doubling as the census's DIRECT "context reports the real
+values not ''" assertion), `workflow_id_diverges_through_export_document_when_id_is_dropped`
+(mechanism-2 load-bearing proof), `workflow_type_is_applied_from_handler_key_on_raw_events_path`
+(mechanism-1 proof), and `workflow_id_is_applied_from_replayer_global_on_raw_events_path`.
+See the PR body "Field census" table for the full per-path threading verification.
+No CLI, scheduler, `ActivityContext`, event, schema, or migration changes.

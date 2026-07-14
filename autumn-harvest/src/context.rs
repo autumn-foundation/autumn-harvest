@@ -1871,6 +1871,24 @@ pub struct WorkflowContext {
 /// [`execution_id`](Self::execution_id) here is the exact identifier an operator
 /// pages on.
 ///
+/// # Field census — replay-safety (issue #698)
+///
+/// Every field is classified into exactly one category, and each `(a)` field is
+/// threaded through **all** replay paths (JSON/export/DB-canary/query/live). See
+/// the PR body for the full per-path table.
+///
+/// - `execution_id` → **(a)** threaded — the constructor `exec_id` arg on every path.
+/// - `workflow_id` → **(a)** threaded — added field on `HistorySnapshot` /
+///   `HistoryExportDocument` (mechanism 2); applied via `with_workflow_id`.
+/// - `workflow_type` → **(a)** threaded — the already-carried `workflow_name`
+///   (handler key / row column, mechanism 1); applied via `with_workflow_name`.
+/// - `start_time` → **(b)** by construction — extracted from the `WorkflowStarted`
+///   event in `for_replay`; reproduced with no threading.
+/// - `history_event_count` → **(b)** by construction — the matcher cursor position.
+/// - `is_replaying` → **(c)** observability-only — the replay indicator itself
+///   (carved out of the branch-safe guarantee below).
+/// - `parent_execution_id` → **(a)** threaded — the row `parent_id` column.
+///
 /// ```rust,ignore
 /// #[workflow]
 /// async fn checkout(ctx: &WorkflowContext, cart: Cart) -> Result<(), String> {

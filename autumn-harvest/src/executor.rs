@@ -545,12 +545,24 @@ pub async fn run_workflow_strict(
     // `ctx.info().parent_execution_id` replays deterministically. `None` models a
     // top-level run.
     parent_execution_id: Option<ExecutionId>,
+    // Issue #698: the logical workflow type name (mechanism 1 — the handler-lookup
+    // key already carried by the snapshot / DB row) and the business-level
+    // `workflow_id` (mechanism 2 — added field). Neither lives in a `WorkflowEvent`
+    // read by `ctx.info()` (the executor sets them on the live context via
+    // span_meta), so a pure-history replay must apply them here or a workflow that
+    // branches command-affecting control flow on `ctx.info().workflow_type` /
+    // `ctx.info().workflow_id` (or embeds either in an activity input) false-reports
+    // non-determinism. `workflow_id` is `None` for a raw-events fixture with no id.
+    workflow_name: String,
+    workflow_id: Option<String>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_workflow_name(workflow_name)
+        .with_workflow_id(workflow_id.unwrap_or_default())
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -576,6 +588,10 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     // Issue #698: the spawning parent's execution id (see [`run_workflow_strict`]).
     parent_execution_id: Option<ExecutionId>,
+    // Issue #698: workflow type name / business `workflow_id` (see
+    // [`run_workflow_strict`]).
+    workflow_name: String,
+    workflow_id: Option<String>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -583,6 +599,8 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_workflow_name(workflow_name)
+        .with_workflow_id(workflow_id.unwrap_or_default())
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -785,12 +803,21 @@ pub(crate) async fn run_workflow_canary(
     // column so a parent-aware child does not false-report non-determinism in the
     // deploy replay canary.
     parent_execution_id: Option<ExecutionId>,
+    // Issue #698: workflow type name / business `workflow_id` (see
+    // [`run_workflow_strict`]). `run_canary` sources both from the sampled
+    // `harvest_workflow_executions` row so a workflow that branches on
+    // `ctx.info().workflow_type` / `workflow_id` does not false-report
+    // non-determinism in the deploy replay canary.
+    workflow_name: String,
+    workflow_id: Option<String>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_workflow_name(workflow_name)
+        .with_workflow_id(workflow_id.unwrap_or_default())
         .with_metrics(metrics);
 
     let span = tracing::info_span!(
@@ -1016,6 +1043,10 @@ pub async fn run_workflow_with_state_advancing_clock(
     // users — WorkflowTestEnv::with_workflow_name/with_queue_name — can
     // assert metric label content (issue #801 post-review P3).
     .with_workflow_name(span_meta.map_or("", |m| m.workflow_name.as_str()))
+    // Issue #698: thread the business `workflow_id` (mirrors the caps sibling
+    // `run_workflow_with_state_history_policy_and_caps`) so `ctx.info().workflow_id`
+    // reports it under a WorkflowTestEnv run that sets it on `span_meta`.
+    .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
     .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     // Issue #772: thread the execution-timeout budget so a WorkflowTestEnv run
     // can exercise deadline-aware continue-as-new.

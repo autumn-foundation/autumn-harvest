@@ -881,6 +881,7 @@ async fn replay_await_condition_non_deterministic_divergence_fails() {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         })
         .await;
 

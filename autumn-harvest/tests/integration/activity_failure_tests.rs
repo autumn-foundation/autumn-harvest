@@ -289,6 +289,7 @@ mod replay_tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            workflow_id: None,
         };
 
         let report = WorkflowReplayer::new()
