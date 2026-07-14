@@ -7007,3 +7007,98 @@ async fn parent_aware_child_diverges_when_parent_is_not_threaded() {
         ),
     }
 }
+
+/// (c) Issue #698 (Codex P2 @ testing.rs:306) — the DB `export_history` ->
+/// `HistoryExportDocument` -> JSON -> `replay_from_json` path (retention
+/// archives / offline replay). The `HistoryExportRequest` carries the row's
+/// `parent_id`, which `export_history` embeds at the TOP LEVEL of the document
+/// so it deserialises into `HistorySnapshot.parent_execution_id`. The child
+/// then replays clean through `replay_from_json` WITHOUT any manual
+/// `with_parent_execution_id` override — proving the parent survives the
+/// export-document round-trip, exactly like `execution_timeout`/`deadline_at`.
+#[tokio::test]
+async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
+    use autumn_harvest::history_export::{
+        HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    };
+
+    let parent = ExecutionId::new();
+    let (exec_id, events) = parent_taken_history();
+
+    // Build the DB-export request the way retention / the HTTP export route
+    // does, sourcing the parent from the row's `parent_id` column.
+    let document = export_history(HistoryExportRequest {
+        workflow_name: "parent_branching_child".to_string(),
+        execution_id: exec_id,
+        shard_id: 0,
+        state: "COMPLETED".to_string(),
+        events,
+        exported_at: Utc::now(),
+        payload_policy: HistoryPayloadPolicy::Full,
+        max_bytes: Some(64 * 1024),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: Some(parent),
+    })
+    .expect("full export should fit under the limit");
+    let json = serde_json::to_string(&document).expect("export serialises");
+
+    // Replay the exported JSON directly — NO with_parent_execution_id override.
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        .replay_from_json(&json)
+        .await
+        .expect("exported document must be accepted by replay_from_json");
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a parent-aware child exported through the DB export document must replay \
+         clean via replay_from_json with no manual parent override, got: {report}"
+    );
+}
+
+/// (d) The negative control for (c): when the export request carries no parent
+/// (`parent_execution_id: None`), the exported document deserialises to
+/// parent = `None`, so the child takes its `orphan_step` branch and diverges
+/// from the recorded `child_of_parent` schedule — proving the export document
+/// is the load-bearing carrier of the parent through this path.
+#[tokio::test]
+async fn parent_aware_child_diverges_through_export_document_without_parent() {
+    use autumn_harvest::history_export::{
+        HistoryExportRequest, HistoryPayloadPolicy, export_history,
+    };
+
+    let (exec_id, events) = parent_taken_history();
+
+    let document = export_history(HistoryExportRequest {
+        workflow_name: "parent_branching_child".to_string(),
+        execution_id: exec_id,
+        shard_id: 0,
+        state: "COMPLETED".to_string(),
+        events,
+        exported_at: Utc::now(),
+        payload_policy: HistoryPayloadPolicy::Full,
+        max_bytes: Some(64 * 1024),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+    })
+    .expect("full export should fit under the limit");
+    let json = serde_json::to_string(&document).expect("export serialises");
+
+    let report = WorkflowReplayer::new()
+        .register_fn("parent_branching_child", parent_branching_child)
+        .replay_from_json(&json)
+        .await
+        .expect("exported document must be accepted by replay_from_json");
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "an export document without a parent must replay the orphan branch and diverge; \
+             got: {other:?}\nreport: {report}"
+        ),
+    }
+}

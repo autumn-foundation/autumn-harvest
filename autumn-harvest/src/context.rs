@@ -2788,13 +2788,26 @@ impl WorkflowContext {
     /// [`is_replaying`](Self::is_replaying)).
     #[must_use]
     pub fn info(&self) -> WorkflowExecutionInfo {
+        // `history_event_count` and `is_replaying` are read by locking the
+        // matcher directly, deliberately bypassing
+        // [`match_history`](Self::match_history)'s `pump_signal_handlers`
+        // post-hook. `info()` is a read-only snapshot (issue #698 AC5
+        // zero-footprint contract): it must never dispatch a push signal
+        // handler (issue #546), claim a reachable `SignalReceived`, advance the
+        // cursor, push a command, or append an event. The public
+        // [`history_event_count`](Self::history_event_count) accessor *does* run
+        // that post-hook, so it cannot be reused here.
+        let (history_event_count, is_replaying) = {
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
+            (matcher.event_count(), matcher.is_replaying())
+        };
         WorkflowExecutionInfo {
             execution_id: self.execution_id(),
             workflow_id: self.workflow_id().to_string(),
             workflow_type: self.workflow_type().to_string(),
             start_time: self.start_time(),
-            history_event_count: self.history_event_count(),
-            is_replaying: self.is_replaying(),
+            history_event_count,
+            is_replaying,
             parent_execution_id: self.parent_execution_id(),
         }
     }
@@ -2961,6 +2974,13 @@ impl WorkflowContext {
     /// This is replay-safe: it is computed from the in-memory history snapshot
     /// loaded before the current workflow task, not from a side-effecting
     /// counter maintained by author code.
+    ///
+    /// **Note:** this routes through [`match_history`](Self::match_history), so
+    /// its `pump_signal_handlers` post-hook runs — a call here can dispatch a
+    /// newly-claimable push signal handler (issue #546). This is fine for
+    /// author code that consults history alongside its normal flow, but if you
+    /// need a purely read-only event count with no dispatch side effect (as
+    /// [`info`](Self::info) does), lock the matcher directly instead.
     #[must_use]
     pub fn history_event_count(&self) -> u64 {
         self.match_history(|matcher| matcher.event_count())
@@ -19686,6 +19706,50 @@ mod tests {
             ctx.history_event_count(),
             before,
             "info() must not append events"
+        );
+    }
+
+    /// AC5 (zero footprint, hardening): `info()` must NOT dispatch a
+    /// registered push signal handler (issue #546) nor claim a reachable
+    /// `SignalReceived`. Before the non-pumping read path, `info()` routed
+    /// through `history_event_count()` → `match_history()` →
+    /// `pump_signal_handlers()`, so a read-only `info()` would fire the handler
+    /// and consume the signal, mutating handler-captured state and control
+    /// flow. The pre-existing `info_emits_no_commands_and_no_events` test used a
+    /// context with NO handlers, so it passed vacuously.
+    #[test]
+    fn info_does_not_pump_signal_handlers_or_claim_signals() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "user_requested"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let fired: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let fired_clone = fired.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            fired_clone.lock().unwrap().push(payload);
+        });
+
+        // Read-only snapshot: must not fire the handler.
+        let _ = ctx.info();
+        let _ = ctx.info();
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "info() must not dispatch a registered signal handler"
+        );
+
+        // The signal must still be reachable: a subsequent flush (the trigger
+        // every other history-consulting call provides) delivers it exactly
+        // once — proving info() did not consume/claim it.
+        ctx.flush_pending_signal_handlers();
+        assert_eq!(
+            *fired.lock().unwrap(),
+            vec![serde_json::json!({"reason": "user_requested"})],
+            "info() must not consume the signal — it stays claimable for a later dispatch"
         );
     }
 

@@ -61,3 +61,42 @@ reports the parent's `execution_id` via `ctx.info().parent_execution_id` end to 
 Example `autumn-harvest/examples/ctx_info.rs` (logs `execution_id`, mints a
 run-scoped `charge-{execution_id}` idempotency key, reads the parent) with embedded
 `WorkflowTestEnv` tests.
+
+**Post-review hardening (Codex P2s).** (A) `info()` must be a genuinely
+read-only snapshot: it previously read `history_event_count()`, which routes
+through `match_history()` whose `pump_signal_handlers()` post-hook (issue #546)
+dispatches push signal handlers and claims a reachable `SignalReceived` — so a
+read-only `ctx.info()` would fire a registered signal handler, mutate
+handler-captured state/control flow, and consume the signal, violating the AC5
+zero-footprint contract. (The pre-existing `info_emits_no_commands_and_no_events`
+test used a context with no handlers, so it passed vacuously.) `info()` now reads
+`event_count`/`is_replaying` by locking the `HistoryMatcher` directly, bypassing
+the post-hook; a doc note on the public `history_event_count()` accessor flags
+that it still runs the pump. New regression test
+`info_does_not_pump_signal_handlers_or_claim_signals` (registers a handler + a
+reachable `SignalReceived`, asserts `info()` neither fires the handler nor
+consumes the signal — a later flush still delivers it). (B) `parent_execution_id`
+is now threaded through the DB `export_history` → `HistoryExportDocument` →
+`replay_from_json` path (retention archives / offline replay), mirroring
+`execution_timeout`/`deadline_at` exactly: `parent_id` is a row column absent from
+every `WorkflowEvent`, so a parent-aware child exported through this path
+previously deserialised parent = `None` and false-reported non-determinism. New
+top-level `parent_execution_id: Option<ExecutionId>` field (additive
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, never redacted) on
+both `HistoryExportRequest` and `HistoryExportDocument`; `export_history_decoded`
+populates the document from the request, round-tripping into
+`HistorySnapshot.parent_execution_id`. Threaded core-side through the retention
+archive path (`CandidateExecution.parent_id` + both candidate SELECTs) and the
+`handle.rs` query-hydration replay context (`replay_from_db`-style). Tests:
+`HistoryExportDocument` round-trip + legacy-back-compat (no-parent field →
+`None`) unit tests in `history_export.rs`, and end-to-end
+`parent_aware_child_replays_clean_through_export_document_round_trip` (+ its
+no-parent negative control) in `replayer_tests.rs` — a parent-aware child exported
+via the document replays `ReplaySucceeded` through `replay_from_json` with **no**
+manual `with_parent_execution_id` override. **Follow-up (sibling-owned crates):**
+the two `HistoryExportRequest` construction sites in the plugin's HTTP export
+route (`autumn-harvest-plugin/src/api.rs:25132`, `:25161`) still need
+`parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid)` /
+`candidate.parent_id.map(...)` added (mirroring their existing
+`execution_timeout`/`deadline_at` lines) so live HTTP exports carry the parent;
+until then those exports round-trip parent = `None`.
