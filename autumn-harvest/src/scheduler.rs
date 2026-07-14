@@ -3815,6 +3815,18 @@ pub struct OverdueInputs<'a> {
     /// Whether the schedule is at/over `max_active_runs` (the tick-exact running
     /// basis: shard-local `RUNNING`/`PAUSED` + #607 pending throttle).
     pub at_capacity: bool,
+    /// Calendar-adjusted effective fire time for the pinned `next_run_at` slot
+    /// (issue #696, Codex round 3). `Some(rebased)` when a calendar skip policy
+    /// (`run_next_business_day`/`run_prev_business_day`) has rebased an excluded
+    /// slot to a different business day; `None` when there is no calendar
+    /// deferral (no calendar, slot not excluded, `SkipPolicy::Skip`-suppressed,
+    /// or unparseable cadence). The predicate anchors the lag test on
+    /// `max(next_run_at, effective_fire_at)`, so a schedule the tick is
+    /// deliberately holding for a *future* calendar-adjusted fire is not falsely
+    /// flagged overdue, while one wedged **past** its adjusted fire still is. The
+    /// caller resolves this (it needs the calendar's exclusions) so the predicate
+    /// stays DB-free (AC2); see [`resolve_effective_fire_at`].
+    pub effective_fire_at: Option<DateTime<Utc>>,
 }
 
 /// Pure overdue predicate (issue #696, AC2). No database.
@@ -3898,7 +3910,22 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    let lag = inputs.now - next_run_at;
+    // Calendar-deferred anchor (Codex round 3): a calendar skip policy can rebase
+    // an excluded slot to a later business day, and while that adjusted fire is
+    // still in the future the tick deliberately keeps `next_run_at` pinned to the
+    // (now past) original slot. Anchoring the lag on `max(next_run_at,
+    // effective_fire_at)` means a schedule waiting for a *future* calendar fire is
+    // not falsely flagged, while a schedule wedged **past** its adjusted fire is
+    // still caught (its `effective_fire_at` is itself now in the past). With no
+    // calendar, `effective_fire_at` is `None` ⇒ anchor == `next_run_at` (byte-for-
+    // byte unchanged). A backward rebase (`run_prev_business_day`, so
+    // `effective_fire_at < next_run_at`) also keeps the raw anchor via the `max`,
+    // preserving detection.
+    let anchor = inputs
+        .effective_fire_at
+        .filter(|eff| *eff > next_run_at)
+        .unwrap_or(next_run_at);
+    let lag = inputs.now - anchor;
     if lag > grace {
         OverdueVerdict {
             overdue: true,
@@ -3957,6 +3984,69 @@ pub async fn schedule_running_basis(
     Ok(running.saturating_add(pending))
 }
 
+/// Resolve the calendar-adjusted effective fire time for a schedule's pinned
+/// `next_run_at` slot (issue #696, Codex round 3).
+///
+/// Mirrors the tick's own calendar rebasing and feeds
+/// [`OverdueInputs::effective_fire_at`].
+///
+/// Returns:
+/// - `Ok(None)` when there is no calendar deferral — no calendar, no pending
+///   slot, unparseable cadence, the slot is not calendar-excluded, or the slot is
+///   `SkipPolicy::Skip`-suppressed. In all these cases the overdue predicate
+///   anchors on the raw `next_run_at`, so behavior is unchanged for every
+///   non-calendar schedule and every `SkipPolicy::Skip` schedule.
+/// - `Ok(Some(rebased))` when a `run_next_business_day`/`run_prev_business_day`
+///   policy has rebased an excluded slot to a different business day. The predicate
+///   then anchors grace on that adjusted fire (via `max(next_run_at, ..)`), so a
+///   schedule the tick is deliberately holding for a future business-day fire is
+///   not flagged overdue.
+///
+/// Reuses the **same** `calendar::apply_skip_policy` + [`rebase_logical_date`]
+/// helpers the tick uses (`tick_one_workflow_schedule`'s dispatch loop), so there
+/// is no second calendar implementation to drift. The calendar's exclusion set is
+/// loaded on `conn` (shard-local), keeping the pure predicate DB-free (AC2).
+///
+/// # Errors
+///
+/// Returns a database error if loading the calendar's exclusions fails.
+pub async fn resolve_effective_fire_at(
+    conn: &mut AsyncPgConnection,
+    calendar_name: Option<&str>,
+    skip_policy_db: &str,
+    schedule_expr: Option<&str>,
+    next_run_at: Option<DateTime<Utc>>,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let (Some(cal_name), Some(slot), Some(expr)) = (calendar_name, next_run_at, schedule_expr)
+    else {
+        return Ok(None);
+    };
+    let Some(parsed) = parse_schedule_from_expr(expr) else {
+        return Ok(None);
+    };
+    let excluded = crate::calendar::load_exclusions_for_calendar(conn, cal_name).await?;
+    let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
+    let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
+    let slot_date = slot.date_naive();
+    Ok(
+        match crate::calendar::apply_skip_policy(
+            slot_date,
+            skip_policy,
+            &excluded,
+            exclude_weekends,
+        ) {
+            // `SkipPolicy::Skip` on an excluded day: the tick drops the slot and
+            // advances, so there is no adjusted fire to defer to. Keep the raw
+            // anchor so a tick genuinely wedged before advancing is still flagged.
+            None => None,
+            // Not excluded: the tick fires the original slot; no rebasing.
+            Some(adjusted) if adjusted == slot_date => None,
+            // Rebased to a business day: the effective fire is at the adjusted slot.
+            Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
+        },
+    )
+}
+
 /// Compute the overdue verdict for every schedule on one shard (issue #696).
 ///
 /// Loads all schedule rows on `conn` and, per schedule, computes the tick's
@@ -4004,6 +4094,16 @@ pub async fn overdue_schedule_samples(
             s.catchup,
         )
         .is_catchup_enabled();
+        // Calendar-adjusted fire time (Codex round 3): resolve the tick's own
+        // calendar rebasing so a calendar-deferred future fire is not flagged.
+        let effective_fire_at = resolve_effective_fire_at(
+            conn,
+            s.calendar_name.as_deref(),
+            &s.skip_policy,
+            s.schedule_expr.as_deref(),
+            s.next_run_at,
+        )
+        .await?;
         let verdict = schedule_overdue(&OverdueInputs {
             schedule: schedule.as_ref(),
             next_run_at: s.next_run_at,
@@ -4019,6 +4119,7 @@ pub async fn overdue_schedule_samples(
             overlap_policy,
             catchup,
             at_capacity,
+            effective_fire_at,
         });
         samples.push(OverdueSample {
             kind,
@@ -6239,6 +6340,7 @@ mod tests {
             overlap_policy: OverlapPolicy::Skip,
             catchup: false,
             at_capacity: false,
+            effective_fire_at: None,
         }
     }
 
@@ -6293,6 +6395,69 @@ mod tests {
         ));
         assert!(past.overdue);
         assert_eq!(past.overdue_by_secs, Some(302));
+    }
+
+    // ── Calendar-deferred anchor (issue #696, Codex round 3) ──────────────────
+
+    #[test]
+    fn calendar_deferred_future_fire_is_not_overdue() {
+        // A daily-cadence schedule whose slot fell on an excluded day: the tick
+        // rebased it to a future business day and pinned next_run_at at the (now
+        // 2-day-past) original slot. next_run_at alone is far past grace, but the
+        // calendar-adjusted fire is still ahead ⇒ not overdue.
+        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily
+        let now = dt(2026, 1, 5, 12, 0, 0);
+        let next_run_at = now - chrono::Duration::days(2); // well past grace
+        let v = schedule_overdue(&OverdueInputs {
+            effective_fire_at: Some(now + chrono::Duration::hours(6)), // future fire
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            !v.overdue,
+            "a schedule deferred to a FUTURE calendar-adjusted fire must not be overdue"
+        );
+        assert_eq!(v.overdue_by_secs, None);
+    }
+
+    #[test]
+    fn calendar_deferred_past_fire_is_still_overdue() {
+        // The calendar-adjusted fire is itself now in the past by > grace: the
+        // scheduler is genuinely wedged past the business-day fire ⇒ still flagged
+        // (detection preserved, not blanket-suppressed for calendar schedules).
+        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily, grace ≈ 1 day
+        let now = dt(2026, 1, 5, 12, 0, 0);
+        let next_run_at = now - chrono::Duration::days(3);
+        let effective = now - chrono::Duration::days(2); // adjusted fire 2 days past
+        let v = schedule_overdue(&OverdueInputs {
+            effective_fire_at: Some(effective),
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            v.overdue,
+            "a schedule wedged PAST its calendar-adjusted fire by > grace must still be overdue"
+        );
+        // Lag is measured from the adjusted fire (anchor), not the raw slot.
+        assert_eq!(v.overdue_by_secs, Some((now - effective).num_seconds()));
+    }
+
+    #[test]
+    fn calendar_backward_rebase_keeps_raw_anchor() {
+        // A `run_prev_business_day` rebase moves the effective fire EARLIER than
+        // next_run_at. `max(next_run_at, effective_fire_at)` keeps the raw slot as
+        // the anchor, so a genuinely stale slot is still flagged (never
+        // under-detected by a backward rebase).
+        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily
+        let now = dt(2026, 1, 5, 12, 0, 0);
+        let next_run_at = now - chrono::Duration::days(2); // past grace
+        let v = schedule_overdue(&OverdueInputs {
+            effective_fire_at: Some(now - chrono::Duration::days(3)), // earlier
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            v.overdue,
+            "a backward calendar rebase must not suppress a genuinely stale slot"
+        );
+        assert_eq!(v.overdue_by_secs, Some((now - next_run_at).num_seconds()));
     }
 
     #[test]

@@ -7710,3 +7710,135 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
         "a non-overdue schedule reports null overdue_by_secs in the response: {body}"
     );
 }
+
+/// Seed a daily-cron schedule whose `next_run_at` slot (3 days ago) sits inside an
+/// explicit calendar exclusion block spanning `[today-3 .. today+2]`, so a
+/// `run_next_business_day` policy rebases the effective fire to `today+3` (future).
+/// Returns `(deferred_id, control_id)`; the control has no calendar (same past
+/// slot). Dates are computed relative to the real `Utc::now()` (the read path uses
+/// the real clock), so the deferral is future regardless of which weekday CI runs.
+async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uuid, uuid::Uuid) {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect");
+    let cal = "cal_read_deferred";
+    let deferred = "overdue_read_cal_deferred";
+    let control = "overdue_read_cal_control";
+
+    // Isolate on a possibly-shared DB.
+    for wf in [deferred, control] {
+        diesel::delete(harvest_schedules::table.filter(dsl::workflow_name.eq(wf)))
+            .execute(&mut conn)
+            .await
+            .expect("clear prior schedule");
+    }
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_calendar_exclusions WHERE calendar_name = '{cal}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear prior exclusions");
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_calendars WHERE name = '{cal}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear prior calendar");
+
+    // Parent calendar row (FK target for both the exclusions and the schedule).
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_calendars (id, name, built_in) VALUES (gen_random_uuid(), '{cal}', false)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("insert calendar");
+
+    let today = chrono::Utc::now().date_naive();
+    let slot_date = today - chrono::Duration::days(3);
+    // Exclude [today-3 .. today+2] (6 days) so the forward scan from the slot lands
+    // on today+3 — comfortably in the future relative to the mid-run `now`.
+    for offset in -3..=2 {
+        let d = today + chrono::Duration::days(offset);
+        diesel::sql_query(format!(
+            "INSERT INTO harvest_calendar_exclusions (id, calendar_name, excluded_date) \
+             VALUES (gen_random_uuid(), '{cal}', DATE '{d}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert exclusion");
+    }
+
+    // next_run_at = slot_date at midnight (a daily-cron slot 3 days in the past).
+    let next_run_at = slot_date.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+
+    let mut deferred_id = uuid::Uuid::nil();
+    let mut control_id = uuid::Uuid::nil();
+    for (wf, cal_name, skip_policy, out) in [
+        (
+            deferred,
+            Some(cal),
+            "run_next_business_day",
+            &mut deferred_id,
+        ),
+        (control, None, "skip", &mut control_id),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        diesel::insert_into(harvest_schedules::table)
+            .values((
+                dsl::id.eq(id),
+                dsl::workflow_name.eq(wf),
+                dsl::schedule_expr.eq("cron:0 0 * * *"),
+                dsl::timezone.eq("UTC"),
+                dsl::catchup.eq(false),
+                dsl::max_active_runs.eq(10),
+                dsl::is_paused.eq(false),
+                dsl::next_run_at.eq(next_run_at),
+                dsl::jitter_secs.eq(0_i64),
+                dsl::overlap_policy.eq("skip"),
+                dsl::buffered_runs.eq(serde_json::json!([])),
+                dsl::buffer_all_max.eq(100),
+                dsl::skip_policy.eq(skip_policy),
+                dsl::calendar_name.eq(cal_name),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("insert schedule");
+        *out = id;
+    }
+    (deferred_id, control_id)
+}
+
+/// Codex round 3: `GET /admin/schedules/{id}` must honor the tick's calendar
+/// deferral. A `run_next_business_day` schedule whose slot fell inside an
+/// exclusion block, rebased to a FUTURE business day, reports `overdue: false`;
+/// the same past slot WITHOUT a calendar reports `overdue: true` (control),
+/// proving the calendar resolution is what suppresses the false positive.
+#[tokio::test]
+async fn schedule_read_honors_calendar_deferred_fire() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let (deferred_id, control_id) = seed_calendar_deferred_read_schedules(&database_url).await;
+
+    let (status, deferred) = get_json(&app, format!("/admin/schedules/{deferred_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        deferred["overdue"], false,
+        "a calendar-deferred (future business-day) schedule must report overdue=false: {deferred}"
+    );
+    assert!(
+        deferred["overdue_by_secs"].is_null(),
+        "a non-overdue schedule reports null overdue_by_secs: {deferred}"
+    );
+
+    let (status, control) = get_json(&app, format!("/admin/schedules/{control_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        control["overdue"], true,
+        "the same past slot WITHOUT a calendar must still report overdue=true (control): {control}"
+    );
+}

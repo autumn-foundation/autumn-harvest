@@ -192,6 +192,42 @@ async fn insert_schedule_bounded(
     id
 }
 
+/// Insert a daily-cron workflow schedule attached to a calendar + skip policy
+/// (Codex round 3 calendar-deferral test). `calendar_name = None` disables the
+/// calendar (the control case). Uses a daily midnight cron so a slot on an
+/// excluded (weekend) day is rebased to the next business day.
+async fn insert_calendar_schedule(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    next_run_at: DateTime<Utc>,
+    calendar_name: Option<&str>,
+    skip_policy: &str,
+) -> Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let id = Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("cron:0 0 * * *"), // daily at midnight (canonical prefix)
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(false),
+            dsl::next_run_at.eq(next_run_at),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("skip"),
+            dsl::buffered_runs.eq(serde_json::json!([])),
+            dsl::buffer_all_max.eq(100),
+            dsl::skip_policy.eq(skip_policy),
+            dsl::calendar_name.eq(calendar_name),
+        ))
+        .execute(conn)
+        .await
+        .expect("insert calendar schedule");
+    id
+}
+
 /// Insert one pending #607 start-throttle row for `wf_name` (drives the
 /// throttle-aware at-capacity guard, matching the tick's basis).
 async fn insert_pending_throttle(conn: &mut AsyncPgConnection, wf_name: &str) {
@@ -503,5 +539,83 @@ async fn non_deferring_policy_at_capacity_is_overdue() {
         metrics.overdue_for("workflow", "cancel_wf"),
         Some(true),
         "a non-deferring policy at capacity with a stale next_run_at is a genuine stall"
+    );
+}
+
+/// Codex round 3: a calendar `run_next_business_day` schedule whose slot fell on
+/// an excluded (weekend) day is deliberately deferred by the tick to the next
+/// business day; while that adjusted fire is still in the FUTURE the tick keeps
+/// `next_run_at` pinned to the (past) original slot. The sampler must NOT flag it
+/// overdue — reusing the tick's own calendar rebasing. A control run WITHOUT the
+/// calendar (same past slot) IS overdue, proving the calendar resolution is what
+/// suppresses the false positive (not a blanket suppression).
+#[tokio::test]
+async fn calendar_deferred_weekend_schedule_is_not_overdue_via_sampler() {
+    let (mut conn, _c) = setup_db().await;
+    // Fixed weekend so the rebase is deterministic:
+    //   2026-01-03 = Sat, 2026-01-04 = Sun, 2026-01-05 = Mon.
+    // Slot on Sat midnight; run_next_business_day → Mon 2026-01-05 00:00 (future).
+    let sat_slot: DateTime<Utc> = "2026-01-03T00:00:00Z".parse().expect("sat slot");
+    let now: DateTime<Utc> = "2026-01-04T12:00:00Z".parse().expect("now (sun)");
+
+    // Calendar-deferred: next fire is Monday (future) → not overdue.
+    insert_calendar_schedule(
+        &mut conn,
+        "cal_deferred_wf",
+        sat_slot,
+        Some("weekends-off"),
+        "run_next_business_day",
+    )
+    .await;
+    // Control: identical past slot, NO calendar → genuinely overdue (~1.5d > grace).
+    insert_calendar_schedule(&mut conn, "cal_control_wf", sat_slot, None, "skip").await;
+
+    let metrics = RecordingMetrics::default();
+    sample_overdue_schedules(&mut conn, now, &metrics)
+        .await
+        .expect("sampler pass");
+
+    assert_eq!(
+        metrics.overdue_for("workflow", "cal_deferred_wf"),
+        Some(false),
+        "a calendar-deferred (future business-day) schedule must not be overdue; samples: {:?}",
+        metrics.samples()
+    );
+    assert_eq!(
+        metrics.overdue_for("workflow", "cal_control_wf"),
+        Some(true),
+        "the same past slot WITHOUT a calendar must still be overdue (control)"
+    );
+}
+
+/// Codex round 3: detection is preserved for a calendar schedule genuinely wedged
+/// PAST its calendar-adjusted fire. Here `now` is a Tuesday well after the rebased
+/// Monday fire, so the effective fire is itself in the past by > grace → overdue.
+#[tokio::test]
+async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
+    let (mut conn, _c) = setup_db().await;
+    // Slot on Sat 2026-01-03; run_next_business_day → Mon 2026-01-05 00:00.
+    let sat_slot: DateTime<Utc> = "2026-01-03T00:00:00Z".parse().expect("sat slot");
+    // now = Wed 2026-01-07 12:00 → the Monday fire is ~2.5 days past (> ~1d grace).
+    let now: DateTime<Utc> = "2026-01-07T12:00:00Z".parse().expect("now (wed)");
+
+    insert_calendar_schedule(
+        &mut conn,
+        "cal_wedged_wf",
+        sat_slot,
+        Some("weekends-off"),
+        "run_next_business_day",
+    )
+    .await;
+
+    let metrics = RecordingMetrics::default();
+    sample_overdue_schedules(&mut conn, now, &metrics)
+        .await
+        .expect("sampler pass");
+
+    assert_eq!(
+        metrics.overdue_for("workflow", "cal_wedged_wf"),
+        Some(true),
+        "a calendar schedule wedged past its adjusted business-day fire must still be overdue"
     );
 }

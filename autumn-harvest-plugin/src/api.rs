@@ -17278,9 +17278,10 @@ async fn list_schedules(
 
     // Best-effort: load the most recent backfill log row for each schedule.
     let recent_backfills = load_recent_backfills(&api_state, &schedule_ids).await;
-    // Shard-local at-capacity suppression for the overdue field (issue #696 §2),
-    // keyed by schedule id so the read agrees with the gauge and the tick.
-    let at_capacity = load_schedule_at_capacity_by_shard(&api_state).await;
+    // Shard-local overdue inputs (at-capacity §2 + calendar-adjusted fire time,
+    // issue #696 / Codex round 3), keyed by schedule id so the read agrees with
+    // the gauge and the tick.
+    let overdue_aux = load_schedule_overdue_aux_by_shard(&api_state).await;
 
     let entries: Vec<ScheduleEntry> = schedules
         .into_iter()
@@ -17289,8 +17290,8 @@ async fn list_schedules(
                 .get(&s.id)
                 .cloned()
                 .map(BackfillSummary::from);
-            let cap = at_capacity.get(&s.id).copied().unwrap_or(false);
-            schedule_entry_from_row(s, last_backfill, cap)
+            let aux = overdue_aux.get(&s.id).copied().unwrap_or_default();
+            schedule_entry_from_row(s, last_backfill, aux.at_capacity, aux.effective_fire_at)
         })
         .collect();
     fanout_list_json("schedules", entries, status, &unavailable_shards)
@@ -17343,6 +17344,8 @@ async fn get_schedule(
     // Computed shard-locally on the schedule's OWN shard (issue #696 §2), so the
     // read agrees with the gauge and the tick — never a cross-shard sum.
     let mut at_capacity = false;
+    // Calendar-adjusted fire time (Codex round 3), resolved on the same shard.
+    let mut effective_fire_at: Option<chrono::DateTime<chrono::Utc>> = None;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let row: Option<HarvestSchedule> = dsl::harvest_schedules
@@ -17364,6 +17367,15 @@ async fn get_schedule(
                 .await
                 .map(|basis| basis >= i64::from(sched.max_active_runs))
                 .unwrap_or(false);
+            effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
+                &mut conn,
+                sched.calendar_name.as_deref(),
+                &sched.skip_policy,
+                sched.schedule_expr.as_deref(),
+                sched.next_run_at,
+            )
+            .await
+            .unwrap_or(None);
             found = row;
             break;
         }
@@ -17376,7 +17388,12 @@ async fn get_schedule(
         .remove(&s.id)
         .map(BackfillSummary::from);
 
-    Ok(Json(schedule_entry_from_row(s, last_backfill, at_capacity)))
+    Ok(Json(schedule_entry_from_row(
+        s,
+        last_backfill,
+        at_capacity,
+        effective_fire_at,
+    )))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -17923,7 +17940,23 @@ async fn upsert_workflow_schedule_and_read_back(
         .await
         .map(|basis| basis >= i64::from(row.max_active_runs))
         .unwrap_or(false);
-    Ok(schedule_entry_from_row(row, None, at_capacity))
+    // Calendar-adjusted fire time (Codex round 3), resolved on the same shard
+    // conn, so a re-registered calendar-deferred schedule is not falsely flagged.
+    let effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
+        conn,
+        row.calendar_name.as_deref(),
+        &row.skip_policy,
+        row.schedule_expr.as_deref(),
+        row.next_run_at,
+    )
+    .await
+    .unwrap_or(None);
+    Ok(schedule_entry_from_row(
+        row,
+        None,
+        at_capacity,
+        effective_fire_at,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -18191,6 +18224,7 @@ fn schedule_entry_from_row(
     s: HarvestSchedule,
     last_backfill: Option<BackfillSummary>,
     at_capacity: bool,
+    effective_fire_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> ScheduleEntry {
     // Overdue detection (issue #696): computed from the schedule's own
     // `next_run_at` + cadence, never an externally-supplied interval. Rides the
@@ -18198,7 +18232,9 @@ fn schedule_entry_from_row(
     // The exclusions mirror the scheduler tick's exact semantics (Codex P2-A/B):
     // bounded-out from raw end_at/max_runs/runs_started (not just exhausted_at),
     // and the at-capacity suppression is gated to the tick's deferring config
-    // (Skip + catchup).
+    // (Skip + catchup). The caller-resolved `effective_fire_at` (Codex round 3)
+    // carries the tick's calendar rebasing so a schedule deferred to a future
+    // business day is not falsely flagged overdue.
     let overdue_schedule = s
         .schedule_expr
         .as_deref()
@@ -18226,6 +18262,7 @@ fn schedule_entry_from_row(
             overlap_policy,
             catchup: catchup_enabled,
             at_capacity,
+            effective_fire_at,
         });
     let (kind, name) = if let Some(ref dag_name) = s.dag_name {
         (ScheduleKind::Dag, dag_name.clone())
@@ -18289,9 +18326,22 @@ fn schedule_entry_from_row(
     }
 }
 
-/// Build a per-schedule `at_capacity` map (keyed by schedule id) for the overdue
-/// read's §2 suppression, computed **shard-locally** so the read agrees with the
-/// gauge and the tick (issue #696 review BLOCKER 1+2).
+/// Shard-resolved overdue inputs for one schedule row (issue #696): the tick's
+/// `at_capacity` and the calendar-adjusted `effective_fire_at`, both resolved on
+/// the schedule's OWN shard connection so the read agrees with the gauge and the
+/// tick. `Default` (`at_capacity = false`, `effective_fire_at = None`) is the
+/// safe fallback for a schedule on an unreachable shard: not-at-capacity + raw
+/// anchor = the wedge signal is preserved, never falsely suppressed.
+#[derive(Clone, Copy, Default)]
+struct ScheduleOverdueAux {
+    at_capacity: bool,
+    effective_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Build a per-schedule overdue-aux map (keyed by schedule id) for the overdue
+/// read's §2 suppression + calendar deferral, computed **shard-locally** so the
+/// read agrees with the gauge and the tick (issue #696 review BLOCKER 1+2 +
+/// Codex round 3).
 ///
 /// A schedule row lives on exactly one shard, and the scheduler tick enforces
 /// `max_active_runs` shard-locally: it holds `next_run_at` in the past only when
@@ -18301,18 +18351,21 @@ fn schedule_entry_from_row(
 /// read disagreed with the alert-source gauge. Here each schedule's `at_capacity`
 /// is computed against the tick's exact basis
 /// (`scheduler::schedule_running_basis` = shard-local `RUNNING`/`PAUSED` count +
-/// #607 pending-throttle backlog) on the connection to its own shard. Iterating
-/// `iter_shards()` and reading each shard's OWN schedule rows keys the result by
-/// schedule id with no cross-shard divergence. An unreachable shard is skipped
-/// (its schedules are simply absent → `unwrap_or(false)` at the read = not
-/// at-capacity = the wedge signal is preserved, never falsely suppressed).
-async fn load_schedule_at_capacity_by_shard(
+/// #607 pending-throttle backlog) on the connection to its own shard, and its
+/// `effective_fire_at` is resolved via `scheduler::resolve_effective_fire_at`
+/// (the tick's own calendar rebasing — loads the calendar's exclusions on that
+/// same shard conn). Iterating `iter_shards()` and reading each shard's OWN
+/// schedule rows keys the result by schedule id with no cross-shard divergence.
+/// An unreachable shard is skipped (its schedules are simply absent → the
+/// `Default` aux at the read = not-at-capacity + raw anchor = the wedge signal is
+/// preserved, never falsely suppressed).
+async fn load_schedule_overdue_aux_by_shard(
     api_state: &HarvestApiState,
-) -> std::collections::HashMap<uuid::Uuid, bool> {
-    let mut at_capacity: std::collections::HashMap<uuid::Uuid, bool> =
+) -> std::collections::HashMap<uuid::Uuid, ScheduleOverdueAux> {
+    let mut aux: std::collections::HashMap<uuid::Uuid, ScheduleOverdueAux> =
         std::collections::HashMap::new();
     let Ok(pool) = api_state.storage_pool() else {
-        return at_capacity;
+        return aux;
     };
     for (_shard, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
@@ -18332,15 +18385,31 @@ async fn load_schedule_at_capacity_by_shard(
                 .or(s.workflow_name.as_deref())
                 .unwrap_or("");
             // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            let cap = match autumn_harvest::scheduler::schedule_running_basis(&mut conn, name).await
-            {
-                Ok(basis) => basis >= i64::from(s.max_active_runs),
-                Err(_) => false, // count failed → don't suppress the wedge signal
-            };
-            at_capacity.insert(s.id, cap);
+            let at_capacity =
+                match autumn_harvest::scheduler::schedule_running_basis(&mut conn, name).await {
+                    Ok(basis) => basis >= i64::from(s.max_active_runs),
+                    Err(_) => false, // count failed → don't suppress the wedge signal
+                };
+            // Calendar-adjusted fire time (Codex round 3), resolved on this shard.
+            let effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
+                &mut conn,
+                s.calendar_name.as_deref(),
+                &s.skip_policy,
+                s.schedule_expr.as_deref(),
+                s.next_run_at,
+            )
+            .await
+            .unwrap_or(None); // resolve failed → raw anchor (don't hide a wedge)
+            aux.insert(
+                s.id,
+                ScheduleOverdueAux {
+                    at_capacity,
+                    effective_fire_at,
+                },
+            );
         }
     }
-    at_capacity
+    aux
 }
 
 /// `PATCH /admin/schedules/{id}` — partial in-place update of an existing
@@ -18694,18 +18763,20 @@ async fn update_schedule_handler(
                 .remove(&row.id)
                 .map(BackfillSummary::from);
             // A non-cadence patch preserves `next_run_at`, so the row may still
-            // be overdue; compute at-capacity (shard-local, #696 §2) so the field
-            // is accurate. Keyed by id from the same shard-local pass the read
-            // uses, so it agrees with the gauge.
-            let at_capacity = load_schedule_at_capacity_by_shard(&api_state)
+            // be overdue; compute the shard-local overdue inputs (at-capacity §2 +
+            // calendar-adjusted fire time, #696 / Codex round 3) so the field is
+            // accurate. Keyed by id from the same shard-local pass the read uses,
+            // so it agrees with the gauge.
+            let aux = load_schedule_overdue_aux_by_shard(&api_state)
                 .await
                 .get(&row.id)
                 .copied()
-                .unwrap_or(false);
+                .unwrap_or_default();
             Ok(Json(schedule_entry_from_row(
                 *row,
                 last_backfill,
-                at_capacity,
+                aux.at_capacity,
+                aux.effective_fire_at,
             )))
         }
         Ok(ScheduleUpdateOutcome::NotFound) => {
