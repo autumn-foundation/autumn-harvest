@@ -987,9 +987,14 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         //     may precede the `use` and still resolve to the import (#778,
         //     Codex r7). Only module/file-level `use` (outside the body) is
         //     never a body shadow.
+        //   * a body-local `fn NAME(...)` item likewise shadows the name for the
+        //     **whole body** — a Rust block `fn` item is in scope for the entire
+        //     enclosing block, so a call `NAME()` resolves to the nested fn, not
+        //     a same-module `fn NAME` (#778, Codex r10).
         let params: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
         let let_binding_lines = collect_body_let_binding_lines(&view);
-        let (use_bindings, has_glob_use) = collect_body_use_bindings(&view);
+        let (mut use_bindings, has_glob_use) = collect_body_use_bindings(&view);
+        use_bindings.extend(collect_body_fn_bindings(&view));
         for callee in collect_direct_free_fn_calls(
             &view,
             &index,
@@ -1159,6 +1164,14 @@ fn collect_direct_free_fn_calls(
                 Some(i)
             };
             let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
+            // A `fn NAME(` is a function DECLARATION (the ident is preceded,
+            // ignoring whitespace, by the `fn` keyword), not a call. Skip it so a
+            // nested `fn helper() {}` in the body is never mis-collected as a call
+            // to a same-module `fn helper` (#778, Codex r10 FP). The declaration's
+            // name is separately added to the whole-body shadow set (see
+            // `collect_body_fn_bindings`), so a *genuine* call to it resolves to
+            // the nested fn rather than the module helper.
+            let is_fn_decl = is_ident_preceded_by_fn(bytes, start);
             // Shadowed in scope at this call site? A param shadows everywhere; a
             // `let` binding shadows a call on a strictly-later source line, or —
             // on the SAME line — a call whose column is past the binding's
@@ -1166,23 +1179,45 @@ fn collect_direct_free_fn_calls(
             // `let helper = ...; helper();` suppresses the call while the RHS of
             // `let bad = bad();` and a pre-shadow `bad(); let bad = ...;` call
             // stay flagged (source-order + column-aware, #778 Codex P2/r9). A
-            // block-local `use` import and a block-local glob `use ...::*;` shadow
-            // the name across the WHOLE body — a Rust block `use` item is in scope
-            // for the entire block regardless of position, so a call may precede
-            // the `use` and still resolve to the import (#778, Codex r7).
+            // block-local `use` import, a block-local glob `use ...::*;`, and a
+            // block-local `fn NAME(...)` item shadow the name across the WHOLE
+            // body — a Rust block `use`/`fn` item is in scope for the entire
+            // block regardless of position, so a call may precede the item and
+            // still resolve to it (#778, Codex r7/r10).
             let shadowed_here = params.contains(token)
                 || let_binding_lines.get(token).is_some_and(|b| {
                     b.line < src_line || (b.line == src_line && start > b.in_scope_col)
                 })
                 || use_bindings.contains(token)
                 || has_glob_use;
-            if first_ok && before_ok && after_ok && candidates.contains_key(token) && !shadowed_here
+            if first_ok
+                && before_ok
+                && after_ok
+                && !is_fn_decl
+                && candidates.contains_key(token)
+                && !shadowed_here
             {
                 called.insert(token.to_string());
             }
         }
     }
     called
+}
+
+/// True when the identifier starting at byte `start` is immediately preceded
+/// (ignoring intervening whitespace) by the `fn` keyword — i.e. it is a function
+/// DECLARATION name (`fn helper(`, `async fn helper(`), not a call. Used to skip
+/// a nested `fn` item's own name in the call collector so a body-local
+/// `fn helper() {}` is never mis-resolved to a same-module `fn helper` (#778,
+/// Codex r10). The `fn` must itself be word-bounded (so `myfn helper` is not a
+/// declaration).
+fn is_ident_preceded_by_fn(bytes: &[u8], start: usize) -> bool {
+    let mut j = start;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    // `j` now sits just past the token preceding the whitespace run.
+    j >= 2 && &bytes[j - 2..j] == b"fn" && (j == 2 || !is_ident_byte(bytes[j - 3]))
 }
 
 /// Given `open_lt` pointing at the `<` opening a turbofish (or generic) segment,
@@ -1382,6 +1417,36 @@ fn collect_body_use_bindings(body: &[(u32, &str)]) -> (std::collections::HashSet
         }
     }
     (names, has_glob)
+}
+
+/// Collects the names of block-local `fn NAME(...)` items declared inside the
+/// workflow body. Like a block-local `use` import, a nested `fn` item shadows a
+/// same-named module helper for the WHOLE enclosing block, so a call `NAME()` in
+/// the body resolves to the nested fn — not a same-module `fn NAME` — and must
+/// be shadow-suppressed to avoid a false positive (#778, Codex r10).
+///
+/// Single-line `fn NAME(` detection only (a signature always opens with its name
+/// on the `fn` keyword's line, whatever qualifiers precede it). A `fn(..)`
+/// pointer TYPE has `(` immediately after `fn`, so it yields no following
+/// identifier and binds nothing. A raw-identifier item (`fn r#gen`) keeps its
+/// `r#` so it keys on the same string as the CALL tokenizer and the def index
+/// (#778, Codex r6). Anything not confidently parsed simply binds nothing
+/// (safe-direction under-collection — the call would then resolve to the module
+/// helper, never a false positive).
+fn collect_body_fn_bindings(body: &[(u32, &str)]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for &(_src_line, line) in body {
+        let code = strip_unparseable_content(line);
+        for pos in word_positions(&code, "fn") {
+            // The identifier following `fn` (skipping whitespace). `extract_use_ident`
+            // reads a leading (raw-`r#`-aware) ident and rejects the `_` wildcard;
+            // a `fn(` pointer type trims to `(` → no ident → `None`.
+            if let Some(name) = extract_use_ident(code[pos + 2..].trim_start()) {
+                names.insert(name);
+            }
+        }
+    }
+    names
 }
 
 /// Parses the text of a single `use` statement (everything after `use`, up to

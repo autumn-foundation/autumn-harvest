@@ -3555,6 +3555,100 @@ mod m {
     );
 }
 
+// ── FIX (issue #778, Codex r10): nested `fn` declarations are not calls ──────
+// A nested `fn helper() {}` DECLARATION inside a workflow body must not be
+// mis-collected as a CALL to a same-module `fn helper` — the declaration token
+// `helper(` is preceded by the `fn` keyword, so it is a definition, not a call.
+
+#[test]
+fn fn_declaration_in_body_is_not_collected_as_a_call() {
+    // A nested `fn helper() {}` in the body (a DECLARATION, never called) plus a
+    // same-module `fn helper()` reading the clock. RED before the r10 fix: the
+    // declaration's `helper(` token was treated as a call and resolved to the
+    // same-module helper → spurious DET001 that could fail innocent CI.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        fn helper() {}
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a nested `fn helper() {{}}` DECLARATION must not be collected as a call to \
+         a same-module `fn helper` (Codex r10 FP), got: {report:?}"
+    );
+}
+
+#[test]
+fn body_local_fn_shadows_the_module_helper_on_a_real_call() {
+    // The body DEFINES a clean nested `fn helper() {}` AND makes a genuine call
+    // `helper()`. Rust resolves the call to the body-local nested fn (which
+    // shadows the module item), so the same-module `fn helper` reading the clock
+    // must NOT be flagged. RED before r10: the call resolved to the module helper.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        fn helper() {}
+        helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a body-local `fn helper() {{}}` shadows the module `helper`, so a genuine \
+         `helper()` call resolves to the nested fn, not the module helper (Codex r10), \
+         got: {report:?}"
+    );
+}
+
+#[test]
+fn same_module_call_without_body_local_fn_is_still_flagged() {
+    // REGRESSION guard (the r10 fix must not over-suppress): a genuine same-module
+    // `helper()` call with NO body-local `fn helper` / `use helper` must still
+    // resolve and flag.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a genuine same-module `helper()` call with NO body-local `fn helper` \
+                 must still be flagged, got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
 // ── FIX F (issue #778, Codex r6): recognize raw identifiers in the CALL tokenizer.
 // Round 4 indexed a `fn r#gen` def under the key `r#gen`, but the call tokenizer
 // split `r#gen()` into `r`/`gen`, so the call never matched the def → a reachable
