@@ -6102,6 +6102,63 @@ async fn child_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succeed
     );
 }
 
+/// No-over-suppression guardrail for issue #1048 — CHILD twin of
+/// `signal_timeout_in_flight_genuine_leftover_event_still_detected_in_canary`
+/// (AC3 symmetry). Removing the byte-identical inline `InProgress` canary-frontier
+/// guard from `spawn_child_workflow_timeout` must NOT let a GENUINE
+/// non-determinism that surfaces as `InProgress`-with-unconsumed-events pass as
+/// `ReplaySucceeded` under canary. Distinct from the `Diverged` case
+/// (`child_timeout_genuine_divergence_still_detected_in_canary`): here
+/// `match_child_or_timer` resolves the race to `InProgress` and rewinds the
+/// cursor to a trailing interleaved-command-allowlist event (`ActivityScheduled`,
+/// replay.rs:4407), but the plain workflow (`child_or_deadline_workflow`, which
+/// only does the child-timeout wait and NEVER schedules an activity) has no
+/// sibling that consumes it — so it is a genuine leftover. The executor's
+/// end-of-cycle authority (`history_has_unconsumed_events`, executor.rs:1183)
+/// must still catch it as `NonDeterminismDetected`, proving the deferral to that
+/// authority does not blind the canary to genuinely-unconsumed history on the
+/// child matcher's distinct rewind path.
+#[tokio::test]
+async fn child_timeout_in_flight_genuine_leftover_event_still_detected_in_canary() {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    let orphan = vec![
+        child_timeout_started(),
+        // Input matches the handler's dispatched `{"id": 42}` so the race
+        // resolves `InProgress`, NOT `Diverged` — testing the leftover path.
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        // Genuine leftover: an interleaved-command-allowlist event the matcher
+        // rewinds to on `InProgress`, but which the plain child-timeout workflow
+        // never dispatches — so nothing consumes it and it remains at the frontier.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "orphaned_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_or_deadline", child_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot("child_or_deadline", exec_id, orphan))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "issue #1048 (child twin): an in-flight child-timeout race with a \
+         genuinely-unconsumed trailing event must STILL be a non-determinism \
+         error under canary — the end-of-cycle authority must catch what the \
+         removed inline guard used to, on the child matcher's rewind path:\n{report}"
+    );
+}
+
 /// A child-timeout whose serialized input exceeds the workflow-input cap on a
 /// FRESH dispatch, PROPAGATING the resulting `PayloadTooLarge` via `?`. The
 /// live over-cap run records no child/timer events — the child was never
