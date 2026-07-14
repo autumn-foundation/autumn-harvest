@@ -34,7 +34,7 @@
 //! so the body re-runs. This makes activity execution **at-least-once**.
 
 use autumn_harvest::{ActivityExecId, ExecutionId};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -122,7 +122,7 @@ pub fn claim_next_ready_task(
                 ))
             },
         )
-        .optional_sqlite()?;
+        .optional()?;
 
     let Some((task_id, act_s, name, input_s, attempt)) = row else {
         tx.commit()?;
@@ -165,12 +165,13 @@ pub fn finish_task(conn: &Connection, task_id: &str) -> SqliteResult<()> {
 /// The stored `state` of a task by id (used by the atomicity tests).
 #[cfg(test)]
 pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<String>> {
-    conn.query_row(
-        "SELECT state FROM harvest_tasks WHERE task_id = ?1",
-        params![task_id],
-        |row| row.get(0),
-    )
-    .optional_sqlite()
+    Ok(conn
+        .query_row(
+            "SELECT state FROM harvest_tasks WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Requeue a task for another attempt at `run_at`, recording the consumed attempt.
@@ -213,7 +214,7 @@ pub fn enqueue_timer(
 
 /// Return the ids of all unfired timers for `exec_id` whose deadline has passed.
 pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT timer_id FROM harvest_timers \
          WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at",
     )?;
@@ -248,23 +249,4 @@ pub fn mark_timer_fired(
         params![exec_id.to_string(), timer_id],
     )?;
     Ok(())
-}
-
-/// `.optional()` for a `query_row` that maps into a `Result<T, SqliteError>`.
-///
-/// `rusqlite`'s own `OptionalExtension` only works on `rusqlite::Result`; the
-/// closures above already return a `rusqlite::Result`, so this translates the
-/// `QueryReturnedNoRows` sentinel to keep the claim path readable.
-trait OptionalSqlite<T> {
-    fn optional_sqlite(self) -> SqliteResult<Option<T>>;
-}
-
-impl<T> OptionalSqlite<T> for rusqlite::Result<T> {
-    fn optional_sqlite(self) -> SqliteResult<Option<T>> {
-        match self {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(SqliteError::from(e)),
-        }
-    }
 }

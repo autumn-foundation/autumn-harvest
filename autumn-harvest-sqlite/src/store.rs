@@ -164,8 +164,8 @@ pub fn append_event(
 /// Load the full ordered history — the exact `Vec<WorkflowEvent>` handed to
 /// [`run_workflow`](autumn_harvest::run_workflow).
 pub fn load_history(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Vec<WorkflowEvent>> {
-    let mut stmt =
-        conn.prepare("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")?;
+    let mut stmt = conn
+        .prepare_cached("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")?;
     let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for r in rows {
