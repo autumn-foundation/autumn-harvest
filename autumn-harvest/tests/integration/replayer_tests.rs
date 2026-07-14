@@ -5531,6 +5531,143 @@ async fn signal_timeout_genuine_divergence_still_detected_in_canary() {
 }
 
 // ---------------------------------------------------------------------------
+// issue #1048 (signal side): the InProgress canary-frontier guard false-fires
+// when the parked race has an interleaved *bookkeeping sibling* command.
+//
+// `match_signal_or_timer` rewinds the matcher cursor to the sibling's
+// unconsumed `SideEffectRecorded` (an interleaved-command allowlist member) so
+// the sibling's own matcher can consume it next. The inline guard reads
+// `has_non_lifecycle_unconsumed()` at that rewound (non-frontier) cursor —
+// BEFORE the joined `side_effect` future is polled — so it observes a
+// transient "not at frontier" and (in canary) fires a false non-determinism.
+// A healthy parked workflow is thus reported `NonDeterminismDetected` instead
+// of `ReplaySucceeded`.
+// ---------------------------------------------------------------------------
+
+/// Reachable #1048 trigger: `tokio::join!(wait_for_signal_timeout, side_effect)`.
+/// `side_effect` lowers to `RecordSideEffect`, so the suspension batch is the
+/// allowlisted `[StartTimer, WaitForSignal, RecordSideEffect]` (accepted by
+/// `extract_started_timer_for_suspension`) — a genuine parked history a canary
+/// samples, unlike the mixed `[StartTimer, WaitForSignal, ScheduleActivity]`
+/// batch the worker rejects.
+fn signal_or_deadline_with_bookkeeping_sibling_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (decision, _seed) = tokio::join!(
+            ctx.wait_for_signal_timeout("approval", std::time::Duration::from_secs(300)),
+            async { ctx.side_effect("nm", || 1_u64).unwrap_or(0) },
+        );
+        let decision = decision.map_err(|e| e.to_string())?;
+        Ok(decision.map_or_else(
+            || serde_json::json!({"escalated": true}),
+            |payload| serde_json::json!({"approved": payload}),
+        ))
+    })
+}
+
+/// Parked signal-timeout race + a trailing interleaved bookkeeping sibling
+/// (`SideEffectRecorded`). The armed timer is at idx 1, the sibling at idx 2;
+/// neither `SignalReceived` nor `TimerFired` is recorded. This is exactly the
+/// history the `join!` workflow above records when it first parks.
+fn signal_in_flight_with_bookkeeping_sibling_fixture() -> Vec<WorkflowEvent> {
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:1:approval"),
+            duration_secs: 300,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Custom,
+            name: Some("nm".to_string()),
+            value: serde_json::json!(1),
+        },
+    ]
+}
+
+/// AC1 (signal): a canary replay of a producible parked history where the
+/// signal-timeout race is in-flight concurrently with an interleaved
+/// bookkeeping sibling must report `ReplaySucceeded`, not
+/// `NonDeterminismDetected`. RED until the inline `InProgress` guard is removed.
+#[tokio::test]
+async fn signal_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "signal_or_deadline_sibling",
+            signal_or_deadline_with_bookkeeping_sibling_workflow,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "signal_or_deadline_sibling",
+            exec_id,
+            signal_in_flight_with_bookkeeping_sibling_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1048: an in-flight signal-timeout race joined with an allowlisted \
+         bookkeeping sibling (side_effect) must be a healthy suspend in canary \
+         mode, not a false non-determinism from the rewound-cursor guard:\n{report}"
+    );
+}
+
+/// No-over-suppression guardrail for issue #1048 (the black-hat risk): removing
+/// the inline `InProgress` guard must NOT let a GENUINE non-determinism that
+/// surfaces as `InProgress`-with-unconsumed-events pass as `ReplaySucceeded`
+/// under canary. This is distinct from the `Diverged` case
+/// (`signal_timeout_genuine_divergence_still_detected_in_canary`): here the race
+/// matcher resolves to `InProgress` and rewinds the cursor to a trailing
+/// interleaved-command event, but the workflow (`signal_or_deadline_workflow`,
+/// which only does the wait and NEVER schedules an activity) has no sibling that
+/// consumes it — so it is a genuine leftover. The executor's end-of-cycle
+/// authority (`history_has_unconsumed_events`, executor.rs:1183) must still
+/// catch it as `NonDeterminismDetected`, proving the deferral does not blind the
+/// canary to genuinely-unconsumed history.
+#[tokio::test]
+async fn signal_timeout_in_flight_genuine_leftover_event_still_detected_in_canary() {
+    let orphan = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:1:approval"),
+            duration_secs: 300,
+        },
+        // Genuine leftover: an interleaved-command-allowlist event the matcher
+        // rewinds to on `InProgress`, but which the plain wait workflow never
+        // dispatches — so nothing consumes it and it remains at the frontier.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "orphaned_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_or_deadline", signal_or_deadline_workflow)
+        .replay_canary_snapshot(make_snapshot("signal_or_deadline", exec_id, orphan))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "issue #1048: an in-flight signal-timeout race with a genuinely-unconsumed \
+         trailing event must STILL be a non-determinism error under canary — the \
+         end-of-cycle authority must catch what the removed inline guard used to:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // execute_child_workflow_timeout — child-or-deadline race (issue #779)
 // ---------------------------------------------------------------------------
 
@@ -5877,6 +6014,91 @@ async fn child_timeout_genuine_divergence_still_detected_in_canary() {
         matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "a genuine mid-history divergence must still be detected in canary mode \
          — the frontier exception must not mask it:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue #1048 (child side, AC3 twin): the byte-identical InProgress
+// canary-frontier guard in `spawn_child_workflow_timeout` false-fires the same
+// way when the parked child-timeout race has an interleaved bookkeeping sibling
+// (`match_child_or_timer` rewinds the cursor to the sibling's
+// `SideEffectRecorded`, and the guard reads `has_non_lifecycle_unconsumed()`
+// there before the sibling is polled).
+// ---------------------------------------------------------------------------
+
+/// Reachable #1048 trigger for the child twin:
+/// `tokio::join!(spawn_child_workflow_timeout, side_effect)`. The suspension
+/// batch is the allowlisted `[StartChildWorkflow, StartTimer, RecordSideEffect]`.
+fn child_or_deadline_with_bookkeeping_sibling_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (outcome, _seed) = tokio::join!(
+            ctx.spawn_child_workflow_timeout(
+                "process_order",
+                serde_json::json!({"id": 42}),
+                std::time::Duration::from_secs(300),
+            ),
+            async { ctx.side_effect("nm", || 1_u64).unwrap_or(0) },
+        );
+        let outcome = outcome.map_err(|e| e.to_string())?;
+        Ok(outcome.map_or_else(
+            || serde_json::json!({"timed_out": true}),
+            |output| serde_json::json!({"child": output}),
+        ))
+    })
+}
+
+/// Parked child-timeout race + a trailing interleaved bookkeeping sibling
+/// (`SideEffectRecorded`): child started (idx 1), timer armed (idx 2), sibling
+/// recorded (idx 3); neither `ChildWorkflow*` terminal nor `TimerFired` is
+/// recorded.
+fn child_in_flight_with_bookkeeping_sibling_fixture() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    let timer_id = TimerId::new("__child_timeout:1:process_order");
+    vec![
+        child_timeout_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".to_string(),
+            input: serde_json::json!({"id": 42}),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 300,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Custom,
+            name: Some("nm".to_string()),
+            value: serde_json::json!(1),
+        },
+    ]
+}
+
+/// AC1 + AC3 (child): a canary replay of a producible parked history where the
+/// child-timeout race is in-flight concurrently with an interleaved bookkeeping
+/// sibling must report `ReplaySucceeded`. RED until the twin's inline `InProgress`
+/// guard is removed symmetrically with the signal side.
+#[tokio::test]
+async fn child_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succeeded() {
+    let exec_id = ExecutionId::new();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "child_or_deadline_sibling",
+            child_or_deadline_with_bookkeeping_sibling_workflow,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "child_or_deadline_sibling",
+            exec_id,
+            child_in_flight_with_bookkeeping_sibling_fixture(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1048: an in-flight child-timeout race joined with an allowlisted \
+         bookkeeping sibling (side_effect) must be a healthy suspend in canary \
+         mode, not a false non-determinism from the rewound-cursor guard:\n{report}"
     );
 }
 
