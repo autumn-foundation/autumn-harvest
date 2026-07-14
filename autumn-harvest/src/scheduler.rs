@@ -4047,7 +4047,23 @@ pub async fn resolve_effective_fire_at(
     )
 }
 
-/// Compute the overdue verdict for every schedule on one shard (issue #696).
+/// One shard's overdue sampling pass (issue #696).
+///
+/// Carries the per-schedule verdicts plus the minimum active cadence step on the
+/// shard, which the worker sampler uses to adapt its poll interval so a sub-30s
+/// schedule is still detected within its cadence-grace window (Codex round 4).
+#[derive(Debug, Clone)]
+pub struct OverdueSamplePass {
+    /// Per-schedule verdicts (all schedules, including not-overdue ones).
+    pub samples: Vec<OverdueSample>,
+    /// Minimum `cadence_step` across *active* (not paused / auto-paused /
+    /// exhausted, and cadence-bearing) schedules on this shard. `None` when no
+    /// active schedule has a cadence (a Manual-only / dormant fleet).
+    pub min_cadence_step: Option<Duration>,
+}
+
+/// Compute the overdue verdict for every schedule on one shard, plus the shard's
+/// fastest active cadence (issue #696).
 ///
 /// Loads all schedule rows on `conn` and, per schedule, computes the tick's
 /// exact shard-local running basis via [`schedule_running_basis`]
@@ -4055,15 +4071,17 @@ pub async fn resolve_effective_fire_at(
 /// `at_capacity` suppression fires *exactly* when the tick would hold
 /// `next_run_at`. Then runs the pure [`schedule_overdue`] predicate against
 /// `now`. ALL schedules are returned (including paused/exhausted, which resolve
-/// to not-overdue) so the sampler can keep the gauge fresh.
+/// to not-overdue) so the sampler can keep the gauge fresh. In the same pass it
+/// tracks the minimum cadence of active schedules for the adaptive sampler
+/// interval (Codex round 4) — gathered here to avoid a second schedule load.
 ///
 /// # Errors
 ///
 /// Returns a database error if any schedule or count query fails.
-pub async fn overdue_schedule_samples(
+pub async fn overdue_schedule_pass(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
-) -> HarvestResult<Vec<OverdueSample>> {
+) -> HarvestResult<OverdueSamplePass> {
     let schedules: Vec<HarvestSchedule> = harvest_schedules::table
         .select(HarvestSchedule::as_select())
         .load(conn)
@@ -4071,6 +4089,7 @@ pub async fn overdue_schedule_samples(
         .map_err(crate::error::database_error)?;
 
     let mut samples = Vec::with_capacity(schedules.len());
+    let mut min_cadence_step: Option<Duration> = None;
     for s in schedules {
         let (kind, name) = if let Some(dag_name) = s.dag_name {
             ("dag".to_string(), dag_name)
@@ -4081,6 +4100,21 @@ pub async fn overdue_schedule_samples(
             .schedule_expr
             .as_deref()
             .and_then(parse_schedule_from_expr);
+        // Track the fastest *active* cadence for the adaptive sampler interval
+        // (Codex round 4). "Active" = not intentionally dormant (paused /
+        // auto-paused / exhausted); a fast, currently-healthy schedule must still
+        // be sampled near its cadence because it could wedge right after a pass.
+        // Over-inclusion (e.g. a bounded-out-but-not-yet-exhausted fast schedule)
+        // only samples slightly faster — correctness-safe, never slower.
+        if !s.is_paused
+            && s.auto_paused_at.is_none()
+            && s.exhausted_at.is_none()
+            && let Some(anchor) = s.next_run_at
+            && let Some(step) =
+                cadence_step(schedule.as_ref(), anchor).and_then(|d| d.to_std().ok())
+        {
+            min_cadence_step = Some(min_cadence_step.map_or(step, |cur| cur.min(step)));
+        }
         let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
         // Shard-local + throttle-aware basis (matches the tick exactly).
         let at_capacity =
@@ -4128,7 +4162,26 @@ pub async fn overdue_schedule_samples(
             overdue_by_secs: verdict.overdue_by_secs,
         });
     }
-    Ok(samples)
+    Ok(OverdueSamplePass {
+        samples,
+        min_cadence_step,
+    })
+}
+
+/// Compute the overdue verdict for every schedule on one shard (issue #696).
+///
+/// Thin wrapper over [`overdue_schedule_pass`] returning only the verdicts, for
+/// callers that don't need the adaptive-interval cadence (the DB tests and
+/// [`sample_overdue_schedules`]).
+///
+/// # Errors
+///
+/// Returns a database error if any schedule or count query fails.
+pub async fn overdue_schedule_samples(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+) -> HarvestResult<Vec<OverdueSample>> {
+    Ok(overdue_schedule_pass(conn, now).await?.samples)
 }
 
 /// Sample the overdue verdict for every schedule on **one shard** and emit the

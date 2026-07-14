@@ -80,13 +80,42 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Minimum sampling cadence for the overdue-schedule gauge (issue #696).
+/// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
+/// #696).
 ///
-/// The overdue signal changes on minute-scale cadence grace, so sampling it at
-/// the sub-second `poll_interval` (which runs an unindexed RUNNING/PAUSED count
-/// per schedule × shards × workers) is wasteful for no benefit. The sampler
-/// runs at `max(poll_interval, SCHEDULE_OVERDUE_SAMPLE_INTERVAL)`.
-pub const SCHEDULE_OVERDUE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+/// For a slow / Manual-only fleet the overdue signal changes on minute-scale
+/// cadence grace, so sampling it at the sub-second `poll_interval` (which runs
+/// an unindexed RUNNING/PAUSED count per schedule × shards × workers) is
+/// wasteful for no benefit — the sampler stays at this 30s ceiling. When a
+/// fast (sub-30s) schedule is present the sampler instead adapts down toward its
+/// cadence (never below the `poll_interval` floor) so `schedule_overdue` is
+/// detected within its grace window (Codex round 4). See
+/// [`next_overdue_sample_interval`].
+pub const SCHEDULE_OVERDUE_SAMPLE_MAX: Duration = Duration::from_secs(30);
+
+/// Compute the overdue sampler's next sleep interval (issue #696, Codex round 4).
+///
+/// Adapts to the fleet's fastest active cadence so the `harvest.schedule.overdue`
+/// gauge is refreshed within the detection grace window even for sub-30s
+/// schedules, while an all-slow / no-cadence fleet stays at the
+/// [`SCHEDULE_OVERDUE_SAMPLE_MAX`] ceiling (the common case, preserving the
+/// coarse-sampling perf win). The result is clamped to
+/// `[poll_interval, SCHEDULE_OVERDUE_SAMPLE_MAX]` so it never busy-spins below
+/// the worker poll interval. `min_cadence_step == None` (no active cadence-bearing
+/// schedule) → the ceiling.
+///
+/// The floor is `poll_interval.min(ceiling)` so a deployment configured with a
+/// `poll_interval` larger than 30s can never invert the clamp (it simply pins
+/// the interval at the 30s ceiling).
+#[must_use]
+pub fn next_overdue_sample_interval(
+    min_cadence_step: Option<Duration>,
+    poll_interval: Duration,
+) -> Duration {
+    let ceiling = SCHEDULE_OVERDUE_SAMPLE_MAX;
+    let floor = poll_interval.min(ceiling);
+    min_cadence_step.map_or(ceiling, |step| step.clamp(floor, ceiling))
+}
 
 /// Validated, runtime-ready worker configuration.
 ///
@@ -11658,12 +11687,17 @@ fn spawn_schedule_overdue_sampler(
     pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
-    interval: Duration,
+    poll_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        // First pass at the ceiling (before any schedule is loaded), then adapt
+        // to the fleet's fastest active cadence each pass (Codex round 4). A
+        // slow / Manual-only fleet stays at the 30s ceiling; a sub-30s schedule
+        // pulls the interval toward its cadence (never below `poll_interval`).
+        let mut interval = crate::worker::SCHEDULE_OVERDUE_SAMPLE_MAX;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -11678,6 +11712,8 @@ fn spawn_schedule_overdue_sampler(
             // would leave if a name transiently existed on two shards.
             let mut by_key: std::collections::BTreeMap<(String, String), bool> =
                 std::collections::BTreeMap::new();
+            // Minimum active cadence across every shard, for the next interval.
+            let mut min_cadence: Option<Duration> = None;
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
@@ -11692,11 +11728,14 @@ fn spawn_schedule_overdue_sampler(
                 // A read failure only skips that shard's schedules (each schedule
                 // lives on one shard, so its gauge holds its last value rather
                 // than being zero-filled misleadingly).
-                match crate::scheduler::overdue_schedule_samples(&mut conn, now).await {
-                    Ok(samples) => {
-                        for s in samples {
+                match crate::scheduler::overdue_schedule_pass(&mut conn, now).await {
+                    Ok(pass) => {
+                        for s in pass.samples {
                             let entry = by_key.entry((s.kind, s.name)).or_insert(false);
                             *entry = *entry || s.overdue;
+                        }
+                        if let Some(step) = pass.min_cadence_step {
+                            min_cadence = Some(min_cadence.map_or(step, |cur| cur.min(step)));
                         }
                     }
                     Err(error) => {
@@ -11713,6 +11752,8 @@ fn spawn_schedule_overdue_sampler(
             if cancel.is_cancelled() {
                 break;
             }
+            // Adapt the next sleep to the fleet's fastest active cadence.
+            interval = crate::worker::next_overdue_sample_interval(min_cadence, poll_interval);
         }
     })
 }
@@ -13353,17 +13394,17 @@ impl Worker {
         // stalled cron is detected within one cadence grace window. Runs on the
         // worker (not the scheduler tick) and no-ops internally when metrics are
         // disabled. Uses `sampler_pools` so single-shard and multi-shard
-        // deployments both aggregate the full schedule set. Sampled on a coarse
-        // cadence (>= 30s) since the overdue signal is minute-scale — never the
-        // sub-second poll_interval the busier samplers use.
+        // deployments both aggregate the full schedule set. The interval is
+        // adaptive (Codex round 4): a coarse 30s ceiling for a slow/Manual fleet,
+        // adapting down toward the fastest active cadence (never below
+        // `poll_interval`) so a sub-30s schedule is still detected within its
+        // grace window.
         #[cfg(feature = "db")]
         let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
             sampler_pools,
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
-            self.config
-                .poll_interval
-                .max(SCHEDULE_OVERDUE_SAMPLE_INTERVAL),
+            self.config.poll_interval,
         ));
         #[cfg(not(feature = "db"))]
         let schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>> = None;
@@ -14736,6 +14777,67 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── Adaptive overdue sampler interval (issue #696, Codex round 4) ─────────
+
+    #[test]
+    fn overdue_interval_no_active_cadence_uses_ceiling() {
+        // A slow / Manual-only fleet (no active cadence) stays at the 30s ceiling.
+        assert_eq!(
+            next_overdue_sample_interval(None, Duration::from_millis(500)),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+    }
+
+    #[test]
+    fn overdue_interval_slow_cadence_clamps_to_ceiling() {
+        // A cadence above the 30s ceiling (e.g. hourly) clamps to the ceiling.
+        assert_eq!(
+            next_overdue_sample_interval(
+                Some(Duration::from_secs(3600)),
+                Duration::from_millis(500)
+            ),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+    }
+
+    #[test]
+    fn overdue_interval_in_band_cadence_is_used() {
+        // A 5s schedule (between the 500ms floor and 30s ceiling) samples at 5s.
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(5)), Duration::from_millis(500)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn overdue_interval_fast_cadence_never_below_poll_floor() {
+        // A 1s schedule present → sampled near its cadence (1s > 500ms floor),
+        // NOT the 30s ceiling — the fast-schedule detection fix.
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(1)), Duration::from_millis(500)),
+            Duration::from_secs(1)
+        );
+        // A cadence below the poll floor is clamped UP to the floor (no busy-spin).
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(1)), Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn overdue_interval_large_poll_interval_never_inverts_clamp() {
+        // A poll_interval larger than the 30s ceiling pins at the ceiling rather
+        // than panicking on an inverted clamp.
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(5)), Duration::from_secs(60)),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+        assert_eq!(
+            next_overdue_sample_interval(None, Duration::from_secs(60)),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+    }
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
