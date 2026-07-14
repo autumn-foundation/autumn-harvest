@@ -305,7 +305,7 @@ pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use det_check::{
     DetCheckReport, DetFinding, DetLocation, DetSeverity, DetSuppression, check_dir, check_file,
-    check_source,
+    check_paths, check_source,
 };
 pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
 pub use error::{HarvestError, HarvestResult, TimeoutType};

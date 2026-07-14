@@ -75,6 +75,7 @@ pub async fn notify_decision(
     //    only on the first execution; replays return the recorded value.
     let region: String = ctx
         .side_effect("deploy_region", || {
+            // harvest-suppress: DET004 "env read is wrapped in ctx.side_effect(); recorded once and replayed deterministically"
             std::env::var("DEPLOY_REGION").unwrap_or_else(|_| "us-east-1".to_string())
         })
         .map_err(|e| e.to_string())?;

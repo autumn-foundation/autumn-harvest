@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use autumn_harvest::{DetCheckReport, DetSeverity, check_paths};
 use clap::{Parser, Subcommand, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
@@ -70,6 +71,19 @@ pub enum OutputFormat {
     /// Pretty-printed JSON.
     PrettyJson,
     /// Compact JSON for scripts.
+    Json,
+}
+
+/// Output format for the `det-check` subcommand (issue #778).
+///
+/// This is a **local** flag (`--format`); it is deliberately distinct from the
+/// global `--output` used for API responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum DetCheckFormat {
+    /// Human-readable one-line-per-finding text (default).
+    #[default]
+    Text,
+    /// Machine-readable `DetCheckReport` JSON for CI consumption.
     Json,
 }
 
@@ -305,6 +319,18 @@ pub enum CliError {
     /// A CLI argument value was invalid (e.g. unrecognised scope format).
     #[error("{0}")]
     InvalidInput(String),
+
+    /// `det-check` found determinism violations that fail the gate (issue #778).
+    ///
+    /// The findings themselves are already printed to stdout; this only carries
+    /// the counts so `main` can exit with the right code. Exit code is `1`.
+    #[error("det-check: {errors} hard-blocker finding(s), {warnings} warning(s)")]
+    DetCheckFindings {
+        /// Number of `Error`-severity findings.
+        errors: usize,
+        /// Number of `Warning`-severity findings.
+        warnings: usize,
+    },
 }
 
 impl CliError {
@@ -551,6 +577,32 @@ enum Commands {
     Build {
         #[command(subcommand)]
         command: BuildRoutingCommand,
+    },
+    /// Statically check source for non-determinism reachable from `#[workflow]`
+    /// bodies, including one first-party helper hop (issue #778).
+    ///
+    /// Read-only source analysis: no database, no network. Exits `0` when there
+    /// are no hard-blocker findings and `1` when any `Error`-severity finding is
+    /// present. Warnings (DET005/DET009 and command-free DET010) never fail the
+    /// build unless `--deny-warnings` is passed.
+    #[command(name = "det-check")]
+    DetCheck {
+        /// Source paths (files or directories) to scan. Defaults to the current
+        /// directory. Directories are scanned recursively; `target` and hidden
+        /// directories are skipped.
+        #[arg(value_name = "PATHS", default_value = ".")]
+        paths: Vec<PathBuf>,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (a full `DetCheckReport` with findings and suppressions).
+        #[arg(long, value_enum, default_value_t)]
+        format: DetCheckFormat,
+        /// Also fail (exit `1`) when any warning-severity finding is present.
+        #[arg(long, default_value_t = false)]
+        deny_warnings: bool,
+        /// List every active `harvest-suppress` suppression with its reason and
+        /// location, then exit `0` (audit mode).
+        #[arg(long, default_value_t = false)]
+        list_suppressions: bool,
     },
 }
 
@@ -1831,6 +1883,9 @@ impl Cli {
                 queue.as_deref(),
             )),
             Commands::Build { command } => Ok(build_routing_request(command)),
+            Commands::DetCheck { .. } => {
+                unreachable!("DetCheck handles its own execution locally")
+            }
         }
     }
 }
@@ -1895,6 +1950,18 @@ pub mod tui;
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
+    // det-check is read-only local source analysis: no HTTP, handled entirely
+    // in-process before the API execute path (mirrors the Tui early-return).
+    if let Commands::DetCheck {
+        paths,
+        format,
+        deny_warnings,
+        list_suppressions,
+    } = &cli.command
+    {
+        return run_det_check(paths, *format, *deny_warnings, *list_suppressions);
+    }
+
     if matches!(cli.command, Commands::Tui) {
         return tui::run_tui(&cli).await;
     }
@@ -2001,6 +2068,211 @@ fn history_output_file(cli: &Cli) -> Option<&Path> {
         } => output_file.as_deref(),
         _ => None,
     }
+}
+
+// ── det-check (issue #778) ──────────────────────────────────────────────────
+
+/// Builds one determinism report across every requested source path.
+///
+/// A single shared first-party helper index (issue #778) is used, so a
+/// cross-file transitive violation is caught even when the two files are passed
+/// as separate arguments (the changed-files CI pattern). Directories are walked
+/// recursively; files are scanned directly; symlinks are not followed;
+/// overlapping arguments are de-duplicated; a non-UTF-8 file mid-walk is
+/// skipped. Pure — no printing.
+///
+/// # Errors
+/// Returns [`CliError::InvalidInput`] if a top-level path is missing or a source
+/// path cannot be read.
+pub fn det_check_report_for_paths(paths: &[PathBuf]) -> Result<DetCheckReport, CliError> {
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    check_paths(&refs).map_err(|source| {
+        CliError::InvalidInput(format!("det-check: failed to read source: {source}"))
+    })
+}
+
+/// Formats one finding as `file:line:col DETxxx  (safe alternative: …)`, with a
+/// trailing `[in helper `H` reached from workflow `W`]` for a transitive finding.
+fn format_det_finding_line(finding: &autumn_harvest::DetFinding) -> String {
+    let loc = finding.location.as_ref();
+    let file = loc.map_or("<unknown>", |l| l.file.as_str());
+    let line = loc.map_or(0, |l| l.line);
+    let col = loc.map_or(1, |l| l.col);
+    let mut out = format!(
+        "{file}:{line}:{col} {}  (safe alternative: {})",
+        finding.rule_id, finding.alternative
+    );
+    if let Some(helper) = &finding.via_helper {
+        let wf = finding.workflow_name.as_deref().unwrap_or("<unknown>");
+        let _ = write!(out, "  [in helper `{helper}` reached from workflow `{wf}`]");
+    }
+    out
+}
+
+/// Renders the findings section of a report as text, one line per finding,
+/// sorted by `(file, line, col, rule_id)`.
+#[must_use]
+pub fn format_det_findings_text(report: &DetCheckReport) -> String {
+    if report.findings.is_empty() {
+        return "det-check: no findings".to_string();
+    }
+    let mut findings: Vec<&autumn_harvest::DetFinding> = report.findings.iter().collect();
+    findings.sort_by(|a, b| det_finding_sort_key(a).cmp(&det_finding_sort_key(b)));
+    let mut lines: Vec<String> = findings
+        .iter()
+        .map(|f| format_det_finding_line(f))
+        .collect();
+    let (errors, warnings) = det_check_counts(report);
+    lines.push(format!(
+        "det-check: {errors} hard-blocker finding(s), {warnings} warning(s)"
+    ));
+    lines.join("\n")
+}
+
+fn det_finding_sort_key(f: &autumn_harvest::DetFinding) -> (String, u32, u32, &'static str) {
+    let loc = f.location.as_ref();
+    (
+        loc.map_or(String::new(), |l| l.file.clone()),
+        loc.map_or(0, |l| l.line),
+        loc.map_or(0, |l| l.col),
+        f.rule_id,
+    )
+}
+
+/// Renders the always-echoed suppression audit footer for text mode.
+#[must_use]
+pub fn format_det_suppressions(report: &DetCheckReport) -> String {
+    if report.suppressions.is_empty() {
+        return "suppressed: none".to_string();
+    }
+    det_sorted_suppressions(report)
+        .iter()
+        .map(|s| {
+            format!(
+                "suppressed: {}:{} {} \"{}\"",
+                s.location.file, s.location.line, s.rule_id, s.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Renders the `--list-suppressions` audit listing (AC6): `file:line RULEID "reason"`.
+#[must_use]
+pub fn format_det_suppressions_list(report: &DetCheckReport) -> String {
+    if report.suppressions.is_empty() {
+        return "no active suppressions".to_string();
+    }
+    det_sorted_suppressions(report)
+        .iter()
+        .map(|s| {
+            format!(
+                "{}:{} {} \"{}\"",
+                s.location.file, s.location.line, s.rule_id, s.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn det_sorted_suppressions(report: &DetCheckReport) -> Vec<&autumn_harvest::DetSuppression> {
+    let mut sups: Vec<&autumn_harvest::DetSuppression> = report.suppressions.iter().collect();
+    sups.sort_by(|a, b| {
+        (
+            a.location.file.as_str(),
+            a.location.line,
+            a.rule_id.as_str(),
+        )
+            .cmp(&(
+                b.location.file.as_str(),
+                b.location.line,
+                b.rule_id.as_str(),
+            ))
+    });
+    sups
+}
+
+/// Serializes the report as pretty JSON (AC2).
+///
+/// # Errors
+/// Returns [`CliError::SerializeResponse`] if serialization fails.
+pub fn det_check_json(report: &DetCheckReport) -> Result<String, CliError> {
+    serde_json::to_string_pretty(report).map_err(CliError::SerializeResponse)
+}
+
+/// Serializes the report's active suppressions as pretty JSON for
+/// `--list-suppressions --format json` (the audit inventory as machine-readable
+/// output rather than the text listing).
+///
+/// # Errors
+/// Returns [`CliError::SerializeResponse`] if serialization fails.
+pub fn det_suppressions_json(report: &DetCheckReport) -> Result<String, CliError> {
+    serde_json::to_string_pretty(&json!({ "suppressions": report.suppressions }))
+        .map_err(CliError::SerializeResponse)
+}
+
+/// `(errors, warnings)` counts across a report's findings.
+fn det_check_counts(report: &DetCheckReport) -> (usize, usize) {
+    let errors = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f.severity, DetSeverity::Error))
+        .count();
+    let warnings = report.findings.len() - errors;
+    (errors, warnings)
+}
+
+/// Decides whether `det-check` should gate (exit non-zero).
+///
+/// Gates whenever a hard-blocker finding is present, or `deny_warnings` is set
+/// and any warning finding is present. Returns the error to surface, or `None`
+/// to pass.
+#[must_use]
+pub fn det_check_gate(report: &DetCheckReport, deny_warnings: bool) -> Option<CliError> {
+    let (errors, warnings) = det_check_counts(report);
+    if report.has_hard_blockers() || (deny_warnings && warnings > 0) {
+        Some(CliError::DetCheckFindings { errors, warnings })
+    } else {
+        None
+    }
+}
+
+/// Runs `det-check`: merges reports for `paths`, prints findings (text or JSON)
+/// or the suppression listing, and gates the exit code.
+///
+/// # Errors
+/// Returns [`CliError::DetCheckFindings`] when the gate trips (findings are
+/// already on stdout), or a read/serialize error.
+pub fn run_det_check(
+    paths: &[PathBuf],
+    format: DetCheckFormat,
+    deny_warnings: bool,
+    list_suppressions: bool,
+) -> Result<(), CliError> {
+    let report = det_check_report_for_paths(paths)?;
+
+    if list_suppressions {
+        match format {
+            DetCheckFormat::Text => println!("{}", format_det_suppressions_list(&report)),
+            DetCheckFormat::Json => println!("{}", det_suppressions_json(&report)?),
+        }
+        return Ok(());
+    }
+
+    match format {
+        DetCheckFormat::Text => {
+            println!("{}", format_det_findings_text(&report));
+            println!("{}", format_det_suppressions(&report));
+        }
+        DetCheckFormat::Json => {
+            println!("{}", det_check_json(&report)?);
+        }
+    }
+
+    if let Some(err) = det_check_gate(&report, deny_warnings) {
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Execute the API request represented by the CLI arguments.
@@ -7558,5 +7830,246 @@ mod usage_cli_tests {
         });
         let rendered = format_usage_table(&value);
         assert!(rendered.contains("No usage groups found."));
+    }
+}
+
+#[cfg(test)]
+mod det_check_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn report(src: &str) -> DetCheckReport {
+        autumn_harvest::check_source(src, "test.rs")
+    }
+
+    // NOTE: these fixtures embed `#[workflow]` source and MUST be single-line
+    // string literals (with `\n` escapes), not multi-line `"\`-continuation
+    // strings — a multi-line literal containing `#[workflow]` at a line start is
+    // misread as a real workflow by the line-based det_check scanner (the
+    // documented multi-line-string lexer caveat), producing a self-scan false
+    // positive on this very file. Single-line literals are stripped correctly.
+    const WF_TIME: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
+
+    const WF_WARN: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::process::id();\n    Ok(())\n}\n";
+
+    const WF_SUPPRESSED: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    // harvest-suppress: DET001 \"recorded in signal payload\"\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
+
+    #[test]
+    fn det_check_parses_paths_and_flags() {
+        let cli = parse(&["det-check", "--format", "json", "some/path"]);
+        match cli.command {
+            Commands::DetCheck {
+                paths,
+                format,
+                deny_warnings,
+                list_suppressions,
+            } => {
+                assert_eq!(paths, vec![PathBuf::from("some/path")]);
+                assert_eq!(format, DetCheckFormat::Json);
+                assert!(!deny_warnings);
+                assert!(!list_suppressions);
+            }
+            other => panic!("expected DetCheck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn det_check_defaults_to_current_dir_and_text_format() {
+        let cli = parse(&["det-check"]);
+        match cli.command {
+            Commands::DetCheck {
+                paths,
+                format,
+                deny_warnings,
+                list_suppressions,
+            } => {
+                assert_eq!(paths, vec![PathBuf::from(".")]);
+                assert_eq!(format, DetCheckFormat::Text);
+                assert!(!deny_warnings);
+                assert!(!list_suppressions);
+            }
+            other => panic!("expected DetCheck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn det_check_accepts_deny_warnings_and_list_suppressions() {
+        let cli = parse(&[
+            "det-check",
+            "--deny-warnings",
+            "--list-suppressions",
+            "a",
+            "b",
+        ]);
+        match cli.command {
+            Commands::DetCheck {
+                paths,
+                deny_warnings,
+                list_suppressions,
+                ..
+            } => {
+                assert_eq!(paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
+                assert!(deny_warnings);
+                assert!(list_suppressions);
+            }
+            other => panic!("expected DetCheck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn det_check_format_default_is_text() {
+        assert_eq!(DetCheckFormat::default(), DetCheckFormat::Text);
+    }
+
+    #[test]
+    fn text_finding_line_has_location_rule_and_alternative() {
+        let r = report(WF_TIME);
+        let text = format_det_findings_text(&r);
+        assert!(text.contains("DET001"), "{text}");
+        assert!(text.contains("test.rs:"), "{text}");
+        assert!(text.contains("safe alternative:"), "{text}");
+        // A direct finding has no helper attribution.
+        assert!(!text.contains("in helper"), "{text}");
+    }
+
+    #[test]
+    fn transitive_text_line_names_helper_and_entry() {
+        let src = "\
+#[workflow]
+async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = bad_helper();
+    Ok(())
+}
+
+fn bad_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+        let text = format_det_findings_text(&report(src));
+        assert!(
+            text.contains("in helper `bad_helper` reached from workflow `entry_wf`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn text_findings_empty_report_is_no_findings() {
+        let empty = DetCheckReport::default();
+        assert_eq!(format_det_findings_text(&empty), "det-check: no findings");
+    }
+
+    #[test]
+    fn suppression_formatter_renders_reason_and_location() {
+        let r = report(WF_SUPPRESSED);
+        let footer = format_det_suppressions(&r);
+        assert!(footer.contains("suppressed:"), "{footer}");
+        assert!(footer.contains("DET001"), "{footer}");
+        assert!(footer.contains("recorded in signal payload"), "{footer}");
+
+        let list = format_det_suppressions_list(&r);
+        assert!(list.contains("DET001"), "{list}");
+        assert!(list.contains("\"recorded in signal payload\""), "{list}");
+    }
+
+    #[test]
+    fn suppression_formatters_handle_none() {
+        let empty = DetCheckReport::default();
+        assert_eq!(format_det_suppressions(&empty), "suppressed: none");
+        assert_eq!(
+            format_det_suppressions_list(&empty),
+            "no active suppressions"
+        );
+    }
+
+    #[test]
+    fn gate_trips_on_hard_blocker() {
+        let r = report(WF_TIME);
+        let gated = det_check_gate(&r, false);
+        assert!(matches!(
+            gated,
+            Some(CliError::DetCheckFindings { errors: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn gate_passes_on_warning_only_unless_deny_warnings() {
+        let r = report(WF_WARN);
+        assert!(det_check_gate(&r, false).is_none());
+        let gated = det_check_gate(&r, true);
+        assert!(matches!(
+            gated,
+            Some(CliError::DetCheckFindings {
+                errors: 0,
+                warnings: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn gate_passes_on_clean_report() {
+        let clean = report(
+            "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    ctx.timer(\"t\", 1).await?;\n    Ok(())\n}\n",
+        );
+        assert!(det_check_gate(&clean, false).is_none());
+        assert!(det_check_gate(&clean, true).is_none());
+    }
+
+    #[test]
+    fn det_check_findings_error_exits_with_code_one() {
+        let err = CliError::DetCheckFindings {
+            errors: 3,
+            warnings: 1,
+        };
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn det_check_json_serializes_report() {
+        let json = det_check_json(&report(WF_TIME)).expect("json");
+        assert!(json.contains("\"rule_id\""));
+        assert!(json.contains("DET001"));
+        assert!(json.contains("\"severity\": \"error\""));
+    }
+
+    // FIX #5: `--list-suppressions --format json` must emit JSON (not silently
+    // fall back to the text listing). The output must parse as JSON containing
+    // the suppression.
+    #[test]
+    fn det_suppressions_json_is_valid_json_containing_the_suppression() {
+        let r = report(WF_SUPPRESSED);
+        let json = det_suppressions_json(&r).expect("suppressions json");
+        let value: Value = serde_json::from_str(&json).expect("output must be valid JSON");
+        let sups = value["suppressions"]
+            .as_array()
+            .expect("suppressions array");
+        assert!(
+            sups.iter().any(|s| s["rule_id"] == "DET001"),
+            "the suppression must be present in the JSON, got: {json}"
+        );
+        assert!(
+            sups.iter()
+                .any(|s| s["reason"] == "recorded in signal payload"),
+            "the reason must be present in the JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn run_det_check_list_suppressions_json_exits_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sup.rs"), WF_SUPPRESSED).unwrap();
+        let result = run_det_check(
+            &[dir.path().to_path_buf()],
+            DetCheckFormat::Json,
+            false,
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "--list-suppressions --format json must exit Ok, got: {result:?}"
+        );
     }
 }

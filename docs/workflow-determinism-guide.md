@@ -500,6 +500,106 @@ assert_eq!(err, GuardrailSuppressionError::EmptyRuleId);
 
 ---
 
+## Running the check in CI
+
+The `det_check` engine ships behind a runnable front door: the **`harvest det-check`** CLI subcommand ([issue #778](https://github.com/madmax983/autumn-harvest/issues/778)). It statically flags non-deterministic API calls reachable from your `#[workflow]` bodies — including through **one hop** of first-party helper functions the body calls directly — so you catch replay foot-guns at PR/CI time instead of post-deploy when in-flight executions DLQ.
+
+```console
+# Scan the current directory (default). Directories are scanned recursively;
+# `target` and hidden directories (`.git`, …) are skipped.
+$ harvest det-check
+
+# Scan specific paths (files or directories).
+$ harvest det-check src examples
+
+# Machine-readable output for CI consumption.
+$ harvest det-check --format json src
+
+# Also fail on warnings (DET005/DET009 and command-free DET010).
+$ harvest det-check --deny-warnings src
+
+# Audit the escape-hatch inventory: list every active suppression.
+$ harvest det-check --list-suppressions src
+```
+
+### Flags and exit-code contract
+
+| Flag | Effect |
+|------|--------|
+| `[PATHS...]` | Source paths to scan. Default: `.` (current directory). |
+| `--format text\|json` | Output format. `text` (default) prints `file:line:col DETxxx  (safe alternative: …)`, one line per finding, with a transitive finding also naming `[in helper `H` reached from workflow `W`]`, followed by a `suppressed:` audit footer. `json` emits a full `DetCheckReport` (findings + suppressions). |
+| `--deny-warnings` | Also gate (exit `1`) when any warning-severity finding is present. |
+| `--list-suppressions` | Print every active `harvest-suppress` with its reason and location, then exit `0`. |
+
+Exit codes: **`0`** when there are no hard-blocker findings; **`1`** when any `Error`-severity finding is present. Warning-severity findings (DET005 process reads, DET009 bare tracing, and a command-free DET010 loop) never fail the build unless `--deny-warnings` is passed. The findings (or JSON) are always printed to stdout *before* the non-zero exit, so CI logs are self-explanatory.
+
+### Transitive coverage and its boundary
+
+A hard-blocker call located in a first-party function that a `#[workflow]` body reaches **via a direct free-function call** is flagged, naming both the offending site and the workflow entry point. The boundary deliberately mirrors the `#[workflow]` compile-time lint ([issue #386](https://github.com/madmax983/autumn-harvest/issues/386)) — the following are **out of scope** and are *not* detected:
+
+- **`#[activity]` bodies** — activities are allowed to be non-deterministic by design and are never scanned (directly or via reachability).
+- **Method calls** (`x.helper()`) and path-qualified calls (`m::helper()`) — only bare free-function calls (`helper()`) are resolved. This is the trait-dispatch / receiver boundary #386 also draws.
+- **Two or more hops** — reachability follows exactly one hop. A workflow → `helper_a` → `helper_b` (violation) chain is *not* flagged.
+- Third-party crates, trait-object dispatch, function pointers, and closures captured by reference.
+
+The catalog docs continue to own the "you must also avoid this transitively beyond one first-party hop" warning. Everything det-check skips here is a false-*negative* that the compile-time `#[workflow]` guardrail ([issue #386](https://github.com/madmax983/autumn-harvest/issues/386)) **also** misses — #386 is likewise **body-only**, so it does *not* hard-block a non-deterministic call hidden inside a helper det-check skips (closing that body-only blind spot is exactly what det-check's one-hop pass partially does). det-check deliberately mirrors #386's boundary for what it *attempts* to analyze, and #386 remains the complementary compile-time check for **direct-in-body** violations — but neither is the net for these transitive skips. That net is the **runtime** determinism detection: `harvest-replay` / `WorkflowReplayer` run against recorded histories in tests/CI (post-hoc, once a history exists), and the live `HistoryMatcher` non-determinism check at execution time (which surfaces as a DLQ'd run) — plus manual code review.
+
+### Known limitations (conservative, safe-direction)
+
+`det_check` is a fast text pre-filter, not the authoritative gate. Its reachability resolution deliberately errs toward **missing** a transitive violation rather than reporting a false one — every case below is a false-*negative* (never a false-positive). These transitive false-negatives are **not** caught by the compile-time `#[workflow]` HVG guardrail ([issue #386](https://github.com/madmax983/autumn-harvest/issues/386)) either: #386 is itself **body-only** — it scans only the annotated workflow body, so it does *not* hard-block a non-deterministic call hidden inside a helper det_check skips (that same body-only blind spot is exactly what det_check's one-hop pass was built to partially close). The backstop for what static analysis can't resolve is the **runtime** determinism detection — `WorkflowReplayer` / `harvest-replay` against recorded histories in tests/CI, and the live `HistoryMatcher` non-determinism check at execution time (which DLQs the run) — plus manual code review. When in doubt, trust `WorkflowReplayer` and a careful read of the helper, not the compile-time guardrail (which cannot see into these helpers).
+
+- **Module scope vs. methods.** `#[workflow]` entry points and their first-party helpers are resolved at **module scope** — top level *and* inside `mod NAME { … }` blocks, at any nesting depth. Methods declared inside `impl`/`trait` blocks are **never** indexed as free helpers and a call to one (`self.method()`, `Type::method()`) is never resolved (the #386 method-exclusion boundary).
+- **One-hop resolution is same-module only.** A bare call `helper()` resolves to a first-party helper **only when that helper is declared in the caller's own module** (same file + `module_path`) — the one case a bare call provably reaches without an import the line-based scanner cannot see. A helper in a **different module or file** (reached via a `use` import, including an aliased `use ... as helper`) is **not** resolved; it is treated as ambiguous and skipped (a safe false-negative). This is deliberate: the text front-door cannot resolve `use` imports/aliases, so *any* cross-module resolution keeps producing false positives on innocent imported/aliased code — and for a CI gate a false positive (failing CI on innocent code) is the worst outcome, outranking marginal recall. Even a **globally unique** helper name is not resolved cross-module. This ends the Codex round-4 (same-file-different-module) and round-5 (aliased-import, globally-unique) false-positive family structurally. A **block-local `use` import inside the workflow body** rebinds a same-module name too (a `use crate::x::helper;` in the body makes `helper()` resolve to the import, not a sibling `fn helper`); such imports are added to the shadow set below so this last same-module rebind vector no longer false-positives (a module/file-level `use` + a same-name `fn` is itself a compile error, so a block-local `use` is the only way to shadow a same-module helper — Codex r6). Because the compile-time `#[workflow]` guardrail (#386) is itself body-only, it does *not* catch a violation inside such a skipped cross-module/imported helper either; `WorkflowReplayer` (and the live `HistoryMatcher` at execution time) is the backstop for this false-negative, not #386.
+- **Local shadowing (by binding kind, matching Rust scoping).** A call whose name is bound by the caller — a fn-pointer / closure **parameter**, a local **closure** binding, a shadowing `let`, a **block-local `use` import** (simple, `as`-aliased, or grouped; an unnameable glob `use ...::*;` suppresses conservatively), or a **block-local `fn NAME(...)` item** — is treated as the local/import/nested-fn, not a same-named free helper. `#[workflow(fn ...)]` fn-pointer params and closures are exactly the forms #386 excludes. A nested `fn NAME(` **declaration** is itself never miscounted as a call — its own name token, preceded by the `fn` keyword, is skipped by the call collector (Codex r10). Suppression differs by binding kind, matching Rust scoping: **params** bind for the whole body and always suppress; a **`let`** shadow is **source-order + column-aware** — it suppresses a call on a strictly-later source line, or a **same-line** call whose column is past the binding's statement-terminating `;` (the point the binding enters scope). A call that runs *before* the binding is in scope still resolves to (and is scanned as) the free helper: `let helper = ...; helper();` suppresses the trailing call, while the RHS of `let bad = bad();` (before the `;`) and a pre-shadow `bad(); let bad = ...;` call (before the binding) both stay flagged; a **body-local `use` import** (and glob) and a **body-local `fn` item** shadow the name for the **whole body**, *not* source-order — a Rust block `use`/`fn` item is in scope for the entire enclosing block regardless of textual position, so a bare call may **precede** the `use`/`fn` and still resolve to it (Codex r7/r10). Adding a `use`/glob/`fn` to the shadow set only ever suppresses *more*, so it introduces no new false-positive. Residual safe false-negatives: a `let` shadow bound in an inner block that has already closed before an outer call still suppresses that call (source-order, not full brace-scope tracking); **block-local `use`/`fn` items are treated as whole-body shadows, not brace-scoped** — a nested-block `use`/`fn` that Rust confines to that inner block still suppresses a same-named call in a sibling or outer block *after* it (a line-based-granularity boundary; precise block-scoping would add brace-range-per-item machinery and risk reopening the ordering false-*positive* the whole-body treatment was chosen to eliminate, so it is declined in favor of the zero-false-positive whole-body rule); and if a body both shadows a name *and* legitimately calls a real free fn of that name, that call is conservatively skipped. Every case here is a false-*negative* (under-reports, never over-reports); the runtime replay net (`WorkflowReplayer` / the live `HistoryMatcher`) plus manual review is the backstop.
+- **Path-qualified one-hop calls.** `self::helper()`, `crate::mod::helper()`, and `super::helper()` are **not** resolved — only bare-ident calls (`helper()`, including a turbofish `helper::<T>()`) are matched, and only against a helper in the caller's own module (see "One-hop resolution is same-module only" above). A `use`-imported or aliased call therefore never resolves, because its real target is always in another module the scanner cannot follow. Resolving qualified / associated-function (`Type::assoc()`) calls would risk associated-function/method false positives, which is exactly the #386 boundary.
+- **Call-form gaps.** Space-before-paren (`helper ()`) call forms are not matched by the one-hop resolver. (Turbofish calls — `helper::<T>()`, including nested generics — *are* resolved.)
+
+### Flag scope
+
+`det-check` has its **own local** `--format text|json` flag and **ignores** the CLI's global network flags (`--base-url`, `--output`, auth) — it is read-only source analysis that never touches the management API, so those flags do not apply. `--format` controls only how the `DetCheckReport` (or, with `--list-suppressions`, the suppression inventory) is rendered.
+
+### Relationship to DET010 / DET011
+
+`det-check` surfaces the **entire** shared `det_check` engine, including **DET010** (`HashMap`/`HashSet` iteration order, [issue #785](https://github.com/madmax983/autumn-harvest/issues/785)) and **DET011** (`select!` / futures-select combinators, [issue #799](https://github.com/madmax983/autumn-harvest/issues/799)). The `det-check` CLI slice ([issue #778](https://github.com/madmax983/autumn-harvest/issues/778)) adds **no new** `HashMap`/data-structure linting — those rules pre-exist. Listing "HashMap iteration" as out-of-scope for #778 means this slice adds no such *new* rule, **not** that the CLI hides the engine's existing DET010 output — a `HashMap`-iteration hard blocker is reported by `det-check` exactly as DET010.
+
+### GitHub Actions
+
+```yaml
+name: determinism
+on: [pull_request]
+jobs:
+  det-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Runs the CLI over the whole repo (default `.`) and fails the job on any
+      # hard blocker. Build artifacts (`target`), hidden directories, and the
+      # trybuild `compile_fail/` fixtures are skipped automatically.
+      - name: harvest det-check
+        run: cargo run -q -p autumn-harvest-cli --bin harvest -- det-check
+```
+
+The command exits non-zero on a hard blocker, so the step fails the job automatically — no extra shell plumbing needed. Add `--deny-warnings` to the run line to also fail on warnings. The argless form scans the repo root; in a larger downstream workspace where you want to scope the scan, enumerate specific crate `src` directories instead (e.g. `det-check crate-a/src crate-b/src`).
+
+### Pre-commit hook
+
+Drop this into `.git/hooks/pre-commit` (make it executable with `chmod +x`):
+
+```sh
+#!/bin/sh
+# Block commits that introduce a workflow-determinism hard blocker.
+if ! cargo run -q -p autumn-harvest-cli --bin harvest -- det-check; then
+    echo "det-check found determinism hard blockers — fix them or add a" >&2
+    echo "// harvest-suppress: DETxxx \"reason\" comment (see the guide)." >&2
+    exit 1
+fi
+```
+
+The shipped tree passes the check: a bare `harvest det-check` at the repo root reports zero hard-blocker findings (the deliberately non-deterministic trybuild fixtures under `autumn-harvest/tests/compile_fail/` are *true* positives that exist to be rejected by the compile-time guardrail — the scanner skips that directory, along with `target` and any hidden directory, automatically).
+
+---
+
 ## Composing with the release playbook
 
 The determinism rule catalog is an early-stage guardrail, not the final proof of replay safety. The recommended release sequence:

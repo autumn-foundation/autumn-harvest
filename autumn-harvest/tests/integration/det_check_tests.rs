@@ -4,7 +4,7 @@
 //! Run with:
 //!   cargo test -p autumn-harvest --test `det_check_tests` --no-default-features
 
-use autumn_harvest::det_check::{DetSeverity, check_source};
+use autumn_harvest::det_check::{DetSeverity, check_dir, check_paths, check_source};
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -1844,5 +1844,1868 @@ fn det011_self_scan_of_harvest_src_is_clean() {
     assert!(
         det011.is_empty(),
         "autumn-harvest/src must have zero DET011 findings, got: {det011:?}"
+    );
+}
+
+// ── Transitive reachability (issue #778, one first-party hop) ──────────────
+//
+// A hard-blocker call located in a first-party helper function that a
+// `#[workflow]` body calls directly must be flagged, naming both the offending
+// site and the workflow entry point. Boundary mirrors #386: activity callees,
+// method calls, and two-hop chains are NOT covered.
+
+#[test]
+fn transitive_same_file_flags_helper_violation() {
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = bad_time_helper();
+    Ok(())
+}
+
+fn bad_time_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a Utc::now() inside a first-party helper called from a workflow must be flagged, got: {report:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn transitive_two_hop_is_not_flagged() {
+    // workflow -> helper_a (clean) -> helper_b (violation): one hop only, so
+    // helper_b must NOT be reached.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    helper_a();
+    Ok(())
+}
+
+fn helper_a() {
+    helper_b();
+}
+
+fn helper_b() {
+    let _ = chrono::Utc::now();
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a two-hop violation must NOT be flagged (one hop only), got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_activity_callee_is_not_flagged() {
+    // A workflow calling an #[activity] free function whose body reads the clock
+    // must NOT be flagged — activities may be non-deterministic by design.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = do_side_effect();
+    Ok(())
+}
+
+#[activity(start_to_close = \"30s\")]
+async fn do_side_effect() -> Result<i64, String> {
+    Ok(chrono::Utc::now().timestamp())
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an #[activity] callee must never be scanned via reachability, got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_method_call_helper_is_not_resolved() {
+    // `x.helper()` is a method call; even though a free `helper` with a violation
+    // exists, the method call must NOT resolve to it.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = thing.helper();
+    Ok(())
+}
+
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a method call must not resolve to a same-named free helper, got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_clean_helper_produces_no_finding() {
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = pure_helper(2);
+    Ok(())
+}
+
+fn pure_helper(x: i64) -> i64 {
+    x * 2
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.is_empty(),
+        "a violation-free helper must produce no finding, got: {report:?}"
+    );
+}
+
+#[test]
+fn transitive_cross_file_via_check_dir_is_not_resolved_same_module_only() {
+    // BOUNDARY (issue #778, Codex r4/r5): the workflow lives in file A and calls
+    // a first-party helper defined in file B. Reaching it requires a `use` import
+    // the line-based scanner cannot see, so under same-module-only resolution the
+    // cross-file helper is deliberately NOT resolved — a documented safe
+    // false-negative (never resolving cross-module is what ends the round-4/round-5
+    // false-positive family for a CI gate). #386 is body-only and also misses these
+    // transitive skips; the backstop is runtime replay (`WorkflowReplayer` / live
+    // `HistoryMatcher`) plus manual review, not #386.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "\
+#[workflow]
+async fn cross_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = shared_time();
+    Ok(())
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.rs"),
+        "\
+pub fn shared_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+
+    let report = autumn_harvest::det_check::check_dir(dir.path()).expect("check_dir");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a cross-file helper must NOT be resolved (same-module-only); documented \
+         safe false-negative, got: {report:?}"
+    );
+}
+
+// ── Success metric: 14-workflow fixture (7 classes x {direct, one-hop}) ────
+
+/// Builds a single source containing, for each of 7 hard-blocker rule classes,
+/// a direct-in-body workflow, a transitive (helper-reachable) workflow, and the
+/// offending helper.
+fn fourteen_workflow_fixture() -> String {
+    use std::fmt::Write as _;
+    // (violation-expression, rule_id)
+    let classes = [
+        ("let _ = chrono::Utc::now();", "DET001"),
+        ("let _: u64 = rand::random();", "DET002"),
+        ("let _ = uuid::Uuid::new_v4();", "DET003"),
+        ("let _ = std::env::var(\"X\");", "DET004"),
+        (
+            "tokio::time::sleep(std::time::Duration::from_secs(1)).await;",
+            "DET006",
+        ),
+        ("tokio::spawn(async {});", "DET007"),
+        ("let _ = std::fs::read(\"/tmp/x\");", "DET008"),
+    ];
+    let mut src = String::new();
+    for (i, (violation, _)) in classes.iter().enumerate() {
+        // direct-in-body workflow
+        let _ = write!(
+            src,
+            "#[workflow]\nasync fn wf_direct_{i}(ctx: &WorkflowContext) -> Result<(), String> {{\n    {violation}\n    Ok(())\n}}\n\n"
+        );
+        // transitive workflow (calls the helper)
+        let _ = write!(
+            src,
+            "#[workflow]\nasync fn wf_via_{i}(ctx: &WorkflowContext) -> Result<(), String> {{\n    bad_helper_{i}();\n    Ok(())\n}}\n\n"
+        );
+        // offending helper
+        let _ = write!(src, "fn bad_helper_{i}() {{\n    {violation}\n}}\n\n");
+    }
+    src
+}
+
+#[test]
+fn fourteen_fixture_flags_all_direct_and_transitive() {
+    let src = fourteen_workflow_fixture();
+    let report = check_source(&src, "fixture.rs");
+    let expected = [
+        "DET001", "DET002", "DET003", "DET004", "DET006", "DET007", "DET008",
+    ];
+
+    for rule in expected {
+        let count = report.findings.iter().filter(|f| f.rule_id == rule).count();
+        assert_eq!(
+            count, 2,
+            "{rule} must be flagged exactly twice (direct + transitive), got {count}: {report:?}"
+        );
+    }
+
+    // Exactly 14 findings, no false positives on the fixture.
+    let total = report
+        .findings
+        .iter()
+        .filter(|f| expected.contains(&f.rule_id))
+        .count();
+    assert_eq!(total, 14, "expected 14 findings, got: {report:?}");
+    assert_eq!(
+        report.findings.len(),
+        14,
+        "fixture must produce zero false-positive findings beyond the 14 expected, got: {report:?}"
+    );
+
+    // The 7 helper-reachable (transitive) violations must be exactly the ones
+    // the macro lint + body scanner miss — 100% via_helper coverage.
+    let transitive = report
+        .findings
+        .iter()
+        .filter(|f| f.via_helper.is_some())
+        .count();
+    let direct = report
+        .findings
+        .iter()
+        .filter(|f| f.via_helper.is_none())
+        .count();
+    assert_eq!(
+        transitive, 7,
+        "all 7 transitive violations must be flagged, got: {report:?}"
+    );
+    assert_eq!(
+        direct, 7,
+        "all 7 direct violations must be flagged, got: {report:?}"
+    );
+}
+
+// ── Finding metadata: via_helper, column, serde (issue #778) ──────────────
+
+#[test]
+fn transitive_finding_names_helper_and_entry_point() {
+    let src = "\
+#[workflow]
+async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = bad_time_helper();
+    Ok(())
+}
+
+fn bad_time_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .expect("DET001 finding");
+    assert_eq!(
+        finding.workflow_name.as_deref(),
+        Some("entry_wf"),
+        "a transitive finding names the workflow entry point"
+    );
+    assert_eq!(
+        finding.via_helper.as_deref(),
+        Some("bad_time_helper"),
+        "a transitive finding names the offending helper"
+    );
+    // The location must be inside the helper, not the workflow body.
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(
+        loc.line, 8,
+        "location must be the offending line in the helper"
+    );
+}
+
+#[test]
+fn direct_finding_has_no_via_helper() {
+    let src = wf("let _t = std::time::SystemTime::now();");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap();
+    assert!(
+        finding.via_helper.is_none(),
+        "a direct-in-body finding must not carry via_helper"
+    );
+}
+
+#[test]
+fn finding_carries_column() {
+    // The pattern `SystemTime::now()` starts at a positive column.
+    let src = wf("let _t = std::time::SystemTime::now();");
+    let report = check_source(&src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap();
+    let loc = finding.location.as_ref().expect("location");
+    assert!(loc.col > 0, "column must be > 0, got: {}", loc.col);
+}
+
+#[test]
+fn report_serializes_to_json() {
+    let src = "\
+#[workflow]
+async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = bad_time_helper();
+    // harvest-suppress: DET003 \"seed comes from input\"
+    let _id = uuid::Uuid::new_v4();
+    Ok(())
+}
+
+fn bad_time_helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let json =
+        autumn_harvest::serde_json::to_string(&report).expect("report must serialize to JSON");
+    let value: autumn_harvest::serde_json::Value =
+        autumn_harvest::serde_json::from_str(&json).expect("JSON must parse");
+
+    let findings = value["findings"].as_array().expect("findings array");
+    assert!(!findings.is_empty());
+    let det001 = findings
+        .iter()
+        .find(|f| f["rule_id"] == "DET001")
+        .expect("DET001 in JSON");
+    assert_eq!(det001["severity"], "error", "severity serializes lowercase");
+    assert!(det001["location"]["col"].as_u64().unwrap() > 0);
+    assert_eq!(det001["via_helper"], "bad_time_helper");
+
+    // A suppression is echoed into the machine-readable output.
+    let sups = value["suppressions"]
+        .as_array()
+        .expect("suppressions array");
+    assert!(sups.iter().any(|s| s["rule_id"] == "DET003"));
+}
+
+// ── Review hardening (#778): compile_fail exclusion + zero-FP shadowing ─────
+
+/// A minimal `#[workflow]` whose body reads the wall clock (DET001 hard
+/// blocker). Kept as a single-line `\n`-escaped literal so this module-level
+/// const (file brace-depth 0) is fully stripped by the scanner rather than
+/// having its content lexed as code — a bare `det-check .` self-scan must stay
+/// clean (the line-based lexer does not track cross-line string literals).
+const WF_UTC: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = chrono::Utc::now();\n    Ok(())\n}\n";
+
+// P1 FIX #1 (AC8): a bare repo-root scan must exclude the deliberately-broken
+// `compile_fail/` trybuild fixtures (they are not real workflow source and
+// carry committed `.stderr` snapshots that must not be edited).
+#[test]
+fn check_dir_excludes_compile_fail_fixtures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cf = dir.path().join("compile_fail");
+    std::fs::create_dir_all(&cf).unwrap();
+    std::fs::write(cf.join("bad.rs"), WF_UTC).unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("wf.rs"), WF_UTC).unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    let det001: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET001")
+        .collect();
+    assert_eq!(
+        det001.len(),
+        1,
+        "only real/ must be scanned; compile_fail/ must be excluded, got: {report:?}"
+    );
+    let file = &det001[0].location.as_ref().unwrap().file;
+    assert!(
+        file.contains("real"),
+        "finding must be from real/, got: {file}"
+    );
+    assert!(
+        !file.contains("compile_fail"),
+        "compile_fail/ must be excluded, got: {file}"
+    );
+}
+
+// P2 FIX #4: `check_dir` must also skip `target/` and hidden (`.`) directories.
+#[test]
+fn check_dir_skips_target_and_hidden_dirs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for sub in ["target", ".hidden"] {
+        let d = dir.path().join(sub);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("gen.rs"), WF_UTC).unwrap();
+    }
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("wf.rs"), WF_UTC).unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    let det001: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET001")
+        .collect();
+    assert_eq!(
+        det001.len(),
+        1,
+        "target/ and .hidden/ must be skipped; only real/ scanned, got: {report:?}"
+    );
+    assert!(det001[0].location.as_ref().unwrap().file.contains("real"));
+}
+
+// P1 FIX #2 (zero-FP): a call bound to a fn-pointer PARAMETER of the same name
+// must NOT resolve to a same-named first-party free helper (#386 excludes
+// function pointers). Reproducer A.
+#[test]
+fn fn_pointer_param_call_is_not_resolved_to_free_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext, transform: fn(i64) -> i64) -> Result<(), String> {
+    let _ = transform(5);
+    Ok(())
+}
+
+fn transform(n: i64) -> i64 {
+    chrono::Utc::now().timestamp() + n
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a fn-pointer parameter call must not resolve to a same-named free helper, got: {report:?}"
+    );
+}
+
+// P1 FIX #2 (zero-FP): a call bound to a LOCAL closure of the same name must
+// NOT resolve to a same-named first-party free helper (#386 excludes
+// closures). Reproducer B.
+#[test]
+fn local_closure_call_is_not_resolved_to_free_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let compute = |x: i64| x + 1;
+    let _ = compute(5);
+    Ok(())
+}
+
+fn compute(n: i64) -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a local closure call must not resolve to a same-named free helper, got: {report:?}"
+    );
+}
+
+// Zero-FP guard: shadowing must NOT suppress a genuinely-reached helper of a
+// DIFFERENT name — a real transitive violation must still be flagged even when
+// the workflow also binds unrelated locals/params.
+#[test]
+fn shadowing_does_not_suppress_a_genuinely_reached_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext, transform: fn(i64) -> i64) -> Result<(), String> {
+    let compute = |x: i64| x + 1;
+    let _ = transform(compute(1));
+    let _ = bad_time();
+    Ok(())
+}
+
+fn bad_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| panic!("bad_time() must still be flagged, got: {report:?}"));
+    assert_eq!(finding.via_helper.as_deref(), Some("bad_time"));
+}
+
+// ── Source-order shadow tracking (issue #778, Codex P2) ─────────────────────
+
+// A call to a free helper that PRECEDES a later same-name `let` binding is
+// resolved by Rust to the FREE helper (the binding is not yet in scope). The
+// whole-body shadow set wrongly suppressed it; source-order tracking restores
+// the (genuine, in-scope) transitive violation. AC4 coverage.
+#[test]
+fn pre_shadow_call_resolves_to_free_helper_not_the_later_binding() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = bad();
+    let bad = |x: i64| x + 1;
+    let _ = bad(5);
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("the pre-shadow bad() call must resolve to the free helper, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+// Documented safe-direction residual FN: source-order tracking (not full
+// scope-awareness) means a shadow bound in an inner/sibling block that has
+// already CLOSED before an outer call still suppresses that call. Rust would
+// resolve the outer call to the free helper, so this is an accepted
+// false-negative (never a false-positive). Pinned so the residual is explicit.
+#[test]
+fn block_confined_shadow_before_call_is_a_documented_false_negative() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    { let bad = 5; let _ = bad; }
+    let _ = bad();
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "documented safe-direction FN: an already-closed inner-block shadow \
+         before the call still suppresses it (source-order, not scope-aware), got: {report:?}"
+    );
+}
+
+// ── Column-aware same-line `let` shadow (issue #778, Codex r9) ──────────────
+
+// A same-line `let helper = ...; helper();` binds the local BEFORE the call, so
+// Rust resolves the call to the local closure. Line-granular source-order
+// tracking wrongly kept flagging this (a same-named free helper with a
+// violation) because the binding and the call share a line; column-awareness
+// (the call comes after the binding's `;`) fixes the FP → NO finding.
+#[test]
+fn same_line_let_binding_before_call_is_suppressed() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let helper = || 0; helper();
+    Ok(())
+}
+
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a same-line `let helper = ...; helper();` binds before the call, so the \
+         call resolves to the local closure, not the free helper, got: {report:?}"
+    );
+}
+
+// The inverse: a same-line call that PRECEDES its `let bad` binding is not yet in
+// scope, so Rust resolves it to the free `fn bad` (a genuine violation). Column
+// awareness must NOT over-suppress a pre-shadow call on the same line as its
+// later binding — it stays flagged.
+#[test]
+fn same_line_call_before_let_binding_is_still_flagged() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = bad(); let bad = || 0;
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a same-line call BEFORE its `let bad` binding must resolve to the \
+                 free helper (binding not yet in scope), got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+// A same-line self-referencing `let bad = bad();` — the RHS call runs before the
+// binding is in scope, so it resolves to the free `fn bad`. Column-awareness
+// (the RHS call precedes the statement-terminating `;`) must keep this flagged
+// rather than introducing a new false-negative.
+#[test]
+fn same_line_self_referencing_let_rhs_call_is_still_flagged() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let bad = bad();
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("the RHS `bad()` of `let bad = bad();` must resolve to the free helper, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+// ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
+
+// BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern `det-check
+// f1.rs f2.rs` passes each file as a SEPARATE argument. `check_paths` still
+// collects them into a single shared index (dedup / symlink / non-UTF-8
+// robustness stand — see the tests below), but bare helper calls resolve
+// same-module ONLY, so a cross-file transitive helper is deliberately NOT
+// resolved (a documented safe false-negative). Never resolving cross-module is
+// what ends the round-4/round-5 false-positive family; for a CI gate a false
+// positive on innocent code is the worse outcome.
+#[test]
+fn check_paths_cross_file_helper_is_not_resolved_same_module_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    std::fs::write(
+        &a,
+        "\
+#[workflow]
+async fn cross_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = shared_time();
+    Ok(())
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "\
+pub fn shared_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+
+    let report = check_paths(&[a.as_path(), b.as_path()]).expect("check_paths");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a cross-file helper across two FILE args must NOT be resolved \
+         (same-module-only); documented safe false-negative, got: {report:?}"
+    );
+}
+
+// Overlapping arguments must not double-count: the same file passed twice, or a
+// directory plus a file inside it, yields exactly one finding.
+#[test]
+fn check_paths_dedups_overlapping_args() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = dir.path().join("wf.rs");
+    std::fs::write(&f, WF_UTC).unwrap();
+
+    let same_twice = check_paths(&[f.as_path(), f.as_path()]).expect("check_paths");
+    assert_eq!(
+        same_twice
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "the same file passed twice must yield one finding, got: {same_twice:?}"
+    );
+
+    let dir_and_file = check_paths(&[dir.path(), f.as_path()]).expect("check_paths");
+    assert_eq!(
+        dir_and_file
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "a directory plus a file inside it must yield one finding, got: {dir_and_file:?}"
+    );
+}
+
+// A directory symlink (here self-referential) must NOT be descended: the scan
+// must terminate and the real file must be scanned exactly once.
+#[cfg(unix)]
+#[test]
+fn check_paths_does_not_follow_directory_symlinks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("real.rs"), WF_UTC).unwrap();
+    // A self-referential directory symlink would recurse forever if followed.
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+
+    let report = check_paths(&[dir.path()]).expect("scan must complete without following the loop");
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "DET001")
+            .count(),
+        1,
+        "the symlinked dir must not be descended (real.rs scanned once), got: {report:?}"
+    );
+}
+
+// A symlink passed as a TOP-LEVEL path argument (a file symlink) must NOT be
+// followed — mirroring the nested no-follow behavior. Following it would lint the
+// target file, which may live outside the requested tree (Codex r9).
+#[cfg(unix)]
+#[test]
+fn check_paths_does_not_follow_a_top_level_symlink_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("real.rs");
+    std::fs::write(&real, WF_UTC).unwrap();
+    let link = dir.path().join("link.rs");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let report = check_paths(&[link.as_path()]).expect("scan must complete");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a top-level symlink FILE arg must be skipped, not followed to its \
+         target (which may be out of tree), got: {report:?}"
+    );
+}
+
+// A symlink to a DIRECTORY passed as a top-level path argument must NOT be
+// walked — following it could pull out-of-tree contents into the report,
+// contradicting the documented no-follow behavior (Codex r9).
+#[cfg(unix)]
+#[test]
+fn check_paths_does_not_follow_a_top_level_symlink_dir() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let realdir = root.path().join("realdir");
+    std::fs::create_dir(&realdir).unwrap();
+    std::fs::write(realdir.join("wf.rs"), WF_UTC).unwrap();
+    let linkdir = root.path().join("linkdir");
+    std::os::unix::fs::symlink(&realdir, &linkdir).unwrap();
+
+    let report = check_paths(&[linkdir.as_path()]).expect("scan must complete");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a top-level symlink DIR arg must be skipped, not walked into \
+         out-of-tree contents, got: {report:?}"
+    );
+}
+
+// Regression: real (non-symlink) file and directory arguments must still be
+// scanned/walked normally after the top-level symlink guard.
+#[test]
+fn check_paths_still_scans_real_file_and_dir_args() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = dir.path().join("wf.rs");
+    std::fs::write(&f, WF_UTC).unwrap();
+    let file_report = check_paths(&[f.as_path()]).expect("check_paths");
+    assert_eq!(
+        file_report
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "a real file arg must still be scanned, got: {file_report:?}"
+    );
+
+    let subdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(subdir.path().join("wf.rs"), WF_UTC).unwrap();
+    let dir_report = check_paths(&[subdir.path()]).expect("check_paths");
+    assert_eq!(
+        dir_report
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "a real dir arg must still be walked, got: {dir_report:?}"
+    );
+}
+
+// A non-UTF-8 `.rs` file discovered during a walk must be skipped (with a
+// warning) rather than aborting the whole scan — the clean file is still
+// analyzed.
+#[test]
+fn check_paths_skips_non_utf8_file_and_continues() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("clean.rs"), WF_UTC).unwrap();
+    std::fs::write(dir.path().join("bad.rs"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+
+    let report = check_paths(&[dir.path()]).expect("scan must complete despite a non-UTF8 file");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "the clean file must still be analyzed, got: {report:?}"
+    );
+}
+
+// A missing top-level path argument is a real usage error (surfaced), distinct
+// from a per-file read error mid-walk (skipped).
+#[test]
+fn check_paths_errors_on_a_missing_top_level_path() {
+    let result = check_paths(&[std::path::Path::new("/nonexistent/definitely/not/here.rs")]);
+    assert!(
+        result.is_err(),
+        "a missing top-level path must surface a read error"
+    );
+}
+
+// ── P2 FIX #4: additional coverage — transitive structural rule, exacts ─────
+
+// A STRUCTURAL rule (DET010) reached through a first-party helper must be
+// attributed with `via_helper` — proving the full rule set (not just the
+// substring classes) applies to reachable helper bodies.
+#[test]
+fn transitive_helper_det010_is_flagged_via_helper() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    fan_out_all(ctx).await;
+    Ok(())
+}
+
+async fn fan_out_all(ctx: &WorkflowContext) {
+    let m: HashMap<String, u64> = HashMap::new();
+    for (k, _v) in &m {
+        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await;
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET010")
+        .unwrap_or_else(|| panic!("expected a transitive DET010 finding, got: {report:?}"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+    assert_eq!(finding.via_helper.as_deref(), Some("fan_out_all"));
+    assert!(matches!(finding.severity, DetSeverity::Error));
+}
+
+// Exact column: `Utc::now()` in `let _t = chrono::Utc::now();` starts at
+// column 18 (after `let _t = chrono::`).
+#[test]
+fn finding_column_is_exact() {
+    let src = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\nlet _t = chrono::Utc::now();\nOk(())\n}\n";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap();
+    let loc = finding.location.as_ref().expect("location");
+    assert_eq!(loc.line, 3, "the violation is on line 3");
+    assert_eq!(
+        loc.col, 18,
+        "`Utc::now()` starts at column 18, got: {}",
+        loc.col
+    );
+}
+
+// One bad helper reached by TWO workflows yields two findings with DISTINCT
+// workflow_name, both attributed to the same helper.
+#[test]
+fn one_bad_helper_reached_by_two_workflows_yields_two_findings() {
+    let src = "\
+#[workflow]
+async fn wf_a(ctx: &WorkflowContext) -> Result<(), String> {
+    bad();
+    Ok(())
+}
+
+#[workflow]
+async fn wf_b(ctx: &WorkflowContext) -> Result<(), String> {
+    bad();
+    Ok(())
+}
+
+fn bad() {
+    let _ = chrono::Utc::now();
+}
+";
+    let report = check_source(src, "test.rs");
+    let det001: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "DET001")
+        .collect();
+    assert_eq!(
+        det001.len(),
+        2,
+        "one helper, two entry points, got: {report:?}"
+    );
+    let names: std::collections::HashSet<_> = det001
+        .iter()
+        .filter_map(|f| f.workflow_name.as_deref())
+        .collect();
+    assert!(
+        names.contains("wf_a") && names.contains("wf_b"),
+        "both entry workflows must be named, got: {names:?}"
+    );
+    assert!(
+        det001
+            .iter()
+            .all(|f| f.via_helper.as_deref() == Some("bad")),
+        "both findings must be attributed to the helper, got: {report:?}"
+    );
+}
+
+// A `harvest-suppress` comment INSIDE a transitively-reached helper body is
+// honored, and echoed into `suppressions` with the helper location.
+#[test]
+fn suppression_inside_transitive_helper_is_honored() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    helper();
+    Ok(())
+}
+
+fn helper() {
+    // harvest-suppress: DET001 \"seed comes from input\"
+    let _ = chrono::Utc::now();
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a suppression inside the reached helper must suppress the finding, got: {report:?}"
+    );
+    let sup = report
+        .suppressions
+        .iter()
+        .find(|s| s.rule_id == "DET001")
+        .unwrap_or_else(|| panic!("suppression must be echoed, got: {report:?}"));
+    assert!(!sup.reason.is_empty());
+    // Location is inside the helper (line 9 of this fixture).
+    assert_eq!(
+        sup.location.line, 9,
+        "suppression location is in the helper"
+    );
+}
+
+// ── module-scoped workflows (issue #778, Codex P1) ──────────────────────────
+// A `#[workflow]` declared inside a Rust module (`mod name { … }`, including
+// nested modules) is a valid entry point and MUST be scanned for direct and
+// one-hop transitive violations, exactly like a top-level workflow. The #386
+// method-exclusion boundary (impl/trait method bodies are not free helpers)
+// must remain intact.
+
+#[test]
+fn module_scoped_workflow_direct_violation_is_flagged() {
+    let src = "\
+mod workflows {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = chrono::Utc::now();
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a direct violation inside a module-scoped #[workflow] must be flagged, got: {report:?}"
+    );
+    assert!(report.has_hard_blockers());
+}
+
+#[test]
+fn module_scoped_workflow_transitive_helper_violation_is_flagged() {
+    let src = "\
+mod workflows {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        stamp();
+        Ok(())
+    }
+    fn stamp() {
+        let _ = chrono::Utc::now();
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "transitive violation in a module-scoped helper must be flagged, got: {report:?}"
+            )
+        });
+    assert_eq!(
+        finding.via_helper.as_deref(),
+        Some("stamp"),
+        "the finding must be attributed to the module-scope helper via `via_helper`, got: {report:?}"
+    );
+}
+
+#[test]
+fn module_scoped_activity_violation_is_not_flagged() {
+    // NEGATIVE guard: a module-nested #[activity] may read the clock — its body
+    // must never be scanned, at any nesting.
+    let src = "\
+mod acts {
+    use autumn_harvest::prelude::*;
+    #[activity(start_to_close = \"30s\")]
+    pub async fn nested_act(_ctx: &ActivityContext) -> Result<(), String> {
+        let _ = chrono::Utc::now();
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a module-nested #[activity] must never be scanned, got: {report:?}"
+    );
+}
+
+#[test]
+fn impl_method_callee_is_not_resolved_as_helper() {
+    // NEGATIVE guard (#386 boundary): a `#[workflow]` calling an inherent /
+    // associated METHOD whose body reads the clock must NOT be flagged — methods
+    // inside `impl` blocks are not free-function helpers and must never be indexed
+    // or resolved. Covers both `self.foo()` and `Type::foo()` dispatch.
+    let src = "\
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let clock = Clock;
+    let _ = clock.stamp();
+    let _ = Clock::stamp_assoc();
+    Ok(())
+}
+
+struct Clock;
+
+impl Clock {
+    fn stamp(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+    fn stamp_assoc() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an impl-method callee must never be indexed or resolved as a free helper, got: {report:?}"
+    );
+}
+
+#[test]
+fn nested_module_workflow_direct_violation_is_flagged() {
+    // A workflow two module levels deep must still be scanned.
+    let src = "\
+mod a {
+    mod b {
+        use autumn_harvest::prelude::*;
+        #[workflow]
+        pub async fn deep(ctx: &WorkflowContext) -> Result<(), String> {
+            let _ = chrono::Utc::now();
+            Ok(())
+        }
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a workflow nested two modules deep must be flagged, got: {report:?}"
+    );
+}
+
+#[test]
+fn module_scoped_det010_hashmap_iteration_is_flagged() {
+    // The bespoke DET010 pass shares the same body-extraction path, so a
+    // module-scoped workflow's HashMap-iteration hazard must also be caught.
+    let src = "\
+mod workflows {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn nested(ctx: &WorkflowContext) -> Result<(), String> {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        for x in m.iter() {
+            ctx.execute_activity_raw(\"a\", serde_json::json!(1), \"q\").await?;
+        }
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET010"),
+        "a module-scoped workflow's DET010 hazard must be flagged, got: {report:?}"
+    );
+}
+
+// ── scope-aware same-name helper resolution (issue #778, Codex P1/r4) ────────
+// When two plain free helpers share an identifier, the caller's own same-module
+// sibling is the Rust-correct resolution target. A same-file-but-different-module
+// definition is NOT preferred (a bare call in a child module does not reach a
+// parent/sibling-module helper without a `use`, which this text-level analysis
+// cannot see), so that case — and any other genuinely-undisambiguable one — is
+// conservatively skipped (safe false-negative, never a false-positive).
+
+#[test]
+fn same_module_helper_resolves_over_unrelated_same_name() {
+    // A workflow in `mod a` calling a bare `stamp()` must resolve to its OWN
+    // module sibling `a::stamp` (which reads the clock) even though an unrelated
+    // `b::stamp` of the same name exists — exactly what Rust resolves the bare
+    // call to. Previously the shared name was marked globally ambiguous and the
+    // reachable hard-blocker in `a::stamp` was skipped (false negative).
+    let src = "\
+mod a {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = stamp();
+        Ok(())
+    }
+    fn stamp() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+mod b {
+    fn stamp() -> String {
+        String::new()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "the same-module sibling `a::stamp` must resolve and flag DET001, got: {report:?}"
+            )
+        });
+    assert_eq!(
+        finding.via_helper.as_deref(),
+        Some("stamp"),
+        "the finding must be attributed to the caller's in-scope `stamp`, got: {report:?}"
+    );
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn same_file_different_module_helper_is_not_resolved() {
+    // FALSE-POSITIVE fix (issue #778, Codex r4): a workflow in a child module
+    // does a bare `helper()` whose real target is a `use`-imported helper from
+    // ANOTHER file (`crate::pure::helper`, clean). An UNRELATED `fn helper()` at
+    // the workflow file's root reads the clock. A bare call in `mod inner` does
+    // NOT resolve to a parent-module (file-root) helper without a `use`, which
+    // this text-level analysis cannot see — so this must be treated as ambiguous
+    // and skipped, NOT resolved to the root helper's hard-blocker (a false
+    // positive that could fail CI on innocent code).
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "\
+mod inner {
+    use autumn_harvest::prelude::*;
+    use crate::pure::helper;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+}
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pure.rs"),
+        "\
+pub fn helper() -> i64 {
+    0
+}
+",
+    )
+    .unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a same-file-but-different-module `helper` must NOT be resolved (the real \
+         target is a `use`-imported helper); the root helper's violation is not \
+         reachable from the workflow, got: {report:?}"
+    );
+}
+
+#[test]
+fn aliased_import_bare_call_is_not_resolved_to_root_helper_same_module_only() {
+    // FALSE-POSITIVE fix (issue #778, Codex r5): a workflow in `mod inner` does a
+    // bare `helper()` whose real target is an ALIASED `use`-imported helper from
+    // ANOTHER file (`use crate::pure_helper as helper;`, clean). An UNRELATED
+    // `fn helper()` at the workflow file's root reads the clock and is the ONLY
+    // definition of the name `helper` in the tree — so the old globally-unique
+    // (`[only]`) resolution branch resolved the bare call cross-module to that root
+    // violation, a false positive that would fail CI on innocent aliased-import
+    // code. Under same-module-only resolution the root `helper` (module "") is NOT
+    // in the caller's own module (`inner`), so it is treated as ambiguous and the
+    // aliased call is NOT resolved. The line-based scanner cannot see the `use ...
+    // as helper;` alias, so no cross-module resolution can be safe here.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "\
+mod inner {
+    use autumn_harvest::prelude::*;
+    use crate::pure_helper as helper;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+}
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pure.rs"),
+        "\
+pub fn pure_helper() -> i64 {
+    0
+}
+",
+    )
+    .unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an aliased-import bare call `helper()` must NOT be resolved to an unrelated \
+         root `fn helper` (globally-unique but cross-module); same-module-only \
+         resolution treats it as ambiguous, got: {report:?}"
+    );
+}
+
+#[test]
+fn genuinely_ambiguous_same_name_helper_is_skipped() {
+    // Rule 4 (safe-FN boundary): two `stamp` helpers in two unrelated modules,
+    // and the workflow lives in a THIRD module with no same-module/same-file
+    // `stamp` to disambiguate its bare call. The call is conservatively skipped
+    // (a safe false-negative), never resolved to an arbitrary candidate.
+    let src = "\
+mod a {
+    fn stamp() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+mod b {
+    fn stamp() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+mod c {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = stamp();
+        Ok(())
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a genuinely-ambiguous bare call must be conservatively skipped, got: {report:?}"
+    );
+}
+
+#[test]
+fn same_name_impl_method_is_not_resolved_via_method_call() {
+    // NEGATIVE guard: a `stamp` free helper (clean) coexists with an impl method
+    // `stamp(&self)` that reads the clock. A workflow calling `obj.stamp()` (a
+    // METHOD call) must never be resolved to either — the method is not indexed
+    // (#386 boundary) and the method-call `.` before-guard excludes it.
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let obj = Clock;
+    let _ = obj.stamp();
+    Ok(())
+}
+
+fn stamp() -> i64 {
+    0
+}
+
+struct Clock;
+
+impl Clock {
+    fn stamp(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an impl method reached via `obj.stamp()` must never be resolved, got: {report:?}"
+    );
+}
+
+// ── turbofish call form (issue #778, Codex P2) ──────────────────────────────
+// A generic first-party helper called with a turbofish (`helper::<T>()`) must
+// still have its body scanned; the byte after the ident is `:` (not `(`), so the
+// call-paren matcher must skip an optional `::<…>` segment before requiring `(`.
+
+#[test]
+fn turbofish_helper_call_is_resolved() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _: i64 = bad::<u64>();
+    Ok(())
+}
+
+fn bad<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("a turbofish free-fn call `bad::<u64>()` must resolve and flag, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+#[test]
+fn nested_generic_turbofish_helper_call_is_resolved() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _: i64 = bad::<Vec<u8>>();
+    Ok(())
+}
+
+fn bad<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a nested-generic turbofish call `bad::<Vec<u8>>()` must resolve, got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+#[test]
+fn method_and_assoc_turbofish_are_not_resolved() {
+    // NEGATIVE guard: a METHOD turbofish (`x.method::<T>()`) and an ASSOCIATED
+    // turbofish (`Type::assoc::<T>()`) must never be resolved to a free helper —
+    // the `.`/`:` before-guard still excludes both, turbofish or not. `method`
+    // and `assoc` free helpers (which read the clock) exist to prove they are NOT
+    // reached via the qualified/method call forms.
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let x = Holder;
+    let _ = x.method::<u64>();
+    let _ = Type::assoc::<u64>();
+    Ok(())
+}
+
+fn method<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn assoc<T>() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+struct Holder;
+impl Holder {
+    fn method<T>(&self) -> i64 {
+        0
+    }
+}
+
+struct Type;
+impl Type {
+    fn assoc<T>() -> i64 {
+        0
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "method/associated turbofish calls must never resolve to a free helper, got: {report:?}"
+    );
+}
+
+// ── raw-identifier function names (issue #778, Codex r4) ─────────────────────
+// A workflow named with a raw identifier (`async fn r#gen(...)` — `gen` is a
+// reserved keyword in edition 2024) must still have its body scanned. Previously
+// the fn-name parser stopped at `r` and the tail sanity check rejected the line,
+// so an `r#`-named workflow's body was never scanned (false negative).
+
+#[test]
+fn raw_ident_workflow_body_is_scanned() {
+    let src = "\
+#[workflow]
+async fn r#gen(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = chrono::Utc::now();
+    Ok(())
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("a raw-identifier `r#gen` workflow body must be scanned, got: {report:?}")
+        });
+    assert_eq!(finding.workflow_name.as_deref(), Some("r#gen"));
+}
+
+// ── FIX E (issue #778, Codex r6): block-local `use` imports shadow a same-module
+// helper. Even under same-module-only resolution, a `use` INSIDE the workflow
+// body rebinds a name to an import; Rust resolves the bare call to that import,
+// so the same-module resolver must not walk a sibling helper of the same name.
+// The old code false-positived on this innocent (clean) code and exits 1 in CI.
+
+#[test]
+fn block_local_use_import_shadows_same_module_helper() {
+    // Codex's exact repro: a body-local `use crate::pure::helper;` shadows the
+    // same-module `fn helper`; `helper()` resolves to the clean import → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::helper;
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local `use crate::pure::helper;` shadows the same-module `helper`; \
+         Rust resolves the call to the clean import, so no DET001 FP, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_local_use_alias_shadows_same_module_helper() {
+    // `use path::orig as helper;` rebinds `helper` to a clean import → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::real as helper;
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local `use ... as helper;` alias shadows the same-module `helper`, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_local_use_group_shadows_same_module_helper() {
+    // Grouped `use path::{helper, other}` binds `helper` (and `other`) → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::{helper, other as _};
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local grouped `use path::{{helper, ..}}` shadows the same-module `helper`, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_use_shadows_a_call_before_the_use_statement() {
+    // Codex r7: a Rust block `use` item is in scope for the ENTIRE enclosing
+    // block regardless of textual position, so a bare `helper()` call that
+    // PRECEDES the block `use crate::pure::helper;` still resolves to the
+    // import — not the same-module `fn helper`. Source-order suppression (r6)
+    // wrongly kept flagging this; whole-body `use` shadowing fixes the FP → NO
+    // DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        use crate::pure::helper;
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local `use crate::pure::helper;` shadows the same-module `helper` \
+         across the WHOLE body (Rust block-item scope), including a call that \
+         precedes the `use`, so no DET001 FP, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_glob_use_shadows_a_call_before_the_glob() {
+    // r7: a body-local glob `use crate::pure::*;` conservatively suppresses
+    // same-module resolution across the WHOLE body — including a call that
+    // precedes the glob (block-item scope, safe-direction) → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        use crate::pure::*;
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a body-local glob `use crate::pure::*;` conservatively suppresses a \
+         same-module call that precedes it (whole-body, safe-direction), got: {report:?}"
+    );
+}
+
+#[test]
+fn same_module_call_without_block_local_use_is_still_resolved() {
+    // REGRESSION guard (FIX E must not over-suppress): a genuine same-module call
+    // with NO block-local `use helper` must still resolve and flag (r5 must survive).
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a genuine same-module helper call with NO block-local `use` must still \
+                 be flagged (r5 same-module resolution preserved), got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn module_level_use_is_not_treated_as_a_body_shadow() {
+    // A module/file-level `use ...::*;` / `use path;` (OUTSIDE the fn body) must
+    // NOT suppress an unrelated same-module call — only body-local `use` shadows.
+    // The common top-of-file prelude-glob case is unaffected by construction.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    use std::collections::*;
+    use std::fmt::Debug;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a module/file-level `use ...::*;`/`use path;` (outside the fn body) must \
+                 NOT suppress a same-module helper call, got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+}
+
+#[test]
+fn block_local_glob_use_conservatively_suppresses_later_same_module_calls() {
+    // A body-local glob `use crate::pure::*;` names no specific binding, so it is
+    // conservatively treated as shadowing every same-module call AFTER it in the
+    // body (safe-direction over-suppression, never a false positive).
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::*;
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a body-local glob `use crate::pure::*;` conservatively suppresses a later \
+         same-module call (safe-direction), got: {report:?}"
+    );
+}
+
+// ── FIX (issue #778, Codex r10): nested `fn` declarations are not calls ──────
+// A nested `fn helper() {}` DECLARATION inside a workflow body must not be
+// mis-collected as a CALL to a same-module `fn helper` — the declaration token
+// `helper(` is preceded by the `fn` keyword, so it is a definition, not a call.
+
+#[test]
+fn fn_declaration_in_body_is_not_collected_as_a_call() {
+    // A nested `fn helper() {}` in the body (a DECLARATION, never called) plus a
+    // same-module `fn helper()` reading the clock. RED before the r10 fix: the
+    // declaration's `helper(` token was treated as a call and resolved to the
+    // same-module helper → spurious DET001 that could fail innocent CI.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        fn helper() {}
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a nested `fn helper() {{}}` DECLARATION must not be collected as a call to \
+         a same-module `fn helper` (Codex r10 FP), got: {report:?}"
+    );
+}
+
+#[test]
+fn body_local_fn_shadows_the_module_helper_on_a_real_call() {
+    // The body DEFINES a clean nested `fn helper() {}` AND makes a genuine call
+    // `helper()`. Rust resolves the call to the body-local nested fn (which
+    // shadows the module item), so the same-module `fn helper` reading the clock
+    // must NOT be flagged. RED before r10: the call resolved to the module helper.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        fn helper() {}
+        helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a body-local `fn helper() {{}}` shadows the module `helper`, so a genuine \
+         `helper()` call resolves to the nested fn, not the module helper (Codex r10), \
+         got: {report:?}"
+    );
+}
+
+#[test]
+fn same_module_call_without_body_local_fn_is_still_flagged() {
+    // REGRESSION guard (the r10 fix must not over-suppress): a genuine same-module
+    // `helper()` call with NO body-local `fn helper` / `use helper` must still
+    // resolve and flag.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a genuine same-module `helper()` call with NO body-local `fn helper` \
+                 must still be flagged, got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+// ── FIX F (issue #778, Codex r6): recognize raw identifiers in the CALL tokenizer.
+// Round 4 indexed a `fn r#gen` def under the key `r#gen`, but the call tokenizer
+// split `r#gen()` into `r`/`gen`, so the call never matched the def → a reachable
+// hard blocker in a raw-ident helper was silently missed (false negative).
+
+#[test]
+fn raw_ident_helper_call_is_resolved_and_flagged() {
+    // A same-module `fn r#gen()` reading the clock, called via `r#gen()`, must be
+    // resolved (one hop) and flagged DET001 — completing raw-ident support on the
+    // call side. RED before FIX F: `r#gen(` tokenized as `r`/`gen`, no match.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = r#gen();
+        Ok(())
+    }
+    fn r#gen() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("a raw-identifier `r#gen()` helper call must be resolved and flagged, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("r#gen"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn raw_ident_method_call_is_not_resolved() {
+    // NEGATIVE: a raw-identifier METHOD call `x.r#gen()` must NOT be resolved to
+    // the free helper `r#gen` — the `.`/`:` before-guard still applies after the
+    // tokenizer re-attaches the `r#` prefix.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext, x: Thing) -> Result<(), String> {
+        let _ = x.r#gen();
+        Ok(())
+    }
+    fn r#gen() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a raw-identifier METHOD call `x.r#gen()` must NOT be resolved to the free \
+         helper `r#gen` (the `.` before-guard still applies), got: {report:?}"
     );
 }
