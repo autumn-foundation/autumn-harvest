@@ -490,56 +490,7 @@ pub async fn replay_dead_letter(
 
             // Restore required_build_id and concurrency policy from the owning
             // execution so the replayed task is subject to the same constraints.
-            if let Some(exec_id) = params.workflow_exec_id {
-                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let row: Option<(Option<String>, String, String)> =
-                    exec_dsl::harvest_workflow_executions
-                        .find(exec_id)
-                        .select((
-                            exec_dsl::assigned_build_id,
-                            exec_dsl::workflow_name,
-                            exec_dsl::state,
-                        ))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                if let Some((build_id, workflow_name, state)) = row {
-                    // Refuse to revive a task into a workflow that has already
-                    // reached a terminal state. Re-running the activity/workflow
-                    // task would execute user code and append events against a
-                    // dead execution, corrupting its history (issue #367). This
-                    // is what makes a poison-pill activity DLQ entry — whose
-                    // owning workflow is failed at quarantine time —
-                    // non-replayable.
-                    if state != "RUNNING" {
-                        return Err(HarvestError::WorkflowNotRunning(
-                            exec_id.to_string().parse().map_err(|_| {
-                                HarvestError::Database(format!(
-                                    "execution id {exec_id} is not a valid ExecutionId"
-                                ))
-                            })?,
-                        ));
-                    }
-                    params.required_build_id = build_id;
-                    // Concurrency policy lives on WorkflowInfo and governs
-                    // workflow-task slots only.  Activity tasks are not subject
-                    // to the workflow-level cap (the claim query enforces caps
-                    // per task_type, so mixing them would throttle activities
-                    // against the wrong budget).
-                    if task_type == TaskType::Workflow
-                        && let Some(reg) = registry
-                        && let Some(info) = reg.workflows.get(&workflow_name)
-                        && let Some(policy) = &info.concurrency
-                    {
-                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
-                            policy.key_expr,
-                            &params.input,
-                        );
-                        params.max_concurrent = Some(policy.limit);
-                    }
-                }
-            }
+            restore_execution_constraints(conn, &mut params, task_type, registry).await?;
 
             let task_id = crate::queue::enqueue(conn, &params).await?;
             let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
@@ -557,6 +508,69 @@ pub async fn replay_dead_letter(
         .scope_boxed()
     })
     .await
+}
+
+async fn restore_execution_constraints(
+    conn: &mut AsyncPgConnection,
+    params: &mut EnqueueParams,
+    task_type: TaskType,
+    registry: Option<&HandlerRegistry>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+
+    let Some(exec_id) = params.workflow_exec_id else {
+        return Ok(());
+    };
+
+    let row: Option<(Option<String>, String, String)> = exec_dsl::harvest_workflow_executions
+        .find(exec_id)
+        .select((
+            exec_dsl::assigned_build_id,
+            exec_dsl::workflow_name,
+            exec_dsl::state,
+        ))
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let Some((build_id, workflow_name, state)) = row else {
+        return Ok(());
+    };
+
+    // Refuse to revive a task into a workflow that has already
+    // reached a terminal state. Re-running the activity/workflow
+    // task would execute user code and append events against a
+    // dead execution, corrupting its history (issue #367). This
+    // is what makes a poison-pill activity DLQ entry — whose
+    // owning workflow is failed at quarantine time —
+    // non-replayable.
+    if state != "RUNNING" {
+        return Err(HarvestError::WorkflowNotRunning(
+            exec_id.to_string().parse().map_err(|_| {
+                HarvestError::Database(format!("execution id {exec_id} is not a valid ExecutionId"))
+            })?,
+        ));
+    }
+
+    params.required_build_id = build_id;
+
+    // Concurrency policy lives on WorkflowInfo and governs
+    // workflow-task slots only.  Activity tasks are not subject
+    // to the workflow-level cap (the claim query enforces caps
+    // per task_type, so mixing them would throttle activities
+    // against the wrong budget).
+    if task_type == TaskType::Workflow
+        && let Some(reg) = registry
+        && let Some(info) = reg.workflows.get(&workflow_name)
+        && let Some(policy) = &info.concurrency
+    {
+        params.concurrency_key =
+            crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+        params.max_concurrent = Some(policy.limit);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
