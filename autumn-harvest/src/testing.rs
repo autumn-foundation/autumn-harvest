@@ -2605,6 +2605,22 @@ pub struct TestRunOutcome {
     /// reported as a FALSE non-determinism. `None` (the default) models a
     /// top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// The logical workflow type name carried from the producing `WorkflowTestEnv`
+    /// (issue #698, Codex P2). `replay_check` uses it for BOTH the replay
+    /// snapshot's `workflow_name` AND the handler-registration key — otherwise the
+    /// replay context reports `ctx.info().workflow_type == "__test__"` while the
+    /// live run recorded the configured value (e.g. embedded in an activity
+    /// input), producing a FALSE non-determinism in the harness's own self-check.
+    /// Defaults to `""` (matching the live run's default), so the live run and its
+    /// replay always agree whatever the value.
+    workflow_name: String,
+    /// The business-level `workflow_id` carried from the producing
+    /// `WorkflowTestEnv` (issue #698, Codex P2). Like `workflow_name`, it lives in
+    /// no `WorkflowEvent`, so `replay_check` threads it onto the replay snapshot so
+    /// a workflow that records `ctx.info().workflow_id` (e.g. in an activity input)
+    /// self-checks deterministically instead of false-flagging on the live value
+    /// vs the replay's empty default. Defaults to `""` (matching the live run).
+    workflow_id: String,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -2736,7 +2752,14 @@ impl TestRunOutcome {
     /// FALSE non-determinism.
     pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
         let snapshot = crate::testing::HistorySnapshot {
-            workflow_name: "__test__".to_string(),
+            // Issue #698 (Codex P2): use the producing env's configured workflow
+            // type name for BOTH the snapshot `workflow_name` (so the replay
+            // context reports the same `ctx.info().workflow_type` the live run
+            // recorded) AND the handler-registration key below — the two MUST be
+            // the same string or the replayer cannot find the handler. Was
+            // hardcoded `"__test__"`, which mismatched a live run configured via
+            // `with_workflow_name(...)` and false-flagged non-determinism.
+            workflow_name: self.workflow_name.clone(),
             execution_id: self.exec_id,
             events: self.events.clone(),
             context_headers: None,
@@ -2750,12 +2773,23 @@ impl TestRunOutcome {
             // parent-aware child self-checks deterministically (matches the live
             // run, which received it via span_meta).
             parent_execution_id: self.parent_execution_id,
-            // Issue #698: the test env carries no business `workflow_id`.
-            workflow_id: None,
+            // Issue #698 (Codex P2): carry the producing env's business
+            // `workflow_id` so a workflow recording `ctx.info().workflow_id`
+            // (e.g. in an activity input) self-checks deterministically. `None`
+            // (empty env default) resolves to `""` in the replay context, which
+            // matches the live run's empty default.
+            workflow_id: if self.workflow_id.is_empty() {
+                None
+            } else {
+                Some(self.workflow_id.clone())
+            },
         };
         let mut replayer = WorkflowReplayer::new()
             .with_existing_state(self.state.clone())
-            .register_fn("__test__", handler)
+            // Register under the SAME name carried on the snapshot above so the
+            // replayer's handler lookup (keyed by `snapshot.workflow_name`)
+            // resolves — consistently changed together with the snapshot name.
+            .register_fn(self.workflow_name.clone(), handler)
             .with_advancing_timer_clock();
         if let Some(execution_timeout) = self.execution_timeout {
             replayer = replayer.with_execution_timeout(execution_timeout);
@@ -2839,6 +2873,12 @@ pub struct WorkflowTestEnv {
     /// compensation counters, issue #801) carry a real `workflow` label.
     /// Defaults to `""` (matching legacy contexts).
     workflow_name: String,
+    /// Business-level `workflow_id` threaded into the `WorkflowContext` (issue
+    /// #698) so a no-DB test can prove `ctx.info().workflow_id` reports the
+    /// configured value. Lives in no `WorkflowEvent`, so it is also carried onto
+    /// the `replay_check` snapshot to keep the harness's own replay self-check
+    /// consistent. Defaults to `""` (matching legacy contexts).
+    workflow_id: String,
     /// Task queue name threaded into the `WorkflowContext` so in-context
     /// engine metrics carry a real `queue` label. Defaults to `""`.
     queue_name: String,
@@ -2878,6 +2918,7 @@ impl WorkflowTestEnv {
             scheduled_time: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             workflow_name: String::new(),
+            workflow_id: String::new(),
             queue_name: String::new(),
             execution_timeout: None,
             parent_execution_id: None,
@@ -3079,6 +3120,19 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the business-level `workflow_id` for the contexts this env builds
+    /// (issue #698), so a no-DB test can prove `ctx.info().workflow_id` reports
+    /// the configured value. `workflow_id` lives in no `WorkflowEvent`, so it is
+    /// threaded into the live run via span-meta and carried onto the
+    /// [`replay_check`](TestRunOutcome::replay_check) snapshot, keeping the
+    /// harness's own replay self-check consistent for a workflow that records
+    /// `ctx.info().workflow_id` (e.g. in an activity input). Defaults to `""`.
+    #[must_use]
+    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.workflow_id = workflow_id.into();
+        self
+    }
+
     /// Set the task queue name for the contexts this env builds, so
     /// in-context engine metrics carry a real `queue` label instead of the
     /// legacy `""` default. Pairs with [`with_metrics`](Self::with_metrics).
@@ -3180,6 +3234,7 @@ impl WorkflowTestEnv {
         // so engine metrics emitted from inside the workflow carry real
         // labels a test can assert on.
         let span_meta = if self.workflow_name.is_empty()
+            && self.workflow_id.is_empty()
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
             && self.parent_execution_id.is_none()
@@ -3188,7 +3243,10 @@ impl WorkflowTestEnv {
         } else {
             Some(WorkflowExecuteSpanMeta {
                 workflow_name: self.workflow_name.clone(),
-                workflow_id: String::new(),
+                // Issue #698: thread the configured business `workflow_id` so
+                // `ctx.info().workflow_id` reports it inside the live test run
+                // (was hardcoded empty).
+                workflow_id: self.workflow_id.clone(),
                 shard_id: 0,
                 queue_name: self.queue_name.clone(),
                 is_replay: false,
@@ -3256,6 +3314,10 @@ impl WorkflowTestEnv {
                                 execution_timeout: self.execution_timeout,
                                 // Issue #698: carry the spawning-parent id for replay_check.
                                 parent_execution_id: self.parent_execution_id,
+                                // Issue #698 (Codex P2): carry the configured
+                                // workflow type / business id for replay_check.
+                                workflow_name: self.workflow_name.clone(),
+                                workflow_id: self.workflow_id.clone(),
                             };
                         }
                     };
@@ -3272,6 +3334,10 @@ impl WorkflowTestEnv {
                             execution_timeout: self.execution_timeout,
                             // Issue #698: carry the spawning-parent id for replay_check.
                             parent_execution_id: self.parent_execution_id,
+                            // Issue #698 (Codex P2): carry the configured workflow
+                            // type / business id for replay_check.
+                            workflow_name: self.workflow_name.clone(),
+                            workflow_id: self.workflow_id.clone(),
                         };
                     }
                 }
@@ -3299,6 +3365,10 @@ impl WorkflowTestEnv {
             execution_timeout: self.execution_timeout,
             // Issue #698: carry the spawning-parent id for replay_check.
             parent_execution_id: self.parent_execution_id,
+            // Issue #698 (Codex P2): carry the configured workflow type /
+            // business id for replay_check.
+            workflow_name: self.workflow_name.clone(),
+            workflow_id: self.workflow_id.clone(),
         }
     }
 
@@ -3355,6 +3425,10 @@ impl WorkflowTestEnv {
             execution_timeout: self.execution_timeout,
             // Issue #698: carry the spawning-parent id for replay_check.
             parent_execution_id: self.parent_execution_id,
+            // Issue #698 (Codex P2): carry the configured workflow type /
+            // business id for replay_check.
+            workflow_name: self.workflow_name.clone(),
+            workflow_id: self.workflow_id.clone(),
         }
     }
 

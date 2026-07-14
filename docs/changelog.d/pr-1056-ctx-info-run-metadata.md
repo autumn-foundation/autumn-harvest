@@ -211,3 +211,24 @@ values not ''" assertion), `workflow_id_diverges_through_export_document_when_id
 (mechanism-1 proof), and `workflow_id_is_applied_from_replayer_global_on_raw_events_path`.
 See the PR body "Field census" table for the full per-path threading verification.
 No CLI, scheduler, `ActivityContext`, event, schema, or migration changes.
+
+**Post-review hardening (Codex P2):** `WorkflowTestEnv::replay_check` now uses the
+producing env's configured `workflow_name` / `workflow_id` / `parent_execution_id`
+for the replay snapshot **and** the workflow-handler registration key — previously
+the snapshot `workflow_name` and the registration key were both hardcoded
+`"__test__"` and `workflow_id` was hardcoded `None`, so a `WorkflowTestEnv` test
+using `.with_workflow_name(...)` / `.with_workflow_id(...)` that recorded
+`ctx.info().workflow_type` / `ctx.info().workflow_id` into an activity input
+false-flagged non-determinism in the harness's own replay self-check (the replay
+context reported `workflow_type == "__test__"` / `workflow_id == ""` while the live
+run recorded the configured value). `TestRunOutcome` now carries the env's
+`workflow_name`/`workflow_id`; `WorkflowTestEnv` gains a `with_workflow_id(...)`
+builder and threads it into the live run's span-meta (was hardcoded empty). Both
+sides now use the same value (whatever it is, incl. the `""` default), so a
+default-env run is unchanged and a configured run replays clean. New no-DB tests
+in `workflow_test_env_tests.rs`: `test_configured_workflow_metadata_in_activity_input_replays_clean`
+(**RED pre-fix**: `ActivityScheduleMismatch`, recorded
+`{"workflow_id":"cart-42","workflow_type":"cart_flow"}` vs replayed
+`{"workflow_id":"","workflow_type":"__test__"}`) and
+`test_default_env_metadata_in_activity_input_replays_clean` (default-env
+regression guard). testing.rs-only change; no production/plugin/CLI/scheduler edits.
