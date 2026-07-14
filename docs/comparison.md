@@ -130,7 +130,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Capabilities |
 |---|---|
-| **autumn-harvest** | Cron + interval, with [jitter (#240)](https://github.com/madmax983/autumn-harvest/issues/240), [overlap policy (#241)](https://github.com/madmax983/autumn-harvest/issues/241), [calendars + backfill (#337)](https://github.com/madmax983/autumn-harvest/issues/337), [bounded catchup window (#484)](https://github.com/madmax983/autumn-harvest/issues/484), [bounded/finite runs (#478](https://github.com/madmax983/autumn-harvest/issues/478) / [#543)](https://github.com/madmax983/autumn-harvest/issues/543), [HA-safe multi-replica ticks (#350)](https://github.com/madmax983/autumn-harvest/issues/350), [schedule run history (#534)](https://github.com/madmax983/autumn-harvest/issues/534), [in-place schedule update (#771)](https://github.com/madmax983/autumn-harvest/issues/771), [last-completion carryover (#488)](https://github.com/madmax983/autumn-harvest/issues/488), plus start-shaping via [debounce (#499)](https://github.com/madmax983/autumn-harvest/issues/499) and [throttle (#607)](https://github.com/madmax983/autumn-harvest/issues/607). |
+| **autumn-harvest** | Cron + interval, with [jitter (#240)](https://github.com/madmax983/autumn-harvest/issues/240), [overlap policy (#241)](https://github.com/madmax983/autumn-harvest/issues/241), [calendars + backfill (#337)](https://github.com/madmax983/autumn-harvest/issues/337), [bounded catchup window (#484)](https://github.com/madmax983/autumn-harvest/issues/484), bounded/finite runs ([#478](https://github.com/madmax983/autumn-harvest/issues/478) / [#543](https://github.com/madmax983/autumn-harvest/issues/543)), [HA-safe multi-replica ticks (#350)](https://github.com/madmax983/autumn-harvest/issues/350), [schedule run history (#534)](https://github.com/madmax983/autumn-harvest/issues/534), [in-place schedule update (#771)](https://github.com/madmax983/autumn-harvest/issues/771), [last-completion carryover (#488)](https://github.com/madmax983/autumn-harvest/issues/488), plus start-shaping via [debounce (#499)](https://github.com/madmax983/autumn-harvest/issues/499) and [throttle (#607)](https://github.com/madmax983/autumn-harvest/issues/607). |
 | Temporal | Schedules with interval and calendar/cron spec; Catchup Window (default 1 year, min 10s); overlap policies (Skip, BufferOne, BufferAll, AllowAll, CancelOther, TerminateOther); Backfill. ([docs](https://docs.temporal.io/schedule)) |
 | DBOS | Cron-scheduled workflows (stored in DB, runtime create/pause/resume/delete), time zones, and automatic backfill of missed runs after downtime. Calendar-holiday / overlap-policy depth **(unverified)**. ([docs](https://docs.dbos.dev/python/tutorials/scheduled-workflows)) |
 | Inngest | Cron/scheduled functions with per-step retries. Calendar, catchup/backfill, and overlap-policy depth **(unverified)** from official docs in this pass. ([docs](https://www.inngest.com/uses/scheduled-jobs)) |
@@ -141,8 +141,8 @@ sourcing doc and flag anything unverified.
 
 | Engine | Surface |
 |---|---|
-| **autumn-harvest** | An [OpenTelemetry trace contract (ADR-0001](adr/0001-otel-trace-contract.md), [#136)](https://github.com/madmax983/autumn-harvest/issues/136) covering 8 named span kinds; a bounded-cardinality metric catalogue with a `metrics-rs` adapter; a [starter alert pack + runbooks](alerts/); a [Grafana dashboard pack (#754)](https://github.com/madmax983/autumn-harvest/issues/754); a per-execution [timeline API (#739)](https://github.com/madmax983/autumn-harvest/issues/739); a [DAG run graph view (#690)](https://github.com/madmax983/autumn-harvest/issues/690); and a rolled-up [health summary endpoint (#679)](https://github.com/madmax983/autumn-harvest/issues/679). The embedded **Vantage UI is partial** — the [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142) and a DLQ summary have shipped, but dedicated DLQ, schedules, and DAG-visualization pages are still Phase 4 (see [Where harvest is behind](#where-harvest-is-behind)). See [telemetry](telemetry.md). |
-| Temporal | Open-source Web UI; SDK metrics (Prometheus); tracing/OTel via SDK interceptors. Temporal Cloud adds a Prometheus-compatible OpenMetrics endpoint. ([docs](https://docs.temporal.io/schedule)) |
+| **autumn-harvest** | An [OpenTelemetry trace contract (ADR-0001)](adr/0001-otel-trace-contract.md) ([#136](https://github.com/madmax983/autumn-harvest/issues/136)) covering 8 named span kinds; a bounded-cardinality metric catalogue with a `metrics-rs` adapter; a [starter alert pack + runbooks](alerts/); a [Grafana dashboard pack (#754)](https://github.com/madmax983/autumn-harvest/issues/754); a per-execution [timeline API (#739)](https://github.com/madmax983/autumn-harvest/issues/739); a [DAG run graph view (#690)](https://github.com/madmax983/autumn-harvest/issues/690); and a rolled-up [health summary endpoint (#679)](https://github.com/madmax983/autumn-harvest/issues/679). The embedded **Vantage UI is partial** — the [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142) and a DLQ inspection page with a summary view ([#226](https://github.com/madmax983/autumn-harvest/issues/226) / [#385](https://github.com/madmax983/autumn-harvest/issues/385)) have shipped, but dedicated schedules and DAG-visualization pages are still Phase 4 (see [Where harvest is behind](#where-harvest-is-behind)). See [telemetry](telemetry.md). |
+| Temporal | Open-source Web UI; SDK metrics (Prometheus); tracing/OTel via SDK interceptors. Temporal Cloud adds a Prometheus-compatible OpenMetrics endpoint. ([docs](https://docs.temporal.io/references/sdk-metrics)) |
 | DBOS | OpenTelemetry traces per workflow/step; Prometheus-compatible metrics endpoint; Conductor dashboards of active/past workflows + queued tasks. ([docs](https://www.dbos.dev/dbos-conductor)) |
 | Inngest | Built-in Dashboard UI with step-level observability (queue delay, step timing, flow control) + event history. Explicit OTel export is **(unverified)** in this pass. ([docs](https://www.inngest.com/docs/self-hosting)) |
 | Hatchet | Built-in dashboard; a built-in **OpenTelemetry** collector emitting traces/spans per task/workflow; Prometheus metrics (noted as Dedicated-tier+ on Hatchet Cloud). ([OTel](https://docs.hatchet.run/home/opentelemetry), [Prometheus](https://docs.hatchet.run/v1/prometheus-metrics)) |
@@ -191,9 +191,9 @@ linked to shipped evidence.
 ### 1. Postgres-only operations — one dependency you already run
 
 Harvest's task queue, durable timers, signals, dead-letter queue, schedules, and
-event history all live in **one Postgres database**. Dispatch latency comes from
-LISTEN/NOTIFY wakeups (`notify.rs`), not a polling backoff, and work is claimed
-with `SELECT … FOR UPDATE SKIP LOCKED` — so there is no Redis, no Kafka/RabbitMQ,
+event history all live in **one Postgres database**. Dispatch latency comes primarily from
+LISTEN/NOTIFY wakeups (`notify.rs`), with a poll-loop fallback in `worker.rs`, and
+work is claimed with `SELECT … FOR UPDATE SKIP LOCKED` — so there is no Redis, no Kafka/RabbitMQ,
 no Elasticsearch, and no separate orchestrator cluster to stand up, secure,
 back up, and upgrade. When you outgrow one database, [sharding](sharding.md)
 spreads state across N independent Postgres instances, with each `ExecutionId`
@@ -278,9 +278,12 @@ where one exists.
   (sharded) Postgres fleet can carry, that is a real constraint.
 - **UI parity is incomplete.** The embedded Vantage dashboard has a
   [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142) and
-  a DLQ summary, but dedicated DLQ, schedules, and DAG-visualization pages are
-  still Phase 4 work in progress. Temporal, Inngest, Hatchet, DBOS (Conductor),
-  and Restate all ship more mature UIs today.
+  a DLQ inspection page with a summary view
+  ([#226](https://github.com/madmax983/autumn-harvest/issues/226) /
+  [#385](https://github.com/madmax983/autumn-harvest/issues/385)), but dedicated
+  schedules and DAG-visualization pages are still Phase 4 work in progress.
+  Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all ship more mature
+  UIs today.
 - **Younger project, smaller ecosystem.** harvest is pre-1.0 (0.x, breaking
   changes in minor versions) with a smaller community, fewer third-party
   integrations, and a much smaller hiring pool than Temporal in particular. Some
