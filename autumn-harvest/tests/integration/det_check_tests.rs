@@ -1973,8 +1973,9 @@ fn transitive_cross_file_via_check_dir_is_not_resolved_same_module_only() {
     // the line-based scanner cannot see, so under same-module-only resolution the
     // cross-file helper is deliberately NOT resolved — a documented safe
     // false-negative (never resolving cross-module is what ends the round-4/round-5
-    // false-positive family for a CI gate). The compile-time guardrail (#386) is
-    // the authoritative net for what det_check skips.
+    // false-positive family for a CI gate). #386 is body-only and also misses these
+    // transitive skips; the backstop is runtime replay (`WorkflowReplayer` / live
+    // `HistoryMatcher`) plus manual review, not #386.
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("a.rs"),

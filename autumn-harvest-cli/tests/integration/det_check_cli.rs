@@ -213,8 +213,9 @@ fn missing_path_is_a_read_error() {
 // one-hop resolution is same-module ONLY — so a helper defined in a DIFFERENT
 // file is deliberately NOT resolved (a documented safe false-negative). Never
 // resolving cross-module ends the r4/r5 false-positive family; for a CI gate a
-// false positive on innocent code is the worse outcome. The compile-time #386
-// guardrail is the authoritative net for what det_check skips.
+// false positive on innocent code is the worse outcome. #386 is body-only and
+// also misses these transitive skips; the backstop is runtime replay
+// (`WorkflowReplayer` / live `HistoryMatcher`) plus manual review, not #386.
 #[test]
 fn two_separate_file_args_do_not_resolve_cross_file_transitive() {
     let dir = tempfile::tempdir().expect("tempdir");
