@@ -1019,8 +1019,10 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
 /// globally-unique) false-positive family. For a CI GATE a false positive
 /// (failing CI on innocent code) is the worst outcome and outranks marginal
 /// recall, so the earlier globally-unique (`[only]`) and same-file-different-module
-/// fallbacks are removed. The compile-time `#[workflow]` guardrail (#386) remains
-/// the authoritative net for what `det_check` skips.
+/// fallbacks are removed. What is skipped here is a false-negative that the
+/// body-only compile-time `#[workflow]` guardrail (#386) also misses; the backstop
+/// for it is runtime determinism detection (`WorkflowReplayer` and the live
+/// `HistoryMatcher`) plus manual review, not #386.
 fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option<usize> {
     // Same module only (same file + same module path). Exactly one such candidate
     // resolves; two same-named helpers in one module is not valid Rust, and none
