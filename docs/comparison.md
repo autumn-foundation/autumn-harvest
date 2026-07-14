@@ -141,7 +141,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Surface |
 |---|---|
-| **autumn-harvest** | An [OpenTelemetry trace contract (ADR-0001)](adr/0001-otel-trace-contract.md) ([#136](https://github.com/madmax983/autumn-harvest/issues/136)) covering 8 named span kinds; a bounded-cardinality metric catalogue with a `metrics-rs` adapter; a [starter alert pack + runbooks](alerts/); a [Grafana dashboard pack (#754)](https://github.com/madmax983/autumn-harvest/issues/754); a per-execution [timeline API (#739)](https://github.com/madmax983/autumn-harvest/issues/739); a [DAG run graph view (#690)](https://github.com/madmax983/autumn-harvest/issues/690); and a rolled-up [health summary endpoint (#679)](https://github.com/madmax983/autumn-harvest/issues/679). The embedded **Vantage UI is partial** — the [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142) and a DLQ inspection page with a summary view ([#226](https://github.com/madmax983/autumn-harvest/issues/226) / [#385](https://github.com/madmax983/autumn-harvest/issues/385)) have shipped, but dedicated schedules and DAG-visualization pages are still Phase 4 (see [Where harvest is behind](#where-harvest-is-behind)). See [telemetry](telemetry.md). |
+| **autumn-harvest** | An [OpenTelemetry trace contract (ADR-0001)](adr/0001-otel-trace-contract.md) ([#136](https://github.com/madmax983/autumn-harvest/issues/136)) covering 8 named span kinds; a bounded-cardinality metric catalogue with a `metrics-rs` adapter; a [starter alert pack + runbooks](alerts/); a [Grafana dashboard pack (#754)](https://github.com/madmax983/autumn-harvest/issues/754); a per-execution [timeline API (#739)](https://github.com/madmax983/autumn-harvest/issues/739); a [DAG run graph view (#690)](https://github.com/madmax983/autumn-harvest/issues/690); and a rolled-up [health summary endpoint (#679)](https://github.com/madmax983/autumn-harvest/issues/679). The embedded **Vantage UI is partial** — the [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142), a DLQ inspection page with a summary view ([#226](https://github.com/madmax983/autumn-harvest/issues/226) / [#385](https://github.com/madmax983/autumn-harvest/issues/385)), a [schedules management page (#333)](https://github.com/madmax983/autumn-harvest/issues/333), and [DAG list + detail pages (#426)](https://github.com/madmax983/autumn-harvest/issues/426) have shipped; a rendered DAG **graph** visualization is still Phase 4 (see [Where harvest is behind](#where-harvest-is-behind)). See [telemetry](telemetry.md). |
 | Temporal | Open-source Web UI; SDK metrics (Prometheus); tracing/OTel via SDK interceptors. Temporal Cloud adds a Prometheus-compatible OpenMetrics endpoint. ([docs](https://docs.temporal.io/references/sdk-metrics)) |
 | DBOS | OpenTelemetry traces per workflow/step; Prometheus-compatible metrics endpoint; Conductor dashboards of active/past workflows + queued tasks. ([docs](https://www.dbos.dev/dbos-conductor)) |
 | Inngest | Built-in Dashboard UI with step-level observability (queue delay, step timing, flow control) + event history. Explicit OTel export is **(unverified)** in this pass. ([docs](https://www.inngest.com/docs/self-hosting)) |
@@ -277,13 +277,15 @@ where one exists.
   persistence. If your durability volume genuinely exceeds what a
   (sharded) Postgres fleet can carry, that is a real constraint.
 - **UI parity is incomplete.** The embedded Vantage dashboard has a
-  [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142) and
+  [Workers tab (#142)](https://github.com/madmax983/autumn-harvest/issues/142),
   a DLQ inspection page with a summary view
   ([#226](https://github.com/madmax983/autumn-harvest/issues/226) /
-  [#385](https://github.com/madmax983/autumn-harvest/issues/385)), but dedicated
-  schedules and DAG-visualization pages are still Phase 4 work in progress.
-  Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all ship more mature
-  UIs today.
+  [#385](https://github.com/madmax983/autumn-harvest/issues/385)), a
+  [schedules management page (#333)](https://github.com/madmax983/autumn-harvest/issues/333),
+  and [DAG list + detail pages (#426)](https://github.com/madmax983/autumn-harvest/issues/426),
+  but a rendered DAG **graph** visualization (a node/edge diagram) is still Phase 4
+  work in progress. Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
+  ship more mature UIs today.
 - **Younger project, smaller ecosystem.** harvest is pre-1.0 (0.x, breaking
   changes in minor versions) with a smaller community, fewer third-party
   integrations, and a much smaller hiring pool than Temporal in particular. Some
