@@ -93,10 +93,20 @@ archive path (`CandidateExecution.parent_id` + both candidate SELECTs) and the
 `parent_aware_child_replays_clean_through_export_document_round_trip` (+ its
 no-parent negative control) in `replayer_tests.rs` — a parent-aware child exported
 via the document replays `ReplaySucceeded` through `replay_from_json` with **no**
-manual `with_parent_execution_id` override. **Follow-up (sibling-owned crates):**
-the two `HistoryExportRequest` construction sites in the plugin's HTTP export
-route (`autumn-harvest-plugin/src/api.rs:25132`, `:25161`) still need
-`parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid)` /
-`candidate.parent_id.map(...)` added (mirroring their existing
-`execution_timeout`/`deadline_at` lines) so live HTTP exports carry the parent;
-until then those exports round-trip parent = `None`.
+manual `with_parent_execution_id` override. (C) **Plugin HTTP export handlers
+threaded (completing the full #1040 mirror).** `parent_execution_id` is now
+carried through **all three** export producers — single, batch, and retention —
+exactly the way `execution_timeout`/`deadline_at` are, so `replay_from_json`
+reconstructs the spawning parent for a child exported by **any** path. The two
+`HistoryExportRequest` construction sites in the plugin's HTTP export route
+(`autumn-harvest-plugin/src/api.rs`) set the field from the row/candidate
+`parent_id` column: the single-execution handler (`export_history_for_execution`)
+uses `execution.parent_id.map(ExecutionId::from_uuid)`, and the batch handler
+(`export_history_for_candidate`) uses `candidate.parent_id.map(ExecutionId::from_uuid)`.
+The plugin-local `HistoryExportCandidate` struct gained a `parent_id: Option<Uuid>`
+field and the batch candidate SELECT (`HISTORY_EXPORT_CANDIDATES_SQL`) now selects
+`w.parent_id` (added to the `GROUP BY` too), mirroring how it already SELECTs the
+columns backing `execution_timeout`/`deadline_at`. With this, live HTTP single and
+batch exports carry the parent (previously they round-tripped parent = `None`); the
+core round-trip unit test and the `retention_archive_carries_parent_execution_id`
+DB test cover the assertion end to end.

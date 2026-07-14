@@ -2987,6 +2987,12 @@ struct HistoryExportCandidate {
     execution_timeout: Option<chrono::Duration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #698: the spawning parent's execution id, carried into the batch
+    // export document so `harvest-replay` / `replay_from_json` threads the
+    // child's spawner into the replayed `WorkflowContext` (parity with the
+    // single-execution export). `parent_id` lives in no `WorkflowEvent`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    parent_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Default)]
@@ -25144,6 +25150,11 @@ fn export_history_for_execution(
             // JSON / `harvest-replay` replay path.
             execution_timeout: execution.execution_timeout,
             deadline_at: execution.deadline_at,
+            // Issue #698: carry the spawning parent's execution id so an exported
+            // child history round-trips its parent into the JSON / `harvest-replay`
+            // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
+            // lives in no `WorkflowEvent`). `None` for a top-level run.
+            parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
         outcome,
@@ -25175,6 +25186,11 @@ fn export_history_for_candidate(
             // single-execution export (`export_history_for_execution`).
             execution_timeout: candidate.execution_timeout,
             deadline_at: candidate.deadline_at,
+            // Issue #698: carry the spawning parent's execution id (the batch
+            // candidate query now SELECTs `parent_id`) so a batch-exported child
+            // history round-trips its parent into the JSON / `harvest-replay`
+            // replay path — parity with the single-execution export.
+            parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
         outcome,
@@ -25348,14 +25364,15 @@ SELECT
     w.state AS state,
     COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at,
     w.execution_timeout AS execution_timeout,
-    w.deadline_at AS deadline_at
+    w.deadline_at AS deadline_at,
+    w.parent_id AS parent_id
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
 WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.shard_id, w.state, w.completed_at, w.started_at, w.created_at,
-         w.execution_timeout, w.deadline_at
+         w.execution_timeout, w.deadline_at, w.parent_id
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -32216,6 +32233,7 @@ mod tests {
             last_history_event_at,
             execution_timeout: None,
             deadline_at: None,
+            parent_id: None,
         }
     }
 
