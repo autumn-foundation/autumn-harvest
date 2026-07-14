@@ -177,6 +177,31 @@ pub(super) fn history_has_timer_started(events: &[WorkflowEvent], timer_id: &str
     events.iter().any(|e| matches!(e, WorkflowEvent::TimerStarted { timer_id: id, .. } if id.to_string() == timer_id))
 }
 
+/// True if history holds a *terminal* activity event for `activity_id` — an
+/// `ActivityCompleted` or a retry-exhausting `ActivityFailed`. Used by
+/// [`import_execution`](super::SqliteRuntime::import_execution) to distinguish a
+/// closed activity (needs no `spike_tasks` row) from an *open* (still in-flight)
+/// one carried in a cross-backend history (needs its derived task row rebuilt).
+pub(super) fn history_has_activity_terminal(events: &[WorkflowEvent], activity_id: &str) -> bool {
+    events.iter().any(|e| match e {
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id, ..
+        }
+        | WorkflowEvent::ActivityFailed {
+            activity_id: id, ..
+        } => id.to_string() == activity_id,
+        _ => false,
+    })
+}
+
+/// True if history holds a `TimerFired` for `timer_id` — the timer already fired
+/// and needs no `spike_timers` row when importing a cross-backend history.
+pub(super) fn history_has_timer_fired(events: &[WorkflowEvent], timer_id: &str) -> bool {
+    events.iter().any(
+        |e| matches!(e, WorkflowEvent::TimerFired { timer_id: id } if id.to_string() == timer_id),
+    )
+}
+
 // ── Activity attempt audit log ───────────────────────────────────────────────
 
 pub(super) fn record_attempt(

@@ -260,6 +260,18 @@ impl SqliteRuntime {
     /// Seed an execution from an externally-produced history (e.g. one a
     /// Postgres backend would have written). Used to prove a PG-shaped history
     /// drives the prototype's own reload path identically.
+    ///
+    /// **In-flight open work is materialized, not left dangling.** When the
+    /// imported history carries an *open* (un-terminated) `ActivityScheduled` or
+    /// `TimerStarted` — the source backend stopped with the activity/timer still
+    /// in flight — the importer rebuilds the companion `spike_tasks`/`spike_timers`
+    /// row a live decision cycle would have created. Without it, replay re-derives
+    /// a `WaitForActivity`/timer wait, [`Self::apply_commands`] skips enqueueing
+    /// (the schedule/start is already in history), and the worker has no durable
+    /// row to drain — wedging the imported run at [`SpikeError::Stuck`]. This is
+    /// the *import* twin of `apply_commands`'s own append+enqueue atomicity, closed
+    /// so a cross-backend handoff of a *partially-complete* execution drains
+    /// correctly rather than deadlocking.
     pub fn import_execution(
         &mut self,
         workflow_name: &str,
@@ -270,12 +282,63 @@ impl SqliteRuntime {
             return Err(SpikeError::UnknownWorkflow(workflow_name.to_string()));
         }
         let exec = ExecutionId::new();
-        // Execution row + the whole imported history commit in ONE transaction,
-        // so a crash mid-import can never leave a partial (torn) history.
+        // Copy the Copy clock before borrowing `self.conn` mutably for the tx —
+        // open timers are re-armed relative to it (handoff semantic below).
+        let clock = self.clock;
+        // Execution row + the whole imported history + companion rows for any
+        // in-flight open scheduled work commit in ONE transaction, so a crash
+        // mid-import can never leave a partial (torn) history, nor a scheduled-work
+        // event without its derived queue/timer row.
         let tx = self.conn.transaction()?;
         store::insert_execution(&tx, exec, workflow_name, &input)?;
         for event in &events {
             store::append_event(&tx, exec, event)?;
+        }
+        // Rebuild the derived state for any *open* scheduled work in the import.
+        for event in &events {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name,
+                    input,
+                    queue,
+                } => {
+                    // Open iff no terminal (`ActivityCompleted`/exhausted
+                    // `ActivityFailed`) for this id. Materialize a fresh PENDING
+                    // task the worker claims + runs. The source backend's in-flight
+                    // attempt (its `ActivityStarted`, which the spike ignores) is
+                    // lost on handoff, so re-running is the correct at-least-once
+                    // recovery.
+                    if !store::history_has_activity_terminal(&events, &activity_id.to_string()) {
+                        queue::enqueue_activity(
+                            &tx,
+                            exec,
+                            *activity_id,
+                            name,
+                            input,
+                            queue,
+                            clock,
+                        )?;
+                    }
+                }
+                WorkflowEvent::TimerStarted {
+                    timer_id,
+                    duration_secs,
+                } => {
+                    // Open iff no `TimerFired` for this id. Handoff semantic: a
+                    // timer's *remaining* delay restarts from import time — the
+                    // source backend's absolute deadline is not portable across
+                    // backends (different clock epochs) — so re-arm fresh at
+                    // `clock + duration_secs` (saturating, like `apply_commands`).
+                    if !store::history_has_timer_fired(&events, &timer_id.to_string()) {
+                        let fire_at = clock
+                            .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
+                            .unwrap_or(i64::MAX);
+                        queue::enqueue_timer(&tx, exec, &timer_id.to_string(), fire_at)?;
+                    }
+                }
+                _ => {}
+            }
         }
         tx.commit()?;
         Ok(exec)
@@ -431,6 +494,20 @@ impl SqliteRuntime {
     /// SKIP-LOCKED substitute) and **atomic** (event + row commit together, or —
     /// if any command in the batch is unsupported and returns `Err`, dropping the
     /// uncommitted transaction — neither does).
+    ///
+    /// **No command is ever silently dropped.** The match is exhaustive (no `_`
+    /// wildcard): each variant is either persisted (`ScheduleActivity`,
+    /// `StartTimer`, `WaitForSignal`, and the bookkeeping `RecordSideEffect` /
+    /// `RecordMarker`), a single documented no-op (`WaitForActivity`, whose work
+    /// the worker pass drains), or an explicit `SpikeError::Unsupported` that rolls
+    /// the batch back. In particular the deterministic side-effect commands
+    /// (issue #384) are persisted as their `SideEffectRecorded` / `MarkerRecorded`
+    /// events so replay recovers the recorded value at the same cursor position
+    /// rather than diverging on the following scheduled-work event.
+    // The exhaustive `WorkflowCommand` match (every variant enumerated so no
+    // command is silently dropped) is intentionally long; the persist arms are
+    // each short and linear.
+    #[allow(clippy::too_many_lines)]
     fn apply_commands(
         &mut self,
         exec: ExecutionId,
@@ -513,17 +590,75 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
-                // A re-park of an already-scheduled activity (`WaitForActivity`)
-                // needs nothing persisted — the worker pass completes it — and
-                // the spike scenarios never emit `RecordMarker`/`RecordSideEffect`
-                // bookkeeping, so all three are harmless no-ops.
-                WorkflowCommand::WaitForActivity { .. }
-                | WorkflowCommand::RecordMarker { .. }
-                | WorkflowCommand::RecordSideEffect { .. } => {}
-                // Dropping `tx` here (un-committed) rolls back the whole batch —
-                // an unsupported command after a supported one leaves NEITHER the
-                // supported command's event NOR its queue/timer row persisted.
-                other => return Err(SpikeError::Unsupported(command_name(other).to_string())),
+                // Deterministic side-effect capture (issue #384): the primitives
+                // `system_now()`/`new_uuid()`/`random_*()`/`side_effect()` emit a
+                // `RecordSideEffect` (often BEFORE a suspending activity/timer/
+                // signal in the same batch). It MUST be persisted as a
+                // `SideEffectRecorded` so the next replay returns the recorded value
+                // at the same cursor position — dropping it makes the matcher find
+                // the following `ActivityScheduled`/`TimerStarted` where it expects
+                // the side effect, diverging replay (or re-minting a fresh value).
+                // No idempotency guard is needed: the reused core emits this ONLY
+                // when running live (past end of history) and replays it from
+                // history thereafter, so a committed side-effect event is never
+                // re-emitted. Appended in command order, so it precedes any
+                // activity/timer scheduled later in the same batch.
+                WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                    store::append_event(
+                        &tx,
+                        exec,
+                        &WorkflowEvent::SideEffectRecorded {
+                            kind: *kind,
+                            name: name.clone(),
+                            value: value.clone(),
+                        },
+                    )?;
+                    produced = true;
+                }
+                // Version-gate / opaque markers (`ctx.version()` etc.). Same
+                // contract as `RecordSideEffect`: persist as `MarkerRecorded` so
+                // replay reads it at the recorded cursor position rather than
+                // diverging on the following scheduled-work event.
+                WorkflowCommand::RecordMarker { name, details } => {
+                    store::append_event(
+                        &tx,
+                        exec,
+                        &WorkflowEvent::MarkerRecorded {
+                            name: name.clone(),
+                            details: details.clone(),
+                        },
+                    )?;
+                    produced = true;
+                }
+                // The ONLY genuine no-op: a re-park of an already-scheduled
+                // activity. The worker pass (`drain_ready`) runs the already-
+                // enqueued task to completion; there is nothing to persist here.
+                WorkflowCommand::WaitForActivity { .. } => {}
+                // Every remaining command is outside the spike's supported subset.
+                // Enumerated EXPLICITLY (no `_` wildcard) so adding a new engine
+                // `WorkflowCommand` variant fails the spike compile and forces an
+                // explicit decision rather than silently dropping the command —
+                // the strongest "never lose a command" guarantee. Returning `Err`
+                // drops the un-committed `tx`, rolling back the whole batch
+                // (both-or-neither). `Complete`/`Fail` normally surface via
+                // `WorkflowOutcome` in `drive_one_cycle`, never reaching here.
+                WorkflowCommand::StartChildWorkflow { .. }
+                | WorkflowCommand::ScheduleExternalActivity { .. }
+                | WorkflowCommand::Complete { .. }
+                | WorkflowCommand::Fail { .. }
+                | WorkflowCommand::ContinueAsNew { .. }
+                | WorkflowCommand::RunLocalActivity { .. }
+                | WorkflowCommand::RecordUpdateResult { .. }
+                | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SetCurrentDetails { .. }
+                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                | WorkflowCommand::CancelRaceLosers { .. }
+                | WorkflowCommand::ArmTimer { .. }
+                | WorkflowCommand::CancelTimer { .. } => {
+                    return Err(SpikeError::Unsupported(command_name(cmd).to_string()));
+                }
             }
         }
         tx.commit()?;
@@ -567,7 +702,9 @@ impl SqliteRuntime {
     }
 }
 
-/// Human name for an unsupported command (for error messages).
+/// Human name for a command (for `Unsupported` error messages). Exhaustive (no
+/// `_` wildcard) so a newly-added engine `WorkflowCommand` variant surfaces a
+/// real name in the error rather than a silent `"Unknown"`.
 const fn command_name(cmd: &WorkflowCommand) -> &'static str {
     match cmd {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
@@ -585,6 +722,11 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
-        _ => "Unknown",
+        WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
+        WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
+        WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
+        WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
+        WorkflowCommand::ArmTimer { .. } => "ArmTimer",
+        WorkflowCommand::CancelTimer { .. } => "CancelTimer",
     }
 }

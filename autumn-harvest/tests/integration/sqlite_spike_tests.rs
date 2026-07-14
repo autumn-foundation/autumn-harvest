@@ -73,6 +73,22 @@ async fn activity_then_child(ctx: &WorkflowContext, n: i64) -> Result<i64, Strin
     Ok(out.as_i64().ok_or("bad activity output")? * 2)
 }
 
+/// Mint a deterministic UUID (issue #384 side effect) BEFORE running an activity,
+/// then return both. Used by the side-effect-persistence regression: the minted
+/// value is emitted as a `RecordSideEffect` command in the same batch as the
+/// activity schedule, so it must be frozen into history (`SideEffectRecorded`)
+/// and recovered verbatim on every replay — including on a FRESH runtime after a
+/// restart. Dropping it (the pre-fix silent no-op) diverges replay.
+#[workflow]
+async fn uuid_then_activity(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+    let id = ctx.new_uuid();
+    let out = ctx
+        .execute_activity_raw("work", json!(1), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "uuid": id.to_string(), "work": out }))
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, String) {
@@ -842,4 +858,168 @@ async fn scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_comma
     // Only the pre-cycle `WorkflowStarted` (its own earlier autocommit) survives.
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], WorkflowEvent::WorkflowStarted { .. }));
+}
+
+// ── Codex P1 regression (round 4): importing an IN-FLIGHT open activity ──
+//
+// `import_execution` seeds a cross-backend history. When that history carries an
+// *open* (un-terminated) `ActivityScheduled` — the source backend stopped with
+// the activity still in flight (`Scheduled → Started`, no `Completed`) — the
+// importer must materialize the companion PENDING `spike_tasks` row, or replay
+// re-derives a `WaitForActivity` whose wait branch enqueues nothing and the run
+// wedges at `SpikeError::Stuck` (the normal command path was made atomic in round
+// 3, but the import path re-created the same "event without companion row" state).
+// With the fix the worker claims the materialized task, runs the body once, and
+// the imported execution drains to `Completed`. Fails on the pre-fix code
+// (`assert_activities_match_events` finds an empty task set / `run_until_blocked`
+// returns `Err(Stuck)`).
+#[tokio::test]
+async fn scenario_import_in_flight_activity_materializes_task_and_drains() {
+    let activity_id = ActivityExecId::new();
+    // In-flight PG-shaped history: Scheduled + Started, but NO terminal event.
+    let in_flight = vec![
+        WorkflowEvent::workflow_started(json!(3), chrono::Utc::now()),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "work".to_string(),
+            input: json!(3),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id,
+            worker_id: WorkerId::new("pg-worker-1"),
+        },
+    ];
+
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+
+    let exec = rt
+        .import_execution("single_activity", json!(3), in_flight)
+        .unwrap();
+    // The importer materialized the derived PENDING task for the open activity:
+    // every `ActivityScheduled` event now has its `spike_tasks` row (pre-fix this
+    // set is empty and this assertion fails).
+    assert_activities_match_events(&rt, exec);
+    assert_eq!(
+        rt.queued_activity_ids(exec).unwrap(),
+        vec![activity_id.to_string()],
+        "the open imported activity has a materialized task row"
+    );
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    // (3 * 10) * 2 == 60 — the in-flight activity runs to completion on handoff.
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(60)),
+        "state = {state:?}"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the open imported activity runs exactly once on handoff (at-least-once)"
+    );
+}
+
+// ── Codex P2 regression (round 4): deterministic side-effect commands persist ──
+//
+// A workflow that calls a deterministic primitive (`ctx.new_uuid()`) BEFORE a
+// suspending activity emits a `RecordSideEffect` in the same command batch. If
+// `apply_commands` drops it (the pre-fix silent no-op), no `SideEffectRecorded`
+// reaches history; on the next replay the matcher finds `ActivityScheduled` where
+// it expects the side effect and either diverges (`SideEffectDrift → WorkflowFailed`)
+// or re-mints a different value. With the fix the value is frozen into history
+// (before the activity schedule, in command order) and recovered VERBATIM across a
+// restart onto a fresh runtime. Fails on the pre-fix code: no `SideEffectRecorded`
+// is persisted, so the `.expect(...)` below panics (and the run cannot even
+// complete deterministically).
+#[tokio::test]
+async fn scenario_side_effect_command_persists_and_replays_across_restart() {
+    let (_dir, path) = temp_db();
+
+    // Runtime #1: drive ONE cycle so the side effect + activity are persisted but
+    // the workflow is NOT resumed past the activity (mirrors scenario_4's crash).
+    let (exec, recorded_uuid) = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&uuid_then_activity_info());
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r2 = ran.clone();
+        rt.register_activity(
+            "work",
+            ActivitySpec::new(1, move |_input: serde_json::Value| {
+                r2.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("done"))
+            }),
+        );
+        let exec = rt.start_workflow("uuid_then_activity", json!(0)).unwrap();
+        let state = rt.drive_one_cycle(exec).await.unwrap();
+        assert!(matches!(state, RunState::InProgress), "state = {state:?}");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        // The side effect is frozen into the replayable history, BEFORE the
+        // scheduled activity (command emission order).
+        let events = rt.load_history(exec).unwrap();
+        let recorded = events.iter().find_map(|e| match e {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                value,
+                ..
+            } => Some(value.as_str().unwrap().to_string()),
+            _ => None,
+        });
+        let recorded_uuid =
+            recorded.expect("SideEffectRecorded(Uuid) must be persisted to history");
+        let side_effect_pos = events
+            .iter()
+            .position(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }))
+            .unwrap();
+        let scheduled_pos = events
+            .iter()
+            .position(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+            .unwrap();
+        assert!(
+            side_effect_pos < scheduled_pos,
+            "the side effect is recorded before the activity schedule (command order)"
+        );
+        (exec, recorded_uuid)
+    };
+
+    // Runtime #2: fresh process on the SAME file. The workflow re-runs from the top
+    // and MUST recover the minted UUID from `SideEffectRecorded` (not re-mint / not
+    // diverge).
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&uuid_then_activity_info());
+    let ran2 = Arc::new(AtomicUsize::new(0));
+    let r2 = ran2.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |_input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!("done"))
+        }),
+    );
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    match state {
+        RunState::Completed(v) => assert_eq!(
+            v.get("uuid").and_then(serde_json::Value::as_str),
+            Some(recorded_uuid.as_str()),
+            "the deterministic UUID is recovered verbatim across the restart"
+        ),
+        other => panic!("expected Completed, got {other:?} — the side effect was not replayed"),
+    }
+    assert_eq!(
+        ran2.load(Ordering::SeqCst),
+        0,
+        "the already-completed activity must not re-run on replay"
+    );
 }

@@ -56,9 +56,23 @@ falls entirely on the shipped Postgres hot path).
   result-before-finish, fire-before-flag, terminal-event-before-state-flip, and
   clock-reset windows; the sole residual window is a crash *mid activity-body*,
   which a productized runtime would recover via the engine's heartbeat-timeout +
-  poison-pill reclaimer (out of a single-process spike's scope).
-- **An 11-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (11/11 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+  poison-pill reclaimer (out of a single-process spike's scope). **The import path
+  materializes derived state for in-flight open work** (Codex P1, round 4): when an
+  imported cross-backend history carries an *open* (un-terminated)
+  `ActivityScheduled`/`TimerStarted`, `import_execution` rebuilds the companion
+  `spike_tasks`/`spike_timers` row inside the import transaction, so a handoff of a
+  *partially-complete* execution drains rather than wedging at `SpikeError::Stuck`
+  (open timers re-arm relative to import time, since a source backend's absolute
+  deadline isn't portable). **Deterministic side-effect commands are persisted, not
+  dropped** (Codex P2, round 4): `apply_commands` appends `RecordSideEffect`/
+  `RecordMarker` as `SideEffectRecorded`/`MarkerRecorded` in command order (so a
+  `ctx.system_now`/`new_uuid`/`random_*`/`side_effect` before a suspending activity
+  replays faithfully rather than diverging), and its match is now **exhaustive**
+  (no `_` wildcard) — every command is persisted, a single documented no-op
+  (`WaitForActivity`), or an explicit `Unsupported` that rolls the batch back, so no
+  command is ever silently dropped.
+- **A 13-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (13/13 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays
@@ -78,7 +92,14 @@ falls entirely on the shipped Postgres hot path).
   and a timer armed at a non-zero logical time fires after a restart via the
   durable clock (`scenario_two_timers_second_fires_across_restart_via_durable_clock`
   — a part-way advance isolates the persisted-clock fix from the fired-timer floor;
-  fails on the pre-fix clock-reset-to-0-on-reopen code).
+  fails on the pre-fix clock-reset-to-0-on-reopen code) — **plus two round-4
+  regression tests**: an imported in-flight open activity materializes its task row
+  and drains to `Completed`
+  (`scenario_import_in_flight_activity_materializes_task_and_drains`; fails pre-fix,
+  wedging at `Stuck`); and a `ctx.new_uuid()` side effect emitted before an activity
+  is frozen into history and recovered verbatim across a restart
+  (`scenario_side_effect_command_persists_and_replays_across_restart`; fails pre-fix
+  where the `RecordSideEffect` was silently dropped).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`

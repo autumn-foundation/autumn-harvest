@@ -295,6 +295,28 @@ autocommits:
   execution row + its `WorkflowStarted` event (or the whole imported history)
   commit in one transaction, so a crash mid-start can never leave a `RUNNING`
   execution with a missing or torn history.
+- *Import materializes derived state for open work* (`import_execution`). When an
+  imported cross-backend history carries an **open** (un-terminated)
+  `ActivityScheduled` or `TimerStarted`, the importer rebuilds the companion
+  `spike_tasks`/`spike_timers` row a live cycle would have created — inside the
+  same import transaction — so a cross-backend handoff of a *partially-complete*
+  execution drains correctly instead of wedging at `SpikeError::Stuck` (replay
+  re-derives the wait, `apply_commands` skips enqueueing because the schedule is
+  already in history, and the worker would otherwise have no row to drain). Open
+  timers are re-armed relative to import time (`fire_at = clock + duration_secs`),
+  since a source backend's absolute deadline is not portable across backends.
+- *Deterministic side-effect commands are persisted, never dropped*
+  (`apply_commands`). The issue #384 primitives (`system_now`/`new_uuid`/
+  `random_*`/`side_effect`) and version-gate markers emit `RecordSideEffect`/
+  `RecordMarker` — often *before* a suspending activity in the same batch. These
+  are persisted as `SideEffectRecorded`/`MarkerRecorded` in command order, so
+  replay recovers the recorded value at the same cursor position rather than
+  diverging on the following scheduled-work event (or re-minting). The
+  `apply_commands` match is exhaustive (no `_` wildcard): every command is
+  persisted, a single documented no-op (`WaitForActivity`), or an explicit
+  `SpikeError::Unsupported` that rolls the batch back — no command is ever
+  silently dropped, and a newly-added engine `WorkflowCommand` fails the spike
+  compile instead of vanishing.
 
 **The virtual clock is itself durable.** It is persisted on every advance
 (`spike_meta`) and restored on `open` (belt-and-braces: never below any
@@ -329,7 +351,7 @@ armed at a non-zero logical time fires after a restart via the durable clock).
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **11 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **13 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -345,6 +367,8 @@ sqlite-spike,testing --test integration sqlite_spike` → **11 passed; 0 failed*
 | `scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` | **(Codex P1 regression, both-or-neither)** A `[ScheduleActivity, StartChildWorkflow]` batch appends+enqueues the activity, then hits the unsupported child command and returns `Err`, dropping the uncommitted transaction — **neither** the `ActivityScheduled` event **nor** its task row persists. Fails on the pre-fix per-command-autocommit code (where the activity event + row would have committed before the unsupported command was reached). |
 | `scenario_timer_fire_is_atomic_no_double_fire_across_reload` | **(Codex P1 regression)** A fired timer's `TimerFired` event and its `fired = 1` row agree — including across a reopen, where `due_timers` then finds nothing to re-fire (exactly one `TimerFired`). Guards against the pre-fix separate-autocommit window that re-fired the timer into a stray duplicate `TimerFired`. |
 | `scenario_two_timers_second_fires_across_restart_via_durable_clock` | **(Codex P1 regression)** A workflow fires a first timer (advancing the virtual clock), arms a second timer at that advanced clock (absolute `fire_at = 10`), advances *part-way* (to 8, captured only by the durable clock — not the fired-timer floor of 5), then **restarts**; advancing 2 more reaches 10 and the second timer fires. Fails on the pre-fix code that reset the clock to 0 on reopen (the second timer would never become due). |
+| `scenario_import_in_flight_activity_materializes_task_and_drains` | **(Codex P1 regression, round 4)** An imported PG-shaped history with an **open** (un-terminated) `ActivityScheduled` (`Scheduled → Started`, no `Completed`) materializes the companion PENDING `spike_tasks` row on import, so the worker claims + runs it and the imported execution drains to `Completed` (activity runs exactly once). Fails on the pre-fix code where the import path created an "event without companion row" and the run wedged at `SpikeError::Stuck`. |
+| `scenario_side_effect_command_persists_and_replays_across_restart` | **(Codex P2 regression, round 4)** A workflow calls `ctx.new_uuid()` (an issue #384 deterministic side effect) before a suspending activity; the minted value is frozen into history as `SideEffectRecorded` (before the activity schedule, in command order) and recovered **verbatim** on a fresh runtime after a restart. Fails on the pre-fix code that silently dropped the `RecordSideEffect` command (no `SideEffectRecorded` reaches history → replay diverges / re-mints). |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 
