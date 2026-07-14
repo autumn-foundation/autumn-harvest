@@ -16555,7 +16555,13 @@ async fn hydrate_ctx_for_query(
     // diverging the next replayed command (running/in-process query) or the
     // terminal-query drift check (`has_unconsumed_history` below → spurious 410).
     .with_execution_timeout(execution.execution_timeout)
-    .with_deadline(execution.deadline_at);
+    .with_deadline(execution.deadline_at)
+    // Issue #698: thread the execution row's parent id so a query replayed on a
+    // child run reports the spawning parent via `ctx.info().parent_execution_id`.
+    // Same class as execution_timeout/deadline_at above — the column lives on the
+    // execution row, absent from history, so this context (which sources those
+    // from the row) must source parent from the row too.
+    .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid));
 
     // Seed declarative query handlers (registered via `.queries(queries![...])`)
     // before replaying, so execute_query_with_args can find them.

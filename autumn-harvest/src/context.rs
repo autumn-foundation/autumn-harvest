@@ -1896,9 +1896,13 @@ pub struct WorkflowExecutionInfo {
     ///
     /// [`now`]: WorkflowContext::now
     pub start_time: DateTime<Utc>,
-    /// The number of events in the loaded history snapshot for this workflow
-    /// task. Replay-safe: computed from the in-memory snapshot, not a
-    /// side-effecting counter.
+    /// The number of history events consumed/processed up to the current point
+    /// (the matcher's cursor position) — replay-stable across workers and replay
+    /// passes, since it is a pure function of how far the workflow's own code has
+    /// advanced through history at the call site. This is **not** the total
+    /// loaded history snapshot length (which grows across workflow tasks), and it
+    /// is **not** suitable for continue-as-new history-size decisions — use
+    /// [`WorkflowContext::should_continue_as_new`] for that.
     pub history_event_count: u64,
     /// `true` while this workflow task is replaying recorded history, `false`
     /// once execution reaches the live frontier.
@@ -2797,9 +2801,26 @@ impl WorkflowContext {
         // cursor, push a command, or append an event. The public
         // [`history_event_count`](Self::history_event_count) accessor *does* run
         // that post-hook, so it cannot be reused here.
+        //
+        // `history_event_count` here is the matcher's **consumed cursor
+        // position** (`matcher.position()`), NOT the total loaded history
+        // snapshot length (`matcher.event_count()`). The total grows across
+        // workflow tasks — a run replayed on task 2 loads a larger history than
+        // it did live on task 1 — so reporting the total would make `info()`
+        // return a different value live vs replay at the same code position,
+        // violating the issue #698 AC3 replay-stability contract. The cursor
+        // position is a pure function of how far the workflow's own code has
+        // consumed history at the call site, so it is byte-identical across
+        // replay passes and workers. (The public
+        // [`history_event_count`](Self::history_event_count) accessor stays the
+        // total, because [`should_continue_as_new`](Self::should_continue_as_new)
+        // needs the whole-history size for its checkpoint decision.)
         let (history_event_count, is_replaying) = {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
-            (matcher.event_count(), matcher.is_replaying())
+            (
+                u64::try_from(matcher.position()).unwrap_or(u64::MAX),
+                matcher.is_replaying(),
+            )
         };
         WorkflowExecutionInfo {
             execution_id: self.execution_id(),
@@ -9017,6 +9038,11 @@ impl WorkflowContext {
         let last_completion_result = self.last_completion_result.clone();
         let last_error = self.last_error.clone();
         let metrics = std::sync::Arc::clone(&self.metrics);
+        // Issue #698: inherit the spawning parent's execution id so an update
+        // handler invoked on a child run observes `ctx.info().parent_execution_id`.
+        // `new_for_handler` inits it to `None`; without this the update-handler
+        // path (unlike the workflow body) would never see the parent.
+        let parent_execution_id = self.parent_execution_id;
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -9040,6 +9066,8 @@ impl WorkflowContext {
                 // Issue #772 (Codex P2): inherit the parent's deadline budget.
                 inner.execution_timeout = execution_timeout;
                 inner.deadline_at = deadline_at;
+                // Issue #698: inherit the spawning parent's execution id.
+                inner.parent_execution_id = parent_execution_id;
             }
             handler_fn(ctx, input)
         });
@@ -9113,6 +9141,9 @@ impl WorkflowContext {
                 // `ctx.deadline()` works inside the handler.
                 inner.execution_timeout = self.execution_timeout;
                 inner.deadline_at = self.deadline_at;
+                // Issue #698: inherit the spawning parent's execution id so
+                // `ctx.info().parent_execution_id` is visible inside the handler.
+                inner.parent_execution_id = self.parent_execution_id;
             }
             h(ctx, input)
         })
@@ -11795,6 +11826,57 @@ mod tests {
             result,
             Ok(serde_json::json!((t0 + timeout).timestamp_millis())),
             "the update handler must inherit execution_timeout (nominal deadline present)"
+        );
+    }
+
+    /// Issue #698 (Codex parent-threading sweep, #B): a declarative `#[update]`
+    /// handler invoked on a child run must observe the spawning parent via
+    /// `ctx.info().parent_execution_id`. `new_for_handler` inits it to `None`;
+    /// `register_declarative_update_handler` (and the `invoke_update` fallback)
+    /// must thread the parent's `parent_execution_id` into the handler context —
+    /// same class as the `execution_timeout`/`deadline_at` threading above.
+    #[tokio::test]
+    async fn update_handler_inherits_parent_execution_id() {
+        #[allow(clippy::needless_pass_by_value)]
+        fn parent_probe_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            // The handler reads the parent id via the exact accessor issue #698
+            // exposes to author code.
+            let parent = ctx.info().parent_execution_id.map(|p| p.to_string());
+            Box::pin(async move { Ok(serde_json::json!(parent)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "parent_probe",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "string",
+            has_validator: false,
+            handler: parent_probe_handler,
+            validator: None,
+            mcp: false,
+        };
+
+        let parent_id = ExecutionId::new();
+        let child_ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()])
+            .with_parent_execution_id(Some(parent_id));
+        // Sanity: the child workflow context itself reports the parent.
+        assert_eq!(child_ctx.info().parent_execution_id, Some(parent_id));
+
+        child_ctx.register_declarative_update_handler(&info);
+        let fut = child_ctx
+            .invoke_update("parent_probe", Value::Null)
+            .expect("handler registered");
+        let result = fut.await;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!(parent_id.to_string())),
+            "a declarative update handler must inherit the spawning parent's execution id \
+             so ctx.info().parent_execution_id is Some(parent) inside the handler"
         );
     }
 
@@ -19820,15 +19902,102 @@ mod tests {
         assert_eq!(baseline.workflow_id, "cart-42");
         assert_eq!(baseline.workflow_type, "checkout");
         assert_eq!(baseline.start_time, frozen);
-        // The fixture has exactly 3 events (WorkflowStarted + TimerStarted +
-        // TimerFired) — assert the loaded size so a constant-0 `history_event_count`
-        // regression cannot survive (every other asserting test uses a 0-event
-        // context).
+        // `history_event_count` is the matcher's CONSUMED cursor position, not the
+        // loaded total. `for_replay` advances the cursor past the leading
+        // `WorkflowStarted` lifecycle event at construction, so a fresh replay
+        // context (before the workflow consumes any command event) is at position
+        // 1 — replay-stable regardless of the total loaded history length. Its
+        // full replay-stability across differently-sized histories is guarded by
+        // `info_history_event_count_is_consumed_position_replay_stable` below.
         assert_eq!(
-            baseline.history_event_count, 3,
-            "history_event_count must reflect the loaded snapshot size"
+            baseline.history_event_count, 1,
+            "history_event_count is the consumed cursor position (1 after WorkflowStarted)"
         );
         assert_eq!(baseline.parent_execution_id, Some(parent));
+    }
+
+    /// AC3 (replay-stability, Codex P2): `info().history_event_count` is the
+    /// matcher's CONSUMED cursor position, NOT the total loaded history snapshot
+    /// length. The total grows across workflow tasks — a run replayed on task 2
+    /// loads a larger history than it did live on task 1 — so reporting the total
+    /// would make `info()` return a different value live vs replay at the same
+    /// code position, a false non-determinism. This is the decisive repro: two
+    /// contexts for the SAME execution at the SAME cursor position, one loaded
+    /// from a short history and one from a longer history, must report EQUAL
+    /// `history_event_count`.
+    #[cfg(any(test, feature = "testing"))]
+    #[tokio::test]
+    async fn info_history_event_count_is_consumed_position_replay_stable() {
+        let exec_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let started = WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+        let sched = WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        };
+        let completed = WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("done"),
+        };
+
+        // Task 1 ("live"): minimal history — just the started event and the
+        // in-flight activity scheduled/completed pair the workflow consumes.
+        let short = vec![started.clone(), sched.clone(), completed.clone()];
+        // Task 2 ("replay"): the SAME prefix plus a larger tail (a second
+        // scheduled activity not yet consumed) — the growing-history case.
+        let activity_id2 = ActivityExecId::new();
+        let long = vec![
+            started,
+            sched,
+            completed,
+            WorkflowEvent::ActivityScheduled {
+                activity_id: activity_id2,
+                name: "step2".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let ctx_short = WorkflowContext::for_replay(exec_id, short);
+        let ctx_long = WorkflowContext::for_replay(exec_id, long);
+
+        // Drive BOTH to the identical cursor position: replay the single "step"
+        // activity, advancing the cursor past WorkflowStarted + the activity pair.
+        ctx_short
+            .execute_activity_raw("step", Value::Null, "default")
+            .await
+            .expect("short replay must match");
+        ctx_long
+            .execute_activity_raw("step", Value::Null, "default")
+            .await
+            .expect("long replay must match");
+
+        let short_count = ctx_short.info().history_event_count;
+        let long_count = ctx_long.info().history_event_count;
+        assert_eq!(
+            short_count, long_count,
+            "history_event_count must be the consumed cursor position, equal at the \
+             same code point regardless of total loaded history length"
+        );
+        // And it must be the consumed position, not the total: > 0 (some history
+        // consumed) and < the long history's total length (4).
+        assert!(
+            short_count > 0,
+            "expected a non-zero consumed position after replaying one activity, got {short_count}"
+        );
+        assert!(
+            long_count < 4,
+            "consumed position ({long_count}) must be below the long history total (4), \
+             i.e. the total was not reported"
+        );
     }
 
     /// `WorkflowExecutionInfo` derives `Clone`/`PartialEq` so tests and author

@@ -109,4 +109,45 @@ field and the batch candidate SELECT (`HISTORY_EXPORT_CANDIDATES_SQL`) now selec
 columns backing `execution_timeout`/`deadline_at`. With this, live HTTP single and
 batch exports carry the parent (previously they round-tripped parent = `None`); the
 core round-trip unit test and the `retention_archive_carries_parent_execution_id`
-DB test cover the assertion end to end.
+DB test cover the assertion end to end. (D) **`history_event_count` is the
+replay-STABLE consumed position, not the total loaded snapshot length (Codex
+P2).** `info()` previously reported `matcher.event_count()` — the total loaded
+history snapshot, which **grows across workflow tasks** (a run replayed on task 2
+loads a larger history than it did live on task 1), so the same `info()` call at
+the same code position returned a different value live vs. replay, a false
+non-determinism violating AC3. `info()` now reports the matcher's **consumed
+cursor position** (`matcher.position()`, a pure non-pumping read consistent with
+the existing non-pumping `info()` read path) — a pure function of how far the
+workflow's own code has advanced through history at the call site, so it is
+byte-identical across replay passes and workers. The public
+`history_event_count()` accessor is **left as the total** because
+`should_continue_as_new()` needs the whole-history size for its checkpoint
+decision (the internal history-cap logic in `worker.rs` uses `events.len()`
+directly); the `WorkflowExecutionInfo.history_event_count` field doc now states it
+is the consumed position, replay-stable, and NOT suitable for continue-as-new
+history-size decisions. New decisive regression test
+`info_history_event_count_is_consumed_position_replay_stable` (two contexts for
+the same execution driven to the SAME cursor, one loaded from a short history and
+one from a longer one, assert EQUAL `history_event_count` — RED pre-fix: 3 vs 4).
+(E) **`parent_execution_id` threaded through ALL remaining replay/handler-context
+paths (closing the Codex parent-threading surface).** The field is now threaded at
+**every** context-construction site that sources the sibling row-only columns
+`execution_timeout`/`deadline_at` from the execution row — the exact same class,
+since `parent_id` likewise lives on the row, absent from every `WorkflowEvent`:
+worker dispatch (`WorkflowExecuteSpanMeta`), the executor strict/canary/live
+construction chains, `WorkflowReplayer`/`replay_from_json` (strict + canary),
+`WorkflowTestEnv`, the history-export document + retention archive + all three
+plugin HTTP export handlers, the typed-client query-replay path (`handle.rs`), and
+— **new this pass** — the plugin's `hydrate_ctx_for_query` query-replay context
+(`autumn-harvest-plugin/src/api.rs`, `.with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))`)
+and the declarative `#[update]` handler contexts (both the
+`register_declarative_update_handler` registration wrapper and the `invoke_update`
+declarative fallback in `context.rs`, which copy the parent's
+`workflow_id`/headers/deadline into the throwaway `new_for_handler` context but
+previously dropped `parent_execution_id`). Query handlers run against the main
+`self` context (`h(self, args)`), so they already inherit the parent; signal
+handlers likewise dispatch in the main context. New regression test
+`update_handler_inherits_parent_execution_id` (a declarative update handler
+invoked on a child run reads `ctx.info().parent_execution_id == Some(parent)` —
+RED pre-fix: `None`). No CLI, scheduler, `ActivityContext`, event, schema, or
+migration changes.
