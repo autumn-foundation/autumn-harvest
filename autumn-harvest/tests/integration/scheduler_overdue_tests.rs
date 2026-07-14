@@ -150,6 +150,48 @@ async fn insert_running_execution(conn: &mut AsyncPgConnection, wf_name: &str) {
     conn.batch_execute(&sql).await.expect("insert execution");
 }
 
+/// Insert a workflow schedule with explicit bound/overlap fields (Codex P2
+/// tests): `overlap_policy`, `catchup`, `max_runs`, `runs_started`, `end_at`.
+#[allow(clippy::too_many_arguments)]
+async fn insert_schedule_bounded(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    next_run_at: DateTime<Utc>,
+    max_active_runs: i32,
+    overlap_policy: &str,
+    catchup: bool,
+    max_runs: Option<i32>,
+    runs_started: i32,
+    end_at: Option<DateTime<Utc>>,
+) -> Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let id = Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:60"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(catchup),
+            dsl::max_active_runs.eq(max_active_runs),
+            dsl::is_paused.eq(false),
+            dsl::next_run_at.eq(next_run_at),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq(overlap_policy),
+            dsl::buffered_runs.eq(serde_json::json!([])),
+            dsl::buffer_all_max.eq(100),
+            dsl::skip_policy.eq("skip"),
+            dsl::exhausted_at.eq(Option::<DateTime<Utc>>::None), // NULL — tick hasn't stamped it
+            dsl::max_runs.eq(max_runs),
+            dsl::runs_started.eq(runs_started),
+            dsl::end_at.eq(end_at),
+        ))
+        .execute(conn)
+        .await
+        .expect("insert bounded schedule");
+    id
+}
+
 /// Insert one pending #607 start-throttle row for `wf_name` (drives the
 /// throttle-aware at-capacity guard, matching the tick's basis).
 async fn insert_pending_throttle(conn: &mut AsyncPgConnection, wf_name: &str) {
@@ -257,15 +299,19 @@ async fn healthy_paused_exhausted_are_not_overdue() {
 async fn at_capacity_schedule_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
     let now = Utc::now();
-    // Stale next_run_at that WOULD be overdue if the schedule were free.
-    insert_schedule(
+    // Stale next_run_at that WOULD be overdue if the schedule were free. Skip +
+    // catchup is the tick's DEFERRING config (Codex P2-B), so at-capacity holds
+    // next_run_at in the past and the predicate suppresses.
+    insert_schedule_bounded(
         &mut conn,
         "busy_wf",
-        "interval:60",
         now - chrono::Duration::seconds(5000),
-        false,
+        1,      // max_active_runs = 1
+        "skip", // deferring policy
+        true,   // catchup
         None,
-        1, // max_active_runs = 1
+        0,
+        None,
     )
     .await;
     // One RUNNING execution => running (1) >= max_active_runs (1) => at capacity.
@@ -361,15 +407,18 @@ async fn backfill_in_progress_does_not_flag_overdue() {
 async fn throttle_pending_at_capacity_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
     let now = Utc::now();
-    // Stale next_run_at that WOULD be overdue if the schedule were free.
-    insert_schedule(
+    // Stale next_run_at that WOULD be overdue if the schedule were free. Skip +
+    // catchup so the tick defers (Codex P2-B) and at-capacity suppresses.
+    insert_schedule_bounded(
         &mut conn,
         "throttled_wf",
-        "interval:60",
         now - chrono::Duration::seconds(5000),
-        false,
+        1,      // max_active_runs = 1
+        "skip", // deferring policy
+        true,   // catchup
         None,
-        1, // max_active_runs = 1
+        0,
+        None,
     )
     .await;
     // 0 RUNNING/PAUSED executions, but 1 pending throttle row => running basis
@@ -385,5 +434,74 @@ async fn throttle_pending_at_capacity_is_not_overdue() {
         metrics.overdue_for("workflow", "throttled_wf"),
         Some(false),
         "a throttle-deferred schedule at capacity must not be reported overdue"
+    );
+}
+
+/// Codex P2-A: a schedule the tick WOULD exhaust (`runs_started >= max_runs`)
+/// but whose tick died before stamping `exhausted_at` (so `exhausted_at IS
+/// NULL`) must NOT be reported overdue — bounded-out is derived from the raw
+/// budget fields, not just `exhausted_at`.
+#[tokio::test]
+async fn bounded_out_by_max_runs_with_null_exhausted_at_is_not_overdue() {
+    let (mut conn, _c) = setup_db().await;
+    let now = Utc::now();
+    insert_schedule_bounded(
+        &mut conn,
+        "budget_wf",
+        now - chrono::Duration::seconds(5000), // stale (would be overdue if active)
+        10,
+        "skip",
+        false,
+        Some(5), // max_runs
+        5,       // runs_started == max_runs => budget spent, exhausted_at NULL
+        None,
+    )
+    .await;
+
+    let metrics = RecordingMetrics::default();
+    sample_overdue_schedules(&mut conn, now, &metrics)
+        .await
+        .expect("sampler pass");
+
+    assert_eq!(
+        metrics.overdue_for("workflow", "budget_wf"),
+        Some(false),
+        "budget-exhausted (runs_started >= max_runs) with NULL exhausted_at must not page"
+    );
+}
+
+/// Codex P2-B: a NON-deferring overlap policy (`CancelOther`) at capacity with a
+/// stale `next_run_at` is a GENUINE stall — the tick would ADVANCE `next_run_at`,
+/// so a persistent past value means the scheduler is wedged. Must be reported
+/// overdue (the blanket at-capacity suppression must NOT mask it).
+#[tokio::test]
+async fn non_deferring_policy_at_capacity_is_overdue() {
+    let (mut conn, _c) = setup_db().await;
+    let now = Utc::now();
+    // CancelOther cancels + proceeds (advances next_run_at); it never retains.
+    insert_schedule_bounded(
+        &mut conn,
+        "cancel_wf",
+        now - chrono::Duration::seconds(5000), // stale
+        1,                                     // max_active_runs = 1
+        "cancel_other",                        // NON-deferring policy
+        true,                                  // catchup on, but cancel_other still advances
+        None,
+        0,
+        None,
+    )
+    .await;
+    // 1 RUNNING execution => at capacity, but the policy is non-deferring.
+    insert_running_execution(&mut conn, "cancel_wf").await;
+
+    let metrics = RecordingMetrics::default();
+    sample_overdue_schedules(&mut conn, now, &metrics)
+        .await
+        .expect("sampler pass");
+
+    assert_eq!(
+        metrics.overdue_for("workflow", "cancel_wf"),
+        Some(true),
+        "a non-deferring policy at capacity with a stale next_run_at is a genuine stall"
     );
 }

@@ -18178,20 +18178,38 @@ fn schedule_entry_from_row(
     // Overdue detection (issue #696): computed from the schedule's own
     // `next_run_at` + cadence, never an externally-supplied interval. Rides the
     // shared read fan-out, so it surfaces on both list and get automatically.
-    let overdue_verdict = autumn_harvest::scheduler::schedule_overdue(
-        s.schedule_expr
-            .as_deref()
-            .and_then(autumn_harvest::scheduler::parse_schedule_from_expr_pub)
-            .as_ref(),
-        s.next_run_at,
-        chrono::Utc::now(),
-        std::time::Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0)),
-        autumn_harvest::scheduler::SCHEDULER_TICK_INTERVAL,
-        s.is_paused,
-        s.auto_paused_at,
-        s.exhausted_at,
-        at_capacity,
-    );
+    // The exclusions mirror the scheduler tick's exact semantics (Codex P2-A/B):
+    // bounded-out from raw end_at/max_runs/runs_started (not just exhausted_at),
+    // and the at-capacity suppression is gated to the tick's deferring config
+    // (Skip + catchup).
+    let overdue_schedule = s
+        .schedule_expr
+        .as_deref()
+        .and_then(autumn_harvest::scheduler::parse_schedule_from_expr_pub);
+    let overlap_policy = autumn_harvest::policy::OverlapPolicy::from_db(&s.overlap_policy);
+    let catchup_enabled = autumn_harvest::policy::CatchupPolicy::from_db(
+        s.catchup_policy.as_deref(),
+        s.catchup_window_secs,
+        s.catchup,
+    )
+    .is_catchup_enabled();
+    let overdue_verdict =
+        autumn_harvest::scheduler::schedule_overdue(&autumn_harvest::scheduler::OverdueInputs {
+            schedule: overdue_schedule.as_ref(),
+            next_run_at: s.next_run_at,
+            now: chrono::Utc::now(),
+            jitter: std::time::Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0)),
+            tick_interval: autumn_harvest::scheduler::SCHEDULER_TICK_INTERVAL,
+            is_paused: s.is_paused,
+            auto_paused_at: s.auto_paused_at,
+            exhausted_at: s.exhausted_at,
+            end_at: s.end_at,
+            max_runs: s.max_runs,
+            runs_started: s.runs_started,
+            overlap_policy,
+            catchup: catchup_enabled,
+            at_capacity,
+        });
     let (kind, name) = if let Some(ref dag_name) = s.dag_name {
         (ScheduleKind::Dag, dag_name.clone())
     } else if let Some(ref wf_name) = s.workflow_name {
