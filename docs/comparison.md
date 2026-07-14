@@ -80,7 +80,7 @@ sourcing doc and flag anything unverified.
 | DBOS | Lightweight — a **library embedded in your app process** + Postgres, "no additional infrastructure required." Optional Conductor control plane for recovery/visualization/HA. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Single `inngest` server binary/container + external Postgres/Redis for production (Helm chart available); your functions are HTTP handlers the engine calls. Self-hosting is comparatively new (GA'd ~2025). ([docs](https://www.inngest.com/docs/self-hosting)) |
 | Hatchet | A Hatchet engine/API server + Postgres (+ optional RabbitMQ); workers connect over gRPC. Documented as "particularly easy to self-host." ([docs](https://docs.hatchet.run/home/architecture)) |
-| Restate | Single binary via Homebrew/npm/Docker; "no extra databases, no separate worker processes." Your handlers are your own processes the server invokes. ([docs](https://docs.restate.dev/foundations/key-concepts)) |
+| Restate | Single-binary server via Homebrew/npm/Docker with embedded storage — **no external database or broker**. Your **service handlers still deploy and scale separately** (containers / serverless / VMs / k8s), which the server sits in front of and invokes over HTTP — as with any code-first engine. ([docs](https://docs.restate.dev/foundations/key-concepts)) |
 
 ### 3. Language / SDK support
 
