@@ -112,6 +112,12 @@ jobs:
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
+      # `--no-deps` scopes the lint to this crate: it depends on `autumn-harvest`
+      # with `default-features = false`, and that no-db build of the core crate
+      # carries pre-existing (out-of-scope) dead-code warnings that `-D warnings`
+      # would otherwise elevate to errors here.
+      - name: Clippy autumn-harvest-sqlite
+        run: cargo clippy -p autumn-harvest-sqlite --all-targets --no-deps -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -174,6 +180,9 @@ jobs:
       - name: Run CLI tests (issue #753)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-cli
+      - name: Run autumn-harvest-sqlite tests (issue #1068)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-sqlite
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics

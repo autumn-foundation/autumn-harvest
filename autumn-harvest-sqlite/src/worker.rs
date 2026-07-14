@@ -1,0 +1,355 @@
+//! The single-writer worker pass.
+//!
+//! [`drain_ready`] is the analog of the Postgres poll/dispatch loop, reduced to
+//! what a synchronous, embedded runtime needs: it claims every ready activity
+//! task, runs its registered body, applies the retry policy, fires every due
+//! timer, and appends the resulting terminal [`WorkflowEvent`]s to the canonical
+//! history.
+//!
+//! # Crash model — activity execution is at-least-once (by design)
+//!
+//! A claim (`BEGIN IMMEDIATE` → `RUNNING`, committed) and the terminal finalize
+//! (record-attempt + terminal-event + `DONE`/requeue, committed together in
+//! [`finalize_activity_result`]) are each atomic, but the activity **body runs
+//! between them, outside any transaction** — you cannot hold `SQLite`'s single
+//! write lock across arbitrary user I/O. So a crash after the body runs but
+//! before the finalize commits leaves the task `RUNNING`; on the next
+//! [`SqliteRuntime::open`](crate::SqliteRuntime::open),
+//! [`reclaim_orphaned_running`](crate::queue::reclaim_orphaned_running) flips it
+//! back to `PENDING` and the **body re-runs** — hence *at-least-once*. Write
+//! activity bodies to be idempotent. A crash *after* the finalize commits sees a
+//! `DONE` task and never re-runs the body. The finalize is transactional so the
+//! replayable log never records a half-completed activity.
+//!
+//! # Retry model
+//!
+//! A *retryable* activity failure is recorded in the `harvest_activity_attempts`
+//! audit table and the task-queue row's `attempt` counter — it is **not** appended
+//! to the replayable event log. Only the terminal outcome (`ActivityCompleted`, or
+//! `ActivityFailed` after exhausting attempts) reaches `harvest_events`. This
+//! matches the Postgres engine (`queue::requeue_for_retry` stores the attempt
+//! error on the task row, never in `harvest_events`), keeping every persisted
+//! history a clean, terminal-only, replay-correct log.
+
+use std::collections::HashMap;
+
+use autumn_harvest::{ExecutionId, TimerId, WorkflowEvent};
+use rusqlite::Connection;
+
+use crate::error::SqliteResult;
+use crate::queue::{self, ClaimedTask};
+use crate::runtime::ActivitySpec;
+use crate::store;
+
+/// Run all currently-ready work for `exec_id` at logical time `now`: drain ready
+/// activity tasks (running bodies + honouring retries) and fire due timers.
+///
+/// Returns `true` if any terminal event was appended (i.e. the workflow may have
+/// made progress and should be re-run).
+pub fn drain_ready(
+    conn: &mut Connection,
+    exec_id: ExecutionId,
+    now: i64,
+    activities: &HashMap<String, ActivitySpec>,
+) -> SqliteResult<bool> {
+    let mut produced = false;
+
+    // Drain activity tasks. A retry requeues at `run_at = now`, so it becomes
+    // immediately ready again and this loop re-claims it — the whole retry
+    // sequence converges in one drain pass under the polling model.
+    while let Some(task) = queue::claim_next_ready_task(conn, exec_id, now)? {
+        let spec = activities
+            .get(&task.name)
+            .ok_or_else(|| crate::error::SqliteError::unregistered(&task.name))?;
+
+        // Body runs OUTSIDE any transaction — at-least-once (see module docs).
+        let result = (spec.body)(task.input.clone());
+
+        if finalize_activity_result(conn, exec_id, &task, spec.max_attempts, now, result)? {
+            produced = true;
+        }
+    }
+
+    // Fire due timers (each append + mark is atomic — see `fire_timer`).
+    for timer_id in queue::due_timers(conn, exec_id, now)? {
+        fire_timer(conn, exec_id, &timer_id)?;
+        produced = true;
+    }
+
+    Ok(produced)
+}
+
+/// Finalize one activity attempt in a **single transaction** (AC7): the audit
+/// record, the terminal event append (on success or retry-exhaustion), and the
+/// task-row transition (`DONE` or requeue) commit together or not at all.
+///
+/// Returns `true` if a terminal event was appended (i.e. the run may progress).
+/// A crash before this commits leaves the task `RUNNING` for orphan reclaim; a
+/// crash after leaves a clean `DONE` row and a terminal-only history.
+pub fn finalize_activity_result(
+    conn: &mut Connection,
+    exec_id: ExecutionId,
+    task: &ClaimedTask,
+    max_attempts: u32,
+    now: i64,
+    result: Result<serde_json::Value, String>,
+) -> SqliteResult<bool> {
+    let tx = conn.transaction()?;
+    let produced = finalize_within_tx(&tx, exec_id, task, max_attempts, now, result)?;
+    tx.commit()?;
+    Ok(produced)
+}
+
+/// The transactional body of [`finalize_activity_result`], factored out so the
+/// atomic unit (record-attempt + terminal-event + task-transition) can be driven
+/// directly inside a caller-owned transaction — the finalize atomicity tests
+/// invoke this and then *drop the transaction without committing* to prove the
+/// three writes roll back together.
+pub fn finalize_within_tx(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    task: &ClaimedTask,
+    max_attempts: u32,
+    now: i64,
+    result: Result<serde_json::Value, String>,
+) -> SqliteResult<bool> {
+    let attempt_num = task.attempt + 1;
+    store::record_attempt(conn, exec_id, &task.name, attempt_num, &result)?;
+
+    match result {
+        Ok(output) => {
+            store::append_event(
+                conn,
+                exec_id,
+                &WorkflowEvent::ActivityCompleted {
+                    activity_id: task.activity_id,
+                    output,
+                },
+            )?;
+            queue::finish_task(conn, &task.task_id)?;
+            Ok(true)
+        }
+        Err(error) => {
+            if attempt_num < max_attempts {
+                // Retryable: bump the attempt counter and requeue at `now`.
+                // NOT recorded in the replayable event log (see module docs).
+                queue::requeue_task(conn, &task.task_id, attempt_num, now)?;
+                Ok(false)
+            } else {
+                // Exhausted: the terminal failure is workflow-visible, so it
+                // goes into the event log.
+                store::append_event(
+                    conn,
+                    exec_id,
+                    &WorkflowEvent::ActivityFailed {
+                        activity_id: task.activity_id,
+                        error,
+                        attempt: attempt_num,
+                        error_type: "Error".to_string(),
+                        non_retryable: false,
+                        details: None,
+                    },
+                )?;
+                queue::finish_task(conn, &task.task_id)?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// Fire one due timer atomically: append `TimerFired` and mark the timer row
+/// `fired` in a single transaction, so a crash never records the fired event
+/// without flipping the row — which would both re-fire the timer on restart and
+/// leave a stray non-lifecycle `TimerFired` in history.
+pub fn fire_timer(conn: &mut Connection, exec_id: ExecutionId, timer_id: &str) -> SqliteResult<()> {
+    let tx = conn.transaction()?;
+    fire_timer_within_tx(&tx, exec_id, timer_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The transactional body of [`fire_timer`], factored out so the append-vs-flag
+/// atomicity can be driven inside a caller-owned transaction (the timer-fire
+/// atomicity test invokes this then *drops the transaction* to prove both writes
+/// roll back together — a crash-between-append-and-flag double-fire is
+/// impossible).
+pub fn fire_timer_within_tx(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+) -> SqliteResult<()> {
+    store::append_event(
+        conn,
+        exec_id,
+        &WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(timer_id.to_string()),
+        },
+    )?;
+    queue::mark_timer_fired(conn, exec_id, timer_id)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use autumn_harvest::ActivityExecId;
+    use rusqlite::Connection;
+
+    use autumn_harvest::ExecutionId;
+
+    use super::{finalize_within_tx, fire_timer, fire_timer_within_tx};
+    use crate::queue::{self, ClaimedTask};
+    use crate::{schema, store};
+
+    fn open() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+        conn
+    }
+
+    fn seed_running_task(conn: &Connection, exec: ExecutionId, name: &str) -> ClaimedTask {
+        let act = ActivityExecId::new();
+        queue::enqueue_activity(conn, exec, act, name, &serde_json::json!({}), "default", 0)
+            .unwrap();
+        conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
+            .unwrap();
+        let task_id: String = conn
+            .query_row("SELECT task_id FROM harvest_tasks", [], |r| r.get(0))
+            .unwrap();
+        ClaimedTask {
+            task_id,
+            activity_id: act,
+            name: name.to_string(),
+            input: serde_json::json!({}),
+            attempt: 0,
+        }
+    }
+
+    // AC7: the terminal finalize is atomic — on rollback NEITHER the
+    // ActivityCompleted event nor the DONE transition persists, leaving the task
+    // RUNNING (re-runnable after orphan reclaim).
+    #[test]
+    fn finalize_rolls_back_terminal_event_and_task_transition_together() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+
+        {
+            let tx = conn.transaction().unwrap();
+            finalize_within_tx(&tx, exec, &task, 1, 0, Ok(serde_json::json!("done"))).unwrap();
+            // Drop `tx` WITHOUT commit → rollback.
+        }
+
+        assert!(
+            store::load_history(&conn, exec).unwrap().is_empty(),
+            "no ActivityCompleted must survive a rolled-back finalize"
+        );
+        assert_eq!(
+            queue::task_state(&conn, &task.task_id).unwrap().as_deref(),
+            Some("RUNNING"),
+            "task must stay RUNNING after a rolled-back finalize"
+        );
+    }
+
+    // AC7: on commit BOTH land together — a clean, terminal-only history and a
+    // DONE task row.
+    #[test]
+    fn finalize_commits_terminal_event_and_done_together() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+
+        {
+            let tx = conn.transaction().unwrap();
+            finalize_within_tx(&tx, exec, &task, 1, 0, Ok(serde_json::json!("done"))).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1, "exactly one terminal event");
+        assert!(matches!(
+            history[0],
+            autumn_harvest::WorkflowEvent::ActivityCompleted { .. }
+        ));
+        assert_eq!(
+            queue::task_state(&conn, &task.task_id).unwrap().as_deref(),
+            Some("DONE")
+        );
+    }
+
+    // A retryable failure requeues (no terminal event) and records the attempt —
+    // both inside the same finalize transaction.
+    #[test]
+    fn finalize_retryable_failure_requeues_without_terminal_event() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+
+        let produced =
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, Err("boom".into()))
+                .unwrap();
+
+        assert!(!produced, "a retry is not workflow-visible progress");
+        assert!(
+            store::load_history(&conn, exec).unwrap().is_empty(),
+            "a retryable failure must NOT reach the replayable log"
+        );
+        assert_eq!(
+            queue::task_state(&conn, &task.task_id).unwrap().as_deref(),
+            Some("PENDING"),
+            "a retryable failure requeues the task"
+        );
+        assert_eq!(store::load_attempts(&conn, exec, "act").unwrap().len(), 1);
+    }
+
+    // A due timer fire is atomic on commit: the TimerFired event and the `fired`
+    // flag land together.
+    #[test]
+    fn timer_fire_commits_event_and_flag_together() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        queue::enqueue_timer(&conn, exec, "t1", 0).unwrap();
+
+        fire_timer(&mut conn, exec, "t1").unwrap();
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            history[0],
+            autumn_harvest::WorkflowEvent::TimerFired { .. }
+        ));
+        assert!(
+            !queue::has_unfired_timer(&conn, exec).unwrap(),
+            "the fired timer must be marked"
+        );
+    }
+
+    // Timer-fire atomicity (correction #1): a crash between the TimerFired append
+    // and the `fired` flag update rolls BOTH back — the timer stays unfired (no
+    // double-fire) and no stray non-lifecycle TimerFired event survives.
+    #[test]
+    fn timer_fire_rolls_back_event_and_flag_together() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        queue::enqueue_timer(&conn, exec, "t1", 0).unwrap();
+
+        {
+            let tx = conn.transaction().unwrap();
+            fire_timer_within_tx(&tx, exec, "t1").unwrap();
+            // Drop `tx` WITHOUT commit → rollback (simulated crash-between).
+        }
+
+        assert!(
+            store::load_history(&conn, exec).unwrap().is_empty(),
+            "no stray TimerFired event may survive a rolled-back fire"
+        );
+        assert!(
+            queue::has_unfired_timer(&conn, exec).unwrap(),
+            "the timer must remain unfired (no double-fire)"
+        );
+    }
+}
