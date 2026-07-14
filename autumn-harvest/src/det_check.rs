@@ -960,20 +960,27 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         // body-local `use` imports (incl. an unnameable glob) — are
         // shadow-suppressed so a call to one is never resolved to a same-named
         // free helper (#778 review, zero-FP; #386 excludes fn pointers/closures).
-        // Suppression is **source-order-aware**: a `let`/`use` shadow only
-        // suppresses a call that comes AFTER it (a call before the binding
-        // resolves to the free helper, matching Rust); params bind for the whole
-        // body (#778, Codex P2/r6).
+        // Suppression differs by binding kind, matching Rust scoping:
+        //   * params bind for the whole body and always suppress;
+        //   * a `let` shadow is **source-order-aware** — it suppresses only a
+        //     call on a strictly-later source line (a call before the binding
+        //     resolves to the free helper);
+        //   * a body-local `use` import (and glob) shadows the name for the
+        //     **whole body** — a Rust block `use` item is in scope for the
+        //     entire enclosing block regardless of textual position, so a call
+        //     may precede the `use` and still resolve to the import (#778,
+        //     Codex r7). Only module/file-level `use` (outside the body) is
+        //     never a body shadow.
         let params: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
         let let_binding_lines = collect_body_let_binding_lines(&view);
-        let (use_binding_lines, glob_use_line) = collect_body_use_bindings(&view);
+        let (use_bindings, has_glob_use) = collect_body_use_bindings(&view);
         for callee in collect_direct_free_fn_calls(
             &view,
             &index,
             &params,
             &let_binding_lines,
-            &use_binding_lines,
-            glob_use_line,
+            &use_bindings,
+            has_glob_use,
         ) {
             if let Some(cands) = index.get(callee.as_str())
                 && let Some(idx) = resolve_helper(cands, fns, wf)
@@ -1044,22 +1051,27 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
 /// same-named free helper (#778 review, zero-FP; #386 excludes fn
 /// pointers/closures).
 ///
-/// Shadow suppression is **source-order-aware** (#778, Codex P2): `params` bind
-/// for the whole body and always suppress, but a `let` shadow (in
-/// `let_binding_lines`, name → earliest binding line) suppresses a call only
-/// when the binding's source line strictly PRECEDES the call — a call that runs
-/// before any same-name binding resolves to the free helper (matching Rust, and
-/// correct even for `let bad = bad();`, where the RHS call sees the outer fn).
+/// Shadow suppression matches Rust scoping by binding kind (#778, Codex P2/r7):
+/// `params` bind for the whole body and always suppress; a `let` shadow (in
+/// `let_binding_lines`, name → earliest binding line) is **source-order-aware**
+/// — it suppresses a call only when the binding's source line strictly PRECEDES
+/// the call (a call that runs before any same-name binding resolves to the free
+/// helper, matching Rust, and correct even for `let bad = bad();`, where the RHS
+/// call sees the outer fn).
 ///
-/// A **block-local `use` import** rebinds a name inside the body, so it is added
-/// to the shadow set the same source-order way (`use_binding_lines`, plus
-/// `glob_use_line` for an unnameable glob `use ...::*;` that suppresses every
-/// later call) — a call to a name a body-local `use` imports is never resolved
-/// to a same-module free helper (#778, Codex r6; the module/file-level `use` is
-/// not a body line, so the common top-of-file prelude case is unaffected).
+/// A **block-local `use` import** rebinds a name for the **whole body**, not
+/// source-order: a Rust block `use` item is in scope for the entire enclosing
+/// block regardless of textual position, so a bare call may PRECEDE the `use`
+/// and still resolve to the import. Any name in `use_bindings` (from an explicit
+/// / aliased / grouped body-local `use`) is therefore suppressed on every line,
+/// and `has_glob_use` (an unnameable glob `use ...::*;` anywhere in the body)
+/// conservatively suppresses every same-module call in the body — a call to such
+/// a name is never resolved to a same-module free helper (#778, Codex r6/r7; the
+/// module/file-level `use` is not a body line, so the common top-of-file prelude
+/// case is unaffected).
 ///
-/// The suppression is safe-direction: it only ever suppresses LESS than the old
-/// whole-body set, so it introduces no new false-positive. A shadow bound in an
+/// The suppression is safe-direction: it only ever suppresses (never adds a
+/// call), so it introduces no new false-positive. A `let` shadow bound in an
 /// inner block that has already closed before an outer call is still treated as
 /// in scope (source-order, not full brace-scope tracking); that over-suppresses
 /// the outer call, an accepted false-negative — never a false-positive.
@@ -1068,8 +1080,8 @@ fn collect_direct_free_fn_calls(
     candidates: &std::collections::HashMap<&str, Vec<usize>>,
     params: &std::collections::HashSet<String>,
     let_binding_lines: &std::collections::HashMap<String, u32>,
-    use_binding_lines: &std::collections::HashMap<String, u32>,
-    glob_use_line: Option<u32>,
+    use_bindings: &std::collections::HashSet<String>,
+    has_glob_use: bool,
 ) -> std::collections::BTreeSet<String> {
     let mut called = std::collections::BTreeSet::new();
     for &(src_line, line) in body {
@@ -1126,18 +1138,18 @@ fn collect_direct_free_fn_calls(
             };
             let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
             // Shadowed in scope at this call site? A param shadows everywhere; a
-            // `let` binding, a block-local `use` import, and a block-local glob
-            // `use ...::*;` each shadow only calls on a strictly-later source line
-            // (source-order, matching round 3 — a `use` shadows calls that appear
-            // AFTER it in the body; #778, Codex r6).
+            // `let` binding shadows only calls on a strictly-later source line
+            // (source-order, matching round 3). A block-local `use` import and a
+            // block-local glob `use ...::*;` shadow the name across the WHOLE
+            // body — a Rust block `use` item is in scope for the entire block
+            // regardless of position, so a call may precede the `use` and still
+            // resolve to the import (#778, Codex r7).
             let shadowed_here = params.contains(token)
                 || let_binding_lines
                     .get(token)
                     .is_some_and(|&bind_line| bind_line < src_line)
-                || use_binding_lines
-                    .get(token)
-                    .is_some_and(|&bind_line| bind_line < src_line)
-                || glob_use_line.is_some_and(|g| g < src_line);
+                || use_bindings.contains(token)
+                || has_glob_use;
             if first_ok && before_ok && after_ok && candidates.contains_key(token) && !shadowed_here
             {
                 called.insert(token.to_string());
@@ -1249,17 +1261,20 @@ fn collect_body_let_binding_lines(body: &[(u32, &str)]) -> std::collections::Has
     lines
 }
 
-/// Collects names bound by **block-local `use` imports** in a workflow body,
-/// each mapped to the EARLIEST source line it is bound on (source-order
-/// suppression, like [`collect_body_let_binding_lines`]), plus the earliest line
-/// carrying a **glob** `use ...::*;`. A glob names no specific binding, so it is
-/// treated conservatively as shadowing every same-module call that comes AFTER
-/// it in the body (safe-direction over-suppression, never a false positive).
+/// Collects the set of names bound by **block-local `use` imports** anywhere in
+/// a workflow body, plus whether the body contains any **glob** `use ...::*;`.
+/// Unlike the `let` collector, this is presence-based (no source line): a Rust
+/// block `use` item is in scope for the entire enclosing block regardless of
+/// textual position, so a bare call may PRECEDE the `use` and still resolve to
+/// the import — the shadow must apply to the WHOLE body, not just later lines
+/// (#778, Codex r7). A glob names no specific binding, so `has_glob_use`
+/// conservatively suppresses every same-module call in the body (safe-direction
+/// over-suppression, never a false positive; block-local globs are rare).
 ///
 /// A body-local `use crate::x::helper;` rebinds `helper` to a clean import, so
 /// Rust resolves a bare `helper()` call to the import, not a same-module sibling
 /// `fn helper` — the same-module resolver must not walk the sibling (#778,
-/// Codex r6). Only `use` statements INSIDE the body are seen (`extract_fn_body`
+/// Codex r6/r7). Only `use` statements INSIDE the body are seen (`extract_fn_body`
 /// captures body lines only), so a module/file-level `use` — including the
 /// common top-of-file prelude glob — is never a body shadow by construction.
 ///
@@ -1267,12 +1282,10 @@ fn collect_body_let_binding_lines(body: &[(u32, &str)]) -> std::collections::Has
 /// under-collection (matching the `let` collector). A `use<'a>` precise-capture
 /// clause (edition 2024 RPIT) is ignored — an import always has whitespace after
 /// the `use` keyword.
-fn collect_body_use_bindings(
-    body: &[(u32, &str)],
-) -> (std::collections::HashMap<String, u32>, Option<u32>) {
-    let mut names: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut glob_line: Option<u32> = None;
-    for &(src_line, line) in body {
+fn collect_body_use_bindings(body: &[(u32, &str)]) -> (std::collections::HashSet<String>, bool) {
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut has_glob = false;
+    for &(_src_line, line) in body {
         let code = strip_unparseable_content(line);
         for pos in word_positions(&code, "use") {
             let after = &code[pos + 3..];
@@ -1284,17 +1297,12 @@ fn collect_body_use_bindings(
             let use_body = after.find(';').map_or(after, |end| &after[..end]);
             let (bound, is_glob) = parse_use_bindings(use_body);
             if is_glob {
-                glob_line = Some(glob_line.map_or(src_line, |g| g.min(src_line)));
+                has_glob = true;
             }
-            for id in bound {
-                names
-                    .entry(id)
-                    .and_modify(|l| *l = (*l).min(src_line))
-                    .or_insert(src_line);
-            }
+            names.extend(bound);
         }
     }
-    (names, glob_line)
+    (names, has_glob)
 }
 
 /// Parses the text of a single `use` statement (everything after `use`, up to

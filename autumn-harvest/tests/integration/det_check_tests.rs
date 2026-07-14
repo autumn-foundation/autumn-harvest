@@ -3244,6 +3244,64 @@ mod m {
 }
 
 #[test]
+fn block_use_shadows_a_call_before_the_use_statement() {
+    // Codex r7: a Rust block `use` item is in scope for the ENTIRE enclosing
+    // block regardless of textual position, so a bare `helper()` call that
+    // PRECEDES the block `use crate::pure::helper;` still resolves to the
+    // import — not the same-module `fn helper`. Source-order suppression (r6)
+    // wrongly kept flagging this; whole-body `use` shadowing fixes the FP → NO
+    // DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        use crate::pure::helper;
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local `use crate::pure::helper;` shadows the same-module `helper` \
+         across the WHOLE body (Rust block-item scope), including a call that \
+         precedes the `use`, so no DET001 FP, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_glob_use_shadows_a_call_before_the_glob() {
+    // r7: a body-local glob `use crate::pure::*;` conservatively suppresses
+    // same-module resolution across the WHOLE body — including a call that
+    // precedes the glob (block-item scope, safe-direction) → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        use crate::pure::*;
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a body-local glob `use crate::pure::*;` conservatively suppresses a \
+         same-module call that precedes it (whole-body, safe-direction), got: {report:?}"
+    );
+}
+
+#[test]
 fn same_module_call_without_block_local_use_is_still_resolved() {
     // REGRESSION guard (FIX E must not over-suppress): a genuine same-module call
     // with NO block-local `use helper` must still resolve and flag (r5 must survive).
