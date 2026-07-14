@@ -27,6 +27,9 @@ metrics-rs = ["dep:metrics"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
+# Sandboxed WebAssembly activities (issue #965). Pulls wasmtime + wat only when
+# explicitly enabled; requires the `db` feature (activity events are persisted).
+wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.4.0", path = "../autumn-harvest-macros" }
@@ -58,6 +61,8 @@ scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 metrics = { version = "0.24", optional = true }
 schemars = { version = "0.8", optional = true }
+wasmtime = { version = "46", optional = true }
+wat = { version = "1", optional = true }
 
 [[test]]
 name = "integration"
