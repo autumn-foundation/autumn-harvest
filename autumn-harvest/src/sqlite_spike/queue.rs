@@ -226,6 +226,22 @@ pub(super) fn mark_timer_fired(
     Ok(())
 }
 
+/// The greatest `fire_at` among all *fired* timers (across every execution), or
+/// `0` if none. A belt-and-braces lower bound for restoring the virtual clock on
+/// [`open`](super::SqliteRuntime::open): a fired timer proves the clock once
+/// reached its deadline, so the restored clock must never regress below it — even
+/// if the explicit clock write was somehow lost. The primary restore is the
+/// persisted [`store::load_clock`](super::store::load_clock); this only guards
+/// against that being absent/stale.
+pub(super) fn max_fired_timer_deadline(conn: &Connection) -> Result<i64, SpikeError> {
+    let v: Option<i64> = conn.query_row(
+        "SELECT MAX(fire_at) FROM spike_timers WHERE fired = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(v.unwrap_or(0))
+}
+
 // ── Introspection (tests) ──────────────────────────────────────────────────────
 
 /// The `activity_id`s of every task-queue row (any state) for `exec_id`, in FIFO
@@ -255,6 +271,26 @@ pub(super) fn armed_timer_ids(
 ) -> Result<Vec<String>, SpikeError> {
     let mut stmt = conn.prepare(
         "SELECT timer_id FROM spike_timers WHERE exec_id = ?1 AND fired = 0 ORDER BY fire_at",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// The `timer_id`s of every *fired* durable timer for `exec_id`. Paired with the
+/// history's `TimerFired` events this asserts timer-fire atomicity: the
+/// `TimerFired` append + `fired = 1` flag commit in one transaction, so a
+/// `TimerFired` event is never durable without its `fired = 1` row — a reload can
+/// therefore never re-fire it and append a stray duplicate `TimerFired`.
+pub(super) fn fired_timer_ids(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> Result<Vec<String>, SpikeError> {
+    let mut stmt = conn.prepare(
+        "SELECT timer_id FROM spike_timers WHERE exec_id = ?1 AND fired = 1 ORDER BY fire_at",
     )?;
     let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();

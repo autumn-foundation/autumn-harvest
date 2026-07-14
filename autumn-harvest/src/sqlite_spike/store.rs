@@ -230,6 +230,35 @@ pub(super) fn load_attempts(
     Ok(out)
 }
 
+// ── Durable virtual clock ────────────────────────────────────────────────────
+
+/// Load the persisted virtual clock (epoch seconds), defaulting to `0` on a
+/// fresh database. Restoring this on [`open`](super::SqliteRuntime::open) is what
+/// keeps a timer armed at a non-zero logical time firing after a restart — timers
+/// store an *absolute* `fire_at`, so resetting the clock to 0 would leave a
+/// later-armed timer permanently not-yet-due.
+pub(super) fn load_clock(conn: &Connection) -> Result<i64, SpikeError> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM spike_meta WHERE key = 'clock'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(v.unwrap_or(0))
+}
+
+/// Persist the virtual clock so a subsequent [`open`](super::SqliteRuntime::open)
+/// restores it. Written whenever the clock advances.
+pub(super) fn persist_clock(conn: &Connection, clock: i64) -> Result<(), SpikeError> {
+    conn.execute(
+        "INSERT INTO spike_meta (key, value) VALUES ('clock', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![clock],
+    )?;
+    Ok(())
+}
+
 // ── Inbound signals ──────────────────────────────────────────────────────────
 
 pub(super) fn stage_signal(

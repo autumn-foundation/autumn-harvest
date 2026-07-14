@@ -26,15 +26,25 @@
 //!    leave a scheduled-event without its queue/timer row — then run the
 //!    [`worker`] pass to execute ready activities and fire due timers, appending
 //!    each activity's post-body persistence (attempt audit + terminal event +
-//!    task-state flip) atomically in one transaction too.
-//! 3. Repeat until the run reports `Completed`/`Failed`, or until a full cycle
-//!    makes no progress (blocked on a not-yet-due timer or an undelivered
-//!    signal).
+//!    task-state flip) and each timer's fire (`TimerFired` event + `fired = 1`
+//!    flag) atomically in one transaction too.
+//! 3. Repeat until the run reports `Completed`/`Failed` — the terminal event and
+//!    the execution-state flip likewise commit in one transaction, so a crash
+//!    can never re-run a run that already appended its terminal event — or until
+//!    a full cycle makes no progress (blocked on a not-yet-due timer or an
+//!    undelivered signal).
+//!
+//! **Every event append is committed together with its companion durable state
+//! mutation** — the paired queue/timer row insert, the fired-timer flag, the
+//! signal `delivered` flag, the terminal execution-state flip, and (at start) the
+//! execution row — so no crash window can leave the two out of sync.
 //!
 //! A "crash" is modelled by dropping the runtime and its `SQLite` connection, then
 //! opening a fresh [`SqliteRuntime`] on the same file: deterministic replay
 //! reproduces the identical command stream from the durable history, so no
-//! activity is re-executed and no work is lost.
+//! activity is re-executed and no work is lost. The virtual clock is itself
+//! durable (persisted on every advance, restored on open), so a timer armed at a
+//! non-zero logical time still fires after a restart.
 
 // Throwaway R&D module: keep the owned-value public API ergonomic (callers pass
 // owned `serde_json::Value`/`Vec` payloads straight through) and skip the
@@ -184,11 +194,19 @@ impl SqliteRuntime {
     pub fn open(path: &str) -> Result<Self, SpikeError> {
         let conn = Connection::open(path)?;
         conn.execute_batch(schema::SCHEMA)?;
+        // Restore the durable virtual clock so timers armed at a non-zero logical
+        // time still fire after a restart. Timers store an *absolute* `fire_at`;
+        // resetting the clock to 0 here would leave any timer armed after the
+        // clock advanced permanently not-yet-due. Belt-and-braces: never regress
+        // below the deadline of an already-FIRED timer (the clock provably reached
+        // it), guarding against a lost clock write — the persisted value is the
+        // primary source.
+        let clock = store::load_clock(&conn)?.max(queue::max_fired_timer_deadline(&conn)?);
         Ok(Self {
             conn,
             workflows: HashMap::new(),
             activities: HashMap::new(),
-            clock: 0,
+            clock,
         })
     }
 
@@ -203,9 +221,16 @@ impl SqliteRuntime {
         self.activities.insert(name.into(), spec);
     }
 
-    /// Advance the virtual clock by `secs` seconds (drives durable timers).
-    pub const fn advance_time(&mut self, secs: i64) {
-        self.clock += secs;
+    /// Advance the virtual clock by `secs` seconds (drives durable timers) and
+    /// **persist** the new value so a subsequent [`Self::open`] restores it. The
+    /// durable write is what keeps a timer armed at a non-zero logical time firing
+    /// across a restart. The new value is persisted *before* the in-memory clock
+    /// is updated, so a failed write leaves the two consistent.
+    pub fn advance_time(&mut self, secs: i64) -> Result<(), SpikeError> {
+        let new = self.clock.saturating_add(secs);
+        store::persist_clock(&self.conn, new)?;
+        self.clock = new;
+        Ok(())
     }
 
     /// Start a fresh workflow execution, appending its `WorkflowStarted` event.
@@ -218,12 +243,17 @@ impl SqliteRuntime {
             return Err(SpikeError::UnknownWorkflow(workflow_name.to_string()));
         }
         let exec = ExecutionId::new();
-        store::insert_execution(&self.conn, exec, workflow_name, &input)?;
+        // Execution row + its `WorkflowStarted` event commit in ONE transaction,
+        // so a crash between them can never leave a RUNNING execution with no
+        // history (which would reload with an empty, start-marker-less log).
+        let tx = self.conn.transaction()?;
+        store::insert_execution(&tx, exec, workflow_name, &input)?;
         store::append_event(
-            &self.conn,
+            &tx,
             exec,
             &WorkflowEvent::workflow_started(input, chrono::Utc::now()),
         )?;
+        tx.commit()?;
         Ok(exec)
     }
 
@@ -240,10 +270,14 @@ impl SqliteRuntime {
             return Err(SpikeError::UnknownWorkflow(workflow_name.to_string()));
         }
         let exec = ExecutionId::new();
-        store::insert_execution(&self.conn, exec, workflow_name, &input)?;
+        // Execution row + the whole imported history commit in ONE transaction,
+        // so a crash mid-import can never leave a partial (torn) history.
+        let tx = self.conn.transaction()?;
+        store::insert_execution(&tx, exec, workflow_name, &input)?;
         for event in &events {
-            store::append_event(&self.conn, exec, event)?;
+            store::append_event(&tx, exec, event)?;
         }
+        tx.commit()?;
         Ok(exec)
     }
 
@@ -285,6 +319,15 @@ impl SqliteRuntime {
     /// invariant — every `TimerStarted` event has a matching `spike_timers` row.
     pub fn armed_timer_ids(&self, exec: ExecutionId) -> Result<Vec<String>, SpikeError> {
         queue::armed_timer_ids(&self.conn, exec)
+    }
+
+    /// Introspection (tests): the `timer_id`s of every *fired* durable timer for
+    /// `exec`. Paired with [`Self::load_history`]'s `TimerFired` events this
+    /// asserts timer-fire atomicity — the `TimerFired` append and its `fired = 1`
+    /// flag commit together, so a reload never re-fires an already-fired timer
+    /// (which would append a stray duplicate `TimerFired`).
+    pub fn fired_timer_ids(&self, exec: ExecutionId) -> Result<Vec<String>, SpikeError> {
+        queue::fired_timer_ids(&self.conn, exec)
     }
 
     /// Drive `exec` to a terminal state or an external-input block.
@@ -329,23 +372,30 @@ impl SqliteRuntime {
 
         match outcome {
             WorkflowOutcome::Completed { output, .. } => {
+                // Terminal event + execution-state flip in ONE transaction. A
+                // crash between them would leave a `WorkflowCompleted` event in
+                // history while the row stayed RUNNING — on reload the top-of-cycle
+                // "already terminal?" check would miss it, re-run the workflow, and
+                // append a SECOND `WorkflowCompleted` (duplicate terminal).
+                let tx = self.conn.transaction()?;
                 store::append_event(
-                    &self.conn,
+                    &tx,
                     exec,
                     &WorkflowEvent::WorkflowCompleted {
                         output: output.clone(),
                     },
                 )?;
-                store::set_completed(&self.conn, exec, &output)?;
+                store::set_completed(&tx, exec, &output)?;
+                tx.commit()?;
                 Ok(RunState::Completed(output))
             }
             WorkflowOutcome::Failed { error, .. } => {
-                store::append_event(
-                    &self.conn,
-                    exec,
-                    &WorkflowEvent::workflow_failed(error.clone()),
-                )?;
-                store::set_failed(&self.conn, exec, &error)?;
+                // Terminal event + state flip in ONE transaction (same duplicate-
+                // terminal hazard as the completed arm above).
+                let tx = self.conn.transaction()?;
+                store::append_event(&tx, exec, &WorkflowEvent::workflow_failed(error.clone()))?;
+                store::set_failed(&tx, exec, &error)?;
+                tx.commit()?;
                 Ok(RunState::Failed(error))
             }
             WorkflowOutcome::ContinuedAsNew { .. } => {

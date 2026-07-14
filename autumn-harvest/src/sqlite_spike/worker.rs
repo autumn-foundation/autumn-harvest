@@ -15,6 +15,11 @@
 //! task can never be left in a half-state (terminal event appended but task
 //! still `RUNNING`); the one residual window is a crash *mid-body* (§5.1).
 //!
+//! **Atomic timer firing.** Likewise, each due timer's `TimerFired` append and
+//! its `fired = 1` flag commit in one transaction — so a crash can never leave a
+//! `TimerFired` event durable with `fired = 0`, which a reload would re-fire into
+//! a stray duplicate `TimerFired`.
+//!
 //! **Retry model (a genuine spike finding).** A *retryable* activity failure is
 //! recorded in the [`spike_activity_attempts`](super::schema) audit table and the
 //! task-queue row's `attempt` counter — it is **not** appended to the replayable
@@ -120,16 +125,25 @@ pub(super) fn drain_ready(
         tx.commit()?;
     }
 
-    // Fire due timers.
+    // Fire due timers. Each timer's `TimerFired` append + `fired = 1` flag commit
+    // in ONE transaction (`due_timers` already collected the ids into an owned
+    // Vec, releasing its borrow, so the loop can take `conn` mutably per timer).
+    // Without this atomicity a crash between the two autocommits would leave the
+    // `TimerFired` event durable with `fired = 0`, so a reload's `due_timers` scan
+    // re-fires the timer and appends a stray SECOND `TimerFired` — corrupting the
+    // replayable history with a non-lifecycle event the workflow consumed only
+    // once.
     for timer_id in queue::due_timers(conn, exec_id, now)? {
+        let tx = conn.transaction()?;
         store::append_event(
-            conn,
+            &tx,
             exec_id,
             &WorkflowEvent::TimerFired {
                 timer_id: crate::types::TimerId::new(timer_id.clone()),
             },
         )?;
-        queue::mark_timer_fired(conn, exec_id, &timer_id)?;
+        queue::mark_timer_fired(&tx, exec_id, &timer_id)?;
+        tx.commit()?;
         produced = true;
     }
 

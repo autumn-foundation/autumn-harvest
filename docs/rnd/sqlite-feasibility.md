@@ -257,25 +257,52 @@ modelled by dropping the runtime + its SQLite connection and reopening on the
 same file — deterministic replay reproduces the identical command stream, so no
 activity is re-executed.
 
-**Persistence model — atomic per-cycle, with one honest residual window.** The
-per-decision-cycle persistence is **transactional**. The single-writer
-`BEGIN…COMMIT` is doing double duty: besides substituting for `SKIP LOCKED` (one
-writer, no claim race), it gives **atomic multi-row persistence**, mirroring the
-Postgres engine, which persists an event and its task-queue row in one
-transaction. Two windows a naive per-command-autocommit implementation would
-leave open are therefore **closed**:
+**Persistence model — every event append is atomic with its companion state
+mutation, with one honest residual window.** The persistence is **transactional
+throughout**. The single-writer `BEGIN…COMMIT` is doing double duty: besides
+substituting for `SKIP LOCKED` (one writer, no claim race), it gives **atomic
+multi-row persistence**, mirroring the Postgres engine, which persists an event
+and its task-queue row in one transaction. A full audit of every site that
+appends a `WorkflowEvent` alongside a companion durable state mutation confirms
+each pair now commits in **one** transaction — none is left as a pair of separate
+autocommits:
 
 - *Append-before-enqueue* (the apply side, `apply_commands`). A decision cycle's
-  derived event and its paired task/timer row commit in **one** transaction, so a
+  derived event and its paired task/timer row commit in one transaction, so a
   crash can never leave history saying an activity/timer is scheduled while its
   `spike_tasks`/`spike_timers` row is missing. (Before the fix this stranded the
   reload at `SpikeError::Stuck`: replay re-derived a `WaitForActivity` whose wait
-  branch enqueued nothing.)
+  branch enqueued nothing.) The staged-signal path — `take_pending_signal`'s
+  `delivered = 1` flag + the `SignalReceived` append — shares this same batch
+  transaction.
 - *Result-before-finish* (the drain side, `drain_ready`). A drained activity's
   terminal `ActivityCompleted`/`ActivityFailed` event and its task-state flip
-  (plus the attempt audit row), or the retry requeue, commit in **one**
-  transaction, so the task is never left "terminal event appended but row still
-  `RUNNING`," and a retry is never half-recorded.
+  (plus the attempt audit row), or the retry requeue, commit in one transaction,
+  so the task is never left "terminal event appended but row still `RUNNING`,"
+  and a retry is never half-recorded.
+- *Fire-before-flag* (timer firing, `drain_ready`). Each due timer's `TimerFired`
+  append + `fired = 1` flag commit in one transaction. Before the fix these were
+  separate autocommits: a crash between them left the `TimerFired` event durable
+  with `fired = 0`, so the reload's `due_timers` scan re-fired the timer and
+  appended a stray **second** `TimerFired` — a non-lifecycle event the workflow
+  consumed only once, which would later diverge replay.
+- *Terminal event before state flip* (`drive_one_cycle`). The `WorkflowCompleted`
+  /`WorkflowFailed` event + the execution-state flip commit in one transaction.
+  Before the fix a crash between them left the terminal event in history while the
+  row stayed `RUNNING`; the reload's top-of-cycle "already terminal?" check would
+  miss it, re-run the workflow, and append a **duplicate** terminal event.
+- *Start row before start event* (`start_workflow`, `import_execution`). The
+  execution row + its `WorkflowStarted` event (or the whole imported history)
+  commit in one transaction, so a crash mid-start can never leave a `RUNNING`
+  execution with a missing or torn history.
+
+**The virtual clock is itself durable.** It is persisted on every advance
+(`spike_meta`) and restored on `open` (belt-and-braces: never below any
+already-fired timer's deadline). Timers store an **absolute** `fire_at`, so a
+prior implementation that reset the clock to 0 on reopen left any timer armed at a
+non-zero logical time permanently not-yet-due — a durability bug for the very
+timer-across-restart property the spike exists to prove. It now holds for timers
+armed at **any** logical time, not just the first.
 
 The **one residual window** is a crash *while the activity body itself is
 mid-execution* — after the task is claimed `RUNNING` but before the post-body
@@ -289,16 +316,20 @@ spike, which has no other worker and so no heartbeat-timeout or poison-pill
 reclaimer. A productized edge runtime would recover it exactly as the Postgres
 engine already does — the heartbeat-timeout scanner (`timeout.rs`) + poison-pill
 reclaim (`poison_pill.rs`) — which is out of a single-process spike's scope. The
-prototype's atomicity is asserted directly by two tests
+prototype's atomicity is asserted directly by four tests
 (`scenario_atomic_persist_event_and_row_never_out_of_sync` — the event/row
-invariant survives a reload; and
+invariant survives a reload;
 `scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` — a
-batch that fails partway rolls back *both* the event and its row).
+batch that fails partway rolls back *both* the event and its row;
+`scenario_timer_fire_is_atomic_no_double_fire_across_reload` — a fired timer's
+event and `fired = 1` row agree across a reload, so it is never re-fired; and
+`scenario_two_timers_second_fires_across_restart_via_durable_clock` — a timer
+armed at a non-zero logical time fires after a restart via the durable clock).
 
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **9 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **11 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -312,6 +343,8 @@ sqlite-spike,testing --test integration sqlite_spike` → **9 passed; 0 failed**
 | `scenario_pg_shaped_history_replays_on_sqlite` | **(executed, "vice versa")** A hand-built, genuinely **PG-shaped** history — `WorkflowStarted → ActivityScheduled → ActivityStarted → ActivityCompleted`, *including* the `ActivityStarted` event the spike itself never writes — is imported into a fresh SQLite runtime and drives the prototype's own reload path: it resumes deterministically to the identical output with the already-completed activity **not** re-executed. Closes the §5.3 gap that no `ActivityStarted`-bearing PG history had actually been pushed through the prototype. |
 | `scenario_atomic_persist_event_and_row_never_out_of_sync` | **(Codex P1 regression)** Across a reload, every `TimerStarted`/`ActivityScheduled` event is observed together with its `spike_timers`/`spike_tasks` row — never one without the other. Guards the cross-table invariant the atomic per-cycle transaction (§5.1) upholds. |
 | `scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` | **(Codex P1 regression, both-or-neither)** A `[ScheduleActivity, StartChildWorkflow]` batch appends+enqueues the activity, then hits the unsupported child command and returns `Err`, dropping the uncommitted transaction — **neither** the `ActivityScheduled` event **nor** its task row persists. Fails on the pre-fix per-command-autocommit code (where the activity event + row would have committed before the unsupported command was reached). |
+| `scenario_timer_fire_is_atomic_no_double_fire_across_reload` | **(Codex P1 regression)** A fired timer's `TimerFired` event and its `fired = 1` row agree — including across a reopen, where `due_timers` then finds nothing to re-fire (exactly one `TimerFired`). Guards against the pre-fix separate-autocommit window that re-fired the timer into a stray duplicate `TimerFired`. |
+| `scenario_two_timers_second_fires_across_restart_via_durable_clock` | **(Codex P1 regression)** A workflow fires a first timer (advancing the virtual clock), arms a second timer at that advanced clock (absolute `fire_at = 10`), advances *part-way* (to 8, captured only by the durable clock — not the fired-timer floor of 5), then **restarts**; advancing 2 more reaches 10 and the second timer fires. Fails on the pre-fix code that reset the clock to 0 on reopen (the second timer would never become due). |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 

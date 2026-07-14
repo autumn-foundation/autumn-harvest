@@ -36,19 +36,29 @@ falls entirely on the shipped Postgres hot path).
   embedded SQLite: single-writer `BEGIN IMMEDIATE` claim substitutes for
   `SELECT … FOR UPDATE SKIP LOCKED`; polling substitutes for LISTEN/NOTIFY;
   app-minted UUIDs substitute for `gen_random_uuid()`; explicit epoch `fire_at`
-  columns substitute for `INTERVAL` deadline arithmetic. **Per-decision-cycle
-  persistence is transactional** (Codex P1 durability fix): a cycle's derived
-  event and its paired task/timer row commit in one `SQLite` transaction
-  (`apply_commands`), and a drained activity's terminal event + task-state flip
-  commit in one transaction (`drain_ready`), mirroring the PG engine, which
-  persists an event and its task-queue row together. This closes the
-  append-before-enqueue and result-before-finish crash windows (which previously
-  wedged the reload at `SpikeError::Stuck`); the sole residual window is a crash
-  *mid-body*, which a productized runtime would recover via the engine's
-  heartbeat-timeout + poison-pill reclaimer (out of a single-process spike's
-  scope).
-- **A 9-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (9/9 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+  columns substitute for `INTERVAL` deadline arithmetic. **Every event append is
+  committed atomically with its companion durable state mutation** (Codex P1
+  durability fixes, closed convergently via a full audit of the append+state
+  class): a cycle's derived event and its paired task/timer row
+  (`apply_commands`); a drained activity's terminal event + task-state flip
+  (`drain_ready`); the staged-signal `delivered` flag + `SignalReceived` append;
+  each due timer's `TimerFired` event + `fired = 1` flag (`drain_ready` — a later
+  Codex P1: separate autocommits previously re-fired a timer into a stray
+  duplicate `TimerFired` after a crash); the terminal `WorkflowCompleted`/
+  `WorkflowFailed` event + execution-state flip (`drive_one_cycle` — separate
+  autocommits previously re-ran a run into a duplicate terminal); and the start
+  execution-row + `WorkflowStarted` event (`start_workflow`/`import_execution`).
+  **The virtual clock is itself durable** (Codex P1): persisted on every advance
+  (`spike_meta`) and restored on `open` (belt-and-braces: never below any
+  already-fired timer's deadline) — timers store an *absolute* `fire_at`, so the
+  prior reset-to-0-on-reopen left a timer armed at a non-zero logical time
+  permanently not-yet-due. This closes the append-before-enqueue,
+  result-before-finish, fire-before-flag, terminal-event-before-state-flip, and
+  clock-reset windows; the sole residual window is a crash *mid activity-body*,
+  which a productized runtime would recover via the engine's heartbeat-timeout +
+  poison-pill reclaimer (out of a single-process spike's scope).
+- **An 11-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (11/11 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays
@@ -57,12 +67,18 @@ falls entirely on the shipped Postgres hot path).
   the identical outcome with no duplicate activity execution (both backends
   serialize the same `WorkflowEvent` via `serde_json`; histories are
   replay-equivalent, not byte-identical event streams, because the matcher skips
-  `ActivityStarted`) — **plus two persistence-atomicity regression tests**: the
+  `ActivityStarted`) — **plus four persistence-durability regression tests**: the
   event/queue-timer-row invariant survives a reload
-  (`scenario_atomic_persist_event_and_row_never_out_of_sync`), and a batch that
-  fails partway rolls back *both* the event and its row
+  (`scenario_atomic_persist_event_and_row_never_out_of_sync`); a batch that fails
+  partway rolls back *both* the event and its row
   (`scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` —
-  a both-or-neither proof that fails on the pre-fix per-command-autocommit code).
+  a both-or-neither proof that fails on the pre-fix per-command-autocommit code);
+  a fired timer's `TimerFired` event and `fired = 1` row agree across a reload so
+  it is never re-fired (`scenario_timer_fire_is_atomic_no_double_fire_across_reload`);
+  and a timer armed at a non-zero logical time fires after a restart via the
+  durable clock (`scenario_two_timers_second_fires_across_restart_via_durable_clock`
+  — a part-way advance isolates the persisted-clock fix from the fired-timer floor;
+  fails on the pre-fix clock-reset-to-0-on-reopen code).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`

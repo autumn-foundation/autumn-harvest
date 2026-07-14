@@ -37,6 +37,18 @@ async fn timer_then_done(ctx: &WorkflowContext, _n: i64) -> Result<String, Strin
     Ok("woke_up".to_string())
 }
 
+/// Arm a durable timer, wait for it, then arm a SECOND durable timer (at the
+/// advanced logical time) and wait for that too. Used by the durable-clock
+/// regression: the second timer's absolute `fire_at` is relative to the clock
+/// value at *its* arm time, so a restart must restore the clock rather than reset
+/// it to 0 or the second timer never becomes due.
+#[workflow]
+async fn two_timers(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    ctx.timer("first", 5).await.map_err(|e| e.to_string())?;
+    ctx.timer("second", 5).await.map_err(|e| e.to_string())?;
+    Ok("both_fired".to_string())
+}
+
 /// Wait for a signal, then echo its payload. Used by the signal-delivery scenario.
 #[workflow]
 async fn wait_then_echo(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
@@ -98,6 +110,31 @@ fn assert_timers_match_events(rt: &SqliteRuntime, exec: ExecutionId) {
         armed.len(),
         started,
         "every armed timer row corresponds to a TimerStarted event and vice versa"
+    );
+}
+
+/// Cross-table invariant (timer-fire atomicity): every `TimerFired` event in the
+/// durable history has a matching `fired = 1` row in `spike_timers` — the atomic
+/// `TimerFired` append + `fired = 1` flag never commits one without the other, so
+/// a reload can never re-fire an already-fired timer (which would append a stray
+/// duplicate `TimerFired` to the replayable log).
+fn assert_fired_timers_match_events(rt: &SqliteRuntime, exec: ExecutionId) {
+    let events = rt.load_history(exec).unwrap();
+    let fired: std::collections::HashSet<String> =
+        rt.fired_timer_ids(exec).unwrap().into_iter().collect();
+    let fired_events = count_events(&events, |e| matches!(e, WorkflowEvent::TimerFired { .. }));
+    for e in &events {
+        if let WorkflowEvent::TimerFired { timer_id } = e {
+            assert!(
+                fired.contains(&timer_id.to_string()),
+                "TimerFired {timer_id:?} has no matching fired=1 spike_timers row"
+            );
+        }
+    }
+    assert_eq!(
+        fired.len(),
+        fired_events,
+        "every fired timer row corresponds to a TimerFired event and vice versa"
     );
 }
 
@@ -213,7 +250,7 @@ async fn scenario_2_timer_fires_across_restart() {
     // deadline; the durable timer must fire and the workflow must complete.
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&timer_then_done_info());
-    rt.advance_time(5);
+    rt.advance_time(5).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
 
     assert!(
@@ -229,6 +266,122 @@ async fn scenario_2_timer_fires_across_restart() {
         count_events(&events, |e| matches!(e, WorkflowEvent::TimerFired { .. })),
         1
     );
+    // Timer-fire atomicity: the fired timer's event and its `fired = 1` row agree.
+    assert_fired_timers_match_events(&rt, exec);
+}
+
+// ── FIX 1 regression: timer-fire is atomic (TimerFired event + fired=1 flag) ──
+//
+// Before the fix, `drain_ready` appended the `TimerFired` event and set the
+// `fired = 1` flag in SEPARATE autocommits. A crash between them would leave the
+// event durable with `fired = 0`, so a reload's `due_timers` scan re-fired the
+// timer and appended a stray SECOND `TimerFired` — corrupting the replayable log
+// with a non-lifecycle event the workflow consumed only once. The append + flag
+// now commit in one transaction, so the invariant "a durable `TimerFired` always
+// has its `fired = 1` row" holds — including across a reopen, where `due_timers`
+// then finds nothing to re-fire.
+#[tokio::test]
+async fn scenario_timer_fire_is_atomic_no_double_fire_across_reload() {
+    let (_dir, path) = temp_db();
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&timer_then_done_info());
+        let exec = rt.start_workflow("timer_then_done", json!(0)).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked(exec).await.unwrap(),
+            RunState::WaitingTimer
+        ));
+        rt.advance_time(5).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked(exec).await.unwrap(),
+            RunState::Completed(_)
+        ));
+        // The fired timer's event and its `fired = 1` row agree.
+        assert_fired_timers_match_events(&rt, exec);
+        exec
+    };
+
+    // Reopen (== restart): exactly one `TimerFired`, and the flag survived with
+    // it, so `due_timers` finds nothing to re-fire — no stray duplicate.
+    let rt = SqliteRuntime::open(&path).unwrap();
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        count_events(&events, |e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        1,
+        "exactly one TimerFired — never re-fired across reload"
+    );
+    assert_fired_timers_match_events(&rt, exec);
+}
+
+// ── FIX 2 regression: the virtual clock is durably restored across a restart ──
+//
+// A workflow arms+fires a FIRST timer (advancing the virtual clock), then arms a
+// SECOND timer whose absolute deadline (`fire_at = 10`) is relative to that
+// advanced clock. Crucially the runtime then advances the clock *part-way* toward
+// the second deadline (to 8 < 10) — progress captured ONLY by the durable clock,
+// NOT by the belt-and-braces fired-timer floor (still 5) — before restarting.
+// Before the fix, `open` reset the clock to 0, so advancing 2 more only reached
+// logical time 2 (≪ 10) and the second timer never fired; the run wedged at
+// `WaitingTimer` forever. With the durable clock the restart restores logical
+// time 8, and +2 reaches 10, firing the second timer and completing the run. (The
+// part-way advance is what makes this isolate the *persisted-clock* fix rather
+// than being masked by the fired-timer floor.)
+#[tokio::test]
+async fn scenario_two_timers_second_fires_across_restart_via_durable_clock() {
+    let (_dir, path) = temp_db();
+
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&two_timers_info());
+        let exec = rt.start_workflow("two_timers", json!(0)).unwrap();
+
+        // Block on the first timer (fire_at = 0 + 5 = 5).
+        assert!(matches!(
+            rt.run_until_blocked(exec).await.unwrap(),
+            RunState::WaitingTimer
+        ));
+        // Fire the first timer; the workflow arms the second at the advanced clock
+        // (fire_at = 5 + 5 = 10) and blocks on it.
+        rt.advance_time(5).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked(exec).await.unwrap(),
+            RunState::WaitingTimer
+        ));
+        // Advance PART-WAY toward the second deadline (clock = 8, still < 10). This
+        // progress lives only in the durable clock — the fired-timer floor is 5.
+        rt.advance_time(3).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked(exec).await.unwrap(),
+            RunState::WaitingTimer
+        ));
+        // First timer fired; second armed and unfired.
+        assert_fired_timers_match_events(&rt, exec);
+        exec
+    };
+
+    // Runtime #2: fresh process on the SAME file. The durable clock restores
+    // logical time 8 (NOT 0, and NOT merely the fired-timer floor of 5).
+    // Advancing 2 more reaches 10 — the second timer's absolute deadline.
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&two_timers_info());
+    rt.advance_time(2).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("both_fired")),
+        "state = {state:?}"
+    );
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        count_events(&events, |e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        2
+    );
+    assert_eq!(
+        count_events(&events, |e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        2
+    );
+    // Timer-fire atomicity holds across the reload for BOTH fired timers.
+    assert_fired_timers_match_events(&rt, exec);
 }
 
 // ── Scenario 3: signal delivery unblocks a waiting workflow ──────────────────

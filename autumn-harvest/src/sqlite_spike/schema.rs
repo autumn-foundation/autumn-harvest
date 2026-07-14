@@ -24,6 +24,13 @@
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
 //!   not `harvest_events`). Keeping every persisted event history a clean,
 //!   terminal-only, replay-correct log is what lets AC4 pass without filtering.
+//! - `spike_meta` — a tiny key→integer store holding the durable virtual clock
+//!   (`key = 'clock'`). The clock persists across a reopen so a timer armed at a
+//!   non-zero logical time still fires after restart — without it, `open` reset
+//!   the clock to 0 while timers store an *absolute* `fire_at`, so a second timer
+//!   armed after the first fired would never become due (issue #966 durability
+//!   fix). Note the virtual clock is a single runtime-global value, not
+//!   per-execution.
 
 /// The full schema, applied idempotently on [`SqliteRuntime::open`](super::SqliteRuntime::open).
 pub(super) const SCHEMA: &str = r"
@@ -79,5 +86,10 @@ CREATE TABLE IF NOT EXISTS spike_activity_attempts (
     attempt     INTEGER NOT NULL,
     ok          INTEGER NOT NULL,         -- 1 = success, 0 = failure
     detail      TEXT NOT NULL             -- output JSON on success, error on failure
+);
+
+CREATE TABLE IF NOT EXISTS spike_meta (
+    key   TEXT PRIMARY KEY,               -- e.g. 'clock'
+    value INTEGER NOT NULL                -- durable virtual clock (epoch seconds)
 );
 ";
