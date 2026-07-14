@@ -61,3 +61,6 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Architecture.**
   [`autumn-workflow-architecture.md`](../autumn-workflow-architecture.md) and the
   [ADRs](../adr/) document the design decisions behind the engine.
+- **Comparison.** [`comparison.md`](../comparison.md) positions harvest against
+  Temporal, DBOS, Inngest, Hatchet, and Restate — every harvest claim linked to
+  shipped evidence, with an honest section on where harvest is behind.

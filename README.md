@@ -19,6 +19,10 @@ with durable history, signal-driven waits, queryable state, and scheduled DAGs.
 If you've reached for Temporal, Cadence, or Inngest from a Rust service, this is
 the same shape with one fewer service to operate.
 
+Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
+honest, evidence-linked [comparison page](docs/comparison.md) — it names
+harvest's own gaps, not just its strengths.
+
 ## Quick example
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
