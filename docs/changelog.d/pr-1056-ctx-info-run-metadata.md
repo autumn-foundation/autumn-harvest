@@ -151,3 +151,11 @@ handlers likewise dispatch in the main context. New regression test
 invoked on a child run reads `ctx.info().parent_execution_id == Some(parent)` —
 RED pre-fix: `None`). No CLI, scheduler, `ActivityContext`, event, schema, or
 migration changes.
+(F) **`is_replaying` documented as observability-only (Codex P2, doc-only).** The
+`WorkflowExecutionInfo` struct/`info()`/field docs, the standalone `is_replaying()`
+accessor doc, CLAUDE.md, and the example now carve `is_replaying` out of the
+byte-identical/branch-safe guarantee: it is the replay indicator itself, so it
+intentionally differs live-vs-replay and must never drive workflow commands or be
+included in an activity input (doing so records different commands live vs replay →
+non-determinism). It remains identical between two replay passes of the same
+history. No runtime-logic change.

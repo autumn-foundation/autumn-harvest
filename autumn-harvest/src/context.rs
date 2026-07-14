@@ -1856,10 +1856,15 @@ pub struct WorkflowContext {
 ///
 /// Returned by [`WorkflowContext::info`]. Every field is derived from
 /// already-recorded state — the `WorkflowStarted` event and the execution row
-/// the executor already loads — so reading it appends **no** `harvest_events`,
-/// emits **no** [`WorkflowCommand`], and yields byte-identical values on every
-/// worker and on every replay pass. It is safe to log, embed in a run-scoped
-/// idempotency key, or branch on from `#[workflow]` code.
+/// the executor already loads — so reading it appends **no** `harvest_events`
+/// and emits **no** [`WorkflowCommand`]. All fields are replay-safe — replaying
+/// the same recorded history yields identical values across workers and across
+/// replay passes — and safe to log, embed in a run-scoped idempotency key,
+/// branch on, or include in an activity input, **with one exception:**
+/// [`is_replaying`](Self::is_replaying), which is the replay indicator itself
+/// and is intentionally **not** byte-identical live-vs-replay (see its field
+/// doc). Do not branch command-affecting logic on `is_replaying` or include it
+/// in an activity input.
 ///
 /// This is the workflow-side counterpart of the `execution.id` span attribute
 /// (ADR-0001) and the management-API `{exec_id}` path key: the
@@ -1904,8 +1909,15 @@ pub struct WorkflowExecutionInfo {
     /// is **not** suitable for continue-as-new history-size decisions — use
     /// [`WorkflowContext::should_continue_as_new`] for that.
     pub history_event_count: u64,
-    /// `true` while this workflow task is replaying recorded history, `false`
-    /// once execution reaches the live frontier.
+    /// Whether the executor is currently replaying recorded history.
+    /// **Observability-only.** Unlike the other fields, this intentionally
+    /// differs between the initial live execution (`false` at the frontier) and
+    /// replay of the same code position (`true`) — it *is* the replay indicator,
+    /// so it is **not** byte-identical live-vs-replay. Do **not** branch
+    /// command-affecting logic on it, include it in an activity input, or
+    /// otherwise derive workflow commands from it: doing so records different
+    /// commands on the live run vs replay and triggers non-determinism. (It is
+    /// still identical between two *replay* passes of the same history.)
     pub is_replaying: bool,
     /// The execution id of the parent workflow that spawned this run, or `None`
     /// for a top-level run ("no parent").
@@ -2778,10 +2790,13 @@ impl WorkflowContext {
     /// existing accessors, so it stays consistent with each of them.
     ///
     /// Every field is derived from already-recorded state, so calling `info()`
-    /// appends **no** `harvest_events`, emits **no** [`WorkflowCommand`], and
-    /// returns byte-identical values on every replay pass and every worker — the
-    /// same leave-no-trace, replay-deterministic property as a query handler.
-    /// Use it for logging, run-scoped idempotency keys
+    /// appends **no** `harvest_events` and emits **no** [`WorkflowCommand`] — the
+    /// same leave-no-trace property as a query handler. All fields return
+    /// byte-identical values on every replay pass and every worker **except**
+    /// [`is_replaying`](Self::is_replaying), which is observability-only and
+    /// intentionally differs live-vs-replay (see its field doc — do not branch
+    /// command-affecting logic on it or include it in an activity input). Use it
+    /// for logging, run-scoped idempotency keys
     /// (`format!("charge-{}", ctx.info().execution_id)`), and parent-aware child
     /// logic.
     ///
@@ -3212,6 +3227,11 @@ impl WorkflowContext {
     /// an email or writing to a file), because the workflow code runs multiple times
     /// as it recovers state. You can check this flag to skip logging or local
     /// non-deterministic side-effects during recovery.
+    ///
+    /// Observability-only: use it to gate side effects, never to derive workflow
+    /// commands. Branching command-affecting logic on it records different
+    /// commands live vs replay and triggers non-determinism (see
+    /// [`WorkflowExecutionInfo::is_replaying`]).
     ///
     /// ## Examples
     ///

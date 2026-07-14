@@ -45,6 +45,11 @@
 //! Fields: `execution_id`, `workflow_id`, `workflow_type`, `start_time`,
 //! `history_event_count`, `is_replaying`, and `parent_execution_id`
 //! (`None` for a top-level run).
+//!
+//! One exception to "replay-safe": `is_replaying` is **observability-only** — it
+//! intentionally differs live-vs-replay (it *is* the replay indicator). Do not
+//! branch command-affecting logic on it or include it in an activity input; the
+//! example below only ever logs the other fields.
 
 use autumn_harvest::prelude::*;
 
