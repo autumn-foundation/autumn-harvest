@@ -188,6 +188,26 @@ pub fn requeue_task(
     Ok(())
 }
 
+/// Cancel a still-open (`PENDING`/`RUNNING`) activity task by its `activity_id`,
+/// flipping it to `CANCELLED`. Returns `true` iff a row was actually cancelled.
+///
+/// The loser-cancellation primitive for a losing activity branch of a resolved
+/// `ctx.race()` (issue #600), mirroring the Postgres `queue::cancel_activity_task`.
+/// An activity that
+/// genuinely completed first (a real completion raced the cancellation) is
+/// already `DONE`, matches nothing, and returns `false` — so its real terminal
+/// event is never shadowed by a synthetic one. A `CANCELLED` row is terminal for
+/// this queue: [`claim_next_ready_task`] only selects `state = 'PENDING'`, so a
+/// cancelled loser is never re-run.
+pub fn cancel_activity_task(conn: &Connection, activity_id: ActivityExecId) -> SqliteResult<bool> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'CANCELLED' \
+         WHERE activity_id = ?1 AND state IN ('PENDING', 'RUNNING')",
+        params![activity_id.to_string()],
+    )?;
+    Ok(n > 0)
+}
+
 // ── Durable timers ───────────────────────────────────────────────────────────
 
 pub fn enqueue_timer(
@@ -249,4 +269,30 @@ pub fn mark_timer_fired(
         params![exec_id.to_string(), timer_id],
     )?;
     Ok(())
+}
+
+/// Delete a single still-pending (`fired = 0`) durable timer row by its
+/// `timer_id`. A no-op if the timer already fired or does not exist.
+///
+/// The loser-cancellation primitive for a losing timer branch of a resolved race
+/// — `ctx.race()` (issue #600) and, in particular, the deadline timer of a
+/// `wait_for_signal_timeout` / `receive_signal_timeout` whose **signal wins**
+/// (issue #476). Mirrors the Postgres `queue::delete_pending_timer`. Deleting
+/// the unfired row is what keeps the completed workflow from being pinned by a
+/// stray armed timer (and from a stray later `TimerFired`).
+///
+/// Returns `true` iff a row was actually removed. This lets the (idempotent)
+/// re-push of the same teardown on every subsequent replay cycle report *no*
+/// progress once the row is gone, so the decision loop still converges instead
+/// of spinning on a repeated no-op delete.
+pub fn delete_pending_timer(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+) -> SqliteResult<bool> {
+    let n = conn.execute(
+        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
+        params![exec_id.to_string(), timer_id],
+    )?;
+    Ok(n > 0)
 }

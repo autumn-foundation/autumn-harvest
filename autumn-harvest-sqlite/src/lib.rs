@@ -95,14 +95,25 @@
 //! a re-park `WaitForActivity`.
 //!
 //! **Signals are pull-only.** A staged signal is appended to history (as
-//! `SignalReceived`) only when a workflow reaches a pull primitive
-//! (`ctx.wait_for_signal` / `ctx.receive_signal`) that consumes it. The
-//! push-handler and non-blocking drain APIs — `register_signal_handler` (#546),
-//! `drain_signals` / `try_receive_signal` (#775) — depend on the Postgres
+//! `SignalReceived`) only when a workflow reaches a pull primitive that consumes
+//! it. The supported pull surface is:
+//! - the plain waits `ctx.wait_for_signal` / `ctx.receive_signal`; and
+//! - the signal-or-deadline waits `ctx.wait_for_signal_timeout` /
+//!   `ctx.receive_signal_timeout` (issue #476), which race the signal against a
+//!   durable deadline timer — the signal wins if it arrives first, else the timer
+//!   fires and the wait resolves to `None`. When the **signal** wins, the core
+//!   emits a `CancelRaceLosers` bookkeeping command to durably delete the losing
+//!   deadline timer; this backend handles it (deleting the `harvest_timers` row in
+//!   the same cycle transaction — whether it rides a suspending batch or the
+//!   terminal drain), so the run completes cleanly and no orphaned timer is left
+//!   behind.
+//!
+//! The push-handler and non-blocking drain APIs — `register_signal_handler`
+//! (#546), `drain_signals` / `try_receive_signal` (#775) — depend on the Postgres
 //! task-preparation ingest that promotes *all* pending signals into history up
 //! front, which this single-writer backend does not implement; a workflow that
 //! relies on them will not see its signals here. Restrict to the pull primitives
-//! on this backend; push-based signal delivery is a follow-up.
+//! on this backend; push-based signal *handlers* remain a follow-up.
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is

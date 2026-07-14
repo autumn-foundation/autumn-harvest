@@ -584,6 +584,24 @@ impl SqliteRuntime {
                     )?;
                     produced = true;
                 }
+                // Race-loser teardown (issue #476/#600). Emitted when a resolved
+                // `ctx.race()` / `wait_for_signal_timeout` picks a winner and rides
+                // in the SAME suspending batch when the workflow blocks again
+                // afterwards (e.g. `wait_for_signal_timeout(...)` then another
+                // `execute_activity`). Delete each losing timer / cancel each losing
+                // activity in this cycle's transaction. `produced` is set only when a
+                // durable row actually changed, so the idempotent re-push on every
+                // later replay cycle reports no progress once torn down and the loop
+                // converges instead of spinning.
+                WorkflowCommand::CancelRaceLosers {
+                    activities,
+                    children,
+                    timers,
+                } => {
+                    if apply_cancel_race_losers(&tx, exec, activities, children, timers)? {
+                        produced = true;
+                    }
+                }
                 // Dropping `tx` here (un-committed) rolls back the whole batch — an
                 // unsupported command after a supported one leaves NEITHER the
                 // supported command's event NOR its queue/timer row persisted.
@@ -716,6 +734,21 @@ fn persist_terminal_pending_commands(
                     },
                 )?;
             }
+            // Race-loser teardown (issue #476/#600) drained in the SAME cycle the
+            // workflow completes/fails — the canonical `wait_for_signal_timeout(...)`
+            // signal-win shape: `let s = ctx.wait_for_signal_timeout(..).await?;
+            // Ok(s)`. The losing deadline timer MUST be deleted here (an unfired
+            // `harvest_timers` row would otherwise outlive the terminal run), inside
+            // the SAME terminal transaction, BEFORE the terminal event. Without this
+            // arm the drain rejected it as `Unsupported`, wedging every
+            // pull-signal-plus-timeout workflow (Codex #1069 P2).
+            WorkflowCommand::CancelRaceLosers {
+                activities,
+                children,
+                timers,
+            } => {
+                apply_cancel_race_losers(conn, exec, activities, children, timers)?;
+            }
             // Benign bookkeeping — appends no event, gates no control flow.
             WorkflowCommand::WaitForActivity { .. } | WorkflowCommand::SetCurrentDetails { .. } => {
             }
@@ -723,6 +756,73 @@ fn persist_terminal_pending_commands(
         }
     }
     Ok(())
+}
+
+/// Resolve a [`WorkflowCommand::CancelRaceLosers`] bookkeeping command (issue
+/// #476/#600): durably tear down the losing branches of a resolved `ctx.race()` /
+/// `wait_for_signal_timeout` race. The caller runs this inside its own
+/// transaction (the same one that persists the race's winner marker, or the
+/// terminal event), so a crash between the two can never leak a row. Mirrors the
+/// Postgres `worker::apply_race_loser_cancellations`.
+///
+/// Returns `true` iff a durable row actually changed (a timer was deleted or an
+/// activity was cancelled), so [`apply_commands`](SqliteRuntime::apply_commands)
+/// can treat the idempotent re-push on later replay cycles as no progress and let
+/// the decision loop converge.
+///
+/// - `timers`: delete each still-pending `harvest_timers` row (the common
+///   `wait_for_signal_timeout` signal-win case). Removing the unfired row keeps
+///   the completed run from being pinned by a stray armed timer and from
+///   surfacing a stray later `TimerFired`.
+/// - `activities`: cancel each still-open (`PENDING`/`RUNNING`) task row and — only
+///   for a row actually cancelled — append the synthetic
+///   `ActivityFailed { error: "lost race to a sibling branch", .. }` the core
+///   records (reusing the existing event variant, no new `WorkflowEvent`), so a
+///   future replay resolves that branch to a terminal instead of looping on
+///   `ActivityInProgress`. An activity that genuinely completed first is `DONE`,
+///   is left untouched, and keeps its real `ActivityCompleted`.
+/// - `children`: child-workflow races are OUT of the single-writer subset
+///   (`StartChildWorkflow` is [`SqliteError::Unsupported`]), so a child race can
+///   never have been dispatched on this backend and `children` is always empty. A
+///   non-empty `children` is rejected LOUDLY rather than silently dropping a loser
+///   the core would have cancelled.
+fn apply_cancel_race_losers(
+    conn: &Connection,
+    exec: ExecutionId,
+    activities: &[ActivityExecId],
+    children: &[ExecutionId],
+    timers: &[TimerId],
+) -> SqliteResult<bool> {
+    if !children.is_empty() {
+        return Err(SqliteError::Unsupported(
+            "CancelRaceLosers.children — child-workflow races are outside the sqlite subset"
+                .to_string(),
+        ));
+    }
+    let mut changed = false;
+    for timer_id in timers {
+        if queue::delete_pending_timer(conn, exec, &timer_id.to_string())? {
+            changed = true;
+        }
+    }
+    for activity_id in activities {
+        if queue::cancel_activity_task(conn, *activity_id)? {
+            store::append_event(
+                conn,
+                exec,
+                &WorkflowEvent::ActivityFailed {
+                    activity_id: *activity_id,
+                    error: "lost race to a sibling branch".to_string(),
+                    attempt: 1,
+                    error_type: "Error".to_string(),
+                    non_retryable: true,
+                    details: None,
+                },
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Human name for an unsupported command (for error messages). The `_` arm keeps
