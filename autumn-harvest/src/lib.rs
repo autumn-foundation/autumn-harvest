@@ -183,6 +183,15 @@ pub mod signal_handler;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
+/// SQLite edge/local-first feasibility spike (issue #966).
+///
+/// Throwaway R&D — gated behind the `sqlite-spike` feature so the default build
+/// never compiles it (or `rusqlite`). It reuses the backend-neutral determinism
+/// core (`run_workflow`, `WorkflowEvent`, replay) wholesale and reimplements only
+/// persistence (store/queue/worker) on embedded SQLite. Not part of the shipped
+/// engine.
+#[cfg(feature = "sqlite-spike")]
+pub mod sqlite_spike;
 /// Request-scoped idempotency keys for plain workflow starts (issue #808).
 pub mod start_idempotency;
 /// OpenTelemetry integration: trace-context propagation and metrics.

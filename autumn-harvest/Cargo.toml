@@ -24,6 +24,12 @@ db = [
 ]
 testing = []
 metrics-rs = ["dep:metrics"]
+# Throwaway R&D spike (issue #966): embedded SQLite persistence prototype for the
+# edge/local-first feasibility study. Feature-gated so the default build is
+# byte-unaffected and never compiles rusqlite. Reuses the backend-neutral
+# determinism core (`run_workflow`, `WorkflowEvent`, replay) wholesale; only
+# persistence (worker/store/queue) is reimplemented on SQLite. Not shipped.
+sqlite-spike = ["dep:rusqlite"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
@@ -58,6 +64,12 @@ scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 metrics = { version = "0.24", optional = true }
 schemars = { version = "0.8", optional = true }
+# Issue #966 SQLite feasibility spike only (feature `sqlite-spike`). `bundled`
+# compiles SQLite from source — no system libsqlite3 needed. Version 0.38 pins
+# `libsqlite3-sys` 0.36.0 exactly, matching the version already in the workspace
+# lock (pulled by autumn-web) so the `links = "sqlite3"` graph unifies on a
+# single copy — no duplicate `libsqlite3-sys` is introduced.
+rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 [[test]]
 name = "integration"

@@ -38,6 +38,7 @@
 # ordering correct by construction.
 #
 # osclass      crate                    target                           features                   filter
+allos        autumn-harvest         integration                      sqlite-spike,testing       sqlite_spike
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
