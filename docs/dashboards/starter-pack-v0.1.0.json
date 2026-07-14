@@ -4381,6 +4381,64 @@
             }
           ],
           "description": "Admitted workflow updates whose handler returned an error per second (issue #684). Emitted post-commit, exactly once per failed update."
+        },
+        {
+          "id": 908,
+          "type": "timeseries",
+          "title": "Update latency (admit → terminal)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 110
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_update_duration_bucket{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (workflow) (rate(harvest_update_duration_sum{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / sum by (workflow) (rate(harvest_update_duration_count{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "avg {{workflow}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Wall-clock latency from an update's durable admission (UpdateAdmitted) to its terminal result (UpdateCompleted/UpdateFailed) (issue #781). p99 needs set_buckets_for_metric on the exporter; the bucket-less avg fallback works on any install. Rejected updates are excluded (no handler runs)."
         }
       ]
     }

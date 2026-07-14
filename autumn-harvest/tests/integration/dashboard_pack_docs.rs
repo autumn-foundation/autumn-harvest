@@ -150,6 +150,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_payload_offload_fetch_duration_bucket",
     "harvest_payload_offload_fetch_duration_count",
     "harvest_payload_offload_fetch_duration_sum",
+    "harvest_update_duration_bucket",
+    "harvest_update_duration_count",
+    "harvest_update_duration_sum",
     // --- gauges (bare) -------------------------------------------------------
     "harvest_queue_depth",
     "harvest_queue_oldest_pending_age",
@@ -220,6 +223,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_update_rejected", &["workflow", "name"]),
     ("harvest_update_completed", &["workflow", "name", "queue"]),
     ("harvest_update_failed", &["workflow", "name", "queue"]),
+    (
+        "harvest_update_duration",
+        &["workflow", "name", "queue", "outcome"],
+    ),
     (
         "harvest_activity_duration",
         &["activity", "queue", "status", "error_type"],

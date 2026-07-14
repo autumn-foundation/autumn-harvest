@@ -342,6 +342,7 @@ metric is emitted in the source code.
 | `harvest.update.rejected` | Counter | `api.rs` (plugin) — the `admit_update` and `update_with_start` handlers, once per update rejected by its registered validator before admission (a durable pre-admission 422). Validator rejections only; non-RUNNING/paused state conflicts are caller errors, not counted (issue #684) |
 | `harvest.update.completed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateCompleted` (name resolved from the `UpdateAdmitted` events in history) (issue #684) |
 | `harvest.update.failed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateFailed` (issue #684) |
+| `harvest.update.duration` | Histogram | `worker.rs` — `emit_update_result_metrics`, alongside `harvest.update.completed`/`failed` on the **same** post-commit path (the terminal/suspend `Persisted` arm and the two inline external-signal branches). Wall-clock seconds from the recorded `UpdateAdmitted.timestamp` to the terminal recording (`Utc::now()` at emit, clamped so a clock-skew negative delta records `0`). Rejected updates are excluded (no handler runs); an update whose admit is not in the loaded history skips the sample (the counter still fires). Shares the completed/failed counters' delivery semantics — exactly-once on the happy path; a crash after the persist commit but before the post-commit emit drops the sample (never a double-count) (issue #781) |
 
 ### Label sets
 
@@ -379,6 +380,7 @@ metric is emitted in the source code.
 | `harvest.update.rejected` | `workflow`, `name` (update name, bounded — validator rejection fires only for a registered handler) |
 | `harvest.update.completed` | `workflow`, `name` (update name — inherently bounded: a completed update always ran a real handler), `queue` |
 | `harvest.update.failed` | `workflow`, `name` (update name, bounded — an unregistered name's handler-not-found failure → `__unregistered__`; real handlers, declarative or imperative, keep their name), `queue` |
+| `harvest.update.duration` | `workflow`, `name` (update name — bounded exactly as `update.completed`/`failed`; unregistered → `__unregistered__`), `queue`, `outcome` (`completed\|failed` — bounded; rejected excluded) |
 | `harvest.completion_trigger.skipped` | `trigger` (trigger UUID — same precedent as `harvest.completion_trigger.fires`), `reason` (`condition_unmet\|condition_invalid`) |
 | `harvest.activity.panic` | `activity`, `queue` |
 | `harvest.workflow.panic` | `workflow`, `queue` |
