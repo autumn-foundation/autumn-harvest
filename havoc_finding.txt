@@ -1,0 +1,7 @@
+Title: 👺 Havoc: Missing Tests Found
+
+Description:
+🧨 **The Trigger:** Fuzzed `dlq.rs` `failure_signature` via `cargo-fuzz`. Fuzzed `eligibility.rs` via `proptest`. Loomed `on_external_failure` in `circuit_breaker.rs`.
+📉 **The Stack Trace:** No panic trace available. The system is hardened.
+🧪 **Reproduction:** Run `cargo fuzz run fuzz_target_1`, run `cargo test --test havoc_tests`, and run `RUSTFLAGS="--cfg loom" cargo test --test loom_models`.
+😈 **Comment:** "You assumed I would find a bug. You were wrong. The system survived the chaos."

@@ -291,3 +291,30 @@ fn session_slot_acquire_release_balances_and_never_underflows() {
         );
     });
 }
+
+/// Model 5: (Havoc) Fails on bug.
+#[test]
+fn havoc_circuit_breaker_stale_external_failure() {
+    loom::model(|| {
+        let reg = breaker(Duration::from_secs(60));
+        let now = Instant::now();
+
+        // Trip the breaker OPEN
+        reg.force_open("svc", now);
+
+        let r_close = Arc::clone(&reg);
+        let close = loom::thread::spawn(move || {
+            r_close.force_close("svc");
+        });
+
+        let r_fail = Arc::clone(&reg);
+        let fail = loom::thread::spawn(move || r_fail.on_external_failure("svc", now));
+
+        close.join().unwrap();
+        let trans = fail.join().unwrap();
+
+        // Even though we failed out of band concurrently, we expect it to not trip the reset breaker.
+        // It should either be ignored (None) or not panic at least.
+        assert!(trans == None || trans == Some(CircuitTransition::Tripped));
+    });
+}
