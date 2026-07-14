@@ -84,8 +84,10 @@ async fn each_event_json_roundtrips_byte_identically() {
         let once = serde_json::to_string(event).unwrap();
         // Re-parse via the SAME adjacently-tagged `WorkflowEvent` derive the
         // Postgres backend uses, and re-serialize: a stable, canonical encoding
-        // round-trips byte-identically, which is the property that makes a history
-        // byte-identical per event across backends.
+        // round-trips byte-identically. This is a *necessary condition* for
+        // cross-backend byte-identity given the shared derive — not a direct
+        // demonstration of identity against a PG-written stream (the golden
+        // assertion below pins one concrete encoding).
         let parsed: WorkflowEvent = serde_json::from_str(&once).unwrap();
         let twice = serde_json::to_string(&parsed).unwrap();
         assert_eq!(once, twice, "event JSON must be byte-stable: {once}");
@@ -94,6 +96,31 @@ async fn each_event_json_roundtrips_byte_identically() {
             "adjacently-tagged encoding must carry a `type` tag: {once}"
         );
     }
+}
+
+// ── AC5: a concrete GOLDEN encoding — makes "byte-identical to the core" real ──
+//
+// `single_activity(3)` completes with output `6`. Its terminal `WorkflowCompleted`
+// event, as STORED by the SQLite backend, must equal this exact byte string — the
+// same bytes the Postgres backend's shared `WorkflowEvent` serde derive produces.
+// A concrete tripwire against an accidental core encoding change that a
+// self-round-trip test would not catch.
+
+#[tokio::test]
+async fn stored_event_matches_golden_encoding() {
+    const GOLDEN_WORKFLOW_COMPLETED: &str = r#"{"type":"WorkflowCompleted","data":{"output":6}}"#;
+
+    let history = run_to_completion_on_sqlite().await;
+    let completed = history
+        .iter()
+        .find(|e| matches!(e, WorkflowEvent::WorkflowCompleted { .. }))
+        .expect("a completed run has a WorkflowCompleted event");
+
+    let stored = serde_json::to_string(completed).unwrap();
+    assert_eq!(
+        stored, GOLDEN_WORKFLOW_COMPLETED,
+        "the stored event must be byte-identical to the shared core encoding"
+    );
 }
 
 // ── AC5: event-SET equivalence — a genuinely PG-shaped history replays ───────

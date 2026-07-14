@@ -184,12 +184,33 @@ pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &st
     })
 }
 
-/// True if history already holds `TimerStarted` for `timer_id`.
-pub fn history_has_timer_started(events: &[WorkflowEvent], timer_id: &str) -> bool {
-    events.iter().any(|e| {
-        matches!(e, WorkflowEvent::TimerStarted { timer_id: id, .. }
-            if id.to_string() == timer_id)
-    })
+/// The number of currently-*pending* arms of `timer_id` — recorded
+/// `TimerStarted(timer_id)` events not yet matched by a `TimerFired(timer_id)`.
+///
+/// A timer id may be RE-ARMED under the same name (the poll-loop idiom
+/// `loop { ctx.timer("tick", 1).await?; … }`), which the core supports via
+/// cursor-based per-id FIFO pairing. Arm idempotency must therefore key on
+/// OCCURRENCE, not the bare id: a plain "history already has a `TimerStarted`
+/// for this id?" guard would wrongly match a PRIOR *fired* arm and skip a genuine
+/// re-arm, wedging the run. `> 0` means an arm is already recorded and unfired
+/// (a replay-cycle re-emit — skip it); `== 0` means every prior arm has fired, so
+/// a `StartTimer` for this id is a genuinely new arm that must be persisted.
+pub fn pending_timer_arms(events: &[WorkflowEvent], timer_id: &str) -> i64 {
+    let started = events
+        .iter()
+        .filter(|e| {
+            matches!(e, WorkflowEvent::TimerStarted { timer_id: id, .. }
+                if id.to_string() == timer_id)
+        })
+        .count();
+    let fired = events
+        .iter()
+        .filter(|e| {
+            matches!(e, WorkflowEvent::TimerFired { timer_id: id }
+                if id.to_string() == timer_id)
+        })
+        .count();
+    i64::try_from(started).unwrap_or(i64::MAX) - i64::try_from(fired).unwrap_or(i64::MAX)
 }
 
 // ── Activity attempt audit log ───────────────────────────────────────────────

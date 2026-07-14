@@ -195,8 +195,16 @@ pub fn enqueue_timer(
     timer_id: &str,
     fire_at: i64,
 ) -> SqliteResult<()> {
+    // `INSERT OR REPLACE` (not `OR IGNORE`) so a timer id can be RE-ARMED under the
+    // same name after a prior fire (the poll-loop idiom). The caller
+    // (`apply_commands`) only reaches this for a genuinely-new arm — occurrence
+    // idempotency (`store::pending_timer_arms == 0`) guarantees no *pending* arm of
+    // this id exists — so any conflicting `(exec_id, timer_id)` row is a spent
+    // (`fired = 1`) row from a previous arm that is safe to supersede with the
+    // fresh unfired arm. `OR IGNORE` would instead silently keep the spent row and
+    // wedge the re-arm at `Stuck`.
     conn.execute(
-        "INSERT OR IGNORE INTO harvest_timers (timer_id, exec_id, fire_at, fired) \
+        "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired) \
          VALUES (?1, ?2, ?3, 0)",
         params![timer_id, exec_id.to_string(), fire_at],
     )?;

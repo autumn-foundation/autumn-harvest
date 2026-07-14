@@ -89,7 +89,20 @@
 //! API, retention, worker sessions, sharding, and DAGs. In the supported
 //! workflow subset, `continue_as_new`, child workflows, external signals/cancels,
 //! local activities, updates, and search attributes are unsupported and surface
-//! as [`SqliteError::Unsupported`].
+//! as [`SqliteError::Unsupported`]. Two benign bookkeeping commands are instead
+//! silently **no-ops** (they append no `WorkflowEvent` and gate no control flow):
+//! `ctx.set_current_details(...)` (the operator status breadcrumb, issue #593) and
+//! a re-park `WaitForActivity`.
+//!
+//! **Signals are pull-only.** A staged signal is appended to history (as
+//! `SignalReceived`) only when a workflow reaches a pull primitive
+//! (`ctx.wait_for_signal` / `ctx.receive_signal`) that consumes it. The
+//! push-handler and non-blocking drain APIs — `register_signal_handler` (#546),
+//! `drain_signals` / `try_receive_signal` (#775) — depend on the Postgres
+//! task-preparation ingest that promotes *all* pending signals into history up
+//! front, which this single-writer backend does not implement; a workflow that
+//! relies on them will not see its signals here. Restrict to the pull primitives
+//! on this backend; push-based signal delivery is a follow-up.
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is
@@ -98,19 +111,20 @@
 //! open scheduled work (or reject such histories) so a run isn't wedged — that is
 //! a follow-up.
 //!
-//! # Deterministic side effects — a known limitation
+//! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
 //! record a frozen value as a `SideEffectRecorded` event so replay never re-mints
-//! it. Those events are persisted (atomically, with the rest of the cycle) when
-//! they ride a **suspending** batch — i.e. the common case, a side effect *before*
-//! an activity/timer/signal. A side effect emitted in a cycle that then completes
-//! with **no** further suspension is not persisted, because the reused
-//! [`run_workflow`](autumn_harvest::run_workflow) entry point discards a completing
-//! cycle's pending bookkeeping and the value-returning variant that exposes it is
-//! not part of the core's public surface. Emit deterministic primitives before a
-//! suspension point (or capture their result into an activity input) to stay
-//! replay-safe; lifting this needs a core-crate export and is a follow-up.
+//! it. These events are persisted **atomically with the rest of the cycle** in
+//! every case — whether they ride a **suspending** batch (a side effect *before*
+//! an activity/timer/signal, via [`apply_commands`](crate::SqliteRuntime)) or are
+//! emitted in the cycle that **completes/fails** the workflow with no further
+//! suspension (e.g. `ctx.new_uuid()` right before `Ok(..)`): the terminal cycle
+//! drains those pending bookkeeping commands and appends each one BEFORE the
+//! terminal `WorkflowCompleted`/`WorkflowFailed` event, in the same transaction,
+//! mirroring the Postgres worker's `persist_terminal_outcome_commands`. So a
+//! deterministic primitive is **never** silently dropped, and a history written
+//! here always replays byte-identically on the core `WorkflowReplayer`.
 
 mod error;
 mod queue;

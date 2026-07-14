@@ -9,6 +9,15 @@
 //! terminal — reopening the database at each stage and asserting history ⟷ rows
 //! consistency after each reopen. It also proves the activity body runs exactly
 //! once across all the reopens (deterministic replay).
+//!
+//! **What "crash" means here:** each stage boundary is a clean `drop(rt)` of a
+//! *quiesced* runtime, so this sweep proves **logical atomicity** — the committed
+//! state is internally consistent (history ⟷ rows) at every reopen. It does NOT
+//! model a mid-transaction interruption or fsync/power-loss durability: true
+//! crash-between-append-and-mutate is covered by the inline `*_within_tx`
+//! drop-uncommitted unit tests in `src/{runtime,worker}.rs`, and a genuine
+//! stranded-`RUNNING` reopen is covered by
+//! `durability::orphaned_running_task_is_reclaimed_and_body_reruns`.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the

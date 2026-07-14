@@ -4,9 +4,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use autumn_harvest::context::empty_shared_state;
+use autumn_harvest::executor::run_workflow_with_state;
 use autumn_harvest::{
     ActivityExecId, ExecutionId, TimerId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
-    WorkflowInfo, WorkflowOutcome, run_workflow,
+    WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -120,6 +122,25 @@ impl SqliteRuntime {
     }
 
     fn from_connection(conn: Connection) -> SqliteResult<Self> {
+        // Durability & concurrency posture (issue #1068). This backend makes a
+        // deliberate, conservative durability claim (a committed transaction
+        // survives a crash/power-loss — the crash-then-reopen tests depend on it),
+        // so make it explicit rather than leaning on driver defaults:
+        // - `synchronous = FULL`: fsync on every COMMIT. WAL + FULL is fully
+        //   durable (every commit is flushed), just reader-friendly.
+        // - `journal_mode = WAL`: the idiomatic embedded choice for a single
+        //   writer plus an occasional external reader (a monitoring/inspector
+        //   connection coexists with the writer without an immediate
+        //   `SQLITE_BUSY`). Persisted in the file header; a harmless no-op on an
+        //   in-memory database (always "memory"-journalled).
+        // - `busy_timeout = 5000` (ms): a second connection that races the
+        //   writer's `BEGIN IMMEDIATE` claim lock retries briefly instead of
+        //   failing instantly with `SQLITE_BUSY`.
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 5000;\n\
+             PRAGMA journal_mode = WAL;\n\
+             PRAGMA synchronous = FULL;",
+        )?;
         conn.execute_batch(schema::SCHEMA)?;
         // Single-server crash recovery: any task left `RUNNING` was claimed by a
         // process that exited without finalizing — flip it back to `PENDING` so
@@ -175,8 +196,11 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns a persistence error if the signal row cannot be written.
-    // Owned-value ingress API (see `import_execution`): `payload` is serialized
-    // into durable storage, borrowed at the leaf.
+    // Owned-value ingress API: callers hand over a `serde_json::Value` payload
+    // that is serialized into durable storage; `store::stage_signal` only borrows
+    // it at the leaf, so taking it by value keeps the call site ergonomic
+    // (`rt.send_signal(exec, "go", json!({..}))`) rather than forcing the caller
+    // to keep the value alive.
     #[allow(clippy::needless_pass_by_value)]
     pub fn send_signal(
         &mut self,
@@ -199,6 +223,14 @@ impl SqliteRuntime {
 
     /// The per-attempt audit log for `activity_name` (retryable failures live
     /// here, not in the replayable event log).
+    ///
+    /// **Name-scoped:** the audit view keys on `(exec_id, activity_name)`, not the
+    /// per-instance `ActivityExecId`. A workflow that schedules the same activity
+    /// *name* more than once gets a single merged, attempt-ordered list across all
+    /// those instances (each instance's `attempt` counter restarts at 1, so
+    /// numbers can repeat). This is a debug/audit accessor; the replayable
+    /// history in [`load_history`](Self::load_history) is the per-instance source
+    /// of truth.
     ///
     /// # Errors
     ///
@@ -254,9 +286,17 @@ impl SqliteRuntime {
     /// this is naturally monotonic across restarts — there is no virtual clock to
     /// persist or reset.
     ///
+    /// A deterministic-simulation seam. Timers store an absolute epoch deadline,
+    /// so an adversarial `now` only changes due-ness (fires early/late) and can
+    /// never corrupt stored state — but do **not** mix `_as_of` and wall-clock
+    /// drivers for the *same* execution: a timer armed under an injected `now`
+    /// anchors its deadline to that test epoch, so a later wall-clock fire is
+    /// surprising.
+    ///
     /// # Errors
     ///
     /// See [`run_until_blocked`](Self::run_until_blocked).
+    #[doc(hidden)]
     pub async fn run_until_blocked_as_of(
         &mut self,
         exec: ExecutionId,
@@ -282,11 +322,15 @@ impl SqliteRuntime {
         self.poll_once_as_of(Utc::now()).await
     }
 
-    /// Like [`poll_once`](Self::poll_once) but with an injected "as-of" time.
+    /// Like [`poll_once`](Self::poll_once) but with an injected "as-of" time. A
+    /// deterministic-simulation seam — see the caveat on
+    /// [`run_until_blocked_as_of`](Self::run_until_blocked_as_of) about not mixing
+    /// `_as_of` and wall-clock drivers for the same execution.
     ///
     /// # Errors
     ///
     /// See [`run_until_blocked`](Self::run_until_blocked).
+    #[doc(hidden)]
     pub async fn poll_once_as_of(&mut self, now: DateTime<Utc>) -> SqliteResult<bool> {
         let now = now.timestamp();
         let mut progress = false;
@@ -305,14 +349,19 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// See [`run_until_blocked`](Self::run_until_blocked).
+    /// Returns [`SqliteError::Runaway`] if the fleet never quiesces within the
+    /// [`MAX_ITERATIONS`] safety bound — surfaced honestly (mirroring
+    /// [`run_until_blocked`](Self::run_until_blocked)'s [`SqliteError::Stuck`])
+    /// rather than swallowed as a clean `Ok(())` a caller cannot distinguish from
+    /// genuine quiescence. Also propagates any per-execution error (see
+    /// [`run_until_blocked`](Self::run_until_blocked)).
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
         for _ in 0..MAX_ITERATIONS {
             if !self.poll_once().await? {
                 return Ok(());
             }
         }
-        Ok(())
+        Err(SqliteError::Runaway)
     }
 
     /// Run exactly one decision cycle at logical time `now` (epoch seconds):
@@ -340,12 +389,32 @@ impl SqliteRuntime {
             .get(&workflow_name)
             .ok_or_else(|| SqliteError::UnknownWorkflow(workflow_name.clone()))?;
 
-        // The reused, backend-neutral determinism core.
-        let outcome = run_workflow(exec, history.clone(), handler, input).await;
+        // The reused, backend-neutral determinism core. Use the value-returning
+        // entry point (`run_workflow_with_state`) rather than `run_workflow`: on a
+        // Completed/Failed cycle it hands back the drained `pending` commands
+        // (`RecordSideEffect`/`RecordMarker` emitted at the live frontier in the
+        // SAME cycle the workflow returns) so we can persist them BEFORE the
+        // terminal event. `run_workflow` discards that vector, silently dropping a
+        // side effect emitted after the last suspension (e.g. `ctx.new_uuid()`
+        // right before `Ok(..)`) and producing a history that fails the core
+        // `WorkflowReplayer` with `SideEffectDrift`.
+        let (outcome, pending, _span) = run_workflow_with_state(
+            exec,
+            history.clone(),
+            handler,
+            input,
+            empty_shared_state(),
+            None,
+        )
+        .await;
 
         match outcome {
             WorkflowOutcome::Completed { output, .. } => {
                 let tx = self.conn.transaction()?;
+                // Persist terminal-cycle bookkeeping (issue #1068) BEFORE the
+                // terminal event, in command order, inside the SAME transaction —
+                // mirroring the Postgres `persist_terminal_outcome_commands`.
+                persist_terminal_pending_commands(&tx, exec, &pending)?;
                 store::append_event(
                     &tx,
                     exec,
@@ -359,6 +428,7 @@ impl SqliteRuntime {
             }
             WorkflowOutcome::Failed { error, .. } => {
                 let tx = self.conn.transaction()?;
+                persist_terminal_pending_commands(&tx, exec, &pending)?;
                 store::append_event(&tx, exec, &WorkflowEvent::workflow_failed(error.clone()))?;
                 store::set_failed(&tx, exec, &error)?;
                 tx.commit()?;
@@ -403,6 +473,10 @@ impl SqliteRuntime {
     ) -> SqliteResult<bool> {
         let tx = self.conn.transaction()?;
         let mut produced = false;
+        // Timer ids armed within THIS batch, so a (pathological) duplicate
+        // `StartTimer` for the same id in one cycle can't double-append.
+        let mut armed_this_batch: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for cmd in commands {
             match cmd {
                 WorkflowCommand::ScheduleActivity {
@@ -430,7 +504,21 @@ impl SqliteRuntime {
                     duration_secs,
                     ..
                 } => {
-                    if !store::history_has_timer_started(history, &timer_id.to_string()) {
+                    // Occurrence-keyed arm idempotency (issue #1068). A timer id may
+                    // be RE-ARMED under the same name (the poll-loop idiom
+                    // `loop { ctx.timer("tick", 1).await?; … }`), which the core
+                    // supports via cursor-based per-id FIFO pairing. A bare-id
+                    // "already has a TimerStarted?" guard would wrongly match the
+                    // PRIOR fired arm and skip the re-arm, wedging the run at
+                    // `Stuck`. Persist a NEW arm only when every prior arm of this
+                    // id has already fired (no pending arm): a still-pending arm
+                    // re-emits its `StartTimer` on each replay cycle until it fires
+                    // — skip those (they are already in history); a genuine re-arm
+                    // after a fire has zero pending arms and MUST persist a fresh
+                    // `TimerStarted` + timer row.
+                    let tid = timer_id.to_string();
+                    if store::pending_timer_arms(history, &tid) == 0 && armed_this_batch.insert(tid)
+                    {
                         // Absolute deadline computed from `now` (real wall clock in
                         // the public API), so it stays valid across a restart —
                         // there is no virtual clock to reset. Checked add: a
@@ -456,9 +544,16 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
-                // A re-park of an already-scheduled activity needs nothing
-                // persisted — the worker pass completes it.
-                WorkflowCommand::WaitForActivity { .. } => {}
+                // Benign bookkeeping the single-writer backend has no surface for
+                // yet, but which is safe to DROP (never an error): each is
+                // replay-suppressed in the core, appends no `WorkflowEvent`, and
+                // gates no control flow. `WaitForActivity` is a re-park of an
+                // already-scheduled activity the worker pass completes;
+                // `SetCurrentDetails` is an operator status breadcrumb (issue #593)
+                // the core actively encourages — hard-erroring it would wedge an
+                // otherwise fully in-subset workflow.
+                WorkflowCommand::WaitForActivity { .. }
+                | WorkflowCommand::SetCurrentDetails { .. } => {}
                 // Bookkeeping commands that carry an event MUST be persisted, even
                 // when they ride in the same batch as a suspending command: a
                 // dropped `SideEffectRecorded`/`MarkerRecorded` would make the next
@@ -573,6 +668,60 @@ pub fn persist_started_timer(
         },
     )?;
     queue::enqueue_timer(conn, exec, &timer_id.to_string(), fire_at)?;
+    Ok(())
+}
+
+/// Persist a terminal cycle's drained bookkeeping commands (issue #1068).
+///
+/// A `RecordSideEffect`/`RecordMarker` emitted in the SAME decision cycle a
+/// workflow completes or fails (e.g. `ctx.new_uuid()` / `ctx.system_now()` /
+/// `ctx.random_*()` / `ctx.side_effect()` right before `Ok(..)`/`Err(..)`, with no
+/// further suspension) MUST be appended to history, in command order, BEFORE the
+/// terminal `WorkflowCompleted`/`WorkflowFailed` event and inside the SAME
+/// terminal transaction — mirroring the Postgres worker's
+/// `persist_terminal_outcome_commands`. Dropping it would let the core
+/// `WorkflowReplayer` re-mint a different value on replay (`SideEffectDrift`),
+/// violating the crate's cross-backend guarantee.
+///
+/// `SetCurrentDetails` is a benign no-op here (as in [`apply_commands`]). Any
+/// OTHER command in a terminal drain is out of the supported subset and is
+/// rejected LOUDLY with [`SqliteError::Unsupported`] — the `?` drops the caller's
+/// uncommitted terminal transaction, rolling back every side effect persisted so
+/// far this cycle. It is never silently dropped.
+fn persist_terminal_pending_commands(
+    conn: &Connection,
+    exec: ExecutionId,
+    pending: &[WorkflowCommand],
+) -> SqliteResult<()> {
+    for cmd in pending {
+        match cmd {
+            WorkflowCommand::RecordMarker { name, details } => {
+                store::append_event(
+                    conn,
+                    exec,
+                    &WorkflowEvent::MarkerRecorded {
+                        name: name.clone(),
+                        details: details.clone(),
+                    },
+                )?;
+            }
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                store::append_event(
+                    conn,
+                    exec,
+                    &WorkflowEvent::SideEffectRecorded {
+                        kind: *kind,
+                        name: name.clone(),
+                        value: value.clone(),
+                    },
+                )?;
+            }
+            // Benign bookkeeping — appends no event, gates no control flow.
+            WorkflowCommand::WaitForActivity { .. } | WorkflowCommand::SetCurrentDetails { .. } => {
+            }
+            other => return Err(SqliteError::Unsupported(command_name(other).to_string())),
+        }
+    }
     Ok(())
 }
 

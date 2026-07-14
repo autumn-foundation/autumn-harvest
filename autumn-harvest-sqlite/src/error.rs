@@ -43,6 +43,14 @@ pub enum SqliteError {
     /// not clear (e.g. a different database file).
     #[error("execution {0} made no progress and could not be classified (stuck)")]
     Stuck(ExecutionId),
+
+    /// The fleet-wide driver
+    /// ([`run_until_idle`](crate::SqliteRuntime::run_until_idle)) never quiesced
+    /// within its iteration safety bound — surfaced honestly rather than swallowed
+    /// as a clean `Ok(())` a caller could not distinguish from genuine
+    /// quiescence. The per-execution analog is [`Stuck`](Self::Stuck).
+    #[error("fleet driver made no progress within the iteration safety bound (runaway)")]
+    Runaway,
 }
 
 impl SqliteError {
