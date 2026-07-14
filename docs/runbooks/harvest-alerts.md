@@ -597,34 +597,87 @@ audit op `dlq.redrive`).
 
 ## harvest_schedule_missed_runs
 
+The primary signal is the server-side overdue gauge `harvest_schedule_overdue`
+(issue #696): `1` for any active schedule that is past its own cadence grace
+(`now − next_run_at > cadence step + jitter + scheduler tick`), computed from
+the schedule's own `next_run_at` + cadence — no per-schedule interval needs
+hand-encoding. Alert on `max by (kind, name) (harvest_schedule_overdue) > 0`; it
+names the wedged schedule directly. The gauge is sampled by the worker (not the
+scheduler tick), so a wedged tick or a dead scheduler is still detected as long
+as any worker is alive; a *total* process outage (all workers and the scheduler
+down) is caught only by the tertiary absence-of-runs expression, which must be
+paired with an `up`/scrape-health signal.
+
 ### Triage steps
 
-1. Run `harvest schedule list --output json`.
-2. Inspect `is_paused`, `next_run_at`, `last_run_at`, and schedule kind.
+1. Run `harvest schedule list --output json` and look for `overdue: true`. The
+   per-schedule `overdue` and `overdue_by_secs` fields (also on
+   `GET /api/harvest/admin/schedules` and `/{id}`) name exactly which schedule is
+   wedged and how many seconds past its slot it is.
+2. Inspect `is_paused`, `auto_paused_at`, `next_run_at`, `last_run_at`,
+   `exhausted_at`, and schedule kind for the overdue schedule.
 3. Run `harvest preflight --output json` to confirm scheduler coverage.
 4. Check queue backlog for the schedule's dispatch queue.
 
 ### Likely causes
 
-Schedule paused, scheduler disabled, max active runs reached, catchup disabled,
-worker outage, queue backlog, or shard readiness issue.
+Scheduler loop stalled or disabled, `next_run_at` wedged in the past, an HA fire
+claim (#350) that never released, all scheduler replicas down, worker outage,
+queue backlog, or shard readiness issue. (A schedule at `max_active_runs`, or one
+paused/auto-paused/manual/exhausted, is deliberately not firing and reads
+`overdue: false` — see below.)
 
 ### False positives
 
-Manual schedules and intentionally paused schedules should not page. Cron
-schedules with long intervals need a rule window larger than two expected
-firings.
+Intentionally-not-firing schedules are excluded from the overdue gauge by
+construction (issue #696 AC3), so they never page: `is_paused`, `auto_paused_at`
+set (#360), `Schedule::Manual`, and `end_at`/`max_runs`-exhausted schedules
+(#478/#543) all read `overdue: false`. A schedule deliberately deferring because
+it is at `max_active_runs` — including fires deferred into the #607 throttle
+queue, which the at-capacity check counts exactly as the scheduler tick does — is
+also suppressed; that is a capacity condition, not a stalled cron. The grace
+window already absorbs jitter and one scheduler tick, so a healthy schedule
+caught mid-tick is never flagged.
+
+Transient / self-healing cases (add `for: 2m` to the primary rule so none of
+these page — see below):
+- **Just-resumed long-paused schedule** (F3): resume/unpause does not recompute
+  `next_run_at`, so for ~1 scheduler tick after resuming a schedule that was
+  paused for a long time, its stale far-past `next_run_at` can read `overdue`.
+  It self-heals on the next tick (catchup advances `next_run_at`), well within
+  the ~30s sampler cadence and a `for: 2m` hold.
+- **Short-cadence clock skew** (F5): `lag = now − next_run_at` is measured on a
+  different process (worker/API) than the one that wrote `next_run_at` (the
+  scheduler), so fleet clock skew inflates the lag. Absorbed by grace's tick term
+  and `for: 2m` for normal cadences; for very short cadences (few-second
+  intervals) keep clocks NTP-synced and prefer a cadence ≥ your worst-case skew.
+
+Stuck-firing case: a schedule that was overdue (gauge = 1) and then **deleted**
+leaves its `harvest_schedule_overdue{kind,name}` series stuck at 1 until the
+emitting worker process restarts (an inherent gauge property — no in-process
+clear path for a vanished key). Cross-check the read: `GET /admin/schedules` no
+longer lists the schedule, so the firing is for a ghost. A `for: 2m` hold plus a
+metric-staleness/`up` check resolves it; treat it as cleared.
+
+A *total* process outage (nothing emits the overdue gauge at all) is covered by
+the tertiary absence-of-`harvest.schedule.runs` expression plus your
+scrape-health/`up` signal, not by the overdue gauge.
 
 ### Safe actions
 
-Resume an accidentally paused schedule, restore scheduler coverage, scale the
-dispatch queue, or trigger a manual catchup only after idempotency is confirmed.
-Avoid blind backfills while downstream systems are unhealthy.
+Configure the primary overdue rule with `for: 2m` (above the ~30s sampler cadence
+and one scheduler tick) so the transient/self-healing cases above never page
+while a genuine wedge (persists many minutes) still fires. Then: resume an
+accidentally paused schedule, restore scheduler coverage, restart a wedged
+scheduler replica (a stale HA claim self-releases after ≤30s), scale the dispatch
+queue, or trigger a manual catchup only after idempotency is confirmed. Avoid
+blind backfills while downstream systems are unhealthy.
 
 ### Escalation criteria
 
-Escalate when a regulatory, billing, or customer-notification schedule misses
-one required firing, or when catchup would exceed downstream capacity.
+Escalate when a regulatory, billing, or customer-notification schedule reports
+`overdue: true` for one required firing, or when catchup would exceed downstream
+capacity.
 
 ## harvest_retention_lag
 

@@ -102,6 +102,8 @@ mod scheduler_carryover_tests;
 mod scheduler_catchup_tests;
 #[cfg(feature = "db")]
 mod scheduler_ha_tests;
+#[cfg(feature = "db")]
+mod scheduler_overdue_tests;
 mod security;
 mod sharding_unit;
 mod signal_tests;

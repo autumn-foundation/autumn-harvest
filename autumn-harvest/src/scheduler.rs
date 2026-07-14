@@ -31,6 +31,12 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The scheduler tick interval (issue #696).
+///
+/// Re-exported so the overdue-schedule read/sampler callers pass the identical
+/// "one tick" grace term the scheduler loop actually sleeps between ticks.
+pub const SCHEDULER_TICK_INTERVAL: Duration = DEFAULT_SCHEDULER_TICK_INTERVAL;
+
 /// Default upper bound on the number of timestamps a single backfill request may plan.
 ///
 /// Chosen to cover a 7-day hourly window (168 slots) with comfortable headroom.
@@ -3721,6 +3727,499 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
     }
 }
 
+// ── Overdue-schedule detection (issue #696) ──────────────────────────────────
+//
+// A read/observability slice over existing `harvest_schedules` columns: no new
+// `WorkflowEvent` variant, no migration, no change to how schedules fire. The
+// core is the pure `schedule_overdue` predicate (unit-tested without a DB); the
+// per-shard `sample_overdue_schedules` sampler emits the
+// `harvest.schedule.overdue` gauge (issue #696 AC4/AC5).
+
+/// Verdict of the overdue predicate (issue #696).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverdueVerdict {
+    /// Whether the schedule is overdue to fire relative to its own cadence.
+    pub overdue: bool,
+    /// How long past its scheduled fire the schedule is (`now − next_run_at`)
+    /// in whole seconds, or `None` when it is not overdue.
+    pub overdue_by_secs: Option<i64>,
+}
+
+impl OverdueVerdict {
+    const NOT_OVERDUE: Self = Self {
+        overdue: false,
+        overdue_by_secs: None,
+    };
+}
+
+/// The nominal cadence step at `anchor` (the slot that should have fired).
+///
+/// - `Interval` → the fixed interval.
+/// - `Cron`/`CronInTimezone` → the gap to the next occurrence strictly after
+///   `anchor` (so a DST-variable cron step reflects the actual upcoming step
+///   following the missed slot, not a fixed assumption).
+/// - `Manual`/`None`/unparseable → `None` (no cadence; never overdue).
+fn cadence_step(schedule: Option<&Schedule>, anchor: DateTime<Utc>) -> Option<chrono::Duration> {
+    if let Some(period) = interval_period(schedule) {
+        return Some(period);
+    }
+    match schedule {
+        Some(Schedule::Cron(_) | Schedule::CronInTimezone { .. }) => {
+            let next = next_run_after(schedule, anchor)?;
+            let step = next - anchor;
+            (step > chrono::Duration::zero()).then_some(step)
+        }
+        // Interval was handled above; Manual/None have no cadence.
+        _ => None,
+    }
+}
+
+/// Inputs to the pure [`schedule_overdue`] predicate (issue #696).
+///
+/// Grouped into a struct because the exclusions must mirror the scheduler tick's
+/// exact semantics, which depend on several raw schedule fields. Both callers
+/// build this directly from the schedule row: the gauge sampler from a
+/// `HarvestSchedule`, the read from a `ScheduleEntry`/`HarvestSchedule`.
+#[derive(Debug, Clone, Copy)]
+pub struct OverdueInputs<'a> {
+    /// Parsed cadence (from `schedule_expr`). `None`/`Manual` ⇒ never overdue.
+    pub schedule: Option<&'a Schedule>,
+    /// The pending fire slot. `None` ⇒ never overdue.
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// Reference instant (`Utc::now()` at the caller).
+    pub now: DateTime<Utc>,
+    /// Jitter window (`jitter_secs`), a grace term.
+    pub jitter: Duration,
+    /// Scheduler tick interval, a grace term.
+    pub tick_interval: Duration,
+    /// `is_paused` (#229) — AC3 exclusion.
+    pub is_paused: bool,
+    /// `auto_paused_at` (#360) — AC3 exclusion.
+    pub auto_paused_at: Option<DateTime<Utc>>,
+    /// `exhausted_at` (#478/#543) — AC3 exclusion. **Note:** set by the tick, so
+    /// the raw `end_at`/`max_runs`/`runs_started` fields below are also consulted
+    /// to catch a schedule that is bounded-out but whose tick died before
+    /// stamping `exhausted_at`.
+    pub exhausted_at: Option<DateTime<Utc>>,
+    /// `end_at` (#478) hard cutoff.
+    pub end_at: Option<DateTime<Utc>>,
+    /// `max_runs` (#478) budget.
+    pub max_runs: Option<i32>,
+    /// `runs_started` (#478) consumed budget.
+    pub runs_started: i32,
+    /// Resolved overlap policy (`OverlapPolicy::from_db(&overlap_policy)`).
+    pub overlap_policy: OverlapPolicy,
+    /// Resolved catchup-enabled flag
+    /// (`CatchupPolicy::from_db(...).is_catchup_enabled()`).
+    pub catchup: bool,
+    /// Whether the schedule is at/over `max_active_runs` (the tick-exact running
+    /// basis: shard-local `RUNNING`/`PAUSED` + #607 pending throttle).
+    pub at_capacity: bool,
+    /// Calendar-adjusted effective fire time for the pinned `next_run_at` slot
+    /// (issue #696, Codex round 3). `Some(rebased)` when a calendar skip policy
+    /// (`run_next_business_day`/`run_prev_business_day`) has rebased an excluded
+    /// slot to a different business day; `None` when there is no calendar
+    /// deferral (no calendar, slot not excluded, `SkipPolicy::Skip`-suppressed,
+    /// or unparseable cadence). The predicate anchors the lag test on
+    /// `max(next_run_at, effective_fire_at)`, so a schedule the tick is
+    /// deliberately holding for a *future* calendar-adjusted fire is not falsely
+    /// flagged overdue, while one wedged **past** its adjusted fire still is. The
+    /// caller resolves this (it needs the calendar's exclusions) so the predicate
+    /// stays DB-free (AC2); see [`resolve_effective_fire_at`].
+    pub effective_fire_at: Option<DateTime<Utc>>,
+}
+
+/// Pure overdue predicate (issue #696, AC2). No database.
+///
+/// A schedule is **overdue** iff it is *active* AND `now − next_run_at > grace`,
+/// where `grace = cadence_step + jitter + tick_interval`. The cadence-step term
+/// gives a full extra cadence of slack (so the first missed fire is detected
+/// within ~one more cadence step), the jitter term absorbs jitter-deferred
+/// dispatch, and the tick term absorbs the scheduler's own poll latency — so a
+/// healthy schedule caught mid-tick, or deferred by jitter, is never flagged.
+///
+/// **Bounded-out exclusion, derived from RAW fields (Codex P2-A).** `exhausted_at`
+/// is stamped *by* the tick — the very thing that may be wedged — so the
+/// predicate must also recognise a schedule the tick *would* exhaust but hasn't
+/// yet. Mirroring `tick_one_workflow_schedule` byte-for-byte
+/// (`now_budget_exhausted`/`end_at_now_exhausted`, scheduler.rs): bounded-out =
+/// `exhausted_at.is_some()` **or** `max_runs > 0 && runs_started >= max_runs`
+/// **or** `next_run_at >= end_at`. A slot with `next_run_at < end_at` that hasn't
+/// fired is a GENUINE missed slot (still overdue), only `next_run_at >= end_at`
+/// is bounded-out.
+///
+/// **`at_capacity` suppression, gated to the tick's deferring config (Codex P2-B).**
+/// The tick only retains `next_run_at` in the past under
+/// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
+/// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
+/// `next_run_at`: non-catchup Skip drops-and-advances, BufferOne/BufferAll
+/// advance, CancelOther/TerminateOther cancel/terminate and proceed. So the
+/// `at_capacity` suppression applies **only** when
+/// `overlap_policy == Skip && catchup && at_capacity` — for every other config a
+/// past `next_run_at` while at capacity is a GENUINE stall the gauge must flag.
+///
+/// AC3: intentionally-not-firing states (`is_paused`, `auto_paused_at` set
+/// (#360), `Schedule::Manual`, and bounded-out schedules) are never overdue.
+#[must_use]
+pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
+    // Bounded-out via RAW fields (Codex P2-A): mirror the tick's exhaustion
+    // conditions exactly, so a schedule the tick *would* mark exhausted (but
+    // whose tick died first, leaving exhausted_at NULL) is not flagged.
+    let max_runs_bounded_out = inputs
+        .max_runs
+        .is_some_and(|max| max > 0 && inputs.runs_started >= max);
+    // The at-capacity suppression applies ONLY under the tick's deferring config
+    // (Codex P2-B): Skip + catchup. For every other policy a stale next_run_at
+    // while at capacity is a genuine stall.
+    let at_capacity_suppresses =
+        inputs.at_capacity && inputs.overlap_policy == OverlapPolicy::Skip && inputs.catchup;
+
+    // AC3 exclusions + the gated §2 guard: never overdue.
+    if inputs.is_paused
+        || inputs.auto_paused_at.is_some()
+        || inputs.exhausted_at.is_some()
+        || max_runs_bounded_out
+        || at_capacity_suppresses
+    {
+        return OverdueVerdict::NOT_OVERDUE;
+    }
+    // No pending fire (Manual, never-scheduled, exhausted-with-nulled-next).
+    let Some(next_run_at) = inputs.next_run_at else {
+        return OverdueVerdict::NOT_OVERDUE;
+    };
+    // end_at bounded-out (Codex P2-A): mirrors `end_at_now_exhausted` — the next
+    // slot is at/past the cutoff, so there is no legal slot left to fire.
+    if inputs.end_at.is_some_and(|end| next_run_at >= end) {
+        return OverdueVerdict::NOT_OVERDUE;
+    }
+    // No cadence (Manual/None/unparseable): nothing to be "overdue" against.
+    let Some(step) = cadence_step(inputs.schedule, next_run_at) else {
+        return OverdueVerdict::NOT_OVERDUE;
+    };
+    let jitter =
+        chrono::Duration::from_std(inputs.jitter).unwrap_or_else(|_| chrono::Duration::zero());
+    let tick = chrono::Duration::from_std(inputs.tick_interval)
+        .unwrap_or_else(|_| chrono::Duration::zero());
+    // `chrono::Duration`'s `+` panics on overflow; a pathological (near-i64-ms)
+    // interval + jitter could overflow. Treat an unrepresentable grace as "no
+    // cadence" (never overdue), consistent with how the module treats a
+    // non-representable interval elsewhere.
+    let Some(grace) = step
+        .checked_add(&jitter)
+        .and_then(|partial| partial.checked_add(&tick))
+    else {
+        return OverdueVerdict::NOT_OVERDUE;
+    };
+    // Calendar-deferred anchor (Codex round 3): a calendar skip policy can rebase
+    // an excluded slot to a later business day, and while that adjusted fire is
+    // still in the future the tick deliberately keeps `next_run_at` pinned to the
+    // (now past) original slot. Anchoring the lag on `max(next_run_at,
+    // effective_fire_at)` means a schedule waiting for a *future* calendar fire is
+    // not falsely flagged, while a schedule wedged **past** its adjusted fire is
+    // still caught (its `effective_fire_at` is itself now in the past). With no
+    // calendar, `effective_fire_at` is `None` ⇒ anchor == `next_run_at` (byte-for-
+    // byte unchanged). A backward rebase (`run_prev_business_day`, so
+    // `effective_fire_at < next_run_at`) also keeps the raw anchor via the `max`,
+    // preserving detection.
+    let anchor = inputs
+        .effective_fire_at
+        .filter(|eff| *eff > next_run_at)
+        .unwrap_or(next_run_at);
+    let lag = inputs.now - anchor;
+    if lag > grace {
+        OverdueVerdict {
+            overdue: true,
+            overdue_by_secs: Some(lag.num_seconds()),
+        }
+    } else {
+        OverdueVerdict::NOT_OVERDUE
+    }
+}
+
+/// One schedule's overdue verdict, tagged with its bounded `kind` and `name`
+/// (issue #696). Returned by [`overdue_schedule_samples`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverdueSample {
+    /// `"workflow"` or `"dag"`.
+    pub kind: String,
+    /// The registered workflow or DAG name.
+    pub name: String,
+    /// Whether this schedule is overdue.
+    pub overdue: bool,
+    /// `now − next_run_at` in whole seconds when overdue, else `None`.
+    pub overdue_by_secs: Option<i64>,
+}
+
+/// The scheduler tick's exact at-capacity running basis for a schedule's
+/// workflow (or DAG) name on **one shard** connection (issue #696).
+///
+/// Replicates `tick_one_workflow_schedule`'s own count byte-for-byte: the
+/// shard-local `COUNT(state IN ('RUNNING','PAUSED') WHERE workflow_name = name)`
+/// **plus** the #607 pending-throttle backlog
+/// (`throttle::pending_throttle_count_for_workflow`) that the tick adds before
+/// comparing against `max_active_runs`. A DAG schedule's executions carry
+/// `workflow_name == dag_name`, and the DAG tick uses the same two-term basis,
+/// so callers pass `dag_name` for a DAG schedule and `workflow_name` for a
+/// workflow schedule. Because the count runs on the schedule's own shard `conn`,
+/// this is shard-local — identical to the tick, which enforces `max_active_runs`
+/// shard-locally. `at_capacity` computed from this basis therefore suppresses
+/// `overdue` *exactly* when the tick would deliberately hold `next_run_at` in
+/// the past.
+///
+/// # Errors
+///
+/// Returns a database error if either count query fails.
+pub async fn schedule_running_basis(
+    conn: &mut AsyncPgConnection,
+    name: &str,
+) -> HarvestResult<i64> {
+    let running: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(name))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let pending = crate::throttle::pending_throttle_count_for_workflow(conn, name).await?;
+    Ok(running.saturating_add(pending))
+}
+
+/// Resolve the calendar-adjusted effective fire time for a schedule's pinned
+/// `next_run_at` slot (issue #696, Codex round 3).
+///
+/// Mirrors the tick's own calendar rebasing and feeds
+/// [`OverdueInputs::effective_fire_at`].
+///
+/// Returns:
+/// - `Ok(None)` when there is no calendar deferral — no calendar, no pending
+///   slot, unparseable cadence, the slot is not calendar-excluded, or the slot is
+///   `SkipPolicy::Skip`-suppressed. In all these cases the overdue predicate
+///   anchors on the raw `next_run_at`, so behavior is unchanged for every
+///   non-calendar schedule and every `SkipPolicy::Skip` schedule.
+/// - `Ok(Some(rebased))` when a `run_next_business_day`/`run_prev_business_day`
+///   policy has rebased an excluded slot to a different business day. The predicate
+///   then anchors grace on that adjusted fire (via `max(next_run_at, ..)`), so a
+///   schedule the tick is deliberately holding for a future business-day fire is
+///   not flagged overdue.
+///
+/// Reuses the **same** `calendar::apply_skip_policy` + [`rebase_logical_date`]
+/// helpers the tick uses (`tick_one_workflow_schedule`'s dispatch loop), so there
+/// is no second calendar implementation to drift. The calendar's exclusion set is
+/// loaded on `conn` (shard-local), keeping the pure predicate DB-free (AC2).
+///
+/// # Errors
+///
+/// Returns a database error if loading the calendar's exclusions fails.
+pub async fn resolve_effective_fire_at(
+    conn: &mut AsyncPgConnection,
+    calendar_name: Option<&str>,
+    skip_policy_db: &str,
+    schedule_expr: Option<&str>,
+    next_run_at: Option<DateTime<Utc>>,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let (Some(cal_name), Some(slot), Some(expr)) = (calendar_name, next_run_at, schedule_expr)
+    else {
+        return Ok(None);
+    };
+    let Some(parsed) = parse_schedule_from_expr(expr) else {
+        return Ok(None);
+    };
+    let excluded = crate::calendar::load_exclusions_for_calendar(conn, cal_name).await?;
+    let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
+    let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
+    let slot_date = slot.date_naive();
+    Ok(
+        match crate::calendar::apply_skip_policy(
+            slot_date,
+            skip_policy,
+            &excluded,
+            exclude_weekends,
+        ) {
+            // `SkipPolicy::Skip` on an excluded day: the tick drops the slot and
+            // advances, so there is no adjusted fire to defer to. Keep the raw
+            // anchor so a tick genuinely wedged before advancing is still flagged.
+            None => None,
+            // Not excluded: the tick fires the original slot; no rebasing.
+            Some(adjusted) if adjusted == slot_date => None,
+            // Rebased to a business day: the effective fire is at the adjusted slot.
+            Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
+        },
+    )
+}
+
+/// One shard's overdue sampling pass (issue #696).
+///
+/// Carries the per-schedule verdicts plus the minimum active cadence step on the
+/// shard, which the worker sampler uses to adapt its poll interval so a sub-30s
+/// schedule is still detected within its cadence-grace window (Codex round 4).
+#[derive(Debug, Clone)]
+pub struct OverdueSamplePass {
+    /// Per-schedule verdicts (all schedules, including not-overdue ones).
+    pub samples: Vec<OverdueSample>,
+    /// Minimum `cadence_step` across *active* (not paused / auto-paused /
+    /// exhausted, and cadence-bearing) schedules on this shard. `None` when no
+    /// active schedule has a cadence (a Manual-only / dormant fleet).
+    pub min_cadence_step: Option<Duration>,
+}
+
+/// Compute the overdue verdict for every schedule on one shard, plus the shard's
+/// fastest active cadence (issue #696).
+///
+/// Loads all schedule rows on `conn` and, per schedule, computes the tick's
+/// exact shard-local running basis via [`schedule_running_basis`]
+/// (`RUNNING`/`PAUSED` count + #607 pending-throttle backlog), so the
+/// `at_capacity` suppression fires *exactly* when the tick would hold
+/// `next_run_at`. Then runs the pure [`schedule_overdue`] predicate against
+/// `now`. ALL schedules are returned (including paused/exhausted, which resolve
+/// to not-overdue) so the sampler can keep the gauge fresh. In the same pass it
+/// tracks the minimum cadence of active schedules for the adaptive sampler
+/// interval (Codex round 4) — gathered here to avoid a second schedule load.
+///
+/// # Errors
+///
+/// Returns a database error if any schedule or count query fails.
+pub async fn overdue_schedule_pass(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+) -> HarvestResult<OverdueSamplePass> {
+    let schedules: Vec<HarvestSchedule> = harvest_schedules::table
+        .select(HarvestSchedule::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut samples = Vec::with_capacity(schedules.len());
+    let mut min_cadence_step: Option<Duration> = None;
+    for s in schedules {
+        let (kind, name) = if let Some(dag_name) = s.dag_name {
+            ("dag".to_string(), dag_name)
+        } else {
+            ("workflow".to_string(), s.workflow_name.unwrap_or_default())
+        };
+        let schedule = s
+            .schedule_expr
+            .as_deref()
+            .and_then(parse_schedule_from_expr);
+        // Track the fastest *active* cadence for the adaptive sampler interval
+        // (Codex round 4). "Active" = not intentionally dormant (paused /
+        // auto-paused / exhausted); a fast, currently-healthy schedule must still
+        // be sampled near its cadence because it could wedge right after a pass.
+        // Over-inclusion (e.g. a bounded-out-but-not-yet-exhausted fast schedule)
+        // only samples slightly faster — correctness-safe, never slower.
+        if !s.is_paused
+            && s.auto_paused_at.is_none()
+            && s.exhausted_at.is_none()
+            && let Some(anchor) = s.next_run_at
+            && let Some(step) =
+                cadence_step(schedule.as_ref(), anchor).and_then(|d| d.to_std().ok())
+        {
+            min_cadence_step = Some(min_cadence_step.map_or(step, |cur| cur.min(step)));
+        }
+        let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
+        // Shard-local + throttle-aware basis (matches the tick exactly).
+        let at_capacity =
+            schedule_running_basis(conn, &name).await? >= i64::from(s.max_active_runs);
+        // Resolve overlap/catchup exactly as the tick does, so the gated
+        // at-capacity suppression (Codex P2-B) matches when the tick retains.
+        let overlap_policy = OverlapPolicy::from_db(&s.overlap_policy);
+        let catchup = crate::policy::CatchupPolicy::from_db(
+            s.catchup_policy.as_deref(),
+            s.catchup_window_secs,
+            s.catchup,
+        )
+        .is_catchup_enabled();
+        // Calendar-adjusted fire time (Codex round 3): resolve the tick's own
+        // calendar rebasing so a calendar-deferred future fire is not flagged.
+        let effective_fire_at = resolve_effective_fire_at(
+            conn,
+            s.calendar_name.as_deref(),
+            &s.skip_policy,
+            s.schedule_expr.as_deref(),
+            s.next_run_at,
+        )
+        .await?;
+        let verdict = schedule_overdue(&OverdueInputs {
+            schedule: schedule.as_ref(),
+            next_run_at: s.next_run_at,
+            now,
+            jitter,
+            tick_interval: SCHEDULER_TICK_INTERVAL,
+            is_paused: s.is_paused,
+            auto_paused_at: s.auto_paused_at,
+            exhausted_at: s.exhausted_at,
+            end_at: s.end_at,
+            max_runs: s.max_runs,
+            runs_started: s.runs_started,
+            overlap_policy,
+            catchup,
+            at_capacity,
+            effective_fire_at,
+        });
+        samples.push(OverdueSample {
+            kind,
+            name,
+            overdue: verdict.overdue,
+            overdue_by_secs: verdict.overdue_by_secs,
+        });
+    }
+    Ok(OverdueSamplePass {
+        samples,
+        min_cadence_step,
+    })
+}
+
+/// Compute the overdue verdict for every schedule on one shard (issue #696).
+///
+/// Thin wrapper over [`overdue_schedule_pass`] returning only the verdicts, for
+/// callers that don't need the adaptive-interval cadence (the DB tests and
+/// [`sample_overdue_schedules`]).
+///
+/// # Errors
+///
+/// Returns a database error if any schedule or count query fails.
+pub async fn overdue_schedule_samples(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+) -> HarvestResult<Vec<OverdueSample>> {
+    Ok(overdue_schedule_pass(conn, now).await?.samples)
+}
+
+/// Sample the overdue verdict for every schedule on **one shard** and emit the
+/// `harvest.schedule.overdue` gauge (issue #696).
+///
+/// Verdicts are aggregated per `(kind, name)` within the shard (overdue if any
+/// same-named schedule is overdue) before emitting, so a healthy same-named
+/// schedule cannot mask an overdue one via last-write-wins.
+///
+/// This is a single-shard convenience (used by the DB integration tests). The
+/// worker's fleet sampler instead calls [`overdue_schedule_samples`] per shard
+/// and OR-aggregates across **all** shard pools into one `(kind, name)` map
+/// before emitting, so a same-named schedule that transiently exists on two
+/// shards (e.g. a `default_shard`/router reconfiguration) cannot be masked by a
+/// per-pool last-write-wins `.set()`.
+///
+/// # Errors
+///
+/// Returns a database error if loading schedules or execution counts fails.
+pub async fn sample_overdue_schedules(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) -> HarvestResult<()> {
+    let samples = overdue_schedule_samples(conn, now).await?;
+    // Aggregate per (kind, name): overdue if ANY same-key schedule is overdue.
+    let mut by_key: std::collections::BTreeMap<(String, String), bool> =
+        std::collections::BTreeMap::new();
+    for s in samples {
+        let entry = by_key.entry((s.kind, s.name)).or_insert(false);
+        *entry = *entry || s.overdue;
+    }
+    for ((kind, name), overdue) in by_key {
+        metrics.record_schedule_overdue(&kind, &name, overdue);
+    }
+    Ok(())
+}
+
 fn due_run_plan(
     schedule: Option<&Schedule>,
     first_due: DateTime<Utc>,
@@ -5854,5 +6353,517 @@ mod tests {
             matches!(&parsed, Schedule::CronInTimezone { tz, .. } if tz == "America/Los_Angeles"),
             "round-trip failed: {parsed:?}"
         );
+    }
+
+    // ── Overdue-schedule detection (issue #696) ──────────────────────────────
+    //
+    // Pure predicate table tests (AC2/AC3/AC6). No database. `grace = cadence
+    // step + jitter + tick`, so a healthy schedule caught mid-tick, deferred by
+    // jitter, or deliberately not firing is never flagged.
+
+    /// Build a fixed UTC instant (avoids `Utc::now()` non-determinism).
+    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).single().unwrap()
+    }
+
+    const TICK: Duration = Duration::from_secs(1);
+    const NO_JITTER: Duration = Duration::from_secs(0);
+
+    /// Build a healthy, non-bounded, non-deferring [`OverdueInputs`] (Skip, no
+    /// catchup, no bounds). Tests override specific fields via struct-update
+    /// syntax (`OverdueInputs { field, ..base(..) }`) since `OverdueInputs` is
+    /// `Copy`.
+    fn base(
+        sched: Option<&Schedule>,
+        next_run_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> OverdueInputs<'_> {
+        OverdueInputs {
+            schedule: sched,
+            next_run_at,
+            now,
+            jitter: NO_JITTER,
+            tick_interval: TICK,
+            is_paused: false,
+            auto_paused_at: None,
+            exhausted_at: None,
+            end_at: None,
+            max_runs: None,
+            runs_started: 0,
+            overlap_policy: OverlapPolicy::Skip,
+            catchup: false,
+            at_capacity: false,
+            effective_fire_at: None,
+        }
+    }
+
+    #[test]
+    fn overdue_interval_flagged_past_grace() {
+        let sched = Schedule::Interval(Duration::from_secs(300)); // 5-min cadence
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // grace = 300 + 0 + 1 = 301. lag = 400 > 301 => overdue.
+        let next_run_at = now - chrono::Duration::seconds(400);
+        let v = schedule_overdue(&base(Some(&sched), Some(next_run_at), now));
+        assert!(
+            v.overdue,
+            "5-min schedule 400s past its slot must be overdue"
+        );
+        assert_eq!(
+            v.overdue_by_secs,
+            Some(400),
+            "overdue_by_secs is now - next_run_at, not lag - grace"
+        );
+    }
+
+    #[test]
+    fn overdue_interval_not_flagged_within_grace() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // lag = 200 <= 301 grace => not overdue (caught mid-cadence).
+        let v = schedule_overdue(&base(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(200)),
+            now,
+        ));
+        assert!(!v.overdue);
+        assert_eq!(v.overdue_by_secs, None);
+    }
+
+    #[test]
+    fn overdue_interval_boundary_exactly_at_grace_is_not_overdue() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // lag == grace (301) => strictly-greater predicate => not overdue.
+        let at = schedule_overdue(&base(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(301)),
+            now,
+        ));
+        assert!(!at.overdue, "lag == grace must not flag (strict >)");
+        // One second past the boundary flips it.
+        let past = schedule_overdue(&base(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(302)),
+            now,
+        ));
+        assert!(past.overdue);
+        assert_eq!(past.overdue_by_secs, Some(302));
+    }
+
+    // ── Calendar-deferred anchor (issue #696, Codex round 3) ──────────────────
+
+    #[test]
+    fn calendar_deferred_future_fire_is_not_overdue() {
+        // A daily-cadence schedule whose slot fell on an excluded day: the tick
+        // rebased it to a future business day and pinned next_run_at at the (now
+        // 2-day-past) original slot. next_run_at alone is far past grace, but the
+        // calendar-adjusted fire is still ahead ⇒ not overdue.
+        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily
+        let now = dt(2026, 1, 5, 12, 0, 0);
+        let next_run_at = now - chrono::Duration::days(2); // well past grace
+        let v = schedule_overdue(&OverdueInputs {
+            effective_fire_at: Some(now + chrono::Duration::hours(6)), // future fire
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            !v.overdue,
+            "a schedule deferred to a FUTURE calendar-adjusted fire must not be overdue"
+        );
+        assert_eq!(v.overdue_by_secs, None);
+    }
+
+    #[test]
+    fn calendar_deferred_past_fire_is_still_overdue() {
+        // The calendar-adjusted fire is itself now in the past by > grace: the
+        // scheduler is genuinely wedged past the business-day fire ⇒ still flagged
+        // (detection preserved, not blanket-suppressed for calendar schedules).
+        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily, grace ≈ 1 day
+        let now = dt(2026, 1, 5, 12, 0, 0);
+        let next_run_at = now - chrono::Duration::days(3);
+        let effective = now - chrono::Duration::days(2); // adjusted fire 2 days past
+        let v = schedule_overdue(&OverdueInputs {
+            effective_fire_at: Some(effective),
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            v.overdue,
+            "a schedule wedged PAST its calendar-adjusted fire by > grace must still be overdue"
+        );
+        // Lag is measured from the adjusted fire (anchor), not the raw slot.
+        assert_eq!(v.overdue_by_secs, Some((now - effective).num_seconds()));
+    }
+
+    #[test]
+    fn calendar_backward_rebase_keeps_raw_anchor() {
+        // A `run_prev_business_day` rebase moves the effective fire EARLIER than
+        // next_run_at. `max(next_run_at, effective_fire_at)` keeps the raw slot as
+        // the anchor, so a genuinely stale slot is still flagged (never
+        // under-detected by a backward rebase).
+        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily
+        let now = dt(2026, 1, 5, 12, 0, 0);
+        let next_run_at = now - chrono::Duration::days(2); // past grace
+        let v = schedule_overdue(&OverdueInputs {
+            effective_fire_at: Some(now - chrono::Duration::days(3)), // earlier
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            v.overdue,
+            "a backward calendar rebase must not suppress a genuinely stale slot"
+        );
+        assert_eq!(v.overdue_by_secs, Some((now - next_run_at).num_seconds()));
+    }
+
+    #[test]
+    fn overdue_jitter_absorbed_by_grace() {
+        // A schedule deferred for jitter holds next_run_at at the slot until
+        // `now >= slot + jitter_offset`; grace's jitter term absorbs it.
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let jitter = Duration::from_secs(120);
+        // lag = 300 + 100 = 400. grace = 300 + 120 + 1 = 421 => not overdue.
+        let v = schedule_overdue(&OverdueInputs {
+            jitter,
+            ..base(
+                Some(&sched),
+                Some(now - chrono::Duration::seconds(400)),
+                now,
+            )
+        });
+        assert!(!v.overdue, "jitter window must be absorbed by grace");
+    }
+
+    #[test]
+    fn overdue_cron_hourly_cadence_step() {
+        let sched = Schedule::Cron("0 * * * *".to_string()); // top of every hour
+        let slot = dt(2026, 1, 1, 0, 0, 0); // a valid occurrence
+        // grace = 3600 + 0 + 1 = 3601.
+        let just_over = slot + chrono::Duration::seconds(3700);
+        let v = schedule_overdue(&base(Some(&sched), Some(slot), just_over));
+        assert!(v.overdue, "hourly cron 3700s past its slot is overdue");
+        assert_eq!(v.overdue_by_secs, Some(3700));
+        // Within one cadence step => not overdue.
+        let within = schedule_overdue(&base(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(3500),
+        ));
+        assert!(!within.overdue);
+    }
+
+    #[test]
+    fn overdue_cron_every_five_minutes_cadence_step() {
+        let sched = Schedule::Cron("*/5 * * * *".to_string()); // 300s step
+        let slot = dt(2026, 1, 1, 0, 0, 0);
+        // grace = 300 + 0 + 1 = 301. 400s past => overdue.
+        let v = schedule_overdue(&base(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(400),
+        ));
+        assert!(v.overdue);
+        assert_eq!(v.overdue_by_secs, Some(400));
+    }
+
+    #[test]
+    fn overdue_cron_daily_cadence_step() {
+        let sched = Schedule::Cron("0 0 * * *".to_string()); // midnight, 86400s step
+        let slot = dt(2026, 1, 1, 0, 0, 0);
+        // Just under one day past => not overdue (grace ~= 1 day + 1s).
+        let within = schedule_overdue(&base(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(86_000),
+        ));
+        assert!(
+            !within.overdue,
+            "daily schedule 86000s late is still within grace"
+        );
+        // Over a full day + tick => overdue.
+        let over = schedule_overdue(&base(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(86_500),
+        ));
+        assert!(over.overdue);
+    }
+
+    #[test]
+    fn overdue_cron_weekly_cadence_step() {
+        let sched = Schedule::Cron("0 0 * * 0".to_string()); // Sunday midnight
+        // 2026-01-04 is a Sunday.
+        let slot = dt(2026, 1, 4, 0, 0, 0);
+        // 6 days late is still < one weekly step (604800s) => not overdue.
+        let within = schedule_overdue(&base(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(6 * 86_400),
+        ));
+        assert!(!within.overdue, "weekly cadence step must be ~604800s");
+        // 8 days late exceeds one weekly step => overdue.
+        let over = schedule_overdue(&base(
+            Some(&sched),
+            Some(slot),
+            slot + chrono::Duration::seconds(8 * 86_400),
+        ));
+        assert!(over.overdue);
+    }
+
+    #[test]
+    fn overdue_ac3_exclusions_never_flagged() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        // A next_run_at well past grace that WOULD be overdue if active.
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let b = || base(Some(&sched), stale, now);
+        // Sanity: with none of the exclusions it IS overdue.
+        assert!(schedule_overdue(&b()).overdue);
+        // is_paused (#229).
+        assert!(
+            !schedule_overdue(&OverdueInputs {
+                is_paused: true,
+                ..b()
+            })
+            .overdue
+        );
+        // auto_paused_at set (#360).
+        assert!(
+            !schedule_overdue(&OverdueInputs {
+                auto_paused_at: Some(now),
+                ..b()
+            })
+            .overdue
+        );
+        // exhausted_at set (#478/#543).
+        assert!(
+            !schedule_overdue(&OverdueInputs {
+                exhausted_at: Some(now),
+                ..b()
+            })
+            .overdue
+        );
+        // at_capacity under the tick's DEFERRING config (Skip + catchup): the
+        // tick deliberately holds next_run_at in the past — never a wedge.
+        assert!(
+            !schedule_overdue(&OverdueInputs {
+                at_capacity: true,
+                overlap_policy: OverlapPolicy::Skip,
+                catchup: true,
+                ..b()
+            })
+            .overdue
+        );
+    }
+
+    #[test]
+    fn overdue_manual_and_none_never_flagged() {
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        // Manual schedule: no cadence => never overdue.
+        assert!(!schedule_overdue(&base(Some(&Schedule::Manual), stale, now)).overdue);
+        // Unparseable/absent schedule (None) => never overdue.
+        assert!(!schedule_overdue(&base(None, stale, now)).overdue);
+    }
+
+    #[test]
+    fn overdue_next_run_at_none_never_flagged() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        assert!(!schedule_overdue(&base(Some(&sched), None, now)).overdue);
+    }
+
+    #[test]
+    fn overdue_fleet_of_100_healthy_reports_zero_false_positives() {
+        // AC6 companion test: N=100 healthy schedules under varied cadence,
+        // jitter, overlap and an at-capacity (backfill/long-running) case must
+        // ALL report not-overdue.
+        let now = dt(2026, 1, 1, 12, 0, 0);
+        let mut flagged = Vec::new();
+        for i in 0..100u32 {
+            // Vary the cadence across interval and cron shapes.
+            let (sched, step_secs): (Schedule, i64) = match i % 4 {
+                0 => (Schedule::Interval(Duration::from_secs(300)), 300),
+                1 => (Schedule::Interval(Duration::from_secs(3600)), 3600),
+                2 => (Schedule::Cron("0 * * * *".to_string()), 3600),
+                _ => (Schedule::Cron("*/15 * * * *".to_string()), 900),
+            };
+            let jitter = Duration::from_secs(u64::from(i % 60)); // 0..59s jitter windows
+            // Fresh next_run_at: within [now - 0, now + step] — i.e. either just
+            // fired (lag up to jitter+tick) or scheduled slightly ahead. Never
+            // more than one cadence past, so grace always absorbs it.
+            let lag = i64::from(i % 30); // 0..29s late — well inside grace
+            let next_run_at = now - chrono::Duration::seconds(lag);
+            // Every 10th schedule is an overlap=Skip + catchup long-running case
+            // at capacity, with next_run_at also held stale — the exact tick
+            // retain-at-logical_date deferring scenario. It must still report
+            // healthy (the P2-B gated suppression applies for Skip+catchup).
+            let at_capacity = i % 10 == 0;
+            let next_run_at = if at_capacity {
+                now - chrono::Duration::seconds(step_secs * 5) // deep in the past
+            } else {
+                next_run_at
+            };
+            let v = schedule_overdue(&OverdueInputs {
+                jitter,
+                at_capacity,
+                overlap_policy: OverlapPolicy::Skip,
+                catchup: at_capacity, // Skip+catchup only for the deferring case
+                ..base(Some(&sched), Some(next_run_at), now)
+            });
+            if v.overdue {
+                flagged.push((i, v.overdue_by_secs));
+            }
+        }
+        assert!(
+            flagged.is_empty(),
+            "healthy fleet must report 0 overdue; false positives: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_interval_reexport_matches_internal() {
+        assert_eq!(SCHEDULER_TICK_INTERVAL, DEFAULT_SCHEDULER_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn overdue_grace_overflow_is_not_overdue() {
+        // A pathological interval near chrono's i64-ms bound makes `grace =
+        // step + jitter + tick` overflow; the predicate must treat that as
+        // not-overdue (checked add) rather than panic.
+        let sched = Schedule::Interval(Duration::from_millis(u64::try_from(i64::MAX).unwrap()));
+        let now = dt(2026, 1, 1, 0, 0, 0);
+        let v = schedule_overdue(&base(
+            Some(&sched),
+            Some(now - chrono::Duration::seconds(10_000)),
+            now,
+        ));
+        assert!(
+            !v.overdue,
+            "an overflowing grace must be treated as not overdue, never a panic"
+        );
+    }
+
+    // ── Codex P2-A: bounded-out from RAW fields (exhausted_at may be NULL) ────
+
+    #[test]
+    fn overdue_bounded_out_by_max_runs_with_null_exhausted_at() {
+        // The tick would set exhausted_at (runs_started >= max_runs > 0) but its
+        // process died first, leaving exhausted_at NULL. The predicate must still
+        // treat the schedule as bounded-out (not overdue), mirroring
+        // `now_budget_exhausted`.
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let v = schedule_overdue(&OverdueInputs {
+            max_runs: Some(5),
+            runs_started: 5, // budget spent
+            exhausted_at: None,
+            ..base(Some(&sched), stale, now)
+        });
+        assert!(
+            !v.overdue,
+            "budget-exhausted (runs_started >= max_runs) must not be overdue even with NULL exhausted_at"
+        );
+        // max_runs = 0 is treated as unlimited by the tick (max > 0 guard), so a
+        // stale slot IS a genuine miss.
+        let unlimited = schedule_overdue(&OverdueInputs {
+            max_runs: Some(0),
+            runs_started: 5,
+            ..base(Some(&sched), stale, now)
+        });
+        assert!(
+            unlimited.overdue,
+            "max_runs = 0 is unlimited (tick's `max > 0` guard); a stale slot is overdue"
+        );
+    }
+
+    #[test]
+    fn overdue_bounded_out_by_end_at_with_null_exhausted_at() {
+        // next_run_at >= end_at: no legal slot left, bounded-out (mirrors
+        // `end_at_now_exhausted`), even with exhausted_at NULL.
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let next = now - chrono::Duration::seconds(10_000);
+        let v = schedule_overdue(&OverdueInputs {
+            end_at: Some(next), // next_run_at == end_at (>= end)
+            exhausted_at: None,
+            ..base(Some(&sched), Some(next), now)
+        });
+        assert!(
+            !v.overdue,
+            "next_run_at >= end_at is bounded-out (no legal slot left) with NULL exhausted_at"
+        );
+    }
+
+    #[test]
+    fn overdue_legal_missed_slot_before_end_at_is_flagged() {
+        // Converse: next_run_at < end_at is a GENUINE missed slot — the end_at
+        // field must not mask it.
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let next = now - chrono::Duration::seconds(10_000);
+        let v = schedule_overdue(&OverdueInputs {
+            end_at: Some(now + chrono::Duration::seconds(100_000)), // far future
+            exhausted_at: None,
+            ..base(Some(&sched), Some(next), now)
+        });
+        assert!(
+            v.overdue,
+            "a stale slot with next_run_at < end_at is a legal missed slot => overdue"
+        );
+    }
+
+    // ── Codex P2-B: at_capacity suppression gated to the tick's deferring config ─
+
+    #[test]
+    fn overdue_at_capacity_skip_catchup_is_suppressed() {
+        // The one deferring config the tick retains next_run_at under: Skip +
+        // catchup + at capacity. Must be suppressed (the guard's whole reason).
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let v = schedule_overdue(&OverdueInputs {
+            at_capacity: true,
+            overlap_policy: OverlapPolicy::Skip,
+            catchup: true,
+            ..base(Some(&sched), stale, now)
+        });
+        assert!(
+            !v.overdue,
+            "Skip + catchup + at_capacity is the tick's deferring config; must be suppressed"
+        );
+    }
+
+    #[test]
+    fn overdue_at_capacity_non_deferring_policies_are_flagged() {
+        // Every NON-deferring config advances next_run_at, so a stale slot while
+        // at capacity is a GENUINE stall the gauge must flag (Codex P2-B).
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let stale = Some(now - chrono::Duration::seconds(10_000));
+        // (policy, catchup) combos that do NOT retain next_run_at:
+        let non_deferring = [
+            (OverlapPolicy::Skip, false),       // non-catchup Skip advances
+            (OverlapPolicy::CancelOther, true), // cancel + proceed
+            (OverlapPolicy::CancelOther, false),
+            (OverlapPolicy::TerminateOther, true), // terminate + proceed
+            (OverlapPolicy::TerminateOther, false),
+            (OverlapPolicy::BufferOne, true), // buffer + advance
+            (OverlapPolicy::BufferOne, false),
+            (OverlapPolicy::BufferAll, true),
+            (OverlapPolicy::BufferAll, false),
+        ];
+        for (policy, catchup) in non_deferring {
+            let v = schedule_overdue(&OverdueInputs {
+                at_capacity: true,
+                overlap_policy: policy,
+                catchup,
+                ..base(Some(&sched), stale, now)
+            });
+            assert!(
+                v.overdue,
+                "non-deferring config {policy:?} (catchup={catchup}) at capacity with a stale \
+                 next_run_at is a genuine stall and must be flagged"
+            );
+        }
     }
 }

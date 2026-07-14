@@ -80,6 +80,72 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
+/// #696).
+///
+/// For a slow / Manual-only fleet the overdue signal changes on minute-scale
+/// cadence grace, so sampling it at the sub-second `poll_interval` (which runs
+/// an unindexed RUNNING/PAUSED count per schedule × shards × workers) is
+/// wasteful for no benefit — the sampler stays at this 30s ceiling. When a
+/// fast (sub-30s) schedule is present the sampler instead adapts down toward its
+/// cadence (never below the `poll_interval` floor) so `schedule_overdue` is
+/// detected within its grace window (Codex round 4). See
+/// [`next_overdue_sample_interval`].
+pub const SCHEDULE_OVERDUE_SAMPLE_MAX: Duration = Duration::from_secs(30);
+
+/// Compute the overdue sampler's next sleep interval (issue #696, Codex round 4).
+///
+/// Adapts to the fleet's fastest active cadence so the `harvest.schedule.overdue`
+/// gauge is refreshed within the detection grace window even for sub-30s
+/// schedules, while an all-slow / no-cadence fleet stays at the
+/// [`SCHEDULE_OVERDUE_SAMPLE_MAX`] ceiling (the common case, preserving the
+/// coarse-sampling perf win). The result is clamped to
+/// `[poll_interval, SCHEDULE_OVERDUE_SAMPLE_MAX]` so it never busy-spins below
+/// the worker poll interval. `min_cadence_step == None` (no active cadence-bearing
+/// schedule) → the ceiling.
+///
+/// The floor is `poll_interval.min(ceiling)` so a deployment configured with a
+/// `poll_interval` larger than 30s can never invert the clamp (it simply pins
+/// the interval at the 30s ceiling).
+#[must_use]
+pub fn next_overdue_sample_interval(
+    min_cadence_step: Option<Duration>,
+    poll_interval: Duration,
+) -> Duration {
+    let ceiling = SCHEDULE_OVERDUE_SAMPLE_MAX;
+    let floor = poll_interval.min(ceiling);
+    min_cadence_step.map_or(ceiling, |step| step.clamp(floor, ceiling))
+}
+
+/// A `harvest.schedule.overdue` gauge series label: `(kind, name)`.
+type ScheduleGaugeKey = (String, String);
+
+/// Gauge labels to reset to `0` after an overdue sampling pass (issue #696,
+/// Codex round 5).
+///
+/// When a schedule is deleted or renamed, a later pass stops emitting its
+/// `(kind, name)` gauge series, but both the built-in scrape recorder and
+/// metrics-rs retain the last value — so `harvest.schedule.overdue` would stay
+/// at `1` for a gone schedule (keeping the alert firing) until the worker
+/// restarts. This returns the previously-emitted labels absent from the current
+/// pass so the caller can zero them.
+///
+/// **Safety gate:** returns empty when `pass_complete == false` (some shard
+/// errored). A partial pass legitimately omits every label on the failed shard,
+/// so zeroing "disappeared" labels then would wrongly clear a genuinely-overdue
+/// schedule living on the unreachable shard.
+#[must_use]
+pub fn labels_to_clear<S: std::hash::BuildHasher>(
+    previous: &std::collections::HashSet<ScheduleGaugeKey, S>,
+    current: &std::collections::HashSet<ScheduleGaugeKey, S>,
+    pass_complete: bool,
+) -> Vec<ScheduleGaugeKey> {
+    if !pass_complete {
+        return Vec::new();
+    }
+    previous.difference(current).cloned().collect()
+}
+
 /// Validated, runtime-ready worker configuration.
 ///
 /// Built from [`WorkerConfig`] (the user-facing builder) via `From`, which
@@ -11636,6 +11702,124 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
+/// Spawn the overdue-schedule sampler (issue #696).
+///
+/// Emits the `harvest.schedule.overdue` gauge (`1`/`0` per schedule) so a
+/// stalled cron — the scheduler loop not ticking, `next_run_at` wedged in the
+/// past, an HA claim that never released — is detected within one cadence grace
+/// window instead of downstream. Runs on the worker (not the scheduler tick) so
+/// a wedged tick cannot suppress its own health signal; a total scheduler
+/// outage is still caught here as long as any worker is alive, and only a total
+/// process outage falls back to the absence-of-signal alert. Iterates every
+/// shard pool (`pools`) so a schedule wedged on one shard is surfaced while
+/// others are healthy (AC5). Skipped entirely when no metrics recorder is
+/// configured — the per-shard schedule/execution queries are not free.
+#[cfg(feature = "db")]
+fn spawn_schedule_overdue_sampler(
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    poll_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        // Labels emitted on the previous pass, so a series that disappears from a
+        // COMPLETE pass (schedule deleted/renamed) can be zeroed instead of
+        // sticking at its last value (Codex round 5 F2).
+        let mut previous_emitted: std::collections::HashSet<ScheduleGaugeKey> =
+            std::collections::HashSet::new();
+        loop {
+            // Sample FIRST, then sleep (Codex round 5 F1): an eager pass on
+            // startup emits the gauge and learns the adaptive cadence
+            // immediately, so a worker that starts while a fast schedule is
+            // already wedged detects it within one cadence grace window rather
+            // than only after the initial ceiling sleep.
+            let now = chrono::Utc::now();
+            // Aggregate verdicts across ALL shard pools into one (kind, name) map
+            // (overdue if any shard's same-named schedule is overdue) BEFORE
+            // emitting, mirroring the queue_depth precedent. This closes the
+            // cross-shard last-write-wins masking window a per-pool `.set()`
+            // would leave if a name transiently existed on two shards.
+            let mut by_key: std::collections::BTreeMap<ScheduleGaugeKey, bool> =
+                std::collections::BTreeMap::new();
+            // Minimum active cadence across every shard, for the next interval.
+            let mut min_cadence: Option<Duration> = None;
+            // A pass is COMPLETE only when every shard was queried without error.
+            // Any connection or read failure makes it PARTIAL, which gates the
+            // disappeared-label cleanup (a shard's schedules are absent then, not
+            // deleted).
+            let mut pass_complete = true;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        pass_complete = false;
+                        tracing::debug!(
+                            error = %error,
+                            "schedule overdue sampler could not acquire DB connection"
+                        );
+                        continue;
+                    }
+                };
+                // A read failure only skips that shard's schedules (each schedule
+                // lives on one shard, so its gauge holds its last value rather
+                // than being zero-filled misleadingly).
+                match crate::scheduler::overdue_schedule_pass(&mut conn, now).await {
+                    Ok(pass) => {
+                        for s in pass.samples {
+                            let entry = by_key.entry((s.kind, s.name)).or_insert(false);
+                            *entry = *entry || s.overdue;
+                        }
+                        if let Some(step) = pass.min_cadence_step {
+                            min_cadence = Some(min_cadence.map_or(step, |cur| cur.min(step)));
+                        }
+                    }
+                    Err(error) => {
+                        pass_complete = false;
+                        tracing::debug!(error = %error, "schedule overdue sample failed");
+                    }
+                }
+            }
+            let current_keys: std::collections::HashSet<ScheduleGaugeKey> =
+                by_key.keys().cloned().collect();
+            for ((kind, name), overdue) in by_key {
+                telemetry
+                    .metrics
+                    .record_schedule_overdue(&kind, &name, overdue);
+            }
+            // Zero any label that vanished from a COMPLETE pass (deleted/renamed
+            // schedule). Empty on a partial pass, so a transient shard outage
+            // never zeroes a genuinely-overdue schedule on the failed shard.
+            for (kind, name) in
+                crate::worker::labels_to_clear(&previous_emitted, &current_keys, pass_complete)
+            {
+                telemetry
+                    .metrics
+                    .record_schedule_overdue(&kind, &name, false);
+            }
+            // Track emitted labels: prune to the current set on a complete pass
+            // (cleared labels are now 0 and gone); grow-only on a partial pass so
+            // a label that may live on the failed shard is never dropped.
+            if pass_complete {
+                previous_emitted = current_keys;
+            } else {
+                previous_emitted.extend(current_keys);
+            }
+
+            // Adapt the next sleep to the fleet's fastest active cadence, then
+            // sleep (cancellable).
+            let interval = crate::worker::next_overdue_sample_interval(min_cadence, poll_interval);
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+        }
+    })
+}
+
 /// Spawn the worker slot-occupancy sampler (issue #531).
 ///
 /// Reads the two dispatch `Semaphore`s' `available_permits()` against the
@@ -12030,6 +12214,9 @@ struct WorkerMonitoringHandles {
     history_oversized_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
+    /// itself no-ops when metrics are disabled); `None` without `db`.
+    schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
@@ -12818,6 +13005,11 @@ impl Worker {
         {
             tracing::warn!(error = %error, "stranded-work sampler failed during shutdown");
         }
+        if let Some(handle) = monitors.schedule_overdue_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "schedule overdue sampler failed during shutdown");
+        }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "slot tuner loop failed during shutdown");
@@ -13090,7 +13282,7 @@ impl Worker {
             })
             .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(
-            sampler_pools,
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.registry.history_policy().continue_as_new_threshold(),
@@ -13259,6 +13451,26 @@ impl Worker {
         #[cfg(not(feature = "db"))]
         let stranded_work_sampler: Option<tokio::task::JoinHandle<()>> = None;
 
+        // Overdue-schedule gauge sampler (issue #696): emits
+        // `harvest.schedule.overdue` per schedule across every shard pool so a
+        // stalled cron is detected within one cadence grace window. Runs on the
+        // worker (not the scheduler tick) and no-ops internally when metrics are
+        // disabled. Uses `sampler_pools` so single-shard and multi-shard
+        // deployments both aggregate the full schedule set. The interval is
+        // adaptive (Codex round 4): a coarse 30s ceiling for a slow/Manual fleet,
+        // adapting down toward the fastest active cadence (never below
+        // `poll_interval`) so a sub-30s schedule is still detected within its
+        // grace window.
+        #[cfg(feature = "db")]
+        let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
+            sampler_pools,
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        ));
+        #[cfg(not(feature = "db"))]
+        let schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>> = None;
+
         WorkerMonitoringHandles {
             queue_depth_sampler,
             concurrency_sampler,
@@ -13271,6 +13483,7 @@ impl Worker {
             history_oversized_sampler,
             worker_slot_sampler,
             stranded_work_sampler,
+            schedule_overdue_sampler,
             slot_tuners,
             workflow_slot_target,
             activity_slot_target,
@@ -13476,6 +13689,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "stranded-work sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.schedule_overdue_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "schedule overdue sampler failed during shutdown"
             );
         }
         for handle in monitors.slot_tuners {
@@ -14617,6 +14839,111 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── Adaptive overdue sampler interval (issue #696, Codex round 4) ─────────
+
+    #[test]
+    fn overdue_interval_no_active_cadence_uses_ceiling() {
+        // A slow / Manual-only fleet (no active cadence) stays at the 30s ceiling.
+        assert_eq!(
+            next_overdue_sample_interval(None, Duration::from_millis(500)),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+    }
+
+    #[test]
+    fn overdue_interval_slow_cadence_clamps_to_ceiling() {
+        // A cadence above the 30s ceiling (e.g. hourly) clamps to the ceiling.
+        assert_eq!(
+            next_overdue_sample_interval(
+                Some(Duration::from_secs(3600)),
+                Duration::from_millis(500)
+            ),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+    }
+
+    #[test]
+    fn overdue_interval_in_band_cadence_is_used() {
+        // A 5s schedule (between the 500ms floor and 30s ceiling) samples at 5s.
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(5)), Duration::from_millis(500)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn overdue_interval_fast_cadence_never_below_poll_floor() {
+        // A 1s schedule present → sampled near its cadence (1s > 500ms floor),
+        // NOT the 30s ceiling — the fast-schedule detection fix.
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(1)), Duration::from_millis(500)),
+            Duration::from_secs(1)
+        );
+        // A cadence below the poll floor is clamped UP to the floor (no busy-spin).
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(1)), Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn overdue_interval_large_poll_interval_never_inverts_clamp() {
+        // A poll_interval larger than the 30s ceiling pins at the ceiling rather
+        // than panicking on an inverted clamp.
+        assert_eq!(
+            next_overdue_sample_interval(Some(Duration::from_secs(5)), Duration::from_secs(60)),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+        assert_eq!(
+            next_overdue_sample_interval(None, Duration::from_secs(60)),
+            SCHEDULE_OVERDUE_SAMPLE_MAX
+        );
+    }
+
+    // ── Disappeared gauge-label cleanup (issue #696, Codex round 5 F2) ─────────
+
+    fn key(kind: &str, name: &str) -> ScheduleGaugeKey {
+        (kind.to_string(), name.to_string())
+    }
+
+    fn key_set(pairs: &[(&str, &str)]) -> std::collections::HashSet<ScheduleGaugeKey> {
+        pairs.iter().map(|(k, n)| key(k, n)).collect()
+    }
+
+    #[test]
+    fn labels_to_clear_returns_disappeared_labels_on_complete_pass() {
+        // previous={A,B} current={A} complete=true → [B].
+        let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
+        let current = key_set(&[("workflow", "a")]);
+        let cleared = labels_to_clear(&previous, &current, true);
+        assert_eq!(cleared, vec![key("workflow", "b")]);
+    }
+
+    #[test]
+    fn labels_to_clear_is_empty_on_partial_pass() {
+        // Same as above but complete=false → [] (a shard outage must not zero a
+        // genuinely-overdue schedule living on the failed shard).
+        let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
+        let current = key_set(&[("workflow", "a")]);
+        assert!(labels_to_clear(&previous, &current, false).is_empty());
+    }
+
+    #[test]
+    fn labels_to_clear_is_empty_when_previous_subset_of_current() {
+        // previous ⊆ current → [] (nothing disappeared).
+        let previous = key_set(&[("workflow", "a")]);
+        let current = key_set(&[("workflow", "a"), ("dag", "b")]);
+        assert!(labels_to_clear(&previous, &current, true).is_empty());
+    }
+
+    #[test]
+    fn labels_to_clear_is_empty_when_previous_empty() {
+        // Empty previous (first pass) → [] regardless of current.
+        let previous = std::collections::HashSet::new();
+        let current = key_set(&[("workflow", "a")]);
+        assert!(labels_to_clear(&previous, &current, true).is_empty());
+    }
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {

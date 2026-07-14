@@ -16,8 +16,9 @@
 //!
 //! This aggregates the nine ADR-0001 §7 catalogue metrics named in issue
 //! #355, plus `harvest.queue.oldest_pending_age`, `harvest.worker.slots_*`,
-//! and `harvest.shard.stranded_pending` — the engine's own background
-//! samplers already compute these under the same `MetricsRecorder::is_enabled()`
+//! `harvest.shard.stranded_pending`, and `harvest.schedule.overdue` (issue
+//! #696) — the engine's own background samplers already compute these under the
+//! same `MetricsRecorder::is_enabled()`
 //! gate (see `HarvestMetricsRecorder::is_enabled`, which reports `true`
 //! unconditionally so the nine required metrics are actually sampled), so
 //! leaving them unimplemented would mean the sampler's DB queries still ran
@@ -150,6 +151,10 @@ struct Inner {
     worker_slots_available: Gauge,
     worker_slot_target: Gauge,
     shard_stranded_pending: Gauge,
+    // The #696 overdue-schedule sampler runs under the same is_enabled() gate;
+    // render its primary gauge here so the recommended built-in scrape path (not
+    // just the metrics-rs adapter) exposes `harvest_schedule_overdue`.
+    schedule_overdue: Gauge,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -308,6 +313,18 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .shard_stranded_pending
             .set(vec![shard.to_string()], count as f64);
+    }
+
+    fn record_schedule_overdue(&self, kind: &str, name: &str, overdue: bool) {
+        // Last-write-wins gauge per (kind, name): 1.0 when the schedule is overdue
+        // relative to its own cadence, 0.0 when healthy (issue #696). The #696
+        // sampler already ran under the is_enabled() gate to compute this; without
+        // this override the value would fall through to the trait no-op and the
+        // primary overdue gauge would be absent from the built-in scrape endpoint.
+        self.0.schedule_overdue.set(
+            vec![kind.to_owned(), name.to_owned()],
+            f64::from(u8::from(overdue)),
+        );
     }
 }
 
@@ -518,6 +535,13 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         "Claimable pending task demand per shard with no compatible worker",
         &[METRIC_LABEL_SHARD],
         inner.shard_stranded_pending.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_schedule_overdue",
+        "Whether a schedule is overdue to fire relative to its own cadence (1 = overdue, 0 = healthy)",
+        &[METRIC_LABEL_KIND, METRIC_LABEL_NAME],
+        inner.schedule_overdue.snapshot(),
     );
 }
 
@@ -758,6 +782,41 @@ mod tests {
         let families = recorder.collect();
         let f = family(&families, "harvest_shard_stranded_pending");
         assert_eq!(sample_value(f, &[("shard", "2")]), 9.0);
+    }
+
+    #[test]
+    fn schedule_overdue_is_a_gauge_labeled_by_kind_and_name() {
+        // Issue #696 (Codex round 3): the built-in scrape recorder must render
+        // `harvest_schedule_overdue` (1 = overdue, 0 = healthy) so the recommended
+        // `with_metrics_scrape()` path exposes the primary overdue gauge the alert
+        // consumes — not only the metrics-rs adapter.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_schedule_overdue("workflow", "foo", true);
+        recorder.record_schedule_overdue("dag", "bar", false);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_schedule_overdue");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(
+            sample_value(f, &[("kind", "workflow"), ("name", "foo")]),
+            1.0
+        );
+        assert_eq!(sample_value(f, &[("kind", "dag"), ("name", "bar")]), 0.0);
+    }
+
+    #[test]
+    fn schedule_overdue_gauge_is_last_write_wins() {
+        // A healthy → overdue → recovered transition must reflect the latest value.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_schedule_overdue("workflow", "foo", true);
+        recorder.record_schedule_overdue("workflow", "foo", false);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_schedule_overdue");
+        assert_eq!(
+            sample_value(f, &[("kind", "workflow"), ("name", "foo")]),
+            0.0
+        );
     }
 
     #[test]

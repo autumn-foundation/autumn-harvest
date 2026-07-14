@@ -2763,6 +2763,55 @@
             }
           ],
           "description": "Output-guarded completion triggers (issue #810): condition-skip rate per trigger and reason. reason=condition_unmet is a resolved skip (the guard evaluated false); reason=condition_invalid means a stored guard this build cannot parse \u2014 investigate mixed-version deploys or repair the condition."
+        },
+        {
+          "id": 907,
+          "type": "timeseries",
+          "title": "Schedules overdue",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 72
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (kind, name) (harvest_schedule_overdue)",
+              "legendFormat": "overdue {{kind}} {{name}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_schedule_missed_runs (docs/runbooks/harvest-alerts.md#harvest_schedule_missed_runs) Per-schedule overdue flag (issue #696): 1 when an active schedule is past its own cadence grace (next_run_at wedged, scheduler stalled, or an HA claim that never released), 0 when healthy. Precise per-schedule detection that names the wedged schedule, replacing absence-of-runs inference. Paused / auto-paused / manual / exhausted / at-capacity schedules read 0."
         }
       ]
     },
