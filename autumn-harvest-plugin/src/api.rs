@@ -11671,6 +11671,124 @@ pub(crate) async fn start_workflow(
             }
         }
 
+        // Admission gate (issue #377 / issue #618, PR #1014): halt beats pace.
+        // A throttle DEFER returns `202` from this branch *before* the core start
+        // primitive's authoritative gated create path (`GateMode::Check`, reached
+        // only on the fall-through plain/keyed start below) ever runs, so without
+        // this check a fresh throttled start would silently slip an armed gate.
+        // Mirror the batch route: check the gate here, before `reserve_or_defer`,
+        // and reject a genuinely-fresh admission with `503`. An idempotent retry —
+        // an explicit caller-supplied `workflow_id` whose resolved reuse policy
+        // ATTACHES to an existing prior (or errors `AlreadyExists`) rather than
+        // creating a fresh execution, OR that is already durably deferred (a
+        // pending throttle row) — is NOT a fresh admission (`reserve_or_defer`
+        // resolves it to the existing run / same pending row without inserting
+        // anything new), so the gate must not block it (preserves #808
+        // keyed-replay and the round-7 pending-throttle-row bypass). The bypass
+        // is reuse-policy-AWARE (Codex P1): a policy that genuinely CREATES a
+        // fresh execution on retry — `AllowDuplicateFailedOnly` over a
+        // FAILED/CANCELLED prior, or `TerminateIfRunning` — is a real admission
+        // and must face the gate, or the token-empty `Deferred` path would let a
+        // fresh replacement start slip an armed gate. This keys the decision on
+        // the SAME `start_will_create_new_execution` predicate the authoritative
+        // core locked gate uses (see `execution.rs`). We already know this
+        // workflow resolves a throttle policy (the enclosing `if let`), so the
+        // batch route's extra `workflow_resolving_throttle(...).is_some()` guard
+        // is redundant here.
+        if let Some((gate_id, gate_reason, scope_kind)) = {
+            let wf_owner = runtime
+                .registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|i| i.owner);
+            api_state
+                .gate_cache()
+                .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner)
+        } {
+            // Idempotent-retry bypass (mirrors the batch route's bypasses). Only
+            // meaningful for an explicit `workflow_id`: an auto-generated id varies
+            // per retry and can never resolve to a prior run/row. The checks reuse
+            // the already-held shard connection `conn` (the batch route acquires a
+            // fresh one only because it holds no per-item shard connection yet).
+            let is_idempotent_retry = explicit_workflow_id && {
+                // Load the prior run's STATE using the SAME non-sealed filter the
+                // authoritative locked gate applies (`try_load_active_execution_for_update`
+                // in `execution.rs`). The partial unique index guarantees at most
+                // one non-sealed row per `(workflow_name, workflow_id)`, so
+                // `.first()` is deterministic (there is no active-vs-terminal
+                // ambiguity to resolve).
+                let prior_state = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .filter(
+                        harvest_workflow_executions::state
+                            .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                    )
+                    .select(harvest_workflow_executions::state)
+                    .first::<String>(&mut conn)
+                    .await
+                    .optional()
+                    .unwrap_or(None);
+                // Bypass the gate only when the resolved reuse policy would NOT
+                // create a fresh execution (attach, or `AlreadyExists`) — the
+                // exact question the core gate keys on. A `None` prior, or a
+                // create-on-retry policy (`AllowDuplicateFailedOnly` +
+                // FAILED/CANCELLED prior, `TerminateIfRunning`), returns `true`
+                // here, so `attaches_to_existing` is `false` and the gate blocks.
+                let attaches_to_existing =
+                    !autumn_harvest::execution::start_will_create_new_execution(
+                        prior_state.as_deref(),
+                        reuse_policy,
+                    );
+                attaches_to_existing
+                    || autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
+                        &mut conn,
+                        &workflow_name,
+                        &workflow_id,
+                    )
+                    .await
+                    .unwrap_or(false)
+            };
+            if !is_idempotent_retry {
+                let reason_label = match gate_reason.char_indices().nth(64) {
+                    Some((idx, _)) => &gate_reason[..idx],
+                    None => &gate_reason,
+                };
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                // Best-effort failed-start audit (parity with the debounce/batch
+                // gate paths); a failure here must not mask the gate rejection.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "admission blocked",
+                        "gate_id": gate_id,
+                        "reason": gate_reason,
+                    })),
+                )
+                    .into_response();
+            }
+            // Idempotent retry: fall through to `reserve_or_defer`, which resolves
+            // it to the existing execution / same pending row (no fresh admission).
+        }
+
         let start_options = autumn_harvest::debounce::DebounceStartOptions {
             reuse_policy: request.reuse_policy.clone(),
             execution_timeout_secs: request.execution_timeout_secs.or_else(|| {
