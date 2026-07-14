@@ -472,8 +472,11 @@ pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
 ///
 /// A file argument is scanned directly; a directory argument is walked
 /// recursively with [`skip_scan_dir`] applied. Symlinked files and directories
-/// are **not** followed (a self-referential directory symlink cannot explode the
-/// scan, and a `../..` symlink cannot pull out-of-tree files into the report).
+/// are **not** followed — neither those discovered during a directory walk nor
+/// one passed directly as a top-level path argument (classified with
+/// `symlink_metadata`, which does not follow, and skipped with a warning). A
+/// self-referential directory symlink cannot explode the scan, and a `../..`
+/// symlink cannot pull out-of-tree files into the report.
 /// Overlapping arguments (a directory and a file inside it, or a repeated path)
 /// are de-duplicated by canonicalized path, so no file is scanned twice. A
 /// single unreadable / non-UTF-8 `.rs` file discovered during a directory walk
@@ -488,10 +491,22 @@ pub fn check_paths(paths: &[&Path]) -> std::io::Result<DetCheckReport> {
     let mut sources: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     for &path in paths {
+        // Classify with `symlink_metadata` (which does NOT follow) so a
+        // top-level symlink argument is skipped rather than followed — mirroring
+        // the nested walker's no-follow behavior (#778, Codex r9). Following a
+        // symlinked file would lint its target, and a symlinked directory would
+        // walk out-of-tree contents into the report; both contradict the
+        // documented no-follow contract. `metadata` (which follows) is still used
+        // for the resolved file-vs-dir decision below, but only after confirming
+        // the argument is not itself a symlink.
+        let link_md = std::fs::symlink_metadata(path)?;
+        if link_md.file_type().is_symlink() {
+            eprintln!("det-check: skipping symlink {}", path.display());
+            continue;
+        }
         // Erroring on a missing top-level path (a nonexistent argument) is a
         // real usage error, distinct from a per-file read error mid-walk.
-        let md = std::fs::metadata(path)?;
-        if md.is_dir() {
+        if link_md.is_dir() {
             collect_rs_sources_robust(path, &mut sources, &mut seen)?;
         } else {
             add_source_strict(path, &mut sources, &mut seen)?;
@@ -962,9 +977,10 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         // free helper (#778 review, zero-FP; #386 excludes fn pointers/closures).
         // Suppression differs by binding kind, matching Rust scoping:
         //   * params bind for the whole body and always suppress;
-        //   * a `let` shadow is **source-order-aware** — it suppresses only a
-        //     call on a strictly-later source line (a call before the binding
-        //     resolves to the free helper);
+        //   * a `let` shadow is **source-order + column-aware** — it suppresses a
+        //     call on a strictly-later source line, or a same-line call past the
+        //     binding's statement-terminating `;` (a call before the binding is
+        //     in scope resolves to the free helper);
         //   * a body-local `use` import (and glob) shadows the name for the
         //     **whole body** — a Rust block `use` item is in scope for the
         //     entire enclosing block regardless of textual position, so a call
@@ -1053,13 +1069,17 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
 /// same-named free helper (#778 review, zero-FP; #386 excludes fn
 /// pointers/closures).
 ///
-/// Shadow suppression matches Rust scoping by binding kind (#778, Codex P2/r7):
+/// Shadow suppression matches Rust scoping by binding kind (#778, Codex P2/r7/r9):
 /// `params` bind for the whole body and always suppress; a `let` shadow (in
-/// `let_binding_lines`, name → earliest binding line) is **source-order-aware**
-/// — it suppresses a call only when the binding's source line strictly PRECEDES
-/// the call (a call that runs before any same-name binding resolves to the free
-/// helper, matching Rust, and correct even for `let bad = bad();`, where the RHS
-/// call sees the outer fn).
+/// `let_binding_lines`, name → earliest [`LetBinding`] scope-entry point) is
+/// **source-order + column-aware** — it suppresses a call on a strictly-later
+/// source line, or on the SAME line only when the call's column is past the
+/// binding's statement-terminating `;` (the point the binding enters scope). A
+/// call that runs before the binding is in scope resolves to the free helper,
+/// matching Rust — correct for `let helper = ...; helper();` (the same-line call
+/// after the `;` is suppressed), for the RHS of `let bad = bad();` (before the
+/// `;`, so flagged), and for a pre-shadow `bad(); let bad = ...;` (before the
+/// binding, so flagged).
 ///
 /// A **block-local `use` import** rebinds a name for the **whole body**, not
 /// source-order: a Rust block `use` item is in scope for the entire enclosing
@@ -1081,7 +1101,7 @@ fn collect_direct_free_fn_calls(
     body: &[(u32, &str)],
     candidates: &std::collections::HashMap<&str, Vec<usize>>,
     params: &std::collections::HashSet<String>,
-    let_binding_lines: &std::collections::HashMap<String, u32>,
+    let_binding_lines: &std::collections::HashMap<String, LetBinding>,
     use_bindings: &std::collections::HashSet<String>,
     has_glob_use: bool,
 ) -> std::collections::BTreeSet<String> {
@@ -1140,16 +1160,20 @@ fn collect_direct_free_fn_calls(
             };
             let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
             // Shadowed in scope at this call site? A param shadows everywhere; a
-            // `let` binding shadows only calls on a strictly-later source line
-            // (source-order, matching round 3). A block-local `use` import and a
-            // block-local glob `use ...::*;` shadow the name across the WHOLE
-            // body — a Rust block `use` item is in scope for the entire block
-            // regardless of position, so a call may precede the `use` and still
-            // resolve to the import (#778, Codex r7).
+            // `let` binding shadows a call on a strictly-later source line, or —
+            // on the SAME line — a call whose column is past the binding's
+            // statement-terminating `;` (the point the binding enters scope), so
+            // `let helper = ...; helper();` suppresses the call while the RHS of
+            // `let bad = bad();` and a pre-shadow `bad(); let bad = ...;` call
+            // stay flagged (source-order + column-aware, #778 Codex P2/r9). A
+            // block-local `use` import and a block-local glob `use ...::*;` shadow
+            // the name across the WHOLE body — a Rust block `use` item is in scope
+            // for the entire block regardless of position, so a call may precede
+            // the `use` and still resolve to the import (#778, Codex r7).
             let shadowed_here = params.contains(token)
-                || let_binding_lines
-                    .get(token)
-                    .is_some_and(|&bind_line| bind_line < src_line)
+                || let_binding_lines.get(token).is_some_and(|b| {
+                    b.line < src_line || (b.line == src_line && start > b.in_scope_col)
+                })
                 || use_bindings.contains(token)
                 || has_glob_use;
             if first_ok && before_ok && after_ok && candidates.contains_key(token) && !shadowed_here
@@ -1231,36 +1255,89 @@ fn extract_fn_params(lines: &[&str], fn_idx: usize) -> Vec<String> {
     det010_pattern_mask_idents(&sig[open + 1..close])
 }
 
+/// The scope-entry point of a `let` binding: the source line it is bound on and,
+/// for that line, the byte column (in stripped-code coordinates) of the
+/// statement-terminating `;` at which the binding comes into scope. `in_scope_col`
+/// is [`usize::MAX`] when the `let` statement has no depth-0 `;` on its keyword
+/// line (a multi-line `let`), so no same-line call is ever suppressed by it.
+#[derive(Clone, Copy)]
+struct LetBinding {
+    /// Source line the `let` keyword is on.
+    line: u32,
+    /// Byte column of the statement-terminating `;` on that line (the point the
+    /// binding enters scope), or [`usize::MAX`] for a multi-line `let`.
+    in_scope_col: usize,
+}
+
 /// Collects the identifiers bound by `let` statements in a function body,
-/// mapping each to the **earliest** source line on which it is bound, so a call
-/// to a same-named local (a closure binding, a shadowing `let`) is never
+/// mapping each to the **earliest** point at which it enters scope (earliest
+/// source line, and on that line the earliest statement-terminating `;`), so a
+/// call to a same-named local (a closure binding, a shadowing `let`) is never
 /// resolved to a same-named free helper (#778 review, zero-FP) — but only for
-/// calls that come after the binding (source-order suppression, #778 Codex P2).
-/// Reuses [`det010_parse_let`] for robust pattern handling (simple, `mut`,
-/// annotated, and destructuring / enum-variant patterns). Single-line handling
-/// only; a multi-line `let` is a safe-direction under-collection.
-fn collect_body_let_binding_lines(body: &[(u32, &str)]) -> std::collections::HashMap<String, u32> {
-    let mut lines: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut record = |ident: String, src_line: u32| {
+/// calls that come after the binding is in scope (source-order suppression, #778
+/// Codex P2; column-aware within a line, #778 Codex r9). Reuses
+/// [`det010_parse_let`] for robust pattern handling (simple, `mut`, annotated,
+/// and destructuring / enum-variant patterns). Single-line handling only; a
+/// multi-line `let` is a safe-direction under-collection.
+fn collect_body_let_binding_lines(
+    body: &[(u32, &str)],
+) -> std::collections::HashMap<String, LetBinding> {
+    let mut lines: std::collections::HashMap<String, LetBinding> = std::collections::HashMap::new();
+    let mut record = |ident: String, binding: LetBinding| {
         lines
             .entry(ident)
-            .and_modify(|l| *l = (*l).min(src_line))
-            .or_insert(src_line);
+            .and_modify(|b| {
+                // Keep the earliest scope-entry point: earliest line, and on the
+                // same line the earliest terminating `;` (earliest in-scope col).
+                if (binding.line, binding.in_scope_col) < (b.line, b.in_scope_col) {
+                    *b = binding;
+                }
+            })
+            .or_insert(binding);
     };
     for &(src_line, line) in body {
         let code = strip_unparseable_content(line);
         for pos in word_positions(&code, "let") {
+            let binding = LetBinding {
+                line: src_line,
+                in_scope_col: let_stmt_terminator_col(&code, pos),
+            };
             match det010_parse_let(&code[pos + 3..]) {
-                Det010LetBinding::Simple { ident, .. } => record(ident, src_line),
+                Det010LetBinding::Simple { ident, .. } => record(ident, binding),
                 Det010LetBinding::PatternMask(ids) => {
                     for id in ids {
-                        record(id, src_line);
+                        record(id, binding);
                     }
                 }
             }
         }
     }
     lines
+}
+
+/// Returns the byte column of the depth-0 `;` that terminates the `let` statement
+/// beginning at `let_pos` in already-stripped `code` (strings/comments removed by
+/// [`strip_unparseable_content`], so a `;` inside a string cannot mislead it), or
+/// [`usize::MAX`] if the statement is not terminated on this line (a multi-line
+/// `let`). Depth tracks `()`/`[]`/`{}` so a `;` inside a closure block (e.g.
+/// `let f = || { a(); b() };`) or a nested expression is skipped — the terminator
+/// is the point at which the binding enters scope, so a same-line call before it
+/// (the `let`'s own RHS, incl. a self-referencing `let x = x();`) is not
+/// suppressed, while a same-line call after it is.
+fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut k = let_pos;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' if depth == 0 => return k,
+            _ => {}
+        }
+        k += 1;
+    }
+    usize::MAX
 }
 
 /// Collects the set of names bound by **block-local `use` imports** anywhere in

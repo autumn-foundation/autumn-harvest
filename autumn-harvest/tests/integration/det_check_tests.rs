@@ -2405,6 +2405,93 @@ fn bad() -> i64 {
     );
 }
 
+// ── Column-aware same-line `let` shadow (issue #778, Codex r9) ──────────────
+
+// A same-line `let helper = ...; helper();` binds the local BEFORE the call, so
+// Rust resolves the call to the local closure. Line-granular source-order
+// tracking wrongly kept flagging this (a same-named free helper with a
+// violation) because the binding and the call share a line; column-awareness
+// (the call comes after the binding's `;`) fixes the FP → NO finding.
+#[test]
+fn same_line_let_binding_before_call_is_suppressed() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let helper = || 0; helper();
+    Ok(())
+}
+
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a same-line `let helper = ...; helper();` binds before the call, so the \
+         call resolves to the local closure, not the free helper, got: {report:?}"
+    );
+}
+
+// The inverse: a same-line call that PRECEDES its `let bad` binding is not yet in
+// scope, so Rust resolves it to the free `fn bad` (a genuine violation). Column
+// awareness must NOT over-suppress a pre-shadow call on the same line as its
+// later binding — it stays flagged.
+#[test]
+fn same_line_call_before_let_binding_is_still_flagged() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = bad(); let bad = || 0;
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a same-line call BEFORE its `let bad` binding must resolve to the \
+                 free helper (binding not yet in scope), got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
+// A same-line self-referencing `let bad = bad();` — the RHS call runs before the
+// binding is in scope, so it resolves to the free `fn bad`. Column-awareness
+// (the RHS call precedes the statement-terminating `;`) must keep this flagged
+// rather than introducing a new false-negative.
+#[test]
+fn same_line_self_referencing_let_rhs_call_is_still_flagged() {
+    let src = "\
+#[workflow]
+async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let bad = bad();
+    Ok(())
+}
+
+fn bad() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("the RHS `bad()` of `let bad = bad();` must resolve to the free helper, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("bad"));
+}
+
 // ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
 
 // BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern `det-check
@@ -2499,6 +2586,79 @@ fn check_paths_does_not_follow_directory_symlinks() {
             .count(),
         1,
         "the symlinked dir must not be descended (real.rs scanned once), got: {report:?}"
+    );
+}
+
+// A symlink passed as a TOP-LEVEL path argument (a file symlink) must NOT be
+// followed — mirroring the nested no-follow behavior. Following it would lint the
+// target file, which may live outside the requested tree (Codex r9).
+#[cfg(unix)]
+#[test]
+fn check_paths_does_not_follow_a_top_level_symlink_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("real.rs");
+    std::fs::write(&real, WF_UTC).unwrap();
+    let link = dir.path().join("link.rs");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let report = check_paths(&[link.as_path()]).expect("scan must complete");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a top-level symlink FILE arg must be skipped, not followed to its \
+         target (which may be out of tree), got: {report:?}"
+    );
+}
+
+// A symlink to a DIRECTORY passed as a top-level path argument must NOT be
+// walked — following it could pull out-of-tree contents into the report,
+// contradicting the documented no-follow behavior (Codex r9).
+#[cfg(unix)]
+#[test]
+fn check_paths_does_not_follow_a_top_level_symlink_dir() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let realdir = root.path().join("realdir");
+    std::fs::create_dir(&realdir).unwrap();
+    std::fs::write(realdir.join("wf.rs"), WF_UTC).unwrap();
+    let linkdir = root.path().join("linkdir");
+    std::os::unix::fs::symlink(&realdir, &linkdir).unwrap();
+
+    let report = check_paths(&[linkdir.as_path()]).expect("scan must complete");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a top-level symlink DIR arg must be skipped, not walked into \
+         out-of-tree contents, got: {report:?}"
+    );
+}
+
+// Regression: real (non-symlink) file and directory arguments must still be
+// scanned/walked normally after the top-level symlink guard.
+#[test]
+fn check_paths_still_scans_real_file_and_dir_args() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = dir.path().join("wf.rs");
+    std::fs::write(&f, WF_UTC).unwrap();
+    let file_report = check_paths(&[f.as_path()]).expect("check_paths");
+    assert_eq!(
+        file_report
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "a real file arg must still be scanned, got: {file_report:?}"
+    );
+
+    let subdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(subdir.path().join("wf.rs"), WF_UTC).unwrap();
+    let dir_report = check_paths(&[subdir.path()]).expect("check_paths");
+    assert_eq!(
+        dir_report
+            .findings
+            .iter()
+            .filter(|x| x.rule_id == "DET001")
+            .count(),
+        1,
+        "a real dir arg must still be walked, got: {dir_report:?}"
     );
 }
 
