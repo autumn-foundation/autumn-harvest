@@ -2,6 +2,10 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::doc_markdown)]
+// The admission-gate test below holds `TEST_SERIAL` across `.await` points to
+// serialize its process-global-cache mutation — same as the admission-gate
+// authoritative suites (`admission_gate_authoritative_localpg.rs`).
+#![allow(clippy::await_holding_lock)]
 //! HTTP integration tests for request-scoped start idempotency (issue #808).
 //!
 //! Exercises the plugin `POST /workflows/{name}/start` idempotency path against
@@ -18,7 +22,7 @@
 //!   execution, zero errors.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
@@ -50,6 +54,15 @@ fn init_sql() -> Vec<u8> {
 }
 
 type HarvestApiApp = axum::Router;
+
+/// Serializes any test that mutates the *process-global* admission-gate cache
+/// (`admission_gate::set_global_admission_gate_cache`), mirroring the
+/// `TEST_SERIAL` pattern in the admission-gate authoritative suites. Every test
+/// in this binary gets its own Postgres container (`setup_database`), so the DB
+/// is not a serialization point — but the gate cache is a single process-wide
+/// static, so a gate-manipulating test must never run concurrently with another
+/// one. Poison-tolerant so a panic in one holder does not wedge the rest.
+static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -839,6 +852,36 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     use autumn_harvest::admission_gate::set_global_admission_gate_cache;
     use autumn_harvest::{AdmissionGate, AdmissionGateId, GateScope};
 
+    // Serialize against any other test in this binary that mutates the
+    // process-global gate cache (Codex P2). The DB is per-test, but the gate
+    // cache is process-wide — two gate-manipulating tests must never overlap.
+    let _serial = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // RAII teardown: clear the process-global gate cache when this test's scope
+    // ends — including on a mid-test panic (Codex P2). A bare
+    // `set_global_admission_gate_cache(None)` at the end of the body would leak
+    // the installed gate into the *next* serial test if any assertion below
+    // regressed and panicked. Declared *after* `_serial` so it drops *first*:
+    // the global is torn down while the serialization lock is still held.
+    struct GateGuard;
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+        }
+    }
+    let _gate_guard = GateGuard;
+
+    // Use a workflow name NO sibling test starts. The gate scope is
+    // `WorkflowName(..)`, so even if the process-global handle were somehow
+    // observed by a concurrent sibling, `check_admission` only blocks a start
+    // whose workflow name *matches* the gate's scope — a sibling starting
+    // `order_flow` can never be spuriously gated by this test's `wf` gate. This
+    // makes the cross-talk (Codex P2) structurally impossible, not merely
+    // reset-window-dependent.
+    let wf = "order_flow_gate";
+
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
 
@@ -846,7 +889,7 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let registry = HandlerRegistry::new(vec![plain_info("order_flow")], vec![]);
+    let registry = HandlerRegistry::new(vec![plain_info(wf)], vec![]);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(registry),
         Arc::new(DagCatalog::default()),
@@ -864,12 +907,11 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     // -local one. So mutating the local cache below is invisible to enforcement
     // unless we also publish the (interior-mutable) cache handle to the global
     // static — exactly as `admission_gate_authoritative_localpg.rs` does. The
-    // global is torn down to `None` at the end so sibling serial tests (this
-    // suite runs `--test-threads=1`) are unaffected.
+    // global is torn down by `GateGuard` above (even on panic).
     let raise_gate = || {
         api_state.initialize_gate_cache(vec![AdmissionGate {
             id: AdmissionGateId(uuid::Uuid::new_v4()),
-            scope: GateScope::WorkflowName("order_flow".to_string()),
+            scope: GateScope::WorkflowName(wf.to_string()),
             reason: "incident".to_string(),
             message: None,
             created_by: "op".to_string(),
@@ -888,7 +930,7 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
 
     // 1. Gate raised → a FRESH keyed start is rejected (503), as today.
     raise_gate();
-    let (s0, _b0) = post_start(&app, "order_flow", json!({"input": {}}), Some("G")).await;
+    let (s0, _b0) = post_start(&app, wf, json!({"input": {}}), Some("G")).await;
     assert_eq!(
         s0,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -897,13 +939,13 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
 
     // 2. Lift the gate and create the run + claim for key "G".
     lift_gate();
-    let (s1, b1) = post_start(&app, "order_flow", json!({"input": {}}), Some("G")).await;
+    let (s1, b1) = post_start(&app, wf, json!({"input": {}}), Some("G")).await;
     assert_eq!(s1, StatusCode::CREATED, "{b1}");
     let exec1 = b1["execution_id"].as_str().unwrap().to_string();
 
     // 3. Re-raise the gate; a same-key RETRY must bypass it → 200 dedup.
     raise_gate();
-    let (s2, b2) = post_start(&app, "order_flow", json!({"input": {}}), Some("G")).await;
+    let (s2, b2) = post_start(&app, wf, json!({"input": {}}), Some("G")).await;
     assert_eq!(
         s2,
         StatusCode::OK,
@@ -913,11 +955,9 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     assert_eq!(b2["execution_id"].as_str().unwrap(), exec1);
 
     let mut conn = raw_connect(&url).await;
-    assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+    assert_eq!(execution_count(&mut conn, wf).await, 1);
 
-    // Tear down the process-global cache so sibling serial tests in this binary
-    // are not gated by a leaked handle.
-    set_global_admission_gate_cache(None);
+    // `GateGuard` tears down the process-global cache on scope exit (incl. panic).
 }
 
 /// FINDING (Codex P2, issue #808): a committed keyed replay short-circuits to the
