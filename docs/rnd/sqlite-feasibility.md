@@ -295,16 +295,28 @@ autocommits:
   execution row + its `WorkflowStarted` event (or the whole imported history)
   commit in one transaction, so a crash mid-start can never leave a `RUNNING`
   execution with a missing or torn history.
-- *Import materializes derived state for open work* (`import_execution`). When an
-  imported cross-backend history carries an **open** (un-terminated)
-  `ActivityScheduled` or `TimerStarted`, the importer rebuilds the companion
-  `spike_tasks`/`spike_timers` row a live cycle would have created — inside the
-  same import transaction — so a cross-backend handoff of a *partially-complete*
-  execution drains correctly instead of wedging at `SpikeError::Stuck` (replay
-  re-derives the wait, `apply_commands` skips enqueueing because the schedule is
-  already in history, and the worker would otherwise have no row to drain). Open
-  timers are re-armed relative to import time (`fire_at = clock + duration_secs`),
-  since a source backend's absolute deadline is not portable across backends.
+- *Import materializes derived state for open work; a sealed import derives its
+  terminal state* (`import_execution`). When an imported cross-backend history
+  carries an **open** (un-terminated) `ActivityScheduled` or `TimerStarted`, the
+  importer rebuilds the companion `spike_tasks`/`spike_timers` row a live cycle
+  would have created — inside the same import transaction — so a cross-backend
+  handoff of a *partially-complete* execution drains correctly instead of wedging
+  at `SpikeError::Stuck` (replay re-derives the wait, `apply_commands` skips
+  enqueueing because the schedule is already in history, and the worker would
+  otherwise have no row to drain). Open timers are re-armed relative to import
+  time (`fire_at = clock + duration_secs`), since a source backend's absolute
+  deadline is not portable across backends. Conversely, when the imported history
+  is already **sealed** — its tail lifecycle event a terminal
+  `WorkflowCompleted`/`WorkflowFailed`, a source backend handing off an
+  *already-finished* execution — the importer initializes the execution row
+  directly in that terminal state with the imported output/error and materializes
+  no open work (a well-formed sealed history has none). Otherwise a re-`run_until_blocked`
+  would replay the sealed history and append a **second** terminal event before
+  flipping the row, corrupting the imported log (Codex P2, round 5). The three
+  import shapes — fully open, partially complete (some activities done, one open),
+  fully sealed — are all handled: the fully-open and partial cases by the
+  in-flight branch's per-item terminal check (a completed/exhausted activity or a
+  fired timer gets no row), the sealed case by the terminal-state derivation.
 - *Deterministic side-effect commands are persisted, never dropped*
   (`apply_commands`). The issue #384 primitives (`system_now`/`new_uuid`/
   `random_*`/`side_effect`) and version-gate markers emit `RecordSideEffect`/
@@ -317,6 +329,23 @@ autocommits:
   `SpikeError::Unsupported` that rolls the batch back — no command is ever
   silently dropped, and a newly-added engine `WorkflowCommand` fails the spike
   compile instead of vanishing.
+- *Terminal-cycle bookkeeping is persisted before the seal* (`drive_one_cycle`).
+  A workflow that records a deterministic value (`ctx.new_uuid()`/`system_now()`/
+  `random_*`/`side_effect()`) or a version-gate marker and then **returns in the
+  same cycle without suspending** emits a `RecordSideEffect`/`RecordMarker` in the
+  *terminal* command batch. The bare `run_workflow` discards that pending vector,
+  so those events never reached history and a replay re-minted / diverged before
+  the seal (Codex P2, round 5). The prototype now drives the cycle through the
+  no-DB `run_workflow_with_state` (which surfaces the pending commands) and
+  persists the corresponding `SideEffectRecorded`/`MarkerRecorded` — inside the
+  same transaction as, and *before*, the terminal `WorkflowCompleted`/
+  `WorkflowFailed` event — mirroring the engine's
+  `worker::persist_terminal_outcome_commands`. This terminal-path persistence
+  uses the same exhaustive-match discipline as `apply_commands`: `RecordSideEffect`
+  and `RecordMarker` are persisted; any *other* live command on a terminal cycle
+  (e.g. `RecordUpdateResult` — updates are out of spike scope) returns
+  `SpikeError::Unsupported` and rolls the seal back rather than being silently
+  dropped.
 
 **The virtual clock is itself durable.** It is persisted on every advance
 (`spike_meta`) and restored on `open` (belt-and-braces: never below any
@@ -348,10 +377,41 @@ event and `fired = 1` row agree across a reload, so it is never re-fired; and
 `scenario_two_timers_second_fires_across_restart_via_durable_clock` — a timer
 armed at a non-zero logical time fires after a restart via the durable clock).
 
+**Known functional limitation (documented, not fixed) — reusing a classic timer
+id after a prior same-id timer has fired.** A workflow that arms `ctx.timer("t",
+5)`, lets it fire, then arms `ctx.timer("t", 5)` *again* wedges the run at
+`SpikeError::Stuck`. The engine's cursor/occurrence-based
+`HistoryMatcher::match_timer` correctly emits a fresh `StartTimer{t}` command for
+the second arm, but the prototype's `apply_commands` idempotency guard is a
+*whole-history bare-id* check (`history_has_timer_started`) that skips arming
+whenever *any* `TimerStarted{t}` is already in history — so it drops the
+legitimately-new second arm; and the `spike_timers` schema (PK `(exec_id,
+timer_id)` + `INSERT OR IGNORE`) cannot represent a *second occurrence* of the
+same id anyway (the first row is `fired = 1`, so `due_timers` finds nothing to
+fire). A faithful fix is genuine surgery to a throwaway prototype —
+occurrence-paired arming (skip only while an *unfired* `TimerStarted{id}`
+occurrence exists) **plus** a `spike_timers` schema change to a surrogate PK
+allowing multiple rows per `timer_id` **plus** occurrence-aware
+`mark_timer_fired`/`due_timers`/`drain_ready`/introspection — so per this spike's
+timebox it is documented rather than force-fitted. The productized engine handles
+this natively via occurrence-based matching over the real `harvest_timers`
+schema; distinct timer ids or the #768 cancellable-timer API sidestep it in
+practice. **This is not a defect that undercuts the go/no-go — it is evidence for
+it.** The three edges surfaced by the round-5 review — sealed-history import,
+terminal-cycle bookkeeping, and timer-id reuse — are all points where faithfully
+reproducing the engine's *coordination and matcher-coupling* in a from-scratch
+persistence layer is real, subtle work (occurrence pairing, terminal-command
+draining before the seal, sealed-state derivation on handoff). That is precisely
+the "deep coordination surface" that makes the report's recommendation — **a
+separate companion crate that reuses the backend-neutral core rather than a
+trivial port** (§9, option ii) — the right shape: the core (which already handles
+all three) is reused unchanged, and only the persistence layer, where these edges
+live, is rebuilt.
+
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **13 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **15 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -369,6 +429,8 @@ sqlite-spike,testing --test integration sqlite_spike` → **13 passed; 0 failed*
 | `scenario_two_timers_second_fires_across_restart_via_durable_clock` | **(Codex P1 regression)** A workflow fires a first timer (advancing the virtual clock), arms a second timer at that advanced clock (absolute `fire_at = 10`), advances *part-way* (to 8, captured only by the durable clock — not the fired-timer floor of 5), then **restarts**; advancing 2 more reaches 10 and the second timer fires. Fails on the pre-fix code that reset the clock to 0 on reopen (the second timer would never become due). |
 | `scenario_import_in_flight_activity_materializes_task_and_drains` | **(Codex P1 regression, round 4)** An imported PG-shaped history with an **open** (un-terminated) `ActivityScheduled` (`Scheduled → Started`, no `Completed`) materializes the companion PENDING `spike_tasks` row on import, so the worker claims + runs it and the imported execution drains to `Completed` (activity runs exactly once). Fails on the pre-fix code where the import path created an "event without companion row" and the run wedged at `SpikeError::Stuck`. |
 | `scenario_side_effect_command_persists_and_replays_across_restart` | **(Codex P2 regression, round 4)** A workflow calls `ctx.new_uuid()` (an issue #384 deterministic side effect) before a suspending activity; the minted value is frozen into history as `SideEffectRecorded` (before the activity schedule, in command order) and recovered **verbatim** on a fresh runtime after a restart. Fails on the pre-fix code that silently dropped the `RecordSideEffect` command (no `SideEffectRecorded` reaches history → replay diverges / re-mints). |
+| `scenario_terminal_cycle_side_effect_persists_before_seal` | **(Codex P2 regression, round 5)** A workflow mints `ctx.new_uuid()` and returns in the **same terminal cycle** (no suspension), emitting a `RecordSideEffect` in the terminal command batch. The prototype persists the `SideEffectRecorded` **before** the `WorkflowCompleted` seal (via `run_workflow_with_state`, which surfaces the pending vector the bare `run_workflow` drops), and a genuine restart on the terminal-stripped history recovers the SAME UUID rather than re-minting. Fails on the pre-fix code (no `SideEffectRecorded` reaches history → the `.expect` panics, and the restart mints a fresh UUID ≠ output). |
+| `scenario_import_sealed_history_derives_terminal_state` | **(Codex P2 regression, round 5)** A **sealed** imported history — tail event a terminal `WorkflowCompleted{output}` (and a sibling `WorkflowFailed` case) — initializes the execution row directly in that terminal state with the imported output/error; a re-`run_until_blocked` short-circuits at the "already terminal?" check, re-runs nothing, and appends **no** second terminal event (event count unchanged). Fails on the pre-fix code (the row is created RUNNING, the sealed history is re-driven, and a duplicate terminal is appended — event count grows 5 → 6). |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 

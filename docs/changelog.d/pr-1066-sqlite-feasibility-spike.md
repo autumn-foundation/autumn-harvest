@@ -70,9 +70,33 @@ falls entirely on the shipped Postgres hot path).
   replays faithfully rather than diverging), and its match is now **exhaustive**
   (no `_` wildcard) — every command is persisted, a single documented no-op
   (`WaitForActivity`), or an explicit `Unsupported` that rolls the batch back, so no
-  command is ever silently dropped.
-- **A 13-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (13/13 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+  command is ever silently dropped. **Terminal-cycle bookkeeping is persisted before
+  the seal, and a sealed import derives its terminal state** (Codex P2, round 5):
+  `drive_one_cycle` now drives through the no-DB `run_workflow_with_state` (which
+  surfaces the terminal cycle's pending command vector the bare `run_workflow`
+  drops) and persists a same-cycle `RecordSideEffect`/`RecordMarker` as
+  `SideEffectRecorded`/`MarkerRecorded` **before** the terminal
+  `WorkflowCompleted`/`WorkflowFailed` event (mirroring the engine's
+  `worker::persist_terminal_outcome_commands`) — so a workflow that mints a value
+  and returns *without suspending* no longer re-mints/diverges on replay; and
+  `import_execution`, when handed an already-**sealed** history (tail event a
+  terminal `WorkflowCompleted`/`WorkflowFailed`), initializes the row directly in
+  that terminal state with the imported output/error instead of creating it RUNNING
+  and re-driving it into a duplicate terminal. **One documented known limitation
+  (not fixed, per timebox):** reusing a *classic* timer id after a prior same-id
+  timer has fired wedges at `SpikeError::Stuck` — the prototype's whole-history
+  bare-id arm-guard drops the engine's legitimately-new second `StartTimer`, and the
+  `spike_timers` PK `(exec_id, timer_id)` cannot represent a second occurrence; a
+  faithful fix is occurrence-paired arming plus a surrogate-PK schema change plus
+  occurrence-aware fire/introspection queries — real surgery to disposable code that
+  the productized engine already handles natively (occurrence-based matcher over the
+  real `harvest_timers`). These three round-5 edges (sealed import, terminal-cycle
+  bookkeeping, timer-id reuse) are documented in report §5.1/§5.2 as *evidence for*
+  the go/no-go: they are exactly the deep coordination/matcher-coupling surface that
+  motivates the "separate companion crate reusing the core, not a trivial port"
+  recommendation.
+- **A 15-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (15/15 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays
@@ -99,7 +123,15 @@ falls entirely on the shipped Postgres hot path).
   wedging at `Stuck`); and a `ctx.new_uuid()` side effect emitted before an activity
   is frozen into history and recovered verbatim across a restart
   (`scenario_side_effect_command_persists_and_replays_across_restart`; fails pre-fix
-  where the `RecordSideEffect` was silently dropped).
+  where the `RecordSideEffect` was silently dropped) — **plus two round-5 regression
+  tests**: a `ctx.new_uuid()` minted and returned in the *same terminal cycle* is
+  frozen into history before the seal and recovered verbatim on a fresh runtime
+  (`scenario_terminal_cycle_side_effect_persists_before_seal`; fails pre-fix — no
+  `SideEffectRecorded` reaches history, so the `.expect` panics and the restart
+  re-mints); and a fully-sealed imported history is derived to its terminal state
+  and grows by no second terminal event
+  (`scenario_import_sealed_history_derives_terminal_state`; fails pre-fix — the row
+  is created RUNNING, re-driven, and the log grows 5 → 6 with a duplicate terminal).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`

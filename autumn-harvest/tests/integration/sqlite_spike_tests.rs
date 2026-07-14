@@ -89,6 +89,20 @@ async fn uuid_then_activity(ctx: &WorkflowContext, _n: i64) -> Result<serde_json
     Ok(json!({ "uuid": id.to_string(), "work": out }))
 }
 
+/// Mint a deterministic UUID (issue #384 side effect) and return it IMMEDIATELY —
+/// no suspending activity/timer/signal. This is the terminal-cycle bookkeeping
+/// case: the workflow completes in ONE cycle, emitting a `RecordSideEffect` in the
+/// SAME command batch it returns from. `run_workflow` drops that terminal-cycle
+/// command vector, so the prototype must use `run_workflow_with_state` and persist
+/// the pending `SideEffectRecorded` BEFORE the `WorkflowCompleted` seal. Dropping
+/// it (the pre-fix path) leaves history with no `SideEffectRecorded`, so a replay
+/// re-mints a different value / diverges.
+#[workflow]
+async fn uuid_then_done(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+    let id = ctx.new_uuid();
+    Ok(json!({ "uuid": id.to_string() }))
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, String) {
@@ -1021,5 +1035,203 @@ async fn scenario_side_effect_command_persists_and_replays_across_restart() {
         ran2.load(Ordering::SeqCst),
         0,
         "the already-completed activity must not re-run on replay"
+    );
+}
+
+// ── Codex P2 regression (round 5): terminal-cycle bookkeeping persists before seal ──
+//
+// A workflow that mints a deterministic value (`ctx.new_uuid()`) and then RETURNS
+// in the SAME cycle — with no suspending activity/timer/signal — emits a
+// `RecordSideEffect` in the terminal command batch. `run_workflow` drops that
+// vector; the prototype must instead use `run_workflow_with_state` and persist the
+// pending `SideEffectRecorded` BEFORE the `WorkflowCompleted` seal (mirroring the
+// engine's `worker::persist_terminal_outcome_commands`). Fails on the pre-fix code:
+// no `SideEffectRecorded` reaches history, so the `.expect(...)` below panics; and
+// the genuine-restart leg re-mints a DIFFERENT uuid on the imported (side-effect-
+// less) history rather than recovering the recorded one.
+#[tokio::test]
+async fn scenario_terminal_cycle_side_effect_persists_before_seal() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&uuid_then_done_info());
+
+    let exec = rt.start_workflow("uuid_then_done", json!(0)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    // Completed in ONE terminal cycle (no suspension): the minted UUID is the output.
+    let output_uuid = match state {
+        RunState::Completed(ref v) => v
+            .get("uuid")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string(),
+        other => panic!("expected Completed, got {other:?}"),
+    };
+
+    // The side effect is frozen into the replayable history BEFORE the terminal
+    // seal — dropping it (pre-fix) leaves history with no `SideEffectRecorded`, so
+    // `.expect` panics.
+    let events = rt.load_history(exec).unwrap();
+    let recorded = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                value,
+                ..
+            } => Some(value.as_str().unwrap().to_string()),
+            _ => None,
+        })
+        .expect("SideEffectRecorded(Uuid) must be persisted before the terminal seal");
+    assert_eq!(
+        recorded, output_uuid,
+        "the recorded side effect is the minted UUID returned as the output"
+    );
+    let se_pos = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }))
+        .unwrap();
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::WorkflowCompleted { .. }))
+        .unwrap();
+    assert!(
+        se_pos < done_pos,
+        "the side effect precedes the terminal WorkflowCompleted"
+    );
+
+    // Genuine-restart proof: strip the terminal seal (a PG-shaped in-flight
+    // history) and drive the reload path on a FRESH runtime — the workflow recovers
+    // the SAME UUID from `SideEffectRecorded` rather than re-minting. Pre-fix, the
+    // stripped history is `[WorkflowStarted]` (no side effect), so a fresh UUID
+    // ≠ output is minted and this assertion fails.
+    let mut in_flight = events.clone();
+    assert!(matches!(
+        in_flight.pop(),
+        Some(WorkflowEvent::WorkflowCompleted { .. })
+    ));
+    let (_dir2, path2) = temp_db();
+    let mut rt2 = SqliteRuntime::open(&path2).unwrap();
+    rt2.register_workflow(&uuid_then_done_info());
+    let exec2 = rt2
+        .import_execution("uuid_then_done", json!(0), in_flight)
+        .unwrap();
+    match rt2.run_until_blocked(exec2).await.unwrap() {
+        RunState::Completed(v) => assert_eq!(
+            v.get("uuid").and_then(serde_json::Value::as_str),
+            Some(output_uuid.as_str()),
+            "the terminal-cycle side effect is recovered verbatim on restart"
+        ),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+// ── Codex P2 regression (round 5): a SEALED imported history derives terminal state ──
+//
+// `import_execution` seeds a cross-backend history. When that history is already
+// SEALED — its tail lifecycle event is a terminal `WorkflowCompleted` (a source
+// backend handing off an *already-finished* execution) — the importer must
+// initialize the execution row directly in that terminal state with the imported
+// output, NOT create it RUNNING. Otherwise the next `run_until_blocked` replays the
+// already-sealed history and appends a SECOND `WorkflowCompleted` before flipping
+// the row, corrupting the imported log. With the fix: the imported run reads as
+// terminal with the imported output, and driving it appends NO second terminal
+// event (event count unchanged) and re-runs nothing. Fails on the pre-fix code
+// (the row is RUNNING, the workflow is re-driven, and a duplicate terminal is
+// appended).
+#[tokio::test]
+async fn scenario_import_sealed_history_derives_terminal_state() {
+    let activity_id = ActivityExecId::new();
+    // A fully SEALED PG-shaped history: Scheduled → Started → Completed →
+    // WorkflowCompleted{output}. The imported output ((3 * 10) * 2 == 60) is what
+    // the run reports without any re-execution.
+    let sealed = vec![
+        WorkflowEvent::workflow_started(json!(3), chrono::Utc::now()),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "work".to_string(),
+            input: json!(3),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id,
+            worker_id: WorkerId::new("pg-worker-1"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: json!(30),
+        },
+        WorkflowEvent::WorkflowCompleted { output: json!(60) },
+    ];
+    let imported_len = sealed.len();
+
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+
+    let exec = rt
+        .import_execution("single_activity", json!(3), sealed)
+        .unwrap();
+
+    // The sealed import is immediately terminal with the imported output — a
+    // `run_until_blocked` short-circuits at the "already terminal?" check.
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(60)),
+        "state = {state:?}"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a sealed imported history must not re-run any activity"
+    );
+
+    // No SECOND terminal event was appended: the durable log is exactly the
+    // imported history, unchanged (pre-fix, a duplicate `WorkflowCompleted` is
+    // appended, corrupting the log).
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        events.len(),
+        imported_len,
+        "the imported sealed history is not grown by a second terminal event"
+    );
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::WorkflowCompleted { .. }
+        )),
+        1,
+        "exactly one WorkflowCompleted — never a duplicate terminal"
+    );
+
+    // A sealed FAILED import is derived the same way (its imported error surfaces).
+    let sealed_failed = vec![
+        WorkflowEvent::workflow_started(json!(1), chrono::Utc::now()),
+        WorkflowEvent::workflow_failed("boom from source backend".to_string()),
+    ];
+    let (_dir2, path2) = temp_db();
+    let mut rt2 = SqliteRuntime::open(&path2).unwrap();
+    rt2.register_workflow(&single_activity_info());
+    let exec2 = rt2
+        .import_execution("single_activity", json!(1), sealed_failed)
+        .unwrap();
+    let state2 = rt2.run_until_blocked(exec2).await.unwrap();
+    assert!(
+        matches!(state2, RunState::Failed(ref e) if e == "boom from source backend"),
+        "state = {state2:?}"
+    );
+    assert_eq!(
+        rt2.load_history(exec2).unwrap().len(),
+        2,
+        "the sealed FAILED import is not grown by a second terminal event"
     );
 }

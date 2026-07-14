@@ -28,11 +28,14 @@
 //!    each activity's post-body persistence (attempt audit + terminal event +
 //!    task-state flip) and each timer's fire (`TimerFired` event + `fired = 1`
 //!    flag) atomically in one transaction too.
-//! 3. Repeat until the run reports `Completed`/`Failed` — the terminal event and
-//!    the execution-state flip likewise commit in one transaction, so a crash
-//!    can never re-run a run that already appended its terminal event — or until
-//!    a full cycle makes no progress (blocked on a not-yet-due timer or an
-//!    undelivered signal).
+//! 3. Repeat until the run reports `Completed`/`Failed` — any same-cycle
+//!    bookkeeping the terminal cycle emitted (a `SideEffectRecorded`/
+//!    `MarkerRecorded` from a `ctx.new_uuid()`/`side_effect()` that returned
+//!    without suspending), the terminal event, and the execution-state flip all
+//!    commit in one transaction, so a crash can never re-run a run that already
+//!    appended its terminal event nor drop a frozen side-effect value before the
+//!    seal — or until a full cycle makes no progress (blocked on a not-yet-due
+//!    timer or an undelivered signal).
 //!
 //! **Every event append is committed together with its companion durable state
 //! mutation** — the paired queue/timer row insert, the fired-timer flag, the
@@ -62,11 +65,10 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::context::WorkflowCommand;
+use crate::context::{WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
-use crate::executor::WorkflowOutcome;
+use crate::executor::{WorkflowOutcome, run_workflow_with_state};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
-use crate::run_workflow;
 use crate::types::ExecutionId;
 
 pub use store::ActivityAttempt;
@@ -272,6 +274,18 @@ impl SqliteRuntime {
     /// the *import* twin of `apply_commands`'s own append+enqueue atomicity, closed
     /// so a cross-backend handoff of a *partially-complete* execution drains
     /// correctly rather than deadlocking.
+    ///
+    /// **A sealed import derives its terminal state, not RUNNING.** When the
+    /// imported history already carries a terminal `WorkflowCompleted`/
+    /// `WorkflowFailed` (a source backend handing off an *already-finished*
+    /// execution), the importer initializes the execution row directly in that
+    /// terminal state with the imported output/error — it does **not** create it
+    /// RUNNING and does **not** materialize open work (a well-formed sealed history
+    /// has none). Otherwise a subsequent [`Self::run_until_blocked`] would replay
+    /// the already-sealed history and append a SECOND terminal event before
+    /// flipping the row, corrupting the imported log (Codex P2). This makes a
+    /// cross-backend handoff of a COMPLETED execution a faithful no-op:
+    /// re-`run_until_blocked` returns the imported outcome without re-running.
     pub fn import_execution(
         &mut self,
         workflow_name: &str,
@@ -285,59 +299,83 @@ impl SqliteRuntime {
         // Copy the Copy clock before borrowing `self.conn` mutably for the tx —
         // open timers are re-armed relative to it (handoff semantic below).
         let clock = self.clock;
+        // Is the imported history sealed (its last lifecycle event terminal)? The
+        // spike writes only `WorkflowCompleted`/`WorkflowFailed` terminals, so a
+        // reverse scan for the first of either is the tail terminal.
+        let sealed_terminal: Option<Result<Value, String>> =
+            events.iter().rev().find_map(|e| match e {
+                WorkflowEvent::WorkflowCompleted { output } => Some(Ok(output.clone())),
+                WorkflowEvent::WorkflowFailed { error, .. } => Some(Err(error.clone())),
+                _ => None,
+            });
         // Execution row + the whole imported history + companion rows for any
-        // in-flight open scheduled work commit in ONE transaction, so a crash
-        // mid-import can never leave a partial (torn) history, nor a scheduled-work
-        // event without its derived queue/timer row.
+        // in-flight open scheduled work (or the derived terminal state, for a
+        // sealed import) commit in ONE transaction, so a crash mid-import can never
+        // leave a partial (torn) history, nor a scheduled-work event without its
+        // derived queue/timer row.
         let tx = self.conn.transaction()?;
         store::insert_execution(&tx, exec, workflow_name, &input)?;
         for event in &events {
             store::append_event(&tx, exec, event)?;
         }
-        // Rebuild the derived state for any *open* scheduled work in the import.
-        for event in &events {
-            match event {
-                WorkflowEvent::ActivityScheduled {
-                    activity_id,
-                    name,
-                    input,
-                    queue,
-                } => {
-                    // Open iff no terminal (`ActivityCompleted`/exhausted
-                    // `ActivityFailed`) for this id. Materialize a fresh PENDING
-                    // task the worker claims + runs. The source backend's in-flight
-                    // attempt (its `ActivityStarted`, which the spike ignores) is
-                    // lost on handoff, so re-running is the correct at-least-once
-                    // recovery.
-                    if !store::history_has_activity_terminal(&events, &activity_id.to_string()) {
-                        queue::enqueue_activity(
-                            &tx,
-                            exec,
-                            *activity_id,
-                            name,
-                            input,
-                            queue,
-                            clock,
-                        )?;
+        if let Some(outcome) = &sealed_terminal {
+            // Sealed import: flip the row straight to its imported terminal state.
+            // No open work is materialized (a well-formed sealed history has none),
+            // and the next `run_until_blocked` short-circuits at the top-of-cycle
+            // "already terminal?" check without re-running or appending a second
+            // terminal.
+            match outcome {
+                Ok(output) => store::set_completed(&tx, exec, output)?,
+                Err(error) => store::set_failed(&tx, exec, error)?,
+            }
+        } else {
+            // In-flight import: rebuild the derived state for any *open* scheduled
+            // work so the worker has a row to drain.
+            for event in &events {
+                match event {
+                    WorkflowEvent::ActivityScheduled {
+                        activity_id,
+                        name,
+                        input,
+                        queue,
+                    } => {
+                        // Open iff no terminal (`ActivityCompleted`/exhausted
+                        // `ActivityFailed`) for this id. Materialize a fresh PENDING
+                        // task the worker claims + runs. The source backend's
+                        // in-flight attempt (its `ActivityStarted`, which the spike
+                        // ignores) is lost on handoff, so re-running is the correct
+                        // at-least-once recovery.
+                        if !store::history_has_activity_terminal(&events, &activity_id.to_string())
+                        {
+                            queue::enqueue_activity(
+                                &tx,
+                                exec,
+                                *activity_id,
+                                name,
+                                input,
+                                queue,
+                                clock,
+                            )?;
+                        }
                     }
-                }
-                WorkflowEvent::TimerStarted {
-                    timer_id,
-                    duration_secs,
-                } => {
-                    // Open iff no `TimerFired` for this id. Handoff semantic: a
-                    // timer's *remaining* delay restarts from import time — the
-                    // source backend's absolute deadline is not portable across
-                    // backends (different clock epochs) — so re-arm fresh at
-                    // `clock + duration_secs` (saturating, like `apply_commands`).
-                    if !store::history_has_timer_fired(&events, &timer_id.to_string()) {
-                        let fire_at = clock
-                            .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
-                            .unwrap_or(i64::MAX);
-                        queue::enqueue_timer(&tx, exec, &timer_id.to_string(), fire_at)?;
+                    WorkflowEvent::TimerStarted {
+                        timer_id,
+                        duration_secs,
+                    } => {
+                        // Open iff no `TimerFired` for this id. Handoff semantic: a
+                        // timer's *remaining* delay restarts from import time — the
+                        // source backend's absolute deadline is not portable across
+                        // backends (different clock epochs) — so re-arm fresh at
+                        // `clock + duration_secs` (saturating, like `apply_commands`).
+                        if !store::history_has_timer_fired(&events, &timer_id.to_string()) {
+                            let fire_at = clock
+                                .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
+                                .unwrap_or(i64::MAX);
+                            queue::enqueue_timer(&tx, exec, &timer_id.to_string(), fire_at)?;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         tx.commit()?;
@@ -430,17 +468,37 @@ impl SqliteRuntime {
             .get(&workflow_name)
             .ok_or_else(|| SpikeError::UnknownWorkflow(workflow_name.clone()))?;
 
-        // The reused, backend-neutral determinism core.
-        let outcome = run_workflow(exec, history.clone(), handler, input).await;
+        // The reused, backend-neutral determinism core. `run_workflow_with_state`
+        // (unlike the bare `run_workflow`) surfaces the terminal cycle's PENDING
+        // bookkeeping commands — the `RecordSideEffect`/`RecordMarker` a workflow
+        // emits when it records a deterministic value (`ctx.new_uuid()`/
+        // `system_now()`/`random_*`/`side_effect()`) and then returns WITHOUT
+        // suspending. `run_workflow` drops that vector, so those events never reach
+        // history and a replay re-mints / diverges before the terminal seal (Codex
+        // P2). We persist them BEFORE the terminal event, in the same transaction,
+        // mirroring the engine's `worker::persist_terminal_outcome_commands`.
+        let (outcome, pending, _span) = run_workflow_with_state(
+            exec,
+            history.clone(),
+            handler,
+            input,
+            empty_shared_state(),
+            None,
+        )
+        .await;
 
         match outcome {
             WorkflowOutcome::Completed { output, .. } => {
-                // Terminal event + execution-state flip in ONE transaction. A
-                // crash between them would leave a `WorkflowCompleted` event in
-                // history while the row stayed RUNNING — on reload the top-of-cycle
-                // "already terminal?" check would miss it, re-run the workflow, and
-                // append a SECOND `WorkflowCompleted` (duplicate terminal).
+                // Terminal-cycle bookkeeping events + terminal event + execution-
+                // state flip in ONE transaction. A crash between any of them would
+                // leave a `WorkflowCompleted` event in history while the row stayed
+                // RUNNING — on reload the top-of-cycle "already terminal?" check
+                // would miss it, re-run the workflow, and append a SECOND
+                // `WorkflowCompleted` (duplicate terminal). Persisting `pending`
+                // first also guarantees a same-cycle side effect is frozen into
+                // history before the seal, so a later replay recovers it verbatim.
                 let tx = self.conn.transaction()?;
+                persist_terminal_bookkeeping(&tx, exec, &pending)?;
                 store::append_event(
                     &tx,
                     exec,
@@ -453,9 +511,11 @@ impl SqliteRuntime {
                 Ok(RunState::Completed(output))
             }
             WorkflowOutcome::Failed { error, .. } => {
-                // Terminal event + state flip in ONE transaction (same duplicate-
-                // terminal hazard as the completed arm above).
+                // Terminal-cycle bookkeeping + terminal event + state flip in ONE
+                // transaction (same duplicate-terminal + drop-the-side-effect
+                // hazards as the completed arm above).
                 let tx = self.conn.transaction()?;
+                persist_terminal_bookkeeping(&tx, exec, &pending)?;
                 store::append_event(&tx, exec, &WorkflowEvent::workflow_failed(error.clone()))?;
                 store::set_failed(&tx, exec, &error)?;
                 tx.commit()?;
@@ -557,6 +617,27 @@ impl SqliteRuntime {
                     duration_secs,
                     ..
                 } => {
+                    // KNOWN LIMITATION (documented, not fixed) — reusing a classic
+                    // timer id after a prior same-id timer already fired wedges the
+                    // run at `SpikeError::Stuck`. This whole-history bare-id guard
+                    // skips re-arming when *any* `TimerStarted{id}` is in history,
+                    // but the engine's cursor/occurrence-based matcher legitimately
+                    // emits a fresh `StartTimer{id}` for the SECOND arm — the guard
+                    // drops it, and the `spike_timers` PK `(exec_id, timer_id)` +
+                    // `INSERT OR IGNORE` cannot represent a second occurrence anyway
+                    // (the first row is `fired = 1`, so `due_timers` finds nothing).
+                    // A faithful fix is real surgery to a THROWAWAY prototype:
+                    // occurrence-paired arming (skip only while an *unfired*
+                    // `TimerStarted{id}` occurrence exists) PLUS a `spike_timers`
+                    // schema change to a surrogate PK allowing multiple rows per
+                    // timer_id PLUS occurrence-aware `mark_timer_fired`/`due_timers`/
+                    // `drain_ready`/introspection. The productized engine handles
+                    // this natively (occurrence-based `HistoryMatcher::match_timer`
+                    // over the real `harvest_timers` schema); reproducing it in the
+                    // persistence layer is exactly the deep coordination edge that
+                    // motivates the report's "separate companion crate, not a trivial
+                    // port" recommendation (§5.2). Distinct timer ids or the #768
+                    // cancellable-timer API sidestep it entirely.
                     let id = timer_id.to_string();
                     if !store::history_has_timer_started(history, &id) {
                         // Event append + durable-timer row insert in the SAME tx.
@@ -700,6 +781,91 @@ impl SqliteRuntime {
             |row| row.get(0),
         )?)
     }
+}
+
+/// Persist the bookkeeping commands a workflow emits on a **terminal** decision
+/// cycle — one where it records a deterministic value
+/// (`ctx.new_uuid()`/`system_now()`/`random_*`/`side_effect()`) or a
+/// version-gate marker and then RETURNS without suspending — **before** the
+/// terminal `WorkflowCompleted`/`WorkflowFailed` event is appended, in the
+/// caller's transaction.
+///
+/// This is the terminal-path twin of [`SqliteRuntime::apply_commands`]'s
+/// `RecordSideEffect`/`RecordMarker` arms (the engine's own
+/// `worker::persist_terminal_outcome_commands` does the same for the Postgres
+/// backend). The engine emits these commands ONLY when running live (past end of
+/// history) and replays them from history thereafter, so a committed side-effect
+/// event is never re-emitted — no idempotency guard is needed.
+///
+/// The match is **exhaustive** (no `_` wildcard). Only the two bookkeeping
+/// commands the spike supports are persisted; a workflow that emits any *other*
+/// live command on a terminal cycle (e.g. `RecordUpdateResult`,
+/// `UpsertSearchAttributes`, `SetCurrentDetails` — none in the spike's supported
+/// subset) returns [`SpikeError::Unsupported`], which rolls the caller's
+/// transaction back rather than silently dropping the command and sealing anyway.
+/// `ScheduleActivity`/`StartTimer`/`WaitForSignal`/`WaitForActivity`/
+/// `ContinueAsNew` cannot appear here — a completing/failing workflow schedules
+/// no new suspending work, and `ContinueAsNew`/`Complete`/`Fail` surface via
+/// `WorkflowOutcome`, never the pending vector — but they are enumerated so a
+/// newly-added engine command fails the spike compile instead of vanishing.
+fn persist_terminal_bookkeeping(
+    tx: &rusqlite::Transaction<'_>,
+    exec: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> Result<(), SpikeError> {
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                store::append_event(
+                    tx,
+                    exec,
+                    &WorkflowEvent::SideEffectRecorded {
+                        kind: *kind,
+                        name: name.clone(),
+                        value: value.clone(),
+                    },
+                )?;
+            }
+            WorkflowCommand::RecordMarker { name, details } => {
+                store::append_event(
+                    tx,
+                    exec,
+                    &WorkflowEvent::MarkerRecorded {
+                        name: name.clone(),
+                        details: details.clone(),
+                    },
+                )?;
+            }
+            // Every other command is outside the spike's supported subset on the
+            // terminal path. Enumerated EXPLICITLY (no `_` wildcard) so a
+            // newly-added engine `WorkflowCommand` fails the spike compile and
+            // forces an explicit decision rather than being silently dropped.
+            // Returning `Err` rolls the caller's transaction back (the terminal
+            // event is NOT sealed).
+            WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+            | WorkflowCommand::StartChildWorkflow { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::Complete { .. }
+            | WorkflowCommand::Fail { .. }
+            | WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::RunLocalActivity { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. } => {
+                return Err(SpikeError::Unsupported(command_name(cmd).to_string()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Human name for a command (for `Unsupported` error messages). Exhaustive (no
