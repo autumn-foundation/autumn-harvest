@@ -14,7 +14,9 @@
 
 use std::sync::Mutex;
 
-use autumn_harvest::scheduler::{overdue_schedule_samples, sample_overdue_schedules};
+use autumn_harvest::scheduler::{
+    overdue_schedule_pass, overdue_schedule_samples, sample_overdue_schedules,
+};
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_OVERDUE, MetricsRecorder};
 use chrono::{DateTime, Utc};
@@ -617,5 +619,94 @@ async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
         metrics.overdue_for("workflow", "cal_wedged_wf"),
         Some(true),
         "a calendar schedule wedged past its adjusted business-day fire must still be overdue"
+    );
+}
+
+/// Run ONE overdue sampling pass for a single shard connection and emit into
+/// `metrics`, mirroring the worker sampler loop's per-pass reconciliation
+/// (Codex round 5): run [`overdue_schedule_pass`], emit each verdict, then zero
+/// any label from `previous_emitted` that disappeared from this COMPLETE pass via
+/// [`autumn_harvest::worker::labels_to_clear`]. Returns `(current keys,
+/// pass_complete)`. Single-shard, so a pass is complete iff the read succeeded.
+async fn run_and_emit_overdue_pass(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    previous_emitted: &std::collections::HashSet<(String, String)>,
+    metrics: &RecordingMetrics,
+) -> (std::collections::HashSet<(String, String)>, bool) {
+    let mut by_key: std::collections::BTreeMap<(String, String), bool> =
+        std::collections::BTreeMap::new();
+    let mut complete = true;
+    match overdue_schedule_pass(conn, now).await {
+        Ok(pass) => {
+            for s in pass.samples {
+                let e = by_key.entry((s.kind, s.name)).or_insert(false);
+                *e = *e || s.overdue;
+            }
+        }
+        Err(_) => complete = false,
+    }
+    let current: std::collections::HashSet<(String, String)> = by_key.keys().cloned().collect();
+    for ((k, n), o) in by_key {
+        metrics.record_schedule_overdue(&k, &n, o);
+    }
+    for (k, n) in autumn_harvest::worker::labels_to_clear(previous_emitted, &current, complete) {
+        metrics.record_schedule_overdue(&k, &n, false);
+    }
+    (current, complete)
+}
+
+/// Codex round 5 F2: a schedule that was overdue and is then deleted has its
+/// gauge series zeroed on the next COMPLETE pass, so `harvest.schedule.overdue`
+/// cannot stick at `1` for a schedule that no longer exists. Drives the real
+/// `overdue_schedule_pass` + `worker::labels_to_clear` reconciliation the sampler
+/// loop performs, against a real DB, across a delete. (F1's eager-first-pass is a
+/// structural loop change — sample-before-sleep — with no non-brittle unit seam;
+/// "pass 1" here mirrors that first emission.)
+#[tokio::test]
+async fn deleted_overdue_schedule_is_zeroed_on_next_complete_pass() {
+    use std::collections::HashSet;
+    let (mut conn, _c) = setup_db().await;
+    let now = Utc::now();
+    // Wedged (interval:60, next_run_at 5000s ago) → overdue.
+    insert_schedule(
+        &mut conn,
+        "disappear_wf",
+        "interval:60",
+        now - chrono::Duration::seconds(5000),
+        false,
+        None,
+        10,
+    )
+    .await;
+
+    // Pass 1 (the eager first pass): a single-shard COMPLETE pass emits true.
+    let mut previous_emitted: HashSet<(String, String)> = HashSet::new();
+    let m1 = RecordingMetrics::default();
+    let (keys1, complete1) =
+        run_and_emit_overdue_pass(&mut conn, now, &previous_emitted, &m1).await;
+    assert!(complete1, "single-shard pass is complete");
+    previous_emitted = keys1; // complete pass → track exactly the current keys
+    assert_eq!(
+        m1.overdue_for("workflow", "disappear_wf"),
+        Some(true),
+        "pass 1 must emit overdue=true for the wedged schedule"
+    );
+
+    // Delete the schedule; the next COMPLETE pass zeroes its disappeared label.
+    diesel::delete(
+        harvest_schedules::table.filter(harvest_schedules::workflow_name.eq("disappear_wf")),
+    )
+    .execute(&mut conn)
+    .await
+    .expect("delete schedule");
+    let m2 = RecordingMetrics::default();
+    let (_keys2, complete2) =
+        run_and_emit_overdue_pass(&mut conn, now, &previous_emitted, &m2).await;
+    assert!(complete2, "single-shard pass is complete");
+    assert_eq!(
+        m2.overdue_for("workflow", "disappear_wf"),
+        Some(false),
+        "the deleted schedule's gauge label must be zeroed on the next complete pass"
     );
 }

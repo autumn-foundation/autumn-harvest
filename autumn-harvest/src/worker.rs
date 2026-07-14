@@ -117,6 +117,35 @@ pub fn next_overdue_sample_interval(
     min_cadence_step.map_or(ceiling, |step| step.clamp(floor, ceiling))
 }
 
+/// A `harvest.schedule.overdue` gauge series label: `(kind, name)`.
+type ScheduleGaugeKey = (String, String);
+
+/// Gauge labels to reset to `0` after an overdue sampling pass (issue #696,
+/// Codex round 5).
+///
+/// When a schedule is deleted or renamed, a later pass stops emitting its
+/// `(kind, name)` gauge series, but both the built-in scrape recorder and
+/// metrics-rs retain the last value — so `harvest.schedule.overdue` would stay
+/// at `1` for a gone schedule (keeping the alert firing) until the worker
+/// restarts. This returns the previously-emitted labels absent from the current
+/// pass so the caller can zero them.
+///
+/// **Safety gate:** returns empty when `pass_complete == false` (some shard
+/// errored). A partial pass legitimately omits every label on the failed shard,
+/// so zeroing "disappeared" labels then would wrongly clear a genuinely-overdue
+/// schedule living on the unreachable shard.
+#[must_use]
+pub fn labels_to_clear<S: std::hash::BuildHasher>(
+    previous: &std::collections::HashSet<ScheduleGaugeKey, S>,
+    current: &std::collections::HashSet<ScheduleGaugeKey, S>,
+    pass_complete: bool,
+) -> Vec<ScheduleGaugeKey> {
+    if !pass_complete {
+        return Vec::new();
+    }
+    previous.difference(current).cloned().collect()
+}
+
 /// Validated, runtime-ready worker configuration.
 ///
 /// Built from [`WorkerConfig`] (the user-facing builder) via `From`, which
@@ -11693,31 +11722,37 @@ fn spawn_schedule_overdue_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
-        // First pass at the ceiling (before any schedule is loaded), then adapt
-        // to the fleet's fastest active cadence each pass (Codex round 4). A
-        // slow / Manual-only fleet stays at the 30s ceiling; a sub-30s schedule
-        // pulls the interval toward its cadence (never below `poll_interval`).
-        let mut interval = crate::worker::SCHEDULE_OVERDUE_SAMPLE_MAX;
+        // Labels emitted on the previous pass, so a series that disappears from a
+        // COMPLETE pass (schedule deleted/renamed) can be zeroed instead of
+        // sticking at its last value (Codex round 5 F2).
+        let mut previous_emitted: std::collections::HashSet<ScheduleGaugeKey> =
+            std::collections::HashSet::new();
         loop {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(interval) => {}
-            }
-
+            // Sample FIRST, then sleep (Codex round 5 F1): an eager pass on
+            // startup emits the gauge and learns the adaptive cadence
+            // immediately, so a worker that starts while a fast schedule is
+            // already wedged detects it within one cadence grace window rather
+            // than only after the initial ceiling sleep.
             let now = chrono::Utc::now();
             // Aggregate verdicts across ALL shard pools into one (kind, name) map
             // (overdue if any shard's same-named schedule is overdue) BEFORE
             // emitting, mirroring the queue_depth precedent. This closes the
             // cross-shard last-write-wins masking window a per-pool `.set()`
             // would leave if a name transiently existed on two shards.
-            let mut by_key: std::collections::BTreeMap<(String, String), bool> =
+            let mut by_key: std::collections::BTreeMap<ScheduleGaugeKey, bool> =
                 std::collections::BTreeMap::new();
             // Minimum active cadence across every shard, for the next interval.
             let mut min_cadence: Option<Duration> = None;
+            // A pass is COMPLETE only when every shard was queried without error.
+            // Any connection or read failure makes it PARTIAL, which gates the
+            // disappeared-label cleanup (a shard's schedules are absent then, not
+            // deleted).
+            let mut pass_complete = true;
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
                     Err(error) => {
+                        pass_complete = false;
                         tracing::debug!(
                             error = %error,
                             "schedule overdue sampler could not acquire DB connection"
@@ -11739,21 +11774,44 @@ fn spawn_schedule_overdue_sampler(
                         }
                     }
                     Err(error) => {
+                        pass_complete = false;
                         tracing::debug!(error = %error, "schedule overdue sample failed");
                     }
                 }
             }
+            let current_keys: std::collections::HashSet<ScheduleGaugeKey> =
+                by_key.keys().cloned().collect();
             for ((kind, name), overdue) in by_key {
                 telemetry
                     .metrics
                     .record_schedule_overdue(&kind, &name, overdue);
             }
-
-            if cancel.is_cancelled() {
-                break;
+            // Zero any label that vanished from a COMPLETE pass (deleted/renamed
+            // schedule). Empty on a partial pass, so a transient shard outage
+            // never zeroes a genuinely-overdue schedule on the failed shard.
+            for (kind, name) in
+                crate::worker::labels_to_clear(&previous_emitted, &current_keys, pass_complete)
+            {
+                telemetry
+                    .metrics
+                    .record_schedule_overdue(&kind, &name, false);
             }
-            // Adapt the next sleep to the fleet's fastest active cadence.
-            interval = crate::worker::next_overdue_sample_interval(min_cadence, poll_interval);
+            // Track emitted labels: prune to the current set on a complete pass
+            // (cleared labels are now 0 and gone); grow-only on a partial pass so
+            // a label that may live on the failed shard is never dropped.
+            if pass_complete {
+                previous_emitted = current_keys;
+            } else {
+                previous_emitted.extend(current_keys);
+            }
+
+            // Adapt the next sleep to the fleet's fastest active cadence, then
+            // sleep (cancellable).
+            let interval = crate::worker::next_overdue_sample_interval(min_cadence, poll_interval);
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
         }
     })
 }
@@ -14837,6 +14895,50 @@ mod tests {
             next_overdue_sample_interval(None, Duration::from_secs(60)),
             SCHEDULE_OVERDUE_SAMPLE_MAX
         );
+    }
+
+    // ── Disappeared gauge-label cleanup (issue #696, Codex round 5 F2) ─────────
+
+    fn key(kind: &str, name: &str) -> ScheduleGaugeKey {
+        (kind.to_string(), name.to_string())
+    }
+
+    fn key_set(pairs: &[(&str, &str)]) -> std::collections::HashSet<ScheduleGaugeKey> {
+        pairs.iter().map(|(k, n)| key(k, n)).collect()
+    }
+
+    #[test]
+    fn labels_to_clear_returns_disappeared_labels_on_complete_pass() {
+        // previous={A,B} current={A} complete=true → [B].
+        let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
+        let current = key_set(&[("workflow", "a")]);
+        let cleared = labels_to_clear(&previous, &current, true);
+        assert_eq!(cleared, vec![key("workflow", "b")]);
+    }
+
+    #[test]
+    fn labels_to_clear_is_empty_on_partial_pass() {
+        // Same as above but complete=false → [] (a shard outage must not zero a
+        // genuinely-overdue schedule living on the failed shard).
+        let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
+        let current = key_set(&[("workflow", "a")]);
+        assert!(labels_to_clear(&previous, &current, false).is_empty());
+    }
+
+    #[test]
+    fn labels_to_clear_is_empty_when_previous_subset_of_current() {
+        // previous ⊆ current → [] (nothing disappeared).
+        let previous = key_set(&[("workflow", "a")]);
+        let current = key_set(&[("workflow", "a"), ("dag", "b")]);
+        assert!(labels_to_clear(&previous, &current, true).is_empty());
+    }
+
+    #[test]
+    fn labels_to_clear_is_empty_when_previous_empty() {
+        // Empty previous (first pass) → [] regardless of current.
+        let previous = std::collections::HashSet::new();
+        let current = key_set(&[("workflow", "a")]);
+        assert!(labels_to_clear(&previous, &current, true).is_empty());
     }
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
