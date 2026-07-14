@@ -836,6 +836,7 @@ async fn explicit_reuse_of_a_keyed_auto_workflow_id_is_seen_uniqueness_preserved
 /// gated.
 #[tokio::test]
 async fn keyed_replay_bypasses_a_raised_admission_gate() {
+    use autumn_harvest::admission_gate::set_global_admission_gate_cache;
     use autumn_harvest::{AdmissionGate, AdmissionGateId, GateScope};
 
     let (url, _c) = setup_database().await;
@@ -857,6 +858,14 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
         ShardRouter::default(),
     ));
 
+    // PR #1051 (issue #618) made the CORE start primitive authoritative for
+    // admission gating: `execution::evaluate_start_gate` reads the *process-global*
+    // cache (`admission_gate::global_admission_gate_cache()`), not this api_state
+    // -local one. So mutating the local cache below is invisible to enforcement
+    // unless we also publish the (interior-mutable) cache handle to the global
+    // static — exactly as `admission_gate_authoritative_localpg.rs` does. The
+    // global is torn down to `None` at the end so sibling serial tests (this
+    // suite runs `--test-threads=1`) are unaffected.
     let raise_gate = || {
         api_state.initialize_gate_cache(vec![AdmissionGate {
             id: AdmissionGateId(uuid::Uuid::new_v4()),
@@ -867,8 +876,12 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
             created_at: chrono::Utc::now(),
             expires_at: None,
         }]);
+        set_global_admission_gate_cache(Some(api_state.gate_cache()));
     };
-    let lift_gate = || api_state.initialize_gate_cache(vec![]);
+    let lift_gate = || {
+        api_state.initialize_gate_cache(vec![]);
+        set_global_admission_gate_cache(Some(api_state.gate_cache()));
+    };
 
     let app =
         harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
@@ -901,6 +914,10 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
 
     let mut conn = raw_connect(&url).await;
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
+
+    // Tear down the process-global cache so sibling serial tests in this binary
+    // are not gated by a leaked handle.
+    set_global_admission_gate_cache(None);
 }
 
 /// FINDING (Codex P2, issue #808): a committed keyed replay short-circuits to the
