@@ -8,9 +8,13 @@
 //! - `spike_executions` — one row per workflow run (input + terminal state).
 //! - `spike_events` — the append-only [`WorkflowEvent`](crate::event::WorkflowEvent)
 //!   log, `(exec_id, seq)`; `event_json` is `serde_json::to_string(&WorkflowEvent)`.
-//!   This is the *canonical, replayable* history — byte-identical to what the
-//!   Postgres backend would write, which is what makes cross-backend replay
-//!   (AC4) hold by construction.
+//!   This is the *canonical, replayable* history. Each event's JSON encoding is
+//!   byte-identical to the Postgres backend's (the shared adjacently-tagged
+//!   `serde` form), but the event *streams* are not identical — the PG engine
+//!   also writes an `ActivityStarted` per claim that this spike omits. The two
+//!   are **replay-equivalent** (which is what makes cross-backend replay, AC4,
+//!   hold: `HistoryMatcher::scan_activity_terminal` skips `ActivityStarted`), not
+//!   byte-identical event streams.
 //! - `spike_tasks` — the activity task queue (the `SKIP LOCKED` analog; single
 //!   writer, see [`queue`](super::queue)).
 //! - `spike_timers` — durable timers with an absolute epoch `fire_at`.

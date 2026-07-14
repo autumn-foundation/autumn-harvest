@@ -17,12 +17,18 @@ The spike proved the load-bearing hypothesis: the valuable, hard part of
 Harvest — the deterministic replay core (`run_workflow`, `WorkflowEvent`, the
 `HistoryMatcher`, `WorkflowContext`) — is **already backend-neutral**. It was
 reused *wholesale* and driven to a terminal state by a single-writer, embedded
-SQLite persistence layer (`rusqlite`) in ~1,150 lines, with **zero changes to
-the core** and **zero impact on the default Postgres build**. All four required
-durability scenarios plus a cross-backend replay check pass (§5).
+SQLite persistence layer (`rusqlite`) in ~1,150 lines, with **zero core-logic
+changes** — the only edit to the crate outside the new module is additive,
+feature-gated registration (a single `#[cfg(feature = "sqlite-spike")] pub mod
+sqlite_spike;` in `lib.rs` plus the `sqlite-spike` Cargo feature) — and **zero
+impact on the default Postgres build**. All four required
+durability scenarios plus cross-backend replay — **executed in both directions**
+(a SQLite-written history, including a retry history, replays on the engine path;
+and a genuinely PG-shaped `ActivityStarted`-bearing history drives the SQLite
+runtime) — pass (§5).
 
 What the spike also made concrete is the *cost of the in-crate option*. Roughly
-**35 modules** touch `AsyncPgConnection`, **39 `SELECT … FOR UPDATE SKIP
+**35 modules** touch `AsyncPgConnection`, **34 `SELECT … FOR UPDATE SKIP
 LOCKED`** call sites across **12 modules** encode multi-writer claim contention,
 and the coordination surface (event store, task queue, timers, signals,
 concurrency, throttle, debounce, completion callbacks, poison-pill reclaim,
@@ -96,14 +102,24 @@ Postgres, classified per surface as:
 
 ### 3.1 Grep-verified counts
 
-Reproduce from `autumn-harvest/src` (excluding `sqlite_spike/`):
+**Every count below excludes the throwaway `sqlite_spike/` prototype** — it is
+the spike under evaluation, not PG-coupled core, and its module docs *mention*
+"SKIP LOCKED"/"FOR UPDATE" in prose (explaining the single-writer substitutes),
+which are concept references, not call sites. Reproduce each from the repo root;
+the three load-bearing counts are:
 
-| Pattern | Grep | Occurrences | Modules |
+```
+grep -rn  "SKIP LOCKED" autumn-harvest/src --include=*.rs | grep -v sqlite_spike | wc -l   # 34
+grep -rln "FOR UPDATE"  autumn-harvest/src --include=*.rs | grep -v sqlite_spike | wc -l   # 16
+grep -rn  "pg_advisory" autumn-harvest/src --include=*.rs | grep -v sqlite_spike           # admission_gate.rs:920
+```
+
+| Pattern | Grep (piped through `grep -v sqlite_spike`) | Occurrences | Modules |
 |---|---|---|---|
-| `FOR UPDATE SKIP LOCKED` | `grep -rc "SKIP LOCKED"` | **39** call sites | 12 |
-| `FOR UPDATE` (incl. SKIP LOCKED) | `grep -rln "FOR UPDATE"` | — | 17 |
+| `FOR UPDATE SKIP LOCKED` | `grep -rn "SKIP LOCKED"` | **34** call sites | 12 |
+| `FOR UPDATE` (incl. SKIP LOCKED) | `grep -rln "FOR UPDATE"` | — | 16 |
 | LISTEN / NOTIFY / `pg_notify` | `grep -rlnE "pg_notify\|LISTEN \|NOTIFY "` | — | 5 (+`handle.rs` via the `notify` wrapper) |
-| Advisory locks (`pg_advisory_xact_lock`) | `grep -rn "pg_advisory"` | **1** SQL call site | `queue.rs` (used by `admission_gate.rs` concurrency) |
+| Advisory locks (`pg_advisory_xact_lock`) | `grep -rn "pg_advisory"` | **1** SQL call site | `admission_gate.rs:920` (the per-key concurrency gate) |
 | `gen_random_uuid()` | `grep -rln "gen_random_uuid"` | 1 runtime SQL (`throttle.rs`) + 13 migration DDL defaults | 1 src + 13 migrations |
 | `to_regclass(...)` (table-exists probe) | `grep -rln "to_regclass"` | — | `completion_callback`, `debounce`, `event_batch`, `start_idempotency`, `throttle` |
 | `INTERVAL` / `make_interval` arithmetic | `grep -rlnE "INTERVAL\|make_interval"` | — | 11 |
@@ -111,16 +127,18 @@ Reproduce from `autumn-harvest/src` (excluding `sqlite_spike/`):
 | Diesel `table!` definitions | `grep -c "table! {"` (`schema.rs`) | **30** | `schema.rs` |
 | Migration directories | `ls -d migrations/*/` | **73** timestamped PG DDL dirs | `migrations/` |
 
-The claim in the success metric — "every Postgres-coupled call site, verifiable
-against a grep-level audit" — is satisfied by the greps above; every count below
-is reproducible from them.
+The **34** SKIP-LOCKED call sites reconcile exactly with the per-module rows in
+§3.2 (they sum to 34), and the sole `pg_advisory_xact_lock(377)` call is in
+`admission_gate.rs`, not `queue.rs`. The claim in the success metric — "every
+Postgres-coupled call site, verifiable against a grep-level audit" — is satisfied
+by the greps above; every count below is reproducible from them.
 
 ### 3.2 Module-by-module classification
 
 | Module | Coupling | # `SKIP LOCKED` | Class | Substitute on SQLite |
 |---|---|---:|:--:|---|
 | `store.rs` | Event append/load; `FOR UPDATE` lock on execution row | 1 | **(a)** | Plain `INSERT`/`SELECT … ORDER BY seq`; single-writer needs no row lock. **Proven** — `sqlite_spike/store.rs`. |
-| `queue.rs` | Task claim, retry requeue, advisory-lock concurrency, notify | 5 | **(b)** | `BEGIN IMMEDIATE` single-writer claim replaces SKIP LOCKED; polling replaces NOTIFY; serialized single-writer replaces advisory locks. **Proven** — `sqlite_spike/queue.rs`. |
+| `queue.rs` | Task claim, retry requeue, notify | 5 | **(b)** | `BEGIN IMMEDIATE` single-writer claim replaces SKIP LOCKED; polling replaces NOTIFY. (The advisory-lock concurrency gate lives in `admission_gate.rs`, not here.) **Proven** — `sqlite_spike/queue.rs`. |
 | `notify.rs` | The LISTEN/NOTIFY wrapper itself | — | **(b)** | Poll loop (drain-ready-then-repoll). **Proven** — `sqlite_spike` driver loop. |
 | `worker.rs` | Poll/dispatch loop, `append_activity_started_if_pending`, notify, `FOR UPDATE` | — | **(b)** | Synchronous `drain_ready` pass; no semaphore, no multi-worker dispatch. **Proven** — `sqlite_spike/worker.rs`. |
 | `timeout.rs` | Timer/timeout scan, `INTERVAL` deadline arithmetic | 3 | **(b)** | Explicit absolute `fire_at INTEGER` (epoch) column + `WHERE fire_at <= now`. **Proven** — `spike_timers`. |
@@ -130,10 +148,12 @@ is reproducible from them.
 | `debounce.rs` | Debounce upsert + scanner, `to_regclass`, `INTERVAL` | 3 | **(b)** | `ON CONFLICT DO UPDATE` upsert works in SQLite; scanner is single-writer. |
 | `throttle.rs` | Token-bucket start throttle, `gen_random_uuid`, `to_regclass` | 3 | **(b)** | App-minted UUID replaces `gen_random_uuid()`; token bucket is portable SQL. |
 | `event_batch.rs` | Batched event append claim | 2 | **(a)/(b)** | Single-writer batch append; no claim contention. |
+| `signal.rs` | Signal insert + idempotent deliver (Diesel DSL, no raw `SKIP LOCKED`/`FOR UPDATE`) | 0 | **(b)** | A staged-row `INSERT` + oldest-undelivered `SELECT`/mark-delivered; a single writer needs no claim coordination. **Proven** — the spike's `spike_signals` / scenario 3. |
+| `start_idempotency.rs` | Start-dedup reservation (`ON CONFLICT`, table-exists probe; ~18 SQL constructs) | 0 | **(b)** | A real coordination surface, but portable: the reservation is an upsert keyed on the idempotency key; a single writer serializes it trivially (`ON CONFLICT DO NOTHING` works in SQLite). Not in spike scope. |
 | `retention.rs` | Retention janitor scan + delete | 2 | **(b)** | Single-writer sweep; `INTERVAL` → explicit deadline column. |
 | `poison_pill.rs` | Orphaned-`RUNNING` reclaim by dead-worker heartbeat | 1 | **(c)** | **No analog** — a single-writer process has no *other* worker whose crash strands a `RUNNING` row; process crash is recovered by replay on restart (the spike's scenario 4). |
 | `concurrency.rs` | Per-key concurrency claim gate | 1 | **(c)** | Advisory-lock fair-share across *concurrent* claimers is meaningless with one writer. |
-| `admission_gate.rs` | Advisory-lock admission gate | — | **(c)** | Same — a coordination primitive for many claimers. |
+| `admission_gate.rs` | Advisory-lock admission gate — holds the **sole** `pg_advisory_xact_lock(377)` call (`admission_gate.rs:920`) | — | **(c)** | A coordination primitive for *many* claimers; a serialized single writer needs no advisory lock. |
 | `external_task.rs` | External-activity `FOR UPDATE` claim | — | **(c)** | Multi-process external-task delivery; out of scope. |
 | `scheduler.rs` | HA schedule tick with claim-token exclusivity (#350) | — | **(c)** | Multi-replica claim exclusivity is definitionally multi-node. Single edge node = single scheduler; trivial. |
 | `build_routing.rs` | Build-id routing, `INTERVAL` reachability | — | **(c)** | Fleet-deploy concept; no meaning on one edge binary. |
@@ -141,6 +161,7 @@ is reproducible from them.
 | `pool.rs` | Two `AsyncPgConnection` pools with shared ceiling | — | **(a)** | One `rusqlite::Connection`; no pool. |
 | `schema.rs` / `models.rs` | 30 Diesel `table!` + Queryable/Insertable | — | **(a)** | Hand-written SQLite DDL (dialect differs: TEXT UUIDs/JSON, INTEGER epochs). **Proven** — `sqlite_spike/schema.rs` (6 tables). |
 | `migrations/` | 73 timestamped PG DDL dirs | — | **(a)** | A single idempotent `CREATE TABLE IF NOT EXISTS` batch. **Proven**. |
+| *(sweep — the remaining ~15 `AsyncPgConnection` modules)* | `audit.rs`, `batch.rs`, `calendar.rs`, `context.rs`, `dlq.rs`, `erase.rs`, `handle.rs`, `heartbeat.rs`, `reset.rs`, `schedule_decision.rs`, `testing.rs`, `usage.rs`, `version_gate_retirement.rs`, `version_usage.rs`, `workers.rs` | 0 | **(c)/peripheral** | None is a blocker or in spike scope. Split two ways: **fleet/multi-node concerns** with no single-writer analog (`workers.rs`/`audit.rs`/`batch.rs`/`schedule_decision.rs`/`usage.rs`/`version_usage.rs`/`version_gate_retirement.rs` — worker-fleet registry, cross-node audit, batch admin, HA schedule decisions, fleet build-version reachability) are class **(c)**; and **support surfaces the four scenarios simply didn't exercise** (`dlq.rs`/`heartbeat.rs`/`reset.rs`/`calendar.rs`/`erase.rs`/`handle.rs`/`context.rs`/`testing.rs`) are portable class (a)/(b) plumbing left unbuilt. This row exists so the "every `AsyncPgConnection` module" bar is visibly met: all **35** are now accounted for. |
 
 **Reading of the table.** The *core coordination surface a durable engine
 minimally needs* — event store **(a)**, task queue + timers + signals **(b)** —
@@ -171,12 +192,18 @@ Roughly **12–18 trait methods**, of which the spike implements the ~10
 load-bearing ones. That part is small. The cost is **not** the trait — it is the
 **cost to the shipped Postgres path** of adopting it:
 
-- **Performance.** The task-claim path is the engine's hottest loop. Today it is
-  a monomorphized `diesel` call on `AsyncPgConnection`. Behind `dyn
-  StorageBackend` it becomes a virtual call on every claim, plus the loss of
-  Postgres-specific query shapes (`SKIP LOCKED`, `RETURNING`, advisory locks) as
-  first-class calls — they'd hide behind a lowest-common-denominator method or
-  leak back through backend-specific escape hatches, defeating the abstraction.
+- **Performance — a weaker leg than it first appears.** The task-claim path is
+  the engine's hottest loop, and a `dyn StorageBackend` object would add a virtual
+  call on every claim. But this is *avoidable*: a `StorageBackend` taken as a
+  monomorphized generic (`fn worker<S: StorageBackend>(…)`) is statically
+  dispatched with **zero vtable cost**, so "hot-path indirection" is not an
+  inherent tax of the trait — only of the `dyn`-object form. The genuine
+  performance-adjacent cost is subtler: Postgres-specific query shapes (`SKIP
+  LOCKED`, `RETURNING`, advisory locks) would either hide behind a
+  lowest-common-denominator method or leak back through backend-specific escape
+  hatches, eroding the abstraction. So the decline rests not on dispatch cost but
+  on the **two real legs below** — the wide-but-half-empty trait shape and the
+  ×2 test matrix.
 - **Code complexity.** All **35** `AsyncPgConnection`-touching modules would be
   refactored to speak the trait. Many of them (`poison_pill`, `concurrency`,
   `admission_gate`, `scheduler`, `external_task`, `build_routing`, `sessions`)
@@ -221,11 +248,25 @@ modelled by dropping the runtime + its SQLite connection and reopening on the
 same file — deterministic replay reproduces the identical command stream, so no
 activity is re-executed.
 
+**Durability-scope limitation (honest bound on that crash model).** The scenarios
+model only a *clean, between-cycle* crash. Activity execution inside `drain_ready`
+spans several separate autocommits — run the body → `record_attempt` → append the
+terminal `ActivityCompleted`/`ActivityFailed` event → `finish_task` — with **no
+enclosing transaction** wrapping the body run and its terminal-event append. A
+crash *between* body execution and the terminal-event append therefore leaves the
+task row `RUNNING` and the workflow blocked (the reload path's
+`claim_next_ready_task` only claims `PENDING` rows, and `classify_block` now
+surfaces this stranded state honestly as [`SpikeError::Stuck`] rather than
+mislabelling it a timer wait). This mid-drain crash window is **outside the
+spike's stated single-writer / no-crash-mid-transaction scope**; a productized
+edge runtime would wrap the body-run-through-terminal-append in one transaction
+(or make the body idempotent and reclaim orphaned `RUNNING` rows on restart).
+
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **5 passed; 0 failed**
-(0.58s, no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
+sqlite-spike,testing --test integration sqlite_spike` → **7 passed; 0 failed**
+(no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
 |---|---|
@@ -234,6 +275,8 @@ sqlite-spike,testing --test integration sqlite_spike` → **5 passed; 0 failed**
 | `scenario_3_signal_delivery` | Workflow blocks on `wait_for_signal`; an out-of-band `deliver_signal` unblocks it; the payload is echoed. |
 | `scenario_4_deterministic_replay_after_crash` | Drive one cycle so the activity **completes and is persisted** but the workflow is not resumed past it; drop the runtime; reopen; the workflow resumes **purely by replay** — the activity is **not** re-executed (invocation counter stays at 1). |
 | `scenario_cross_backend_replay` | A history *written by the SQLite prototype* replays cleanly on the engine's own (`testing`) `WorkflowReplayer` path, because both backends serialize the **same** `WorkflowEvent` via `serde_json`; and a terminal-stripped history drives the prototype's own reload path to the identical outcome with no duplicate activity execution. |
+| `scenario_cross_backend_replay_retry_history` | **(executed, both-directions closure)** A *retry-bearing* history — produced by driving the fail-once-then-succeed scenario — round-trips through the engine's `WorkflowReplayer` with `ReplaySucceeded`. Closes the §5.3 gap that the original cross-backend test only exercised a success-path, single-attempt history. |
+| `scenario_pg_shaped_history_replays_on_sqlite` | **(executed, "vice versa")** A hand-built, genuinely **PG-shaped** history — `WorkflowStarted → ActivityScheduled → ActivityStarted → ActivityCompleted`, *including* the `ActivityStarted` event the spike itself never writes — is imported into a fresh SQLite runtime and drives the prototype's own reload path: it resumes deterministically to the identical output with the already-completed activity **not** re-executed. Closes the §5.3 gap that no `ActivityStarted`-bearing PG history had actually been pushed through the prototype. |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 
@@ -265,34 +308,42 @@ recovered retry; the intermediate failure lives off the replayable log (on the
 task row in PG, in the audit table in the prototype). The prototype's module
 docs claim this parity, and it holds.
 
-**The genuine caveat is about test coverage, not divergence.** The
-`scenario_cross_backend_replay` test only exercised a **success-path,
-single-attempt** history in both directions. It did **not** feed a *retry*
-history across backends. The parity above is verified by *code reading*, but
-**not by the cross-backend test itself** — a leadership-grade honest statement
-is: "retry-history cross-backend replay is argued from source, not proven by an
-executed round-trip." A follow-up would add a retry-history cross-backend case.
+**The original caveat was about test coverage — now closed by an executed
+round-trip.** The first cut's `scenario_cross_backend_replay` only exercised a
+**success-path, single-attempt** history. The review pass added
+`scenario_cross_backend_replay_retry_history`: it drives the *fail-once-then-
+succeed* scenario through the prototype and round-trips the resulting
+(terminal-clean, `ActivityScheduled → ActivityCompleted`) history through the
+engine's `WorkflowReplayer` with `ReplaySucceeded`. So a **retry-produced**
+history's cross-backend replay is now **proven by an executed test**, not argued.
+One honest boundary remains: the parity claim *about the Postgres engine's own
+internals* — that PG stores a retryable error on the task-queue row, never in
+`harvest_events` — is verified by **code reading** (the citations above), because
+this spike has no Postgres to run against; it cannot be an executed PG-side test
+here.
 
-**A second, smaller fidelity nuance (also honest):** the PG engine appends an
-`ActivityStarted` event on claim (`append_activity_started_if_pending`,
-`worker.rs:2678`); the prototype **never** writes `ActivityStarted`. A genuine
-PG history is `ActivityScheduled → ActivityStarted → ActivityCompleted`; the
-prototype's is `ActivityScheduled → ActivityCompleted`. **Both replay
-identically** because `HistoryMatcher::scan_activity_terminal` *skips*
-`ActivityStarted` (`replay.rs:1041`), so this is benign for replay
-correctness — but it means "byte-identical history across backends" is precisely
-**"byte-identical per-event `serde_json` encoding + replay-equivalent event
-sets,"** not "identical event streams." The cross-backend test used
-SQLite-authored histories in *both* directions, so it never actually pushed an
-`ActivityStarted`-bearing PG history through the prototype's reload path
-(it would replay fine — the matcher skips it — but this is unproven by the
-test, same gap as the retry case).
+**The second nuance — `ActivityStarted` — is also now executed in both
+directions.** The PG engine appends an `ActivityStarted` on claim
+(`append_activity_started_if_pending`, `worker.rs:2678`) that the prototype
+**never** writes: a genuine PG history is `ActivityScheduled → ActivityStarted →
+ActivityCompleted`, the prototype's is `ActivityScheduled → ActivityCompleted`.
+The two **replay identically** because `HistoryMatcher::scan_activity_terminal`
+*skips* `ActivityStarted` (`replay.rs:1041`). The precise statement is therefore
+**"per-event `serde_json` encoding is byte-identical + the event sets are
+replay-equivalent,"** *not* "identical event streams." The review pass added
+`scenario_pg_shaped_history_replays_on_sqlite`, which hand-builds a genuinely
+`ActivityStarted`-bearing PG-shaped history and drives it through the prototype's
+own reload path — resuming to the identical output with the activity not
+re-executed — so the "vice versa" direction (a PG-shaped history on the SQLite
+runtime) is now **executed**, not merely argued from the matcher-skip.
 
 Neither caveat changes the go/no-go: the **invariant that matters** — every
 persisted event is the same `WorkflowEvent`, serialized the same way, replaying
-under the same matcher — holds. The caveats are about *which histories the
-executed test covered*, and they are named here so the recommendation rests on
-disclosed evidence.
+under the same matcher — holds, and is now demonstrated by executed tests in
+**both** cross-backend directions (SQLite→engine, incl. a retry history; and
+PG-shaped→SQLite, incl. an `ActivityStarted`-bearing history). The one residual
+code-read (not executed) item is the PG engine's *internal* retry-recording
+mechanism, unavoidable without a Postgres to exercise.
 
 ---
 
@@ -342,12 +393,23 @@ spike reused; the *meaningless* ones are exactly the class **(c)** surface from
 - **Append-only history.** The prototype's `spike_events` table is strictly
   append-only (`INSERT … (exec_id, seq, event_json)` ordered by `seq`); no event
   is ever mutated or reordered. Same invariant as `harvest_events`.
-- **Adjacently-tagged JSON, byte-identical across backends.** Every event row is
-  `serde_json::to_string(&WorkflowEvent)` — the exact `#[serde(tag = "type",
-  content = "data")]` encoding (`event.rs:68`) the Postgres backend uses. This is
-  **proven** by `scenario_cross_backend_replay`: a SQLite-written history parses
-  and replays on the engine's `WorkflowReplayer` with `ReplayStatus::
-  ReplaySucceeded` (with the coverage caveats disclosed in §5.3).
+- **Adjacently-tagged JSON, per-event byte-identical across backends.** Every
+  event row is `serde_json::to_string(&WorkflowEvent)` — the exact `#[serde(tag =
+  "type", content = "data")]` encoding (`event.rs:68`) the Postgres backend uses.
+  The event *streams* are replay-equivalent, not byte-identical (the PG engine
+  also writes `ActivityStarted` per claim; §5.3). This is **proven, in both
+  directions, by executed tests**: `scenario_cross_backend_replay` and
+  `scenario_cross_backend_replay_retry_history` replay SQLite-written histories
+  (success-path *and* retry) on the engine's `WorkflowReplayer` with
+  `ReplayStatus::ReplaySucceeded`; and `scenario_pg_shaped_history_replays_on_sqlite`
+  drives a genuinely `ActivityStarted`-bearing PG-shaped history through the
+  prototype's reload path to the identical outcome (the one residual code-read
+  item — the PG engine's internal retry recording — is disclosed in §5.3).
+- **Zero core-logic changes; additive registration only.** Precisely stated: the
+  only edit to the crate outside the self-contained `sqlite_spike/` module is one
+  additive, feature-gated line in `lib.rs` (`#[cfg(feature = "sqlite-spike")] pub
+  mod sqlite_spike;`) plus the `sqlite-spike = ["dep:rusqlite"]` Cargo feature. No
+  existing function, type, or event was modified.
 - **Macro paths untouched.** The spike adds no macro and touches no
   `::autumn_harvest::` path plumbing; the test workflows are ordinary
   `#[workflow]` fns whose macro-generated `WorkflowInfo` is registered as-is.
@@ -425,11 +487,14 @@ built.**
 **Recommendation: pursue option (ii) — a separate companion crate.**
 
 **(i) In-crate `StorageBackend` trait — DECLINE.** Cost to the shipped Postgres
-path is the blocker: hot-path `dyn` dispatch on the claim loop, a wide-but-
-half-empty trait (class **(c)** modules stub out), refactoring all **35**
-`AsyncPgConnection` modules, and a ×2 integration test matrix that covers the
-SQLite backend only shallowly (§6). The spike specifically demonstrates this cost
-is **unnecessary** — the core needed zero changes to be reused.
+path is the blocker — and it is **not** hot-path dispatch (a monomorphized
+generic `StorageBackend` is statically dispatched with zero vtable cost; §4). The
+two real legs are: a **wide-but-half-empty trait** (the class **(c)** modules
+would stub out with `unimplemented!()`/error on the SQLite side, refactoring all
+**35** `AsyncPgConnection` modules to speak a trait most of them can't honour),
+and a **×2 integration test matrix** that covers the SQLite backend only
+shallowly (§6). The spike specifically demonstrates this cost is
+**unnecessary** — the core needed zero changes to be reused.
 
 **(ii) Separate companion crate — RECOMMEND.** Publish the backend-neutral core
 (`event`, `replay`, `context`, `executor`, `types`, `info`) as a library, and
@@ -441,8 +506,15 @@ no test-matrix blow-up. The core is already reusable — the spike is the proof.
 The main engineering work becomes *stabilizing the core's public surface* as a
 dependency contract (today `run_workflow`/`WorkflowCommand`/`WorkflowOutcome` are
 `pub` but evolve freely), plus productizing the edge runtime (a real poll loop,
-signal ingress, an embedding API). The §5.3 fidelity caveats are the known
-follow-ups to close before productization.
+signal ingress, an embedding API). One concrete surface item to resolve:
+`ActivityContext::run_transactional` (`context.rs:10528`) is a **public** API that
+hands activity code a raw `&mut diesel_async::AsyncPgConnection` — a
+Postgres-typed leak in an otherwise backend-neutral surface. The "core is
+backend-neutral" claim holds for every primitive the spike exercises (the spike's
+activities never touch `run_transactional`), but this signature is exactly the
+kind of thing the separate-crate path must abstract or gate when the core's public
+API is stabilized as a dependency contract. The §5.3 fidelity caveats are the
+other known follow-ups to close before productization.
 
 **(iii) Decline entirely — acceptable fallback.** If edge/local-first is not a
 near-term product priority, shipping nothing is a legitimate outcome; the spike

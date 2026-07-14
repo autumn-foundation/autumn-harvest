@@ -5,7 +5,15 @@
 //!
 //! The `spike_events` table is the append-only [`WorkflowEvent`] log and is the
 //! *canonical, replayable* history: every row is `serde_json::to_string` of a
-//! `WorkflowEvent`, byte-identical to what the Postgres backend would write.
+//! `WorkflowEvent`. The precise cross-backend claim is **per-event encoding
+//! byte-identity, not event-stream identity**: any event both backends write
+//! serializes to the same bytes (the shared `#[serde(tag = "type", content =
+//! "data")]` encoding), but the streams differ — the Postgres engine appends an
+//! `ActivityStarted` event per claim that this spike never writes, so a PG
+//! history is `Scheduled → Started → Completed` where the spike's is `Scheduled
+//! → Completed`. The two are **replay-equivalent** (cross-backend replay, AC4,
+//! holds because `HistoryMatcher::scan_activity_terminal` skips `ActivityStarted`
+//! — not because the streams are byte-identical), which is what matters here.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -253,11 +261,15 @@ pub(super) fn take_pending_signal(
         .optional()?;
     match row {
         Some((seq, payload)) => {
+            // Deserialize BEFORE marking delivered: a `?`-return on a corrupt
+            // payload must leave the signal `delivered = 0` so it is not lost —
+            // a mark-then-deserialize ordering would silently drop it.
+            let val = serde_json::from_str(&payload)?;
             conn.execute(
                 "UPDATE spike_signals SET delivered = 1 WHERE signal_seq = ?1",
                 params![seq],
             )?;
-            Ok(Some(serde_json::from_str(&payload)?))
+            Ok(Some(val))
         }
         None => Ok(None),
     }

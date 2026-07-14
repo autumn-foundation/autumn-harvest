@@ -383,3 +383,152 @@ async fn scenario_cross_backend_replay() {
         "importing a completed-activity history must not re-run the activity"
     );
 }
+
+// ── AC4: a RETRY-bearing SQLite history replays on the engine's strict path ──
+//
+// Closes the §5.3 coverage gap: the original cross-backend test exercised only a
+// success-path, single-attempt history. Here the history is produced by driving
+// the *retry* scenario (fail once, then succeed) through the prototype, then
+// round-tripped through the engine's own `WorkflowReplayer`. The retryable
+// failure lives in the audit table, not the replayable log, so the resulting
+// event stream is terminal-clean (`ActivityScheduled → ActivityCompleted`) — and
+// this proves that stream replays cleanly on the strict engine path.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn scenario_cross_backend_replay_retry_history() {
+    use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
+
+    let (_dir, path) = temp_db();
+
+    // Drive the retry scenario: "work" fails on attempt 1, succeeds on attempt 2.
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a2 = attempts.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(3, move |input: serde_json::Value| {
+            let n = a2.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err("transient boom".to_string())
+            } else {
+                Ok(json!(input.as_i64().unwrap() * 10))
+            }
+        }),
+    );
+    let exec = rt.start_workflow("single_activity", json!(4)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    // (4 * 10) * 2 == 80, after exactly two activity attempts.
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(80)),
+        "state = {state:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let events = rt.load_history(exec).unwrap();
+
+    // The retry-produced history round-trips through the engine's strict replay.
+    let snapshot = HistorySnapshot {
+        workflow_name: "single_activity".to_string(),
+        execution_id: exec,
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+    };
+    let jsn = serde_json::to_string(&snapshot).unwrap();
+    let report = WorkflowReplayer::new()
+        .register_fn("single_activity", single_activity_info().handler)
+        .replay_from_json(&jsn)
+        .await
+        .expect("snapshot must parse");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "retry-bearing SQLite history must replay on the engine path:\n{report}"
+    );
+}
+
+// ── AC4 (vice versa): a genuinely PG-SHAPED history drives the SQLite runtime ──
+//
+// The other direction of the cross-backend guarantee, closing the §5.3 gap that
+// the executed test never pushed an `ActivityStarted`-bearing history through the
+// prototype. Hand-build a `Vec<WorkflowEvent>` in the exact shape the *Postgres*
+// engine writes — including the `ActivityStarted` event the spike itself never
+// emits (`WorkflowStarted → ActivityScheduled → ActivityStarted →
+// ActivityCompleted`) — import it into a fresh SQLite runtime, and drive the
+// prototype's OWN reload path. It must resume deterministically to the identical
+// output with the already-completed activity NOT re-executed.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn scenario_pg_shaped_history_replays_on_sqlite() {
+    let activity_id = ActivityExecId::new();
+
+    // A PG-shaped, replay-equivalent-not-byte-identical history: the `Scheduled →
+    // Started → Completed` triple a Postgres claim produces, terminating before
+    // any suspension (the `single_activity` workflow completes on replay).
+    let pg_history = vec![
+        WorkflowEvent::workflow_started(json!(3), chrono::Utc::now()),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "work".to_string(),
+            input: json!(3),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id,
+            worker_id: WorkerId::new("pg-worker-1"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: json!(30),
+        },
+    ];
+
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+
+    let exec = rt
+        .import_execution("single_activity", json!(3), pg_history)
+        .unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    // Resumes purely by replaying the PG-shaped history: (3 * 10) * 2 == 60,
+    // with the activity body NEVER invoked (the matcher skips `ActivityStarted`
+    // and reads the recorded `ActivityCompleted`).
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(60)),
+        "state = {state:?}"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a PG-shaped completed-activity history must not re-run the activity"
+    );
+
+    // And the prototype's persisted stream now carries the imported
+    // `ActivityStarted` (proof it drove a genuinely PG-shaped history), plus its
+    // own appended terminal `WorkflowCompleted`.
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::ActivityStarted { .. }
+        )),
+        1
+    );
+    assert!(matches!(
+        events.last(),
+        Some(WorkflowEvent::WorkflowCompleted { .. })
+    ));
+}

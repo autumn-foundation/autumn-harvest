@@ -109,6 +109,15 @@ pub(super) fn claim_next_ready_task(
         return Ok(None);
     };
 
+    // Parse the fallible fields BEFORE mutating: a `?`-return here drops `tx`
+    // un-committed, rolling back the `BEGIN IMMEDIATE` transaction so the task
+    // stays `PENDING` and can be re-claimed — a mutate-then-parse ordering would
+    // strand it `RUNNING` on a corrupt-row error.
+    let activity_id = act_s
+        .parse()
+        .map_err(|_| SpikeError::corrupt("activity_id"))?;
+    let input: Value = serde_json::from_str(&input_s)?;
+
     tx.execute(
         "UPDATE spike_tasks SET state = 'RUNNING' WHERE task_id = ?1",
         params![task_id],
@@ -117,11 +126,9 @@ pub(super) fn claim_next_ready_task(
 
     Ok(Some(ClaimedTask {
         task_id,
-        activity_id: act_s
-            .parse()
-            .map_err(|_| SpikeError::corrupt("activity_id"))?,
+        activity_id,
         name,
-        input: serde_json::from_str(&input_s)?,
+        input,
         attempt: u32::try_from(attempt).unwrap_or(0),
     }))
 }
@@ -182,6 +189,20 @@ pub(super) fn due_timers(
         out.push(r?);
     }
     Ok(out)
+}
+
+/// True if `exec_id` has any armed (unfired) durable timer — the ground-truth
+/// signal a no-progress cycle is genuinely waiting on a not-yet-due timer.
+pub(super) fn has_unfired_timer(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> Result<bool, SpikeError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM spike_timers WHERE exec_id = ?1 AND fired = 0",
+        params![exec_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 pub(super) fn mark_timer_fired(

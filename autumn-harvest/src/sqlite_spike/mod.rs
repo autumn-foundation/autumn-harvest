@@ -339,7 +339,7 @@ impl SqliteRuntime {
                 if applied || drained {
                     Ok(RunState::InProgress)
                 } else {
-                    Ok(Self::classify_block(&commands))
+                    self.classify_block(exec, &commands)
                 }
             }
         }
@@ -402,8 +402,12 @@ impl SqliteRuntime {
                                 duration_secs: *duration_secs,
                             },
                         )?;
-                        let fire_at =
-                            self.clock + i64::try_from(*duration_secs).unwrap_or(i64::MAX);
+                        // Checked add: a pathological duration must not panic —
+                        // saturate to `i64::MAX` (an effectively-infinite deadline).
+                        let fire_at = self
+                            .clock
+                            .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
+                            .unwrap_or(i64::MAX);
                         queue::enqueue_timer(&self.conn, exec, &id, fire_at)?;
                         produced = true;
                     }
@@ -437,14 +441,31 @@ impl SqliteRuntime {
     }
 
     /// Classify why a no-progress cycle is blocked.
-    fn classify_block(commands: &[WorkflowCommand]) -> RunState {
+    ///
+    /// A no-progress `Suspended` cycle is only a legitimate *wait* for one of two
+    /// reasons: an undelivered signal, or a not-yet-due durable timer. We check
+    /// each against ground truth rather than defaulting: a `WaitForSignal` command
+    /// names the awaited signal, and an armed-but-unfired row in `spike_timers` is
+    /// the proof of a pending timer (`drain_ready` already fired every *due* timer
+    /// this cycle, so any survivor is genuinely not yet due). If neither holds the
+    /// run made no progress and cannot be classified — an unsupported primitive or
+    /// a task stranded `RUNNING` by a crash mid-drain — which is exactly the
+    /// [`SpikeError::Stuck`] condition, surfaced honestly instead of being
+    /// mislabelled `WaitingTimer`.
+    fn classify_block(
+        &self,
+        exec: ExecutionId,
+        commands: &[WorkflowCommand],
+    ) -> Result<RunState, SpikeError> {
         for cmd in commands {
             if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
-                return RunState::WaitingSignal(signal_name.clone());
+                return Ok(RunState::WaitingSignal(signal_name.clone()));
             }
         }
-        // The only other blocking primitive in scope is a not-yet-due timer.
-        RunState::WaitingTimer
+        if queue::has_unfired_timer(&self.conn, exec)? {
+            return Ok(RunState::WaitingTimer);
+        }
+        Err(SpikeError::Stuck)
     }
 
     fn workflow_name_of(&self, exec: ExecutionId) -> Result<String, SpikeError> {

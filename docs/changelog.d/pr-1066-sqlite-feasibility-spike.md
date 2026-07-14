@@ -26,22 +26,31 @@ falls entirely on the shipped Postgres hot path).
   `SELECT … FOR UPDATE SKIP LOCKED`; polling substitutes for LISTEN/NOTIFY;
   app-minted UUIDs substitute for `gen_random_uuid()`; explicit epoch `fire_at`
   columns substitute for `INTERVAL` deadline arithmetic.
-- **A 5-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (5/5 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+- **A 7-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (7/7 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
-  after a simulated crash, and a cross-backend replay check (a SQLite-written
-  history replays cleanly on the engine's own `WorkflowReplayer` path because
-  both backends serialize the same `WorkflowEvent` via `serde_json`).
+  after a simulated crash, and **cross-backend replay executed in both
+  directions** — a SQLite-written history (success-path *and* a retry-produced
+  history) replays cleanly on the engine's own `WorkflowReplayer` path, and a
+  genuinely PG-shaped `ActivityStarted`-bearing history drives the SQLite
+  runtime's own reload path to the identical outcome with no duplicate activity
+  execution (both backends serialize the same `WorkflowEvent` via `serde_json`;
+  histories are replay-equivalent, not byte-identical event streams, because the
+  matcher skips `ActivityStarted`).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`
 counter, not in the replayable log — **verified to match the PG engine**
 (`queue::requeue_for_retry` stores the error on the task-queue row, never in
 `harvest_events`; `ActivityFailed` reaches the event log only on terminal
-retry-exhaustion via `finalize_activity_failure`). The genuine caveat is test
-coverage: the cross-backend replay test only exercised a success-path,
-single-attempt history, so retry-history round-tripping is argued from source,
-not proven by an executed test.
+retry-exhaustion via `finalize_activity_failure`). The original test-coverage
+caveat is now **closed by executed tests in both directions**: a retry-produced
+history round-trips through the engine's `WorkflowReplayer`
+(`scenario_cross_backend_replay_retry_history`), and a genuinely PG-shaped
+`ActivityStarted`-bearing history drives the SQLite runtime's reload path
+(`scenario_pg_shaped_history_replays_on_sqlite`). The one residual code-read
+(not executed) item is the PG engine's *internal* retry-recording mechanism —
+unavoidable without a Postgres to exercise.
 
 **Invariants:** No new `WorkflowEvent` variant, no migration, feature-gated
 behind `sqlite-spike` so the default Postgres build is byte-unaffected (`cargo

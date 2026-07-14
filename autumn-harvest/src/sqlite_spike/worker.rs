@@ -10,11 +10,16 @@
 //! recorded in the [`spike_activity_attempts`](super::schema) audit table and the
 //! task-queue row's `attempt` counter — it is **not** appended to the replayable
 //! event log. Only the terminal outcome (`ActivityCompleted`, or `ActivityFailed`
-//! after exhausting attempts) reaches `spike_events`. This mirrors the Postgres
-//! engine exactly (`queue::requeue_for_retry` stores the attempt error on the
-//! task row, never in `harvest_events`) and is what keeps every persisted history
-//! a clean, terminal-only, replay-correct log — the property AC4 (cross-backend
-//! replay) depends on.
+//! after exhausting attempts) reaches `spike_events`. On this specific
+//! point — keeping retryable failures out of the replayable log — the spike
+//! matches the Postgres engine (`queue::requeue_for_retry` stores the attempt
+//! error on the task row, never in `harvest_events`), which is what keeps every
+//! persisted history a clean, terminal-only, replay-correct log. It is **not** a
+//! byte-identical event stream, though: the PG engine additionally appends an
+//! `ActivityStarted` on claim that this spike never writes, so the two histories
+//! are **replay-equivalent** (the matcher skips `ActivityStarted`), not
+//! identical. That replay-equivalence is the property AC4 (cross-backend replay)
+//! depends on.
 
 use std::collections::HashMap;
 
