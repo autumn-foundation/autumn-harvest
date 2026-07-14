@@ -1967,9 +1967,14 @@ fn pure_helper(x: i64) -> i64 {
 }
 
 #[test]
-fn transitive_cross_file_via_check_dir_is_flagged() {
-    // The workflow lives in file A and calls a first-party helper defined in
-    // file B; `check_dir` must build a cross-file index and flag it.
+fn transitive_cross_file_via_check_dir_is_not_resolved_same_module_only() {
+    // BOUNDARY (issue #778, Codex r4/r5): the workflow lives in file A and calls
+    // a first-party helper defined in file B. Reaching it requires a `use` import
+    // the line-based scanner cannot see, so under same-module-only resolution the
+    // cross-file helper is deliberately NOT resolved — a documented safe
+    // false-negative (never resolving cross-module is what ends the round-4/round-5
+    // false-positive family for a CI gate). The compile-time guardrail (#386) is
+    // the authoritative net for what det_check skips.
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("a.rs"),
@@ -1994,8 +1999,9 @@ pub fn shared_time() -> i64 {
 
     let report = autumn_harvest::det_check::check_dir(dir.path()).expect("check_dir");
     assert!(
-        report.findings.iter().any(|f| f.rule_id == "DET001"),
-        "a cross-file first-party helper violation must be flagged, got: {report:?}"
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a cross-file helper must NOT be resolved (same-module-only); documented \
+         safe false-negative, got: {report:?}"
     );
 }
 
@@ -2400,11 +2406,16 @@ fn bad() -> i64 {
 
 // ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
 
-// The changed-files CI pattern `det-check f1.rs f2.rs` passes each file as a
-// SEPARATE argument. A cross-file transitive violation must still be caught via
-// the single shared index (per-file scanning misses it).
+// BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern `det-check
+// f1.rs f2.rs` passes each file as a SEPARATE argument. `check_paths` still
+// collects them into a single shared index (dedup / symlink / non-UTF-8
+// robustness stand — see the tests below), but bare helper calls resolve
+// same-module ONLY, so a cross-file transitive helper is deliberately NOT
+// resolved (a documented safe false-negative). Never resolving cross-module is
+// what ends the round-4/round-5 false-positive family; for a CI gate a false
+// positive on innocent code is the worse outcome.
 #[test]
-fn check_paths_resolves_cross_file_between_two_file_args() {
+fn check_paths_cross_file_helper_is_not_resolved_same_module_only() {
     let dir = tempfile::tempdir().expect("tempdir");
     let a = dir.path().join("a.rs");
     let b = dir.path().join("b.rs");
@@ -2430,15 +2441,11 @@ pub fn shared_time() -> i64 {
     .unwrap();
 
     let report = check_paths(&[a.as_path(), b.as_path()]).expect("check_paths");
-    let finding = report
-        .findings
-        .iter()
-        .find(|f| f.rule_id == "DET001")
-        .unwrap_or_else(|| {
-            panic!("cross-file transitive violation across two FILE args must be caught, got: {report:?}")
-        });
-    assert_eq!(finding.workflow_name.as_deref(), Some("cross_wf"));
-    assert_eq!(finding.via_helper.as_deref(), Some("shared_time"));
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a cross-file helper across two FILE args must NOT be resolved \
+         (same-module-only); documented safe false-negative, got: {report:?}"
+    );
 }
 
 // Overlapping arguments must not double-count: the same file passed twice, or a
@@ -2910,6 +2917,57 @@ pub fn helper() -> i64 {
         "a same-file-but-different-module `helper` must NOT be resolved (the real \
          target is a `use`-imported helper); the root helper's violation is not \
          reachable from the workflow, got: {report:?}"
+    );
+}
+
+#[test]
+fn aliased_import_bare_call_is_not_resolved_to_root_helper_same_module_only() {
+    // FALSE-POSITIVE fix (issue #778, Codex r5): a workflow in `mod inner` does a
+    // bare `helper()` whose real target is an ALIASED `use`-imported helper from
+    // ANOTHER file (`use crate::pure_helper as helper;`, clean). An UNRELATED
+    // `fn helper()` at the workflow file's root reads the clock and is the ONLY
+    // definition of the name `helper` in the tree — so the old globally-unique
+    // (`[only]`) resolution branch resolved the bare call cross-module to that root
+    // violation, a false positive that would fail CI on innocent aliased-import
+    // code. Under same-module-only resolution the root `helper` (module "") is NOT
+    // in the caller's own module (`inner`), so it is treated as ambiguous and the
+    // aliased call is NOT resolved. The line-based scanner cannot see the `use ...
+    // as helper;` alias, so no cross-module resolution can be safe here.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "\
+mod inner {
+    use autumn_harvest::prelude::*;
+    use crate::pure_helper as helper;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+}
+fn helper() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pure.rs"),
+        "\
+pub fn pure_helper() -> i64 {
+    0
+}
+",
+    )
+    .unwrap();
+
+    let report = check_dir(dir.path()).expect("check_dir");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "an aliased-import bare call `helper()` must NOT be resolved to an unrelated \
+         root `fn helper` (globally-unique but cross-module); same-module-only \
+         resolution treats it as ambiguous, got: {report:?}"
     );
 }
 

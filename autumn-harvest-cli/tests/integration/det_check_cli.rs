@@ -11,8 +11,11 @@ use autumn_harvest_cli::{
     format_det_findings_text, format_det_suppressions_list, run_det_check,
 };
 
-/// Writes a two-file source tree where a workflow in `a.rs` reaches a
-/// clock-reading first-party helper defined in `b.rs`.
+/// Writes a two-file source tree where a workflow reaches a clock-reading
+/// first-party helper **in its own module** (same file `a.rs`); `b.rs` is an
+/// unrelated clean file. One-hop resolution is same-module only, so the helper
+/// must share the workflow's module (issue #778, Codex r5); the second file
+/// exercises the multi-file `check_paths` index (dedup / shared scan).
 fn transitive_tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
@@ -23,14 +26,18 @@ async fn cross_wf(ctx: &WorkflowContext) -> Result<(), String> {
     let _ = shared_time();
     Ok(())
 }
+
+fn shared_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
 ",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("b.rs"),
         "\
-pub fn shared_time() -> i64 {
-    chrono::Utc::now().timestamp()
+pub fn unrelated() -> i64 {
+    0
 }
 ",
     )
@@ -200,22 +207,45 @@ fn missing_path_is_a_read_error() {
     assert!(result.is_err(), "a missing path must surface a read error");
 }
 
-// FIX #3 (P2-1): the changed-files CI pattern `det-check f1.rs f2.rs` passes
-// each file as a SEPARATE argument; a cross-file transitive violation must
-// still be caught through the shared index (per-path scanning missed it).
+// BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern
+// `det-check f1.rs f2.rs` passes each file as a SEPARATE argument. `check_paths`
+// still collects them into one shared index (dedup / robustness stand), but
+// one-hop resolution is same-module ONLY — so a helper defined in a DIFFERENT
+// file is deliberately NOT resolved (a documented safe false-negative). Never
+// resolving cross-module ends the r4/r5 false-positive family; for a CI gate a
+// false positive on innocent code is the worse outcome. The compile-time #386
+// guardrail is the authoritative net for what det_check skips.
 #[test]
-fn two_separate_file_args_resolve_cross_file_transitive() {
-    let dir = transitive_tree();
+fn two_separate_file_args_do_not_resolve_cross_file_transitive() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let a = dir.path().join("a.rs");
     let b = dir.path().join("b.rs");
+    std::fs::write(
+        &a,
+        "\
+#[workflow]
+async fn cross_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = shared_time();
+    Ok(())
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "\
+pub fn shared_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+",
+    )
+    .unwrap();
     let report = det_check_report_for_paths(&[a, b]).expect("report should build");
-    let finding = report
-        .findings
-        .iter()
-        .find(|f| f.rule_id == "DET001")
-        .unwrap_or_else(|| panic!("cross-file transitive violation must be caught: {report:?}"));
-    assert_eq!(finding.workflow_name.as_deref(), Some("cross_wf"));
-    assert_eq!(finding.via_helper.as_deref(), Some("shared_time"));
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a cross-file helper across two file args must NOT be resolved \
+         (same-module-only); documented safe false-negative, got: {report:?}"
+    );
 }
 
 // FIX #3 (P2-2): overlapping arguments (a directory plus a file inside it) must

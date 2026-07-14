@@ -406,11 +406,14 @@ const RULES: &[Rule] = &[
 /// `#[workflow]` functions.
 ///
 /// Each `#[workflow]` body is scanned directly, and — one first-party hop
-/// (issue #778) — every same-source plain helper function it calls directly is
-/// scanned too, attributing any finding to the workflow entry point via
-/// [`DetFinding::via_helper`]. `#[activity]` bodies are never scanned (activities
-/// are allowed to be non-deterministic by design), and neither are the bodies of
-/// helpers a workflow does not reach.
+/// (issue #778) — every plain helper function it calls directly **that is
+/// declared in the workflow's own module** (same file + module path) is scanned
+/// too, attributing any finding to the workflow entry point via
+/// [`DetFinding::via_helper`]. A helper in a different module / file (reached via
+/// a `use` import the line-based scanner cannot see) is NOT resolved — a safe
+/// false-negative (see [`resolve_helper`]). `#[activity]` bodies are never
+/// scanned (activities are allowed to be non-deterministic by design), and
+/// neither are the bodies of helpers a workflow does not reach.
 ///
 /// `file` is used only for source-location reporting; no file is read.
 /// The function always returns a report; it never panics on malformed input.
@@ -434,9 +437,12 @@ pub fn check_file(path: &Path) -> std::io::Result<DetCheckReport> {
     Ok(check_source(&source, &file))
 }
 
-/// Recursively check all `.rs` files under `dir` for determinism violations,
-/// resolving first-party helper reachability (issue #778) across every file in
-/// the tree.
+/// Recursively check all `.rs` files under `dir` for determinism violations.
+///
+/// One-hop first-party helper reachability (issue #778) is resolved
+/// **same-module only** — a helper in the caller's own module (same file +
+/// module path; see [`resolve_helper`]); a cross-file / cross-module helper is
+/// not resolved.
 ///
 /// Build-output, hidden, and trybuild-fixture directories are skipped so a scan
 /// of a repository root stays fast, never lints generated code, and never lints
@@ -453,11 +459,16 @@ pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
 /// Check an explicit set of source paths (files and/or directories) for
 /// determinism violations.
 ///
-/// First-party helper reachability (issue #778) is resolved across **every**
-/// file in **all** paths through a single shared index — so a cross-file
-/// transitive violation is caught even when the two files are passed as separate
-/// arguments (the changed-files CI pattern `det-check $(git diff --name-only
-/// '*.rs')`), which per-path scanning misses.
+/// All paths are collected into a **single shared index** before scanning, so
+/// every file is de-duplicated across arguments (the changed-files CI pattern
+/// `det-check $(git diff --name-only '*.rs')`) and no file is scanned twice.
+/// One-hop first-party helper reachability (issue #778) is nevertheless resolved
+/// **same-module only** (same file + module path; see [`resolve_helper`]): a
+/// cross-file transitive helper is deliberately NOT resolved (a safe
+/// false-negative), because the line-based scanner cannot see the `use` import
+/// that would make such a bare call reach across files — resolving it risks the
+/// Codex round-4/round-5 false-positive family, which for a CI gate is the worse
+/// outcome.
 ///
 /// A file argument is scanned directly; a directory argument is walked
 /// recursively with [`skip_scan_dir`] applied. Symlinked files and directories
@@ -489,9 +500,10 @@ pub fn check_paths(paths: &[&Path]) -> std::io::Result<DetCheckReport> {
     Ok(scan_sources(&sources))
 }
 
-/// Builds a single first-party function index across every collected file (so a
-/// workflow in one file can resolve a helper defined in another) and scans it
-/// once.
+/// Builds a single first-party function index across every collected file and
+/// scans it once. The shared index de-duplicates and orders the files, but bare
+/// helper calls resolve **same-module only** ([`resolve_helper`]): a workflow in
+/// one file never resolves a helper defined in another.
 fn scan_sources(sources: &[(String, String)]) -> DetCheckReport {
     let mut all_fns: Vec<FnDef> = Vec::new();
     for (label, content) in sources {
@@ -920,10 +932,11 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
 
     // Candidate helper index: only plain helpers are eligible callees. A name may
     // map to more than one plain helper (same name in different modules/files);
-    // resolution of a bare call is deferred to [`resolve_helper`], which prefers
-    // the caller's own in-scope sibling (Rust-accurate) and only skips the
-    // genuinely-undisambiguable case — so an ambiguous resolution can never
-    // introduce a false positive (#778, Codex P1).
+    // resolution of a bare call is deferred to [`resolve_helper`], which resolves
+    // ONLY a candidate in the caller's own module (same file + same module path)
+    // and treats every cross-module / cross-file / imported / aliased case as
+    // ambiguous — so a resolution can never introduce a false positive (#778,
+    // Codex r4/r5).
     let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, f) in fns.iter().enumerate() {
         if f.is_workflow || f.is_activity {
@@ -972,35 +985,31 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
     report
 }
 
-/// Resolves a bare call to a same-named free helper from `caller`'s scope, using
-/// Rust-accurate nearest-scope preference (#778, Codex P1):
+/// Resolves a bare call to a first-party free helper from `caller`'s scope,
+/// restricted to **same-module candidates only** (#778, Codex r4/r5 — ends the
+/// cross-module false-positive family structurally):
 ///
-/// 1. the candidate if the name is **globally unique** (exactly one definition
-///    anywhere in the index) — the only candidate, so unambiguous whether it is
-///    same-module, imported, or elsewhere;
-/// 2. else a candidate in the **same module** (same file + same `module_path`) as
-///    the caller — what Rust resolves a bare call to first when several same-named
-///    definitions exist;
-/// 3. else (multiple candidates, none in the caller's own module to disambiguate)
-///    — conservatively skipped (a safe false-negative, never a false-positive).
+/// - a candidate in the caller's **own module** (same `file` + same `module_path`)
+///   resolves — the one case a bare call `name()` provably reaches without an
+///   import the line-based scanner cannot see;
+/// - **everything else** (cross-module, cross-file, `use`-imported, aliased via
+///   `use ... as name`, and even a *globally-unique* helper that is not in the
+///   caller's own module) is treated as ambiguous and NOT resolved — a safe
+///   false-negative, never a false-positive.
 ///
-/// A same-file-but-different-module definition is deliberately NOT preferred: a
-/// bare call in a child module does not resolve to a helper in a sibling / parent
-/// module of the same file unless brought in by a `use` (which this text-level
-/// analysis cannot see), so that case is treated as ambiguous rather than
-/// resolved to a possibly-wrong in-file candidate (#778, Codex r4 — removes a
-/// false positive on `use`-imported same-named helpers).
+/// This is a deliberate scope decision: the line-based front-door cannot resolve
+/// `use` imports/aliases, so ANY cross-module resolution keeps producing the
+/// Codex round-4 (same-file-different-module) and round-5 (aliased-import,
+/// globally-unique) false-positive family. For a CI GATE a false positive
+/// (failing CI on innocent code) is the worst outcome and outranks marginal
+/// recall, so the earlier globally-unique (`[only]`) and same-file-different-module
+/// fallbacks are removed. The compile-time `#[workflow]` guardrail (#386) remains
+/// the authoritative net for what `det_check` skips.
 fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option<usize> {
-    match candidates {
-        [] => return None,
-        // Globally unique name — the only definition, so unambiguous.
-        [only] => return Some(*only),
-        _ => {}
-    }
-    // Same module (same file + same module path) — Rust resolves a bare call here
-    // first. Exactly one such candidate resolves; two same-named helpers in one
-    // module is not valid Rust, and none means the target is out of the caller's
-    // own module scope (e.g. `use`-imported from elsewhere) — treat as ambiguous.
+    // Same module only (same file + same module path). Exactly one such candidate
+    // resolves; two same-named helpers in one module is not valid Rust, and none
+    // means the target is out of the caller's own module scope (cross-module,
+    // cross-file, `use`-imported, or aliased) — treat as ambiguous and skip.
     let same_module: Vec<usize> = candidates
         .iter()
         .copied()
@@ -1009,8 +1018,6 @@ fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option
     if let [only] = same_module.as_slice() {
         return Some(*only);
     }
-    // Multiple candidates, none uniquely in the caller's own module — conservatively
-    // skip (safe false-negative, never a false-positive).
     None
 }
 
