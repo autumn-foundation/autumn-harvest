@@ -975,24 +975,32 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
 /// Resolves a bare call to a same-named free helper from `caller`'s scope, using
 /// Rust-accurate nearest-scope preference (#778, Codex P1):
 ///
-/// 1. a candidate in the **same module** (same file + same `module_path`) as the
-///    caller — what Rust resolves a bare call to first;
-/// 2. else a candidate in the **same file** (any module), if exactly one;
-/// 3. else the candidate if it is **globally unique**;
-/// 4. else (multiple candidates, none disambiguated by the caller's module/file
-///    scope) — conservatively skipped (a safe false-negative, never a
-///    false-positive).
+/// 1. the candidate if the name is **globally unique** (exactly one definition
+///    anywhere in the index) — the only candidate, so unambiguous whether it is
+///    same-module, imported, or elsewhere;
+/// 2. else a candidate in the **same module** (same file + same `module_path`) as
+///    the caller — what Rust resolves a bare call to first when several same-named
+///    definitions exist;
+/// 3. else (multiple candidates, none in the caller's own module to disambiguate)
+///    — conservatively skipped (a safe false-negative, never a false-positive).
 ///
-/// A unique name is resolved directly (step 3). Preferring the same-module /
-/// same-file definition is exactly what the compiler resolves a bare call to, so
-/// this is a strict accuracy improvement with no added false-positive risk.
+/// A same-file-but-different-module definition is deliberately NOT preferred: a
+/// bare call in a child module does not resolve to a helper in a sibling / parent
+/// module of the same file unless brought in by a `use` (which this text-level
+/// analysis cannot see), so that case is treated as ambiguous rather than
+/// resolved to a possibly-wrong in-file candidate (#778, Codex r4 — removes a
+/// false positive on `use`-imported same-named helpers).
 fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option<usize> {
     match candidates {
         [] => return None,
+        // Globally unique name — the only definition, so unambiguous.
         [only] => return Some(*only),
         _ => {}
     }
-    // 1. Same module (same file + same module path).
+    // Same module (same file + same module path) — Rust resolves a bare call here
+    // first. Exactly one such candidate resolves; two same-named helpers in one
+    // module is not valid Rust, and none means the target is out of the caller's
+    // own module scope (e.g. `use`-imported from elsewhere) — treat as ambiguous.
     let same_module: Vec<usize> = candidates
         .iter()
         .copied()
@@ -1001,21 +1009,8 @@ fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option
     if let [only] = same_module.as_slice() {
         return Some(*only);
     }
-    // Two helpers of the same name in one module is not valid Rust; if seen, skip.
-    if !same_module.is_empty() {
-        return None;
-    }
-    // 2. Same file (any module) — resolve only if exactly one.
-    let same_file: Vec<usize> = candidates
-        .iter()
-        .copied()
-        .filter(|&i| fns[i].file == caller.file)
-        .collect();
-    if let [only] = same_file.as_slice() {
-        return Some(*only);
-    }
-    // 3/4. Multiple candidates, none in the caller's module/file scope to
-    // disambiguate — conservatively skip (safe false-negative).
+    // Multiple candidates, none uniquely in the caller's own module — conservatively
+    // skip (safe false-negative, never a false-positive).
     None
 }
 
@@ -1271,10 +1266,19 @@ fn fn_decl_name(trimmed: &str) -> Option<String> {
         return None;
     }
     let after = after.trim_start();
-    let name: String = after.chars().take_while(|c| is_ident_char(*c)).collect();
-    if name.is_empty() {
+    // Optional raw-identifier prefix (`r#gen`, `r#type`, …) — a valid Rust fn name
+    // whose identifier may itself be a reserved keyword (`gen` is reserved in
+    // edition 2024). Keep the `r#` on the extracted name so a def and any
+    // `r#name(` call site key on the same string (#778, Codex r4).
+    let raw_prefix_len = if after.starts_with("r#") { 2 } else { 0 };
+    let ident: String = after[raw_prefix_len..]
+        .chars()
+        .take_while(|c| is_ident_char(*c))
+        .collect();
+    if ident.is_empty() {
         return None;
     }
+    let name = format!("{}{ident}", &after[..raw_prefix_len]);
     // Sanity: the name must be followed by `(`, `<` (generics), or nothing.
     let tail = after[name.len()..].trim_start();
     if tail.is_empty() || tail.starts_with('(') || tail.starts_with('<') {
@@ -2607,6 +2611,13 @@ mod tests {
         assert_eq!(
             fn_decl_name("fn plain<T>(x: T) {"),
             Some("plain".to_string())
+        );
+        // Raw identifiers — the `r#` prefix is retained on the extracted name
+        // (#778, Codex r4).
+        assert_eq!(fn_decl_name("async fn r#gen("), Some("r#gen".to_string()));
+        assert_eq!(
+            fn_decl_name("pub fn r#type() -> i64 {"),
+            Some("r#type".to_string())
         );
         assert_eq!(fn_decl_name("let x = 1;"), None);
         assert_eq!(fn_decl_name("impl Foo {"), None);

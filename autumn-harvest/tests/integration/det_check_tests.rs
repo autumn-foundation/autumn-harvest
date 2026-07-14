@@ -2814,11 +2814,13 @@ mod workflows {
     );
 }
 
-// ── scope-aware same-name helper resolution (issue #778, Codex P1) ───────────
-// When two plain free helpers share an identifier, the caller's own in-scope
-// sibling (same module, else same file) is the Rust-correct resolution target.
-// Only the genuinely-undisambiguable case (multiple candidates, none in the
-// caller's module/file scope) is conservatively skipped.
+// ── scope-aware same-name helper resolution (issue #778, Codex P1/r4) ────────
+// When two plain free helpers share an identifier, the caller's own same-module
+// sibling is the Rust-correct resolution target. A same-file-but-different-module
+// definition is NOT preferred (a bare call in a child module does not reach a
+// parent/sibling-module helper without a `use`, which this text-level analysis
+// cannot see), so that case — and any other genuinely-undisambiguable one — is
+// conservatively skipped (safe false-negative, never a false-positive).
 
 #[test]
 fn same_module_helper_resolves_over_unrelated_same_name() {
@@ -2864,17 +2866,22 @@ mod b {
 }
 
 #[test]
-fn same_file_different_module_helper_disambiguates() {
-    // Rule 2: the caller's OWN module has no `helper`, but exactly one `helper`
-    // is defined in the same FILE (at file root). An unrelated same-named helper
-    // lives in a DIFFERENT file. The in-file one must resolve, the cross-file one
-    // must not make it ambiguous.
+fn same_file_different_module_helper_is_not_resolved() {
+    // FALSE-POSITIVE fix (issue #778, Codex r4): a workflow in a child module
+    // does a bare `helper()` whose real target is a `use`-imported helper from
+    // ANOTHER file (`crate::pure::helper`, clean). An UNRELATED `fn helper()` at
+    // the workflow file's root reads the clock. A bare call in `mod inner` does
+    // NOT resolve to a parent-module (file-root) helper without a `use`, which
+    // this text-level analysis cannot see — so this must be treated as ambiguous
+    // and skipped, NOT resolved to the root helper's hard-blocker (a false
+    // positive that could fail CI on innocent code).
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("a.rs"),
         "\
 mod inner {
     use autumn_harvest::prelude::*;
+    use crate::pure::helper;
     #[workflow]
     pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
         let _ = helper();
@@ -2888,25 +2895,22 @@ fn helper() -> i64 {
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("b.rs"),
+        dir.path().join("pure.rs"),
         "\
-fn helper() -> String {
-    String::new()
+pub fn helper() -> i64 {
+    0
 }
 ",
     )
     .unwrap();
 
     let report = check_dir(dir.path()).expect("check_dir");
-    let finding = report
-        .findings
-        .iter()
-        .find(|f| f.rule_id == "DET001")
-        .unwrap_or_else(|| {
-            panic!("the same-file `helper` must resolve despite a cross-file same-name, got: {report:?}")
-        });
-    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
-    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a same-file-but-different-module `helper` must NOT be resolved (the real \
+         target is a `use`-imported helper); the root helper's violation is not \
+         reachable from the workflow, got: {report:?}"
+    );
 }
 
 #[test]
@@ -3073,4 +3077,30 @@ impl Type {
         !report.findings.iter().any(|f| f.rule_id == "DET001"),
         "method/associated turbofish calls must never resolve to a free helper, got: {report:?}"
     );
+}
+
+// ── raw-identifier function names (issue #778, Codex r4) ─────────────────────
+// A workflow named with a raw identifier (`async fn r#gen(...)` — `gen` is a
+// reserved keyword in edition 2024) must still have its body scanned. Previously
+// the fn-name parser stopped at `r` and the tail sanity check rejected the line,
+// so an `r#`-named workflow's body was never scanned (false negative).
+
+#[test]
+fn raw_ident_workflow_body_is_scanned() {
+    let src = "\
+#[workflow]
+async fn r#gen(ctx: &WorkflowContext) -> Result<(), String> {
+    let _ = chrono::Utc::now();
+    Ok(())
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("a raw-identifier `r#gen` workflow body must be scanned, got: {report:?}")
+        });
+    assert_eq!(finding.workflow_name.as_deref(), Some("r#gen"));
 }
