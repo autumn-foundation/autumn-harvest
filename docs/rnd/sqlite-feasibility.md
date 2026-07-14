@@ -32,16 +32,25 @@ What the spike also made concrete is the *cost of the in-crate option*. Roughly
 LOCKED`** call sites across **12 modules** encode multi-writer claim contention,
 and the coordination surface (event store, task queue, timers, signals,
 concurrency, throttle, debounce, completion callbacks, poison-pill reclaim,
-retention) is Postgres-shaped by design. Hiding all of that behind a
-`StorageBackend` trait would tax the Postgres hot path (dyn dispatch on claim),
-double the integration test matrix, and refactor every `db`-gated module — for a
-use case the core already serves without any of that cost.
+retention) is Postgres-shaped by design. The cost of hiding all of that behind a
+`StorageBackend` trait is **not** hot-path dispatch — a monomorphized generic
+(`<S: StorageBackend>`) is statically dispatched with **zero vtable cost** (§4),
+so the recommendation does **not** rest on dispatch overhead. It rests on two
+real costs, both of which fall on the shipped Postgres path: (1) a
+**wide-but-half-empty trait** — most of that coordination surface (SKIP-LOCKED
+claims, LISTEN/NOTIFY wakeups, advisory-lock concurrency, poison-pill reclaim) is
+meaningless on a single-writer SQLite backend, so those methods would stub out to
+`unimplemented!()`/error, an abstraction worse than none; and (2) a **~doubled
+integration test matrix**, most of which (SKIP-LOCKED races, HA scheduler
+exclusivity, poison-pill reclaim, sharding) is itself meaningless on single-writer
+SQLite (§6). For a use case the core already serves as a plain library dependency
+with **zero** tax (option ii), that is a bad trade.
 
 **Costed options (full detail in §9):**
 
 | Option | One-line | Cost to the shipped PG path | Recommendation |
 |---|---|---|---|
-| (i) In-crate `StorageBackend` trait | Both backends live in `autumn-harvest` behind a trait | **High** — hot-path indirection, test-matrix ×2, every `db`-module refactored | **Decline** |
+| (i) In-crate `StorageBackend` trait | Both backends live in `autumn-harvest` behind a trait | **High** — wide-but-half-empty trait, test-matrix ×2, every `db`-module refactored (**not** hot-path dispatch — a monomorphized generic is zero-cost; §4) | **Decline** |
 | (ii) Separate companion crate | New crate depends on the core (`event`/`replay`/`context`/`executor`) as a library; reimplements only persistence | **Zero** — PG path untouched, spike proved the core is already reusable | **Recommended** |
 | (iii) Decline entirely | Ship nothing; edge demand unserved | Zero | Acceptable fallback |
 
@@ -279,7 +288,15 @@ autocommits:
   terminal `ActivityCompleted`/`ActivityFailed` event and its task-state flip
   (plus the attempt audit row), or the retry requeue, commit in one transaction,
   so the task is never left "terminal event appended but row still `RUNNING`,"
-  and a retry is never half-recorded.
+  and a retry is never half-recorded. And because the claim commits `RUNNING` in a
+  *separate* transaction from that post-body persistence (the body runs between
+  them — a SQLite write lock cannot be held across arbitrary user work), **any**
+  fallible step after the claim — the registered-handler lookup for an
+  *unregistered* activity (a recoverable application condition), or a *transient*
+  post-body persistence error — requeues the task to `PENDING` (attempt unchanged)
+  before surfacing the error, so a re-run re-drains it rather than wedging
+  un-reclaimable (later claims select only `PENDING`). The sole residual is a
+  *hard process crash* between the claim and that requeue (below).
 - *Fire-before-flag* (timer firing, `drain_ready`). Each due timer's `TimerFired`
   append + `fired = 1` flag commit in one transaction. Before the fix these were
   separate autocommits: a crash between them left the `TimerFired` event durable
@@ -355,19 +372,23 @@ non-zero logical time permanently not-yet-due — a durability bug for the very
 timer-across-restart property the spike exists to prove. It now holds for timers
 armed at **any** logical time, not just the first.
 
-The **one residual window** is a crash *while the activity body itself is
-mid-execution* — after the task is claimed `RUNNING` but before the post-body
-transaction commits. The body is run *outside* any transaction deliberately: a
-`SQLite` write lock cannot be held across arbitrary user work, and the PG engine
-does not hold one across the activity body either. Such a crash leaves the task
-`RUNNING` and un-reclaimed (the reload path's `claim_next_ready_task` only claims
-`PENDING` rows; `classify_block` surfaces this honestly as [`SpikeError::Stuck`]
-rather than mislabelling it a timer wait). This is inherent to a *single-process*
-spike, which has no other worker and so no heartbeat-timeout or poison-pill
-reclaimer. A productized edge runtime would recover it exactly as the Postgres
-engine already does — the heartbeat-timeout scanner (`timeout.rs`) + poison-pill
-reclaim (`poison_pill.rs`) — which is out of a single-process spike's scope. The
-prototype's atomicity is asserted directly by four tests
+The **one residual window** is a *hard process crash* (power loss, `SIGKILL`)
+between the claim commit and the post-body persistence — after the task is claimed
+`RUNNING` but before the drain either completes it or requeues it. The body is run
+*outside* any transaction deliberately: a `SQLite` write lock cannot be held across
+arbitrary user work, and the PG engine does not hold one across the activity body
+either. A *Rust-level* error anywhere after the claim (an unregistered handler, a
+transient `SQLite`/JSON persistence error) now requeues the task to `PENDING` (the
+*Result-before-finish* bullet above), so it is **no longer** a wedge — only a hard
+crash, where no in-process error handler runs to requeue, leaves the task `RUNNING`
+and un-reclaimed (the reload path's `claim_next_ready_task` only claims `PENDING`
+rows; `classify_block` surfaces a genuinely un-drainable state honestly as
+[`SpikeError::Stuck`] rather than mislabelling it a timer wait). This is inherent
+to a *single-process* spike, which has no other worker and so no heartbeat-timeout
+or poison-pill reclaimer. A productized edge runtime would recover it exactly as
+the Postgres engine already does — the heartbeat-timeout scanner (`timeout.rs`) +
+poison-pill reclaim (`poison_pill.rs`) — which is out of a single-process spike's
+scope. The prototype's atomicity is asserted directly by four tests
 (`scenario_atomic_persist_event_and_row_never_out_of_sync` — the event/row
 invariant survives a reload;
 `scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` — a
@@ -375,7 +396,11 @@ batch that fails partway rolls back *both* the event and its row;
 `scenario_timer_fire_is_atomic_no_double_fire_across_reload` — a fired timer's
 event and `fired = 1` row agree across a reload, so it is never re-fired; and
 `scenario_two_timers_second_fires_across_restart_via_durable_clock` — a timer
-armed at a non-zero logical time fires after a restart via the durable clock).
+armed at a non-zero logical time fires after a restart via the durable clock). The
+requeue-on-any-post-claim-error invariant is asserted by a fifth,
+`scenario_unregistered_activity_requeues_and_drains_after_registration` — a
+claimed task whose handler is unregistered is returned to `PENDING` (not stranded
+`RUNNING`), so registering the handler and re-running drains it.
 
 **Known functional limitation (documented, not fixed) — reusing a classic timer
 id after a prior same-id timer has fired.** A workflow that arms `ctx.timer("t",
@@ -411,7 +436,7 @@ live, is rebuilt.
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **15 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **16 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -431,6 +456,7 @@ sqlite-spike,testing --test integration sqlite_spike` → **15 passed; 0 failed*
 | `scenario_side_effect_command_persists_and_replays_across_restart` | **(Codex P2 regression, round 4)** A workflow calls `ctx.new_uuid()` (an issue #384 deterministic side effect) before a suspending activity; the minted value is frozen into history as `SideEffectRecorded` (before the activity schedule, in command order) and recovered **verbatim** on a fresh runtime after a restart. Fails on the pre-fix code that silently dropped the `RecordSideEffect` command (no `SideEffectRecorded` reaches history → replay diverges / re-mints). |
 | `scenario_terminal_cycle_side_effect_persists_before_seal` | **(Codex P2 regression, round 5)** A workflow mints `ctx.new_uuid()` and returns in the **same terminal cycle** (no suspension), emitting a `RecordSideEffect` in the terminal command batch. The prototype persists the `SideEffectRecorded` **before** the `WorkflowCompleted` seal (via `run_workflow_with_state`, which surfaces the pending vector the bare `run_workflow` drops), and a genuine restart on the terminal-stripped history recovers the SAME UUID rather than re-minting. Fails on the pre-fix code (no `SideEffectRecorded` reaches history → the `.expect` panics, and the restart mints a fresh UUID ≠ output). |
 | `scenario_import_sealed_history_derives_terminal_state` | **(Codex P2 regression, round 5)** A **sealed** imported history — tail event a terminal `WorkflowCompleted{output}` (and a sibling `WorkflowFailed` case) — initializes the execution row directly in that terminal state with the imported output/error; a re-`run_until_blocked` short-circuits at the "already terminal?" check, re-runs nothing, and appends **no** second terminal event (event count unchanged). Fails on the pre-fix code (the row is created RUNNING, the sealed history is re-driven, and a duplicate terminal is appended — event count grows 5 → 6). |
+| `scenario_unregistered_activity_requeues_and_drains_after_registration` | **(Codex P2 regression, round 6)** A workflow schedules an activity whose handler is NOT registered. The claim commits the task `RUNNING` in its own transaction; the handler lookup then fails. The task is requeued to `PENDING` (attempt unchanged) and the `UnregisteredActivity` error surfaced, so registering the handler and re-running drains the same task to `Completed`. Fails on the pre-fix code, where the claimed task was stranded `RUNNING` (later claims select only `PENDING`) so the re-run could never drain it and wedged at `SpikeError::Stuck`. This is the recoverable-application-condition half of `drain_ready`'s requeue-on-any-post-claim-error invariant (§5.1). |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 
@@ -611,9 +637,10 @@ built.**
   is natural — replaying the same event stream twice is a no-op if keyed on
   `(exec_id, seq)`.
 - **Replay-fidelity guarantee.** A history produced on the edge **must replay
-  byte-identically on the hub.** The byte-identical-encoding invariant (§7) —
-  proven by the cross-backend replay test — is exactly this guarantee: the hub's
-  `HistoryMatcher` will drive the same commands from the edge-written history.
+  identically on the hub** — the hub's `HistoryMatcher` driving the same commands
+  from the edge-written history. The byte-identical-**encoding** invariant (§7) —
+  proven by the cross-backend replay test — is what guarantees it (the *encoding*
+  is byte-identical; the streams are replay-equivalent, §5.3).
   (The §5.3 `ActivityStarted`/retry caveats apply: the hub would *add*
   `ActivityStarted` on any *new* work it runs, but a fully-terminal
   edge history needs no further work and replays as-is.)

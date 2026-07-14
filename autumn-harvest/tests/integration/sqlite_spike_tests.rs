@@ -1235,3 +1235,70 @@ async fn scenario_import_sealed_history_derives_terminal_state() {
         "the sealed FAILED import is not grown by a second terminal event"
     );
 }
+
+// ── Codex P2 regression (round 6): an unregistered activity requeues, not wedges ──
+//
+// A workflow schedules an activity whose handler is NOT registered. The claim
+// commits the task RUNNING in its own transaction (the body runs between the claim
+// and the post-body persistence, so the two can't share one), and only THEN does
+// the handler lookup fail. Before the fix that error propagated with the task left
+// stranded RUNNING — and later claims select only PENDING, so registering the
+// handler and re-running could NEVER drain it: the run wedged at
+// `SpikeError::Stuck` forever. With the fix the failed claim requeues the task to
+// PENDING (attempt unchanged) via `mark_pending` and surfaces the original
+// `UnregisteredActivity` error, so a subsequent run — after the handler is
+// registered — drains the same task and the workflow completes. This is the
+// recoverable-application-condition half of `drain_ready`'s
+// requeue-on-any-post-claim-error invariant (the other half — a transient
+// post-body persistence error — requeues by the same path).
+#[tokio::test]
+async fn scenario_unregistered_activity_requeues_and_drains_after_registration() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+    // NB: the "work" activity is deliberately NOT registered for the first run.
+
+    let exec = rt.start_workflow("single_activity", json!(6)).unwrap();
+
+    // First run: the activity is scheduled and claimed RUNNING, then the missing
+    // handler surfaces `UnregisteredActivity` — but the task is requeued to
+    // PENDING, NOT left stranded RUNNING.
+    let first = rt.run_until_blocked(exec).await;
+    assert!(
+        matches!(first, Err(SpikeError::UnregisteredActivity(ref n)) if n == "work"),
+        "first run should surface the unregistered activity: {first:?}"
+    );
+    // The claimed task was returned to PENDING (re-drainable), not stranded
+    // RUNNING. Pre-fix this reads `["RUNNING"]` and the assertion fails.
+    assert_eq!(
+        rt.task_states(exec).unwrap(),
+        vec!["PENDING".to_string()],
+        "the claimed task is requeued to PENDING, not stranded RUNNING"
+    );
+
+    // Register the missing handler and re-run: the PENDING task now drains and the
+    // workflow completes. (Pre-fix, the task was stuck RUNNING —
+    // `claim_next_ready_task` selects only PENDING — so this re-run returns
+    // `Err(Stuck)` and the `.unwrap()` panics.)
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    // (6 * 10) * 2 == 120, drained after the handler was registered.
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(120)),
+        "state = {state:?}"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the activity runs exactly once, on the run after it was registered"
+    );
+}

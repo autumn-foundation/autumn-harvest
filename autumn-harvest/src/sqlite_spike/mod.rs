@@ -330,49 +330,51 @@ impl SqliteRuntime {
             }
         } else {
             // In-flight import: rebuild the derived state for any *open* scheduled
-            // work so the worker has a row to drain.
+            // work so the worker has a row to drain. The "open?" test is a match
+            // *guard* (not an `if` inside the arm body) so clippy's
+            // `collapsible_match` is satisfied — a closed activity/timer simply
+            // falls through to the `_` arm and materializes no row.
             for event in &events {
                 match event {
+                    // Open: no terminal (`ActivityCompleted`/exhausted
+                    // `ActivityFailed`) for this id. Materialize a fresh PENDING
+                    // task the worker claims + runs. The source backend's in-flight
+                    // attempt (its `ActivityStarted`, which the spike ignores) is
+                    // lost on handoff, so re-running is the correct at-least-once
+                    // recovery.
                     WorkflowEvent::ActivityScheduled {
                         activity_id,
                         name,
                         input,
                         queue,
-                    } => {
-                        // Open iff no terminal (`ActivityCompleted`/exhausted
-                        // `ActivityFailed`) for this id. Materialize a fresh PENDING
-                        // task the worker claims + runs. The source backend's
-                        // in-flight attempt (its `ActivityStarted`, which the spike
-                        // ignores) is lost on handoff, so re-running is the correct
-                        // at-least-once recovery.
-                        if !store::history_has_activity_terminal(&events, &activity_id.to_string())
-                        {
-                            queue::enqueue_activity(
-                                &tx,
-                                exec,
-                                *activity_id,
-                                name,
-                                input,
-                                queue,
-                                clock,
-                            )?;
-                        }
+                    } if !store::history_has_activity_terminal(
+                        &events,
+                        &activity_id.to_string(),
+                    ) =>
+                    {
+                        queue::enqueue_activity(
+                            &tx,
+                            exec,
+                            *activity_id,
+                            name,
+                            input,
+                            queue,
+                            clock,
+                        )?;
                     }
+                    // Open: no `TimerFired` for this id. Handoff semantic: a timer's
+                    // *remaining* delay restarts from import time — the source
+                    // backend's absolute deadline is not portable across backends
+                    // (different clock epochs) — so re-arm fresh at `clock +
+                    // duration_secs` (saturating, like `apply_commands`).
                     WorkflowEvent::TimerStarted {
                         timer_id,
                         duration_secs,
-                    } => {
-                        // Open iff no `TimerFired` for this id. Handoff semantic: a
-                        // timer's *remaining* delay restarts from import time — the
-                        // source backend's absolute deadline is not portable across
-                        // backends (different clock epochs) — so re-arm fresh at
-                        // `clock + duration_secs` (saturating, like `apply_commands`).
-                        if !store::history_has_timer_fired(&events, &timer_id.to_string()) {
-                            let fire_at = clock
-                                .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
-                                .unwrap_or(i64::MAX);
-                            queue::enqueue_timer(&tx, exec, &timer_id.to_string(), fire_at)?;
-                        }
+                    } if !store::history_has_timer_fired(&events, &timer_id.to_string()) => {
+                        let fire_at = clock
+                            .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
+                            .unwrap_or(i64::MAX);
+                        queue::enqueue_timer(&tx, exec, &timer_id.to_string(), fire_at)?;
                     }
                     _ => {}
                 }
@@ -413,6 +415,15 @@ impl SqliteRuntime {
     /// matching `spike_tasks` row, and a rolled-back batch leaves neither.
     pub fn queued_activity_ids(&self, exec: ExecutionId) -> Result<Vec<String>, SpikeError> {
         queue::all_task_activity_ids(&self.conn, exec)
+    }
+
+    /// Introspection (tests): the `state` of every task-queue row for `exec`, in
+    /// FIFO order. Used to assert a task that hit a **post-claim** error (an
+    /// unregistered activity, or a transient post-body persistence failure) was
+    /// returned to `PENDING` (re-drainable) rather than stranded `RUNNING` — the
+    /// invariant [`worker::drain_ready`]'s requeue-on-any-error path upholds.
+    pub fn task_states(&self, exec: ExecutionId) -> Result<Vec<String>, SpikeError> {
+        queue::task_states(&self.conn, exec)
     }
 
     /// Introspection (tests): the `timer_id`s of every armed (unfired) durable

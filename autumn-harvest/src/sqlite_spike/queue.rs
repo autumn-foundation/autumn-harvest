@@ -165,6 +165,29 @@ pub(super) fn requeue_task(
     Ok(())
 }
 
+/// Return a claimed (`RUNNING`) task to `PENDING` **without** touching its
+/// `attempt` or `run_at`, so a subsequent drain re-claims and re-runs it exactly
+/// as it stood before the claim.
+///
+/// The claim ([`claim_next_ready_task`]) commits the `RUNNING` flip in its own
+/// `BEGIN IMMEDIATE` transaction (the activity body runs between the claim and the
+/// post-body persistence, so the two cannot share one transaction — a `SQLite`
+/// write lock can't be held across arbitrary user work). Any fallible step
+/// *after* that claim — the handler lookup for an unregistered activity, or a
+/// transient post-body persistence error — would otherwise strand the task
+/// `RUNNING` un-reclaimable, since later claims select only `PENDING`. The worker
+/// pass ([`super::worker::drain_ready`]) calls this on **any** such error so the
+/// wedge is recoverable: register the missing handler / let the fault clear,
+/// re-run, and the task drains. (Contrast [`requeue_task`], the retry path, which
+/// also *advances* `attempt`/`run_at`.)
+pub(super) fn mark_pending(conn: &Connection, task_id: &str) -> Result<(), SpikeError> {
+    conn.execute(
+        "UPDATE spike_tasks SET state = 'PENDING' WHERE task_id = ?1",
+        params![task_id],
+    )?;
+    Ok(())
+}
+
 // ── Durable timers ───────────────────────────────────────────────────────────
 
 pub(super) fn enqueue_timer(
@@ -254,6 +277,24 @@ pub(super) fn all_task_activity_ids(
 ) -> Result<Vec<String>, SpikeError> {
     let mut stmt =
         conn.prepare("SELECT activity_id FROM spike_tasks WHERE exec_id = ?1 ORDER BY seq")?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// The `state` of every task-queue row for `exec_id`, in FIFO (`seq`) order.
+/// Exposed so a test can assert a claimed task that hit a post-claim error (an
+/// unregistered handler, or a transient post-body persistence failure) was
+/// returned to `PENDING` (re-drainable) via [`mark_pending`], never stranded
+/// `RUNNING`.
+pub(super) fn task_states(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> Result<Vec<String>, SpikeError> {
+    let mut stmt = conn.prepare("SELECT state FROM spike_tasks WHERE exec_id = ?1 ORDER BY seq")?;
     let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for r in rows {

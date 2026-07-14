@@ -5,8 +5,10 @@ timeboxed study answering one question: *can the backend-neutral determinism
 core (`run_workflow`, `WorkflowEvent`, deterministic replay) be driven by a
 non-Postgres, embedded, single-writer persistence layer?* The answer:
 **feasible, but do not port in-crate** — recommend a separate companion crate
-that depends on the core; decline the in-crate `StorageBackend` trait (its cost
-falls entirely on the shipped Postgres hot path).
+that depends on the core; decline the in-crate `StorageBackend` trait (its cost —
+a wide-but-half-empty trait plus a ~doubled integration test matrix, **not**
+hot-path dispatch, which a monomorphized generic makes zero-cost — falls entirely
+on the shipped Postgres path).
 
 **What shipped:**
 
@@ -54,9 +56,18 @@ falls entirely on the shipped Postgres hot path).
   prior reset-to-0-on-reopen left a timer armed at a non-zero logical time
   permanently not-yet-due. This closes the append-before-enqueue,
   result-before-finish, fire-before-flag, terminal-event-before-state-flip, and
-  clock-reset windows; the sole residual window is a crash *mid activity-body*,
-  which a productized runtime would recover via the engine's heartbeat-timeout +
-  poison-pill reclaimer (out of a single-process spike's scope). **The import path
+  clock-reset windows. **Any post-claim error requeues the task to `PENDING`, never
+  strands it `RUNNING`** (Codex P2, round 6): the claim commits `RUNNING` in a
+  *separate* transaction from the post-body persistence (the body runs between
+  them), so `drain_ready` now requeues the task on **any** subsequent error — an
+  *unregistered* activity (a recoverable application condition: register it and
+  re-run) or a *transient* post-body persistence error — via `queue::mark_pending`
+  before surfacing the error, so a re-run re-drains it rather than wedging at
+  `SpikeError::Stuck` (later claims select only `PENDING`). The **sole residual
+  window** is now a *hard process crash* between the claim and that requeue — no
+  in-process handler runs — which a productized runtime would recover via the
+  engine's heartbeat-timeout + poison-pill reclaimer (out of a single-process
+  spike's scope). **The import path
   materializes derived state for in-flight open work** (Codex P1, round 4): when an
   imported cross-backend history carries an *open* (un-terminated)
   `ActivityScheduled`/`TimerStarted`, `import_execution` rebuilds the companion
@@ -95,8 +106,8 @@ falls entirely on the shipped Postgres hot path).
   the go/no-go: they are exactly the deep coordination/matcher-coupling surface that
   motivates the "separate companion crate reusing the core, not a trivial port"
   recommendation.
-- **A 15-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (15/15 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+- **A 16-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (16/16 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays
@@ -131,7 +142,13 @@ falls entirely on the shipped Postgres hot path).
   re-mints); and a fully-sealed imported history is derived to its terminal state
   and grows by no second terminal event
   (`scenario_import_sealed_history_derives_terminal_state`; fails pre-fix — the row
-  is created RUNNING, re-driven, and the log grows 5 → 6 with a duplicate terminal).
+  is created RUNNING, re-driven, and the log grows 5 → 6 with a duplicate terminal)
+  — **plus one round-6 regression test**: a workflow scheduling an *unregistered*
+  activity requeues the claimed task to `PENDING` and, once the handler is
+  registered, drains it to `Completed`
+  (`scenario_unregistered_activity_requeues_and_drains_after_registration`; fails
+  pre-fix — the claimed task is stranded `RUNNING`, later claims select only
+  `PENDING`, so the re-run wedges at `Stuck`).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`
