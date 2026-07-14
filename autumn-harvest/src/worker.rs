@@ -3753,7 +3753,7 @@ async fn persist_update_result_commands(
 fn collect_update_result_metrics(
     history_events: &[WorkflowEvent],
     pending_cmds: &[WorkflowCommand],
-) -> Vec<(String, bool)> {
+) -> Vec<(String, bool, Option<chrono::DateTime<chrono::Utc>>)> {
     // Fast path: nothing to resolve or emit.
     if !pending_cmds
         .iter()
@@ -3762,14 +3762,25 @@ fn collect_update_result_metrics(
         return Vec::new();
     }
 
-    let mut names: std::collections::HashMap<crate::types::UpdateId, &str> =
-        std::collections::HashMap::new();
+    // Resolve both the update name AND its admit timestamp (issue #781) from the
+    // `UpdateAdmitted` events in history. The timestamp is the admit→terminal
+    // latency histogram's start point; a `RecordUpdateResult` whose admit is not
+    // in the loaded history (should not happen — admission always precedes the
+    // result) yields name "unknown" AND `None` timestamp together, so its
+    // histogram sample is skipped rather than fabricated.
+    let mut admitted: std::collections::HashMap<
+        crate::types::UpdateId,
+        (&str, chrono::DateTime<chrono::Utc>),
+    > = std::collections::HashMap::new();
     for event in history_events {
         if let WorkflowEvent::UpdateAdmitted {
-            update_id, name, ..
+            update_id,
+            name,
+            timestamp,
+            ..
         } = event
         {
-            names.insert(*update_id, name.as_str());
+            admitted.insert(*update_id, (name.as_str(), *timestamp));
         }
     }
 
@@ -3777,17 +3788,38 @@ fn collect_update_result_metrics(
         .iter()
         .filter_map(|cmd| match cmd {
             WorkflowCommand::RecordUpdateResult { update_id, result } => {
-                let name = names.get(update_id).copied().unwrap_or("unknown");
+                let resolved = admitted.get(update_id).copied();
+                let name = resolved.map_or("unknown", |(name, _)| name);
+                let admit_ts = resolved.map(|(_, ts)| ts);
                 let label = if is_unregistered_update_failure(name, result) {
                     crate::telemetry::UNREGISTERED_UPDATE_NAME
                 } else {
                     name
                 };
-                Some((label.to_owned(), result.is_ok()))
+                Some((label.to_owned(), result.is_ok(), admit_ts))
             }
             _ => None,
         })
         .collect()
+}
+
+/// Admit→terminal latency in seconds for the `harvest.update.duration` histogram
+/// (issue #781).
+///
+/// Pure and unit-tested. `admit_ts` is the recorded `UpdateAdmitted.timestamp`
+/// (or `None` when the admit could not be resolved from history, in which case
+/// the histogram sample is **skipped** — `None` is returned so the caller emits
+/// nothing). `now` is the terminal time (`Utc::now()` at the post-commit emit).
+/// A negative delta (clock skew across event appends) clamps to `0.0`, never a
+/// garbage/negative sample.
+#[allow(clippy::cast_precision_loss)] // realistic admit→terminal latencies (ms) are far within f64's exact range
+fn update_admit_duration_secs(
+    admit_ts: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<f64> {
+    let admit = admit_ts?;
+    let millis = (now - admit).num_milliseconds().max(0);
+    Some(millis as f64 / 1000.0)
 }
 
 /// Whether a `RecordUpdateResult` is the "update handler not found" failure a
@@ -3826,27 +3858,47 @@ fn update_result_command_source<'a>(
     }
 }
 
-/// Emit `harvest.update.completed` / `harvest.update.failed` for each collected
-/// `(update_name, completed)` pair (issue #684). Shared by the worker's
-/// `Persisted`-arm terminal/suspend emission and the two inline external-signal
-/// suspension branches, which persist their update results outside the main
-/// transaction and would otherwise leave them uncounted.
+/// Emit `harvest.update.completed` / `harvest.update.failed` (issue #684) AND the
+/// `harvest.update.duration` admit→terminal latency histogram (issue #781) for
+/// each collected `(update_name, completed, admit_ts)` triple. Shared by the
+/// worker's `Persisted`-arm terminal/suspend emission and the two inline
+/// external-signal suspension branches, which persist their update results
+/// outside the main transaction and would otherwise leave them uncounted.
 ///
 /// The `update_name` is already bounded by `collect_update_result_metrics` (an
 /// unregistered name's handler-not-found failure is bucketed to the
 /// [`UNREGISTERED_UPDATE_NAME`](crate::telemetry::UNREGISTERED_UPDATE_NAME)
 /// sentinel, issue #684 Codex P2), so this helper emits the name verbatim.
+///
+/// The histogram (issue #781) records `now - admit_ts` in seconds, capturing a
+/// single `now` at the top so all results in one cycle share a terminal time.
+/// A result whose admit could not be resolved from history (`admit_ts == None`)
+/// records the counter but **skips** the histogram sample — never a fabricated
+/// `0`. This piggybacks on the completed/failed counters' exact post-commit
+/// path, so the histogram shares their delivery semantics.
 fn emit_update_result_metrics(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     workflow_name: &str,
     queue: &str,
-    results: &[(String, bool)],
+    results: &[(String, bool, Option<chrono::DateTime<chrono::Utc>>)],
 ) {
-    for (update_name, completed) in results {
-        if *completed {
+    let now = chrono::Utc::now();
+    for (update_name, completed, admit_ts) in results {
+        let outcome = if *completed {
             metrics.record_update_completed(workflow_name, update_name, queue);
+            "completed"
         } else {
             metrics.record_update_failed(workflow_name, update_name, queue);
+            "failed"
+        };
+        if let Some(duration_secs) = update_admit_duration_secs(*admit_ts, now) {
+            metrics.record_update_duration(
+                workflow_name,
+                update_name,
+                queue,
+                outcome,
+                duration_secs,
+            );
         }
     }
 }
@@ -17419,6 +17471,24 @@ mod tests {
         }
     }
 
+    /// The admit timestamp carried alongside the name/completed flag by
+    /// `collect_update_result_metrics` (issue #781). The exact value is asserted
+    /// by `collect_update_result_metrics_carries_admit_timestamp`; the other
+    /// tests only care about name + completed, so they read it back verbatim.
+    fn admit_ts_of(
+        history: &[WorkflowEvent],
+        id: crate::types::UpdateId,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        history.iter().find_map(|e| match e {
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                timestamp,
+                ..
+            } if *update_id == id => Some(*timestamp),
+            _ => None,
+        })
+    }
+
     #[test]
     fn collect_update_result_metrics_empty_without_record_update_result() {
         let id = crate::types::UpdateId::new();
@@ -17449,8 +17519,12 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                ("set_priority".to_owned(), true),
-                ("cancel".to_owned(), false)
+                (
+                    "set_priority".to_owned(),
+                    true,
+                    admit_ts_of(&history, ok_id)
+                ),
+                ("cancel".to_owned(), false, admit_ts_of(&history, err_id))
             ]
         );
     }
@@ -17490,7 +17564,7 @@ mod tests {
         let source = update_result_command_source(&outcome, &pending_cmds);
         assert_eq!(
             collect_update_result_metrics(&history, source),
-            vec![("set_priority".to_owned(), true)],
+            vec![("set_priority".to_owned(), true, admit_ts_of(&history, id))],
             "the suspend path's update result must be collected from the outcome's commands"
         );
     }
@@ -17539,7 +17613,7 @@ mod tests {
         }];
         assert_eq!(
             collect_update_result_metrics(&history, &cmds),
-            vec![("unknown".to_owned(), true)]
+            vec![("unknown".to_owned(), true, None)]
         );
     }
 
@@ -17570,8 +17644,16 @@ mod tests {
         assert_eq!(
             collect_update_result_metrics(&history, &cmds),
             vec![
-                (crate::telemetry::UNREGISTERED_UPDATE_NAME.to_owned(), false),
-                ("set_priority".to_owned(), false),
+                (
+                    crate::telemetry::UNREGISTERED_UPDATE_NAME.to_owned(),
+                    false,
+                    admit_ts_of(&history, unregistered_id)
+                ),
+                (
+                    "set_priority".to_owned(),
+                    false,
+                    admit_ts_of(&history, real_id)
+                ),
             ]
         );
     }
@@ -17594,6 +17676,63 @@ mod tests {
             "set_val",
             &Err("boom".to_owned())
         ));
+    }
+
+    // ── update admit→terminal latency histogram (issue #781) ──────────────
+
+    #[test]
+    fn update_admit_duration_secs_none_when_admit_missing() {
+        // A RecordUpdateResult whose UpdateAdmitted is not in the loaded history
+        // yields no admit timestamp → the histogram sample is SKIPPED (never a
+        // bogus 0), while the completed/failed counter still fires.
+        let now = chrono::Utc::now();
+        assert_eq!(update_admit_duration_secs(None, now), None);
+    }
+
+    #[test]
+    fn update_admit_duration_secs_measures_positive_delta_in_seconds() {
+        let admit = chrono::Utc::now();
+        let now = admit + chrono::Duration::milliseconds(2500);
+        let secs = update_admit_duration_secs(Some(admit), now).expect("some duration");
+        assert!((secs - 2.5).abs() < 1e-6, "expected ~2.5s, got {secs}");
+    }
+
+    #[test]
+    fn update_admit_duration_secs_clamps_negative_skew_to_zero() {
+        // Terminal time BEFORE the recorded admit (clock skew across appends)
+        // must clamp to 0 — never emit a negative/garbage sample.
+        let admit = chrono::Utc::now();
+        let now = admit - chrono::Duration::seconds(5);
+        assert_eq!(update_admit_duration_secs(Some(admit), now), Some(0.0));
+    }
+
+    #[test]
+    fn collect_update_result_metrics_carries_admit_timestamp() {
+        // Issue #781: collect now also carries the admit timestamp so emit can
+        // compute admit→terminal latency. A resolved admit carries Some(ts); an
+        // unresolved one carries None (name "unknown", no histogram sample).
+        let ok_id = crate::types::UpdateId::new();
+        let missing_id = crate::types::UpdateId::new();
+        let admit_ts = chrono::Utc::now();
+        let history = vec![WorkflowEvent::UpdateAdmitted {
+            update_id: ok_id,
+            name: "set_priority".to_string(),
+            input: Value::Null,
+            timestamp: admit_ts,
+        }];
+        let cmds = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: ok_id,
+                result: Ok(Value::Null),
+            },
+            WorkflowCommand::RecordUpdateResult {
+                update_id: missing_id,
+                result: Ok(Value::Null),
+            },
+        ];
+        let out = collect_update_result_metrics(&history, &cmds);
+        assert_eq!(out[0], ("set_priority".to_owned(), true, Some(admit_ts)));
+        assert_eq!(out[1], ("unknown".to_owned(), true, None));
     }
 
     // ── signal.unhandled post-commit collection (issue #684, Codex P2) ─────

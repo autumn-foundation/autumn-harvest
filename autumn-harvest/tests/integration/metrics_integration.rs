@@ -29,10 +29,11 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_SIGNAL_RECEIVED,
-    METRIC_SIGNAL_UNHANDLED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_FAILED,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, TelemetryConfig, WorkflowStatus,
+    METRIC_SIGNAL_UNHANDLED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED,
+    METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, TelemetryConfig,
+    WorkflowStatus,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -266,6 +267,28 @@ impl MetricsRecorder for RecordingMetrics {
             METRIC_UPDATE_FAILED,
             vec![
                 ("name", update_name.to_owned()),
+                ("queue", queue.to_owned()),
+                ("workflow", workflow_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_update_duration(
+        &self,
+        workflow_name: &str,
+        update_name: &str,
+        queue: &str,
+        outcome: &str,
+        duration_secs: f64,
+    ) {
+        // The measured latency value itself is not a label (issue #781); the
+        // histogram's label set is workflow/name/queue/outcome.
+        let _ = duration_secs;
+        self.push(
+            METRIC_UPDATE_DURATION,
+            vec![
+                ("name", update_name.to_owned()),
+                ("outcome", outcome.to_owned()),
                 ("queue", queue.to_owned()),
                 ("workflow", workflow_name.to_owned()),
             ],
@@ -3517,6 +3540,24 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
         completed[0].labels_debug,
         "name=set_val,queue=default,workflow=update_then_suspend_workflow",
         "update.completed must carry workflow+name+queue labels"
+    );
+
+    // Issue #781: the admit→terminal latency histogram fires on the SAME
+    // post-commit path, exactly once, carrying workflow+name+queue+outcome
+    // (outcome=completed here — the update ran to success).
+    let duration = emissions
+        .iter()
+        .filter(|e| e.name == METRIC_UPDATE_DURATION)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        duration.len(),
+        1,
+        "harvest.update.duration must fire exactly once on the suspend path; got {emissions:?}"
+    );
+    assert_eq!(
+        duration[0].labels_debug,
+        "name=set_val,outcome=completed,queue=default,workflow=update_then_suspend_workflow",
+        "update.duration must carry workflow+name+queue+outcome labels"
     );
     assert_eq!(
         emissions

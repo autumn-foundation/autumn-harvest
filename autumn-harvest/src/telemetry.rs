@@ -807,6 +807,26 @@ pub const METRIC_UPDATE_COMPLETED: &str = "harvest.update.completed";
 /// per ADR-0001 §7.
 pub const METRIC_UPDATE_FAILED: &str = "harvest.update.failed";
 
+/// Histogram: wall-clock seconds from an update's durable admission
+/// (`UpdateAdmitted`) to its terminal result recording
+/// (`UpdateCompleted`/`UpdateFailed`) (issue #781).
+///
+/// The admit→terminal latency companion to the `harvest.update.*` lifecycle
+/// counters (issue #684). Emitted on the **same** post-commit best-effort path
+/// as [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] (the shared
+/// `collect_update_result_metrics`/`emit_update_result_metrics` worker helpers),
+/// so it inherits their exactly-once-on-the-happy-path delivery semantics: a
+/// crash after the persist commit but before the post-commit emit drops the
+/// sample (at-most-once for that window, never a double-count). Labeled by
+/// `workflow`, `name` (update name — bounded to the resolved handler set, an
+/// unregistered name → [`UNREGISTERED_UPDATE_NAME`]), `queue`, and `outcome`
+/// (`"completed"`/`"failed"` — rejected updates never enter the histogram, as no
+/// handler runs). The admit timestamp comes from the `UpdateAdmitted` event
+/// already in the loaded history; the terminal time is `Utc::now()` at emit,
+/// clamped so a clock-skew negative delta records `0`, never a garbage value.
+/// `execution.id`/`update_id` are span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_DURATION: &str = "harvest.update.duration";
+
 /// Sentinel `name` label for a `harvest.update.failed` counter when the admitted
 /// update name resolved to no handler (issue #684, Codex P2).
 ///
@@ -2208,6 +2228,25 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, update_name, queue);
     }
 
+    /// An admitted workflow update reached a terminal result; `duration_secs` is
+    /// the wall-clock time from durable admission to that result (issue #781).
+    ///
+    /// Maps to the histogram [`METRIC_UPDATE_DURATION`] with labels `workflow`,
+    /// `name` (update name), `queue`, and `outcome` (`"completed"`/`"failed"`).
+    /// Emitted on the same post-commit path as
+    /// [`record_update_completed`](Self::record_update_completed)/[`record_update_failed`](Self::record_update_failed),
+    /// so it shares their delivery semantics (see [`METRIC_UPDATE_DURATION`]).
+    fn record_update_duration(
+        &self,
+        workflow_name: &str,
+        update_name: &str,
+        queue: &str,
+        outcome: &str,
+        duration_secs: f64,
+    ) {
+        let _ = (workflow_name, update_name, queue, outcome, duration_secs);
+    }
+
     /// Whether this recorder actually forwards samples anywhere.
     ///
     /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
@@ -2578,6 +2617,23 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_activity_panic("send_email", "default");
         rec.record_workflow_panic("onboarding", "default");
+    }
+
+    #[test]
+    fn metric_update_duration_constant_has_correct_name() {
+        // Issue #781: the admit→terminal latency histogram name is
+        // family-consistent with the #1032 `harvest.update.*` counters.
+        assert_eq!(METRIC_UPDATE_DURATION, "harvest.update.duration");
+    }
+
+    #[test]
+    fn record_update_duration_has_noop_default() {
+        // Issue #781: the admit→terminal latency histogram must exist as a
+        // no-op-default trait method so existing MetricsRecorder implementations
+        // compile without changes. Outcome ∈ {completed, failed}.
+        let rec = NoOpMetrics;
+        rec.record_update_duration("onboarding", "set_priority", "default", "completed", 0.42);
+        rec.record_update_duration("onboarding", "cancel", "default", "failed", 1.5);
     }
 
     #[test]

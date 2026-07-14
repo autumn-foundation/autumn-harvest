@@ -263,6 +263,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_UPDATE_REJECTED`   | `harvest.update.rejected`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded) | `execution.id` |
 | `METRIC_UPDATE_COMPLETED`  | `harvest.update.completed`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded), `queue` | `execution.id` |
 | `METRIC_UPDATE_FAILED`     | `harvest.update.failed`       | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded), `queue` | `execution.id` |
+| `METRIC_UPDATE_DURATION`   | `harvest.update.duration`     | Histogram    | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded — `__unregistered__` for an unresolved name), `queue`, `outcome` (`completed`/`failed`, bounded — rejected excluded) | `execution.id`, `update_id` |
 
 **Cardinality rule**: `execution.id` (a UUID) is **explicitly forbidden** as a
 metric label. It is unbounded and would explode the metric time-series in any
