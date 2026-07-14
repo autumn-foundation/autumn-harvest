@@ -6092,47 +6092,29 @@ impl WorkflowContext {
                     ChildOrTimerMatch::InProgress { child_id } => {
                         // A running workflow parked on this race replays to
                         // `InProgress` at the recorded-history frontier. The
-                        // deploy canary samples exactly such executions and
-                        // expects them to *suspend* (ReplaySucceeded), so mirror
-                        // `check_strict_replay_no_match`'s canary-at-end
-                        // exception: fall through to re-park (which suspends)
-                        // rather than reporting a false non-determinism. A
-                        // genuine mid-history divergence never reaches this arm
-                        // (it returns `Diverged`); an unresolved race with real
-                        // events still after it (a fixture bug) stays a hard
-                        // error. Strict `WorkflowReplayer` runs (non-canary)
-                        // always get complete histories, so an unresolved race
-                        // there is still a fixture problem.
-                        //
-                        // "At frontier" must treat trailing transparent update
-                        // events (`UpdateAdmitted`/`UpdateCompleted`/`Update-
-                        // Failed`) exactly as the global unconsumed check does
-                        // (issue #779 Codex P2): the `InProgress` scan above
-                        // skips them via `scan_cursor += 1` WITHOUT consuming
-                        // them, so it leaves the cursor positioned BEFORE them
-                        // and a raw `position() >= len()` check would read false
-                        // for a healthy in-flight race merely woken by an update.
-                        // `has_non_lifecycle_unconsumed` skips update (and
-                        // terminal-lifecycle) events, so it agrees with
-                        // `history_has_unconsumed_events` — the same authority
-                        // the executor uses to decide a suspend is clean.
-                        let (position, at_frontier) = self.match_history(|m| {
-                            (
-                                i32::try_from(m.position()).ok(),
-                                !m.has_non_lifecycle_unconsumed(),
-                            )
-                        });
-                        if self.strict_replay && !(self.canary_mode && at_frontier) {
-                            return Err(self.nd_error(
-                                format!(
-                                    "child-or-timeout race '{workflow_name}' started but \
-                                     unresolved in history"
-                                ),
-                                position,
-                                Some("ChildOrTimerResolved".to_string()),
-                                Some("ChildOrTimerInProgress".to_string()),
-                            ));
-                        }
+                        // in-flight non-determinism decision is deliberately NOT
+                        // made inline here (issue #1048): `match_child_or_timer`
+                        // intentionally rewinds the matcher cursor to a concurrent
+                        // bookkeeping sibling's still-unconsumed event so that
+                        // sibling's own matcher can consume it next, so an inline
+                        // `has_non_lifecycle_unconsumed` check would read that
+                        // transient rewound cursor and fire a poll-order-dependent
+                        // false positive (a healthy parked race joined with an
+                        // allowlisted bookkeeping sibling, e.g.
+                        // `tokio::join!(spawn_child_workflow_timeout(...),
+                        // async { ctx.side_effect(...) })`). Instead fall through
+                        // to re-park (which suspends) and let the executor's
+                        // end-of-cycle authority (`history_has_unconsumed_events`,
+                        // run once AFTER the whole `tokio::join!` is polled and
+                        // every sibling matcher has consumed its rewound event)
+                        // decide: a clean parked race → `Suspended`
+                        // (ReplaySucceeded under canary), a genuine leftover event
+                        // → non-determinism. A genuine mid-history divergence never
+                        // reaches this arm (it returns `Diverged`, which always
+                        // errors); a non-canary strict `Suspended` is
+                        // unconditionally mapped to non-determinism by the report
+                        // layer, so a genuinely-parked race under strict replay
+                        // still errors.
                         Some(child_id)
                     }
                     _ => {
@@ -6705,54 +6687,29 @@ impl WorkflowContext {
                 ));
             }
             outcome @ (SignalOrTimerMatch::NoMatch | SignalOrTimerMatch::InProgress) => {
+                // NoMatch is a first live run (or, under strict replay, an early-
+                // completion mismatch caught by `check_strict_replay_no_match`).
+                // InProgress deliberately makes NO inline non-determinism decision
+                // (issue #1048): `match_signal_or_timer` rewinds the matcher cursor
+                // to a concurrent bookkeeping sibling's still-unconsumed event so
+                // that sibling's own matcher can consume it next, so an inline
+                // `has_non_lifecycle_unconsumed` check would read that transient
+                // rewound cursor and fire a poll-order-dependent false positive (a
+                // healthy parked race joined with an allowlisted bookkeeping
+                // sibling, e.g. `tokio::join!(wait_for_signal_timeout(...),
+                // async { ctx.side_effect(...) })`). Instead it falls through to
+                // re-park (which suspends) and lets the executor's end-of-cycle
+                // authority (`history_has_unconsumed_events`, run once AFTER the
+                // whole `tokio::join!` is polled and every sibling matcher has
+                // consumed its rewound event) decide — mirroring the child-timeout
+                // twin. A genuine `Diverged` never reaches this arm (it always
+                // errors); a non-canary strict `Suspended` is unconditionally
+                // mapped to non-determinism by the report layer, so a
+                // genuinely-parked race under strict replay still errors.
                 if matches!(outcome, SignalOrTimerMatch::NoMatch) {
                     self.check_strict_replay_no_match(&format!(
                         "SignalOrTimer({signal_name}, {timer_id})"
                     ))?;
-                } else {
-                    // InProgress: a running workflow parked on this race replays
-                    // to `InProgress` at the recorded-history frontier. The deploy
-                    // canary samples exactly such executions and expects them to
-                    // *suspend* (ReplaySucceeded), so mirror
-                    // `check_strict_replay_no_match`'s canary-at-end exception (and
-                    // the child-timeout twin, `spawn_child_workflow_timeout`): fall
-                    // through to re-park (which suspends) rather than reporting a
-                    // false non-determinism. A genuine mid-history divergence never
-                    // reaches this arm (it returns `Diverged`); an unresolved race
-                    // with real events still after it (a fixture bug) stays a hard
-                    // error. Strict `WorkflowReplayer` runs (non-canary) always get
-                    // complete histories, so an unresolved race there is still a
-                    // fixture problem.
-                    //
-                    // "At frontier" must treat trailing transparent update events
-                    // (`UpdateAdmitted`/`UpdateCompleted`/`UpdateFailed`) exactly
-                    // as the global unconsumed check does (mirrors the twin, issue
-                    // #779 Codex P2): `match_signal_or_timer`'s `InProgress` scan
-                    // skips them via `scan_cursor += 1` WITHOUT consuming them, so
-                    // it leaves the cursor positioned BEFORE them and a raw
-                    // `position() >= len()` check would read false for a healthy
-                    // in-flight race merely woken by an update.
-                    // `has_non_lifecycle_unconsumed` skips update (and terminal-
-                    // lifecycle) events, so it agrees with
-                    // `history_has_unconsumed_events` — the same authority the
-                    // executor uses to decide a suspend is clean.
-                    let (position, at_frontier) = self.match_history(|m| {
-                        (
-                            i32::try_from(m.position()).ok(),
-                            !m.has_non_lifecycle_unconsumed(),
-                        )
-                    });
-                    if self.strict_replay && !(self.canary_mode && at_frontier) {
-                        return Err(self.nd_error(
-                            format!(
-                                "signal-or-timeout race '{signal_name}' started but \
-                                 unresolved in history"
-                            ),
-                            position,
-                            Some("SignalOrTimerResolved".to_string()),
-                            Some("SignalOrTimerInProgress".to_string()),
-                        ));
-                    }
                 }
 
                 // First live run (NoMatch) or re-park after a spurious wake
