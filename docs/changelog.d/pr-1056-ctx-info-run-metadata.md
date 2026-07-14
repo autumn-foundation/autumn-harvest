@@ -232,3 +232,36 @@ in `workflow_test_env_tests.rs`: `test_configured_workflow_metadata_in_activity_
 `{"workflow_id":"","workflow_type":"__test__"}`) and
 `test_default_env_metadata_in_activity_input_replays_clean` (default-env
 regression guard). testing.rs-only change; no production/plugin/CLI/scheduler edits.
+
+**Post-review hardening (Codex P2 @ `testing.rs:903`):** `WorkflowReplayer` gains
+`with_execution_id(ExecutionId)` so raw `replay_from_events` fixtures can supply the
+captured original run id. `ctx.info().execution_id` is documented as replay-safe —
+the production / DB (`replay_from_db`) / snapshot (`replay_from_snapshot` /
+`replay_from_json`) / canary (`run_canary`) paths all recover the real id, and
+`TestRunOutcome::replay_check` threads the captured live-run id via its snapshot —
+but the raw-events path carries no `HistorySnapshot`, so it minted a fresh random
+`ExecutionId::new()`. A workflow that recorded its own `ctx.info().execution_id` in
+a command-affecting value (e.g. an activity input) then false-flagged
+non-determinism (random replay id vs recorded original run id). With this builder,
+**every** `WorkflowReplayer` / `WorkflowTestEnv` replay entry point now threads all
+four replay-stable `info()` fields — `execution_id`, `workflow_id`,
+`workflow_type`, `parent_execution_id` — so no `ctx.info()` field can false-flag
+non-determinism on any harness replay path. `None` (the default) preserves the
+fresh-id behaviour, so existing raw-events fixtures are unaffected. New no-DB tests
+in `replayer_tests.rs`: `execution_id_is_applied_from_replayer_global_on_raw_events_path`
+(**RED pre-fix**: divergence, recorded activity input carries the real
+`execution_id` vs the replay's fresh random one) and
+`execution_id_diverges_on_raw_events_path_without_the_builder` (the load-bearing
+negative control). testing.rs-only change; no production/plugin/CLI/scheduler edits.
+
+**Per-path × 4-field harness census (after this change — every cell threaded):**
+
+| Replay path | `execution_id` | `workflow_id` | `workflow_type` | `parent_execution_id` |
+|---|---|---|---|---|
+| `replay_from_events` (raw) | ✅ `with_execution_id` global (else fresh id) | ✅ `with_workflow_id` global | ✅ handler key | ✅ `with_parent_execution_id` global |
+| `replay_with_reset` (delegates to `replay_from_events`) | ✅ (inherits) | ✅ | ✅ | ✅ |
+| `replay_from_snapshot` / `replay_from_json` | ✅ snapshot (required field) | ✅ snapshot → global | ✅ snapshot | ✅ snapshot → global |
+| `replay_from_db` | ✅ row | ✅ row | ✅ row | ✅ row |
+| `run_canary` | ✅ row | ✅ row | ✅ row | ✅ row |
+| `TestRunOutcome::replay_check` | ✅ captured live-run id (via snapshot) | ✅ env config (via snapshot) | ✅ env config (via snapshot) | ✅ env config (via snapshot) |
+| harness dir-fixture (`verify_history`) | ✅ snapshot (via `replay_from_snapshot`) | ✅ snapshot | ✅ snapshot | ✅ snapshot |

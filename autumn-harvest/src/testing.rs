@@ -380,6 +380,18 @@ pub struct WorkflowReplayer {
     /// carries its own `workflow_id` overrides this global. `None` (the default)
     /// models a run without an explicit id.
     workflow_id: Option<String>,
+    /// Effective `execution_id` threaded into the replayed `WorkflowContext` on
+    /// the raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
+    /// `execution_id` is documented as replay-safe (`ctx.info().execution_id`),
+    /// but a raw-events fixture carries no [`HistorySnapshot`] to source it from,
+    /// so `replay_from_events` mints a fresh id unless one is set here with
+    /// [`with_execution_id`](Self::with_execution_id). Without it a workflow that
+    /// recorded `ctx.info().execution_id` in a command-affecting value (e.g. an
+    /// activity input) false-reports non-determinism (the random replay id vs the
+    /// recorded original run id). The snapshot/DB/canary paths already carry the
+    /// real id and ignore this global. `None` (the default) mints a fresh id, so
+    /// existing raw-events fixtures are unaffected.
+    execution_id: Option<ExecutionId>,
 }
 
 impl Default for WorkflowReplayer {
@@ -424,6 +436,7 @@ impl WorkflowReplayer {
             execution_timeout: None,
             parent_execution_id: None,
             workflow_id: None,
+            execution_id: None,
         }
     }
 
@@ -474,6 +487,24 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
         self.workflow_id = Some(workflow_id.into());
+        self
+    }
+
+    /// Set the `execution_id` threaded into the replayed `WorkflowContext` on the
+    /// raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
+    ///
+    /// `ctx.info().execution_id` is replay-safe — the production/DB/snapshot/canary
+    /// replay paths all recover it from the recorded run — but a raw-events fixture
+    /// carries no [`HistorySnapshot`], so `replay_from_events` mints a fresh id
+    /// unless you supply the captured original run id here. Without it a workflow
+    /// that recorded `ctx.info().execution_id` in a command-affecting value (e.g.
+    /// an activity input) false-reports non-determinism against a history recorded
+    /// under the real id. The snapshot / DB / canary paths already carry the real
+    /// id and ignore this global. `None` (the default) mints a fresh id, matching
+    /// pre-#698 behaviour.
+    #[must_use]
+    pub const fn with_execution_id(mut self, execution_id: ExecutionId) -> Self {
+        self.execution_id = Some(execution_id);
         self
     }
 
@@ -870,7 +901,7 @@ impl WorkflowReplayer {
     /// early with `WorkflowFailed` before that line.
     pub async fn replay_from_events(&self, events: Vec<WorkflowEvent>) -> ReplayReport {
         if self.handlers.len() != 1 {
-            let exec_id = ExecutionId::new();
+            let exec_id = self.execution_id.unwrap_or_default();
             let error = if self.handlers.is_empty() {
                 "no workflow handlers registered; call register_fn() before replay_from_events()"
                     .to_string()
@@ -896,11 +927,15 @@ impl WorkflowReplayer {
         // workflow type name — apply it to the replayed context via
         // `.with_workflow_name(...)` so `ctx.info().workflow_type` is the real
         // name, not "". A raw-events fixture carries no `workflow_id`, so fall back
-        // to the replayer's global (`with_workflow_id`).
+        // to the replayer's global (`with_workflow_id`). The raw-events path
+        // likewise carries no `execution_id`, so use the replayer's global
+        // (`with_execution_id`) when set — otherwise mint a fresh id (pre-#698
+        // behaviour), which false-flags only a workflow that recorded its own
+        // `ctx.info().execution_id` in a command-affecting value.
         let (name, &handler) = self.handlers.iter().next().unwrap();
         let workflow_name = name.clone();
         let workflow_id = self.workflow_id.clone();
-        let exec_id = ExecutionId::new();
+        let exec_id = self.execution_id.unwrap_or_default();
         let events = match self.maybe_inflate(events).await {
             Ok(e) => e,
             Err(error) => {
@@ -2486,6 +2521,10 @@ async fn replay_fixture_file(
         // Issue #698: same as parent — the directory-fixture path relies on the
         // snapshot's own `workflow_id`; no global override.
         workflow_id: None,
+        // Issue #698: the directory-fixture path routes through
+        // `replay_from_snapshot`, which always sources `execution_id` from the
+        // snapshot (a required field); no raw-events global override applies.
+        execution_id: None,
     };
 
     let replay_result =

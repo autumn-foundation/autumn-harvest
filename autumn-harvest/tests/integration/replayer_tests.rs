@@ -7337,3 +7337,110 @@ async fn workflow_id_is_applied_from_replayer_global_on_raw_events_path() {
          context, got: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (issue #698, Codex P2 @ testing.rs:903) execution_id must be threadable into
+//   the raw `replay_from_events` path. `ctx.info().execution_id` is documented
+//   as replay-safe (the production / DB / snapshot / canary replay paths all
+//   recover the real id), but a raw-events fixture carries no HistorySnapshot to
+//   source it from, so `replay_from_events` mints a FRESH id. A workflow that
+//   recorded its own `ctx.info().execution_id` in a command-affecting value
+//   (here, an activity INPUT — which the docs promise is replay-safe) then
+//   false-reports non-determinism: the random replay id vs the recorded original
+//   run id. `WorkflowReplayer::with_execution_id` closes that last raw-path gap.
+// ---------------------------------------------------------------------------
+
+/// A workflow that embeds its own `ctx.info().execution_id` into the input of a
+/// single activity. Under STRICT replay the emitted input is compared
+/// byte-for-byte against the recorded `ActivityScheduled.input`, so a replay that
+/// computed a DIFFERENT `execution_id` diverges — the strongest, most direct
+/// assertion that the raw-path context reports the supplied id.
+fn exec_id_into_activity_input<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let info = ctx.info();
+        let payload = serde_json::json!({ "execution_id": info.execution_id.to_string() });
+        let out = ctx
+            .execute_activity_raw("record_exec_id", payload, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// History recorded by a live run of `exec_id_into_activity_input`: the
+/// `record_exec_id` activity input carries the REAL `execution_id` the live
+/// context observed.
+fn exec_id_taken_history(exec_id: ExecutionId) -> Vec<WorkflowEvent> {
+    let act_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "record_exec_id".into(),
+            input: serde_json::json!({ "execution_id": exec_id.to_string() }),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!("ok"),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!("ok"),
+        },
+    ]
+}
+
+/// (i) THE MONEY TEST for the raw-events `execution_id` gap: with the captured run
+/// id supplied via `with_execution_id`, the replayed activity input matches the
+/// recorded one → `ReplaySucceeded`. Pre-fix `replay_from_events` minted a fresh
+/// random id and this diverged.
+#[tokio::test]
+async fn execution_id_is_applied_from_replayer_global_on_raw_events_path() {
+    let exec_id = ExecutionId::new();
+    let events = exec_id_taken_history(exec_id);
+
+    let report = WorkflowReplayer::new()
+        .register_fn("exec_id_wf", exec_id_into_activity_input)
+        .with_execution_id(exec_id)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "with_execution_id must thread the captured run id into the raw-events \
+         replay context, got: {report}"
+    );
+}
+
+/// (j) The load-bearing negative control for (i): WITHOUT `with_execution_id`,
+/// `replay_from_events` mints a fresh random id, so the replayed activity input
+/// carries a DIFFERENT `execution_id` than the recorded one → divergence. This is
+/// exactly the false non-determinism the builder closes.
+#[tokio::test]
+async fn execution_id_diverges_on_raw_events_path_without_the_builder() {
+    let exec_id = ExecutionId::new();
+    let events = exec_id_taken_history(exec_id);
+
+    let report = WorkflowReplayer::new()
+        .register_fn("exec_id_wf", exec_id_into_activity_input)
+        // Deliberately DO NOT call with_execution_id — a fresh random id is minted.
+        .replay_from_events(events)
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {}
+        other => panic!(
+            "without a threaded execution_id the raw-events replay mints a fresh id \
+             and must diverge from the recorded one; got: {other:?}\nreport: {report}"
+        ),
+    }
+}
