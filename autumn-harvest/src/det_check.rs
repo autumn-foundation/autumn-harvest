@@ -956,16 +956,25 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         report.merge(check_body(&scope, &view));
 
         // Names locally bound in the workflow — parameters (fn-pointer /
-        // closure params) plus body `let` bindings (closures, shadows) — are
+        // closure params), body `let` bindings (closures, shadows), and
+        // body-local `use` imports (incl. an unnameable glob) — are
         // shadow-suppressed so a call to one is never resolved to a same-named
         // free helper (#778 review, zero-FP; #386 excludes fn pointers/closures).
-        // Suppression is **source-order-aware**: a `let` shadow only suppresses
-        // a call that comes AFTER it (a call before the binding resolves to the
-        // free helper, matching Rust); params bind for the whole body (#778,
-        // Codex P2).
+        // Suppression is **source-order-aware**: a `let`/`use` shadow only
+        // suppresses a call that comes AFTER it (a call before the binding
+        // resolves to the free helper, matching Rust); params bind for the whole
+        // body (#778, Codex P2/r6).
         let params: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
         let let_binding_lines = collect_body_let_binding_lines(&view);
-        for callee in collect_direct_free_fn_calls(&view, &index, &params, &let_binding_lines) {
+        let (use_binding_lines, glob_use_line) = collect_body_use_bindings(&view);
+        for callee in collect_direct_free_fn_calls(
+            &view,
+            &index,
+            &params,
+            &let_binding_lines,
+            &use_binding_lines,
+            glob_use_line,
+        ) {
             if let Some(cands) = index.get(callee.as_str())
                 && let Some(idx) = resolve_helper(cands, fns, wf)
             {
@@ -1042,6 +1051,13 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
 /// before any same-name binding resolves to the free helper (matching Rust, and
 /// correct even for `let bad = bad();`, where the RHS call sees the outer fn).
 ///
+/// A **block-local `use` import** rebinds a name inside the body, so it is added
+/// to the shadow set the same source-order way (`use_binding_lines`, plus
+/// `glob_use_line` for an unnameable glob `use ...::*;` that suppresses every
+/// later call) — a call to a name a body-local `use` imports is never resolved
+/// to a same-module free helper (#778, Codex r6; the module/file-level `use` is
+/// not a body line, so the common top-of-file prelude case is unaffected).
+///
 /// The suppression is safe-direction: it only ever suppresses LESS than the old
 /// whole-body set, so it introduces no new false-positive. A shadow bound in an
 /// inner block that has already closed before an outer call is still treated as
@@ -1052,6 +1068,8 @@ fn collect_direct_free_fn_calls(
     candidates: &std::collections::HashMap<&str, Vec<usize>>,
     params: &std::collections::HashSet<String>,
     let_binding_lines: &std::collections::HashMap<String, u32>,
+    use_binding_lines: &std::collections::HashMap<String, u32>,
+    glob_use_line: Option<u32>,
 ) -> std::collections::BTreeSet<String> {
     let mut called = std::collections::BTreeSet::new();
     for &(src_line, line) in body {
@@ -1066,6 +1084,24 @@ fn collect_direct_free_fn_calls(
             let start = i;
             while i < bytes.len() && is_ident_byte(bytes[i]) {
                 i += 1;
+            }
+            // Raw-identifier call: `r#gen(` tokenizes as `r`/`#`/`gen` under the
+            // ident-byte scan (`#` is not an ident byte), so re-attach the `r#`
+            // prefix and the following ident run — a call `r#gen(` then keys on
+            // `r#gen`, matching a `fn r#gen` def (indexed under `r#gen`, Codex r4)
+            // and completing raw-ident support on the CALL side (#778, Codex r6).
+            // `start` still points at `r`, so the `.`/`:` before-guard below keeps
+            // excluding `x.r#m()` / `Type::r#a()`, and the turbofish skip still
+            // applies (`r#gen::<T>()`).
+            if &code[start..i] == "r"
+                && i + 1 < bytes.len()
+                && bytes[i] == b'#'
+                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+            {
+                i += 1; // consume `#`
+                while i < bytes.len() && is_ident_byte(bytes[i]) {
+                    i += 1;
+                }
             }
             let token = &code[start..i];
             // Must start with a letter or `_` (not a number literal).
@@ -1090,11 +1126,18 @@ fn collect_direct_free_fn_calls(
             };
             let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
             // Shadowed in scope at this call site? A param shadows everywhere; a
-            // `let` binding shadows only calls on a strictly-later source line.
+            // `let` binding, a block-local `use` import, and a block-local glob
+            // `use ...::*;` each shadow only calls on a strictly-later source line
+            // (source-order, matching round 3 — a `use` shadows calls that appear
+            // AFTER it in the body; #778, Codex r6).
             let shadowed_here = params.contains(token)
                 || let_binding_lines
                     .get(token)
-                    .is_some_and(|&bind_line| bind_line < src_line);
+                    .is_some_and(|&bind_line| bind_line < src_line)
+                || use_binding_lines
+                    .get(token)
+                    .is_some_and(|&bind_line| bind_line < src_line)
+                || glob_use_line.is_some_and(|g| g < src_line);
             if first_ok && before_ok && after_ok && candidates.contains_key(token) && !shadowed_here
             {
                 called.insert(token.to_string());
@@ -1204,6 +1247,135 @@ fn collect_body_let_binding_lines(body: &[(u32, &str)]) -> std::collections::Has
         }
     }
     lines
+}
+
+/// Collects names bound by **block-local `use` imports** in a workflow body,
+/// each mapped to the EARLIEST source line it is bound on (source-order
+/// suppression, like [`collect_body_let_binding_lines`]), plus the earliest line
+/// carrying a **glob** `use ...::*;`. A glob names no specific binding, so it is
+/// treated conservatively as shadowing every same-module call that comes AFTER
+/// it in the body (safe-direction over-suppression, never a false positive).
+///
+/// A body-local `use crate::x::helper;` rebinds `helper` to a clean import, so
+/// Rust resolves a bare `helper()` call to the import, not a same-module sibling
+/// `fn helper` — the same-module resolver must not walk the sibling (#778,
+/// Codex r6). Only `use` statements INSIDE the body are seen (`extract_fn_body`
+/// captures body lines only), so a module/file-level `use` — including the
+/// common top-of-file prelude glob — is never a body shadow by construction.
+///
+/// Single-line handling only; a multi-line `use` is a safe-direction
+/// under-collection (matching the `let` collector). A `use<'a>` precise-capture
+/// clause (edition 2024 RPIT) is ignored — an import always has whitespace after
+/// the `use` keyword.
+fn collect_body_use_bindings(
+    body: &[(u32, &str)],
+) -> (std::collections::HashMap<String, u32>, Option<u32>) {
+    let mut names: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut glob_line: Option<u32> = None;
+    for &(src_line, line) in body {
+        let code = strip_unparseable_content(line);
+        for pos in word_positions(&code, "use") {
+            let after = &code[pos + 3..];
+            // Require whitespace after `use` (an import is `use <path>`); this
+            // excludes the `use<'a>` precise-capturing bound in RPIT.
+            if !after.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let use_body = after.find(';').map_or(after, |end| &after[..end]);
+            let (bound, is_glob) = parse_use_bindings(use_body);
+            if is_glob {
+                glob_line = Some(glob_line.map_or(src_line, |g| g.min(src_line)));
+            }
+            for id in bound {
+                names
+                    .entry(id)
+                    .and_modify(|l| *l = (*l).min(src_line))
+                    .or_insert(src_line);
+            }
+        }
+    }
+    (names, glob_line)
+}
+
+/// Parses the text of a single `use` statement (everything after `use`, up to
+/// but not including the `;`) into `(bound_names, is_glob)`. Handles the common
+/// forms: `path::name` → binds `name`; `path as alias` / `path::orig as alias`
+/// → binds `alias`; grouped `path::{a, b as c}` → binds `a` and `c`; glob
+/// `path::*` → `is_glob = true` (no nameable binding). A raw-identifier segment
+/// (`r#gen`) keeps its `r#` so it keys on the same string as a `fn r#gen` def
+/// (#778, Codex r6). Conservative on anything it cannot confidently parse
+/// (nested group, unnameable item) → `is_glob = true`, i.e. over-suppress
+/// (safe-direction, never a false positive).
+fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
+    let s = use_body.trim();
+    if s.is_empty() {
+        return (Vec::new(), false);
+    }
+    // Grouped import: `path::{a, b as c}`.
+    if let Some(open) = s.find('{') {
+        let Some(close) = s.rfind('}') else {
+            return (Vec::new(), true); // malformed / multi-line group → conservative
+        };
+        let inner = &s[open + 1..close];
+        // A nested group is beyond this simple parser — over-suppress.
+        if inner.contains('{') {
+            return (Vec::new(), true);
+        }
+        let mut names = Vec::new();
+        let mut glob = false;
+        for item in inner.split(',') {
+            let item = item.trim();
+            if item.is_empty() || item == "self" {
+                continue;
+            }
+            if item == "*" || item.ends_with("::*") {
+                glob = true;
+                continue;
+            }
+            match parse_use_single(item) {
+                Some(name) => names.push(name),
+                None => glob = true, // couldn't name it → conservative
+            }
+        }
+        return (names, glob);
+    }
+    // Glob: `path::*` or bare `*`.
+    if s == "*" || s.ends_with("::*") {
+        return (Vec::new(), true);
+    }
+    // Simple or aliased single import.
+    parse_use_single(s).map_or_else(|| (Vec::new(), false), |name| (vec![name], false))
+}
+
+/// Extracts the bound name of a single (non-grouped, non-glob) `use` item: the
+/// alias after `as`, else the last `::`-separated path segment. Retains an `r#`
+/// raw-identifier prefix (#778, Codex r6). Returns `None` if no valid identifier
+/// is found (e.g. an `as _` throwaway).
+fn parse_use_single(item: &str) -> Option<String> {
+    let item = item.trim();
+    let seg = item.rfind(" as ").map_or_else(
+        || item.rsplit("::").next().unwrap_or(item).trim(),
+        |idx| item[idx + 4..].trim(),
+    );
+    extract_use_ident(seg)
+}
+
+/// Reads a leading (optionally raw `r#`-prefixed) identifier from a `use`
+/// segment, retaining the `r#` so it keys on the same string as a `fn r#name`
+/// def (#778, Codex r6). Returns `None` for an empty ident or the `_` wildcard
+/// binding (`use path as _;` binds no nameable local).
+fn extract_use_ident(seg: &str) -> Option<String> {
+    let seg = seg.trim();
+    let raw = seg.starts_with("r#");
+    let rest = if raw { &seg[2..] } else { seg };
+    let ident: String = rest.chars().take_while(|&c| is_ident_char(c)).collect();
+    if ident.is_empty() || ident == "_" {
+        None
+    } else if raw {
+        Some(format!("r#{ident}"))
+    } else {
+        Some(ident)
+    }
 }
 
 /// Removes duplicate findings, keeping one per

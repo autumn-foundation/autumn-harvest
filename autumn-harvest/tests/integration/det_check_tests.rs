@@ -3162,3 +3162,237 @@ async fn r#gen(ctx: &WorkflowContext) -> Result<(), String> {
         });
     assert_eq!(finding.workflow_name.as_deref(), Some("r#gen"));
 }
+
+// ── FIX E (issue #778, Codex r6): block-local `use` imports shadow a same-module
+// helper. Even under same-module-only resolution, a `use` INSIDE the workflow
+// body rebinds a name to an import; Rust resolves the bare call to that import,
+// so the same-module resolver must not walk a sibling helper of the same name.
+// The old code false-positived on this innocent (clean) code and exits 1 in CI.
+
+#[test]
+fn block_local_use_import_shadows_same_module_helper() {
+    // Codex's exact repro: a body-local `use crate::pure::helper;` shadows the
+    // same-module `fn helper`; `helper()` resolves to the clean import → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::helper;
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local `use crate::pure::helper;` shadows the same-module `helper`; \
+         Rust resolves the call to the clean import, so no DET001 FP, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_local_use_alias_shadows_same_module_helper() {
+    // `use path::orig as helper;` rebinds `helper` to a clean import → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::real as helper;
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local `use ... as helper;` alias shadows the same-module `helper`, got: {report:?}"
+    );
+}
+
+#[test]
+fn block_local_use_group_shadows_same_module_helper() {
+    // Grouped `use path::{helper, other}` binds `helper` (and `other`) → NO DET001.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::{helper, other as _};
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a block-local grouped `use path::{{helper, ..}}` shadows the same-module `helper`, got: {report:?}"
+    );
+}
+
+#[test]
+fn same_module_call_without_block_local_use_is_still_resolved() {
+    // REGRESSION guard (FIX E must not over-suppress): a genuine same-module call
+    // with NO block-local `use helper` must still resolve and flag (r5 must survive).
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a genuine same-module helper call with NO block-local `use` must still \
+                 be flagged (r5 same-module resolution preserved), got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn module_level_use_is_not_treated_as_a_body_shadow() {
+    // A module/file-level `use ...::*;` / `use path;` (OUTSIDE the fn body) must
+    // NOT suppress an unrelated same-module call — only body-local `use` shadows.
+    // The common top-of-file prelude-glob case is unaffected by construction.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    use std::collections::*;
+    use std::fmt::Debug;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!(
+                "a module/file-level `use ...::*;`/`use path;` (outside the fn body) must \
+                 NOT suppress a same-module helper call, got: {report:?}"
+            )
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("helper"));
+}
+
+#[test]
+fn block_local_glob_use_conservatively_suppresses_later_same_module_calls() {
+    // A body-local glob `use crate::pure::*;` names no specific binding, so it is
+    // conservatively treated as shadowing every same-module call AFTER it in the
+    // body (safe-direction over-suppression, never a false positive).
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        use crate::pure::*;
+        let _ = helper();
+        Ok(())
+    }
+    fn helper() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a body-local glob `use crate::pure::*;` conservatively suppresses a later \
+         same-module call (safe-direction), got: {report:?}"
+    );
+}
+
+// ── FIX F (issue #778, Codex r6): recognize raw identifiers in the CALL tokenizer.
+// Round 4 indexed a `fn r#gen` def under the key `r#gen`, but the call tokenizer
+// split `r#gen()` into `r`/`gen`, so the call never matched the def → a reachable
+// hard blocker in a raw-ident helper was silently missed (false negative).
+
+#[test]
+fn raw_ident_helper_call_is_resolved_and_flagged() {
+    // A same-module `fn r#gen()` reading the clock, called via `r#gen()`, must be
+    // resolved (one hop) and flagged DET001 — completing raw-ident support on the
+    // call side. RED before FIX F: `r#gen(` tokenized as `r`/`gen`, no match.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
+        let _ = r#gen();
+        Ok(())
+    }
+    fn r#gen() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "DET001")
+        .unwrap_or_else(|| {
+            panic!("a raw-identifier `r#gen()` helper call must be resolved and flagged, got: {report:?}")
+        });
+    assert_eq!(finding.via_helper.as_deref(), Some("r#gen"));
+    assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
+}
+
+#[test]
+fn raw_ident_method_call_is_not_resolved() {
+    // NEGATIVE: a raw-identifier METHOD call `x.r#gen()` must NOT be resolved to
+    // the free helper `r#gen` — the `.`/`:` before-guard still applies after the
+    // tokenizer re-attaches the `r#` prefix.
+    let src = "\
+mod m {
+    use autumn_harvest::prelude::*;
+    #[workflow]
+    pub async fn wf(ctx: &WorkflowContext, x: Thing) -> Result<(), String> {
+        let _ = x.r#gen();
+        Ok(())
+    }
+    fn r#gen() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+";
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "a raw-identifier METHOD call `x.r#gen()` must NOT be resolved to the free \
+         helper `r#gen` (the `.` before-guard still applies), got: {report:?}"
+    );
+}
