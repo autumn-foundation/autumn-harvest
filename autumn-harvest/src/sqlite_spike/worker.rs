@@ -6,6 +6,15 @@
 //! and fires every due timer, appending the resulting terminal
 //! [`WorkflowEvent`]s to the canonical history.
 //!
+//! **Atomic post-body persistence.** The activity body runs *outside* any
+//! transaction (a `SQLite` write lock cannot be held across arbitrary user
+//! work), but everything *after* it — the attempt audit row plus the terminal
+//! `ActivityCompleted`/`ActivityFailed` event and the task-state flip, or the
+//! retry requeue — commits in a **single** transaction, mirroring the PG
+//! engine's `finalize_activity_*` / `requeue_for_retry` transactions. So the
+//! task can never be left in a half-state (terminal event appended but task
+//! still `RUNNING`); the one residual window is a crash *mid-body* (§5.1).
+//!
 //! **Retry model (a genuine spike finding).** A *retryable* activity failure is
 //! recorded in the [`spike_activity_attempts`](super::schema) audit table and the
 //! task-queue row's `attempt` counter — it is **not** appended to the replayable
@@ -50,33 +59,49 @@ pub(super) fn drain_ready(
             .get(&task.name)
             .ok_or_else(|| SpikeError::unregistered(&task.name))?;
 
+        // Run the body OUTSIDE any transaction: a `SQLite` write lock cannot be
+        // held across arbitrary user work, and the PG engine does not hold one
+        // across the activity body either — the atomic unit is (run body) THEN
+        // (persist the result), not (body + result) together.
         let result = (spec.body)(task.input.clone());
         let attempt_num = task.attempt + 1;
-        store::record_attempt(conn, exec_id, &task.name, attempt_num, &result)?;
+
+        // Persist everything AFTER the body — the attempt audit row plus the
+        // terminal event + task-state flip (success/exhausted), or the retry
+        // requeue — in ONE transaction, mirroring the PG engine's
+        // `finalize_activity_*` / `requeue_for_retry` transactions. A crash
+        // before this commits rolls the whole post-body persistence back, so the
+        // task is never left in the half-state "terminal event appended but task
+        // still RUNNING" (nor "attempt recorded but no requeue"). The one
+        // residual window — a crash *while the body is mid-execution* — leaves
+        // the task RUNNING and un-reclaimed; a single-process spike has no
+        // heartbeat-timeout/poison-pill reclaimer to recover it (§5.1).
+        let tx = conn.transaction()?;
+        store::record_attempt(&tx, exec_id, &task.name, attempt_num, &result)?;
 
         match result {
             Ok(output) => {
                 store::append_event(
-                    conn,
+                    &tx,
                     exec_id,
                     &WorkflowEvent::ActivityCompleted {
                         activity_id: task.activity_id,
                         output,
                     },
                 )?;
-                queue::finish_task(conn, &task.task_id)?;
+                queue::finish_task(&tx, &task.task_id)?;
                 produced = true;
             }
             Err(error) => {
                 if attempt_num < spec.max_attempts {
                     // Retryable: bump the attempt counter and requeue. NOT
                     // recorded in the replayable event log (see module docs).
-                    queue::requeue_task(conn, &task.task_id, attempt_num, now)?;
+                    queue::requeue_task(&tx, &task.task_id, attempt_num, now)?;
                 } else {
                     // Exhausted: the terminal failure is the workflow-visible
                     // outcome, so it goes into the event log.
                     store::append_event(
-                        conn,
+                        &tx,
                         exec_id,
                         &WorkflowEvent::ActivityFailed {
                             activity_id: task.activity_id,
@@ -87,11 +112,12 @@ pub(super) fn drain_ready(
                             details: None,
                         },
                     )?;
-                    queue::finish_task(conn, &task.task_id)?;
+                    queue::finish_task(&tx, &task.task_id)?;
                     produced = true;
                 }
             }
         }
+        tx.commit()?;
     }
 
     // Fire due timers.

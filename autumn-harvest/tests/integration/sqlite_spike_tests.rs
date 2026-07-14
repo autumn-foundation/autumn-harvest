@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest::prelude::*;
-use autumn_harvest::sqlite_spike::{ActivitySpec, RunState, SqliteRuntime};
+use autumn_harvest::sqlite_spike::{ActivitySpec, RunState, SpikeError, SqliteRuntime};
 use serde_json::json;
 
 // ── Test workflows (real `#[workflow]` fns — the reused determinism core) ──
@@ -44,6 +44,23 @@ async fn wait_then_echo(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Va
     Ok(payload)
 }
 
+/// Concurrently schedule an activity AND spawn a child workflow. The pure
+/// `run_workflow` executor collects BOTH commands into one suspension batch
+/// (`[ScheduleActivity, StartChildWorkflow]`, in `join!` poll order). The spike
+/// supports `ScheduleActivity` but not `StartChildWorkflow`, so `apply_commands`
+/// appends the activity's event + task row, then hits the unsupported child
+/// command and rolls the whole transaction back. Used by the atomicity-rollback
+/// regression test.
+#[workflow]
+async fn activity_then_child(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let (a, _c) = tokio::join!(
+        ctx.execute_activity_raw("work", json!(n), "default"),
+        ctx.spawn_child_workflow_raw("child", json!(n)),
+    );
+    let out = a.map_err(|e| e.to_string())?;
+    Ok(out.as_i64().ok_or("bad activity output")? * 2)
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, String) {
@@ -59,6 +76,46 @@ fn temp_db() -> (tempfile::TempDir, String) {
 
 fn count_events(events: &[WorkflowEvent], pred: impl Fn(&WorkflowEvent) -> bool) -> usize {
     events.iter().filter(|e| pred(e)).count()
+}
+
+/// Cross-table invariant: every `TimerStarted` event in the durable history has
+/// a matching armed (unfired) `spike_timers` row — the atomic append+arm never
+/// commits one without the other.
+fn assert_timers_match_events(rt: &SqliteRuntime, exec: ExecutionId) {
+    let events = rt.load_history(exec).unwrap();
+    let armed: std::collections::HashSet<String> =
+        rt.armed_timer_ids(exec).unwrap().into_iter().collect();
+    let started = count_events(&events, |e| matches!(e, WorkflowEvent::TimerStarted { .. }));
+    for e in &events {
+        if let WorkflowEvent::TimerStarted { timer_id, .. } = e {
+            assert!(
+                armed.contains(&timer_id.to_string()),
+                "TimerStarted {timer_id:?} has no matching armed spike_timers row"
+            );
+        }
+    }
+    assert_eq!(
+        armed.len(),
+        started,
+        "every armed timer row corresponds to a TimerStarted event and vice versa"
+    );
+}
+
+/// Cross-table invariant: every `ActivityScheduled` event in the durable history
+/// has a matching `spike_tasks` row — the atomic append+enqueue never commits
+/// one without the other.
+fn assert_activities_match_events(rt: &SqliteRuntime, exec: ExecutionId) {
+    let events = rt.load_history(exec).unwrap();
+    let queued: std::collections::HashSet<String> =
+        rt.queued_activity_ids(exec).unwrap().into_iter().collect();
+    for e in &events {
+        if let WorkflowEvent::ActivityScheduled { activity_id, .. } = e {
+            assert!(
+                queued.contains(&activity_id.to_string()),
+                "ActivityScheduled {activity_id:?} has no matching spike_tasks row"
+            );
+        }
+    }
 }
 
 // ── Scenario 1: activity retry (fail once, then succeed) ─────────────────────
@@ -531,4 +588,105 @@ async fn scenario_pg_shaped_history_replays_on_sqlite() {
         events.last(),
         Some(WorkflowEvent::WorkflowCompleted { .. })
     ));
+}
+
+// ── Codex P1 regression: per-cycle persistence is atomic (event + queue/timer row) ──
+//
+// The prototype persists a decision cycle's derived event AND its paired task /
+// durable-timer row in ONE `SQLite` transaction (`apply_commands`), and a drained
+// activity's terminal event + task-state flip in ONE transaction (`drain_ready`).
+// Before the fix these were separate autocommits: a crash between the event
+// append and the row insert left history saying an activity/timer was scheduled
+// while no queue/timer row existed, wedging the reload path at `SpikeError::Stuck`.
+
+/// Invariant guard (deterministic): across a reload, every scheduled-work event
+/// is observed together with its queue/timer row — never one without the other.
+#[tokio::test]
+async fn scenario_atomic_persist_event_and_row_never_out_of_sync() {
+    // Timer: after arming (blocked on the timer), the `TimerStarted` event and
+    // its `spike_timers` row are BOTH present, and survive a reload together.
+    let (_dir, path) = temp_db();
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&timer_then_done_info());
+        let exec = rt.start_workflow("timer_then_done", json!(0)).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked(exec).await.unwrap(),
+            RunState::WaitingTimer
+        ));
+        assert_timers_match_events(&rt, exec);
+        exec
+    };
+    // Reopen on the same file (== process restart): event and row still agree.
+    let rt = SqliteRuntime::open(&path).unwrap();
+    assert_timers_match_events(&rt, exec);
+
+    // Activity: a completed activity's `ActivityScheduled` event keeps its
+    // `spike_tasks` row across a reload — the append+enqueue committed together.
+    let (_dir2, path2) = temp_db();
+    let exec2 = {
+        let mut rt = SqliteRuntime::open(&path2).unwrap();
+        rt.register_workflow(&single_activity_info());
+        rt.register_activity(
+            "work",
+            ActivitySpec::new(1, |input: serde_json::Value| {
+                Ok(json!(input.as_i64().unwrap() * 10))
+            }),
+        );
+        let exec2 = rt.start_workflow("single_activity", json!(3)).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked(exec2).await.unwrap(),
+            RunState::Completed(_)
+        ));
+        assert_activities_match_events(&rt, exec2);
+        exec2
+    };
+    let rt2 = SqliteRuntime::open(&path2).unwrap();
+    assert_activities_match_events(&rt2, exec2);
+}
+
+/// Both-or-neither proof (fails on the pre-fix per-command-autocommit code): a
+/// batch of `[ScheduleActivity, StartChildWorkflow]` appends+enqueues the
+/// activity, then hits the unsupported child command and returns `Err`, dropping
+/// the uncommitted transaction. The activity's event AND its task row are rolled
+/// back with the failed batch — NEITHER persists. (Under separate autocommits the
+/// `ActivityScheduled` event + task row would have committed before the
+/// unsupported command was reached, so this assertion would fail.)
+#[tokio::test]
+async fn scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&activity_then_child_info());
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, |input: serde_json::Value| {
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+
+    let exec = rt.start_workflow("activity_then_child", json!(5)).unwrap();
+    let err = rt.drive_one_cycle(exec).await.unwrap_err();
+    assert!(
+        matches!(err, SpikeError::Unsupported(ref c) if c == "StartChildWorkflow"),
+        "err = {err:?}"
+    );
+
+    // Atomicity: the `ScheduleActivity` appended+enqueued earlier in the batch was
+    // rolled back with the failed transaction — neither the event nor the row.
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. }
+        )),
+        0,
+        "the scheduled-activity event must roll back with the failed batch"
+    );
+    assert!(
+        rt.queued_activity_ids(exec).unwrap().is_empty(),
+        "the task-queue row must roll back with the failed batch"
+    );
+    // Only the pre-cycle `WorkflowStarted` (its own earlier autocommit) survives.
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], WorkflowEvent::WorkflowStarted { .. }));
 }

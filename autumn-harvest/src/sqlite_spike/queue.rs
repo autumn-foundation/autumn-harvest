@@ -14,6 +14,15 @@
 //! a `busy_timeout`/retry protocol layered on the `BEGIN IMMEDIATE` claim, which
 //! is precisely the complexity the edge/local-first use case is trying to avoid.
 //!
+//! The same single-writer `BEGIN…COMMIT` does double duty: besides substituting
+//! for `SKIP LOCKED`, it gives **atomic multi-row persistence**. A decision
+//! cycle's event append and its paired task/timer row insert
+//! ([`super::SqliteRuntime::apply_commands`]), and a drained activity's terminal
+//! event + task-state flip ([`super::worker::drain_ready`]), each commit in one
+//! transaction — so a crash never leaves an event without its row, matching the
+//! Postgres engine, which persists an event and its task-queue row in a single
+//! transaction.
+//!
 //! # Polling replaces `LISTEN`/`NOTIFY`
 //!
 //! The Postgres backend wakes idle workers with `LISTEN`/`NOTIFY`. `SQLite` has no
@@ -215,6 +224,44 @@ pub(super) fn mark_timer_fired(
         params![exec_id.to_string(), timer_id],
     )?;
     Ok(())
+}
+
+// ── Introspection (tests) ──────────────────────────────────────────────────────
+
+/// The `activity_id`s of every task-queue row (any state) for `exec_id`, in FIFO
+/// order. Exposed so the spike's tests can assert the per-cycle append+enqueue
+/// atomicity: an `ActivityScheduled` event and its `spike_tasks` row are always
+/// observed together (both committed, or — on a rolled-back batch — neither).
+pub(super) fn all_task_activity_ids(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> Result<Vec<String>, SpikeError> {
+    let mut stmt =
+        conn.prepare("SELECT activity_id FROM spike_tasks WHERE exec_id = ?1 ORDER BY seq")?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// The `timer_id`s of every armed (unfired) durable timer for `exec_id`. The
+/// timer half of the append+arm atomicity invariant: every `TimerStarted` event
+/// has a matching `spike_timers` row.
+pub(super) fn armed_timer_ids(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> Result<Vec<String>, SpikeError> {
+    let mut stmt = conn.prepare(
+        "SELECT timer_id FROM spike_timers WHERE exec_id = ?1 AND fired = 0 ORDER BY fire_at",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 /// `.optional()` for a `query_row` that maps into a `Result<T, SpikeError>`.

@@ -43,7 +43,7 @@ sources.
 
 | Dimension | autumn-harvest | Temporal | DBOS | Inngest | Hatchet | Restate |
 |---|---|---|---|---|---|---|
-| **Backing store** | Postgres only ([sharding](sharding.md)) | DB + Visibility store | Postgres only | Postgres + Redis | Postgres (+ opt. RabbitMQ) | Embedded (RocksDB) |
+| **Backing store** | Postgres only ([sharding](sharding.md)) | DB + Visibility store | SQLite (default) / Postgres | Postgres + Redis | Postgres (+ opt. RabbitMQ) | Embedded (RocksDB) |
 | **Self-host shape** | Embed in app / standalone runner | Server cluster + DB(s) | Library in app | Server binary + PG/Redis | Engine + Postgres | Single binary |
 | **SDK languages** | Rust only ([planned](https://github.com/madmax983/autumn-harvest/issues/955): TS/Py) | 7 SDKs | Py/TS/Go/Java | TS/Py/Go | Py/TS/Go(/Ruby) | TS/Java/Kotlin/Py/Go/Rust |
 | **Model** | Code-first + DAG ([#256](https://github.com/madmax983/autumn-harvest/issues/256)) | Imperative WF+Activity | Decorated WF+steps | Event/step functions | Queue/DAG/durable | Services/Objects/WF |
@@ -66,7 +66,7 @@ sourcing doc and flag anything unverified.
 |---|---|
 | **autumn-harvest** | **Postgres only.** No broker, no message queue, no separate server cluster — the task queue is `SELECT … FOR UPDATE SKIP LOCKED` and dispatch wakeups are Postgres LISTEN/NOTIFY (`notify.rs`). Runs as a companion to the [Autumn](https://github.com/madmax983/autumn) web framework or standalone via `HarvestRunner`. Optional [sharding](sharding.md) spreads state across N independent Postgres databases. |
 | Temporal | A persistence DB (Cassandra / MySQL / PostgreSQL) **plus** a separate Visibility store (Elasticsearch recommended for production; Cassandra can't back Visibility). ([docs](https://docs.temporal.io/temporal-service/persistence), [Visibility](https://docs.temporal.io/self-hosted-guide/visibility)) |
-| DBOS | PostgreSQL only; durable queues and step checkpoints live in Postgres, no separate broker. ([docs](https://docs.dbos.dev/architecture)) |
+| DBOS | A **system database** stores workflow/step state, with **SQLite as the default** (zero-config, "excellent for prototyping and testing") or **Postgres**; no separate broker. DBOS recommends Postgres "for production" because a SQLite file "can't be used in a distributed setting where an application runs on multiple servers." ([architecture](https://docs.dbos.dev/architecture), [system database](https://docs.dbos.dev/python/tutorials/database-connection)) |
 | Inngest | Server needs external **Postgres + Redis** for production (SQLite + in-memory Redis in dev mode). ([docs](https://www.inngest.com/docs/self-hosting)) |
 | Hatchet | **PostgreSQL** as the durability layer; a single Postgres DB suffices, with **RabbitMQ** optional for high-throughput inter-service messaging. ([docs](https://docs.hatchet.run/home/architecture)) |
 | Restate | **Single self-contained binary** with embedded RocksDB-based storage — no external database required. ([docs](https://docs.restate.dev/foundations/key-concepts)) |
@@ -77,7 +77,7 @@ sourcing doc and flag anything unverified.
 |---|---|
 | **autumn-harvest** | Embed `HarvestPlugin` in your Autumn app (or run standalone `HarvestRunner`) + point at a Postgres URL + run `diesel migration run`. No separate orchestrator cluster. Separate web/worker connection pools with a shared ceiling (`pool.rs`) keep worker bursts from starving HTTP handling; optional [sharding](sharding.md) is additive. |
 | Temporal | Separate server cluster of multiple services (Frontend, History, Matching, Worker) plus external DB(s); not a single production binary. Helm charts / docker-compose provided; your Workers are separate processes. ([docs](https://docs.temporal.io/self-hosted-guide/deployment)) |
-| DBOS | Lightweight — a **library embedded in your app process** + Postgres, "no additional infrastructure required." Optional Conductor control plane for recovery/visualization/HA. ([docs](https://docs.dbos.dev/architecture)) |
+| DBOS | Lightweight — a **library embedded in your app process** + its system database (**SQLite by default**, or Postgres for production), "no additional infrastructure required." Optional Conductor control plane for recovery/visualization/HA. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Single `inngest` server binary/container + external Postgres/Redis for production (Helm chart available); your functions are HTTP handlers the engine calls. Self-hosting is comparatively new (GA'd ~2025). ([docs](https://www.inngest.com/docs/self-hosting)) |
 | Hatchet | A Hatchet engine/API server + Postgres (+ optional RabbitMQ); workers connect over gRPC. Documented as "particularly easy to self-host." ([docs](https://docs.hatchet.run/home/architecture)) |
 | Restate | Single-binary server via Homebrew/npm/Docker with embedded storage — **no external database or broker**. Your **service handlers still deploy and scale separately** (containers / serverless / VMs / k8s), which the server sits in front of and invokes over HTTP — as with any code-first engine. ([docs](https://docs.restate.dev/foundations/key-concepts)) |
@@ -201,9 +201,11 @@ carrying its `ShardId` so any caller routes to the owning shard in O(1) — no
 directory service. Separate web/worker connection pools with a shared ceiling
 (`pool.rs`) keep a worker burst from starving HTTP request handling in the same
 process. For a team that already operates Postgres, the marginal operational
-footprint of adding durable execution is close to zero. DBOS shares this
-Postgres-only philosophy (and is the closest positioning to harvest here); the
-difference is language and embedding, covered below.
+footprint of adding durable execution is close to zero. DBOS is the closest
+positioning to harvest's embed-in-your-app shape here — the difference is
+language and embedding, covered below — though DBOS's system database **defaults
+to embedded SQLite** (Postgres recommended for production / multi-server),
+whereas harvest is Postgres-only.
 
 ### 2. Determinism safety in depth — caught before, and after, deploy
 
@@ -315,12 +317,13 @@ large-scale deployments, or the largest hiring pool and ecosystem in the durable
 execution market. Temporal is the safe institutional default; harvest trades that
 breadth for a single-Postgres footprint and a Rust-native, embedded model.
 
-**Choose DBOS if** you want harvest's lightweight Postgres-only, embed-in-your-app
-shape but need it in **TypeScript, Python, Go, or Java** rather than Rust, or you
-want a managed control plane (DBOS Cloud + Conductor) with a time-travel debugger.
-DBOS is the closest positioning to harvest; language and the checkpoint/resume
-recovery model (vs harvest's command-comparison replay + guardrail tooling) are
-the main axes to weigh.
+**Choose DBOS if** you want harvest's lightweight, embed-in-your-app shape but
+need it in **TypeScript, Python, Go, or Java** rather than Rust, or you want a
+managed control plane (DBOS Cloud + Conductor) with a time-travel debugger. DBOS
+is the closest positioning to harvest; its system database **defaults to embedded
+SQLite** (Postgres for production/multi-server), where harvest is Postgres-only.
+Language and the checkpoint/resume recovery model (vs harvest's command-comparison
+replay + guardrail tooling) are the other main axes to weigh.
 
 **Choose Inngest if** your problem is event-first — functions triggered by events,
 webhooks, and crons, split into memoized steps — and you want TypeScript / Python /

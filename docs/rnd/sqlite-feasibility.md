@@ -63,10 +63,19 @@ software, single-binary self-hosted deployments, and test/dev ergonomics
 (no container to stand up). Embedded SQLite is the natural substrate — a file,
 no server, no ops.
 
-The prior-art gap (§11) confirms this category is real and mostly unserved:
-Restate ships a single-binary embedded log; DBOS is the closest philosophical
-match but is still Postgres-only; Temporal, Hatchet, Inngest, and Oban are all
-server-backed with no embedded story.
+The prior-art scan (§11) confirms this category is real and **actively being
+explored** — an embedded/local-first durable engine is no longer speculative.
+DBOS — an in-process durable-execution *library*, the closest architectural
+precedent to Harvest's plugin model — ships **SQLite as its default** system
+database for local/single-server use; Oban (Elixir) ships a built-in SQLite
+engine (`Oban.Engines.Lite`); Restate ships a single self-contained binary with
+no external database; even Temporal's dev server runs on embedded SQLite. Harvest
+would **join** this group, not pioneer it — the narrower gap it fills is a Rust,
+deterministic-replay durable engine on embedded SQLite with a clean Postgres-hub
+handoff story (§8). Crucially, DBOS's own guidance that its SQLite path "can't be
+used in a distributed setting where an application runs on multiple servers"
+independently corroborates this spike's central finding: a SQLite Harvest backend
+is inherently single-writer / single-server.
 
 ### Scope & framing (read this before §9)
 
@@ -248,24 +257,48 @@ modelled by dropping the runtime + its SQLite connection and reopening on the
 same file — deterministic replay reproduces the identical command stream, so no
 activity is re-executed.
 
-**Durability-scope limitation (honest bound on that crash model).** The scenarios
-model only a *clean, between-cycle* crash. Activity execution inside `drain_ready`
-spans several separate autocommits — run the body → `record_attempt` → append the
-terminal `ActivityCompleted`/`ActivityFailed` event → `finish_task` — with **no
-enclosing transaction** wrapping the body run and its terminal-event append. A
-crash *between* body execution and the terminal-event append therefore leaves the
-task row `RUNNING` and the workflow blocked (the reload path's
-`claim_next_ready_task` only claims `PENDING` rows, and `classify_block` now
-surfaces this stranded state honestly as [`SpikeError::Stuck`] rather than
-mislabelling it a timer wait). This mid-drain crash window is **outside the
-spike's stated single-writer / no-crash-mid-transaction scope**; a productized
-edge runtime would wrap the body-run-through-terminal-append in one transaction
-(or make the body idempotent and reclaim orphaned `RUNNING` rows on restart).
+**Persistence model — atomic per-cycle, with one honest residual window.** The
+per-decision-cycle persistence is **transactional**. The single-writer
+`BEGIN…COMMIT` is doing double duty: besides substituting for `SKIP LOCKED` (one
+writer, no claim race), it gives **atomic multi-row persistence**, mirroring the
+Postgres engine, which persists an event and its task-queue row in one
+transaction. Two windows a naive per-command-autocommit implementation would
+leave open are therefore **closed**:
+
+- *Append-before-enqueue* (the apply side, `apply_commands`). A decision cycle's
+  derived event and its paired task/timer row commit in **one** transaction, so a
+  crash can never leave history saying an activity/timer is scheduled while its
+  `spike_tasks`/`spike_timers` row is missing. (Before the fix this stranded the
+  reload at `SpikeError::Stuck`: replay re-derived a `WaitForActivity` whose wait
+  branch enqueued nothing.)
+- *Result-before-finish* (the drain side, `drain_ready`). A drained activity's
+  terminal `ActivityCompleted`/`ActivityFailed` event and its task-state flip
+  (plus the attempt audit row), or the retry requeue, commit in **one**
+  transaction, so the task is never left "terminal event appended but row still
+  `RUNNING`," and a retry is never half-recorded.
+
+The **one residual window** is a crash *while the activity body itself is
+mid-execution* — after the task is claimed `RUNNING` but before the post-body
+transaction commits. The body is run *outside* any transaction deliberately: a
+`SQLite` write lock cannot be held across arbitrary user work, and the PG engine
+does not hold one across the activity body either. Such a crash leaves the task
+`RUNNING` and un-reclaimed (the reload path's `claim_next_ready_task` only claims
+`PENDING` rows; `classify_block` surfaces this honestly as [`SpikeError::Stuck`]
+rather than mislabelling it a timer wait). This is inherent to a *single-process*
+spike, which has no other worker and so no heartbeat-timeout or poison-pill
+reclaimer. A productized edge runtime would recover it exactly as the Postgres
+engine already does — the heartbeat-timeout scanner (`timeout.rs`) + poison-pill
+reclaim (`poison_pill.rs`) — which is out of a single-process spike's scope. The
+prototype's atomicity is asserted directly by two tests
+(`scenario_atomic_persist_event_and_row_never_out_of_sync` — the event/row
+invariant survives a reload; and
+`scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` — a
+batch that fails partway rolls back *both* the event and its row).
 
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **7 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **9 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -277,6 +310,8 @@ sqlite-spike,testing --test integration sqlite_spike` → **7 passed; 0 failed**
 | `scenario_cross_backend_replay` | A history *written by the SQLite prototype* replays cleanly on the engine's own (`testing`) `WorkflowReplayer` path, because both backends serialize the **same** `WorkflowEvent` via `serde_json`; and a terminal-stripped history drives the prototype's own reload path to the identical outcome with no duplicate activity execution. |
 | `scenario_cross_backend_replay_retry_history` | **(executed, both-directions closure)** A *retry-bearing* history — produced by driving the fail-once-then-succeed scenario — round-trips through the engine's `WorkflowReplayer` with `ReplaySucceeded`. Closes the §5.3 gap that the original cross-backend test only exercised a success-path, single-attempt history. |
 | `scenario_pg_shaped_history_replays_on_sqlite` | **(executed, "vice versa")** A hand-built, genuinely **PG-shaped** history — `WorkflowStarted → ActivityScheduled → ActivityStarted → ActivityCompleted`, *including* the `ActivityStarted` event the spike itself never writes — is imported into a fresh SQLite runtime and drives the prototype's own reload path: it resumes deterministically to the identical output with the already-completed activity **not** re-executed. Closes the §5.3 gap that no `ActivityStarted`-bearing PG history had actually been pushed through the prototype. |
+| `scenario_atomic_persist_event_and_row_never_out_of_sync` | **(Codex P1 regression)** Across a reload, every `TimerStarted`/`ActivityScheduled` event is observed together with its `spike_timers`/`spike_tasks` row — never one without the other. Guards the cross-table invariant the atomic per-cycle transaction (§5.1) upholds. |
+| `scenario_atomic_persist_rolls_back_the_whole_batch_on_unsupported_command` | **(Codex P1 regression, both-or-neither)** A `[ScheduleActivity, StartChildWorkflow]` batch appends+enqueues the activity, then hits the unsupported child command and returns `Err`, dropping the uncommitted transaction — **neither** the `ActivityScheduled` event **nor** its task row persists. Fails on the pre-fix per-command-autocommit code (where the activity event + row would have committed before the unsupported command was reached). |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 
@@ -554,25 +589,34 @@ This was an explicitly **timeboxed feasibility spike**, and it was run as one:
 
 ## 11. Gap analysis vs. prior art
 
-The competitive landscape confirms the category is real and largely unserved by
-an embedded/local-first durable-workflow engine:
+The competitive landscape confirms the category is real and **actively being
+served** — an embedded/local-first durable engine is no longer speculative:
 
 | Engine | Substrate | Embedded / local-first story |
 |---|---|---|
-| **Temporal** | Cassandra/MySQL/Postgres server + separate service | None. Heavyweight server + workers; no embedded mode. |
-| **DBOS** | Postgres | Closest *philosophy* (durable execution as a library, workflow state in the DB), but **still Postgres-only** — no embedded substrate. |
-| **Inngest** | Managed / dev-server | Dev-server for local iteration only; not an embeddable durable engine. |
+| **DBOS** | **SQLite (default)** or Postgres | **Closest precedent — an in-process durable-execution *library* (like Harvest's plugin) that ships embedded SQLite *by default*.** Recommends Postgres "for production" because a SQLite file "can't be used in a distributed setting where an application runs on multiple servers" — the same single-writer / single-server bound this spike found. (Citation in References; accessed 2026-07-14.) |
+| **Restate** | Single self-contained binary; no external DB | The single binary *is* the durable runtime; your app's SDK connects to it — a **separate server process**, not an in-process library. Strong evidence the "no external database" demand is real; a different form factor from Harvest's (and DBOS's) in-process model. |
+| **Oban** (Elixir) | Postgres, MySQL, **or SQLite** | **Not** Postgres-only — ships a built-in SQLite engine (`Oban.Engines.Lite`) alongside Postgres/MySQL. A job queue, not a replay-based workflow engine, but direct evidence the embedded-SQLite-for-durable-jobs demand is both real and *serviceable*. Its own docs note SQLite "may not be suitable for high-concurrency systems" — again the single-writer bound. |
+| **Temporal** | Cassandra/MySQL/Postgres server + separate service | No *production* embedded mode; the heavyweight server + workers is the product. Its dev server (`temporal server start-dev`, formerly *temporalite*) does run on embedded SQLite, but "for development or testing and not production use." |
 | **Hatchet** | Postgres server | Server-backed; no embedded story. |
-| **Restate** | Single binary, embedded log | **Strongest evidence the category is real** — ships a single-binary durable engine with an embedded log; validates "no external DB" demand directly. |
-| **Oban** | Postgres (Elixir) | Postgres-only; its community has recurring unserved demand for a SQLite/embedded option. |
+| **Inngest** | Managed / dev-server | Dev-server for local iteration only; not an embeddable durable engine. |
 
-**Reading:** DBOS proves the *durable-execution-as-a-library* philosophy has
-traction but stops at Postgres; Restate proves the *single-binary, embedded-log*
-form factor is viable and wanted; Oban's community proves the *SQLite-specifically*
-demand exists and is unmet. Harvest's differentiator — a **deterministic replay
-core that is already backend-neutral** — is exactly what makes option (ii)
-cheap: none of the above got to reuse a production replay engine unchanged; the
-spike shows Harvest can.
+**Reading:** the corrected landscape *strengthens* the feasibility case rather
+than resting it on novelty. DBOS already ships an in-process durable-execution
+library on **embedded SQLite by default** — so the category Harvest would enter is
+real and shipped, not speculative — and DBOS's own "can't be used in a distributed
+setting" caveat independently confirms this spike's single-writer finding. Oban
+shows the embedded-SQLite-for-durable-jobs demand is real *and serviceable* (it
+ships a SQLite engine); Restate shows the "no external database" demand is real (a
+single self-contained binary). **Harvest would join these, not pioneer a new
+category.** Its differentiator is *not* being first on SQLite — it is a **Rust,
+deterministic-replay durable engine whose replay core is already backend-neutral**
+(none of the above offered to reuse a production replay engine unchanged; the
+spike shows Harvest can), plus a clean Postgres-hub handoff (§8). The go/no-go
+rests on **feasibility + real demand + zero cost to the production Postgres path** —
+not on being first — and every one of those holds independent of this prior-art
+correction. **Verdict unchanged: feasible; pursue option (ii), the separate
+companion crate.**
 
 ---
 
@@ -590,3 +634,16 @@ spike shows Harvest can.
 - Adjacently-tagged event contract: `WorkflowEvent` (`event.rs:68`).
 - `docs/adr/0001-otel-trace-contract.md` — analytical-depth template for this
   report.
+
+### Prior-art citations (§11; all accessed 2026-07-14)
+
+- DBOS system database — SQLite is the default; "because a SQLite database is
+  just a file on disk, it can't be used in a distributed setting where an
+  application runs on multiple servers … for production, we recommend using
+  Postgres": <https://docs.dbos.dev/python/tutorials/database-connection>.
+- Oban ships a built-in SQLite engine (`Oban.Engines.Lite`) alongside Postgres
+  and MySQL: <https://github.com/oban-bg/oban>.
+- Restate is a single self-contained binary / server (SDK-in-app + separate
+  server), no external database: <https://docs.restate.dev/server/overview>.
+- Temporal dev server runs on embedded SQLite, "for development or testing and
+  not production use": <https://docs.temporal.io/cli/server>.

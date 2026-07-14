@@ -21,8 +21,12 @@
 //!    [`run_workflow`](crate::run_workflow) once.
 //! 2. On `Suspended`, persist each new command as event(s) and enqueue the
 //!    corresponding work (an activity task, a durable timer, or apply a staged
-//!    signal), then run the [`worker`] pass to execute ready activities and fire
-//!    due timers — appending their terminal events.
+//!    signal) — **the event append and its paired task/timer row insert commit
+//!    in one `SQLite` transaction per decision cycle**, so a crash can never
+//!    leave a scheduled-event without its queue/timer row — then run the
+//!    [`worker`] pass to execute ready activities and fire due timers, appending
+//!    each activity's post-body persistence (attempt audit + terminal event +
+//!    task-state flip) atomically in one transaction too.
 //! 3. Repeat until the run reports `Completed`/`Failed`, or until a full cycle
 //!    makes no progress (blocked on a not-yet-due timer or an undelivered
 //!    signal).
@@ -268,6 +272,21 @@ impl SqliteRuntime {
         store::load_attempts(&self.conn, exec, activity_name)
     }
 
+    /// Introspection (tests): the `activity_id`s of every task-queue row (any
+    /// state) for `exec`. Paired with [`Self::load_history`] this asserts the
+    /// per-cycle append+enqueue atomicity — every `ActivityScheduled` event has a
+    /// matching `spike_tasks` row, and a rolled-back batch leaves neither.
+    pub fn queued_activity_ids(&self, exec: ExecutionId) -> Result<Vec<String>, SpikeError> {
+        queue::all_task_activity_ids(&self.conn, exec)
+    }
+
+    /// Introspection (tests): the `timer_id`s of every armed (unfired) durable
+    /// timer for `exec`. The timer half of the same append+arm atomicity
+    /// invariant — every `TimerStarted` event has a matching `spike_timers` row.
+    pub fn armed_timer_ids(&self, exec: ExecutionId) -> Result<Vec<String>, SpikeError> {
+        queue::armed_timer_ids(&self.conn, exec)
+    }
+
     /// Drive `exec` to a terminal state or an external-input block.
     pub async fn run_until_blocked(&mut self, exec: ExecutionId) -> Result<RunState, SpikeError> {
         for _ in 0..MAX_ITERATIONS {
@@ -347,12 +366,30 @@ impl SqliteRuntime {
 
     /// Persist newly-requested side effects. Returns `true` if any new event was
     /// appended (i.e. progress was made this call).
+    ///
+    /// **Atomic per-decision-cycle persistence.** Every derived event append AND
+    /// its paired task-queue / durable-timer row insert commit in **one** `SQLite`
+    /// `BEGIN…COMMIT` transaction. This mirrors the Postgres engine, which
+    /// persists an event and its task-queue row in a single transaction (see the
+    /// [`worker`](crate::worker) persist paths). Without it, a crash *between*
+    /// the event append and the row insert would leave history saying an
+    /// activity/timer is scheduled while no `spike_tasks`/`spike_timers` row
+    /// exists — on reload, replay re-derives a `WaitForActivity` whose wait
+    /// branch enqueues nothing, wedging the run at [`SpikeError::Stuck`]. The
+    /// single writer holds `SQLite`'s database write lock for the whole
+    /// transaction, so the batch is simultaneously **serialized** (the
+    /// SKIP-LOCKED substitute) and **atomic** (event + row commit together, or —
+    /// if any command in the batch is unsupported and returns `Err`, dropping the
+    /// uncommitted transaction — neither does).
     fn apply_commands(
-        &self,
+        &mut self,
         exec: ExecutionId,
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
     ) -> Result<bool, SpikeError> {
+        // Copy the Copy clock before borrowing `self.conn` mutably for the tx.
+        let clock = self.clock;
+        let tx = self.conn.transaction()?;
         let mut produced = false;
         for cmd in commands {
             match cmd {
@@ -365,8 +402,9 @@ impl SqliteRuntime {
                 } => {
                     let id = activity_id.to_string();
                     if !store::history_has_activity_scheduled(history, &id) {
+                        // Event append + task-queue row insert in the SAME tx.
                         store::append_event(
-                            &self.conn,
+                            &tx,
                             exec,
                             &WorkflowEvent::ActivityScheduled {
                                 activity_id: *activity_id,
@@ -376,13 +414,13 @@ impl SqliteRuntime {
                             },
                         )?;
                         queue::enqueue_activity(
-                            &self.conn,
+                            &tx,
                             exec,
                             *activity_id,
                             name,
                             input,
                             queue,
-                            self.clock,
+                            clock,
                         )?;
                         produced = true;
                     }
@@ -394,8 +432,9 @@ impl SqliteRuntime {
                 } => {
                     let id = timer_id.to_string();
                     if !store::history_has_timer_started(history, &id) {
+                        // Event append + durable-timer row insert in the SAME tx.
                         store::append_event(
-                            &self.conn,
+                            &tx,
                             exec,
                             &WorkflowEvent::TimerStarted {
                                 timer_id: timer_id.clone(),
@@ -404,20 +443,17 @@ impl SqliteRuntime {
                         )?;
                         // Checked add: a pathological duration must not panic —
                         // saturate to `i64::MAX` (an effectively-infinite deadline).
-                        let fire_at = self
-                            .clock
+                        let fire_at = clock
                             .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
                             .unwrap_or(i64::MAX);
-                        queue::enqueue_timer(&self.conn, exec, &id, fire_at)?;
+                        queue::enqueue_timer(&tx, exec, &id, fire_at)?;
                         produced = true;
                     }
                 }
                 WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                    if let Some(payload) =
-                        store::take_pending_signal(&self.conn, exec, signal_name)?
-                    {
+                    if let Some(payload) = store::take_pending_signal(&tx, exec, signal_name)? {
                         store::append_event(
-                            &self.conn,
+                            &tx,
                             exec,
                             &WorkflowEvent::SignalReceived {
                                 signal_name: signal_name.clone(),
@@ -434,9 +470,13 @@ impl SqliteRuntime {
                 WorkflowCommand::WaitForActivity { .. }
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordSideEffect { .. } => {}
+                // Dropping `tx` here (un-committed) rolls back the whole batch —
+                // an unsupported command after a supported one leaves NEITHER the
+                // supported command's event NOR its queue/timer row persisted.
                 other => return Err(SpikeError::Unsupported(command_name(other).to_string())),
             }
         }
+        tx.commit()?;
         Ok(produced)
     }
 
