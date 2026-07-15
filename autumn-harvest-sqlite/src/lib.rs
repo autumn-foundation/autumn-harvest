@@ -36,9 +36,12 @@
 //!   the workflow resumes purely by deterministic replay. This makes activity
 //!   execution **at-least-once**: a crash *after a body runs but before its result
 //!   commits* re-runs the body on resume — write activity bodies to be idempotent.
-//! - **Durable timers use the real wall clock.** A timer's absolute deadline is
-//!   stored at arm time (`now + duration`); on any pass, timers whose deadline has
-//!   passed fire. There is no virtual clock to persist or reset, so timers are
+//! - **Durable timers use the real wall clock, at millisecond precision.** A
+//!   timer's absolute deadline is stored at arm time (`now + duration`) as an
+//!   epoch-MILLISECOND (issue #1069 P2), so a fractional-second arm never fires
+//!   before its true deadline (a `duration = 1s` timer armed at `…000.900` fires
+//!   at `…001.900`, not the floored `…001.001`). On any pass, timers whose deadline
+//!   has passed fire. There is no virtual clock to persist or reset, so timers are
 //!   naturally monotonic across restarts. The public drivers use [`chrono::Utc::now`];
 //!   the `*_as_of` variants inject an as-of time for deterministic, sleep-free tests.
 //!   Timers that share the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
@@ -113,12 +116,16 @@
 //!   `ctx.receive_signal_timeout` (issue #476), which race the signal against a
 //!   durable deadline timer — the signal wins if it arrives first, else the timer
 //!   fires and the wait resolves to `None`. The winner is decided by **arrival
-//!   time**, not consumption order: the wake ingest interleaves a staged signal's
-//!   `received_at` against the deadline timer's `fire_at` (mirroring the Postgres
-//!   `merge_wake_events`), so a signal delivered *after* an expired deadline
-//!   records its `TimerFired` FIRST and the timeout wins (the late signal stays
-//!   recorded, observable to a later plain wait), while an on-time signal wins even
-//!   when the run is only driven past the deadline. When the **signal** wins, the
+//!   time** (at millisecond precision, issue #1069 P2), not consumption order: the
+//!   wake ingest interleaves a staged signal's `received_at` against the deadline
+//!   timer's `fire_at` (mirroring the Postgres `merge_wake_events`), so a signal
+//!   delivered *after* an expired deadline records its `TimerFired` FIRST and the
+//!   timeout wins (the late signal stays recorded, observable to a later plain
+//!   wait), while an on-time signal wins even when the run is only driven past the
+//!   deadline. **Only the raced deadline timer of THIS wait** (the core's
+//!   `__signal_timeout:{seq}:{name}` row) is reordered ahead of the signal (issue
+//!   #1069 P2); an unrelated durable timer is never fired ahead of a consumed
+//!   signal. When the **signal** wins, the
 //!   core emits a `CancelRaceLosers` bookkeeping command to durably delete the
 //!   losing deadline timer; this backend handles it (deleting the `harvest_timers`
 //!   row in the same cycle transaction — whether it rides a suspending batch or the

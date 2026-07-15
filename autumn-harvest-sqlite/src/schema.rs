@@ -27,12 +27,13 @@
 //!   an unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
 //!   (issue #1069 P2).
 //! - `harvest_signals` — staged inbound signals awaiting a matching
-//!   `wait_for_signal`. Each row records the absolute epoch-second the signal
-//!   arrived (`received_at`), which the wake-event ingest interleaves against a
-//!   deadline timer's `fire_at` so a signal delivered *after* an expired
-//!   `wait_for_signal_timeout` deadline cannot retroactively win the race
-//!   (issue #476; mirrors the Postgres `merge_wake_events` `received_at` vs
-//!   `fires_at` ordering).
+//!   `wait_for_signal`. Each row records the absolute epoch-millisecond the signal
+//!   arrived (`received_at`, issue #1069 P2 — millisecond precision so an on-time
+//!   signal cannot lose a deadline race near a second boundary), which the
+//!   wake-event ingest interleaves against a deadline timer's `fire_at` so a
+//!   signal delivered *after* an expired `wait_for_signal_timeout` deadline cannot
+//!   retroactively win the race (issue #476; mirrors the Postgres `merge_wake_events`
+//!   `received_at` vs `fires_at` ordering).
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
@@ -66,7 +67,7 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
     queue        TEXT NOT NULL,
     state        TEXT NOT NULL,            -- PENDING | RUNNING | DONE
     attempt      INTEGER NOT NULL,         -- attempts consumed so far
-    run_at       INTEGER NOT NULL,         -- earliest epoch-second this may run
+    run_at       INTEGER NOT NULL,         -- earliest epoch-millisecond this may run
     seq          INTEGER NOT NULL,         -- FIFO ordering within the queue
     max_attempts INTEGER                   -- per-call retry cap from the command's
                                            -- retry_policy_override (issue #1069 P2);
@@ -76,7 +77,9 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
 CREATE TABLE IF NOT EXISTS harvest_timers (
     timer_id TEXT NOT NULL,
     exec_id  TEXT NOT NULL,
-    fire_at  INTEGER NOT NULL,            -- absolute epoch-second
+    fire_at  INTEGER NOT NULL,            -- absolute epoch-millisecond (issue #1069 P2:
+                                          -- sub-second precision so a timer never fires
+                                          -- before its true deadline)
     fired    INTEGER NOT NULL DEFAULT 0,
     arm_seq  INTEGER NOT NULL DEFAULT 0,  -- monotonic arm order (issue #1069 P2);
                                           -- the deterministic tie-breaker for equal
@@ -93,7 +96,7 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     name         TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     delivered    INTEGER NOT NULL DEFAULT 0,
-    received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-second the signal arrived
+    received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
 );
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (

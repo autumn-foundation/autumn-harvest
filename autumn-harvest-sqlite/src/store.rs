@@ -268,7 +268,7 @@ pub fn load_attempts(
 
 // ── Inbound signals ──────────────────────────────────────────────────────────
 
-/// Stage an inbound signal, recording the absolute epoch-second it arrived
+/// Stage an inbound signal, recording the absolute epoch-millisecond it arrived
 /// (`received_at`).
 ///
 /// `received_at` is compared against a `wait_for_signal_timeout` deadline timer's
@@ -301,7 +301,7 @@ pub fn stage_signal(
 pub struct PendingSignal {
     /// `harvest_signals.signal_seq` — pass to [`mark_signal_delivered`].
     pub seq: i64,
-    /// Absolute epoch-second the signal arrived (`received_at`).
+    /// Absolute epoch-millisecond the signal arrived (`received_at`).
     pub received_at: i64,
     /// Deserialized payload.
     pub payload: Value,

@@ -119,18 +119,41 @@ pub fn drain_ready(
     Ok(produced)
 }
 
+/// True iff `timer_id` is the deadline timer of a `wait_for_signal_timeout` /
+/// `receive_signal_timeout` race for the signal named `signal_name`.
+///
+/// The core arms that deadline timer with the id `__signal_timeout:{seq}:{name}`
+/// (an inline `format!` in `autumn_harvest::context`, issue #476 — there is no
+/// exported constant, so the prefix convention is matched here). Only THAT timer
+/// may be recorded ahead of the signal in [`ingest_awaited_signal`]; an unrelated
+/// durable timer armed in the same batch must not (see the call site).
+///
+/// Parsed structurally — strip the `__signal_timeout:` prefix, then `split_once`
+/// on the seq's colon so the remainder is the signal name — rather than a `LIKE`
+/// pattern, so a signal name that itself contains `:` (or a `LIKE` metacharacter
+/// like `%`/`_`) still matches exactly.
+fn is_signal_timeout_deadline_timer(timer_id: &str, signal_name: &str) -> bool {
+    timer_id
+        .strip_prefix("__signal_timeout:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(_seq, name)| name == signal_name)
+}
+
 /// Ingest one awaited signal chronologically against the execution's due timers
 /// (issue #476), mirroring the Postgres `merge_wake_events`.
 ///
 /// Consumes the oldest undelivered signal named `signal_name` (if any) and
-/// appends its `SignalReceived` — but a due deadline timer whose `fire_at` is at
-/// or before the signal's `received_at` is fired (`TimerFired`) **first**, so a
-/// signal delivered *after* an expired `wait_for_signal_timeout` deadline can
-/// never retroactively win the signal-or-deadline race. A due timer whose
-/// deadline is *after* the signal arrived is left for the ordinary
-/// [`drain_ready`] pass to fire *after* the signal, so an on-time signal still
-/// wins even when the run is only driven past the deadline. Runs entirely inside
-/// the caller's cycle transaction (`conn` is a `&tx`).
+/// appends its `SignalReceived` — but the **race deadline timer of THIS wait**
+/// (`__signal_timeout:{seq}:{signal_name}`) is fired (`TimerFired`) **first** when
+/// its `fire_at` is at or before the signal's `received_at`, so a signal delivered
+/// *after* an expired `wait_for_signal_timeout` deadline can never retroactively
+/// win the signal-or-deadline race. Two kinds of timer are deliberately NOT fired
+/// ahead of the signal: (1) the race deadline timer whose deadline is *after* the
+/// signal arrived (left for the ordinary [`drain_ready`] pass so an on-time signal
+/// still wins even when the run is only driven past the deadline), and (2) any
+/// **unrelated** durable timer (e.g. a `join!`ed `ctx.timer("t", 5)`) — firing it
+/// before the signal would wedge replay (see the scoping note at the call site).
+/// Runs entirely inside the caller's cycle transaction (`conn` is a `&tx`).
 ///
 /// Returns `true` iff any event was appended (a signal was consumed and/or a due
 /// deadline timer fired).
@@ -146,10 +169,24 @@ pub fn ingest_awaited_signal(
     let Some(signal) = store::peek_pending_signal(conn, exec_id, signal_name)? else {
         return Ok(false);
     };
-    // Fire every due timer whose deadline is at or before the signal's arrival —
-    // recorded BEFORE the SignalReceived so the deadline wins over a late signal.
+    // Fire the RACED signal-timeout deadline timer for THIS wait — but ONLY it —
+    // ahead of the signal when its deadline expired at or before the signal
+    // arrived (issue #476; Codex #1069 P2, runtime.rs:699). `due_timers_before_signal`
+    // returns *every* due timer whose deadline is `<= received_at`, but only the
+    // `__signal_timeout:{seq}:{signal_name}` deadline timer of this
+    // `wait_for_signal_timeout` race may be recorded before the `SignalReceived`.
+    // An UNRELATED durable timer armed in the same batch — e.g.
+    // `join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` — must NOT fire first:
+    // the core `match_signal` path does not skip an interleaved `TimerFired`, so a
+    // `TimerFired(t)` recorded before `SignalReceived(go)` wedges replay (the run
+    // stays parked waiting even though the signal row was delivered). Leave any
+    // such unrelated due timer to the ordinary [`drain_ready`] pass, which fires
+    // it *after* this signal at a history position the workflow's own timer-await
+    // consumes.
     for timer_id in queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)? {
-        fire_timer_within_tx(conn, exec_id, &timer_id)?;
+        if is_signal_timeout_deadline_timer(&timer_id, signal_name) {
+            fire_timer_within_tx(conn, exec_id, &timer_id)?;
+        }
     }
     store::append_event(
         conn,
@@ -280,7 +317,10 @@ mod tests {
 
     use autumn_harvest::ExecutionId;
 
-    use super::{finalize_within_tx, fire_timer, fire_timer_within_tx};
+    use super::{
+        finalize_within_tx, fire_timer, fire_timer_within_tx, ingest_awaited_signal,
+        is_signal_timeout_deadline_timer,
+    };
     use crate::queue::{self, ClaimedTask};
     use crate::{schema, store};
 
@@ -444,6 +484,126 @@ mod tests {
         assert!(
             queue::has_unfired_timer(&conn, exec).unwrap(),
             "the timer must remain unfired (no double-fire)"
+        );
+    }
+
+    // FIX 1 (Codex #1069 P2, runtime.rs:699): the deadline-timer-name predicate
+    // matches ONLY a `__signal_timeout:{seq}:{name}` race timer for the exact
+    // signal name — including a name that itself contains a colon — and never an
+    // unrelated durable timer.
+    #[test]
+    fn signal_timeout_deadline_timer_predicate_matches_only_the_raced_timer() {
+        assert!(is_signal_timeout_deadline_timer(
+            "__signal_timeout:0:go",
+            "go"
+        ));
+        assert!(is_signal_timeout_deadline_timer(
+            "__signal_timeout:7:approval",
+            "approval"
+        ));
+        // A signal name that itself contains ':' still matches (structural
+        // `split_once`, not a fragile suffix/`LIKE` match).
+        assert!(is_signal_timeout_deadline_timer(
+            "__signal_timeout:3:ns:go",
+            "ns:go"
+        ));
+        // Wrong signal name → no match (a deadline timer for a DIFFERENT wait must
+        // not be reordered ahead of THIS signal).
+        assert!(!is_signal_timeout_deadline_timer(
+            "__signal_timeout:0:other",
+            "go"
+        ));
+        // An UNRELATED durable timer (`join!(wait_for_signal("go"), timer("t", 5))`)
+        // is never a race deadline timer.
+        assert!(!is_signal_timeout_deadline_timer("t", "go"));
+        assert!(!is_signal_timeout_deadline_timer("heartbeat", "go"));
+        // A prefix look-alike that is not the real convention → no match.
+        assert!(!is_signal_timeout_deadline_timer(
+            "__signal_timeout_go",
+            "go"
+        ));
+    }
+
+    // FIX 1 (Codex #1069 P2, runtime.rs:699): `ingest_awaited_signal` reorders ONLY
+    // the raced `__signal_timeout:{seq}:{name}` deadline timer ahead of the signal.
+    // An UNRELATED due timer (e.g. a `join!`ed `ctx.timer("t", 5)`) is deliberately
+    // LEFT UNFIRED here — firing a `TimerFired(t)` before `SignalReceived(go)` would
+    // wedge the core `match_signal` replay (which does not skip an interleaved
+    // `TimerFired`). The unrelated timer is instead left for the ordinary
+    // `drain_ready` pass to fire AFTER the signal.
+    //
+    // Seed BOTH a raced deadline timer and an unrelated timer, both due at or
+    // before the signal's arrival, then ingest the signal and assert only the
+    // deadline timer fired ahead of it. Pre-fix (fire every due-before-signal
+    // timer) this test is RED: it also records `TimerFired(t)` before the signal
+    // and leaves `t` fired.
+    #[test]
+    fn ingest_reorders_only_the_raced_deadline_timer_ahead_of_the_signal() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+
+        // Signal arrives at t=100.
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("v"), 100).unwrap();
+        // The raced deadline timer of THIS wait, expired at t=60 (<= 100).
+        queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
+        // An UNRELATED durable timer, also due at t=50 (<= 100) — must NOT fire
+        // ahead of the signal.
+        queue::enqueue_timer(&conn, exec, "t", 50).unwrap();
+
+        // Ingest inside a transaction (the real caller passes a `&tx`); commit so
+        // the assertions read the persisted state.
+        let tx = conn.unchecked_transaction().unwrap();
+        let produced = ingest_awaited_signal(&tx, exec, "go", 200).unwrap();
+        tx.commit().unwrap();
+        assert!(
+            produced,
+            "a signal was consumed (and/or the deadline timer fired)"
+        );
+
+        let history = store::load_history(&conn, exec).unwrap();
+        let fired: Vec<&str> = history
+            .iter()
+            .filter_map(|e| match e {
+                autumn_harvest::WorkflowEvent::TimerFired { timer_id } => Some(timer_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fired,
+            vec!["__signal_timeout:0:go"],
+            "ONLY the raced deadline timer may fire ahead of the signal; the \
+             unrelated timer `t` must NOT (pre-fix this also fired `t`):\n{history:?}"
+        );
+
+        // The deadline TimerFired is recorded BEFORE the SignalReceived (the timeout
+        // wins the race against a late signal); the signal is still recorded.
+        let deadline_pos = history
+            .iter()
+            .position(|e| matches!(e, autumn_harvest::WorkflowEvent::TimerFired { .. }))
+            .expect("the deadline timer fired");
+        let signal_pos = history
+            .iter()
+            .position(|e| matches!(e, autumn_harvest::WorkflowEvent::SignalReceived { .. }))
+            .expect("the signal was consumed");
+        assert!(
+            deadline_pos < signal_pos,
+            "the raced deadline TimerFired must precede the SignalReceived:\n{history:?}"
+        );
+
+        // The unrelated timer `t` is still armed (unfired) — left for the ordinary
+        // drain pass, which fires it at a position the workflow's own timer-await
+        // consumes AFTER the signal.
+        let t_fired: i64 = conn
+            .query_row(
+                "SELECT fired FROM harvest_timers WHERE exec_id = ?1 AND timer_id = 't'",
+                rusqlite::params![exec.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            t_fired, 0,
+            "the unrelated timer `t` must remain unfired after ingest"
         );
     }
 }

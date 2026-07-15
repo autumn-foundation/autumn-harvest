@@ -280,7 +280,17 @@ impl SqliteRuntime {
                 state,
             });
         }
-        store::stage_signal(&self.conn, exec, name, &payload, received_at.timestamp())
+        // Millisecond precision (issue #1069 P2): `received_at` is compared against
+        // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
+        // ingest, so a whole-second floor could flip an on-time signal past its
+        // deadline near a second boundary.
+        store::stage_signal(
+            &self.conn,
+            exec,
+            name,
+            &payload,
+            received_at.timestamp_millis(),
+        )
     }
 
     /// The full ordered event history — the canonical, replayable log.
@@ -354,9 +364,10 @@ impl SqliteRuntime {
     /// Like [`run_until_blocked`](Self::run_until_blocked) but with an injected
     /// "as-of" time, so tests can arm a durable timer, restart, and fire it past
     /// its absolute deadline without sleeping. The runtime stores each timer's
-    /// deadline as an absolute epoch second (`now + duration`) at arm time, so
-    /// this is naturally monotonic across restarts — there is no virtual clock to
-    /// persist or reset.
+    /// deadline as an absolute epoch millisecond (`now + duration`, issue #1069
+    /// P2) at arm time, so this is naturally monotonic across restarts — there is
+    /// no virtual clock to persist or reset — and never fires before the true
+    /// sub-second deadline.
     ///
     /// A deterministic-simulation seam. Timers store an absolute epoch deadline,
     /// so an adversarial `now` only changes due-ness (fires early/late) and can
@@ -374,7 +385,13 @@ impl SqliteRuntime {
         exec: ExecutionId,
         now: DateTime<Utc>,
     ) -> SqliteResult<RunState> {
-        let now = now.timestamp();
+        // Millisecond precision (issue #1069 P2): a whole-second floor would arm a
+        // timer up to ~1s early and could flip an on-time signal-vs-deadline race
+        // near a second boundary. Every internal epoch value (`fire_at`,
+        // `received_at`, `run_at`) is a relative epoch-MILLISECOND, so the whole
+        // comparison stays self-consistent — no DDL change (the columns are
+        // `INTEGER`).
+        let now = now.timestamp_millis();
         for _ in 0..MAX_ITERATIONS {
             match self.drive_one_cycle(exec, now).await? {
                 RunState::InProgress => {}
@@ -404,7 +421,8 @@ impl SqliteRuntime {
     /// See [`run_until_blocked`](Self::run_until_blocked).
     #[doc(hidden)]
     pub async fn poll_once_as_of(&mut self, now: DateTime<Utc>) -> SqliteResult<bool> {
-        let now = now.timestamp();
+        // Millisecond precision — see `run_until_blocked_as_of` (issue #1069 P2).
+        let now = now.timestamp_millis();
         let mut progress = false;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now).await? {
@@ -436,7 +454,7 @@ impl SqliteRuntime {
         Err(SqliteError::Runaway)
     }
 
-    /// Run exactly one decision cycle at logical time `now` (epoch seconds):
+    /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
     /// replay/execute the workflow once, persist the resulting side effects, and
     /// run one worker pass.
     async fn drive_one_cycle(&mut self, exec: ExecutionId, now: i64) -> SqliteResult<RunState> {
@@ -678,11 +696,18 @@ impl SqliteRuntime {
                     {
                         // Absolute deadline computed from `now` (real wall clock in
                         // the public API), so it stays valid across a restart —
-                        // there is no virtual clock to reset. Checked add: a
-                        // pathological duration saturates to an effectively-infinite
-                        // deadline instead of panicking.
-                        let fire_at = now
-                            .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
+                        // there is no virtual clock to reset. `now` is an
+                        // epoch-MILLISECOND (issue #1069 P2), so the whole-second
+                        // `duration_secs` is scaled by 1000 and ADDED to preserve
+                        // the sub-second arm instant: a timer armed at `10.900` with
+                        // duration `1` fires at `11.900`, never `11.001`. Every
+                        // step is checked (mul then add): a pathological duration
+                        // saturates to an effectively-infinite deadline instead of
+                        // panicking or overflowing.
+                        let fire_at = i64::try_from(*duration_secs)
+                            .ok()
+                            .and_then(|secs| secs.checked_mul(1000))
+                            .and_then(|ms| now.checked_add(ms))
                             .unwrap_or(i64::MAX);
                         persist_started_timer(&tx, exec, timer_id, *duration_secs, fire_at)?;
                         produced = true;
