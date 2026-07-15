@@ -54,6 +54,17 @@ pub struct ClaimedTask {
     /// `execute_activity_raw` path, in which case the worker falls back to the
     /// registered [`ActivitySpec`](crate::runtime::ActivitySpec)'s default.
     pub max_attempts: Option<u32>,
+    /// Per-activity start-to-close budget in milliseconds, carried from the
+    /// scheduling command's `start_to_close_override` (issue #1069 P2). `Some(ms)`
+    /// when the workflow's declared/per-call activity has a start-to-close timeout
+    /// (via `#[activity(start_to_close = "…")]` or `execute_activity_with_opts`);
+    /// `None` = no budget (unbounded, prior behavior). Enforced by the worker as a
+    /// **post-execution outcome**: a synchronous body cannot be cancelled mid-flight
+    /// in a single-writer runtime, but a body whose real wall-clock runtime exceeds
+    /// this budget records a terminal `ActivityTimedOut { StartToClose }` instead of
+    /// `ActivityCompleted` — byte-equivalent to the durable event the Postgres
+    /// timeout scanner (`enforce_activity_timeout`) records.
+    pub start_to_close_ms: Option<i64>,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -97,6 +108,11 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 /// `retry_policy_override` (issue #1069 P2): `Some(n)` honors the workflow's
 /// declared/per-call [`RetryPolicy`](autumn_harvest::policy::RetryPolicy), `None`
 /// leaves the worker to fall back to the registered `ActivitySpec` default.
+///
+/// `start_to_close_ms` is the per-activity start-to-close budget (milliseconds)
+/// from the command's `start_to_close_override` (issue #1069 P2): `Some(ms)`
+/// persists the declared/per-call timeout for the worker to enforce; `None` = no
+/// budget (unbounded).
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
@@ -107,13 +123,14 @@ pub fn enqueue_activity(
     queue: &str,
     run_at: i64,
     max_attempts: Option<u32>,
+    start_to_close_ms: Option<i64>,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
         "INSERT INTO harvest_tasks \
          (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
-          max_attempts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9)",
+          max_attempts, start_to_close_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10)",
         params![
             uuid::Uuid::new_v4().to_string(),
             exec_id.to_string(),
@@ -124,6 +141,7 @@ pub fn enqueue_activity(
             run_at,
             seq,
             max_attempts.map(i64::from),
+            start_to_close_ms,
         ],
     )?;
     Ok(())
@@ -140,7 +158,8 @@ pub fn claim_next_ready_task(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
-            "SELECT task_id, activity_id, name, input_json, attempt, max_attempts \
+            "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
+             start_to_close_ms \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -152,12 +171,14 @@ pub fn claim_next_ready_task(
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((task_id, act_s, name, input_s, attempt, max_attempts)) = row else {
+    let Some((task_id, act_s, name, input_s, attempt, max_attempts, start_to_close_ms)) = row
+    else {
         tx.commit()?;
         return Ok(None);
     };
@@ -184,6 +205,7 @@ pub fn claim_next_ready_task(
         input,
         attempt: u32::try_from(attempt).unwrap_or(0),
         max_attempts: max_attempts.and_then(|m| u32::try_from(m).ok()),
+        start_to_close_ms,
     }))
 }
 

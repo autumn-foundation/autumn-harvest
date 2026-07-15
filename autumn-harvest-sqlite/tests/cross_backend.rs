@@ -13,11 +13,13 @@
 // deliberately-unused param reads as a "used underscore binding" through the
 // expansion.
 #![allow(clippy::used_underscore_binding)]
+// The terminal-failure workflow fixtures return immediately (no `.await`).
+#![allow(clippy::unused_async)]
 
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{ActivityExecId, WorkerId};
-use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
+use autumn_harvest_sqlite::{ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime};
 use serde_json::json;
 
 #[workflow]
@@ -290,4 +292,160 @@ async fn workflow_type_reaches_ctx_info_and_replays_on_core() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a history recording ctx.info().workflow_type must replay on the core:\n{report}"
     );
+}
+
+// ── FIX 1 (Codex #1069 P2, runtime.rs:660): typed workflow failures preserve
+//    metadata and stay byte-equivalent to the Postgres path ─────────────────────
+//
+// When a `#[workflow]` returns a typed `WorkflowFailure`, the macro shim encodes it
+// into a `harvest_workflow_failure_v1` envelope carried on the failure string. The
+// Postgres path DECODES that envelope and writes `WorkflowFailed` with
+// `error_type`/`details` (+ the human message), storing the human message in the
+// execution `error` column. Pre-fix this backend stored the RAW envelope and an
+// all-`None` untyped `WorkflowFailed`, losing the typed metadata and breaking the
+// crate's cross-backend byte-identity guarantee (AC5). This is RED pre-fix.
+
+#[workflow]
+async fn typed_failure_workflow(ctx: &WorkflowContext, _n: i64) -> Result<i64, WorkflowFailure> {
+    // Read `ctx` so the macro's expansion does not warn on an unused binding.
+    let _ = ctx.info();
+    Err(
+        WorkflowFailure::new("BudgetExceeded", "over the monthly budget")
+            .with_details(json!({ "limit": 1000, "spent": 1500 })),
+    )
+}
+
+#[tokio::test]
+async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&typed_failure_workflow_info());
+    let exec = rt
+        .start_workflow("typed_failure_workflow", json!(0))
+        .unwrap();
+
+    // The run fails, and the SURFACED failure is the HUMAN message — not the raw
+    // wire envelope (RED pre-fix: the surfaced value was the whole envelope).
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    let RunState::Failed(msg) = state else {
+        panic!("expected a Failed terminal state, got {state:?}");
+    };
+    assert_eq!(
+        msg, "over the monthly budget",
+        "the surfaced failure must be the decoded human message, not the raw envelope"
+    );
+
+    // The stored execution `error` column is the human message, never the raw
+    // envelope (mirrors the Postgres `update_workflow_execution_failed(&decoded.message)`).
+    match rt.outcome(exec).unwrap() {
+        ExecutionOutcome::Failed(e) => {
+            assert_eq!(e, "over the monthly budget");
+            assert!(
+                !e.contains("harvest_workflow_failure_v1"),
+                "the error column must not store the raw wire envelope: {e}"
+            );
+        }
+        other => panic!("expected a Failed outcome, got {other:?}"),
+    }
+
+    // The stored `WorkflowFailed` event carries the DECODED typed fields, exactly as
+    // the Postgres path's `workflow_failed_typed` does — NOT an all-`None` untyped
+    // event (RED pre-fix: `error_type`/`details` were `None` and `error` was the
+    // raw envelope).
+    let history = rt.load_history(exec).unwrap();
+    let (error, error_type, details, non_retryable) = history
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => Some((
+                error.clone(),
+                error_type.clone(),
+                details.clone(),
+                *non_retryable,
+            )),
+            _ => None,
+        })
+        .expect("a failed run records a WorkflowFailed event");
+    assert_eq!(
+        error, "over the monthly budget",
+        "the WorkflowFailed event's `error` must be the human message"
+    );
+    assert_eq!(
+        error_type.as_deref(),
+        Some("BudgetExceeded"),
+        "the typed error_type must be preserved (RED pre-fix: None)"
+    );
+    assert_eq!(
+        details,
+        Some(json!({ "limit": 1000, "spent": 1500 })),
+        "the typed details must be preserved (RED pre-fix: None)"
+    );
+    assert_eq!(
+        non_retryable,
+        Some(false),
+        "the typed non_retryable flag must be preserved (RED pre-fix: None)"
+    );
+
+    // AC5: the typed-failure history replays cleanly on the core engine — the
+    // handler deterministically re-fails (`WorkflowFailed`, the replayer's clean
+    // terminal for a failing workflow), with NO non-determinism divergence. The
+    // stored typed `WorkflowFailed` event is consistent with re-running the handler.
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "typed_failure_workflow",
+            typed_failure_workflow_info().handler,
+        )
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
+        "a typed-workflow-failure history must replay to a clean WorkflowFailed \
+         (no non-determinism divergence) on the core engine:\n{report}"
+    );
+}
+
+// A legacy untyped `Err(String)` still stores its message unchanged (all typed
+// fields `None`) — the decode's back-compat path, so the fix does not regress the
+// common untyped failure.
+#[workflow]
+async fn untyped_failure_workflow(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx.info();
+    Err("plain author error".to_string())
+}
+
+#[tokio::test]
+async fn untyped_workflow_failure_is_unchanged() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&untyped_failure_workflow_info());
+    let exec = rt
+        .start_workflow("untyped_failure_workflow", json!(0))
+        .unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Failed(ref m) if m == "plain author error"));
+
+    let history = rt.load_history(exec).unwrap();
+    let event = history
+        .iter()
+        .find(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. }))
+        .expect("a failed run records a WorkflowFailed event");
+    let WorkflowEvent::WorkflowFailed {
+        error,
+        error_type,
+        details,
+        non_retryable,
+    } = event
+    else {
+        unreachable!()
+    };
+    assert_eq!(error, "plain author error");
+    assert_eq!(
+        *error_type, None,
+        "an untyped failure records no error_type"
+    );
+    assert_eq!(*details, None);
+    assert_eq!(*non_retryable, None);
 }

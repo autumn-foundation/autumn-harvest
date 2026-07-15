@@ -654,12 +654,26 @@ impl SqliteRuntime {
             // A genuine author `Err(...)` carries `non_deterministic_details:
             // None` and fails terminally, exactly as before.
             WorkflowOutcome::Failed { error, .. } => {
+                // Preserve typed workflow-failure metadata (issue #1069 P2,
+                // Codex #767). When the workflow returns a typed `WorkflowFailure`
+                // the macro shim encodes it into a `harvest_workflow_failure_v1`
+                // envelope carried on `error`; the Postgres path DECODES it and
+                // writes `WorkflowFailed` with `error_type`/`details` (+ the human
+                // message) — storing the raw envelope here instead would lose that
+                // metadata and break the crate's cross-backend byte-identity
+                // guarantee (AC5). Decode BEFORE appending/updating, exactly as the
+                // Postgres terminal path does: the `WorkflowFailed` event carries the
+                // decoded typed fields, and the execution `error` column holds the
+                // human message (`decoded.message`), never the raw envelope. A legacy
+                // untyped `Err(String)` decodes to `message = error` with all typed
+                // fields `None`, so its stored form is unchanged.
+                let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
                 let tx = self.conn.transaction()?;
                 persist_terminal_pending_commands(&tx, exec, &pending)?;
-                store::append_event(&tx, exec, &WorkflowEvent::workflow_failed(error.clone()))?;
-                store::set_failed(&tx, exec, &error)?;
+                store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
+                store::set_failed(&tx, exec, &decoded.message)?;
                 tx.commit()?;
-                Ok(RunState::Failed(error))
+                Ok(RunState::Failed(decoded.message))
             }
             WorkflowOutcome::ContinuedAsNew { .. } => {
                 Err(SqliteError::Unsupported("ContinueAsNew".to_string()))
@@ -706,33 +720,8 @@ impl SqliteRuntime {
             std::collections::HashSet::new();
         for cmd in commands {
             match cmd {
-                WorkflowCommand::ScheduleActivity {
-                    activity_id,
-                    name,
-                    input,
-                    queue,
-                    retry_policy_override,
-                    ..
-                } => {
-                    if !store::history_has_activity_scheduled(history, &activity_id.to_string()) {
-                        // Honor the workflow's declared/per-call retry policy (issue
-                        // #1069 P2): the typed `execute_activity`/`_with_opts` path
-                        // resolves the activity's `RetryPolicy` and carries it here.
-                        // Persist its `max_attempts` on the task row so the worker
-                        // uses it instead of the registered `ActivitySpec` default.
-                        // `None` (the raw `execute_activity_raw` path) leaves the
-                        // task row's `max_attempts` NULL, preserving the fallback.
-                        let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
-                        persist_scheduled_activity(
-                            &tx,
-                            exec,
-                            *activity_id,
-                            name,
-                            input,
-                            queue,
-                            now,
-                            max_attempts,
-                        )?;
+                cmd @ WorkflowCommand::ScheduleActivity { .. } => {
+                    if apply_schedule_activity(&tx, exec, history, cmd, now)? {
                         produced = true;
                     }
                 }
@@ -903,16 +892,21 @@ impl SqliteRuntime {
         };
         if strikes >= WORKFLOW_PANIC_MAX_ATTEMPTS {
             // Budget exhausted: fail terminally with the typed HandlerPanic error.
+            // `error` is the encoded `harvest_workflow_failure_v1` envelope the core
+            // produces for a contained handler panic (`error_type = "HandlerPanic"`),
+            // so DECODE it (issue #1069 P2, Codex #767) exactly like the author-`Err`
+            // terminal path above: the `WorkflowFailed` event carries the typed
+            // `error_type`/`details`, and the execution `error` column holds the human
+            // `decoded.message`, never the raw envelope — byte-equivalent to the
+            // Postgres worker's terminal panic path and preserving cross-backend
+            // fidelity (AC5).
             self.workflow_panic_strikes.remove(&exec);
+            let decoded = autumn_harvest::failure::decode_workflow_failure(error);
             let tx = self.conn.transaction()?;
-            store::append_event(
-                &tx,
-                exec,
-                &WorkflowEvent::workflow_failed(error.to_string()),
-            )?;
-            store::set_failed(&tx, exec, error)?;
+            store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
+            store::set_failed(&tx, exec, &decoded.message)?;
             tx.commit()?;
-            Ok(RunState::Failed(error.to_string()))
+            Ok(RunState::Failed(decoded.message))
         } else {
             // Under budget: non-terminal, resumable. No event, no state change.
             Err(SqliteError::WorkflowPanicked {
@@ -921,6 +915,87 @@ impl SqliteRuntime {
             })
         }
     }
+}
+
+/// Apply one [`WorkflowCommand::ScheduleActivity`] inside the cycle transaction
+/// (extracted from [`SqliteRuntime::apply_commands`]).
+///
+/// **Closes the dropped-command-field class (issue #1069 P2):** every
+/// author-declared field on `ScheduleActivity` is either HONORED or REJECTED
+/// LOUDLY — none is silently ignored.
+/// - `activity_id`/`name`/`input`/`queue` — honored (persisted onto the task row;
+///   single-process has one worker draining all queues, so `queue` *routing* is a
+///   no-op, but it is still recorded for fidelity).
+/// - `retry_policy_override` — honored: its `max_attempts` is persisted so the
+///   worker uses it over the registered [`ActivitySpec`] default (`None` = fallback).
+/// - `start_to_close_override` — honored: persisted (milliseconds) so the worker
+///   enforces it as a post-execution outcome (a body exceeding its budget records a
+///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
+///   timeout scanner). `None` = no budget (unbounded).
+/// - `session_id`/`session_worker_id` (worker sessions, issue #606) and the
+///   session-acquire-only `schedule_to_start_override` — REJECTED LOUDLY with
+///   [`SqliteError::Unsupported`]: they are outside the single-writer subset (worker
+///   sessions co-locate a pipeline across workers this backend has no notion of), so
+///   a `Some` means the workflow used `ctx.create_session(...)`, whose pinning this
+///   backend cannot honor. Rejecting beats dropping the setting and running the
+///   activity un-pinned. The `?` propagation drops the caller's uncommitted cycle
+///   transaction, so no partial event/row is left behind.
+///
+/// Returns `true` iff a durable row was produced (a fresh schedule).
+fn apply_schedule_activity(
+    conn: &Connection,
+    exec: ExecutionId,
+    history: &[WorkflowEvent],
+    cmd: &WorkflowCommand,
+    now: i64,
+) -> SqliteResult<bool> {
+    let WorkflowCommand::ScheduleActivity {
+        activity_id,
+        name,
+        input,
+        queue,
+        retry_policy_override,
+        start_to_close_override,
+        session_id,
+        session_worker_id,
+        schedule_to_start_override,
+        ..
+    } = cmd
+    else {
+        // Only ever called with a `ScheduleActivity` (matched at the call site).
+        return Ok(false);
+    };
+    if session_id.is_some() || session_worker_id.is_some() {
+        return Err(SqliteError::Unsupported(
+            "ScheduleActivity.session_id — worker sessions (issue #606) \
+             are outside the sqlite subset"
+                .to_string(),
+        ));
+    }
+    if schedule_to_start_override.is_some() {
+        return Err(SqliteError::Unsupported(
+            "ScheduleActivity.schedule_to_start_override — used only by the \
+             session-acquire dispatch, which is outside the sqlite subset"
+                .to_string(),
+        ));
+    }
+    if store::history_has_activity_scheduled(history, &activity_id.to_string()) {
+        return Ok(false);
+    }
+    let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
+    let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
+    persist_scheduled_activity(
+        conn,
+        exec,
+        *activity_id,
+        name,
+        input,
+        queue,
+        now,
+        max_attempts,
+        start_to_close_ms,
+    )?;
+    Ok(true)
 }
 
 /// Atomic dispatch pair (AC6): append `ActivityScheduled` **and** insert the
@@ -932,6 +1007,11 @@ impl SqliteRuntime {
 /// (issue #1069 P2): `Some(n)` persists the workflow's declared/per-call retry cap
 /// onto the task row; `None` leaves it NULL so the worker falls back to the
 /// registered [`ActivitySpec`] default.
+///
+/// `start_to_close_ms` carries the scheduling command's `start_to_close_override`
+/// (issue #1069 P2): `Some(ms)` persists the per-activity start-to-close budget
+/// onto the task row so the worker enforces it as a post-execution outcome; `None`
+/// leaves it NULL (no budget, prior behavior).
 #[allow(clippy::too_many_arguments)]
 pub fn persist_scheduled_activity(
     conn: &Connection,
@@ -942,6 +1022,7 @@ pub fn persist_scheduled_activity(
     queue_name: &str,
     run_at: i64,
     max_attempts: Option<u32>,
+    start_to_close_ms: Option<i64>,
 ) -> SqliteResult<()> {
     store::append_event(
         conn,
@@ -962,6 +1043,7 @@ pub fn persist_scheduled_activity(
         queue_name,
         run_at,
         max_attempts,
+        start_to_close_ms,
     )?;
     Ok(())
 }
@@ -1123,6 +1205,14 @@ fn apply_cancel_race_losers(
     Ok(changed)
 }
 
+/// Convert a [`std::time::Duration`] budget to whole milliseconds, saturating a
+/// pathologically-large value to [`i64::MAX`] rather than panicking/overflowing
+/// (issue #1069 P2). Used to persist an activity's `start_to_close_override` onto
+/// the task row on the same millisecond clock as every other epoch value.
+fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
 /// Human name for an unsupported command (for error messages). The `_` arm keeps
 /// this total against future [`WorkflowCommand`] variants.
 const fn command_name(cmd: &WorkflowCommand) -> &'static str {
@@ -1193,6 +1283,7 @@ mod tests {
                 "default",
                 0,
                 None,
+                None,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -1219,6 +1310,7 @@ mod tests {
                 &serde_json::json!({}),
                 "default",
                 0,
+                None,
                 None,
             )
             .unwrap();

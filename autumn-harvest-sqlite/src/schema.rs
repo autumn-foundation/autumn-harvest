@@ -69,9 +69,19 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
     attempt      INTEGER NOT NULL,         -- attempts consumed so far
     run_at       INTEGER NOT NULL,         -- earliest epoch-millisecond this may run
     seq          INTEGER NOT NULL,         -- FIFO ordering within the queue
-    max_attempts INTEGER                   -- per-call retry cap from the command's
+    max_attempts INTEGER,                  -- per-call retry cap from the command's
                                            -- retry_policy_override (issue #1069 P2);
                                            -- NULL = use the registered ActivitySpec default
+    start_to_close_ms INTEGER              -- per-activity start-to-close budget in
+                                           -- milliseconds from the command's
+                                           -- start_to_close_override (issue #1069 P2);
+                                           -- NULL = no budget (unbounded, prior behavior).
+                                           -- Enforced as a post-execution outcome by the
+                                           -- worker: a body whose real wall-clock runtime
+                                           -- exceeds it records a terminal ActivityTimedOut
+                                           -- { StartToClose } instead of ActivityCompleted,
+                                           -- byte-equivalent to what the Postgres timeout
+                                           -- scanner durably records.
 );
 
 CREATE TABLE IF NOT EXISTS harvest_timers (

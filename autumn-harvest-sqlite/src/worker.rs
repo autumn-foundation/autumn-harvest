@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use autumn_harvest::{ExecutionId, TimerId, WorkflowEvent};
+use autumn_harvest::{ExecutionId, TimeoutType, TimerId, WorkflowEvent};
 use rusqlite::Connection;
 
 use crate::error::SqliteResult;
@@ -89,6 +89,11 @@ pub fn drain_ready(
         // result is discarded (no observable state was left half-mutated — the
         // body ran outside any transaction). Mirrors the Postgres worker's
         // handler-panic containment (`catch_unwind` → retryable typed failure).
+        //
+        // Measure the body's REAL wall-clock runtime (`Instant`, NOT the logical
+        // `now` — start-to-close is a real budget for real execution) so a body
+        // that overran its start-to-close budget records a timeout below.
+        let started = std::time::Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (spec.body)(task.input.clone())
         }))
@@ -98,6 +103,28 @@ pub fn drain_ready(
                 autumn_harvest::error::panic_message(payload)
             ))
         });
+        let elapsed = started.elapsed();
+
+        // Enforce the activity's start-to-close timeout (issue #1069 P2), when the
+        // scheduling command carried one (`start_to_close_override`, persisted on the
+        // task row). A synchronous body cannot be cancelled mid-flight in a
+        // single-writer runtime, so this is a POST-EXECUTION outcome: if the body's
+        // real runtime exceeded its budget, record a TERMINAL
+        // `ActivityTimedOut { StartToClose }` — byte-equivalent to the durable event
+        // the Postgres timeout scanner (`enforce_activity_timeout`) records — instead
+        // of the body's actual result. Terminal, NOT retried (the Postgres scanner
+        // appends `ActivityTimedOut` + `fail_task` without requeuing; the workflow
+        // observes `HistoryMatch::TimedOut` and drives its own timeout branch).
+        // Checked BEFORE the normal finalize so an over-budget body's outcome is a
+        // timeout regardless of what it eventually returned. Replay-safe: the outcome
+        // is recorded once, and replay never re-runs the body, so a body whose timing
+        // varies across a crash-rerun (at-least-once) cannot diverge a committed
+        // history.
+        if start_to_close_exceeded(elapsed, task.start_to_close_ms) {
+            finalize_activity_timeout(conn, exec_id, &task, TimeoutType::StartToClose)?;
+            produced = true;
+            continue;
+        }
 
         // Honor the workflow's declared/per-call retry policy when the scheduling
         // command carried one (issue #1069 P2): the task row's persisted
@@ -278,6 +305,76 @@ pub fn finalize_within_tx(
     }
 }
 
+/// True iff a body's real wall-clock `elapsed` exceeded its start-to-close
+/// `budget_ms` (issue #1069 P2).
+///
+/// `None` budget = no start-to-close timeout (unbounded — never exceeded, the
+/// prior behavior for every activity without a declared/per-call timeout). A
+/// non-positive budget is also treated as unbounded (defensive: the core never
+/// emits a `<= 0` start-to-close, and a `0` budget would otherwise time out every
+/// body). The comparison is strict (`>`), so a body that finishes exactly at its
+/// budget completes normally rather than timing out.
+#[must_use]
+pub fn start_to_close_exceeded(elapsed: std::time::Duration, budget_ms: Option<i64>) -> bool {
+    match budget_ms {
+        Some(ms) if ms > 0 => elapsed.as_millis() > u128::try_from(ms).unwrap_or(u128::MAX),
+        _ => false,
+    }
+}
+
+/// Finalize an activity that exceeded its start-to-close budget (issue #1069 P2)
+/// in a **single transaction** (AC7): record the timed-out attempt in the audit
+/// log, append the terminal `ActivityTimedOut` event, and mark the task `DONE`,
+/// together or not at all.
+///
+/// **Terminal — no requeue.** This mirrors the Postgres `enforce_activity_timeout`,
+/// which appends `ActivityTimedOut` and `fail_task`s without requeuing: a
+/// start-to-close timeout is workflow-visible (`HistoryMatch::TimedOut`), not an
+/// attempt-level retry. The workflow drives its own timeout branch.
+pub fn finalize_activity_timeout(
+    conn: &mut Connection,
+    exec_id: ExecutionId,
+    task: &ClaimedTask,
+    timeout_type: TimeoutType,
+) -> SqliteResult<()> {
+    let tx = conn.transaction()?;
+    finalize_timeout_within_tx(&tx, exec_id, task, timeout_type)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The transactional body of [`finalize_activity_timeout`], factored out so the
+/// atomic unit (audit-attempt + terminal `ActivityTimedOut` + `DONE`) can be
+/// driven inside a caller-owned transaction and its roll-back-together atomicity
+/// asserted directly.
+pub fn finalize_timeout_within_tx(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    task: &ClaimedTask,
+    timeout_type: TimeoutType,
+) -> SqliteResult<()> {
+    let attempt_num = task.attempt + 1;
+    // A timed-out attempt is an attempt outcome — record it in the per-attempt
+    // audit log (mirroring `finalize_within_tx`, which always records the attempt).
+    store::record_attempt(
+        conn,
+        exec_id,
+        &task.name,
+        attempt_num,
+        &Err("activity exceeded its start-to-close timeout".to_string()),
+    )?;
+    store::append_event(
+        conn,
+        exec_id,
+        &WorkflowEvent::ActivityTimedOut {
+            activity_id: task.activity_id,
+            timeout_type,
+        },
+    )?;
+    queue::finish_task(conn, &task.task_id)?;
+    Ok(())
+}
+
 /// Fire one due timer atomically: append `TimerFired` and mark the timer row
 /// `fired` in a single transaction, so a crash never records the fired event
 /// without flipping the row — which would both re-fire the timer on restart and
@@ -317,9 +414,11 @@ mod tests {
 
     use autumn_harvest::ExecutionId;
 
+    use std::time::Duration;
+
     use super::{
         finalize_within_tx, fire_timer, fire_timer_within_tx, ingest_awaited_signal,
-        is_signal_timeout_deadline_timer,
+        is_signal_timeout_deadline_timer, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::{schema, store};
@@ -341,6 +440,7 @@ mod tests {
             "default",
             0,
             None,
+            None,
         )
         .unwrap();
         conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
@@ -355,6 +455,7 @@ mod tests {
             input: serde_json::json!({}),
             attempt: 0,
             max_attempts: None,
+            start_to_close_ms: None,
         }
     }
 
@@ -485,6 +586,30 @@ mod tests {
             queue::has_unfired_timer(&conn, exec).unwrap(),
             "the timer must remain unfired (no double-fire)"
         );
+    }
+
+    // FIX 2 (Codex #1069 P2, runtime.rs:715): the start-to-close budget predicate.
+    // `None` (and a non-positive) budget is unbounded (never exceeded); a body is
+    // over-budget only when it STRICTLY exceeds a positive budget, so a body that
+    // finishes exactly at its budget completes normally.
+    #[test]
+    fn start_to_close_exceeded_truth_table() {
+        // No budget → never exceeded (prior behavior for every un-timed activity).
+        assert!(!start_to_close_exceeded(Duration::from_secs(10), None));
+        // Under budget.
+        assert!(!start_to_close_exceeded(Duration::from_millis(5), Some(10)));
+        // Exactly at budget → NOT exceeded (strict `>`).
+        assert!(!start_to_close_exceeded(
+            Duration::from_millis(10),
+            Some(10)
+        ));
+        // Over budget → exceeded.
+        assert!(start_to_close_exceeded(Duration::from_millis(11), Some(10)));
+        assert!(start_to_close_exceeded(Duration::from_secs(40), Some(1)));
+        // A non-positive budget is treated as unbounded (defensive; core never
+        // emits `<= 0`), so a `0`/negative budget never times a body out.
+        assert!(!start_to_close_exceeded(Duration::from_secs(10), Some(0)));
+        assert!(!start_to_close_exceeded(Duration::from_secs(10), Some(-5)));
     }
 
     // FIX 1 (Codex #1069 P2, runtime.rs:699): the deadline-timer-name predicate

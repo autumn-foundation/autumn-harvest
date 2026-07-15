@@ -58,6 +58,28 @@
 //!   `max_attempts` on the task row and the worker uses it in preference to the
 //!   registered [`ActivitySpec`] cap (the raw `execute_activity_raw` path carries no
 //!   override and still falls back to the registered default) (issue #1069 P2).
+//! - **Activity `start_to_close` timeouts are honored.** The declared/per-call
+//!   `start_to_close` (from `#[activity(start_to_close = "…")]` /
+//!   `execute_activity_with_opts`) flows through the scheduling command's
+//!   `start_to_close_override`; the backend persists it (milliseconds) on the task
+//!   row and the worker enforces it as a **post-execution outcome** (issue #1069 P2):
+//!   a synchronous body cannot be cancelled mid-flight in a single-writer runtime, so
+//!   a body whose real wall-clock runtime exceeds its budget records a **terminal**
+//!   `ActivityTimedOut { StartToClose }` (the workflow observes
+//!   [`HarvestError::Timeout`](autumn_harvest::HarvestError::Timeout) and drives its
+//!   own timeout branch) instead of `ActivityCompleted` — byte-equivalent to the
+//!   durable event the Postgres timeout scanner records. The recorded history is
+//!   byte-equivalent even though the wall-clock behavior (the body runs to completion
+//!   before the timeout is recorded) differs, and it is replay-safe: the outcome is
+//!   recorded once and replay never re-runs the body. `None` = no budget (unbounded,
+//!   the prior behavior for every un-timed activity).
+//! - **Typed workflow failures preserve their metadata.** A `#[workflow]` returning a
+//!   typed [`WorkflowFailure`](autumn_harvest::failure::WorkflowFailure) (issue #767)
+//!   is decoded from its `harvest_workflow_failure_v1` wire envelope before the
+//!   terminal `WorkflowFailed` event is appended, so the event carries the typed
+//!   `error_type`/`details` and the execution `error` column holds the human message
+//!   — byte-equivalent to the Postgres terminal path (issue #1069 P2). A legacy
+//!   `Err(String)` is unchanged (all typed fields `None`).
 //!
 //! # Crash-model bound (accepted non-goal)
 //!
@@ -105,11 +127,24 @@
 //! `NOTIFY` push wake-ups, multi-server crash recovery, schedules, the management
 //! API, retention, worker sessions, sharding, and DAGs. In the supported
 //! workflow subset, `continue_as_new`, child workflows, external signals/cancels,
-//! local activities, updates, and search attributes are unsupported and surface
-//! as [`SqliteError::Unsupported`]. Two benign bookkeeping commands are instead
+//! local activities, updates, search attributes, and **worker sessions**
+//! (`ctx.create_session(...)`, issue #606 — a session dispatch carries the
+//! `session_id` / `schedule_to_start_override` `ScheduleActivity` fields this
+//! single-writer backend cannot honor) are unsupported and surface as
+//! [`SqliteError::Unsupported`]. Two benign bookkeeping commands are instead
 //! silently **no-ops** (they append no `WorkflowEvent` and gate no control flow):
 //! `ctx.set_current_details(...)` (the operator status breadcrumb, issue #593) and
 //! a re-park `WaitForActivity`.
+//!
+//! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
+//! author-declared field on the core `ScheduleActivity` command is either HONORED
+//! (`activity_id`/`name`/`input`; `queue` — persisted, though routing is a
+//! single-process no-op; `retry_policy_override` → `max_attempts`;
+//! `start_to_close_override`, above) or REJECTED LOUDLY with
+//! [`SqliteError::Unsupported`] (`session_id`/`session_worker_id` and the
+//! session-acquire-only `schedule_to_start_override`, all outside the subset) —
+//! never silently ignored, so a workflow's declared setting can never take
+//! silently-wrong effect.
 //!
 //! **Signals are pull-only.** A staged signal is appended to history (as
 //! `SignalReceived`) only when a workflow reaches a pull primitive that consumes
