@@ -239,6 +239,37 @@ meet the spike's bar, recommended for GA.
 - **Randomness is explicitly non-cryptographic.** The granted `env::random_u64` is
   a per-invocation xorshift64 draw, documented as unsuitable for security-sensitive
   use.
+- **Minimal-proposal core-WASM engine + fully-bounded store.** The `alloc`/`run`
+  JSON-over-linear-memory ABI needs only MVP core WASM plus funcref tables, so the
+  engine `Config` **disables every post-MVP proposal it does not use** — the
+  narrower the enabled feature set, the smaller both the module-validation attack
+  surface and the set of resource dimensions a guest can reach. Disabled:
+  `wasm_multi_memory`, `wasm_gc`, `wasm_function_references`, `wasm_threads`,
+  `wasm_shared_everything_threads`, `wasm_component_model`, `wasm_relaxed_simd`,
+  `wasm_tail_call`, `wasm_wide_arithmetic`, `wasm_stack_switching`,
+  `wasm_custom_page_sizes`, `wasm_extended_const`, `wasm_memory64`,
+  `wasm_exceptions`, `wasm_legacy_exceptions`. Kept enabled because the ABI or
+  rustc-emitted guests require them and each is already bounded by fuel/memory/table
+  limits (not a host-resource-escape vector): `reference_types` (funcref tables +
+  `ref.null func`), `bulk_memory` (`memory.copy`/`fill`, and a `reference_types`
+  prerequisite), `multi_value`, `simd` (`v128` is a bounded value type),
+  `backtrace`. This closes two escapes that a single `memory_size` cap misses: a
+  multi-memory module (N individually sub-cap linear memories) and a GC-using module
+  (allocations live in a separate GC heap **outside** the linear-memory ceiling) —
+  both now fail **validation** outright. Complementing the engine config, the
+  per-invocation `StoreLimits` caps **every** store resource dimension, not just
+  linear-memory bytes: `memory_size` (16 MiB default), `memories(1)` and
+  `instances(1)` (the ABI instantiates exactly one memory and one module),
+  `tables(16)` + `table_elements(100_000)` (a table is host storage outside the byte
+  ceiling), and `trap_on_grow_failure(true)` (an over-cap `memory.grow`/`table.grow`
+  traps as a retryable `ResourceExhausted` rather than allocating). The guest call
+  stack is bounded by `max_wasm_stack` (512 KiB) so deep recursion traps
+  (`WasmTrap`) rather than overflowing the host worker thread. Evidence:
+  `multi_memory_module_is_rejected_at_validation`, `gc_module_is_rejected_at_validation`,
+  `deep_recursion_is_bounded_trap_not_host_stack_overflow`,
+  `huge_table_declaration_is_bounded_resource_exhausted`,
+  `table_grow_past_cap_is_bounded_resource_exhausted`,
+  `memory_limit_is_resource_exhausted`.
 
 Follow-up (out of scope per the issue): cryptographic module **signing/provenance**
 (the spike provides content-hash **integrity** only — it proves bytes weren't
