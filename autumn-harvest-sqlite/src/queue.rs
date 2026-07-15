@@ -85,23 +85,34 @@ pub struct ClaimedTask {
     /// Unlike [`Self::run_at`-mutating retries], it always denotes when the activity
     /// was first scheduled, so a wait for LATE registration cannot extend the budget.
     pub scheduled_at: i64,
-    /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond.
-    /// **Resolved at CLAIM time**, not read from the DB and not carried on the
-    /// `ScheduleActivity` command (issue #378, Codex #1069 P2 `runtime.rs:944`):
-    /// [`claim_next_ready_task`] leaves it `None`, and
-    /// [`drain_ready`](crate::worker::drain_ready) fills it from the now-guaranteed
-    /// registered `ActivitySpec`'s `default_schedule_to_close` anchored to
-    /// [`Self::scheduled_at`] — exactly as the Postgres worker resolves `ActivityInfo`
-    /// from its `HandlerRegistry` at claim. Resolving at claim (not schedule) time is
-    /// what preserves the deadline for a LATE-registered activity (whose spec was
-    /// absent at schedule time). `Some(at)` = the whole activity (all attempts +
-    /// back-off sleeps combined) must finish before `at`; `None` = no total deadline
-    /// (the activity has no declared `schedule_to_close`, or was raw-registered).
-    /// Enforced by the worker: a task drained at/after `at`, or a retry whose next
-    /// attempt would land at/after `at`, records a terminal
-    /// `ActivityTimedOut { ScheduleToClose }` instead of running/retrying —
-    /// byte-equivalent to the Postgres `schedule_to_close_deadline_exceeded` path.
+    /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond,
+    /// **read from the frozen `schedule_to_close_at` column** (issue #1068). For a
+    /// FROZEN task (`defaults_frozen == true`) this is the immutable value resolved
+    /// once at schedule/claim time; for an UNFROZEN task it is whatever is currently
+    /// on the row (`None` until the worker resolves it from the registered spec,
+    /// anchored to [`Self::scheduled_at`], and freezes it — mirroring the Postgres
+    /// worker resolving `ActivityInfo` from its `HandlerRegistry`). `Some(at)` = the
+    /// whole activity (all attempts + back-off sleeps combined) must finish before
+    /// `at`; `None` = no total deadline (the activity has no declared
+    /// `schedule_to_close`, or was raw-registered). Enforced by the worker: a task
+    /// drained at/after `at`, or a retry whose next attempt would land at/after `at`,
+    /// records a terminal `ActivityTimedOut { ScheduleToClose }` instead of
+    /// running/retrying — byte-equivalent to the Postgres
+    /// `schedule_to_close_deadline_exceeded` path.
     pub schedule_to_close_at: Option<i64>,
+    /// Whether this task's four resolved-default scalars (`retry_policy`,
+    /// `max_attempts`, `start_to_close_ms`, `schedule_to_close_at`) are FROZEN on the
+    /// row (issue #1068). `true` = they were resolved once (at schedule time when the
+    /// activity was already registered, or at first claim for a late-registered one)
+    /// and persisted — the worker reads them VERBATIM and never re-consults the
+    /// mutable registry for them, so an in-flight activity's retry/deadline contract
+    /// is immutable across a crash/reopen or a re-registration under a changed spec.
+    /// `false` = not yet resolved (the activity was scheduled before its
+    /// body/`ActivityInfo` was registered): the worker resolves the four fields from
+    /// the now-present spec, persists them via [`freeze_task_defaults`], and sets this
+    /// to `true`. The activity BODY is always resolved from the registry regardless —
+    /// only the policy/deadline scalars are frozen.
+    pub defaults_frozen: bool,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -156,14 +167,16 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 /// persists it so the worker honors backoff timing + non-retryable classification;
 /// `None` for the raw path (immediate requeue, no policy list).
 ///
-/// The activity's total (cross-retry) `schedule_to_close` deadline is deliberately
-/// **not** a parameter here (issue #378, Codex #1069 P2 `runtime.rs:944`): it is not
-/// carried on the `ScheduleActivity` command, and resolving it here (at schedule
-/// time) from the backend registry would silently DROP it for an activity scheduled
-/// before its body/`ActivityInfo` was registered. Instead the initial `run_at` is
-/// also recorded as the stable `scheduled_at` anchor, and
-/// [`drain_ready`](crate::worker::drain_ready) resolves the deadline from the
-/// registered spec at CLAIM time (when the body is guaranteed present).
+/// `schedule_to_close_at` is the FROZEN absolute (epoch-millisecond) total
+/// (cross-retry) deadline (issue #1068): `Some(at)` when the activity is registered
+/// at schedule time and declares a `schedule_to_close` (`scheduled_at +
+/// default_schedule_to_close`), `None` otherwise. `defaults_frozen` records whether
+/// the four resolved-default scalars are frozen on this row (`true` when the caller
+/// resolved them from the registered spec at schedule time; `false` when the
+/// activity was scheduled before it was registered, so the worker resolves and
+/// freezes them at first claim). The initial `run_at` is also recorded as the stable
+/// `scheduled_at` anchor so the frozen deadline is always measured from when the
+/// activity was first scheduled, never mutated by a retry requeue.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
@@ -176,13 +189,16 @@ pub fn enqueue_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+    defaults_frozen: bool,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
         "INSERT INTO harvest_tasks \
          (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
-          max_attempts, retry_policy_json, start_to_close_ms, scheduled_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7)",
+          max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, \
+          schedule_to_close_at, defaults_frozen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7, ?12, ?13)",
         params![
             uuid::Uuid::new_v4().to_string(),
             exec_id.to_string(),
@@ -195,6 +211,44 @@ pub fn enqueue_activity(
             max_attempts.map(i64::from),
             retry_policy_json,
             start_to_close_ms,
+            schedule_to_close_at,
+            i64::from(defaults_frozen),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Freeze the four resolved-default scalars onto a task row and set
+/// `defaults_frozen = 1` (issue #1068).
+///
+/// Called by [`drain_ready`](crate::worker::drain_ready) at CLAIM time for a task
+/// that was scheduled before its activity was registered (`defaults_frozen == 0`):
+/// once the body/`ActivityInfo` is present, the worker resolves `retry_policy_json`,
+/// `max_attempts`, `start_to_close_ms`, and the absolute `schedule_to_close_at` from
+/// the registered spec, persists them here, and reads them verbatim thereafter — so
+/// a later claim (crash/reopen, or a re-registration under a changed spec) sees the
+/// SAME values rather than re-resolving against a mutated registry. A single
+/// autocommit `UPDATE` scoped to `task_id`. A `None` argument is written as SQL
+/// `NULL` (= "resolved to no value"), which the frozen claim path reads back as
+/// `None`.
+pub fn freeze_task_defaults(
+    conn: &Connection,
+    task_id: &str,
+    retry_policy_json: Option<&str>,
+    max_attempts: Option<u32>,
+    start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET retry_policy_json = ?2, max_attempts = ?3, \
+         start_to_close_ms = ?4, schedule_to_close_at = ?5, defaults_frozen = 1 \
+         WHERE task_id = ?1",
+        params![
+            task_id,
+            retry_policy_json,
+            max_attempts.map(i64::from),
+            start_to_close_ms,
+            schedule_to_close_at,
         ],
     )?;
     Ok(())
@@ -212,7 +266,8 @@ pub fn claim_next_ready_task(
     let row = tx
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
-             retry_policy_json, start_to_close_ms, scheduled_at \
+             retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
+             defaults_frozen \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -227,6 +282,8 @@ pub fn claim_next_ready_task(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
                     row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )
@@ -242,6 +299,8 @@ pub fn claim_next_ready_task(
         retry_policy_json,
         start_to_close_ms,
         scheduled_at,
+        schedule_to_close_at,
+        defaults_frozen,
     )) = row
     else {
         tx.commit()?;
@@ -277,12 +336,12 @@ pub fn claim_next_ready_task(
         retry_policy,
         start_to_close_ms,
         scheduled_at,
-        // Resolved at CLAIM time by `drain_ready` from the now-guaranteed registered
-        // spec anchored to `scheduled_at` (issue #378, Codex #1069 P2 `runtime.rs:944`)
-        // — NOT stored on the row and NOT known here, so `None` until the worker fills
-        // it. Resolving at claim (vs schedule) time preserves the deadline for a
-        // LATE-registered activity whose spec was absent at schedule time.
-        schedule_to_close_at: None,
+        // Read straight from the row (issue #1068). For a frozen task this is the
+        // immutable resolved deadline; for an unfrozen task it is whatever is on the
+        // row (`None` until the worker resolves and freezes it from the now-present
+        // registered spec, anchored to `scheduled_at`).
+        schedule_to_close_at,
+        defaults_frozen: defaults_frozen != 0,
     }))
 }
 

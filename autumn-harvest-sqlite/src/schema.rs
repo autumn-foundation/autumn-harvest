@@ -1,4 +1,6 @@
-//! Hand-written `SQLite` DDL for the embedded backend.
+//! Hand-written `SQLite` DDL for the embedded backend, plus the additive
+//! [`migrate`] step that brings a pre-existing database file up to the current
+//! shape.
 //!
 //! Deliberately **not** the Postgres migration DDL: the dialect differs (TEXT for
 //! UUIDs/JSON, INTEGER for sequence numbers and epoch timestamps) and this
@@ -102,28 +104,48 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- { StartToClose } instead of ActivityCompleted,
                                            -- byte-equivalent to what the Postgres timeout
                                            -- scanner durably records.
-    scheduled_at INTEGER NOT NULL          -- ABSOLUTE epoch-millisecond the ScheduleActivity
+    scheduled_at INTEGER NOT NULL,         -- ABSOLUTE epoch-millisecond the ScheduleActivity
                                            -- command was persisted (== the initial `run_at`).
                                            -- The STABLE anchor for the activity's total
                                            -- (cross-retry) schedule_to_close deadline (issue
                                            -- #378, Codex #1069 P2 runtime.rs:944): unlike
                                            -- `run_at`, it is NEVER mutated by a retry requeue,
                                            -- so it always denotes when the activity was first
-                                           -- scheduled. The deadline itself is NOT persisted
-                                           -- here — the `ActivityInfo::default_schedule_to_close`
-                                           -- is NOT carried on the ScheduleActivity command,
-                                           -- so it is resolved by name from the registered spec
-                                           -- at CLAIM time (when the body is guaranteed
-                                           -- registered — an unregistered activity can never be
-                                           -- claimed) as `scheduled_at + default_schedule_to_close`,
-                                           -- exactly as the Postgres worker resolves ActivityInfo
-                                           -- from its HandlerRegistry. Resolving at CLAIM time
-                                           -- (not schedule time) preserves the deadline for a
-                                           -- LATE-registered activity, whose spec was absent at
-                                           -- schedule time; anchoring to `scheduled_at` (not
-                                           -- claim time) keeps the wall-clock budget measured
-                                           -- from when the activity was scheduled, so a
-                                           -- registration wait does not extend it.
+                                           -- scheduled. The FROZEN absolute deadline derived from
+                                           -- it lives in `schedule_to_close_at` below (issue
+                                           -- #1068).
+    schedule_to_close_at INTEGER,          -- The FROZEN absolute (epoch-millisecond) total
+                                           -- (cross-retry) schedule_to_close deadline for this
+                                           -- task (issue #1068): `scheduled_at +
+                                           -- default_schedule_to_close`. NULL = no total cap
+                                           -- (the activity declared no schedule_to_close, or was
+                                           -- raw-registered). Resolved ONCE and frozen — at
+                                           -- schedule time when the activity is already registered
+                                           -- (`defaults_frozen = 1`), else at first CLAIM for a
+                                           -- LATE-registered activity — so an in-flight run's
+                                           -- deadline is IMMUTABLE and a crash/reopen or a
+                                           -- re-registration under a changed spec cannot alter it,
+                                           -- mirroring the Postgres engine (which freezes the
+                                           -- deadline onto the task-queue row). Anchoring to
+                                           -- `scheduled_at` (never claim time) keeps the wall-clock
+                                           -- budget measured from when the activity was first
+                                           -- scheduled, so a wait for late registration does not
+                                           -- extend it.
+    defaults_frozen INTEGER NOT NULL DEFAULT 0  -- Whether the four resolved-default scalars
+                                           -- (`retry_policy_json`, `max_attempts`,
+                                           -- `start_to_close_ms`, `schedule_to_close_at`) have
+                                           -- been RESOLVED onto this row (issue #1068). 0 = not
+                                           -- yet resolved (the activity was scheduled before its
+                                           -- body/`ActivityInfo` was registered) — the CLAIM path
+                                           -- resolves them from the now-present registered spec,
+                                           -- persists them, and sets this to 1. 1 = frozen: read
+                                           -- the four columns VERBATIM (a NULL means resolved-to-
+                                           -- None) and NEVER re-consult the mutable registry for
+                                           -- them. The activity BODY is always resolved from the
+                                           -- registry regardless — only the policy/deadline
+                                           -- scalars are frozen. `DEFAULT 0` so a row created by
+                                           -- the additive migration (pre-#1068) is treated as
+                                           -- unresolved and gets frozen on its next claim.
 );
 
 CREATE TABLE IF NOT EXISTS harvest_timers (
@@ -160,3 +182,154 @@ CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     detail      TEXT NOT NULL             -- output JSON on success, error on failure
 );
 ";
+
+use rusqlite::Connection;
+
+use crate::error::SqliteResult;
+
+/// Bring an existing database file up to the current [`SCHEMA`] shape by adding
+/// any columns introduced after it was created — run on every
+/// [`SqliteRuntime::open`](crate::SqliteRuntime::open), right after the idempotent
+/// `CREATE TABLE IF NOT EXISTS` batch.
+///
+/// The base schema is applied with `CREATE TABLE IF NOT EXISTS`, so a table that
+/// already exists is left with its *original* column set — a database created
+/// before a column was added would otherwise be missing it, and a fresh `INSERT`
+/// (which lists the new column) would fail with "no such column". This step is the
+/// backend's minimal, forward-only migration: it is **strictly additive** (only
+/// `ALTER TABLE … ADD COLUMN`, never `DROP`/`RENAME`), **idempotent** (each column
+/// is added only when absent, so it is safe to run on every open — including a
+/// fresh database that already has the column), and preserves every existing row's
+/// data.
+///
+/// Current migrations:
+/// - **issue #1068** — `harvest_tasks.schedule_to_close_at` (the frozen absolute
+///   total-deadline column) and `harvest_tasks.defaults_frozen` (the
+///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
+///   valid unchanged and is treated as "defaults not yet frozen" (its next claim
+///   resolves and freezes them).
+///
+/// # Errors
+///
+/// Returns [`SqliteError::Sqlite`](crate::SqliteError::Sqlite) if a column probe or
+/// `ALTER TABLE` fails.
+pub fn migrate(conn: &Connection) -> SqliteResult<()> {
+    // issue #1068: freeze resolved activity defaults onto the task row.
+    add_column_if_absent(
+        conn,
+        "harvest_tasks",
+        "schedule_to_close_at",
+        "ALTER TABLE harvest_tasks ADD COLUMN schedule_to_close_at INTEGER",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_tasks",
+        "defaults_frozen",
+        "ALTER TABLE harvest_tasks ADD COLUMN defaults_frozen INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+/// Run `add_column_sql` iff `table` does not already have a column named `column`.
+///
+/// `table`/`column` are backend-internal string LITERALS (never caller input), so
+/// interpolating them into the `PRAGMA table_info(...)` probe is safe — a `PRAGMA`
+/// takes its table name as a bare identifier, not a bindable parameter.
+fn add_column_if_absent(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    add_column_sql: &str,
+) -> SqliteResult<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute_batch(add_column_sql)?;
+    }
+    Ok(())
+}
+
+/// True iff `table` has a column named `column`, read from `PRAGMA table_info`
+/// (whose result rows are `(cid, name, type, notnull, dflt_value, pk)` — the name
+/// is column index 1).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> SqliteResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::{SCHEMA, column_exists, migrate};
+
+    // The pre-#1068 `harvest_tasks` shape (no freeze columns) — the 14 columns that
+    // existed before this change.
+    const OLD_HARVEST_TASKS_DDL: &str = "\
+        CREATE TABLE harvest_tasks (\
+            task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, activity_id TEXT NOT NULL, \
+            name TEXT NOT NULL, input_json TEXT NOT NULL, queue TEXT NOT NULL, \
+            state TEXT NOT NULL, attempt INTEGER NOT NULL, run_at INTEGER NOT NULL, \
+            seq INTEGER NOT NULL, max_attempts INTEGER, retry_policy_json TEXT, \
+            start_to_close_ms INTEGER, scheduled_at INTEGER NOT NULL)";
+
+    // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is
+    // a pure no-op (idempotent).
+    #[test]
+    fn migrate_is_a_noop_on_a_fresh_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
+        assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
+        // Running it (repeatedly) does not error and does not change the columns.
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
+        assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
+    }
+
+    // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to
+    // date additively — the two columns are added, existing data is preserved.
+    #[test]
+    fn migrate_adds_freeze_columns_to_an_old_schema_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        // Seed a pre-existing row to prove data survives the ALTER.
+        conn.execute(
+            "INSERT INTO harvest_tasks \
+             (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, \
+              run_at, seq, max_attempts, retry_policy_json, start_to_close_ms, scheduled_at) \
+             VALUES ('t1', 'e1', 'a1', 'act', '{}', 'default', 'PENDING', 0, 0, 0, NULL, NULL, NULL, 0)",
+            [],
+        )
+        .unwrap();
+
+        assert!(!column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
+        assert!(!column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
+
+        migrate(&conn).unwrap();
+
+        assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
+        assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
+
+        // The pre-existing row survives; the new columns default correctly (NULL
+        // deadline, unresolved defaults so its next claim freezes them).
+        let (deadline, frozen): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT schedule_to_close_at, defaults_frozen FROM harvest_tasks WHERE task_id = 't1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(deadline, None, "the migrated column defaults to NULL");
+        assert_eq!(
+            frozen, 0,
+            "a migrated row is treated as defaults-not-yet-frozen"
+        );
+    }
+}

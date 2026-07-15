@@ -123,62 +123,78 @@ pub fn drain_ready(
             return Err(crate::error::SqliteError::unregistered(&task.name));
         };
 
-        // Resolve the activity's TOTAL (cross-retry) schedule-to-close deadline at
-        // CLAIM time — NOT schedule time (Codex #1069 P2, `runtime.rs:944`). The
-        // `default_schedule_to_close` (issue #378) is NOT carried on the
-        // `ScheduleActivity` command; the backend resolves it BY NAME from the
-        // registered `ActivitySpec`. Resolving it at schedule time DROPPED it for a
-        // LATE-registered activity — one scheduled before its body/`ActivityInfo` was
-        // registered (the crate's supported flow: the task waits `PENDING` until the
-        // body appears, then a re-drive picks it up), because no spec existed yet and
-        // the later re-drive never backfilled it. By CLAIM time the spec is guaranteed
-        // present: an unregistered activity can never be claimed — it is released back
-        // to `PENDING` above. Anchor the absolute deadline to the task's ORIGINAL
-        // schedule instant (`scheduled_at`, never mutated by a retry requeue), NOT
-        // claim time (which would extend the wall-clock budget by however long the
-        // task waited for registration) and NOT `run_at` (which retries bump forward).
-        // For a normally-registered activity `scheduled_at == the schedule `now``, so
-        // the resolved absolute deadline is byte-identical to the old schedule-time
-        // value — no behavior change for the common case.
+        // FREEZE-OR-READ the four resolved defaults (issue #1068). The task row
+        // records whether its defaults are FROZEN (resolved once and made immutable).
+        //
+        // - `task.defaults_frozen == true`: the four scalars — `retry_policy`,
+        //   `max_attempts`, `start_to_close_ms`, and the absolute
+        //   `schedule_to_close_at` — were resolved at schedule time (or a prior claim)
+        //   and are already loaded from the row verbatim (a NULL column reads as
+        //   `None`). Use them AS-IS and do NOT re-consult the mutable registry for
+        //   them. This is what makes an in-flight activity's retry/deadline contract
+        //   immutable: a crash/reopen or a re-registration of the activity under a
+        //   changed spec between attempts cannot alter it (mirroring the Postgres
+        //   engine, which freezes these onto the task-queue row). Only the activity
+        //   BODY is resolved from the registry (`spec`, above).
+        //
+        // - `task.defaults_frozen == false`: the activity was scheduled before it was
+        //   registered (a late registration — the crate's supported flow: the task
+        //   waits `PENDING` until the body appears, then a re-drive picks it up), so
+        //   the defaults were never frozen. Resolve them now from the
+        //   now-guaranteed-present `ActivitySpec` (an unregistered activity was
+        //   released back to `PENDING` above and never reaches here), PERSIST them, and
+        //   mark the row FROZEN — so any LATER claim (crash/reopen, or a re-registration
+        //   under a changed spec) reads the SAME values rather than re-resolving against
+        //   a mutated registry.
+        //
+        //   The resolution mirrors the schedule-time freeze in `apply_schedule_activity`
+        //   and the pre-#1068 claim-time fallback (Codex #1069 P2, `runtime.rs:331`):
+        //   the command override (persisted as `task.retry_policy` / `.start_to_close_ms`
+        //   on the TYPED path) wins; the RAW path (no override) falls back to the
+        //   registered spec's FULL `default_retry_policy` (backoff + `non_retryable_errors`)
+        //   and `default_start_to_close`. The absolute deadline is anchored to the task's
+        //   ORIGINAL schedule instant (`scheduled_at`, never mutated by a retry requeue),
+        //   NOT claim time (which would extend the wall-clock budget by however long the
+        //   task waited for registration) and NOT `run_at` (which retries bump forward).
+        //   For a normally-registered activity `scheduled_at == the schedule `now``, so
+        //   the resolved absolute deadline is byte-identical to the pre-#1068 value — no
+        //   behavior change for the common case.
         let mut task = task;
-        task.schedule_to_close_at = spec.schedule_to_close.map(|d| {
-            task.scheduled_at
-                .saturating_add(crate::runtime::duration_to_millis_saturating(d))
-        });
+        if !task.defaults_frozen {
+            if task.retry_policy.is_none() {
+                task.retry_policy.clone_from(&spec.default_retry_policy);
+            }
+            if task.start_to_close_ms.is_none() {
+                task.start_to_close_ms = spec
+                    .start_to_close
+                    .map(crate::runtime::duration_to_millis_saturating);
+            }
+            task.schedule_to_close_at = spec.schedule_to_close.map(|d| {
+                task.scheduled_at
+                    .saturating_add(crate::runtime::duration_to_millis_saturating(d))
+            });
+            // The frozen attempt cap: the command override's cap (persisted as
+            // `task.max_attempts`) wins; otherwise the registered spec's derived cap.
+            task.max_attempts = Some(task.max_attempts.unwrap_or(spec.max_attempts));
 
-        // Resolve the effective RETRY POLICY at CLAIM time (FINDING B, Codex #1069 P2
-        // `runtime.rs:331`). The scheduling command's `retry_policy_override` (persisted
-        // as `task.retry_policy`) wins — that is the TYPED `execute_activity` path, which
-        // resolves the activity's declared/per-call policy into the command. But the RAW
-        // `execute_activity_raw` path carries NO override, so `task.retry_policy == None`;
-        // without a fallback the worker would requeue IMMEDIATELY at `now` (no backoff)
-        // and IGNORE the policy's `non_retryable_errors` list — losing BOTH the backoff
-        // timing (`compute_retry_delay`) and the non-retryable classification for a raw
-        // call to an info-registered activity. Mirror the Postgres dispatch fallback to
-        // the registered activity's FULL `default_retry_policy`: resolve it BY NAME from
-        // the now-guaranteed-present `ActivitySpec` (an unregistered activity was released
-        // above and never reaches here), exactly as `schedule_to_close_at` is resolved.
-        // The registry entry is the WHOLE policy (backoff params + `non_retryable_errors`
-        // + `max_attempts`), NOT a collapsed `max_attempts`. A hand-made
-        // `register_activity_raw` spec carries no policy (`None`), so its raw-path task
-        // keeps the prior attempt-cap-only behavior. The `max_attempts` resolution below
-        // stays consistent — `spec.max_attempts` is derived from this same policy in
-        // `register_activity`.
-        if task.retry_policy.is_none() {
-            task.retry_policy.clone_from(&spec.default_retry_policy);
-        }
-
-        // Resolve the per-attempt START-TO-CLOSE budget at CLAIM time (FINDING B class
-        // audit — the sibling of the retry-policy fallback above). The command's
-        // `start_to_close_override` (persisted as `task.start_to_close_ms`) wins on the
-        // TYPED path; the RAW path carries no override, so fall back to the registered
-        // spec's declared `start_to_close` BY NAME — otherwise a raw call to an
-        // info-registered activity silently loses its declared per-attempt budget. A
-        // hand-made raw spec carries `None`, so its behavior is unchanged.
-        if task.start_to_close_ms.is_none() {
-            task.start_to_close_ms = spec
-                .start_to_close
-                .map(crate::runtime::duration_to_millis_saturating);
+            // Persist all four onto the row + flip `defaults_frozen = 1`, so a later
+            // claim reads these verbatim. Run BEFORE the body so a crash after the
+            // freeze but before the finalize reclaims a frozen row (read verbatim on
+            // re-claim), never re-resolving against a spec that may have changed.
+            let retry_json = task
+                .retry_policy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            queue::freeze_task_defaults(
+                conn,
+                &task.task_id,
+                retry_json.as_deref(),
+                task.max_attempts,
+                task.start_to_close_ms,
+                task.schedule_to_close_at,
+            )?;
+            task.defaults_frozen = true;
         }
 
         // Enforce the activity's TOTAL (cross-retry) schedule-to-close deadline
@@ -929,6 +945,9 @@ mod tests {
     /// the registered spec, runs the body, and finalizes — so a finalize-time recheck
     /// exercises the real path end to end.
     fn seed_pending_activity(conn: &Connection, exec: ExecutionId, name: &str) {
+        // Seed an UNFROZEN task (defaults_frozen = false): `drain_ready` resolves the
+        // defaults (incl. `schedule_to_close_at`) from the registered spec at claim and
+        // freezes them — exercising the claim-time freeze path end to end.
         queue::enqueue_activity(
             conn,
             exec,
@@ -940,6 +959,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         )
         .unwrap();
     }
@@ -1026,6 +1047,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         )
         .unwrap();
         conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
@@ -1033,6 +1056,10 @@ mod tests {
         let task_id: String = conn
             .query_row("SELECT task_id FROM harvest_tasks", [], |r| r.get(0))
             .unwrap();
+        // A hand-built ClaimedTask that bypasses the claim SELECT (these tests drive
+        // `finalize_within_tx`/`finalize_activity_result` directly). `defaults_frozen`
+        // is irrelevant on this path — the freeze-or-read branch lives in `drain_ready`,
+        // which these tests do not call — so it is left at the default `false`.
         ClaimedTask {
             task_id,
             activity_id: act,
@@ -1044,6 +1071,7 @@ mod tests {
             start_to_close_ms: None,
             scheduled_at: 0,
             schedule_to_close_at: None,
+            defaults_frozen: false,
         }
     }
 

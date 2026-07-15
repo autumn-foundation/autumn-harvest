@@ -235,6 +235,12 @@ impl SqliteRuntime {
              PRAGMA synchronous = FULL;",
         )?;
         conn.execute_batch(schema::SCHEMA)?;
+        // Bring an existing file up to the current shape (issue #1068): the
+        // `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing table with its
+        // ORIGINAL columns, so this additive, idempotent step adds any column
+        // introduced since the file was created (e.g. `harvest_tasks`'s freeze
+        // columns) before any read/insert touches them. A no-op on a fresh file.
+        schema::migrate(&conn)?;
         // Single-server crash recovery: any task left `RUNNING` was claimed by a
         // process that exited without finalizing — flip it back to `PENDING` so
         // its body re-runs (at-least-once).
@@ -1093,19 +1099,19 @@ impl SqliteRuntime {
         for cmd in commands {
             match cmd {
                 cmd @ WorkflowCommand::ScheduleActivity { .. } => {
-                    // The activity's total (cross-retry) `schedule_to_close` deadline
-                    // (issue #378) is NOT resolved here (Codex #1069 P2,
-                    // `runtime.rs:944`). It is not carried on the `ScheduleActivity`
-                    // command, and resolving it at THIS (schedule) time from the
-                    // registry would silently DROP it for an activity scheduled before
-                    // its body/`ActivityInfo` is registered (`self.activities.get(name)`
-                    // would be `None`), never backfilling it on the later re-drive.
-                    // The stable schedule instant (`now`) is recorded as `scheduled_at`,
-                    // and [`worker::drain_ready`] resolves the deadline from the
-                    // registered spec at CLAIM time — when the body is guaranteed
-                    // present — exactly as the Postgres worker resolves `ActivityInfo`
-                    // from its `HandlerRegistry`.
-                    if apply_schedule_activity(&tx, exec, history, cmd, now)? {
+                    // Freeze the resolved defaults onto the task row when the activity
+                    // is already registered at schedule time (issue #1068): the four
+                    // scalars (retry policy, max_attempts, start_to_close,
+                    // schedule_to_close deadline) are resolved ONCE from the command
+                    // override / registered spec and made immutable for the run's
+                    // life. If the activity is NOT yet registered here (a late
+                    // registration — `self.activities.get(name)` is `None`), the row
+                    // is enqueued UNFROZEN and [`worker::drain_ready`] resolves and
+                    // freezes the defaults from the now-present spec at first CLAIM.
+                    // `self.conn` and `self.activities` are disjoint fields, so
+                    // borrowing the registry while the cycle transaction holds
+                    // `self.conn` is sound.
+                    if apply_schedule_activity(&tx, &self.activities, exec, history, cmd, now)? {
                         produced = true;
                     }
                 }
@@ -1348,15 +1354,20 @@ impl SqliteRuntime {
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
 ///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
 ///   timeout scanner). `None` = no budget (unbounded).
-/// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378,
-///   Codex #1069 P2 `runtime.rs:944`) — honored, but resolved at CLAIM time, NOT
-///   here. It is not a command field, and resolving it at schedule time from the
-///   registry would silently DROP it for an activity scheduled before its body is
-///   registered. This site records only the stable schedule instant (`now`) as
-///   `scheduled_at`; [`worker::drain_ready`](crate::worker::drain_ready) resolves the
-///   absolute deadline (`scheduled_at + default_schedule_to_close`) from the
-///   guaranteed-present registered spec at claim, enforcing the total cross-retry cap
-///   (terminal `ActivityTimedOut { ScheduleToClose }`).
+/// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378)
+///   and the other three resolved defaults — FROZEN onto the row here when the
+///   activity is already registered (issue #1068). It is not a command field, so it
+///   is resolved from the registered spec's `default_schedule_to_close` anchored to
+///   the stable schedule instant (`now`) as the absolute deadline
+///   `scheduled_at + default_schedule_to_close`, and persisted alongside the frozen
+///   retry policy / `max_attempts` / `start_to_close` with `defaults_frozen = 1`. If
+///   the activity is NOT yet registered at schedule time (a late registration), the
+///   row is enqueued UNFROZEN (command overrides only, `defaults_frozen = 0`) and
+///   [`worker::drain_ready`](crate::worker::drain_ready) resolves and freezes the
+///   deadline (and the other defaults) from the now-present spec at first claim.
+///   Freezing makes an in-flight activity's cross-retry deadline immutable across a
+///   crash/reopen or a re-registration under a changed spec, mirroring the Postgres
+///   engine (terminal `ActivityTimedOut { ScheduleToClose }` on the cap).
 /// - `session_id`/`session_worker_id` (worker sessions, issue #606) and the
 ///   session-acquire-only `schedule_to_start_override` — REJECTED LOUDLY with
 ///   [`SqliteError::Unsupported`]: they are outside the single-writer subset (worker
@@ -1369,6 +1380,7 @@ impl SqliteRuntime {
 /// Returns `true` iff a durable row was produced (a fresh schedule).
 fn apply_schedule_activity(
     conn: &Connection,
+    activities: &HashMap<String, ActivitySpec>,
     exec: ExecutionId,
     history: &[WorkflowEvent],
     cmd: &WorkflowCommand,
@@ -1407,22 +1419,68 @@ fn apply_schedule_activity(
     if store::history_has_activity_scheduled(history, &activity_id.to_string()) {
         return Ok(false);
     }
-    let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
-    // Persist the WHOLE retry policy, not just its `max_attempts` (issue #1069 P2,
-    // Codex `runtime.rs:985`): the worker reads `initial_interval` /
-    // `backoff_coefficient` / `max_interval` (backoff timing) and
-    // `non_retryable_errors` (classification) from it. `None` on the raw path.
-    let retry_policy_json = retry_policy_override
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-    let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
-    // The total (cross-retry) `schedule_to_close` deadline is NOT resolved/persisted
-    // here (Codex #1069 P2, `runtime.rs:944`) — `now` is recorded as the stable
-    // `scheduled_at` anchor (inside `persist_scheduled_activity` → `enqueue_activity`,
-    // where the initial `run_at` doubles as `scheduled_at`), and the worker resolves
-    // the deadline from the registered spec at claim time so a LATE-registered
-    // activity keeps its declared deadline.
+
+    // Resolve the four defaults ONCE (issue #1068). When the activity is already
+    // registered, resolve the effective retry policy / `max_attempts` /
+    // `start_to_close` / `schedule_to_close` deadline from the command override
+    // (typed path) falling back to the registered spec (raw path / declared
+    // defaults), and FREEZE them onto the row (`defaults_frozen = true`). A later
+    // claim then reads them verbatim rather than re-resolving against a mutated
+    // registry — so a crash/reopen or a re-registration cannot alter an in-flight
+    // activity's contract. When the activity is NOT yet registered (a late
+    // registration), enqueue the command overrides only (`defaults_frozen = false`);
+    // the worker resolves and freezes the defaults from the now-present spec at first
+    // claim, anchored to the stable `scheduled_at` (== `now` here). `now` is recorded
+    // as `scheduled_at` inside `enqueue_activity` (the initial `run_at` doubles as it).
+    let (max_attempts, retry_policy_json, start_to_close_ms, schedule_to_close_at, defaults_frozen) =
+        if let Some(spec) = activities.get(name.as_str()) {
+            // The effective retry policy: the command override (typed path) wins;
+            // otherwise the registered spec's declared `default_retry_policy` (raw
+            // path). Serialize the WHOLE policy so the worker honors backoff timing +
+            // `non_retryable_errors`, not just the attempt cap.
+            let retry_policy = retry_policy_override
+                .clone()
+                .or_else(|| spec.default_retry_policy.clone());
+            let retry_json = retry_policy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            // The attempt cap: the override's cap wins; otherwise the spec's derived
+            // `max_attempts` (which `register_activity` derives from the same
+            // `default_retry_policy`, so it agrees with `retry_json`).
+            let max_attempts = retry_policy_override
+                .as_ref()
+                .map_or(spec.max_attempts, |p| p.max_attempts);
+            // The per-attempt start-to-close budget: override (typed) wins, else the
+            // spec's declared `default_start_to_close` (raw path).
+            let start_to_close_ms = start_to_close_override
+                .map(duration_to_millis_saturating)
+                .or_else(|| spec.start_to_close.map(duration_to_millis_saturating));
+            // The total (cross-retry) deadline: `scheduled_at (== now) +
+            // default_schedule_to_close`. There is no per-call schedule_to_close
+            // override, so the spec always supplies it.
+            let deadline = spec
+                .schedule_to_close
+                .map(|d| now.saturating_add(duration_to_millis_saturating(d)));
+            (
+                Some(max_attempts),
+                retry_json,
+                start_to_close_ms,
+                deadline,
+                true,
+            )
+        } else {
+            // Late registration: carry the command overrides only; the worker freezes
+            // the rest from the now-present spec at claim (`defaults_frozen = false`).
+            let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
+            let retry_json = retry_policy_override
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
+            (max_attempts, retry_json, start_to_close_ms, None, false)
+        };
+
     persist_scheduled_activity(
         conn,
         exec,
@@ -1434,6 +1492,8 @@ fn apply_schedule_activity(
         max_attempts,
         retry_policy_json.as_deref(),
         start_to_close_ms,
+        schedule_to_close_at,
+        defaults_frozen,
     )?;
     Ok(true)
 }
@@ -1457,11 +1517,13 @@ fn apply_schedule_activity(
 /// onto the task row so the worker enforces it as a post-execution outcome; `None`
 /// leaves it NULL (no budget, prior behavior).
 ///
-/// The total (cross-retry) `schedule_to_close` deadline is deliberately **not** a
-/// parameter (issue #378, Codex #1069 P2 `runtime.rs:944`): `run_at` is recorded as
-/// the stable `scheduled_at` anchor (see [`queue::enqueue_activity`]), and the worker
-/// resolves the deadline from the registered spec at claim time so a LATE-registered
-/// activity keeps its declared deadline.
+/// `schedule_to_close_at`/`defaults_frozen` carry the FROZEN total (cross-retry)
+/// deadline and the resolved-defaults flag (issue #1068): `Some(at)` + `true` when
+/// the activity was registered at schedule time (the four scalars are frozen on the
+/// row), else `None` + `false` for a late registration (the worker freezes them at
+/// first claim). `run_at` is recorded as the stable `scheduled_at` anchor (see
+/// [`queue::enqueue_activity`]) so the frozen deadline is measured from when the
+/// activity was first scheduled.
 #[allow(clippy::too_many_arguments)]
 pub fn persist_scheduled_activity(
     conn: &Connection,
@@ -1474,6 +1536,8 @@ pub fn persist_scheduled_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+    defaults_frozen: bool,
 ) -> SqliteResult<()> {
     store::append_event(
         conn,
@@ -1496,6 +1560,8 @@ pub fn persist_scheduled_activity(
         max_attempts,
         retry_policy_json,
         start_to_close_ms,
+        schedule_to_close_at,
+        defaults_frozen,
     )?;
     Ok(())
 }
@@ -2241,6 +2307,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -2277,6 +2345,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .unwrap();
             tx.commit().unwrap();
