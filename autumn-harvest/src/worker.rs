@@ -12896,10 +12896,15 @@ impl Worker {
         // hot-swapped to v2 back to v1 (issue #965 review). The embedded bytes
         // are always made fetchable-by-hash (so in-flight pinned attempts and
         // this worker can run them); they only become *active* when no active
-        // version exists yet. Idempotent, and per-shard. A failure is logged but
-        // does not abort startup: the module is simply unavailable on that shard
-        // until a later publish, and a dispatch there fails with a typed
-        // `WasmModuleUnavailable`.
+        // version exists yet. Idempotent, and per-shard.
+        //
+        // Fail closed (issue #965 review): if the worker cannot seed its
+        // advertised WASM modules on an assigned shard — because the connection
+        // is unavailable or the seed itself errors (transient DB/migration/
+        // validation failure) — refuse to start rather than enter the poll loop.
+        // Otherwise the worker would advertise WASM activities that resolve to a
+        // non-retryable `WasmModuleUnavailable` on that shard indefinitely. This
+        // mirrors the missing-shard-pool guard at `run()` entry.
         #[cfg(feature = "wasm-activities")]
         {
             let registrations = self.registry.wasm_module_registrations();
@@ -12917,9 +12922,11 @@ impl Worker {
                                     worker_id = %self.config.worker_id,
                                     shard = ?shard,
                                     error = %e,
-                                    "failed to seed registered wasm modules; wasm activities \
-                                     may be unavailable on this shard until published"
+                                    "failed to seed registered wasm modules; refusing to start \
+                                     this worker rather than advertising wasm activities it \
+                                     cannot serve on this shard"
                                 );
+                                return;
                             }
                         }
                         Err(e) => {
@@ -12927,8 +12934,11 @@ impl Worker {
                                 worker_id = %self.config.worker_id,
                                 shard = ?shard,
                                 error = %e,
-                                "failed to acquire a connection to seed registered wasm modules"
+                                "failed to acquire a connection to seed registered wasm modules; \
+                                 refusing to start this worker rather than advertising wasm \
+                                 activities it cannot serve on this shard"
                             );
+                            return;
                         }
                     }
                 }

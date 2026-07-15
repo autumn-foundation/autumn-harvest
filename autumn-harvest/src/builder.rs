@@ -678,6 +678,22 @@ pub enum HarvestBuilderError {
         /// The machine-readable SSRF rejection reason.
         rejection: crate::completion_callback::SsrfRejection,
     },
+
+    /// A native `#[activity]` registration shares its name with a WASM activity
+    /// binding (issue #965 review). The native registration would win in the
+    /// handler registry while the WASM binding lingered, so the worker's WASM
+    /// dispatch seam would run the sandboxed guest under the native activity's
+    /// metadata — a silent wrong-implementation. Rejected at build time; pick a
+    /// distinct name for one of them.
+    #[cfg(feature = "wasm-activities")]
+    #[error(
+        "activity '{activity}' is registered both as a native activity and as a WASM \
+         activity binding; rename one so the name is unambiguous"
+    )]
+    WasmActivityNameCollision {
+        /// The name registered as both native and WASM.
+        activity: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -1715,6 +1731,8 @@ impl HarvestBuilder {
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
         validate_rate_limit_keys(&self.activities)?;
+        #[cfg(feature = "wasm-activities")]
+        validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
             return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
         }
@@ -2176,6 +2194,35 @@ fn validate_rate_limit_keys(
         }
     }
 
+    Ok(())
+}
+
+/// Reject a name registered as BOTH a WASM activity binding and a native
+/// `#[activity]` (issue #965 review).
+///
+/// `wasm_activity(...)` pushes a placeholder `ActivityInfo` ([`is_wasm_stub`]) and
+/// records a `WasmBinding`; a later native `.activities(...)` with the same name
+/// wins in the handler registry (a `HashMap`, last-registration-wins) while the
+/// WASM binding lingers, so the worker's WASM dispatch seam would still resolve
+/// the binding and run the sandboxed guest under the native metadata — a silent
+/// wrong-implementation. Fail closed instead.
+///
+/// [`is_wasm_stub`]: crate::info::ActivityInfo::is_wasm_stub
+#[cfg(feature = "wasm-activities")]
+fn validate_wasm_activity_name_collisions(
+    wasm_bindings: &std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    for activity in activities {
+        // A native (non-placeholder) activity whose name is also a WASM binding
+        // is the ambiguous case. The WASM-activity placeholder itself IS a WASM
+        // binding by construction, so exclude it via `is_wasm_stub`.
+        if !activity.is_wasm_stub() && wasm_bindings.contains_key(activity.name) {
+            return Err(HarvestBuilderError::WasmActivityNameCollision {
+                activity: activity.name.to_string(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -4496,6 +4543,38 @@ mod tests {
         assert_eq!(
             built.completion_callback_config().retry_policy.max_attempts,
             5
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn native_activity_shadowing_a_wasm_binding_is_rejected() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        // A native activity registered with the same name as a WASM activity is
+        // ambiguous: the native handler wins in the registry while the WASM
+        // binding lingers. try_build must reject it rather than silently run the
+        // guest under native metadata.
+        let result = HarvestBuilder::new()
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .activities(vec![make_activity("checksum", None, None)])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmActivityNameCollision { ref activity })
+                    if activity == "checksum"
+            ),
+            "expected WasmActivityNameCollision, got {result:?}"
+        );
+
+        // A WASM activity with no native shadow builds fine.
+        assert!(
+            HarvestBuilder::new()
+                .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+                .try_build()
+                .is_ok(),
+            "a lone WASM activity must build"
         );
     }
 

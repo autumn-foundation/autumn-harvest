@@ -204,7 +204,21 @@ Two distinct costs to keep separate:
   seen, wasmtime Cranelift-compiles it (tens of ms for a real guest). The spike
   amortizes this with the content-hash compiled-module cache
   (`WasmModuleStore::get_or_compile` compiles at most once per hash, process-wide),
-  so only the very first attempt for a given version pays it.
+  so only the very first attempt for a given version pays it. That first compile
+  runs **inside** `PreparedWasmActivity::invoke` on the blocking pool (never on the
+  async dispatch reactor), and its wall-clock is now **charged against the guest's
+  `start_to_close` deadline** (`effective_invoke_deadline` subtracts the measured
+  compile time before arming the epoch deadline): the worker records
+  `ActivityStarted` before the compile, so a large cold module can no longer spend
+  most of its budget compiling and still hand the guest a fresh full deadline — if
+  compile alone meets/exceeds the deadline the guest traps immediately as retryable
+  `ResourceExhausted`. Cancellation is also checked **before** starting a cold
+  compile, so an already-cancelled attempt skips it. A compile **already in flight**
+  cannot be interrupted (wasmtime `Module::new` is not cancellable); the blast
+  radius is bounded by the 32 MiB module-size cap. The GA mitigation that removes
+  cold compile from the dispatch path entirely is **precompile-at-publish/seed**
+  (store the serialized compiled artifact next to the bytes so dispatch only
+  deserializes), which also makes the deadline-charging moot.
 
 GA mitigation for the per-invocation cost: **instance pooling** —
 `wasmtime::InstancePre` (pre-linked instantiation) plus the pooling instance
@@ -334,6 +348,21 @@ invariant).**
   `publish_wasm_module` remains the operator hot-swap primitive.)
 - **Module-size cap.** `MAX_WASM_MODULE_BYTES` (32 MiB) is enforced **before** any
   hashing or DB work (`oversized_module_is_rejected_before_insert`).
+- **Fail-closed startup seed.** If a worker cannot seed its advertised WASM modules
+  on an assigned shard (connection unavailable, or the seed itself errors), it
+  **refuses to start** rather than entering the poll loop and advertising activities
+  that resolve to a non-retryable `WasmModuleUnavailable` indefinitely — mirroring
+  the missing-shard-pool guard (`worker_fails_closed_when_seeding_wasm_modules_fails`).
+- **Duplicate registration is last-wins; native-shadow is rejected.** Registering
+  the same activity name twice via `HarvestBuilder::wasm_activity(...)` keeps only
+  the **later** byte-blob in the startup-seed list — consistent with the binding
+  and the `ActivityInfo` registry, both last-wins — so a clean shard seeds+activates
+  the module matching the last metadata, not a stale first blob
+  (`duplicate_wasm_activity_registration_is_last_wins`). A name registered as **both**
+  a native `#[activity]` and a WASM activity is rejected at `try_build`
+  (`WasmActivityNameCollision`), since the native handler would win in the registry
+  while the WASM binding lingered — running the guest under native metadata
+  (`native_activity_shadowing_a_wasm_binding_is_rejected`).
 
 Follow-ups (out of scope per the issue): an embedder-supplied blob backend for
 large modules composing via the #524 `PayloadStore` pattern (keeping the module row

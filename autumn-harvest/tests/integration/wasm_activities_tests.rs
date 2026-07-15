@@ -18,6 +18,7 @@
 //! fresh testcontainers Postgres is booted with the full migration bundle
 //! (`autumn_harvest::full_migrations_sql()`).
 
+use autumn_harvest::HarvestBuilder;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{
     ERROR_TYPE_RESOURCE_EXHAUSTED, ERROR_TYPE_SANDBOX_DENIED, ERROR_TYPE_WASM_MODULE_INVALID,
@@ -36,10 +37,9 @@ use autumn_harvest::wasm_activities::{
 use autumn_harvest::wasm_store::{
     MAX_WASM_MODULE_BYTES, WasmActivityRegistration, WasmBinding, WasmDispatch,
     fetch_wasm_module_bytes, list_wasm_modules, publish_registered_wasm_modules,
-    publish_wasm_module, resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
-    seed_registered_wasm_modules, seed_wasm_module,
+    publish_wasm_module, resolve_active_wasm_hash, resolve_active_wasm_module,
+    resolve_wasm_dispatch, seed_registered_wasm_modules, seed_wasm_module,
 };
-use autumn_harvest::HarvestBuilder;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
 use chrono::Utc;
@@ -1080,6 +1080,56 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     assert!(
         !types.iter().any(|t| t.to_lowercase().contains("wasm")),
         "no wasm-specific event variant may appear: {types:?}"
+    );
+}
+
+// ── fail-closed on seed failure (issue #965 review, Finding 14) ─────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_fails_closed_when_seeding_wasm_modules_fails() {
+    // A worker that cannot seed its advertised WASM modules on startup must
+    // refuse to start rather than enter the poll loop and advertise activities
+    // that resolve to a non-retryable WasmModuleUnavailable forever. We force a
+    // seed failure with an oversized module (rejected before any DB work), then
+    // assert `run()` returns ON ITS OWN — without any `shutdown()` — proving the
+    // fail-closed `return` fired. A worker that did NOT fail closed would poll
+    // indefinitely and this join would time out.
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-failclosed";
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
+
+    let oversized = vec![0u8; MAX_WASM_MODULE_BYTES + 1];
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: oversized,
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    let worker = build_worker("w-wasm-failclosed", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // run() must return on its own (fail closed) — never call shutdown().
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("worker must fail closed and return on its own, not poll forever")
+        .expect("worker task joins cleanly");
+
+    // The seeded workflow was never dispatched — it stays un-completed.
+    let execution = load_execution(&url, exec_id).await;
+    assert_ne!(
+        execution.state, "COMPLETED",
+        "a fail-closed worker must not have processed any work"
     );
 }
 

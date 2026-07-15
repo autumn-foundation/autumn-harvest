@@ -225,6 +225,26 @@ impl PreparedWasmActivity {
         let (module, compile_elapsed) = match &self.source {
             WasmModuleSource::Compiled(module) => (Arc::clone(module), Duration::ZERO),
             WasmModuleSource::Deferred { hash, bytes } => {
+                // Skip a cold compile entirely if the attempt is already
+                // cancelled (issue #965 review). The cancellation-aware epoch
+                // deadline is only armed inside the invoke *after* this compile,
+                // so without this check a cancel arriving during a large cold
+                // compile drops the join handle while the blocking thread keeps
+                // compiling to completion. NB: a `Module::new` compile ALREADY in
+                // flight cannot be interrupted (wasmtime compilation is not
+                // cancellable); this only avoids *starting* one. The blast radius
+                // is bounded by the 32 MiB module-size cap, and the GA mitigation
+                // is to precompile at publish/seed time so no compile ever runs
+                // on the dispatch path.
+                if self
+                    .cancel
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    return Err(ActivityFailure::resource_exhausted(
+                        "wasm activity cancelled before compilation",
+                    ));
+                }
                 // Compile (and integrity-check) here, on the blocking pool. A
                 // concurrent dispatch may have compiled the same hash already;
                 // `get_or_compile` serves the cached `Arc` if so, otherwise
@@ -812,6 +832,39 @@ mod tests {
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(4)), Duration::ZERO),
             Some(Duration::from_secs(4))
+        );
+    }
+
+    #[test]
+    fn cancelled_deferred_invoke_skips_compile() {
+        // An already-cancelled token on a cache-miss (Deferred) invoke must skip
+        // the cold compile and return promptly (issue #965 review). The bytes are
+        // deliberately invalid wasm: had the compile run, `get_or_compile` would
+        // return `WasmModuleInvalid`; instead we get a cancelled
+        // `ResourceExhausted`, proving the compile was never started.
+        let store = Arc::new(WasmModuleStore::new());
+        let invalid = vec![0u8, 1, 2, 3];
+        let hash = WasmModuleStore::compute_hash(&invalid);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let prepared = PreparedWasmActivity {
+            store,
+            source: WasmModuleSource::Deferred {
+                hash,
+                bytes: invalid,
+            },
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            deadline: None,
+            cancel: Some(cancel),
+        };
+        let err = prepared
+            .invoke(&serde_json::Value::Null)
+            .expect_err("cancelled invoke must fail");
+        assert_eq!(
+            err.error_type,
+            crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
+            "a skipped compile yields cancelled ResourceExhausted, not WasmModuleInvalid"
         );
     }
 }
