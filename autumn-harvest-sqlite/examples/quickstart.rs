@@ -123,6 +123,9 @@ async fn main() -> Result<(), SqliteError> {
         ExecutionOutcome::Running => {
             println!("still running (unexpected for this example)");
         }
+        ExecutionOutcome::Terminated(state) => {
+            println!("terminal ({state}) — superseded/cancelled, no clean output");
+        }
     }
 
     // The full, replayable event log — the canonical source of truth.

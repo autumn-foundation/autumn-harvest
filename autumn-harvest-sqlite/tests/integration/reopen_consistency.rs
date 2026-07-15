@@ -163,6 +163,14 @@ fn assert_reopen_consistent(rt: &SqliteRuntime, path: &Path, exec: ExecutionId) 
                 "a RUNNING execution must carry no terminal event"
             );
         }
+        ExecutionOutcome::Terminated(_) => {
+            // A sealed/superseded terminal (CONTINUED_AS_NEW / CANCELLED / …) carries
+            // no clean WorkflowCompleted/WorkflowFailed body event.
+            assert!(
+                !has_completed && !has_failed,
+                "a sealed/terminated execution must carry no completed/failed event"
+            );
+        }
     }
 }
 

@@ -40,7 +40,7 @@
 
 use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::prelude::*;
-use autumn_harvest_sqlite::{RunState, SqliteError, SqliteRuntime, StartOutcome};
+use autumn_harvest_sqlite::{ExecutionOutcome, RunState, SqliteError, SqliteRuntime, StartOutcome};
 use serde_json::json;
 
 // ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -694,4 +694,87 @@ async fn driving_a_sealed_execution_is_terminal() {
         matches!(state, RunState::Failed(_)),
         "a sealed execution drives to a terminal state, got {state:?}"
     );
+}
+
+// ── FINDING 2 (Codex #1080 P2): outcome() of a superseded prior is TERMINAL ───────
+//
+// When a reuse-policy decision SEALS a prior execution to `CONTINUED_AS_NEW`
+// (`TerminateIfRunning` over any prior; `AllowDuplicateFailedOnly` over a FAILED
+// prior), the pure `outcome()` accessor must report the superseded run TERMINALLY —
+// consistent with the driver's `erase::is_terminal_state` short-circuit — NOT as
+// `Running`. Pre-fix `outcome()` mapped every state other than COMPLETED/FAILED to
+// `Running`, so a client polling the superseded prior saw it active forever.
+
+/// A `TerminateIfRunning` replace seals a RUNNING prior to `CONTINUED_AS_NEW`; its
+/// `outcome()` must be `Terminated`, not `Running`.
+#[tokio::test]
+async fn outcome_of_a_superseded_prior_is_terminal_not_running() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime_at(&path);
+    let prior = seed_prior(&mut rt, "wait_wf", "term-1").await;
+    assert_eq!(raw_state(&path, prior), "RUNNING");
+    // Pre-fix control: a RUNNING prior legitimately reports Running.
+    assert!(
+        matches!(rt.outcome(prior).unwrap(), ExecutionOutcome::Running),
+        "precondition: the live prior reports Running"
+    );
+
+    let out = rt
+        .start_workflow_with_reuse_policy(
+            "wait_wf",
+            "term-1",
+            json!({}),
+            WorkflowIdReusePolicy::TerminateIfRunning,
+        )
+        .unwrap();
+    assert!(out.created);
+    assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
+
+    // The superseded prior is TERMINAL, carrying the raw sealed state — NOT Running
+    // (RED pre-fix: outcome() returned Running for the CONTINUED_AS_NEW prior).
+    match rt.outcome(prior).unwrap() {
+        ExecutionOutcome::Terminated(state) => assert_eq!(
+            state, "CONTINUED_AS_NEW",
+            "the sealed prior reports its raw terminal state"
+        ),
+        other => panic!("expected a Terminated outcome for a sealed prior, got {other:?}"),
+    }
+    // The fresh run is the live one.
+    assert!(matches!(
+        rt.outcome(out.exec_id).unwrap(),
+        ExecutionOutcome::Running
+    ));
+}
+
+/// `AllowDuplicateFailedOnly` over a FAILED prior seals it to `CONTINUED_AS_NEW`;
+/// its `outcome()` must likewise be `Terminated`, not `Running`.
+#[tokio::test]
+async fn outcome_of_a_failed_only_replaced_prior_is_terminal_not_running() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime_at(&path);
+    let prior = seed_prior(&mut rt, "fail_wf", "term-2").await;
+    assert_eq!(raw_state(&path, prior), "FAILED");
+    // A genuinely FAILED prior reports Failed before it is replaced.
+    assert!(matches!(
+        rt.outcome(prior).unwrap(),
+        ExecutionOutcome::Failed(_)
+    ));
+
+    let out = rt
+        .start_workflow_with_reuse_policy(
+            "fail_wf",
+            "term-2",
+            json!({}),
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        )
+        .unwrap();
+    assert!(out.created, "a FAILED prior is replaced");
+    assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
+
+    // Once SEALED, the prior is Terminated (superseded), not Running and no longer
+    // Failed (RED pre-fix: outcome() returned Running for the sealed state).
+    match rt.outcome(prior).unwrap() {
+        ExecutionOutcome::Terminated(state) => assert_eq!(state, "CONTINUED_AS_NEW"),
+        other => panic!("expected Terminated for a sealed FAILED-replaced prior, got {other:?}"),
+    }
 }

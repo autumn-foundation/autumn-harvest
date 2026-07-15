@@ -135,6 +135,18 @@ pub enum ExecutionOutcome {
     Completed(Value),
     /// Failed with this error.
     Failed(String),
+    /// A terminal state OTHER than a clean success/failure — inert and never
+    /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
+    /// failure error (unlike [`Self::Failed`]). The dominant case is a prior run
+    /// SEALED to `CONTINUED_AS_NEW` when a `TerminateIfRunning` /
+    /// `AllowDuplicateFailedOnly` reuse-policy decision superseded it with a newer
+    /// run (issue #1068); it also covers `CANCELLED` / `TIMED_OUT` / `TERMINATED`.
+    /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
+    /// caller can distinguish which terminal it is. Reporting these terminally —
+    /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
+    /// driver's `erase::is_terminal_state` short-circuit (Codex #1080 P2): a client
+    /// polling a superseded prior must see it end, not spin forever.
+    Terminated(String),
 }
 
 /// The result of a start-boundary reuse-policy decision (issue #1068) — returned by
@@ -855,6 +867,17 @@ impl SqliteRuntime {
             "FAILED" => Ok(ExecutionOutcome::Failed(
                 store::execution_error(&self.conn, exec)?.unwrap_or_default(),
             )),
+            // Any OTHER terminal state — a prior SEALED to `CONTINUED_AS_NEW` by a
+            // `TerminateIfRunning`/`AllowDuplicateFailedOnly` replace (issue #1068),
+            // or a `CANCELLED`/`TIMED_OUT`/`TERMINATED` run — is inert and must be
+            // reported TERMINALLY, consistent with the driver's
+            // `erase::is_terminal_state` short-circuit (Codex #1080 P2). Mapping it
+            // to `Running` (the old behavior) left a client polling a superseded run
+            // seeing it active forever, even though `drive_one_cycle` already treats
+            // it as terminal.
+            other if autumn_harvest::erase::is_terminal_state(other) => {
+                Ok(ExecutionOutcome::Terminated(other.to_string()))
+            }
             _ => Ok(ExecutionOutcome::Running),
         }
     }

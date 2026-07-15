@@ -107,28 +107,48 @@ pub fn drain_ready(
     // activity `ctx.race()`, break as soon as ONE branch reaches a terminal event
     // so the workflow re-settles and cancels the still-pending losers before they
     // are drained (see the fn doc). A retry (no terminal) never breaks.
-    while let Some(task) = queue::claim_next_ready_task(conn, exec_id, now)? {
-        // `claim_next_ready_task` has already committed this row to `RUNNING`. If
-        // the activity name has no registered body, RELEASE the claim back to
-        // `PENDING` before surfacing the error (Codex #1069 P2) — otherwise the
-        // row is stranded `RUNNING`, invisible to later drains (which only
-        // re-claim `PENDING`), until a full DB close+reopen runs the orphan
-        // reclaim. Releasing it lets a later drain re-claim it once the caller
-        // registers the activity in the SAME runtime, with no reopen. The error
-        // is still returned loudly; the release only leaves the task
-        // re-claimable. The error propagates out of the drive loop, so the
-        // caller is not spun (mirrors the non-determinism gate).
-        let Some(spec) = activities.get(&task.name) else {
-            queue::release_claim(conn, &task.task_id)?;
-            return Err(crate::error::SqliteError::unregistered(&task.name));
+    loop {
+        // Claim the next ready task and FREEZE its resolved defaults ATOMICALLY —
+        // both in ONE `BEGIN IMMEDIATE` transaction (issue #1068; Codex #1080 P2).
+        // The old flow committed the `RUNNING` claim in one transaction and froze
+        // the defaults in a SEPARATE one, leaving a committed `RUNNING`+unfrozen row
+        // in the gap: a crash there was reclaimed `PENDING` (still unfrozen) by
+        // `reclaim_orphaned_running`, and a re-registration under a CHANGED spec
+        // before the next drive then froze the NEW defaults — silently altering an
+        // "already-claimed" late-registered task's frozen contract. Committing the
+        // claim and the freeze together makes that intermediate state unreachable:
+        // either both commit (`RUNNING`+frozen) or neither does (the row stays
+        // `PENDING`+unfrozen, and the freeze happens atomically with whatever spec
+        // is registered at the ACTUAL first successful claim).
+        //
+        // The transaction is held only across the spec lookup + freeze (a hash
+        // lookup + a pure resolution + one `UPDATE`) and is committed BEFORE the
+        // activity body runs — never across the body — so the write lock is held
+        // for microseconds and the body remains at-least-once (outside any tx).
+        let (task, spec) = {
+            let Some((tx, task)) = queue::claim_next_ready_task_tx(conn, exec_id, now)? else {
+                break;
+            };
+            let mut task = task;
+            // If the activity name has no registered body, ROLL BACK the uncommitted
+            // claim (dropping the tx = rollback) so the row stays `PENDING` and is
+            // re-claimable once the body is registered in the SAME runtime — no
+            // orphaned `RUNNING` row, no DB reopen needed. The error still surfaces
+            // loudly out of the drive loop so the caller is not spun (mirrors the
+            // non-determinism gate).
+            let Some(spec) = activities.get(&task.name) else {
+                drop(tx);
+                return Err(crate::error::SqliteError::unregistered(&task.name));
+            };
+            // FREEZE-OR-READ the four resolved defaults (issue #1068) IN THIS SAME
+            // transaction, resolving from the now-present `spec` and persisting them
+            // on a first (unfrozen) claim, then commit the claim+freeze together.
+            // Extracted to [`freeze_defaults_at_claim`]; see its doc for the full
+            // freeze/read contract.
+            freeze_defaults_at_claim(&tx, &mut task, spec)?;
+            tx.commit()?;
+            (task, spec)
         };
-
-        // FREEZE-OR-READ the four resolved defaults (issue #1068), resolving from the
-        // now-present `spec` and persisting them on a first (unfrozen) claim. Extracted
-        // to [`freeze_defaults_at_claim`] (keeps this loop within the clippy line
-        // budget); see its doc for the full freeze/read contract.
-        let mut task = task;
-        freeze_defaults_at_claim(conn, &mut task, spec)?;
 
         // Enforce the activity's TOTAL (cross-retry) schedule-to-close deadline
         // BEFORE running the body (issue #378, Codex #1069 P2 `runtime.rs:39`). A
@@ -368,9 +388,18 @@ pub fn drain_ready(
 ///   resolved absolute deadline is byte-identical to the pre-#1068 value — no
 ///   behavior change for the common case.
 ///
-/// Persists BEFORE the body runs so a crash after the freeze but before the finalize
-/// reclaims a frozen row (read verbatim on re-claim), never re-resolving against a
-/// spec that may have changed.
+/// Called by [`drain_ready`] **inside the same `BEGIN IMMEDIATE` transaction as the
+/// `RUNNING` claim** (issue #1068; Codex #1080 P2): `conn` here is the still-open
+/// claim transaction (a `&Transaction` deref-coerces to `&Connection`), so the freeze
+/// `UPDATE` and the claim's `RUNNING` flip commit together. This closes the gap where
+/// the claim committed `RUNNING` in one transaction and this freeze committed in a
+/// SEPARATE one — a crash between them left a committed `RUNNING`+unfrozen row that a
+/// reopen reclaimed `PENDING` (still unfrozen) and a re-registration could then freeze
+/// against a CHANGED spec. Because the two now commit atomically, there is never a
+/// committed `RUNNING`+unfrozen intermediate for a late-registered task: either both
+/// commit (`RUNNING`+frozen) or neither does (the row stays `PENDING`+unfrozen, so the
+/// freeze happens atomically with whatever spec is registered at the ACTUAL first
+/// successful claim).
 fn freeze_defaults_at_claim(
     conn: &Connection,
     task: &mut ClaimedTask,
@@ -727,14 +756,14 @@ pub fn finalize_within_tx(
                 // matching Postgres (which computes the delay AFTER handling the
                 // result); the old cycle-`now` anchor made a retry ready too early
                 // (or immediately, if the body ran longer than the delay). A delayed
-                // requeue sets `run_at` in the future, so `claim_next_ready_task`
+                // requeue sets `run_at` in the future, so `claim_next_ready_task_tx`
                 // (`run_at <= now`) will NOT re-claim it until the driver advances
                 // the clock past the deadline — the workflow blocks on the
                 // backing-off activity (see `classify_block`) rather than
                 // busy-retrying.
                 //
                 // A ZERO computed delay is an IMMEDIATE retry and MUST requeue at
-                // the CYCLE-START `now`, so `claim_next_ready_task(now)` re-claims it
+                // the CYCLE-START `now`, so `claim_next_ready_task_tx(now)` re-claims it
                 // in THIS same drain pass and the retry sequence converges in one
                 // call. This covers both the raw/no-policy path (`retry_policy ==
                 // None`) AND a zero-delay policy (e.g. `RetryPolicy::fixed(n, 0ms)`,
@@ -789,7 +818,7 @@ pub fn finalize_within_tx(
                 // - IMMEDIATE (`run_at <= now`, a zero-delay/no-policy retry): the
                 //   task would be re-claimable in THIS same drain pass. Move it to
                 //   the BACK of the ready queue (fresh highest `seq`) so
-                //   `claim_next_ready_task` (`ORDER BY seq`) YIELDS to every ready
+                //   `claim_next_ready_task_tx` (`ORDER BY seq`) YIELDS to every ready
                 //   SIBLING before returning to the just-failed branch. Without
                 //   this, a low-`seq` `ctx.race()` branch that fails-and-retries
                 //   with zero delay re-selects itself every retry, monopolizes the
@@ -1514,7 +1543,7 @@ mod tests {
     }
 
     // FIX A invariant preserved: the RAW/no-policy path still requeues at the
-    // CYCLE-START `now` (delay 0, ignoring `failure_now`), so `claim_next_ready_task`
+    // CYCLE-START `now` (delay 0, ignoring `failure_now`), so `claim_next_ready_task_tx`
     // re-claims it in the SAME drain pass and the retry sequence converges in one
     // cycle. Anchoring it to `failure_now` (>= now under the wall clock) would push
     // `run_at` past `now`, break the converge-in-one-pass contract, and make
@@ -2030,5 +2059,176 @@ mod tests {
         };
         assert!(!commands_open_activity_race(std::slice::from_ref(&fan_out)));
         assert!(!commands_open_activity_race(&[]));
+    }
+
+    // ── FINDING 1 (Codex #1080 P2): claim + late-registration freeze are atomic ─────
+    //
+    // The `RUNNING` claim and the first-claim default-freeze commit in ONE
+    // transaction, so a crash in the old claim→freeze gap can no longer leave a
+    // committed `RUNNING`+unfrozen row — which a reopen would reclaim
+    // `PENDING`-still-unfrozen, letting a re-registration under a CHANGED spec
+    // re-freeze the NEW defaults and silently alter an already-claimed
+    // late-registered task's frozen retry/deadline contract.
+
+    /// `(state, defaults_frozen)` of the single task row for `exec` — the direct
+    /// atomic-invariant probe.
+    fn state_and_frozen(conn: &Connection, exec: ExecutionId) -> (String, i64) {
+        conn.query_row(
+            "SELECT state, defaults_frozen FROM harvest_tasks WHERE exec_id = ?1",
+            [exec.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn seed_exec_with_pending_activity(conn: &Connection, exec: ExecutionId, name: &str) {
+        store::insert_execution(
+            conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        // Enqueued UNFROZEN (defaults_frozen = 0) — the late-registration shape.
+        seed_pending_activity(conn, exec, name);
+    }
+
+    /// A late-registered task's claim (`RUNNING` flip) and freeze commit ATOMICALLY:
+    /// after the single commit the row is `RUNNING` **and** frozen — never
+    /// `RUNNING`+unfrozen. Pre-fix the freeze ran in a SEPARATE transaction after the
+    /// claim had already committed `RUNNING`, so a committed `RUNNING`+unfrozen state
+    /// existed in the gap.
+    #[test]
+    fn late_registration_claim_and_freeze_are_atomic() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        seed_exec_with_pending_activity(&conn, exec, "act");
+        let spec = ActivitySpec::new(3, |_| Ok(serde_json::json!(null)));
+
+        // Atomic claim+freeze in ONE transaction, exactly as `drain_ready` does.
+        let (tx, mut task) = queue::claim_next_ready_task_tx(&mut conn, exec, 0)
+            .unwrap()
+            .expect("a ready task");
+        assert!(!task.defaults_frozen, "the seeded task is unfrozen");
+        super::freeze_defaults_at_claim(&tx, &mut task, &spec).unwrap();
+        tx.commit().unwrap();
+
+        // After the single commit: RUNNING AND frozen — the claim and the freeze
+        // landed together. No committed RUNNING+unfrozen state ever existed.
+        let (state, frozen) = state_and_frozen(&conn, exec);
+        assert_eq!(state, "RUNNING", "the claim committed RUNNING");
+        assert_eq!(frozen, 1, "...and the freeze committed atomically with it");
+        assert!(
+            !(state == "RUNNING" && frozen == 0),
+            "invariant: no committed RUNNING+unfrozen row for a late-registered task",
+        );
+    }
+
+    /// The falsifiable crash-in-gap immutability test: a crash AFTER the claim's
+    /// `RUNNING` flip but BEFORE the freeze commits rolls the WHOLE claim back (both
+    /// share one transaction), so the row returns to `PENDING`+unfrozen — never a
+    /// committed `RUNNING`+unfrozen intermediate for a reopen+re-registration to
+    /// re-freeze against a changed spec. Pre-fix `claim_next_ready_task` committed
+    /// `RUNNING` immediately, so the SAME "crash before freeze" left a committed
+    /// `RUNNING`+unfrozen row — the exact gap this closes.
+    #[test]
+    fn late_registration_frozen_defaults_survive_a_crash_in_the_claim_gap() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        seed_exec_with_pending_activity(&conn, exec, "act");
+
+        // Model a crash in the claim→freeze gap: open the atomic claim (which flips
+        // the row to RUNNING INSIDE the tx) and then CRASH before the freeze/commit —
+        // i.e., DROP the transaction without committing. Because claim+freeze share
+        // one tx, the drop rolls the RUNNING flip back too.
+        {
+            let (tx, task) = queue::claim_next_ready_task_tx(&mut conn, exec, 0)
+                .unwrap()
+                .expect("a ready task");
+            assert!(!task.defaults_frozen);
+            // [crash — the freeze never runs and nothing commits]
+            drop(tx);
+        }
+
+        // The uncommitted claim rolled back: PENDING (re-claimable) and still
+        // unfrozen. Critically, no committed RUNNING+unfrozen row was ever left for a
+        // reopen (`reclaim_orphaned_running`) + re-registration to re-freeze against a
+        // hostile spec.
+        let (state, frozen) = state_and_frozen(&conn, exec);
+        assert_eq!(
+            state, "PENDING",
+            "the uncommitted claim rolled back — no orphaned RUNNING row",
+        );
+        assert_eq!(frozen, 0, "still unfrozen — the freeze never committed");
+        assert!(
+            !(state == "RUNNING" && frozen == 0),
+            "a crash in the claim→freeze gap must never leave a committed RUNNING+unfrozen row",
+        );
+
+        // Recovery is clean: the row is re-claimable and freezes atomically against
+        // whatever spec is registered at the ACTUAL first successful claim.
+        let spec = ActivitySpec::new(2, |_| Ok(serde_json::json!(null)));
+        let (tx, mut task) = queue::claim_next_ready_task_tx(&mut conn, exec, 0)
+            .unwrap()
+            .expect("re-claimable after the rolled-back gap");
+        super::freeze_defaults_at_claim(&tx, &mut task, &spec).unwrap();
+        tx.commit().unwrap();
+        let (state, frozen) = state_and_frozen(&conn, exec);
+        assert_eq!(
+            (state.as_str(), frozen),
+            ("RUNNING", 1),
+            "the re-claim freezes atomically",
+        );
+        assert_eq!(
+            task.max_attempts,
+            Some(2),
+            "frozen from the spec registered at the real first claim",
+        );
+    }
+
+    /// `reclaim_orphaned_running` flips a stranded RUNNING row to PENDING but must NOT
+    /// reset `defaults_frozen`: a frozen reclaimed task stays frozen, so its
+    /// retry/deadline contract is not re-resolved against a mutated registry after a
+    /// crash/reopen.
+    #[test]
+    fn reclaim_orphaned_running_preserves_defaults_frozen() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        // A FROZEN, stranded-RUNNING task.
+        queue::enqueue_activity(
+            &conn,
+            exec,
+            ActivityExecId::new(),
+            "act",
+            &serde_json::json!({}),
+            "default",
+            0,
+            Some(3),
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
+            .unwrap();
+
+        let n = queue::reclaim_orphaned_running(&conn).unwrap();
+        assert_eq!(n, 1, "the stranded RUNNING row is reclaimed");
+        let (state, frozen) = state_and_frozen(&conn, exec);
+        assert_eq!(state, "PENDING", "reclaim flips RUNNING → PENDING");
+        assert_eq!(
+            frozen, 1,
+            "reclaim must NOT reset defaults_frozen (the frozen contract survives)",
+        );
     }
 }

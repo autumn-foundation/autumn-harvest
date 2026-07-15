@@ -35,7 +35,7 @@
 
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{ActivityExecId, ExecutionId};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -254,14 +254,32 @@ pub fn freeze_task_defaults(
     Ok(())
 }
 
-/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id`,
-/// flipping it to `RUNNING` inside a `BEGIN IMMEDIATE` transaction. See the
-/// module docs for why this replaces `SKIP LOCKED`.
-pub fn claim_next_ready_task(
+/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id`, flipping
+/// it to `RUNNING` inside a `BEGIN IMMEDIATE` transaction — and return the STILL-OPEN
+/// transaction so the caller can freeze the task's resolved defaults in the SAME
+/// transaction before committing (issue #1068; Codex #1080 P2). See the module docs
+/// for why this replaces `SKIP LOCKED`.
+///
+/// The returned transaction is NOT committed. The caller (`worker::drain_ready`)
+/// resolves the activity's registered spec and, for an UNFROZEN (late-registered)
+/// task, calls [`freeze_task_defaults`] through the same transaction, then commits —
+/// so the `RUNNING` flip and the default-freeze commit ATOMICALLY. This closes the
+/// gap where the old (self-committing) claim left a committed `RUNNING`+unfrozen row:
+/// a crash between the claim commit and a SEPARATE freeze commit could then be
+/// reclaimed `PENDING` (still unfrozen) and re-frozen against a CHANGED registry,
+/// silently altering an "already-claimed" late-registered task's frozen contract. If
+/// the caller instead DROPS the transaction (an unregistered activity, or a crash
+/// before commit), the whole claim rolls back and the row stays `PENDING` — no
+/// orphaned `RUNNING` row, and nothing for a reopen to mis-handle.
+///
+/// The `Transaction` is held only across the caller's spec lookup + freeze (a hash
+/// lookup + a pure resolution + one `UPDATE`) — never across the activity BODY, which
+/// runs after the caller commits — so the write lock is held for microseconds.
+pub fn claim_next_ready_task_tx(
     conn: &mut Connection,
     exec_id: ExecutionId,
     now: i64,
-) -> SqliteResult<Option<ClaimedTask>> {
+) -> SqliteResult<Option<(Transaction<'_>, ClaimedTask)>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
@@ -303,6 +321,7 @@ pub fn claim_next_ready_task(
         defaults_frozen,
     )) = row
     else {
+        // No ready task — commit the empty read tx to release the lock cleanly.
         tx.commit()?;
         return Ok(None);
     };
@@ -320,13 +339,14 @@ pub fn claim_next_ready_task(
         .map(serde_json::from_str::<RetryPolicy>)
         .transpose()?;
 
+    // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
+    // (for a late-registered task) in this SAME transaction, then commits both.
     tx.execute(
         "UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1",
         params![task_id],
     )?;
-    tx.commit()?;
 
-    Ok(Some(ClaimedTask {
+    let task = ClaimedTask {
         task_id,
         activity_id,
         name,
@@ -342,27 +362,8 @@ pub fn claim_next_ready_task(
         // registered spec, anchored to `scheduled_at`).
         schedule_to_close_at,
         defaults_frozen: defaults_frozen != 0,
-    }))
-}
-
-/// Release a just-claimed (`RUNNING`) task back to `PENDING` **without** consuming
-/// an attempt or advancing `run_at` — the body never ran.
-///
-/// The claim-release primitive for the unregistered-activity path (Codex #1069
-/// P2). [`claim_next_ready_task`] commits a task to `RUNNING` *before* the caller
-/// resolves the handler; if the activity name has no registered body, leaving the
-/// row `RUNNING` would strand it (invisible to a later drain, which only re-claims
-/// `PENDING` rows) until a full DB close+reopen ran [`reclaim_orphaned_running`].
-/// Releasing it here lets a later drain re-claim it once the body is registered,
-/// with no reopen. Scoped to one task and guarded on `state = 'RUNNING'` so it is a
-/// no-op against an already-finalized row; mirrors the shape of
-/// [`reclaim_orphaned_running`].
-pub fn release_claim(conn: &Connection, task_id: &str) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING' WHERE task_id = ?1 AND state = 'RUNNING'",
-        params![task_id],
-    )?;
-    Ok(())
+    };
+    Ok(Some((tx, task)))
 }
 
 /// Mark a task terminally done (success or exhausted retries).
@@ -392,7 +393,7 @@ pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<Strin
 /// workflow suspended and neither a command nor a drain made progress this cycle),
 /// any `PENDING` activity task is necessarily one BACKING OFF with a future
 /// `run_at`: a `PENDING` task whose `run_at <= now` would already have been claimed
-/// and run by [`claim_next_ready_task`] in this cycle's `drain_ready` pass. A
+/// and run by [`claim_next_ready_task_tx`] in this cycle's `drain_ready` pass. A
 /// delayed retry (`run_at = now + backoff`, issue #1069 P2, Codex `runtime.rs:985`)
 /// is therefore a genuine time-based block — the driver returns
 /// [`RunState::WaitingTimer`](crate::RunState) (a no-progress state) so a poll
@@ -410,7 +411,7 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
 /// Requeue a task for another attempt at `run_at`, recording the consumed
 /// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
 /// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
-/// (its future `run_at` keeps it out of `claim_next_ready_task`'s `run_at <= now`
+/// (its future `run_at` keeps it out of `claim_next_ready_task_tx`'s `run_at <= now`
 /// window this pass), so keeping its low `seq` is correct and leaves existing
 /// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
 /// [`requeue_task_to_back`] instead.
@@ -433,7 +434,7 @@ pub fn requeue_task(
 ///
 /// This is the fairness variant of [`requeue_task`], for an IMMEDIATE (zero-delay)
 /// retry — one whose `run_at <= now`, so the just-failed task would otherwise be
-/// re-claimable in the SAME drain pass. Because [`claim_next_ready_task`] selects
+/// re-claimable in the SAME drain pass. Because [`claim_next_ready_task_tx`] selects
 /// the oldest ready task (`ORDER BY seq LIMIT 1`), keeping the failed task's
 /// ORIGINAL (lower) `seq` would let it re-select itself before any ready SIBLING
 /// gets a turn — a low-index `ctx.race()` branch that fails-and-retries with zero
@@ -468,7 +469,7 @@ pub fn requeue_task_to_back(
 /// genuinely completed first (a real completion raced the cancellation) is
 /// already `DONE`, matches nothing, and returns `false` — so its real terminal
 /// event is never shadowed by a synthetic one. A `CANCELLED` row is terminal for
-/// this queue: [`claim_next_ready_task`] only selects `state = 'PENDING'`, so a
+/// this queue: [`claim_next_ready_task_tx`] only selects `state = 'PENDING'`, so a
 /// cancelled loser is never re-run.
 pub fn cancel_activity_task(conn: &Connection, activity_id: ActivityExecId) -> SqliteResult<bool> {
     let n = conn.execute(
