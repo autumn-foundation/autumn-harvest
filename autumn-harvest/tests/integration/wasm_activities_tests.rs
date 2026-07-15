@@ -401,7 +401,16 @@ async fn resolve_dispatch_unavailable_when_nothing_published() {
         capabilities: WasmCapabilities::default(),
         limits: WasmLimits::default(),
     };
-    let dispatch = resolve_wasm_dispatch(&mut conn, &store, &binding, "echo", None, None).await;
+    let dispatch = resolve_wasm_dispatch(
+        &mut conn,
+        &store,
+        &binding,
+        "echo",
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .await;
     match dispatch {
         WasmDispatch::Fail(payload) => {
             assert!(
@@ -435,6 +444,7 @@ async fn resolve_dispatch_invokes_a_published_echo() {
         "echo",
         Some(Duration::from_secs(5)),
         None,
+        std::time::Instant::now(),
     )
     .await;
     let prepared = match dispatch {
@@ -473,7 +483,16 @@ async fn resolve_dispatch_invalid_surfaces_at_invoke_not_resolve() {
         limits: WasmLimits::default(),
     };
     // Resolve does NOT compile — garbage still yields a dispatchable Invoke.
-    let dispatch = resolve_wasm_dispatch(&mut conn, &store, &binding, "bad", None, None).await;
+    let dispatch = resolve_wasm_dispatch(
+        &mut conn,
+        &store,
+        &binding,
+        "bad",
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .await;
     let prepared = match dispatch {
         WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(payload) => {
@@ -514,11 +533,20 @@ async fn resolve_dispatch_defers_compile_to_invoke_on_cache_miss() {
         capabilities: WasmCapabilities::default(),
         limits: WasmLimits::default(),
     };
-    let prepared =
-        match resolve_wasm_dispatch(&mut conn, &store, &binding, "echo", None, None).await {
-            WasmDispatch::Invoke(prepared) => prepared,
-            WasmDispatch::Fail(payload) => panic!("expected invoke, got: {payload}"),
-        };
+    let prepared = match resolve_wasm_dispatch(
+        &mut conn,
+        &store,
+        &binding,
+        "echo",
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .await
+    {
+        WasmDispatch::Invoke(prepared) => prepared,
+        WasmDispatch::Fail(payload) => panic!("expected invoke, got: {payload}"),
+    };
     // A cache miss must not have compiled during the async resolve.
     assert!(
         store.cached(&hash).is_none(),
@@ -1207,7 +1235,16 @@ async fn in_flight_dispatch_is_pinned_across_a_mid_flight_republish() {
         limits: WasmLimits::default(),
     };
     // Resolve while v1 is active → prepared is pinned to v1's compiled module.
-    let prepared = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None, None).await
+    let prepared = match resolve_wasm_dispatch(
+        &mut conn,
+        &store,
+        &binding,
+        "pin",
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .await
     {
         WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(p) => panic!("expected invoke: {p}"),
@@ -1227,7 +1264,17 @@ async fn in_flight_dispatch_is_pinned_across_a_mid_flight_republish() {
     );
 
     // A FRESH resolution now sees v2.
-    let fresh = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None, None).await {
+    let fresh = match resolve_wasm_dispatch(
+        &mut conn,
+        &store,
+        &binding,
+        "pin",
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .await
+    {
         WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(p) => panic!("expected invoke: {p}"),
     };

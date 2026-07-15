@@ -195,6 +195,17 @@ pub struct PreparedWasmActivity {
     /// cooperatively interrupted within ~1 epoch tick instead of running to the
     /// wall-clock ceiling (issue #965 review).
     pub cancel: Option<CancellationToken>,
+    /// The instant the activity's start-to-close clock began — the worker
+    /// captures this as `ActivityStarted` is recorded, *before* dispatch
+    /// resolution (issue #965 review round 7). By the time the guest is about to
+    /// run, this clock has ticked through active-hash resolution, cold-cache
+    /// byte fetch from Postgres, the async→blocking handoff, and (on a cache
+    /// miss) module compilation. Measuring `dispatch_start.elapsed()` just
+    /// before the guest invoke charges that entire pre-guest interval against
+    /// the guest's epoch deadline in one measurement — subsuming the earlier
+    /// compile-only subtraction. `None` charges nothing (a non-worker
+    /// constructor that has no dispatch-start reference).
+    pub dispatch_start: Option<Instant>,
 }
 
 impl PreparedWasmActivity {
@@ -214,16 +225,22 @@ impl PreparedWasmActivity {
     /// cancellation, contained host-glue panic, or (on a deferred-compile miss)
     /// a `WasmModuleInvalid` integrity/compile failure.
     pub fn invoke(&self, input: &serde_json::Value) -> Result<serde_json::Value, ActivityFailure> {
-        // Charge cold-compile time against the guest's wall-clock deadline
-        // (issue #965 review). The worker records `ActivityStarted` and derives
-        // the deadline from `start_to_close` *before* this runs, so a cache-miss
-        // compile is already part of the attempt's elapsed budget. Subtracting
-        // the measured compile time before arming the epoch deadline ensures a
-        // large cold module cannot spend most of the budget compiling and then
-        // still hand the guest the full deadline. On a cache hit no compile runs,
-        // so the deadline is unchanged.
-        let (module, compile_elapsed) = match &self.source {
-            WasmModuleSource::Compiled(module) => (Arc::clone(module), Duration::ZERO),
+        // Charge ALL pre-guest overhead against the guest's wall-clock deadline
+        // (issue #965 review round 7). The worker records `ActivityStarted` and
+        // starts the start-to-close clock (captured as `dispatch_start`) *before*
+        // dispatch resolution runs, so by the time the guest is about to run that
+        // clock has been ticking through active-hash resolution, cold-cache byte
+        // fetch from Postgres, the async→blocking handoff, and — on a cache
+        // miss — module compilation. Measuring `dispatch_start.elapsed()` here,
+        // immediately before the guest invoke, charges that entire pre-guest
+        // interval against the guest's epoch deadline in ONE measurement. This
+        // subsumes (and replaces) the earlier compile-only subtraction: a slow
+        // pool checkout or DB byte fetch can no longer consume most of a short
+        // start-to-close budget while the guest still receives the full deadline.
+        // On a cache hit no fetch/compile runs, so the elapsed is just the tiny
+        // resolution overhead and the deadline is effectively unchanged.
+        let module = match &self.source {
+            WasmModuleSource::Compiled(module) => Arc::clone(module),
             WasmModuleSource::Deferred { hash, bytes } => {
                 // Skip a cold compile entirely if the attempt is already
                 // cancelled (issue #965 review). The cancellation-aware epoch
@@ -249,48 +266,56 @@ impl PreparedWasmActivity {
                 // concurrent dispatch may have compiled the same hash already;
                 // `get_or_compile` serves the cached `Arc` if so, otherwise
                 // compiles and caches it.
-                let t = Instant::now();
-                let module = self.store.get_or_compile(hash, bytes).map_err(|e| {
+                self.store.get_or_compile(hash, bytes).map_err(|e| {
                     ActivityFailure::wasm_module_invalid(format!(
                         "wasm module {hash} is invalid: {e}"
                     ))
-                })?;
-                (module, t.elapsed())
+                })?
             }
         };
+        // Measure the total pre-guest elapsed AFTER compile (so resolution +
+        // fetch + compile are all captured) and immediately BEFORE arming the
+        // guest's deadline.
+        let pre_guest_elapsed = self
+            .dispatch_start
+            .map_or(Duration::ZERO, |start| start.elapsed());
         crate::wasm_activities::invoke_wasm_activity_cancellable(
             &self.store,
             &module,
             input,
             &self.caps,
             &self.limits,
-            effective_invoke_deadline(self.deadline, compile_elapsed),
+            effective_invoke_deadline(self.deadline, pre_guest_elapsed),
             self.cancel.as_ref(),
         )
     }
 }
 
-/// Charge `compile_elapsed` against the guest's wall-clock `deadline`
-/// (issue #965 review).
+/// Charge `pre_guest_elapsed` — the total time from when the activity's
+/// start-to-close clock began until just before the guest is invoked — against
+/// the guest's wall-clock `deadline` (issue #965 review round 7).
 ///
-/// A cache-miss compile happens on the same blocking thread that later drives
-/// the guest, and it began accruing against `start_to_close` the moment the
-/// worker recorded `ActivityStarted`. Subtracting it here tightens the guest's
-/// epoch deadline toward the real remaining budget:
+/// This interval accrues against `start_to_close` from the moment the worker
+/// records `ActivityStarted`, and covers dispatch resolution (active-hash
+/// lookup), cold-cache byte fetch from Postgres, the async→blocking handoff,
+/// and (on a cache miss) module compilation — every millisecond of pre-guest
+/// overhead, not just compile. Subtracting it here tightens the guest's epoch
+/// deadline toward the real remaining budget:
 ///
 /// * `None` (no deadline configured) stays `None` — the mandatory
 ///   `limits.max_wall_clock` ceiling still applies inside the invoke.
-/// * A compile that meets or exceeds the deadline leaves `Some(Duration::ZERO)`,
-///   so the guest traps immediately as a retryable `ResourceExhausted` — correct,
-///   since the attempt spent its whole budget compiling.
-/// * On a cache hit `compile_elapsed` is [`Duration::ZERO`], so the deadline is
-///   returned unchanged.
+/// * Pre-guest overhead that meets or exceeds the deadline leaves
+///   `Some(Duration::ZERO)`, so the guest traps immediately as a retryable
+///   `ResourceExhausted` — correct, since the attempt spent its whole budget
+///   resolving/fetching/compiling.
+/// * On a cache hit with negligible resolution overhead the deadline is
+///   returned effectively unchanged (`Duration::ZERO` leaves it verbatim).
 #[must_use]
 fn effective_invoke_deadline(
     deadline: Option<Duration>,
-    compile_elapsed: Duration,
+    pre_guest_elapsed: Duration,
 ) -> Option<Duration> {
-    deadline.map(|d| d.saturating_sub(compile_elapsed))
+    deadline.map(|d| d.saturating_sub(pre_guest_elapsed))
 }
 
 /// The outcome of resolving a WASM activity for dispatch.
@@ -676,6 +701,11 @@ pub async fn resolve_wasm_dispatch(
     name: &str,
     deadline: Option<Duration>,
     cancel: Option<CancellationToken>,
+    // The instant the activity's start-to-close clock began (issue #965 review
+    // round 7). Threaded into the resolved `PreparedWasmActivity` so `invoke`
+    // charges the whole resolution + fetch + compile interval against the
+    // guest's deadline, not just compile.
+    dispatch_start: Instant,
 ) -> WasmDispatch {
     let hash = match resolve_active_wasm_hash(conn, name).await {
         Ok(Some(hash)) => hash,
@@ -736,6 +766,7 @@ pub async fn resolve_wasm_dispatch(
         limits: binding.limits,
         deadline,
         cancel,
+        dispatch_start: Some(dispatch_start),
     })
 }
 
@@ -796,8 +827,9 @@ mod tests {
     }
 
     #[test]
-    fn effective_deadline_subtracts_compile_time() {
-        // A compile that ate part of the budget tightens the remaining deadline.
+    fn effective_deadline_subtracts_total_pre_guest_elapsed() {
+        // Total pre-guest overhead (resolution + fetch + compile) that ate part
+        // of the budget tightens the remaining deadline (issue #965 round 7).
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(10)), Duration::from_secs(3)),
             Some(Duration::from_secs(7))
@@ -805,9 +837,24 @@ mod tests {
     }
 
     #[test]
+    fn effective_deadline_charges_resolution_plus_compile_not_just_compile() {
+        // The whole class this fix closes: a slow pool checkout + DB byte fetch
+        // (say 4s) plus a compile (say 2s) — 6s of pre-guest overhead — must be
+        // charged, so a 10s start-to-close leaves the guest 4s, not 8s.
+        let resolution = Duration::from_secs(4);
+        let compile = Duration::from_secs(2);
+        let total_pre_guest = resolution + compile;
+        assert_eq!(
+            effective_invoke_deadline(Some(Duration::from_secs(10)), total_pre_guest),
+            Some(Duration::from_secs(4)),
+            "resolution+fetch time must be charged, not just compile"
+        );
+    }
+
+    #[test]
     fn effective_deadline_none_stays_none() {
         // No configured deadline: the `max_wall_clock` ceiling still applies
-        // inside the invoke, so subtracting compile time leaves `None`.
+        // inside the invoke, so subtracting pre-guest elapsed leaves `None`.
         assert_eq!(
             effective_invoke_deadline(None, Duration::from_secs(3)),
             None
@@ -816,9 +863,9 @@ mod tests {
 
     #[test]
     fn effective_deadline_over_budget_is_zero() {
-        // A compile that met or exceeded the deadline leaves a ~0 budget, so the
-        // guest traps immediately (retryable ResourceExhausted) rather than
-        // getting a fresh full deadline.
+        // Pre-guest overhead that met or exceeded the deadline leaves a ~0
+        // budget, so the guest traps immediately (retryable ResourceExhausted)
+        // rather than getting a fresh full deadline.
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(2)), Duration::from_secs(5)),
             Some(Duration::ZERO)
@@ -826,9 +873,10 @@ mod tests {
     }
 
     #[test]
-    fn effective_deadline_cache_hit_is_unchanged() {
-        // A cache hit compiles nothing (Duration::ZERO), so the deadline is
-        // returned verbatim.
+    fn effective_deadline_cache_hit_tiny_elapsed_is_unchanged() {
+        // A cache hit fetches/compiles nothing; the resolution overhead is
+        // negligible. Modelled as Duration::ZERO, the deadline is returned
+        // verbatim — effectively unchanged behaviour on the hot path.
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(4)), Duration::ZERO),
             Some(Duration::from_secs(4))
@@ -857,6 +905,7 @@ mod tests {
             limits: WasmLimits::default(),
             deadline: None,
             cancel: Some(cancel),
+            dispatch_start: Some(Instant::now()),
         };
         let err = prepared
             .invoke(&serde_json::Value::Null)

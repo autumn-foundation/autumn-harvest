@@ -7593,6 +7593,15 @@ async fn process_activity_task(
                         // ~1 epoch tick, instead of holding a blocking-pool thread
                         // until its wall-clock ceiling.
                         Some(cancel.clone()),
+                        // Thread the start-to-close anchor so `invoke` charges the
+                        // whole pre-guest interval — resolution (this checkout +
+                        // active-hash lookup + cold-cache byte fetch) plus compile
+                        // — against the guest deadline, not just compile (issue
+                        // #965 review round 7). `started_at` was captured above,
+                        // just before this dispatch resolution began, so it
+                        // aligns with the start-to-close clock that started when
+                        // `ActivityStarted` was recorded.
+                        started_at,
                     )
                     .await
                     // `conn` is dropped at the end of this arm, before the guest runs.

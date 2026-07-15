@@ -206,17 +206,25 @@ Two distinct costs to keep separate:
   (`WasmModuleStore::get_or_compile` compiles at most once per hash, process-wide),
   so only the very first attempt for a given version pays it. That first compile
   runs **inside** `PreparedWasmActivity::invoke` on the blocking pool (never on the
-  async dispatch reactor), and its wall-clock is now **charged against the guest's
-  `start_to_close` deadline** (`effective_invoke_deadline` subtracts the measured
-  compile time before arming the epoch deadline): the worker records
-  `ActivityStarted` before the compile, so a large cold module can no longer spend
-  most of its budget compiling and still hand the guest a fresh full deadline — if
-  compile alone meets/exceeds the deadline the guest traps immediately as retryable
-  `ResourceExhausted`. Cancellation is also checked **before** starting a cold
-  compile, so an already-cancelled attempt skips it. A compile **already in flight**
-  cannot be interrupted (wasmtime `Module::new` is not cancellable); the blast
-  radius is bounded by the 32 MiB module-size cap. The GA mitigation that removes
-  cold compile from the dispatch path entirely is **precompile-at-publish/seed**
+  async dispatch reactor). The guest's `start_to_close` deadline is now **charged
+  for ALL pre-guest overhead — resolution + cold-cache byte fetch + compile — not
+  just compile** (issue #965 review round 7). The worker captures the
+  start-to-close anchor (`dispatch_start`) as it records `ActivityStarted`, *before*
+  dispatch resolution begins; `invoke` measures `dispatch_start.elapsed()` in one
+  shot immediately before arming the guest's epoch deadline, so the active-hash
+  lookup, the cold byte fetch from Postgres, the async→blocking handoff, and the
+  compile are all subtracted from the guest's budget (`effective_invoke_deadline`
+  subtracts that total elapsed). This closes the start-to-close accounting: a slow
+  pool checkout or DB byte fetch can no longer consume most of a short
+  `start_to_close` budget while the guest still receives the full deadline — if
+  pre-guest overhead alone meets/exceeds the deadline the guest traps immediately
+  as retryable `ResourceExhausted`. On a cache hit the fetch/compile are skipped, so
+  the elapsed is just negligible resolution overhead and the deadline is effectively
+  unchanged. Cancellation is also checked **before** starting a cold compile, so an
+  already-cancelled attempt skips it. A compile **already in flight** cannot be
+  interrupted (wasmtime `Module::new` is not cancellable); the blast radius is
+  bounded by the 32 MiB module-size cap. The GA mitigation that removes cold fetch
+  and compile from the dispatch path entirely is **precompile-at-publish/seed**
   (store the serialized compiled artifact next to the bytes so dispatch only
   deserializes), which also makes the deadline-charging moot.
 
