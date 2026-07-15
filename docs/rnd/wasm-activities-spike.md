@@ -207,20 +207,30 @@ Two distinct costs to keep separate:
   so only the very first attempt for a given version pays it. That first compile
   runs **inside** `PreparedWasmActivity::invoke` on the blocking pool (never on the
   async dispatch reactor). The guest's `start_to_close` deadline is now **charged
-  for ALL pre-guest overhead — resolution + cold-cache byte fetch + compile — not
-  just compile** (issue #965 review round 7). The worker captures the
-  start-to-close anchor (`dispatch_start`) as it records `ActivityStarted`, *before*
-  dispatch resolution begins; `invoke` measures `dispatch_start.elapsed()` in one
-  shot immediately before arming the guest's epoch deadline, so the active-hash
-  lookup, the cold byte fetch from Postgres, the async→blocking handoff, and the
-  compile are all subtracted from the guest's budget (`effective_invoke_deadline`
-  subtracts that total elapsed). This closes the start-to-close accounting: a slow
-  pool checkout or DB byte fetch can no longer consume most of a short
-  `start_to_close` budget while the guest still receives the full deadline — if
-  pre-guest overhead alone meets/exceeds the deadline the guest traps immediately
-  as retryable `ResourceExhausted`. On a cache hit the fetch/compile are skipped, so
-  the elapsed is just negligible resolution overhead and the deadline is effectively
-  unchanged. Cancellation is also checked **before** starting a cold compile, so an
+  for ALL host-side pre-guest work — resolution + cold-cache byte fetch + compile +
+  input serialization + store setup — not just compile** (issue #965 review rounds
+  7 & 9). The worker captures the start-to-close anchor (`dispatch_start`) as it
+  records `ActivityStarted`, *before* dispatch resolution begins; the invoke path
+  measures `dispatch_start.elapsed()` in one shot at the last host-only moment —
+  after input serialization and store setup, immediately before arming the guest's
+  epoch deadline — so the active-hash lookup, the cold byte fetch from Postgres, the
+  async→blocking handoff, the compile, and input serialization are all subtracted
+  from the guest's budget (`effective_invoke_deadline` classifies the remainder).
+  Everything after that point — instantiate, alloc, the guest-memory write, and the
+  guest `run` — executes under the single epoch armed from that remainder, so it is
+  cumulatively bounded and can never exceed the mandatory `max_wall_clock` ceiling.
+  This closes the start-to-close accounting: a slow pool checkout, DB byte fetch, or
+  a large input serialization can no longer consume most of a short `start_to_close`
+  budget while the guest still receives the full deadline. **When pre-guest overhead
+  alone meets or exceeds the deadline the attempt fails fast as a retryable
+  `ResourceExhausted("wasm activity start-to-close budget exhausted before guest
+  start")` — the guest is never invoked** (round 9); the earlier behaviour handed
+  such an attempt a zero deadline that clamps to a single epoch tick, which a fast
+  guest could complete within and be recorded *successful* even though its
+  start-to-close had already expired before guest code ran. On a cache hit the
+  fetch/compile are skipped, so the elapsed is just negligible resolution overhead
+  and the deadline is effectively unchanged. Cancellation is also checked **before**
+  starting a cold compile, so an
   already-cancelled attempt skips it. A compile **already in flight** cannot be
   interrupted (wasmtime `Module::new` is not cancellable); the blast radius is
   bounded by the 32 MiB module-size cap. The GA mitigation that removes cold fetch

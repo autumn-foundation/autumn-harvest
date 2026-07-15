@@ -225,20 +225,18 @@ impl PreparedWasmActivity {
     /// cancellation, contained host-glue panic, or (on a deferred-compile miss)
     /// a `WasmModuleInvalid` integrity/compile failure.
     pub fn invoke(&self, input: &serde_json::Value) -> Result<serde_json::Value, ActivityFailure> {
-        // Charge ALL pre-guest overhead against the guest's wall-clock deadline
-        // (issue #965 review round 7). The worker records `ActivityStarted` and
-        // starts the start-to-close clock (captured as `dispatch_start`) *before*
-        // dispatch resolution runs, so by the time the guest is about to run that
-        // clock has been ticking through active-hash resolution, cold-cache byte
-        // fetch from Postgres, the async→blocking handoff, and — on a cache
-        // miss — module compilation. Measuring `dispatch_start.elapsed()` here,
-        // immediately before the guest invoke, charges that entire pre-guest
-        // interval against the guest's epoch deadline in ONE measurement. This
-        // subsumes (and replaces) the earlier compile-only subtraction: a slow
-        // pool checkout or DB byte fetch can no longer consume most of a short
-        // start-to-close budget while the guest still receives the full deadline.
-        // On a cache hit no fetch/compile runs, so the elapsed is just the tiny
-        // resolution overhead and the deadline is effectively unchanged.
+        // Resolve the module (compiling on a Deferred cache miss), then hand the
+        // raw start-to-close deadline plus the `dispatch_start` instant to the
+        // invoke path. ALL pre-guest overhead accounting happens there, at the
+        // last moment before the guest's epoch deadline is armed (issue #965
+        // review rounds 7 & 9): the whole pre-guest interval — active-hash
+        // resolution, cold-cache byte fetch from Postgres, the async→blocking
+        // handoff, module compilation (this function), and input serialization —
+        // is charged against the guest's deadline in ONE measurement, and an
+        // attempt whose overhead already spent the budget fails fast as a
+        // retryable `ResourceExhausted` *without invoking the guest*. Compile
+        // stays here because it happens on this blocking thread and needs the
+        // cancel-before-compile skip below.
         let module = match &self.source {
             WasmModuleSource::Compiled(module) => Arc::clone(module),
             WasmModuleSource::Deferred { hash, bytes } => {
@@ -273,49 +271,74 @@ impl PreparedWasmActivity {
                 })?
             }
         };
-        // Measure the total pre-guest elapsed AFTER compile (so resolution +
-        // fetch + compile are all captured) and immediately BEFORE arming the
-        // guest's deadline.
-        let pre_guest_elapsed = self
-            .dispatch_start
-            .map_or(Duration::ZERO, |start| start.elapsed());
         crate::wasm_activities::invoke_wasm_activity_cancellable(
             &self.store,
             &module,
             input,
             &self.caps,
             &self.limits,
-            effective_invoke_deadline(self.deadline, pre_guest_elapsed),
+            self.deadline,
+            self.dispatch_start,
             self.cancel.as_ref(),
         )
     }
 }
 
+/// The guest's remaining wall-clock budget after charging pre-guest overhead
+/// against the configured start-to-close deadline (issue #965 review).
+///
+/// Distinguishes the three outcomes the caller must handle differently: fail
+/// fast without invoking, invoke with a reduced deadline, or invoke unbounded.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InvokeBudget {
+    /// A start-to-close deadline was configured but pre-guest overhead already
+    /// met or exceeded it before the guest could start. The attempt has spent
+    /// its whole budget resolving/fetching/compiling, so it must fail fast as a
+    /// retryable `ResourceExhausted` **without invoking the guest** — a fast
+    /// guest handed a clamped 1-tick deadline could otherwise race to
+    /// completion and be recorded successful past its own deadline.
+    Exhausted,
+    /// A strictly-positive remaining budget; invoke the guest with this deadline.
+    Remaining(Duration),
+    /// No start-to-close deadline configured; invoke the guest unbounded (the
+    /// mandatory `limits.max_wall_clock` ceiling still applies inside the invoke).
+    Unbounded,
+}
+
 /// Charge `pre_guest_elapsed` — the total time from when the activity's
 /// start-to-close clock began until just before the guest is invoked — against
-/// the guest's wall-clock `deadline` (issue #965 review round 7).
+/// the guest's wall-clock `deadline` (issue #965 review rounds 7 & 9).
 ///
 /// This interval accrues against `start_to_close` from the moment the worker
 /// records `ActivityStarted`, and covers dispatch resolution (active-hash
 /// lookup), cold-cache byte fetch from Postgres, the async→blocking handoff,
 /// and (on a cache miss) module compilation — every millisecond of pre-guest
-/// overhead, not just compile. Subtracting it here tightens the guest's epoch
-/// deadline toward the real remaining budget:
+/// overhead, not just compile. Resolving it here classifies the guest's real
+/// remaining budget:
 ///
-/// * `None` (no deadline configured) stays `None` — the mandatory
-///   `limits.max_wall_clock` ceiling still applies inside the invoke.
-/// * Pre-guest overhead that meets or exceeds the deadline leaves
-///   `Some(Duration::ZERO)`, so the guest traps immediately as a retryable
-///   `ResourceExhausted` — correct, since the attempt spent its whole budget
-///   resolving/fetching/compiling.
-/// * On a cache hit with negligible resolution overhead the deadline is
-///   returned effectively unchanged (`Duration::ZERO` leaves it verbatim).
+/// * `None` (no deadline configured) → [`InvokeBudget::Unbounded`] — the
+///   mandatory `limits.max_wall_clock` ceiling still applies inside the invoke.
+/// * Pre-guest overhead that meets or exceeds the deadline
+///   (`pre_guest_elapsed >= d`) → [`InvokeBudget::Exhausted`], so the attempt
+///   fails fast **before** the guest is invoked rather than running under a
+///   zero-that-clamps-to-one-tick deadline it may win a race against.
+/// * A strictly-positive remainder → [`InvokeBudget::Remaining`], tightening the
+///   guest's epoch deadline toward the real remaining budget. On a cache hit
+///   with negligible resolution overhead this is effectively the full deadline.
 #[must_use]
-fn effective_invoke_deadline(
+pub(crate) fn effective_invoke_deadline(
     deadline: Option<Duration>,
     pre_guest_elapsed: Duration,
-) -> Option<Duration> {
-    deadline.map(|d| d.saturating_sub(pre_guest_elapsed))
+) -> InvokeBudget {
+    let Some(d) = deadline else {
+        return InvokeBudget::Unbounded;
+    };
+    match d.checked_sub(pre_guest_elapsed) {
+        Some(remaining) if remaining > Duration::ZERO => InvokeBudget::Remaining(remaining),
+        // `None` (over budget) or `Some(ZERO)` (exactly at budget): the guest
+        // never gets a positive budget, so fail fast without invoking.
+        _ => InvokeBudget::Exhausted,
+    }
 }
 
 /// The outcome of resolving a WASM activity for dispatch.
@@ -832,7 +855,7 @@ mod tests {
         // of the budget tightens the remaining deadline (issue #965 round 7).
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(10)), Duration::from_secs(3)),
-            Some(Duration::from_secs(7))
+            InvokeBudget::Remaining(Duration::from_secs(7))
         );
     }
 
@@ -846,29 +869,39 @@ mod tests {
         let total_pre_guest = resolution + compile;
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(10)), total_pre_guest),
-            Some(Duration::from_secs(4)),
+            InvokeBudget::Remaining(Duration::from_secs(4)),
             "resolution+fetch time must be charged, not just compile"
         );
     }
 
     #[test]
-    fn effective_deadline_none_stays_none() {
+    fn effective_deadline_none_is_unbounded() {
         // No configured deadline: the `max_wall_clock` ceiling still applies
-        // inside the invoke, so subtracting pre-guest elapsed leaves `None`.
+        // inside the invoke, so the guest runs unbounded here.
         assert_eq!(
             effective_invoke_deadline(None, Duration::from_secs(3)),
-            None
+            InvokeBudget::Unbounded
         );
     }
 
     #[test]
-    fn effective_deadline_over_budget_is_zero() {
-        // Pre-guest overhead that met or exceeded the deadline leaves a ~0
-        // budget, so the guest traps immediately (retryable ResourceExhausted)
-        // rather than getting a fresh full deadline.
+    fn effective_deadline_over_budget_is_exhausted() {
+        // Pre-guest overhead that EXCEEDED the deadline must fail fast without
+        // invoking the guest (issue #965 round 9) — not hand it a zero deadline
+        // that clamps to one epoch tick a fast guest could win a race against.
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(2)), Duration::from_secs(5)),
-            Some(Duration::ZERO)
+            InvokeBudget::Exhausted
+        );
+    }
+
+    #[test]
+    fn effective_deadline_exactly_at_budget_is_exhausted() {
+        // Boundary: pre-guest overhead EXACTLY equal to the deadline leaves zero
+        // remaining, which is still Exhausted (`pre_guest_elapsed >= d`).
+        assert_eq!(
+            effective_invoke_deadline(Some(Duration::from_secs(4)), Duration::from_secs(4)),
+            InvokeBudget::Exhausted
         );
     }
 
@@ -879,7 +912,7 @@ mod tests {
         // verbatim — effectively unchanged behaviour on the hot path.
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(4)), Duration::ZERO),
-            Some(Duration::from_secs(4))
+            InvokeBudget::Remaining(Duration::from_secs(4))
         );
     }
 
@@ -915,5 +948,104 @@ mod tests {
             crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
             "a skipped compile yields cancelled ResourceExhausted, not WasmModuleInvalid"
         );
+    }
+
+    #[test]
+    fn over_budget_invoke_fails_fast_without_running_the_guest() {
+        // An attempt whose pre-guest overhead already spent the whole
+        // start-to-close budget must fail fast as ResourceExhausted BEFORE the
+        // guest is invoked (issue #965 review round 9). The module is a valid,
+        // trivially-fast ECHO guest: had it run under the old zero→1-tick
+        // deadline it would have completed and returned Ok(input). Getting the
+        // specific "before guest start" ResourceExhausted instead proves the
+        // guest never ran and the deadline race can't be lost.
+        const ECHO_WAT: &str = r#"
+            (module
+              (memory (export "memory") 1)
+              (global $bump (mut i32) (i32.const 1024))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                (local.set $ptr (global.get $bump))
+                (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+                (local.get $ptr))
+              (func (export "run") (param $in_ptr i32) (param $in_len i32) (result i64)
+                (i64.or
+                  (i64.shl (i64.extend_i32_u (local.get $in_ptr)) (i64.const 32))
+                  (i64.extend_i32_u (local.get $in_len)))))
+        "#;
+        let store = Arc::new(WasmModuleStore::new());
+        let bytes = wat::parse_str(ECHO_WAT).expect("wat must assemble");
+        let hash = WasmModuleStore::compute_hash(&bytes);
+        let module = store
+            .get_or_compile(&hash, &bytes)
+            .expect("echo module must compile");
+        let prepared = PreparedWasmActivity {
+            store,
+            source: WasmModuleSource::Compiled(module),
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            deadline: Some(Duration::from_millis(50)),
+            cancel: None,
+            // Start-to-close clock began well before now — the whole 50ms budget
+            // was already spent before the guest could start.
+            dispatch_start: Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap()),
+        };
+        let input = serde_json::json!({ "sentinel": "must-not-echo" });
+        let err = prepared
+            .invoke(&input)
+            .expect_err("an over-budget invoke must fail, not echo the input");
+        assert_eq!(
+            err.error_type,
+            crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
+            "an exhausted start-to-close budget is retryable ResourceExhausted"
+        );
+        assert!(
+            err.message.contains("budget exhausted before guest start"),
+            "expected the fail-fast message, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn in_budget_invoke_runs_the_guest() {
+        // The complement of the fail-fast case: with pre-guest overhead well
+        // under the deadline (round-7 behaviour preserved), the guest IS invoked
+        // and the ECHO module returns Ok(input).
+        const ECHO_WAT: &str = r#"
+            (module
+              (memory (export "memory") 1)
+              (global $bump (mut i32) (i32.const 1024))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                (local.set $ptr (global.get $bump))
+                (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+                (local.get $ptr))
+              (func (export "run") (param $in_ptr i32) (param $in_len i32) (result i64)
+                (i64.or
+                  (i64.shl (i64.extend_i32_u (local.get $in_ptr)) (i64.const 32))
+                  (i64.extend_i32_u (local.get $in_len)))))
+        "#;
+        let store = Arc::new(WasmModuleStore::new());
+        let bytes = wat::parse_str(ECHO_WAT).expect("wat must assemble");
+        let hash = WasmModuleStore::compute_hash(&bytes);
+        let module = store
+            .get_or_compile(&hash, &bytes)
+            .expect("echo module must compile");
+        let prepared = PreparedWasmActivity {
+            store,
+            source: WasmModuleSource::Compiled(module),
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            deadline: Some(Duration::from_secs(10)),
+            cancel: None,
+            // Negligible pre-guest overhead — the guest keeps essentially the
+            // full 10s budget and runs to completion.
+            dispatch_start: Some(Instant::now()),
+        };
+        let input = serde_json::json!({ "echo": "me" });
+        let out = prepared
+            .invoke(&input)
+            .expect("an in-budget invoke must run the guest and echo the input");
+        assert_eq!(out, input, "the ECHO guest returns its input verbatim");
     }
 }

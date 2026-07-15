@@ -47,7 +47,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use tokio_util::sync::CancellationToken;
@@ -647,7 +647,7 @@ pub fn invoke_wasm_activity(
     limits: &WasmLimits,
     deadline: Option<Duration>,
 ) -> Result<serde_json::Value, ActivityFailure> {
-    invoke_wasm_activity_cancellable(store, module, input, caps, limits, deadline, None)
+    invoke_wasm_activity_cancellable(store, module, input, caps, limits, deadline, None, None)
 }
 
 /// Cancellable form of [`invoke_wasm_activity`].
@@ -660,11 +660,28 @@ pub fn invoke_wasm_activity(
 /// one invocation's cancellation never affects another's, and the ceiling
 /// remains the hard backstop for a guest that ignores the (implicit) signal.
 ///
+/// # Pre-guest budget accounting
+///
+/// `deadline` is the activity's raw start-to-close budget and `dispatch_start`
+/// (when `Some`) is the instant that clock began — captured by the worker as it
+/// records `ActivityStarted`, *before* dispatch resolution/fetch/compile ran.
+/// The invoke path measures `dispatch_start.elapsed()` at the last host-only
+/// moment before the guest's epoch deadline is armed — after input
+/// serialization and store setup — and charges that whole pre-guest interval
+/// against `deadline`. If the budget is already spent (`elapsed >= deadline`)
+/// the attempt fails fast as a retryable
+/// [`ActivityFailure::resource_exhausted`] **without invoking the guest**,
+/// closing the window where a fast guest handed a zero→one-tick deadline could
+/// race to completion past its own start-to-close (issue #965 review round 9).
+/// `dispatch_start = None` charges nothing and uses `deadline` verbatim as the
+/// guest budget (the convenience/test call shape).
+///
 /// # Errors
 ///
 /// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
 /// exhaustion, guest trap, ABI violation, cooperative cancellation, or
 /// contained host-glue panic.
+#[allow(clippy::too_many_arguments)]
 pub fn invoke_wasm_activity_cancellable(
     store: &WasmModuleStore,
     module: &Module,
@@ -672,10 +689,20 @@ pub fn invoke_wasm_activity_cancellable(
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
+    dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_wasm_activity_inner(store, module, input, caps, limits, deadline, cancel)
+        invoke_wasm_activity_inner(
+            store,
+            module,
+            input,
+            caps,
+            limits,
+            deadline,
+            dispatch_start,
+            cancel,
+        )
     }));
     match result {
         Ok(inner) => inner,
@@ -686,7 +713,7 @@ pub fn invoke_wasm_activity_cancellable(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn invoke_wasm_activity_inner(
     store: &WasmModuleStore,
     module: &Module,
@@ -694,6 +721,7 @@ fn invoke_wasm_activity_inner(
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
+    dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
     let engine = store.engine();
@@ -725,7 +753,32 @@ fn invoke_wasm_activity_inner(
     wasm_store
         .set_fuel(limits.fuel)
         .map_err(|e| ActivityFailure::wasm_trap(format!("failed to set wasm fuel: {e}")))?;
-    let effective = deadline.map_or(limits.max_wall_clock, |d| d.min(limits.max_wall_clock));
+    // Last host-only moment before the guest's deadline is armed: charge ALL
+    // pre-guest overhead against the start-to-close budget in ONE measurement
+    // (issue #965 review rounds 7 & 9). By now `dispatch_start.elapsed()` covers
+    // resolution + cold-cache byte fetch + compile (all before this call) plus
+    // input serialization and store setup (just above). Everything after this —
+    // instantiate, alloc, the guest-memory write, and `run` — executes under the
+    // single epoch armed just below, so it is cumulatively bounded by
+    // `effective` and can never exceed the mandatory `max_wall_clock` ceiling.
+    //
+    // Fail fast when the whole budget is already spent before the guest can
+    // start: arming a zero (→ clamped one-tick) deadline would let a fast guest
+    // race to completion and be recorded successful past its own start-to-close.
+    let pre_guest_elapsed = dispatch_start.map_or(Duration::ZERO, |start| start.elapsed());
+    let effective = match crate::wasm_store::effective_invoke_deadline(deadline, pre_guest_elapsed)
+    {
+        crate::wasm_store::InvokeBudget::Exhausted => {
+            return Err(ActivityFailure::resource_exhausted(
+                "wasm activity start-to-close budget exhausted before guest start",
+            ));
+        }
+        // Cap the remaining budget at the mandatory ceiling (issue #965 round 3).
+        crate::wasm_store::InvokeBudget::Remaining(remaining) => {
+            remaining.min(limits.max_wall_clock)
+        }
+        crate::wasm_store::InvokeBudget::Unbounded => limits.max_wall_clock,
+    };
 
     // Wall-clock bound + cooperative cancellation via a per-invocation
     // epoch-deadline callback (issue #965 review). Arm the first deadline one
@@ -1910,6 +1963,7 @@ mod tests {
                     max_wall_clock: Duration::from_secs(30),
                 },
                 None,
+                None,
                 Some(&cancel),
             )
             .expect_err("a cancelled guest must be interrupted");
@@ -1941,9 +1995,68 @@ mod tests {
             &WasmCapabilities::default(),
             &fast_limits(DEFAULT_FUEL),
             None,
+            None,
             Some(&cancel),
         )
         .expect("an uncancelled guest completes normally");
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn dispatch_start_overhead_fails_fast_before_the_guest() {
+        // Finding 21 (issue #965 review round 9): the invoke path charges ALL
+        // pre-guest overhead — resolution + fetch + compile + input
+        // serialization + store setup — against the start-to-close deadline,
+        // measured at the last host-only moment before the guest's epoch is
+        // armed. A `dispatch_start` already past the deadline must fail fast as a
+        // retryable ResourceExhausted WITHOUT invoking the guest, proven with an
+        // ECHO module that would otherwise return Ok(input) within a single tick.
+        let store = WasmModuleStore::new();
+        let module = compile(&store, ECHO_WAT);
+        let input = serde_json::json!({ "sentinel": "must-not-echo" });
+        let err = invoke_wasm_activity_cancellable(
+            &store,
+            &module,
+            &input,
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            Some(Duration::from_millis(50)), // start-to-close budget
+            // Overhead (whatever the source: resolve/fetch/compile/serialize)
+            // already spent the whole budget before the guest could start.
+            Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap()),
+            None,
+        )
+        .expect_err("an over-budget invoke must fail fast, not echo the input");
+        assert_eq!(
+            err.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED,
+            "an exhausted start-to-close budget is retryable ResourceExhausted"
+        );
+        assert!(
+            err.message.contains("budget exhausted before guest start"),
+            "expected the fail-fast message, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn dispatch_start_within_budget_runs_the_guest() {
+        // The complement: negligible pre-guest overhead leaves the guest
+        // essentially its full budget, so the ECHO module runs and returns
+        // Ok(input) (round-7 in-budget behaviour preserved through the move).
+        let store = WasmModuleStore::new();
+        let module = compile(&store, ECHO_WAT);
+        let input = serde_json::json!({ "echo": "me" });
+        let out = invoke_wasm_activity_cancellable(
+            &store,
+            &module,
+            &input,
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            Some(Duration::from_secs(10)),
+            Some(Instant::now()),
+            None,
+        )
+        .expect("an in-budget invoke runs the guest and echoes the input");
         assert_eq!(out, input);
     }
 
