@@ -278,24 +278,80 @@ pub fn finalize_within_tx(
             Ok(true)
         }
         Err(error) => {
-            if attempt_num < max_attempts {
-                // Retryable: bump the attempt counter and requeue at `now`.
+            // Classify the failure exactly as the core worker does
+            // (`failure::classify_activity_error`, issue #227): a typed
+            // `ActivityFailure` payload carrying `non_retryable: true`, OR a
+            // failure matching the resolved retry policy's `non_retryable_errors`
+            // list (incl. legacy `Err(String)` values), must skip remaining
+            // retries and fail terminally. Without this the SQLite worker would
+            // retry a non-retryable error up to `max_attempts` — diverging from
+            // Postgres semantics and potentially repeating side effects (issue
+            // #1069 P2, Codex `runtime.rs:985`). `parse_typed_payload` returns
+            // `Some` only for the typed envelope, so a plain `Err(String)` never
+            // synthesizes an `"Error"` class the policy could accidentally match
+            // (the back-compat guarantee from #227).
+            let typed = autumn_harvest::failure::parse_typed_payload(&error);
+            let payload_non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable);
+            let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+            let policy_non_retryable = task
+                .retry_policy
+                .as_ref()
+                .is_some_and(|p| p.is_non_retryable(typed_error_type, &error));
+            let non_retryable = payload_non_retryable || policy_non_retryable;
+
+            if attempt_num < max_attempts && !non_retryable {
+                // Retryable: bump the attempt counter and requeue at
+                // `now + backoff_delay`, honoring the WHOLE persisted retry policy
+                // (`initial_interval`, `backoff_coefficient`, `max_interval`) via
+                // the shared core helper `policy::compute_retry_delay` — NOT an
+                // immediate requeue at `now` (issue #1069 P2, Codex
+                // `runtime.rs:985`). A raw-path task (`retry_policy == None`) keeps
+                // the immediate-requeue behavior (`delay = 0`), so its whole retry
+                // sequence still converges in one drain pass. A delayed requeue
+                // sets `run_at` in the future, so `claim_next_ready_task`
+                // (`run_at <= now`) will NOT re-claim it until the driver advances
+                // the clock past the deadline — the workflow blocks on the
+                // backing-off activity (see `classify_block`) rather than
+                // busy-retrying. `attempt_num` is 1-based (1 after the first
+                // failure), matching `compute_retry_delay`'s `attempt` (exp =
+                // attempt - 1), so the first retry waits `initial_interval`.
                 // NOT recorded in the replayable event log (see module docs).
-                queue::requeue_task(conn, &task.task_id, attempt_num, now)?;
+                let delay_ms = task.retry_policy.as_ref().map_or(0, |p| {
+                    let delay = autumn_harvest::policy::compute_retry_delay(
+                        p.initial_interval,
+                        p.backoff_coefficient,
+                        p.max_interval,
+                        attempt_num,
+                    );
+                    i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)
+                });
+                let run_at = now.saturating_add(delay_ms);
+                queue::requeue_task(conn, &task.task_id, attempt_num, run_at)?;
                 Ok(false)
             } else {
-                // Exhausted: the terminal failure is workflow-visible, so it
-                // goes into the event log.
+                // Terminal (attempts exhausted OR non-retryable): the failure is
+                // workflow-visible, so it goes into the event log. DECODE the
+                // failure envelope (`parse_error_payload_full`, issue #1069 P2,
+                // Codex `worker.rs:299`) so the terminal `ActivityFailed` carries
+                // the SAME typed metadata the Postgres worker's
+                // `finalize_activity_failure` records — `error_type` / `details` /
+                // `non_retryable` plus the human `message` (never the raw
+                // `harvest_activity_failure_v1` envelope) — keeping typed-failure
+                // histories byte-equivalent across backends (AC5). A legacy
+                // `Err(String)` decodes to `error_type = "Error"`,
+                // `non_retryable = false`, `details = None`, `message = error`, so
+                // its stored form is unchanged from before this fix.
+                let failure = autumn_harvest::failure::parse_error_payload_full(&error);
                 store::append_event(
                     conn,
                     exec_id,
                     &WorkflowEvent::ActivityFailed {
                         activity_id: task.activity_id,
-                        error,
+                        error: failure.message,
                         attempt: attempt_num,
-                        error_type: "Error".to_string(),
-                        non_retryable: false,
-                        details: None,
+                        error_type: failure.error_type,
+                        non_retryable: failure.non_retryable,
+                        details: failure.details,
                     },
                 )?;
                 queue::finish_task(conn, &task.task_id)?;
@@ -441,6 +497,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .unwrap();
         conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
@@ -455,6 +512,7 @@ mod tests {
             input: serde_json::json!({}),
             attempt: 0,
             max_attempts: None,
+            retry_policy: None,
             start_to_close_ms: None,
         }
     }

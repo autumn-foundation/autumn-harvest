@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
     max_attempts INTEGER,                  -- per-call retry cap from the command's
                                            -- retry_policy_override (issue #1069 P2);
                                            -- NULL = use the registered ActivitySpec default
+    retry_policy_json TEXT,                -- the WHOLE serialized RetryPolicy from the
+                                           -- command's retry_policy_override (issue #1069 P2,
+                                           -- Codex runtime.rs:985) — initial_interval,
+                                           -- backoff_coefficient, max_interval,
+                                           -- non_retryable_errors, jitter — so the worker
+                                           -- honors backoff timing and non-retryable
+                                           -- classification, not just max_attempts.
+                                           -- NULL = raw-path task (no declared policy):
+                                           -- immediate requeue, no policy non-retryable list.
     start_to_close_ms INTEGER              -- per-activity start-to-close budget in
                                            -- milliseconds from the command's
                                            -- start_to_close_override (issue #1069 P2);

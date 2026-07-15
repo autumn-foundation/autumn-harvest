@@ -51,13 +51,23 @@
 //!   ctx.timer("b", 1))`) fire in `(fire_at, arm_seq)` order, so their `TimerFired`
 //!   events land in `TimerStarted`-append order — the core matcher requires it to
 //!   replay (issue #1069 P2).
-//! - **Declared/per-call retry policies are honored.** The typed
+//! - **Declared/per-call retry policies are honored IN FULL.** The typed
 //!   `ctx.execute_activity(&info, ...)` / `execute_activity_with_opts` path carries
 //!   the activity's resolved [`RetryPolicy`](autumn_harvest::policy::RetryPolicy) in
-//!   the scheduling command's `retry_policy_override`; the backend persists its
-//!   `max_attempts` on the task row and the worker uses it in preference to the
-//!   registered [`ActivitySpec`] cap (the raw `execute_activity_raw` path carries no
-//!   override and still falls back to the registered default) (issue #1069 P2).
+//!   the scheduling command's `retry_policy_override`; the backend persists the WHOLE
+//!   policy (`retry_policy_json` on the task row) and the worker honors all of it
+//!   (issue #1069 P2): `max_attempts` in preference to the registered
+//!   [`ActivitySpec`] cap; **backoff timing** — a retryable failure is requeued at
+//!   `now + compute_retry_delay(initial_interval, backoff_coefficient, max_interval,
+//!   attempt)` (the shared core helper), so the workflow BLOCKS on the backing-off
+//!   activity until the driver advances the clock past the deadline rather than
+//!   busy-retrying; and **non-retryable classification** — a typed `non_retryable`
+//!   failure OR one matching the policy's `non_retryable_errors` list (incl. legacy
+//!   `Err(String)`, via the core's `is_non_retryable` rule) fails terminally on the
+//!   first attempt regardless of `max_attempts`, so a non-retryable error never
+//!   repeats side effects. The raw `execute_activity_raw` path carries no override
+//!   and still falls back to the registered default (immediate requeue, no policy
+//!   non-retryable list), byte-for-byte.
 //! - **Activity `start_to_close` timeouts are honored.** The declared/per-call
 //!   `start_to_close` (from `#[activity(start_to_close = "…")]` /
 //!   `execute_activity_with_opts`) flows through the scheduling command's
@@ -80,6 +90,14 @@
 //!   `error_type`/`details` and the execution `error` column holds the human message
 //!   — byte-equivalent to the Postgres terminal path (issue #1069 P2). A legacy
 //!   `Err(String)` is unchanged (all typed fields `None`).
+//! - **Typed ACTIVITY failures preserve their metadata too.** A registered activity
+//!   returning an encoded [`ActivityFailure`](autumn_harvest::failure::ActivityFailure)
+//!   (issue #227) is decoded (`failure::parse_error_payload_full`) before the terminal
+//!   `ActivityFailed` event is appended, so the event carries the typed
+//!   `error_type`/`details`/`non_retryable` and the human `message` (never the raw
+//!   `harvest_activity_failure_v1` envelope) — byte-equivalent to the Postgres worker's
+//!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
+//!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
 //!
 //! # Crash-model bound (accepted non-goal)
 //!
@@ -139,7 +157,8 @@
 //! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
 //! author-declared field on the core `ScheduleActivity` command is either HONORED
 //! (`activity_id`/`name`/`input`; `queue` — persisted, though routing is a
-//! single-process no-op; `retry_policy_override` → `max_attempts`;
+//! single-process no-op; `retry_policy_override` → the WHOLE `RetryPolicy`
+//! (`max_attempts` + backoff timing + non-retryable classification);
 //! `start_to_close_override`, above) or REJECTED LOUDLY with
 //! [`SqliteError::Unsupported`] (`session_id`/`session_worker_id` and the
 //! session-acquire-only `schedule_to_start_override`, all outside the subset) —
@@ -156,7 +175,10 @@
 //!   fires and the wait resolves to `None`. The winner is decided by **arrival
 //!   time** (at millisecond precision, issue #1069 P2), not consumption order: the
 //!   wake ingest interleaves a staged signal's `received_at` against the deadline
-//!   timer's `fire_at` (mirroring the Postgres `merge_wake_events`), so a signal
+//!   timer's `fire_at` (mirroring the Postgres `merge_wake_events`), AND pending
+//!   same-name signals are consumed in ARRIVAL order (`peek_pending_signal` orders
+//!   by `received_at`, not insertion `signal_seq`, issue #1069 P2), so an on-time
+//!   signal staged *after* a late one still wins the race. So a signal
 //!   delivered *after* an expired deadline records its `TimerFired` FIRST and the
 //!   timeout wins (the late signal stays recorded, observable to a later plain
 //!   wait), while an on-time signal wins even when the run is only driven past the

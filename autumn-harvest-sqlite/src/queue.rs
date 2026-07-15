@@ -33,6 +33,7 @@
 //! row back to `PENDING` on [`SqliteRuntime::open`](crate::SqliteRuntime::open)
 //! so the body re-runs. This makes activity execution **at-least-once**.
 
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{ActivityExecId, ExecutionId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
@@ -54,6 +55,17 @@ pub struct ClaimedTask {
     /// `execute_activity_raw` path, in which case the worker falls back to the
     /// registered [`ActivitySpec`](crate::runtime::ActivitySpec)'s default.
     pub max_attempts: Option<u32>,
+    /// The workflow's declared/per-call [`RetryPolicy`], carried from the
+    /// scheduling command's `retry_policy_override` (issue #1069 P2, Codex
+    /// `runtime.rs:985`). `Some(policy)` when the workflow used the typed
+    /// `execute_activity`/`execute_activity_with_opts` path (which resolves the
+    /// activity's declared/per-call `RetryPolicy`); `None` for the raw
+    /// `execute_activity_raw` path. The worker reads it to honor the WHOLE policy
+    /// — backoff timing (`compute_retry_delay`) and non-retryable classification
+    /// (`is_non_retryable`, incl. the `non_retryable_errors` list) — not just
+    /// `max_attempts`. `None` = immediate requeue with no policy non-retryable
+    /// list (a typed-payload `non_retryable: true` is still honored).
+    pub retry_policy: Option<RetryPolicy>,
     /// Per-activity start-to-close budget in milliseconds, carried from the
     /// scheduling command's `start_to_close_override` (issue #1069 P2). `Some(ms)`
     /// when the workflow's declared/per-call activity has a start-to-close timeout
@@ -113,6 +125,11 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 /// from the command's `start_to_close_override` (issue #1069 P2): `Some(ms)`
 /// persists the declared/per-call timeout for the worker to enforce; `None` = no
 /// budget (unbounded).
+///
+/// `retry_policy_json` is the WHOLE serialized [`RetryPolicy`] from the command's
+/// `retry_policy_override` (issue #1069 P2, Codex `runtime.rs:985`): `Some(json)`
+/// persists it so the worker honors backoff timing + non-retryable classification;
+/// `None` for the raw path (immediate requeue, no policy list).
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
@@ -123,14 +140,15 @@ pub fn enqueue_activity(
     queue: &str,
     run_at: i64,
     max_attempts: Option<u32>,
+    retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
         "INSERT INTO harvest_tasks \
          (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
-          max_attempts, start_to_close_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10)",
+          max_attempts, retry_policy_json, start_to_close_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11)",
         params![
             uuid::Uuid::new_v4().to_string(),
             exec_id.to_string(),
@@ -141,6 +159,7 @@ pub fn enqueue_activity(
             run_at,
             seq,
             max_attempts.map(i64::from),
+            retry_policy_json,
             start_to_close_ms,
         ],
     )?;
@@ -159,7 +178,7 @@ pub fn claim_next_ready_task(
     let row = tx
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
-             start_to_close_ms \
+             retry_policy_json, start_to_close_ms \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -171,13 +190,23 @@ pub fn claim_next_ready_task(
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((task_id, act_s, name, input_s, attempt, max_attempts, start_to_close_ms)) = row
+    let Some((
+        task_id,
+        act_s,
+        name,
+        input_s,
+        attempt,
+        max_attempts,
+        retry_policy_json,
+        start_to_close_ms,
+    )) = row
     else {
         tx.commit()?;
         return Ok(None);
@@ -191,6 +220,10 @@ pub fn claim_next_ready_task(
         .parse()
         .map_err(|_| SqliteError::corrupt("activity_id"))?;
     let input: Value = serde_json::from_str(&input_s)?;
+    let retry_policy = retry_policy_json
+        .as_deref()
+        .map(serde_json::from_str::<RetryPolicy>)
+        .transpose()?;
 
     tx.execute(
         "UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1",
@@ -205,6 +238,7 @@ pub fn claim_next_ready_task(
         input,
         attempt: u32::try_from(attempt).unwrap_or(0),
         max_attempts: max_attempts.and_then(|m| u32::try_from(m).ok()),
+        retry_policy,
         start_to_close_ms,
     }))
 }
@@ -248,6 +282,27 @@ pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<Strin
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// True iff `exec_id` has any `PENDING` activity task.
+///
+/// When the driver's [`classify_block`](crate::SqliteRuntime) reaches here (the
+/// workflow suspended and neither a command nor a drain made progress this cycle),
+/// any `PENDING` activity task is necessarily one BACKING OFF with a future
+/// `run_at`: a `PENDING` task whose `run_at <= now` would already have been claimed
+/// and run by [`claim_next_ready_task`] in this cycle's `drain_ready` pass. A
+/// delayed retry (`run_at = now + backoff`, issue #1069 P2, Codex `runtime.rs:985`)
+/// is therefore a genuine time-based block — the driver returns
+/// [`RunState::WaitingTimer`](crate::RunState) (a no-progress state) so a poll
+/// before the deadline neither re-runs the body nor spins to `Stuck`; the caller
+/// advances the clock and re-drives.
+pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')",
+        params![exec_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
 }
 
 /// Requeue a task for another attempt at `run_at`, recording the consumed attempt.

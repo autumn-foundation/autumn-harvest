@@ -307,7 +307,21 @@ pub struct PendingSignal {
     pub payload: Value,
 }
 
-/// Peek (without consuming) the oldest undelivered signal matching `name`.
+/// Peek (without consuming) the EARLIEST-ARRIVED undelivered signal matching
+/// `name`.
+///
+/// Ordered by `received_at` first, `signal_seq` second (issue #1069 P2, Codex
+/// `store.rs:327`) — NOT by `signal_seq` alone. Insertion order (`signal_seq`) and
+/// arrival order (`received_at`) can differ: a caller may `send_signal_as_of` a
+/// signal with a *later* logical arrival time before one with an *earlier* arrival
+/// time (out-of-order staging), so consuming the lowest `signal_seq` would hand
+/// [`ingest_awaited_signal`](crate::worker::ingest_awaited_signal) the WRONG
+/// arrival time to compare against a `wait_for_signal_timeout` deadline: a late
+/// signal staged first + an on-time signal staged second would let the timeout win
+/// and mark the LATE row delivered while the on-time row stayed queued. Ordering by
+/// `received_at` makes the signal-timeout race use the actual arrival order;
+/// `signal_seq` is the deterministic tie-breaker for equal arrival times (matching
+/// the Postgres `harvest_signals.received_at` ordering).
 ///
 /// Deserializes the payload eagerly so a corrupt row surfaces as an error
 /// **before** the caller mutates anything (fires a due timer / appends the
@@ -324,7 +338,8 @@ pub fn peek_pending_signal(
     let row: Option<(i64, i64, String)> = conn
         .query_row(
             "SELECT signal_seq, received_at, payload_json FROM harvest_signals \
-             WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 ORDER BY signal_seq LIMIT 1",
+             WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 \
+             ORDER BY received_at, signal_seq LIMIT 1",
             params![exec_id.to_string(), name],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )

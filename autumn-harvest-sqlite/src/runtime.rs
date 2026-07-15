@@ -869,6 +869,18 @@ impl SqliteRuntime {
         if queue::has_unfired_timer(&self.conn, exec)? {
             return Ok(RunState::WaitingTimer);
         }
+        // A backing-off activity retry (a `PENDING` task with a future `run_at`
+        // from a delayed requeue, issue #1069 P2 / Codex `runtime.rs:985`) is a
+        // genuine time-based block, NOT a wedge: `WaitingTimer` (a no-progress
+        // driver state) so a poll before the backoff deadline neither re-runs the
+        // body nor spins to `Stuck`; the caller advances the clock and re-drives
+        // (the raw/no-policy path requeues immediately at `now`, converges in one
+        // drain pass, and never reaches this branch). Named `WaitingTimer` because
+        // it IS a wait for a scheduled time to arrive — the same class as an armed
+        // durable timer, and `poll_once`/`run_until_idle` treat both as blocked.
+        if queue::has_pending_activity(&self.conn, exec)? {
+            return Ok(RunState::WaitingTimer);
+        }
         Err(SqliteError::Stuck(exec))
     }
 
@@ -926,8 +938,14 @@ impl SqliteRuntime {
 /// - `activity_id`/`name`/`input`/`queue` — honored (persisted onto the task row;
 ///   single-process has one worker draining all queues, so `queue` *routing* is a
 ///   no-op, but it is still recorded for fidelity).
-/// - `retry_policy_override` — honored: its `max_attempts` is persisted so the
-///   worker uses it over the registered [`ActivitySpec`] default (`None` = fallback).
+/// - `retry_policy_override` — honored IN FULL (issue #1069 P2, Codex
+///   `runtime.rs:985`): the WHOLE policy is serialized onto the task row
+///   (`retry_policy_json`), so the worker uses its `max_attempts` over the
+///   registered [`ActivitySpec`] default AND honors `initial_interval` /
+///   `backoff_coefficient` / `max_interval` (backoff timing via
+///   `compute_retry_delay`) and `non_retryable_errors` (non-retryable
+///   classification via `is_non_retryable`). `None` = raw path (fallback attempt
+///   cap, immediate requeue, no policy non-retryable list).
 /// - `start_to_close_override` — honored: persisted (milliseconds) so the worker
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
 ///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
@@ -983,6 +1001,14 @@ fn apply_schedule_activity(
         return Ok(false);
     }
     let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
+    // Persist the WHOLE retry policy, not just its `max_attempts` (issue #1069 P2,
+    // Codex `runtime.rs:985`): the worker reads `initial_interval` /
+    // `backoff_coefficient` / `max_interval` (backoff timing) and
+    // `non_retryable_errors` (classification) from it. `None` on the raw path.
+    let retry_policy_json = retry_policy_override
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
     let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
     persist_scheduled_activity(
         conn,
@@ -993,6 +1019,7 @@ fn apply_schedule_activity(
         queue,
         now,
         max_attempts,
+        retry_policy_json.as_deref(),
         start_to_close_ms,
     )?;
     Ok(true)
@@ -1008,6 +1035,10 @@ fn apply_schedule_activity(
 /// onto the task row; `None` leaves it NULL so the worker falls back to the
 /// registered [`ActivitySpec`] default.
 ///
+/// `retry_policy_json` carries the WHOLE serialized `retry_policy_override` (issue
+/// #1069 P2, Codex `runtime.rs:985`) so the worker honors backoff timing and
+/// non-retryable classification, not just the attempt cap; `None` on the raw path.
+///
 /// `start_to_close_ms` carries the scheduling command's `start_to_close_override`
 /// (issue #1069 P2): `Some(ms)` persists the per-activity start-to-close budget
 /// onto the task row so the worker enforces it as a post-execution outcome; `None`
@@ -1022,6 +1053,7 @@ pub fn persist_scheduled_activity(
     queue_name: &str,
     run_at: i64,
     max_attempts: Option<u32>,
+    retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
 ) -> SqliteResult<()> {
     store::append_event(
@@ -1043,6 +1075,7 @@ pub fn persist_scheduled_activity(
         queue_name,
         run_at,
         max_attempts,
+        retry_policy_json,
         start_to_close_ms,
     )?;
     Ok(())
@@ -1284,6 +1317,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -1310,6 +1344,7 @@ mod tests {
                 &serde_json::json!({}),
                 "default",
                 0,
+                None,
                 None,
                 None,
             )
