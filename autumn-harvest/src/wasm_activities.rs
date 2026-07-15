@@ -62,6 +62,21 @@ use crate::failure::ActivityFailure;
 /// Default guest linear-memory ceiling: 16 MiB.
 pub const DEFAULT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum size, in bytes, of a guest's returned output buffer
+/// (issue #965 review round 8).
+///
+/// The guest's `run` returns a packed `(out_ptr, out_len)`; the host reads
+/// `out_len` bytes and deserializes them as JSON. `out_len` is already
+/// bounds-checked against live guest memory (≤ the linear-memory ceiling), but
+/// a guest returning a large *in-bounds* buffer — e.g. a 16 MiB JSON array of
+/// tiny values — would otherwise make the host spend CPU (outside the guest's
+/// wasmtime fuel/epoch budget) and balloon host memory parsing it into a
+/// `serde_json::Value`. This caps `out_len` *before* deserialization: an
+/// oversized output is rejected as a non-retryable
+/// [`ActivityFailure::wasm_output_too_large`] rather than parsed. Set well
+/// below the 16 MiB memory ceiling; a spike default, not a per-activity knob.
+pub const WASM_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default CPU fuel budget for a single guest invocation.
 pub const DEFAULT_FUEL: u64 = 100_000_000;
 
@@ -817,6 +832,18 @@ fn invoke_wasm_activity_inner(
     let out_len = usize::try_from(bits & 0xFFFF_FFFF)
         .map_err(|_| ActivityFailure::wasm_trap("wasm output length out of range"))?;
 
+    // Cap the output size BEFORE bounds-checking or parsing (issue #965 review
+    // round 8): `out_len` is guest-controlled and, while bounded by live guest
+    // memory (≤ the 16 MiB ceiling), a large in-bounds buffer would otherwise
+    // make the host spend CPU (outside the guest's fuel/epoch budget) and
+    // balloon host memory in `serde_json::from_slice`. An oversized output is a
+    // deterministic guest bug, so reject it non-retryably rather than parsing.
+    if out_len > WASM_MAX_OUTPUT_BYTES {
+        return Err(ActivityFailure::wasm_output_too_large(format!(
+            "wasm activity output ({out_len} bytes) exceeds the {WASM_MAX_OUTPUT_BYTES}-byte limit"
+        )));
+    }
+
     // Bounds-check the output range against live guest memory.
     let data = memory.data(&wasm_store);
     let end = out_ptr
@@ -835,7 +862,8 @@ fn invoke_wasm_activity_inner(
 mod tests {
     use super::*;
     use crate::failure::{
-        ERROR_TYPE_RESOURCE_EXHAUSTED, ERROR_TYPE_SANDBOX_DENIED, ERROR_TYPE_WASM_TRAP,
+        ERROR_TYPE_RESOURCE_EXHAUSTED, ERROR_TYPE_SANDBOX_DENIED, ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        ERROR_TYPE_WASM_TRAP,
     };
     use std::time::Instant;
 
@@ -1680,6 +1708,73 @@ mod tests {
         )
         .expect_err("non-JSON output must be a wasm trap");
         assert_eq!(err.error_type, ERROR_TYPE_WASM_TRAP);
+    }
+
+    #[test]
+    fn oversized_guest_output_is_rejected_before_parse() {
+        // The guest grows memory so a 5 MiB output region is genuinely
+        // in-bounds, then returns packed(out_ptr=0, out_len=5*1024*1024) — over
+        // the 4 MiB WASM_MAX_OUTPUT_BYTES cap. Proving the cap fires here (an
+        // in-bounds buffer that WOULD otherwise be sliced and parsed) shows the
+        // size check runs BEFORE the bounds check and `serde_json::from_slice`,
+        // so an oversized output can never balloon host parse CPU/memory.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32 i32) (result i64)
+                ;; grow to 81 pages (~5.3 MiB) so 0..5_242_880 is in-bounds
+                (drop (memory.grow (i32.const 80)))
+                ;; packed(out_ptr=0, out_len=5_242_880) = 5 MiB, over the 4 MiB cap
+                (i64.const 5242880)))
+        "#;
+        let module = compile(&store, wat);
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect_err("an over-cap output must be rejected, not parsed");
+        assert_eq!(err.error_type, ERROR_TYPE_WASM_OUTPUT_TOO_LARGE);
+        assert!(
+            err.non_retryable,
+            "an oversized output is a deterministic guest bug — non-retryable"
+        );
+        assert!(
+            err.message.contains("exceeds"),
+            "message should name the limit, was: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn small_output_at_cap_still_round_trips() {
+        // Regression: an output well under WASM_MAX_OUTPUT_BYTES parses normally.
+        // The guest writes the 4-byte JSON literal `true` and returns its length.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (data (i32.const 512) "true")
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "run") (param i32 i32) (result i64)
+                (i64.or (i64.shl (i64.const 512) (i64.const 32)) (i64.const 4))))
+        "#;
+        let module = compile(&store, wat);
+        let out = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect("an under-cap output must parse normally");
+        assert_eq!(out, serde_json::json!(true));
     }
 
     #[test]

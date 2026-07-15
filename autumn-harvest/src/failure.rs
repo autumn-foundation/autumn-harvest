@@ -149,6 +149,18 @@ pub const ERROR_TYPE_WASM_MODULE_INVALID: &str = "WasmModuleInvalid";
 #[cfg(feature = "wasm-activities")]
 pub const ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED: &str = "WasmModuleLookupFailed";
 
+/// Stable error-type name for a WASM guest whose returned output exceeds the
+/// host's maximum output-buffer size (issue #965 review round 8).
+///
+/// Synthesised when the guest's `(out_ptr, out_len)` claims more bytes than
+/// [`crate::wasm_activities::WASM_MAX_OUTPUT_BYTES`], *before* the host parses
+/// the buffer as JSON — so an oversized (but in-bounds) buffer never balloons
+/// host parse CPU/memory. **Non-retryable**: an oversized output is a
+/// deterministic guest bug that produces the same size on every attempt, so
+/// retrying in place is pointless.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility
@@ -307,6 +319,21 @@ impl ActivityFailure {
     #[must_use]
     pub fn wasm_trap(detail: impl Into<String>) -> Self {
         Self::retryable(ERROR_TYPE_WASM_TRAP, detail)
+    }
+
+    /// Construct the non-retryable failure used when a WASM guest's returned
+    /// output exceeds the host's maximum output-buffer size
+    /// (issue #965 review round 8).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_OUTPUT_TOO_LARGE`] and the
+    /// failure is non-retryable: an oversized output is a deterministic guest
+    /// bug that produces the same size on every attempt, so retrying is
+    /// pointless. Raised *before* the host deserializes the buffer, so an
+    /// oversized (but in-bounds) output never balloons host parse CPU/memory.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_output_too_large(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_OUTPUT_TOO_LARGE, detail)
     }
 
     /// Construct the non-retryable failure used when no active WASM module row

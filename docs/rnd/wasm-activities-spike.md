@@ -292,6 +292,18 @@ meet the spike's bar, recommended for GA.
   `huge_table_declaration_is_bounded_resource_exhausted`,
   `table_grow_past_cap_is_bounded_resource_exhausted`,
   `memory_limit_is_resource_exhausted`.
+- **Guest output is size-capped before deserialization.** The guest's `run`
+  returns a packed `(out_ptr, out_len)`; `out_len` is bounds-checked against
+  live guest memory, but a guest returning a large *in-bounds* buffer (e.g. a
+  16 MiB JSON array of tiny values) would otherwise make the host spend CPU
+  (outside the guest's fuel/epoch budget) and balloon host memory parsing it
+  into a `serde_json::Value`. `invoke_wasm_activity` therefore rejects any
+  `out_len` over `WASM_MAX_OUTPUT_BYTES` (4 MiB, well below the 16 MiB memory
+  ceiling) **before** the bounds check and `serde_json::from_slice` — an
+  oversized output is a **non-retryable** `WasmOutputTooLarge` (a deterministic
+  guest bug that produces the same size on every attempt), never an unbounded
+  host parse. Evidence: `oversized_guest_output_is_rejected_before_parse`,
+  `small_output_at_cap_still_round_trips`.
 
 Follow-up (out of scope per the issue): cryptographic module **signing/provenance**
 (the spike provides content-hash **integrity** only — it proves bytes weren't
@@ -482,6 +494,19 @@ real SDK (the issue scopes SDK ergonomics beyond one demo language as follow-up)
   (non-local) registered activity dispatched through the worker's task-queue WASM
   seam; a `local = true` WASM activity (inline on the workflow task) is not
   supported.
+- **Module resolution runs before the interceptor chain (eager, not lazy).** The
+  worker's WASM dispatch seam resolves the module (a DB connection checkout +
+  content-hash lookup + cold-cache byte fetch) *before* constructing
+  `dispatch_with_interceptors`, so a WASM activity with a **short-circuiting**
+  `ActivityInterceptor` (a cache/auth/fault-injection interceptor that returns
+  immediately without calling the terminal handler) still pays the resolution
+  cost for a guest it never runs — and under a saturated/down DB or a cold fetch
+  it can block on that resolve. A resolution failure surfaces as a **retryable**
+  `WasmModuleLookupFailed` (not a crash), so the worst case is a retryable error
+  and a wasted resolve, never a wedged worker. Moving `resolve_wasm_dispatch`
+  into the interceptor terminal closure (lazy resolution — resolve only when the
+  chain actually invokes the handler) is a **GA follow-up**, deferred from the
+  spike as a moderate seam restructure outside the activities-only demo scope.
 - **Memory-growth failure classification is a string match** on the wasmtime error
   Debug form (§8) — guarded by a test, but revisit on a wasmtime upgrade.
 - **CI executes the DB test suite via the `linux` integration manifest row**

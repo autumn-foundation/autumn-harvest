@@ -454,7 +454,8 @@ pub use webhook_trigger::{
 #[cfg(feature = "wasm-activities")]
 pub use wasm_activities::{
     DEFAULT_FUEL, DEFAULT_MAX_WALL_CLOCK, DEFAULT_MEMORY_BYTES, EPOCH_TICK_INTERVAL,
-    WasmCapabilities, WasmLimits, WasmModuleStore, deadline_ticks, invoke_wasm_activity,
+    WASM_MAX_OUTPUT_BYTES, WasmCapabilities, WasmLimits, WasmModuleStore, deadline_ticks,
+    invoke_wasm_activity,
 };
 #[cfg(feature = "wasm-activities")]
 pub use wasm_store::{
