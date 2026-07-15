@@ -7786,7 +7786,7 @@ fn interleaved_activity_first_workflow<'a>(
 }
 
 /// Manifestation #4 — two timers armed in one batch
-/// (`tokio::join!(ctx.timer("timer_a", …), ctx.timer("timer_b", …))`, timer_a
+/// (`tokio::join!(ctx.timer("timer_a", …), ctx.timer("timer_b", …))`, `timer_a`
 /// polled/matched first) firing in REVERSED order: the sibling (foreign-id)
 /// `TimerFired(timer_b)` is recorded before the polled timer's own
 /// `TimerFired(timer_a)`. `match_timer_strict`'s scan for `TimerFired(timer_a)`
@@ -7863,8 +7863,8 @@ fn interleaved_timer_before_activity_terminal_history() -> Vec<WorkflowEvent> {
     ]
 }
 
-/// #4 fixture: two timers armed in arm order (timer_a then timer_b) but firing
-/// in REVERSED order (TimerFired(timer_b) before TimerFired(timer_a)).
+/// #4 fixture: two timers armed in arm order (`timer_a` then `timer_b`) but firing
+/// in REVERSED order (`TimerFired(timer_b)` before `TimerFired(timer_a)`).
 fn interleaved_two_timers_reversed_fire_history() -> Vec<WorkflowEvent> {
     let a = TimerId::new("timer_a");
     let b = TimerId::new("timer_b");
@@ -7987,7 +7987,7 @@ async fn interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded()
 /// `TimerStarted` with NO matching `TimerFired` and NO signal must still be a
 /// divergence — pushing a `WaitForSignal` command here would park the run
 /// forever on a signal that will never arrive. The #1071 TimerFired-tolerance
-/// fix must not suppress this (there is no TimerFired to cross here).
+/// fix must not suppress this (there is no `TimerFired` to cross here).
 #[tokio::test]
 async fn interleaved_sibling_signal_stray_timer_started_still_diverges() {
     let events = vec![

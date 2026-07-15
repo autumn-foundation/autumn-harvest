@@ -1196,8 +1196,24 @@ impl HistoryMatcher {
                 WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
                 | WorkflowEvent::TimerStarted { .. }
-                | WorkflowEvent::TimerCancelled { .. } => {
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Progress/terminal events of concurrent siblings from a mixed
+                // suspension batch — a sibling timer's fire (an expired timer
+                // firing before this activity's terminal, e.g.
+                // `tokio::join!(activity, ctx.timer(...))`), a child workflow's
+                // terminal, or a local activity's terminal — are transparent to
+                // this activity's terminal scan. Cross them NON-CONSUMINGLY,
+                // leaving each for its own matcher to claim after the rewind
+                // (issue #1071 manifestation #2).
+                WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. } => {
                     scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
@@ -2963,6 +2979,49 @@ impl HistoryMatcher {
                 continue;
             }
 
+            // Interleaved sibling commands from a mixed suspension batch
+            // (e.g. `tokio::join!(ctx.timer(...), ctx.execute_activity(...))`
+            // where the timer command is emitted FIRST). Keep the first one as
+            // the rewind cursor — mirroring `match_signal_or_timer` — and scan
+            // past it so this timer's own `TimerFired` recorded later is still
+            // found. `settle_terminal` rewinds to it so the sibling's own
+            // matcher re-scans in program order (issue #1071).
+            if matches!(
+                &self.events[scan_cursor],
+                WorkflowEvent::ActivityScheduled { .. }
+                    | WorkflowEvent::LocalActivityScheduled { .. }
+                    | WorkflowEvent::MarkerRecorded { .. }
+                    | WorkflowEvent::SideEffectRecorded { .. }
+            ) {
+                first_interleaved_command.get_or_insert(scan_cursor);
+                scan_cursor += 1;
+                continue;
+            }
+
+            // Progress and terminal events of those concurrent siblings — and
+            // fires of FOREIGN timers (id != timer_id; this timer's own fire is
+            // matched above) — are transparent to this timer's scan. Cross them
+            // NON-CONSUMINGLY, leaving each for its own matcher to claim after
+            // the rewind (a foreign `TimerFired` belongs to the sibling timer's
+            // own `match_timer_strict`; consuming it here would steal it). This
+            // is the reversed-fire-order multi-timer case (issue #1071 #4).
+            if matches!(
+                &self.events[scan_cursor],
+                WorkflowEvent::ActivityStarted { .. }
+                    | WorkflowEvent::ActivityHeartbeat { .. }
+                    | WorkflowEvent::ActivityCompleted { .. }
+                    | WorkflowEvent::ActivityFailed { .. }
+                    | WorkflowEvent::ActivityTimedOut { .. }
+                    | WorkflowEvent::LocalActivityCompleted { .. }
+                    | WorkflowEvent::LocalActivityFailed { .. }
+                    | WorkflowEvent::ChildWorkflowCompleted { .. }
+                    | WorkflowEvent::ChildWorkflowFailed { .. }
+                    | WorkflowEvent::TimerFired { .. }
+            ) {
+                scan_cursor += 1;
+                continue;
+            }
+
             break;
         }
 
@@ -3391,6 +3450,23 @@ impl HistoryMatcher {
                     // Update events are transparent to signal scanning.
                     scan_cursor += 1;
                 }
+                // A signal-or-deadline race's OWN deadline timer (issue #476's
+                // reserved `__signal_timeout:{seq}:{name}` convention) is
+                // transparent to a plain signal wait: it belongs to a concurrent
+                // `receive_signal_timeout` race, not to this wait, so it is
+                // neither a user command to rewind for nor a park-forever stray.
+                // Cross it WITHOUT setting `first_interleaved_command` (its paired
+                // `TimerFired` crosses via the arm below), so the awaited signal
+                // recorded after the spent deadline is found and the reserved
+                // events end up behind the cursor on the win — never flagging
+                // early completion (issue #1071 manifestation #3). A genuine user
+                // `ctx.timer` sibling falls through to the arm below and keeps its
+                // rewind so its own `match_timer_strict` still finds it.
+                WorkflowEvent::TimerStarted { timer_id, .. }
+                    if Self::signal_timeout_race_name(timer_id.as_str()).is_some() =>
+                {
+                    scan_cursor += 1;
+                }
                 // A detached-spawn or a cancellable-timer arm/cancel (issue #768)
                 // — e.g. a `[CancelTimer, TimerStarted]` reset, or a
                 // `[CancelTimer, WaitForSignal]` batch from a
@@ -3486,6 +3562,20 @@ impl HistoryMatcher {
                         p.terminal = Some(StashedCancelTerminal::Failed(code));
                     }
                     self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // A foreign timer's fire — a sibling deadline timer that fired
+                // before the awaited signal arrived (e.g. a concurrent
+                // `receive_signal_timeout`/`ctx.timer` in the same suspension
+                // batch, whose `TimerFired` is recorded ahead of the delivered
+                // `SignalReceived`) — is transparent to the signal scan. Cross
+                // it NON-CONSUMINGLY, leaving it for its own timer matcher, and
+                // keep scanning for the awaited signal (issue #1071
+                // manifestation #3). This does NOT set `first_interleaved_command`,
+                // so the round-13 stray-`TimerStarted` park-forever guard below
+                // (an interleaved timer with NO resolving signal → diverge) is
+                // untouched: a lone `TimerStarted` still diverges.
+                WorkflowEvent::TimerFired { .. } => {
                     scan_cursor += 1;
                 }
                 other => {
