@@ -302,7 +302,7 @@ impl std::fmt::Display for DeadLetterReason {
 }
 
 impl DeadLetterReason {
-    /// Stable, low-cardinality snake_case class name for this quarantine
+    /// Stable, low-cardinality `snake_case` class name for this quarantine
     /// reason (issue #613). This is the value the `dlq_reason` aggregation
     /// dimension and bulk-filter dimension key on.
     #[must_use]
@@ -315,7 +315,7 @@ impl DeadLetterReason {
         }
     }
 
-    /// PascalCase serde `"type"` tag for this reason, used as the derived
+    /// `PascalCase` serde `"type"` tag for this reason, used as the derived
     /// `error_class` for an engine-authored quarantine entry (issue #613).
     #[must_use]
     pub const fn type_tag(&self) -> &'static str {
@@ -1236,7 +1236,7 @@ pub const ERROR_CLASS_MAX_LEN: usize = 80;
 ///
 /// Engine-authored quarantine entries serialize a tagged [`DeadLetterReason`]
 /// as their `error` (see `dead_letter`'s callers); those map to the reason's
-/// stable snake_case [`DeadLetterReason::reason_class`]. Every other error —
+/// stable `snake_case` [`DeadLetterReason::reason_class`]. Every other error —
 /// a plain `Err(String)` or a typed activity-failure envelope — is retry
 /// exhaustion (there is no production path that dead-letters a plain
 /// retry-exhausted activity, but tests and embedders can), so it maps to
@@ -1244,10 +1244,10 @@ pub const ERROR_CLASS_MAX_LEN: usize = 80;
 /// shards for the same input.
 #[must_use]
 pub fn dlq_reason(error: &str) -> String {
-    match serde_json::from_str::<DeadLetterReason>(error) {
-        Ok(reason) => reason.reason_class().to_string(),
-        Err(_) => "retry_exhaustion".to_string(),
-    }
+    serde_json::from_str::<DeadLetterReason>(error).map_or_else(
+        |_| "retry_exhaustion".to_string(),
+        |reason| reason.reason_class().to_string(),
+    )
 }
 
 /// Classify a DLQ `error` string into a low-cardinality *error class*
@@ -1256,7 +1256,7 @@ pub fn dlq_reason(error: &str) -> String {
 /// Resolution order:
 /// 1. A typed activity-failure envelope → its stable `error_type` (e.g.
 ///    `"CircuitOpen"`, `"HandlerPanic"`).
-/// 2. A tagged [`DeadLetterReason`] → its PascalCase [`DeadLetterReason::type_tag`].
+/// 2. A tagged [`DeadLetterReason`] → its `PascalCase` [`DeadLetterReason::type_tag`].
 /// 3. Otherwise → the normalized leading token of the first line (dynamic
 ///    runs collapsed to placeholders).
 ///
