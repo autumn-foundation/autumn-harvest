@@ -103,6 +103,22 @@ async fn uuid_then_done(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Va
     Ok(json!({ "uuid": id.to_string() }))
 }
 
+/// Attempt an activity, SWALLOW any error (including a timeout surfaced on replay
+/// of an imported `ActivityTimedOut`), then arm a durable timer and return. Used
+/// by the timed-out-activity import regression: after the swallowed timeout the
+/// workflow SUSPENDS on the timer, so `drive_one_cycle` reaches its `drain_ready`
+/// pass — which would claim + run a wrongly-materialized stale task for the
+/// already-terminal activity and append a duplicate terminal, had the importer
+/// mis-classified the `ActivityTimedOut` as an open activity.
+#[workflow]
+async fn timeout_then_timer(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    // Swallow whatever the activity resolves to (Ok on a live run; Err(Timeout) on
+    // replay of the imported timed-out history) and continue.
+    let _ = ctx.execute_activity_raw("work", json!(n), "default").await;
+    ctx.timer("after", 5).await.map_err(|e| e.to_string())?;
+    Ok("recovered".to_string())
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, String) {
@@ -1301,4 +1317,188 @@ async fn scenario_unregistered_activity_requeues_and_drains_after_registration()
         1,
         "the activity runs exactly once, on the run after it was registered"
     );
+}
+
+// ── Codex P2 regression (round 7): a timed-out activity is TERMINAL on import ──
+//
+// `import_execution`'s open-vs-closed classification (`history_has_activity_terminal`)
+// recognized only `ActivityCompleted`/`ActivityFailed` — it MISSED `ActivityTimedOut`
+// (and the external terminals). Importing a PG-shaped history in which a scheduled
+// activity TIMED OUT therefore wrongly reported the activity as OPEN and
+// re-materialized a stale PENDING `spike_tasks` row for it. On drive, the workflow
+// swallows the (replayed) timeout and suspends on a timer, so `drive_one_cycle`
+// reaches its `drain_ready` pass — which claims + runs that stale task and appends a
+// SECOND terminal (`ActivityCompleted`) for the already-terminal activity_id,
+// corrupting the replayable log. With the fix (`ActivityTimedOut` recognized as
+// terminal) the importer materializes NO task row, `drain_ready` finds nothing to
+// run, and the imported log grows only by the workflow's own new events.
+//
+// Fails on pre-fix code: `queued_activity_ids` reports the stale [id], the "work"
+// body runs, and a duplicate `ActivityCompleted` is appended for the timed-out id.
+#[tokio::test]
+async fn scenario_import_timed_out_activity_is_terminal_not_re_materialized() {
+    let activity_id = ActivityExecId::new();
+    // In-flight PG-shaped history: "work" was Scheduled → Started → TimedOut
+    // (start-to-close). No `ActivityCompleted`: the id is terminal via the timeout,
+    // and the run continues (the workflow catches the timeout).
+    let timed_out = vec![
+        WorkflowEvent::workflow_started(json!(3), chrono::Utc::now()),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "work".to_string(),
+            input: json!(3),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id,
+            worker_id: WorkerId::new("pg-worker-1"),
+        },
+        WorkflowEvent::ActivityTimedOut {
+            activity_id,
+            timeout_type: TimeoutType::StartToClose,
+        },
+    ];
+
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&timeout_then_timer_info());
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+
+    let exec = rt
+        .import_execution("timeout_then_timer", json!(3), timed_out)
+        .unwrap();
+
+    // The importer must NOT re-materialize a task row for the already-terminal
+    // (timed-out) activity. Pre-fix this reports the stale [activity_id] and fails.
+    assert!(
+        rt.queued_activity_ids(exec).unwrap().is_empty(),
+        "a timed-out activity is terminal — no stale spike_tasks row is materialized"
+    );
+
+    // Drive: the workflow swallows the replayed timeout, arms a timer (SUSPENDS —
+    // so drive_one_cycle reaches its drain_ready pass), then completes once the
+    // timer fires. Pre-fix, drain_ready claims + runs the stale task here.
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::WaitingTimer
+    ));
+    rt.advance_time(5).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("recovered")),
+        "state = {state:?}"
+    );
+
+    // The "work" body NEVER ran — no stale task was materialized to drain
+    // (pre-fix: ran == 1).
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "the timed-out activity's body must not re-run — its task was never materialized"
+    );
+
+    // No SECOND terminal for the timed-out id: exactly one ActivityTimedOut, ZERO
+    // ActivityCompleted, and exactly one ActivityScheduled (the imported one — not a
+    // re-materialized + re-scheduled duplicate). Pre-fix, drain_ready appends a
+    // duplicate ActivityCompleted for the id, corrupting the log.
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut { activity_id: id, .. } if *id == activity_id
+        )),
+        1,
+        "exactly one ActivityTimedOut for the id — never re-run"
+    );
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::ActivityCompleted { activity_id: id, .. } if *id == activity_id
+        )),
+        0,
+        "no duplicate ActivityCompleted terminal for the timed-out id"
+    );
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { activity_id: id, .. } if *id == activity_id
+        )),
+        1,
+        "exactly one ActivityScheduled — the imported one, not a re-materialized duplicate"
+    );
+}
+
+// ── Codex P2 regression (round 7): a sealed terminal the prototype can't model ──
+//
+// `import_execution`'s sealed-terminal scan recognized only WorkflowCompleted /
+// WorkflowFailed. A sealed history whose tail terminal is a variant the
+// COMPLETED/FAILED-only prototype cannot represent (WorkflowCancelled /
+// WorkflowExecutionTimedOut / WorkflowContinuedAsNew / WorkflowResetTerminated)
+// fell through to the in-flight branch and was seeded as a RUNNING import — a later
+// re-drive would then replay the sealed history and append a SECOND terminal,
+// corrupting the log. With the fix such an import is REJECTED outright with a clear
+// `SpikeError::Unsupported` BEFORE any DB write (nothing is imported), consistent
+// with the driven path already rejecting a `ContinueAsNew` command. This closes the
+// whole workflow-terminal-variant sub-class, not just the two representable seals.
+#[tokio::test]
+async fn scenario_import_sealed_unrepresentable_terminal_is_rejected() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+
+    // A sealed CANCELLED history — a terminal the prototype cannot model.
+    let sealed_cancelled = vec![
+        WorkflowEvent::workflow_started(json!(1), chrono::Utc::now()),
+        WorkflowEvent::WorkflowCancelled {
+            reason: "operator cancel from source backend".to_string(),
+        },
+    ];
+    let err = rt
+        .import_execution("single_activity", json!(1), sealed_cancelled)
+        .unwrap_err();
+    assert!(
+        matches!(err, SpikeError::Unsupported(ref v) if v.contains("WorkflowCancelled")),
+        "a sealed WorkflowCancelled import is rejected, not mis-materialized: {err:?}"
+    );
+
+    // A sealed WorkflowExecutionTimedOut is likewise rejected — proving the whole
+    // unrepresentable set is closed (not just Cancelled), the workflow twin of the
+    // activity `ActivityTimedOut` fix above.
+    let sealed_timed_out = vec![
+        WorkflowEvent::workflow_started(json!(2), chrono::Utc::now()),
+        WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: chrono::Utc::now(),
+            timed_out_at: chrono::Utc::now(),
+        },
+    ];
+    let err2 = rt
+        .import_execution("single_activity", json!(2), sealed_timed_out)
+        .unwrap_err();
+    assert!(
+        matches!(err2, SpikeError::Unsupported(ref v) if v.contains("WorkflowExecutionTimedOut")),
+        "a sealed WorkflowExecutionTimedOut import is rejected: {err2:?}"
+    );
+
+    // Rejection happened BEFORE the tx opened — a REPRESENTABLE sealed import after
+    // the two rejected ones still succeeds on the same runtime (no torn/poisoned
+    // state was left behind), and drives to its imported terminal without re-running.
+    let sealed_ok = vec![
+        WorkflowEvent::workflow_started(json!(9), chrono::Utc::now()),
+        WorkflowEvent::WorkflowCompleted { output: json!(18) },
+    ];
+    let exec = rt
+        .import_execution("single_activity", json!(9), sealed_ok)
+        .unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(ref v) if v == &json!(18)
+    ));
 }

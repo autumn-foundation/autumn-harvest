@@ -93,7 +93,25 @@ on the shipped Postgres path).
   `import_execution`, when handed an already-**sealed** history (tail event a
   terminal `WorkflowCompleted`/`WorkflowFailed`), initializes the row directly in
   that terminal state with the imported output/error instead of creating it RUNNING
-  and re-driving it into a duplicate terminal. **One documented known limitation
+  and re-driving it into a duplicate terminal. **The import terminal-recognition
+  helpers recognize the FULL terminal-variant set** (Codex P2, round 7): the
+  open-vs-closed activity check now recognizes `ActivityTimedOut` (and the
+  external-completion terminals `ActivityCompletedExternally`/
+  `ActivityFailedExternally`) alongside `ActivityCompleted`/`ActivityFailed`,
+  mirroring the authoritative engine `HistoryMatcher::scan_activity_terminal` — so
+  importing a PG history whose scheduled activity **timed out** no longer misreads
+  it as *open*, re-materializes a stale `spike_tasks` row, and (once the workflow
+  swallows the replayed timeout and reaches the `drain_ready` pass) corrupts the
+  log with a duplicate `ActivityCompleted`; the timer check recognizes
+  `TimerCancelled` (issue #768) as terminal alongside `TimerFired`; and the sealed
+  workflow-terminal scan recognizes the engine's full `is_terminal_lifecycle` seal
+  set — `WorkflowCompleted`/`WorkflowFailed` are represented directly, while a
+  terminal the COMPLETED/FAILED-only prototype cannot model (`WorkflowCancelled`/
+  `WorkflowExecutionTimedOut`/`WorkflowContinuedAsNew`/`WorkflowResetTerminated`)
+  is **rejected** outright with `SpikeError::Unsupported` before any DB write
+  (never silently mis-materialized as a RUNNING import a later re-drive would
+  append a second terminal to), consistent with the driven path already rejecting a
+  `ContinueAsNew` command. **One documented known limitation
   (not fixed, per timebox):** reusing a *classic* timer id after a prior same-id
   timer has fired wedges at `SpikeError::Stuck` — the prototype's whole-history
   bare-id arm-guard drops the engine's legitimately-new second `StartTimer`, and the
@@ -106,8 +124,8 @@ on the shipped Postgres path).
   the go/no-go: they are exactly the deep coordination/matcher-coupling surface that
   motivates the "separate companion crate reusing the core, not a trivial port"
   recommendation.
-- **A 16-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (16/16 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+- **An 18-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (18/18 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays
@@ -148,7 +166,20 @@ on the shipped Postgres path).
   registered, drains it to `Completed`
   (`scenario_unregistered_activity_requeues_and_drains_after_registration`; fails
   pre-fix — the claimed task is stranded `RUNNING`, later claims select only
-  `PENDING`, so the re-run wedges at `Stuck`).
+  `PENDING`, so the re-run wedges at `Stuck`) — **plus two round-7 regression
+  tests** closing the import terminal-variant completeness gap: an imported
+  timed-out activity (`Scheduled → Started → ActivityTimedOut`) is recognized as
+  terminal, materializes no stale task row, and drives without appending a
+  duplicate `ActivityCompleted`
+  (`scenario_import_timed_out_activity_is_terminal_not_re_materialized`; fails
+  pre-fix — the timed-out activity reads as *open*, a stale task is materialized,
+  and `drain_ready` corrupts the log with a second terminal); and a sealed import
+  whose terminal the prototype cannot model (`WorkflowCancelled`,
+  `WorkflowExecutionTimedOut`) is rejected with `SpikeError::Unsupported` before any
+  DB write while a representable sealed import still succeeds afterward
+  (`scenario_import_sealed_unrepresentable_terminal_is_rejected`; fails pre-fix —
+  the unrepresentable seal falls through to the in-flight branch and is seeded
+  `RUNNING`).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`

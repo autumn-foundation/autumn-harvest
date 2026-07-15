@@ -276,22 +276,42 @@ impl SqliteRuntime {
     /// correctly rather than deadlocking.
     ///
     /// **A sealed import derives its terminal state, not RUNNING.** When the
-    /// imported history already carries a terminal `WorkflowCompleted`/
-    /// `WorkflowFailed` (a source backend handing off an *already-finished*
-    /// execution), the importer initializes the execution row directly in that
-    /// terminal state with the imported output/error — it does **not** create it
+    /// imported history already carries a terminal seal (a source backend handing
+    /// off an *already-finished* execution), the importer initializes the
+    /// execution row directly in that terminal state — it does **not** create it
     /// RUNNING and does **not** materialize open work (a well-formed sealed history
     /// has none). Otherwise a subsequent [`Self::run_until_blocked`] would replay
     /// the already-sealed history and append a SECOND terminal event before
     /// flipping the row, corrupting the imported log (Codex P2). This makes a
-    /// cross-backend handoff of a COMPLETED execution a faithful no-op:
+    /// cross-backend handoff of a finished execution a faithful no-op:
     /// re-`run_until_blocked` returns the imported outcome without re-running.
+    ///
+    /// The recognized seal set is the engine's FULL workflow-terminal-lifecycle
+    /// set (mirrors [`WorkflowEvent::is_terminal_lifecycle`](crate::event::WorkflowEvent::is_terminal_lifecycle)
+    /// minus its two trailing-bookkeeping members `WorkflowRetryScheduled` /
+    /// `ChildWorkflowCascadeApplied`, which are appended *after* the seal and are
+    /// skipped by the reverse tail scan). The COMPLETED/FAILED-only prototype seals
+    /// `WorkflowCompleted` / `WorkflowFailed` directly; a terminal it cannot model
+    /// (`WorkflowCancelled` / `WorkflowExecutionTimedOut` / `WorkflowContinuedAsNew`
+    /// / `WorkflowResetTerminated`) is **rejected** outright with
+    /// [`SpikeError::Unsupported`] (consistent with the driven path, which already
+    /// rejects a `ContinueAsNew` command) rather than silently mis-classified as an
+    /// in-flight RUNNING import — closing the whole variant-completeness class, not
+    /// just the flagged `ActivityTimedOut`.
     pub fn import_execution(
         &mut self,
         workflow_name: &str,
         input: Value,
         events: Vec<WorkflowEvent>,
     ) -> Result<ExecutionId, SpikeError> {
+        // Classification of a sealed imported history's tail terminal (declared at
+        // the top of scope to satisfy `clippy::items_after_statements`).
+        enum SealedSeal {
+            Completed(Value),
+            Failed(String),
+            /// A terminal the COMPLETED/FAILED-only prototype cannot represent.
+            Unsupported(&'static str),
+        }
         if !self.workflows.contains_key(workflow_name) {
             return Err(SpikeError::UnknownWorkflow(workflow_name.to_string()));
         }
@@ -299,15 +319,47 @@ impl SqliteRuntime {
         // Copy the Copy clock before borrowing `self.conn` mutably for the tx —
         // open timers are re-armed relative to it (handoff semantic below).
         let clock = self.clock;
-        // Is the imported history sealed (its last lifecycle event terminal)? The
-        // spike writes only `WorkflowCompleted`/`WorkflowFailed` terminals, so a
-        // reverse scan for the first of either is the tail terminal.
-        let sealed_terminal: Option<Result<Value, String>> =
-            events.iter().rev().find_map(|e| match e {
-                WorkflowEvent::WorkflowCompleted { output } => Some(Ok(output.clone())),
-                WorkflowEvent::WorkflowFailed { error, .. } => Some(Err(error.clone())),
-                _ => None,
-            });
+        // Is the imported history sealed (its tail lifecycle event terminal)? A
+        // reverse scan finds the FIRST terminal-lifecycle seal from the tail,
+        // transparently skipping trailing bookkeeping (`WorkflowRetryScheduled` /
+        // `ChildWorkflowCascadeApplied`, appended AFTER the seal, which return
+        // `None` and keep the scan going). The recognized set is the engine's full
+        // workflow-terminal-seal set: COMPLETED/FAILED are representable and sealed
+        // below; the four seals the prototype cannot model are classified
+        // `Unsupported` and REJECTED before any DB write (never mis-materialized).
+        let sealed_seal: Option<SealedSeal> = events.iter().rev().find_map(|e| match e {
+            WorkflowEvent::WorkflowCompleted { output } => {
+                Some(SealedSeal::Completed(output.clone()))
+            }
+            WorkflowEvent::WorkflowFailed { error, .. } => Some(SealedSeal::Failed(error.clone())),
+            WorkflowEvent::WorkflowCancelled { .. } => {
+                Some(SealedSeal::Unsupported("WorkflowCancelled"))
+            }
+            WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
+                Some(SealedSeal::Unsupported("WorkflowExecutionTimedOut"))
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { .. } => {
+                Some(SealedSeal::Unsupported("WorkflowContinuedAsNew"))
+            }
+            WorkflowEvent::WorkflowResetTerminated { .. } => {
+                Some(SealedSeal::Unsupported("WorkflowResetTerminated"))
+            }
+            _ => None,
+        });
+        // Reject an unrepresentable sealed terminal BEFORE opening the tx — import
+        // nothing rather than silently mis-materialize (the tx would otherwise seed
+        // a RUNNING row a later re-drive appends a second terminal to). Downstream,
+        // `sealed_terminal` carries only the representable Completed/Failed outcomes.
+        let sealed_terminal: Option<Result<Value, String>> = match sealed_seal {
+            Some(SealedSeal::Unsupported(variant)) => {
+                return Err(SpikeError::Unsupported(format!(
+                    "import of sealed {variant} history"
+                )));
+            }
+            Some(SealedSeal::Completed(output)) => Some(Ok(output)),
+            Some(SealedSeal::Failed(error)) => Some(Err(error)),
+            None => None,
+        };
         // Execution row + the whole imported history + companion rows for any
         // in-flight open scheduled work (or the derived terminal state, for a
         // sealed import) commit in ONE transaction, so a crash mid-import can never
@@ -336,8 +388,9 @@ impl SqliteRuntime {
             // falls through to the `_` arm and materializes no row.
             for event in &events {
                 match event {
-                    // Open: no terminal (`ActivityCompleted`/exhausted
-                    // `ActivityFailed`) for this id. Materialize a fresh PENDING
+                    // Open: no activity-terminal event
+                    // (`ActivityCompleted`/`ActivityFailed`/`ActivityTimedOut`, or
+                    // an external terminal) for this id. Materialize a fresh PENDING
                     // task the worker claims + runs. The source backend's in-flight
                     // attempt (its `ActivityStarted`, which the spike ignores) is
                     // lost on handoff, so re-running is the correct at-least-once
@@ -362,15 +415,16 @@ impl SqliteRuntime {
                             clock,
                         )?;
                     }
-                    // Open: no `TimerFired` for this id. Handoff semantic: a timer's
-                    // *remaining* delay restarts from import time — the source
-                    // backend's absolute deadline is not portable across backends
-                    // (different clock epochs) — so re-arm fresh at `clock +
-                    // duration_secs` (saturating, like `apply_commands`).
+                    // Open: no timer-terminal (`TimerFired`/`TimerCancelled`) for
+                    // this id. Handoff semantic: a timer's *remaining* delay
+                    // restarts from import time — the source backend's absolute
+                    // deadline is not portable across backends (different clock
+                    // epochs) — so re-arm fresh at `clock + duration_secs`
+                    // (saturating, like `apply_commands`).
                     WorkflowEvent::TimerStarted {
                         timer_id,
                         duration_secs,
-                    } if !store::history_has_timer_fired(&events, &timer_id.to_string()) => {
+                    } if !store::history_has_timer_terminal(&events, &timer_id.to_string()) => {
                         let fire_at = clock
                             .checked_add(i64::try_from(*duration_secs).unwrap_or(i64::MAX))
                             .unwrap_or(i64::MAX);

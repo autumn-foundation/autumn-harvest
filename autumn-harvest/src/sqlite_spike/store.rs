@@ -177,11 +177,37 @@ pub(super) fn history_has_timer_started(events: &[WorkflowEvent], timer_id: &str
     events.iter().any(|e| matches!(e, WorkflowEvent::TimerStarted { timer_id: id, .. } if id.to_string() == timer_id))
 }
 
-/// True if history holds a *terminal* activity event for `activity_id` — an
-/// `ActivityCompleted` or a retry-exhausting `ActivityFailed`. Used by
-/// [`import_execution`](super::SqliteRuntime::import_execution) to distinguish a
-/// closed activity (needs no `spike_tasks` row) from an *open* (still in-flight)
-/// one carried in a cross-backend history (needs its derived task row rebuilt).
+/// True if history holds any *terminal* activity event for `activity_id`.
+///
+/// The recognized set is the FULL union of terminal outcomes the engine can
+/// emit for an activity, correlated by `activity_id` — mirroring the
+/// authoritative engine replay recognition (`HistoryMatcher::scan_activity_terminal`
+/// for regular activities, plus the external-completion scan). This is the very
+/// recognition that makes cross-backend replay (AC4) hold, so the import path
+/// must classify "closed vs open" identically:
+///
+/// - Regular activities: `ActivityCompleted`, a retry-exhausting `ActivityFailed`,
+///   or an `ActivityTimedOut` (start-to-close / heartbeat / schedule-to-close /
+///   schedule-to-start). The engine settles the match on the *first* of these; an
+///   `ActivityTimedOut` is a terminal outcome for the id, NOT an "open" activity.
+/// - External activities (issue #92): `ActivityCompletedExternally` or
+///   `ActivityFailedExternally` (the engine settles unconditionally, without
+///   inspecting the `retryable` flag — a retry re-schedules under a fresh id).
+///
+/// Used by [`import_execution`](super::SqliteRuntime::import_execution) to
+/// distinguish a closed activity (needs no `spike_tasks` row) from an *open*
+/// (still in-flight) one carried in a cross-backend history (needs its derived
+/// task row rebuilt). A false negative here re-materializes a stale PENDING task
+/// that [`worker::drain_ready`](super::worker) would then run, appending a SECOND
+/// terminal event for the id and corrupting the imported log (Codex P2). Adding
+/// `ActivityTimedOut` closes exactly that gap for a timed-out-then-not-retried
+/// import; the external terminals are recognized for the same reason.
+///
+/// Local activities are deliberately out of scope: the importer never
+/// materializes a `spike_tasks` row for them (they replay inline via
+/// `run_workflow_with_state`), so their `LocalActivityCompleted` /
+/// `LocalActivityExhausted` terminals never gate an import-materialization
+/// decision and are not consulted here.
 pub(super) fn history_has_activity_terminal(events: &[WorkflowEvent], activity_id: &str) -> bool {
     events.iter().any(|e| match e {
         WorkflowEvent::ActivityCompleted {
@@ -189,17 +215,36 @@ pub(super) fn history_has_activity_terminal(events: &[WorkflowEvent], activity_i
         }
         | WorkflowEvent::ActivityFailed {
             activity_id: id, ..
+        }
+        | WorkflowEvent::ActivityTimedOut {
+            activity_id: id, ..
+        }
+        | WorkflowEvent::ActivityCompletedExternally {
+            activity_id: id, ..
+        }
+        | WorkflowEvent::ActivityFailedExternally {
+            activity_id: id, ..
         } => id.to_string() == activity_id,
         _ => false,
     })
 }
 
-/// True if history holds a `TimerFired` for `timer_id` — the timer already fired
-/// and needs no `spike_timers` row when importing a cross-backend history.
-pub(super) fn history_has_timer_fired(events: &[WorkflowEvent], timer_id: &str) -> bool {
-    events.iter().any(
-        |e| matches!(e, WorkflowEvent::TimerFired { timer_id: id } if id.to_string() == timer_id),
-    )
+/// True if history holds a *terminal* timer event for `timer_id` — either a
+/// `TimerFired` (the timer elapsed) or a `TimerCancelled` (an author-controlled
+/// cancellable timer was cancelled / reset, issue #768: the engine deletes the
+/// `harvest_timers` row in the same transaction and never fires it). Either
+/// terminal means the imported timer needs no `spike_timers` row.
+///
+/// Used by [`import_execution`](super::SqliteRuntime::import_execution): a false
+/// negative would re-arm a fresh `spike_timers` row for an already-cancelled
+/// timer, which later injects a spurious `TimerFired` into the replayable log
+/// (the timer-side twin of the activity re-materialization corruption above).
+pub(super) fn history_has_timer_terminal(events: &[WorkflowEvent], timer_id: &str) -> bool {
+    events.iter().any(|e| match e {
+        WorkflowEvent::TimerFired { timer_id: id }
+        | WorkflowEvent::TimerCancelled { timer_id: id } => id.to_string() == timer_id,
+        _ => false,
+    })
 }
 
 // ── Activity attempt audit log ───────────────────────────────────────────────

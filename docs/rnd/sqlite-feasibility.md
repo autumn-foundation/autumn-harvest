@@ -323,17 +323,31 @@ autocommits:
   otherwise have no row to drain). Open timers are re-armed relative to import
   time (`fire_at = clock + duration_secs`), since a source backend's absolute
   deadline is not portable across backends. Conversely, when the imported history
-  is already **sealed** — its tail lifecycle event a terminal
-  `WorkflowCompleted`/`WorkflowFailed`, a source backend handing off an
-  *already-finished* execution — the importer initializes the execution row
-  directly in that terminal state with the imported output/error and materializes
-  no open work (a well-formed sealed history has none). Otherwise a re-`run_until_blocked`
+  is already **sealed** — its tail lifecycle event a terminal seal, a source
+  backend handing off an *already-finished* execution — the importer initializes
+  the execution row directly in that terminal state and materializes no open work
+  (a well-formed sealed history has none). Otherwise a re-`run_until_blocked`
   would replay the sealed history and append a **second** terminal event before
   flipping the row, corrupting the imported log (Codex P2, round 5). The three
   import shapes — fully open, partially complete (some activities done, one open),
   fully sealed — are all handled: the fully-open and partial cases by the
-  in-flight branch's per-item terminal check (a completed/exhausted activity or a
-  fired timer gets no row), the sealed case by the terminal-state derivation.
+  in-flight branch's per-item terminal check (a closed activity or a fired/
+  cancelled timer gets no row), the sealed case by the terminal-state derivation.
+  The per-item and sealed terminal-recognition helpers recognize the **full**
+  terminal-variant set the engine can emit, mirroring the authoritative replay
+  matcher (Codex P2, round 7). For an activity: `ActivityCompleted`,
+  `ActivityFailed`, `ActivityTimedOut`, and the external-completion terminals
+  (`ActivityCompletedExternally`/`ActivityFailedExternally`) — an
+  `ActivityTimedOut` is terminal, not "open," so a timed-out-then-not-retried
+  import no longer re-materializes a stale task the worker would run to append a
+  duplicate terminal. For a timer: `TimerFired` **and** `TimerCancelled` (issue
+  #768). For the sealed workflow-terminal seal: the engine's full
+  `is_terminal_lifecycle` set — `WorkflowCompleted`/`WorkflowFailed` are
+  represented directly, while a terminal the COMPLETED/FAILED-only prototype
+  cannot model (`WorkflowCancelled`/`WorkflowExecutionTimedOut`/
+  `WorkflowContinuedAsNew`/`WorkflowResetTerminated`) is **rejected** outright with
+  `SpikeError::Unsupported` before any DB write (never silently mis-materialized),
+  consistent with the driven path already rejecting a `ContinueAsNew` command.
 - *Deterministic side-effect commands are persisted, never dropped*
   (`apply_commands`). The issue #384 primitives (`system_now`/`new_uuid`/
   `random_*`/`side_effect`) and version-gate markers emit `RecordSideEffect`/
@@ -436,7 +450,7 @@ live, is rebuilt.
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **16 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **18 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -457,6 +471,8 @@ sqlite-spike,testing --test integration sqlite_spike` → **16 passed; 0 failed*
 | `scenario_terminal_cycle_side_effect_persists_before_seal` | **(Codex P2 regression, round 5)** A workflow mints `ctx.new_uuid()` and returns in the **same terminal cycle** (no suspension), emitting a `RecordSideEffect` in the terminal command batch. The prototype persists the `SideEffectRecorded` **before** the `WorkflowCompleted` seal (via `run_workflow_with_state`, which surfaces the pending vector the bare `run_workflow` drops), and a genuine restart on the terminal-stripped history recovers the SAME UUID rather than re-minting. Fails on the pre-fix code (no `SideEffectRecorded` reaches history → the `.expect` panics, and the restart mints a fresh UUID ≠ output). |
 | `scenario_import_sealed_history_derives_terminal_state` | **(Codex P2 regression, round 5)** A **sealed** imported history — tail event a terminal `WorkflowCompleted{output}` (and a sibling `WorkflowFailed` case) — initializes the execution row directly in that terminal state with the imported output/error; a re-`run_until_blocked` short-circuits at the "already terminal?" check, re-runs nothing, and appends **no** second terminal event (event count unchanged). Fails on the pre-fix code (the row is created RUNNING, the sealed history is re-driven, and a duplicate terminal is appended — event count grows 5 → 6). |
 | `scenario_unregistered_activity_requeues_and_drains_after_registration` | **(Codex P2 regression, round 6)** A workflow schedules an activity whose handler is NOT registered. The claim commits the task `RUNNING` in its own transaction; the handler lookup then fails. The task is requeued to `PENDING` (attempt unchanged) and the `UnregisteredActivity` error surfaced, so registering the handler and re-running drains the same task to `Completed`. Fails on the pre-fix code, where the claimed task was stranded `RUNNING` (later claims select only `PENDING`) so the re-run could never drain it and wedged at `SpikeError::Stuck`. This is the recoverable-application-condition half of `drain_ready`'s requeue-on-any-post-claim-error invariant (§5.1). |
+| `scenario_import_timed_out_activity_is_terminal_not_re_materialized` | **(Codex P2 regression, round 7)** An imported PG-shaped history in which a scheduled activity **timed out** (`Scheduled → Started → ActivityTimedOut`) is recognized as **terminal**: the importer materializes **no** stale `spike_tasks` row, so when the workflow swallows the replayed timeout and suspends on a timer (reaching the `drain_ready` pass), no stale task is claimed + run and **no** duplicate `ActivityCompleted` terminal is appended for the id. Fails on the pre-fix code where `history_has_activity_terminal` recognized only `ActivityCompleted`/`ActivityFailed` (missing `ActivityTimedOut`), so the timed-out activity read as *open*, a stale task was materialized, and driving corrupted the log with a second terminal. Closes the activity-terminal-variant completeness gap comprehensively (also recognizes the external-completion terminals). |
+| `scenario_import_sealed_unrepresentable_terminal_is_rejected` | **(Codex P2 regression, round 7)** A **sealed** imported history whose tail terminal is a variant the COMPLETED/FAILED-only prototype cannot model (`WorkflowCancelled`, and separately `WorkflowExecutionTimedOut`) is **rejected** outright with `SpikeError::Unsupported` before any DB write — nothing is imported — and a representable sealed import (`WorkflowCompleted`) still succeeds on the same runtime afterward (no torn/poisoned state left behind). Fails on the pre-fix code where the sealed-terminal scan recognized only `WorkflowCompleted`/`WorkflowFailed`, so an unrepresentable seal fell through to the in-flight branch and was seeded `RUNNING` — a later re-drive would then replay the sealed history and append a second terminal. Closes the workflow-terminal-variant completeness gap (never silently mis-materialized), consistent with the driven path already rejecting a `ContinueAsNew` command. |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 
