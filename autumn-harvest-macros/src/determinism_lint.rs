@@ -929,7 +929,7 @@ mod hvg011_tests {
     //! iteration-order determinism.
     //!
     //! NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
-    //! already permanently assigned to SelectMacro (issue #600) and rule IDs
+    //! already permanently assigned to `SelectMacro` (issue #600) and rule IDs
     //! are never reused, so the iteration-order rule ships as HVG011.
 
     use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
@@ -1603,7 +1603,7 @@ mod hvg010_combinator_tests {
     //! The select-macro positive case is covered by the
     //! `hvg010_select_macro.rs` compile-fail fixture; the activity-body
     //! negative case (AC6) is covered by the `#[activity]` macro never running
-    //! this visitor (see `suppressed_guardrails.rs` and the det_check
+    //! this visitor (see `suppressed_guardrails.rs` and the `det_check`
     //! `det011_activity_bodies_are_never_flagged` test) — the visitor lints
     //! whatever `fn` it is handed, so an "activity" negative cannot be
     //! expressed at this layer.

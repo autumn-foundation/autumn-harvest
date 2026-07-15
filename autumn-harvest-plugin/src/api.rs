@@ -12677,25 +12677,45 @@ async fn batch_start_workflows(
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
                         Ok(mut pre_conn) => {
-                            let has_execution = harvest_workflow_executions::table
+                            // Load the prior run's STATE (not a bare existence
+                            // boolean) using the SAME non-sealed filter the
+                            // authoritative locked gate applies, then decide the
+                            // bypass with `start_will_create_new_execution` —
+                            // mirroring the single-start route (issue #1051).
+                            // The batch route starts every item under
+                            // AllowDuplicate (Phase 2 hardcodes it below;
+                            // `BatchStartItem` has no reuse-policy field), so the
+                            // predicate agrees with the old bare-existence
+                            // heuristic for every prior state today — this is a
+                            // structural/defensive change that stays correct if a
+                            // per-item reuse policy is ever added (issue #1053).
+                            // The substantive residual (a bypass-prior
+                            // force-terminated between this unlocked read and the
+                            // deferred throttle fire) is closed authoritatively
+                            // at fire time by the throttle scanner's CheckCached
+                            // gate (issue #1053, item 2) — the deferred batch item
+                            // fires through the SAME `fire_claimed_throttle_row`.
+                            let prior_state = harvest_workflow_executions::table
                                 .filter(
                                     harvest_workflow_executions::workflow_name
                                         .eq(&item.workflow_name),
                                 )
                                 .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                                 .filter(
-                                    // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
-                                    // or TERMINATED is returned without inserting a new one.
                                     harvest_workflow_executions::state
                                         .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                                 )
-                                .select(harvest_workflow_executions::id)
-                                .first::<uuid::Uuid>(&mut pre_conn)
+                                .select(harvest_workflow_executions::state)
+                                .first::<String>(&mut pre_conn)
                                 .await
                                 .optional()
-                                .unwrap_or(None)
-                                .is_some();
-                            has_execution
+                                .unwrap_or(None);
+                            let attaches_to_existing =
+                                !autumn_harvest::execution::start_will_create_new_execution(
+                                    prior_state.as_deref(),
+                                    WorkflowIdReusePolicy::AllowDuplicate,
+                                );
+                            attaches_to_existing
                                 || (workflow_resolving_throttle(
                                     &runtime.registry,
                                     &item.workflow_name,
