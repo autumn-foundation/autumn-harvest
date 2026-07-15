@@ -66,7 +66,7 @@ fn register(rt: &mut SqliteRuntime) {
     rt.register_workflow(&activity_then_timer_info());
     // Instant, always-succeeding activity body — the point is the *cycle
     // boundary* it introduces, not the work itself.
-    rt.register_activity(
+    rt.register_activity_raw(
         "work",
         ActivitySpec::new(1, |v: Value| -> Result<Value, String> { Ok(v) }),
     );

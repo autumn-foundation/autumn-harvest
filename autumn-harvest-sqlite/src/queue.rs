@@ -77,6 +77,20 @@ pub struct ClaimedTask {
     /// `ActivityCompleted` — byte-equivalent to the durable event the Postgres
     /// timeout scanner (`enforce_activity_timeout`) records.
     pub start_to_close_ms: Option<i64>,
+    /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond,
+    /// resolved at DISPATCH from the registered `ActivityInfo`'s
+    /// `default_schedule_to_close` (issue #378, Codex #1069 P2 `runtime.rs:39`).
+    /// Unlike [`Self::start_to_close_ms`], this is **not** carried on the
+    /// `ScheduleActivity` command — the registry supplies it by name at dispatch,
+    /// mirroring how the Postgres worker resolves `ActivityInfo` from its
+    /// `HandlerRegistry`. `Some(at)` = the whole activity (all attempts + back-off
+    /// sleeps combined) must finish before `at`; `None` = no total deadline (prior
+    /// behavior — the retry policy's `max_attempts` is the only bound). Enforced by
+    /// the worker: a task drained at/after `at`, or a retry whose next attempt would
+    /// land at/after `at`, records a terminal `ActivityTimedOut { ScheduleToClose }`
+    /// instead of running/retrying — byte-equivalent to the Postgres
+    /// `schedule_to_close_deadline_exceeded` path.
+    pub schedule_to_close_at: Option<i64>,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -130,6 +144,12 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 /// `retry_policy_override` (issue #1069 P2, Codex `runtime.rs:985`): `Some(json)`
 /// persists it so the worker honors backoff timing + non-retryable classification;
 /// `None` for the raw path (immediate requeue, no policy list).
+///
+/// `schedule_to_close_at` is the ABSOLUTE epoch-millisecond total (cross-retry)
+/// deadline (issue #378, Codex #1069 P2 `runtime.rs:39`), resolved at dispatch from
+/// the registered `ActivityInfo`'s `default_schedule_to_close`: `Some(at)` persists
+/// the cross-retry cap the worker enforces (terminal `ActivityTimedOut
+/// { ScheduleToClose }`); `None` = no total deadline.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
@@ -142,13 +162,14 @@ pub fn enqueue_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
         "INSERT INTO harvest_tasks \
          (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
-          max_attempts, retry_policy_json, start_to_close_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11)",
+          max_attempts, retry_policy_json, start_to_close_ms, schedule_to_close_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             uuid::Uuid::new_v4().to_string(),
             exec_id.to_string(),
@@ -161,6 +182,7 @@ pub fn enqueue_activity(
             max_attempts.map(i64::from),
             retry_policy_json,
             start_to_close_ms,
+            schedule_to_close_at,
         ],
     )?;
     Ok(())
@@ -178,7 +200,7 @@ pub fn claim_next_ready_task(
     let row = tx
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
-             retry_policy_json, start_to_close_ms \
+             retry_policy_json, start_to_close_ms, schedule_to_close_at \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -192,6 +214,7 @@ pub fn claim_next_ready_task(
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             },
         )
@@ -206,6 +229,7 @@ pub fn claim_next_ready_task(
         max_attempts,
         retry_policy_json,
         start_to_close_ms,
+        schedule_to_close_at,
     )) = row
     else {
         tx.commit()?;
@@ -240,6 +264,7 @@ pub fn claim_next_ready_task(
         max_attempts: max_attempts.and_then(|m| u32::try_from(m).ok()),
         retry_policy,
         start_to_close_ms,
+        schedule_to_close_at,
     }))
 }
 

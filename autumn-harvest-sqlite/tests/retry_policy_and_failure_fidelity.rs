@@ -98,7 +98,7 @@ async fn typed_fail_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 async fn terminal_activity_failure_decodes_typed_envelope_and_replays() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&typed_fail_wf_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "charge",
         ActivitySpec::new(1, |_input: serde_json::Value| {
             // A typed (retryable) ActivityFailure with a distinct error_type +
@@ -202,7 +202,7 @@ async fn retry_policy_backoff_delays_the_requeue() {
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&flaky_wf_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "flaky",
         ActivitySpec::new(3, move |input: serde_json::Value| {
             // Fail attempt 1, succeed attempt 2.
@@ -293,7 +293,7 @@ async fn retry_policy_backoff_anchors_to_failure_time() {
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&flaky_wf_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "flaky",
         ActivitySpec::new(3, move |input: serde_json::Value| {
             // Attempt 1 fails (retryable); the run then blocks on the backoff.
@@ -376,7 +376,7 @@ async fn typed_non_retryable_failure_is_not_retried() {
     let body_calls = calls.clone();
 
     rt.register_workflow(&nonret_typed_wf_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "nonret_typed",
         ActivitySpec::new(3, move |_input: serde_json::Value| {
             body_calls.fetch_add(1, Ordering::SeqCst);
@@ -445,7 +445,7 @@ async fn policy_non_retryable_error_class_is_not_retried() {
     let body_calls = calls.clone();
 
     rt.register_workflow(&nonret_policy_wf_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "nonret_policy",
         ActivitySpec::new(3, move |_input: serde_json::Value| {
             body_calls.fetch_add(1, Ordering::SeqCst);

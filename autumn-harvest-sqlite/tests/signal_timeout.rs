@@ -351,7 +351,7 @@ async fn typed_approval_then_work(ctx: &WorkflowContext, n: i64) -> Result<i64, 
 async fn receive_signal_timeout_signal_wins_with_trailing_activity_completes() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&typed_approval_then_work_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "double",
         autumn_harvest_sqlite::ActivitySpec::new(1, |input: serde_json::Value| {
             Ok(json!(input.as_i64().unwrap_or_default()))

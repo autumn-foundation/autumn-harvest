@@ -93,7 +93,7 @@ async fn work_then_uuid(ctx: &WorkflowContext, n: i64) -> Result<serde_json::Val
 async fn side_effect_after_last_suspension_persists_and_replays() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&work_then_uuid_info());
-    rt.register_activity("work", echo_activity());
+    rt.register_activity_raw("work", echo_activity());
     let exec = rt.start_workflow("work_then_uuid", json!(4)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -143,7 +143,7 @@ async fn status_workflow(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 async fn set_current_details_does_not_wedge_completion() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&status_workflow_info());
-    rt.register_activity("work", echo_activity());
+    rt.register_activity_raw("work", echo_activity());
     let exec = rt.start_workflow("status_workflow", json!(9)).unwrap();
 
     // Must NOT return Err(Unsupported("SetCurrentDetails")).
@@ -177,7 +177,7 @@ async fn calls_boom(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 async fn activity_exhausts_retries_and_workflow_fails() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&calls_boom_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "boom",
         ActivitySpec::new(3, |_input: serde_json::Value| {
             Err("permanent failure".to_string())
@@ -380,7 +380,7 @@ async fn double_it(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 async fn run_until_idle_drives_multiple_executions() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&double_it_info());
-    rt.register_activity("work", echo_activity());
+    rt.register_activity_raw("work", echo_activity());
 
     let e1 = rt.start_workflow("double_it", json!(3)).unwrap();
     let e2 = rt.start_workflow("double_it", json!(10)).unwrap();

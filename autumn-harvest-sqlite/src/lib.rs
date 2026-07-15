@@ -147,27 +147,37 @@
 //!
 //! ```no_run
 //! use autumn_harvest::prelude::*;
-//! use autumn_harvest_sqlite::{ActivitySpec, SqliteRuntime};
+//! use autumn_harvest_sqlite::SqliteRuntime;
 //!
 //! #[workflow]
 //! async fn greet(ctx: &WorkflowContext, name: String) -> Result<String, String> {
 //!     let greeting: String = ctx
-//!         .execute_activity_raw("say_hello", serde_json::json!(name), "default")
+//!         .execute_activity(&say_hello_info(), name)
 //!         .await
-//!         .map_err(|e| e.to_string())?
-//!         .as_str()
-//!         .unwrap_or_default()
-//!         .to_string();
+//!         .map_err(|e| e.to_string())?;
 //!     Ok(greeting)
+//! }
+//!
+//! // The `#[activity]` supplies the macro-generated `say_hello_info()` (name +
+//! // any declared `#[activity(...)]` defaults). This backend runs a caller-supplied
+//! // SYNCHRONOUS body — the async fn body below is a placeholder for the shared
+//! // `ActivityInfo`; the closure registered against it is what actually runs.
+//! #[activity]
+//! async fn say_hello(_ctx: &ActivityContext, name: String) -> Result<String, String> {
+//!     Ok(format!("hello {name}"))
 //! }
 //!
 //! # async fn run() -> Result<(), autumn_harvest_sqlite::SqliteError> {
 //! let mut rt = SqliteRuntime::open("workflows.db")?;
 //! rt.register_workflow(&greet_info());
-//! rt.register_activity(
-//!     "say_hello",
-//!     ActivitySpec::new(1, |input| Ok(serde_json::json!(format!("hello {input}")))),
-//! );
+//! // The audited, `ActivityInfo`-driven registration: any declared `#[activity(...)]`
+//! // default is HONORED (e.g. `schedule_to_close`) or REJECTED LOUDLY at setup, never
+//! // silently dropped. Use `register_activity_raw(name, ActivitySpec::new(..))` for a
+//! // hand-made body that carries no declared defaults.
+//! rt.register_activity(&say_hello_info(), |input| {
+//!     let name: String = serde_json::from_value(input).unwrap_or_default();
+//!     Ok(serde_json::json!(format!("hello {name}")))
+//! });
 //!
 //! let exec = rt.start_workflow("greet", serde_json::json!("world"))?;
 //! rt.run_until_blocked(exec).await?;
@@ -270,6 +280,50 @@
 //! retry orchestration, the admission gates) is real, out-of-v0.1-scope work tracked
 //! as issue #1068 follow-ups — hence rejection rather than a partial, silently-wrong
 //! implementation.
+//!
+//! ## Unsupported `ActivityInfo`-level features — honored or rejected at registration
+//!
+//! This closes the **third** author-declared-feature ingress surface (Codex #1069 P2,
+//! `runtime.rs:39`), after the `ScheduleActivity` command fields and the
+//! `WorkflowInfo` fields above. A `#[activity(...)]` can declare *dispatch-time
+//! defaults the Postgres worker enforces from `ActivityInfo` but which are NOT copied
+//! into the `ScheduleActivity` command* — so a name-only body registration never saw
+//! them, and they were neither honored nor rejected. The audited, `ActivityInfo`-driven
+//! [`register_activity`](crate::SqliteRuntime::register_activity) (the analog of
+//! `register_workflow`) closes that gap: it **PANICS at registration** for an
+//! unsupported field, naming it and pointing at the alternative. (The escape hatch
+//! [`register_activity_raw`](crate::SqliteRuntime::register_activity_raw) carries no
+//! `ActivityInfo` and so runs no audit — the analog of `execute_activity_raw`.) The
+//! partition:
+//!
+//! - **HONORED:**
+//!   - `default_schedule_to_close` (#378) — the total, cross-retry wall-clock deadline.
+//!     Resolved by name from the registry at dispatch (exactly as the Postgres worker
+//!     resolves `ActivityInfo` from its `HandlerRegistry`), persisted as an ABSOLUTE
+//!     deadline on the task row, and enforced by the worker: a task drained at/after
+//!     it, or a retry whose next attempt would land at/after it, records a terminal
+//!     `ActivityTimedOut { ScheduleToClose }` instead of running/retrying —
+//!     byte-equivalent to the Postgres `schedule_to_close_deadline_exceeded` path.
+//!   - `default_retry_policy` — its `max_attempts` becomes the registered fallback
+//!     attempt cap; the WHOLE policy also reaches the worker per-dispatch via the
+//!     command's `retry_policy_override` (backoff timing + non-retryable classification).
+//!   - `default_start_to_close` — honored via the command's `start_to_close_override`
+//!     (a per-attempt post-execution `ActivityTimedOut { StartToClose }`).
+//!   - `default_queue` — recorded on the task row (single-writer routing is a no-op).
+//! - **REJECTED (a dispatch-admission / cross-worker semantic with no single-writer
+//!   analog, or a cap raiser that would otherwise silently apply the STRICTER global
+//!   cap):** `default_heartbeat_timeout` (no heartbeating in the inline drain — use
+//!   `start_to_close` / `schedule_to_close`), `default_schedule_to_start` (no queue-wait
+//!   scanner), `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247),
+//!   `requires` (capability routing), `is_local` (local-activity `RunLocalActivity`
+//!   dispatch is a command-layer non-goal), and a raised `max_input_bytes` /
+//!   `max_result_bytes` (#252).
+//! - **ACCEPTED, inert:** `name` (registration key), `module` (diagnostics), and a lone
+//!   `concurrency_key` (groups a cap that is not set). The core async
+//!   `ActivityInfo::handler` is intentionally NOT used — this backend runs a
+//!   caller-supplied SYNCHRONOUS body (no `ActivityContext`, no I/O framework),
+//!   matching the crate's activity model, so `register_activity` takes both the
+//!   `&ActivityInfo` (for the audit + declared defaults) and the body.
 //!
 //! **Signals are pull-only.** A staged signal is appended to history (as
 //! `SignalReceived`) only when a workflow reaches a pull primitive that consumes

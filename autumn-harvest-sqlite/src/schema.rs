@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- classification, not just max_attempts.
                                            -- NULL = raw-path task (no declared policy):
                                            -- immediate requeue, no policy non-retryable list.
-    start_to_close_ms INTEGER              -- per-activity start-to-close budget in
+    start_to_close_ms INTEGER,             -- per-activity start-to-close budget in
                                            -- milliseconds from the command's
                                            -- start_to_close_override (issue #1069 P2);
                                            -- NULL = no budget (unbounded, prior behavior).
@@ -91,6 +91,22 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- { StartToClose } instead of ActivityCompleted,
                                            -- byte-equivalent to what the Postgres timeout
                                            -- scanner durably records.
+    schedule_to_close_at INTEGER           -- ABSOLUTE epoch-millisecond total deadline
+                                           -- (issue #378) resolved at DISPATCH from the
+                                           -- registered ActivityInfo's default_schedule_to_close
+                                           -- (Codex #1069 P2, runtime.rs:39). NOT carried on
+                                           -- the ScheduleActivity command — the registry
+                                           -- supplies it by name at dispatch, exactly as the
+                                           -- Postgres worker resolves ActivityInfo from its
+                                           -- HandlerRegistry. NULL = no total deadline (the
+                                           -- retry policy's max_attempts is the only bound).
+                                           -- Enforced by the worker as the cross-retry
+                                           -- wall-clock cap: a task drained past it, or a
+                                           -- retry whose next attempt would land at/after it,
+                                           -- records a terminal ActivityTimedOut
+                                           -- { ScheduleToClose } instead of retrying/completing,
+                                           -- byte-equivalent to the Postgres
+                                           -- schedule_to_close enforcement.
 );
 
 CREATE TABLE IF NOT EXISTS harvest_timers (

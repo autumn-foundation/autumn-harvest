@@ -64,7 +64,7 @@ async fn activity_retry_then_success() {
 
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&single_activity_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "work",
         ActivitySpec::new(3, move |input: serde_json::Value| {
             // Fail the first attempt, succeed the second.
@@ -170,7 +170,7 @@ async fn deterministic_replay_after_crash_does_not_reexecute_activity() {
         let mut rt = SqliteRuntime::open(&path).unwrap();
         rt.register_workflow(&single_activity_info());
         let body_calls = calls.clone();
-        rt.register_activity(
+        rt.register_activity_raw(
             "work",
             ActivitySpec::new(1, move |input: serde_json::Value| {
                 body_calls.fetch_add(1, Ordering::SeqCst);
@@ -202,7 +202,7 @@ async fn deterministic_replay_after_crash_does_not_reexecute_activity() {
     let mut rt2 = SqliteRuntime::open(&path).unwrap();
     rt2.register_workflow(&single_activity_info());
     let body_calls = calls.clone();
-    rt2.register_activity(
+    rt2.register_activity_raw(
         "work",
         ActivitySpec::new(1, move |_input| {
             body_calls.fetch_add(1, Ordering::SeqCst);
@@ -293,7 +293,7 @@ async fn orphaned_running_task_is_reclaimed_and_body_reruns() {
     }
     rt2.register_workflow(&single_activity_info());
     let body_calls = calls.clone();
-    rt2.register_activity(
+    rt2.register_activity_raw(
         "work",
         ActivitySpec::new(1, move |input: serde_json::Value| {
             body_calls.fetch_add(1, Ordering::SeqCst);

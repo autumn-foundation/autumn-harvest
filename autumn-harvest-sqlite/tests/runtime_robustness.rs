@@ -94,7 +94,7 @@ async fn engine_nondeterminism_is_nonterminal_and_resumable() {
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&drifty_info());
-    rt.register_activity("work", echo_activity());
+    rt.register_activity_raw("work", echo_activity());
 
     // Phase 1: drive to a durable-timer block. Records [WorkflowStarted, TimerStarted].
     DRIFT_PHASE.store(1, Ordering::SeqCst);
@@ -227,7 +227,7 @@ async fn unregistered_activity_releases_claim_and_is_reclaimable() {
 
     // Register the body on the SAME runtime and drive again — no reopen. The
     // task is re-claimed and the workflow completes.
-    rt.register_activity("unreg", echo_activity());
+    rt.register_activity_raw("unreg", echo_activity());
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
         matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(42)),
@@ -252,7 +252,7 @@ async fn panicking_activity_is_contained_and_exhausts_to_terminal() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&calls_panicky_info());
     // A body that ALWAYS panics, max 2 attempts.
-    rt.register_activity(
+    rt.register_activity_raw(
         "panicky",
         ActivitySpec::new(
             2,
@@ -316,7 +316,7 @@ async fn panicking_activity_retry_then_succeeds() {
     // panic requeues per policy rather than failing terminally on attempt 1.
     let calls = Arc::new(AtomicU32::new(0));
     let calls_body = calls.clone();
-    rt.register_activity(
+    rt.register_activity_raw(
         "panicky",
         ActivitySpec::new(
             3,
@@ -422,7 +422,7 @@ async fn mixed_timer_activity_batch_completes_and_replays() {
 
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&timer_and_activity_info());
-    rt.register_activity("work", echo_activity());
+    rt.register_activity_raw("work", echo_activity());
     let exec = rt.start_workflow("timer_and_activity", json!(9)).unwrap();
 
     // Drive 1 at t0: the batch dispatches BOTH commands (ActivityScheduled + task

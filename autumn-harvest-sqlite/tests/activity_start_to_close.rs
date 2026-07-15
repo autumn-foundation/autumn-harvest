@@ -99,7 +99,7 @@ fn fast_body() -> ActivitySpec {
 async fn slow_activity_records_activity_timed_out_not_completed() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&timed_activity_wf_info());
-    rt.register_activity("work", slow_body());
+    rt.register_activity_raw("work", slow_body());
     let exec = rt.start_workflow("timed_activity_wf", json!(7)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -145,7 +145,7 @@ async fn slow_activity_records_activity_timed_out_not_completed() {
 async fn fast_activity_under_generous_default_completes_normally() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&default_timeout_wf_info());
-    rt.register_activity("work", fast_body());
+    rt.register_activity_raw("work", fast_body());
     let exec = rt.start_workflow("default_timeout_wf", json!(9)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -194,7 +194,7 @@ async fn uses_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
 async fn worker_session_command_is_rejected_loudly_not_silently_dropped() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&uses_session_info());
-    rt.register_activity("work", fast_body());
+    rt.register_activity_raw("work", fast_body());
     let exec = rt.start_workflow("uses_session", json!(0)).unwrap();
 
     let err = rt

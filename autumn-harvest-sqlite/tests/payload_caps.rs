@@ -182,7 +182,7 @@ async fn oversized_activity_result_normalized_to_payload_too_large_failure() {
     rt.register_workflow(&one_activity_info());
     // The activity body returns a value whose serialized length exceeds the 2 MiB
     // result cap.
-    rt.register_activity(
+    rt.register_activity_raw(
         "blob",
         ActivitySpec::new(1, |_input| Ok(json!("q".repeat(2 * 1024 * 1024 + 1)))),
     );
@@ -230,7 +230,7 @@ async fn oversized_activity_result_normalized_to_payload_too_large_failure() {
 async fn under_cap_activity_result_completes_normally() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&one_activity_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "blob",
         ActivitySpec::new(1, |_input| Ok(json!({ "small": "result" }))),
     );

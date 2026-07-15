@@ -54,7 +54,7 @@ fn build_rt(path: &Path, calls: &Arc<AtomicUsize>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(path).unwrap();
     rt.register_workflow(&full_lifecycle_info());
     let body_calls = calls.clone();
-    rt.register_activity(
+    rt.register_activity_raw(
         "work",
         ActivitySpec::new(1, move |input: serde_json::Value| {
             body_calls.fetch_add(1, Ordering::SeqCst);

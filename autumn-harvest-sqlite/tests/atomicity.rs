@@ -34,7 +34,7 @@ async fn completed_run_has_matching_scheduled_events_and_task_rows() {
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&single_activity_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "work",
         ActivitySpec::new(1, |input: serde_json::Value| {
             Ok(json!(input.as_i64().unwrap()))

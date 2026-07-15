@@ -89,6 +89,22 @@ pub fn drain_ready(
             return Err(crate::error::SqliteError::unregistered(&task.name));
         };
 
+        // Enforce the activity's TOTAL (cross-retry) schedule-to-close deadline
+        // BEFORE running the body (issue #378, Codex #1069 P2 `runtime.rs:39`). A
+        // task drained at/after its absolute deadline — the "idle past the deadline,
+        // then finally drained" case, mirroring the Postgres timeout scanner
+        // catching a `PENDING` row past deadline — must NOT run its body and then
+        // record a (possibly successful) result past the declared total cap. Seal it
+        // terminal `ActivityTimedOut { ScheduleToClose }` and move on. Cheap no-op
+        // for the common case (`None`, or a deadline still in the future). The retry
+        // path (below, in `finalize_within_tx`) catches the more common case: a body
+        // that keeps failing/backing off past the deadline.
+        if schedule_to_close_exceeded(now, task.schedule_to_close_at) {
+            finalize_activity_timeout(conn, exec_id, &task, TimeoutType::ScheduleToClose)?;
+            produced = true;
+            continue;
+        }
+
         // Body runs OUTSIDE any transaction — at-least-once (see module docs).
         //
         // Contain a PANICKING body (issue #782 analog; Codex round 8). A body
@@ -475,6 +491,30 @@ pub fn finalize_within_tx(
                         failure_now.saturating_add(delay_ms)
                     }
                 });
+                // Enforce the TOTAL (cross-retry) schedule-to-close deadline before
+                // requeuing (issue #378, Codex #1069 P2 `runtime.rs:39`). This is the
+                // finding's headline: an activity with a retry policy AND a declared
+                // total deadline must NOT keep backing off/retrying past that deadline
+                // and eventually complete. If the next attempt would land at/after the
+                // deadline, seal it terminal `ActivityTimedOut { ScheduleToClose }`
+                // instead of requeuing — byte-equivalent to the Postgres
+                // `record_schedule_to_close_activity_timeout` path (which appends
+                // `ActivityTimedOut { ScheduleToClose }` + `fail_task` instead of
+                // `requeue_for_retry` once `now + retry_delay >= deadline`). The failed
+                // attempt is already recorded above; the workflow observes
+                // `HistoryMatch::TimedOut` and drives its own timeout branch.
+                if schedule_to_close_exceeded(run_at, task.schedule_to_close_at) {
+                    store::append_event(
+                        conn,
+                        exec_id,
+                        &WorkflowEvent::ActivityTimedOut {
+                            activity_id: task.activity_id,
+                            timeout_type: TimeoutType::ScheduleToClose,
+                        },
+                    )?;
+                    queue::finish_task(conn, &task.task_id)?;
+                    return Ok(true);
+                }
                 queue::requeue_task(conn, &task.task_id, attempt_num, run_at)?;
                 Ok(false)
             } else {
@@ -527,6 +567,33 @@ pub fn start_to_close_exceeded(elapsed: std::time::Duration, budget_ms: Option<i
     }
 }
 
+/// True iff an absolute epoch-millisecond instant `at_ms` has reached or passed an
+/// activity's ABSOLUTE total (cross-retry) `schedule_to_close` deadline (issue #378,
+/// Codex #1069 P2 `runtime.rs:39`).
+///
+/// `None` deadline = no total cap (unbounded — never exceeded, the prior behavior
+/// for every activity without a declared `schedule_to_close`). A non-positive
+/// deadline is also treated as no cap (defensive: the core never emits a `<= 0`
+/// schedule-to-close, and an absolute deadline is a real epoch-ms far above zero).
+///
+/// The comparison is `>=` (reached OR passed), mirroring the Postgres
+/// `schedule_to_close_deadline_exceeded` contract (`now + retry_delay >= deadline`):
+/// - the **pre-run** check in [`drain_ready`] passes the cycle `now` — a task drained
+///   at/after its deadline is timed out before its body runs (the "idle past the
+///   deadline, then drained" case; mirrors the Postgres scanner catching a `PENDING`
+///   row past deadline);
+/// - the **retry** check in [`finalize_within_tx`] passes the next attempt's `run_at`
+///   — a retry whose next attempt (after back-off) would land at/after the deadline is
+///   sealed terminal instead of requeued (the finding's headline: an activity that
+///   would otherwise keep backing off/retrying past its declared total deadline).
+#[must_use]
+pub const fn schedule_to_close_exceeded(at_ms: i64, deadline_ms: Option<i64>) -> bool {
+    match deadline_ms {
+        Some(deadline) if deadline > 0 => at_ms >= deadline,
+        _ => false,
+    }
+}
+
 /// Finalize an activity that exceeded its start-to-close budget (issue #1069 P2)
 /// in a **single transaction** (AC7): record the timed-out attempt in the audit
 /// log, append the terminal `ActivityTimedOut` event, and mark the task `DONE`,
@@ -561,13 +628,11 @@ pub fn finalize_timeout_within_tx(
     let attempt_num = task.attempt + 1;
     // A timed-out attempt is an attempt outcome — record it in the per-attempt
     // audit log (mirroring `finalize_within_tx`, which always records the attempt).
-    store::record_attempt(
-        conn,
-        exec_id,
-        &task.name,
-        attempt_num,
-        &Err("activity exceeded its start-to-close timeout".to_string()),
-    )?;
+    // The message names the specific timeout kind so a `ScheduleToClose` (total
+    // cross-retry deadline, issue #378) attempt is not mislabelled as
+    // `StartToClose` in the audit log.
+    let timeout_reason = format!("activity exceeded its {timeout_type} timeout");
+    store::record_attempt(conn, exec_id, &task.name, attempt_num, &Err(timeout_reason))?;
     store::append_event(
         conn,
         exec_id,
@@ -625,7 +690,7 @@ mod tests {
     use super::{
         finalize_within_tx, fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
         ingest_awaited_signal, is_signal_timeout_deadline_timer,
-        payload_too_large_activity_envelope, start_to_close_exceeded,
+        payload_too_large_activity_envelope, schedule_to_close_exceeded, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::{schema, store};
@@ -671,6 +736,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
@@ -687,6 +753,7 @@ mod tests {
             max_attempts: None,
             retry_policy: None,
             start_to_close_ms: None,
+            schedule_to_close_at: None,
         }
     }
 
@@ -841,6 +908,29 @@ mod tests {
         // emits `<= 0`), so a `0`/negative budget never times a body out.
         assert!(!start_to_close_exceeded(Duration::from_secs(10), Some(0)));
         assert!(!start_to_close_exceeded(Duration::from_secs(10), Some(-5)));
+    }
+
+    // The TOTAL (cross-retry) schedule-to-close deadline predicate (issue #378,
+    // Codex #1069 P2 `runtime.rs:39`). `None`/non-positive = no total cap; the
+    // comparison is `>=` (reached OR passed), mirroring the Postgres
+    // `schedule_to_close_deadline_exceeded` contract used at BOTH the pre-run check
+    // (cycle `now`) and the retry check (next attempt's `run_at`).
+    #[test]
+    fn schedule_to_close_exceeded_truth_table() {
+        // No total deadline → never exceeded (prior behavior for every activity
+        // without a declared schedule_to_close).
+        assert!(!schedule_to_close_exceeded(1_000, None));
+        // Before the deadline.
+        assert!(!schedule_to_close_exceeded(999, Some(1_000)));
+        // Exactly AT the deadline → exceeded (`>=`, matching Postgres
+        // `now + retry_delay >= deadline`).
+        assert!(schedule_to_close_exceeded(1_000, Some(1_000)));
+        // Past the deadline (e.g. a retry whose next attempt lands 30s out).
+        assert!(schedule_to_close_exceeded(31_000, Some(1_000)));
+        // A non-positive deadline is treated as no cap (defensive; an absolute
+        // epoch-ms deadline is always far above zero).
+        assert!(!schedule_to_close_exceeded(1_000, Some(0)));
+        assert!(!schedule_to_close_exceeded(1_000, Some(-5)));
     }
 
     // FIX 1 (Codex #1069 P2, runtime.rs:699): the deadline-timer-name predicate

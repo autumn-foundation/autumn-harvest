@@ -11,8 +11,8 @@ use autumn_harvest::builder::{
 use autumn_harvest::context::{DEFAULT_CURRENT_DETAILS_CAP_BYTES, empty_shared_state};
 use autumn_harvest::executor::run_workflow_with_state_history_policy_and_caps;
 use autumn_harvest::{
-    ActivityExecId, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand, WorkflowEvent,
-    WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowInfo, WorkflowOutcome,
+    ActivityExecId, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand,
+    WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -28,7 +28,8 @@ use crate::{queue, schema, store, worker};
 /// registered closure (no `ActivityContext`, no I/O framework).
 pub type ActivityBody = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
-/// A registered activity: its body plus how many attempts the worker may make.
+/// A registered activity: its body plus the declared-default metadata this
+/// backend honors at dispatch/finalize.
 pub struct ActivitySpec {
     // `ActivitySpec` is re-exported publicly; these fields are crate-internal
     // (read by the worker). `pub` would leak them onto the public type, so
@@ -37,11 +38,29 @@ pub struct ActivitySpec {
     pub(crate) body: ActivityBody,
     #[allow(clippy::redundant_pub_crate)]
     pub(crate) max_attempts: u32,
+    /// The activity's declared total (cross-retry) deadline
+    /// (`#[activity(schedule_to_close = "…")]` → `ActivityInfo::default_schedule_to_close`,
+    /// issue #378). Populated ONLY by the info-based
+    /// [`register_activity`](SqliteRuntime::register_activity) — the hand-made
+    /// [`ActivitySpec::new`] path has no `ActivityInfo` and so is always `None`.
+    /// The `ScheduleActivity` command does NOT carry this field (Codex #1069 P2
+    /// `runtime.rs:39`), so this registry entry is where the dispatch site resolves
+    /// it by name — exactly as the Postgres worker resolves it from its
+    /// `HandlerRegistry`. `None` = no total deadline.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) schedule_to_close: Option<std::time::Duration>,
 }
 
 impl ActivitySpec {
     /// Register an activity body that may be attempted up to `max_attempts` times
     /// (`1` = no retry; values below `1` are clamped to `1`).
+    ///
+    /// This is the **hand-made** spec used by
+    /// [`register_activity_raw`](SqliteRuntime::register_activity_raw): it carries
+    /// no [`ActivityInfo`](autumn_harvest::ActivityInfo), so no declared-default
+    /// audit runs and no `ActivityInfo`-level deadline
+    /// (`schedule_to_close`) is honored. For the audited, `ActivityInfo`-driven
+    /// path use [`register_activity`](SqliteRuntime::register_activity).
     #[must_use]
     pub fn new(
         max_attempts: u32,
@@ -50,6 +69,7 @@ impl ActivitySpec {
         Self {
             body: Box::new(body),
             max_attempts: max_attempts.max(1),
+            schedule_to_close: None,
         }
     }
 }
@@ -239,8 +259,94 @@ impl SqliteRuntime {
         self.workflows.insert(info.name.to_string(), info.handler);
     }
 
-    /// Register an activity body under `name`.
-    pub fn register_activity(&mut self, name: impl Into<String>, spec: ActivitySpec) {
+    /// Register an activity from its macro-generated [`ActivityInfo`] plus its
+    /// (synchronous) body.
+    ///
+    /// This is the **audited, `ActivityInfo`-driven** registration path — the
+    /// analog of [`register_workflow`](Self::register_workflow) — and the one that
+    /// closes the third author-declared-feature ingress surface (Codex #1069 P2,
+    /// `runtime.rs:39`). Beyond the command layer ([`apply_schedule_activity`],
+    /// which carries the per-dispatch `retry_policy_override` /
+    /// `start_to_close_override`) and the workflow-registration layer
+    /// ([`unsupported_workflow_feature`]), an activity's `#[activity(...)]`
+    /// declares *dispatch-time defaults the Postgres worker enforces from
+    /// `ActivityInfo` but which are NOT copied into the `ScheduleActivity`
+    /// command* — so a name-only registration would silently drop them. Here every
+    /// such field is HONORED or REJECTED LOUDLY, never silently dropped
+    /// (see [`unsupported_activity_feature`] and the crate-level "Unsupported
+    /// `ActivityInfo`-level features" section for the full audit):
+    ///
+    /// - **HONORED**: `default_schedule_to_close` (issue #378 — the total,
+    ///   cross-retry wall-clock deadline; persisted onto each dispatched task and
+    ///   enforced as a terminal `ActivityTimedOut { ScheduleToClose }`),
+    ///   `default_retry_policy` (its `max_attempts` becomes the registered fallback
+    ///   attempt cap; the *whole* policy also reaches the worker via the command's
+    ///   `retry_policy_override`), `default_start_to_close` (honored via the
+    ///   command's `start_to_close_override`), and `default_queue`
+    ///   (recorded; single-writer routing is a no-op).
+    /// - **REJECTED** at registration (setup-time panic, mirroring
+    ///   [`register_workflow`]): `default_heartbeat_timeout`,
+    ///   `default_schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
+    ///   `max_concurrent`, `requires`, `is_local`, and a raised
+    ///   `max_input_bytes` / `max_result_bytes`.
+    /// - **ACCEPTED, inert**: `name` (registration key), `module` (diagnostics),
+    ///   and a lone `concurrency_key` (groups a cap that is not set). The core
+    ///   async `ActivityInfo::handler` is intentionally NOT used — this backend
+    ///   runs a caller-supplied SYNCHRONOUS body (no `ActivityContext`, no I/O
+    ///   framework), matching the crate's activity model.
+    ///
+    /// # Panics
+    ///
+    /// Panics (setup-time) if `info` declares an unsupported `ActivityInfo`-level
+    /// feature (see the list above). The panic names the feature and points at the
+    /// supported alternative; registering it anyway would silently drop the setting
+    /// and diverge from the declared `#[activity(...)]` contract. Use
+    /// [`register_activity_raw`](Self::register_activity_raw) for a hand-made body
+    /// that carries no declared defaults.
+    pub fn register_activity(
+        &mut self,
+        info: &ActivityInfo,
+        body: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
+    ) {
+        if let Some((feature, hint)) = unsupported_activity_feature(info) {
+            panic!(
+                "autumn-harvest-sqlite (v0.1): activity `{}` declares the unsupported \
+                 `{feature}` feature. This embedded single-writer backend has no \
+                 dispatch-admission or cross-worker machinery to honor it, so \
+                 registering it anyway would silently drop the setting and diverge \
+                 from the #[activity(...)] contract (Codex #1069 P2, runtime.rs:39). \
+                 {hint}",
+                info.name,
+            );
+        }
+        // Derive the fallback attempt cap from the declared retry policy (the WHOLE
+        // policy also reaches the worker per-dispatch via the command's
+        // `retry_policy_override`, which wins over this fallback). No declared
+        // policy ⇒ a single attempt (matching `ActivitySpec::new`'s `>= 1` clamp).
+        let max_attempts = info
+            .default_retry_policy
+            .as_ref()
+            .map_or(1, |p| p.max_attempts.max(1));
+        self.activities.insert(
+            info.name.to_string(),
+            ActivitySpec {
+                body: Box::new(body),
+                max_attempts,
+                schedule_to_close: info.default_schedule_to_close,
+            },
+        );
+    }
+
+    /// Register a hand-made activity body under `name`, bypassing the
+    /// [`ActivityInfo`] declared-default audit.
+    ///
+    /// The escape hatch analog of `execute_activity_raw`: it carries no
+    /// `ActivityInfo`, so no `ActivityInfo`-level default (e.g.
+    /// `schedule_to_close`) is honored or rejected — the caller is responsible for
+    /// any such semantics. Prefer [`register_activity`](Self::register_activity)
+    /// (which audits and honors declared defaults) whenever you have the
+    /// macro-generated `ActivityInfo`.
+    pub fn register_activity_raw(&mut self, name: impl Into<String>, spec: ActivitySpec) {
         self.activities.insert(name.into(), spec);
     }
 
@@ -823,8 +929,20 @@ impl SqliteRuntime {
             std::collections::HashSet::new();
         for cmd in commands {
             match cmd {
-                cmd @ WorkflowCommand::ScheduleActivity { .. } => {
-                    if apply_schedule_activity(&tx, exec, history, cmd, now)? {
+                cmd @ WorkflowCommand::ScheduleActivity { name, .. } => {
+                    // Resolve the activity's total (cross-retry) deadline BY NAME
+                    // from the registry (Codex #1069 P2, `runtime.rs:39`). The
+                    // `ScheduleActivity` command does not carry
+                    // `default_schedule_to_close`, so — exactly as the Postgres
+                    // worker resolves `ActivityInfo` from its `HandlerRegistry` at
+                    // enqueue — the dispatch site reads it here. Only the info-based
+                    // `register_activity(&info, …)` populates it; a raw-registered
+                    // body yields `None`. Disjoint-field borrow: `tx` holds
+                    // `&mut self.conn`, this reads `&self.activities` (same shape as
+                    // the `drain_ready(&mut self.conn, …, &self.activities)` call).
+                    let schedule_to_close =
+                        self.activities.get(name).and_then(|s| s.schedule_to_close);
+                    if apply_schedule_activity(&tx, exec, history, cmd, now, schedule_to_close)? {
                         produced = true;
                     }
                 }
@@ -1067,6 +1185,12 @@ impl SqliteRuntime {
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
 ///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
 ///   timeout scanner). `None` = no budget (unbounded).
+/// - `schedule_to_close` (the caller-resolved `ActivityInfo::default_schedule_to_close`,
+///   issue #378, Codex #1069 P2 `runtime.rs:39`) — honored: an ABSOLUTE deadline
+///   `now + schedule_to_close` is persisted on the task row so the worker enforces
+///   the total cross-retry cap (terminal `ActivityTimedOut { ScheduleToClose }`).
+///   NOT a command field — resolved by name from the registry at the call site.
+///   `None` = no total deadline.
 /// - `session_id`/`session_worker_id` (worker sessions, issue #606) and the
 ///   session-acquire-only `schedule_to_start_override` — REJECTED LOUDLY with
 ///   [`SqliteError::Unsupported`]: they are outside the single-writer subset (worker
@@ -1083,6 +1207,7 @@ fn apply_schedule_activity(
     history: &[WorkflowEvent],
     cmd: &WorkflowCommand,
     now: i64,
+    schedule_to_close: Option<std::time::Duration>,
 ) -> SqliteResult<bool> {
     let WorkflowCommand::ScheduleActivity {
         activity_id,
@@ -1127,6 +1252,15 @@ fn apply_schedule_activity(
         .map(serde_json::to_string)
         .transpose()?;
     let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
+    // The total (cross-retry) deadline is ABSOLUTE: `now + schedule_to_close`, so it
+    // stays valid across a restart (like the timer's absolute `fire_at`) — there is
+    // no virtual clock to reset. `duration_to_millis_saturating` clamps a
+    // pathological duration; `checked_add` keeps a saturating duration from
+    // wrapping to an early deadline. `None` = no total deadline.
+    let schedule_to_close_at = schedule_to_close.map(|d| {
+        let ms = duration_to_millis_saturating(d);
+        now.checked_add(ms).unwrap_or(i64::MAX)
+    });
     persist_scheduled_activity(
         conn,
         exec,
@@ -1138,6 +1272,7 @@ fn apply_schedule_activity(
         max_attempts,
         retry_policy_json.as_deref(),
         start_to_close_ms,
+        schedule_to_close_at,
     )?;
     Ok(true)
 }
@@ -1160,6 +1295,11 @@ fn apply_schedule_activity(
 /// (issue #1069 P2): `Some(ms)` persists the per-activity start-to-close budget
 /// onto the task row so the worker enforces it as a post-execution outcome; `None`
 /// leaves it NULL (no budget, prior behavior).
+///
+/// `schedule_to_close_at` carries the ABSOLUTE total (cross-retry) deadline
+/// resolved from the registered `ActivityInfo::default_schedule_to_close` (issue
+/// #378, Codex #1069 P2 `runtime.rs:39`): `Some(at)` persists it so the worker
+/// enforces the total cap; `None` leaves it NULL (no total deadline).
 #[allow(clippy::too_many_arguments)]
 pub fn persist_scheduled_activity(
     conn: &Connection,
@@ -1172,6 +1312,7 @@ pub fn persist_scheduled_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
 ) -> SqliteResult<()> {
     store::append_event(
         conn,
@@ -1194,6 +1335,7 @@ pub fn persist_scheduled_activity(
         max_attempts,
         retry_policy_json,
         start_to_close_ms,
+        schedule_to_close_at,
     )?;
     Ok(())
 }
@@ -1512,6 +1654,121 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
     None
 }
 
+/// Audit an [`ActivityInfo`] at
+/// [`register_activity`](SqliteRuntime::register_activity) for a declared,
+/// dispatch-time default this v0.1 backend does not implement — returning the
+/// first such `(feature, hint)`, or `None` if the activity is registrable.
+///
+/// This closes the **third** author-declared-feature ingress surface (Codex #1069
+/// P2, `runtime.rs:39`), after the `ScheduleActivity` **command** fields
+/// ([`apply_schedule_activity`]) and the **`WorkflowInfo`** fields
+/// ([`unsupported_workflow_feature`]). A `#[activity(...)]` can declare defaults the
+/// Postgres worker enforces *from `ActivityInfo` at dispatch* but which are NOT
+/// copied into the `ScheduleActivity` command — `default_schedule_to_close`,
+/// `default_heartbeat_timeout`, `default_schedule_to_start`, `circuit_breaker`,
+/// `rate_limit_*`, `max_concurrent`, `requires`, `is_local`, and the per-activity
+/// cap raisers. A name-only registration never saw them, so they were neither
+/// honored nor rejected. The partition (see the crate-level "Unsupported
+/// `ActivityInfo`-level features" section):
+///
+/// - **HONORED** (handled by [`register_activity`], NOT reported here):
+///   `default_schedule_to_close` (persisted + enforced as terminal
+///   `ActivityTimedOut { ScheduleToClose }`), `default_retry_policy` (fallback
+///   attempt cap; the whole policy reaches the worker per-dispatch),
+///   `default_start_to_close` (via the command), `default_queue` (recorded).
+/// - **REJECTED** (reported here) — a dispatch-admission / cross-worker semantic
+///   this single-writer backend has no analog for, or a cap raiser that would
+///   otherwise silently apply the STRICTER global cap:
+///   `default_heartbeat_timeout` (no heartbeating in the inline drain),
+///   `default_schedule_to_start` (no queue-wait scanner), `circuit_breaker`
+///   (#369), `rate_limit_*` (#332), `max_concurrent` (#247), `requires`
+///   (capability routing), `is_local` (local-activity `RunLocalActivity` dispatch
+///   is a command-layer non-goal), and a raised `max_input_bytes` /
+///   `max_result_bytes` (#252).
+/// - **ACCEPTED, inert**: `name`, `module`, and a lone `concurrency_key` (groups a
+///   cap that is not set).
+///
+/// The chain is EXHAUSTIVE by intent: adding an execution-affecting field to core
+/// `ActivityInfo` should extend this audit rather than silently pass through.
+const fn unsupported_activity_feature(info: &ActivityInfo) -> Option<(&'static str, &'static str)> {
+    // Ordered most-impactful first; the first match is reported.
+    if info.is_local {
+        return Some((
+            "local = true",
+            "Local activities dispatch via the RunLocalActivity command, which this \
+             single-writer backend rejects at the command layer. Register a regular \
+             activity instead — this backend already runs every activity body inline.",
+        ));
+    }
+    if info.default_schedule_to_start.is_some() {
+        return Some((
+            "schedule_to_start",
+            "There is no queue-wait (schedule-to-start) timeout scanner on this \
+             single-writer backend, so the declared bound would never fire.",
+        ));
+    }
+    if info.default_heartbeat_timeout.is_some() {
+        return Some((
+            "heartbeat_timeout",
+            "Activity bodies run synchronously inline (no ActivityContext, no \
+             heartbeating), so a heartbeat-timeout could never be observed. Use \
+             start_to_close (honored) for a per-attempt bound, or schedule_to_close \
+             (honored) for a total cross-retry deadline.",
+        ));
+    }
+    if info.circuit_breaker.is_some() {
+        return Some((
+            "circuit_breaker",
+            "The per-activity circuit breaker (#369) is a dispatch-admission feature \
+             with no analog on this backend.",
+        ));
+    }
+    if info.rate_limit_rps.is_some()
+        || info.rate_limit_burst.is_some()
+        || info.rate_limit_key.is_some()
+    {
+        return Some((
+            "rate_limit",
+            "Per-activity rate limiting (#332) is a dispatch-admission feature backed \
+             by the shared task queue's token buckets, which the single-writer backend \
+             has no analog for.",
+        ));
+    }
+    if info.max_concurrent.is_some() {
+        return Some((
+            "max_concurrent",
+            "A cluster-wide per-activity concurrency cap (#247) requires the shared \
+             task queue's claim-time advisory lock, absent on this backend.",
+        ));
+    }
+    if info.requires.is_some() {
+        return Some((
+            "requires",
+            "Capability-based worker routing (#[activity(requires = \"…\")]) targets a \
+             heterogeneous worker fleet, which this single-process backend does not have.",
+        ));
+    }
+    if info.max_input_bytes.is_some() {
+        return Some((
+            "max_input_bytes",
+            "A per-activity RAISED input cap is not threaded into this backend's caps, \
+             so the STRICTER global default would apply — silently REJECTING an input \
+             the activity declared as acceptable. Rejected so the divergence surfaces \
+             at setup rather than as a surprising runtime PayloadTooLarge.",
+        ));
+    }
+    if info.max_result_bytes.is_some() {
+        return Some((
+            "max_result_bytes",
+            "A per-activity RAISED result cap is not threaded into this backend's caps, \
+             so the STRICTER global default would apply — silently REJECTING a result \
+             the activity declared as acceptable. Rejected so the divergence surfaces \
+             at setup rather than as a surprising runtime PayloadTooLarge.",
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use autumn_harvest::{ActivityExecId, ExecutionId, TimerId, WorkflowCommand};
@@ -1519,7 +1776,7 @@ mod tests {
 
     use super::{
         cancellable_timer_unsupported, command_name, persist_scheduled_activity,
-        persist_started_timer,
+        persist_started_timer, unsupported_activity_feature,
     };
     use crate::error::SqliteError;
     use crate::{queue, schema, store};
@@ -1528,6 +1785,174 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema::SCHEMA).unwrap();
         conn
+    }
+
+    // ── unsupported_activity_feature audit (Codex #1069 P2, runtime.rs:39) ────────
+    //
+    // The THIRD author-declared-feature ingress surface: dispatch-time `ActivityInfo`
+    // defaults the Postgres worker enforces but which are NOT carried on the
+    // `ScheduleActivity` command. This exhaustively pins the honor/reject/inert
+    // partition directly against the private audit fn, using struct-update over a
+    // macro-built base `ActivityInfo` to flip one field at a time. `register_activity`
+    // (public) drives the same fn's panic path in `tests/activity_info_features.rs`.
+    mod activity_audit {
+        use std::time::Duration;
+
+        use autumn_harvest::ActivityInfo;
+        use autumn_harvest::policy::{CircuitBreakerPolicy, RetryPolicy};
+        use autumn_harvest::prelude::*;
+
+        use super::unsupported_activity_feature;
+
+        // A minimal, plain remote activity — its `_info()` supplies a real
+        // `ActivityHandlerFn` for `..base_info()` struct-update. Its await-free body
+        // is never run (the audit reads only the info), so `unused_async` is allowed.
+        #[activity]
+        #[allow(clippy::unused_async)]
+        async fn base_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+            Ok(n)
+        }
+
+        fn base_info() -> ActivityInfo {
+            base_act_info()
+        }
+
+        fn rejected_feature(info: &ActivityInfo) -> Option<&'static str> {
+            unsupported_activity_feature(info).map(|(feature, _)| feature)
+        }
+
+        #[test]
+        fn a_plain_activity_is_registrable() {
+            // No declared defaults at all → nothing to reject.
+            assert_eq!(rejected_feature(&base_info()), None);
+        }
+
+        #[test]
+        fn honored_and_inert_fields_do_not_reject() {
+            // HONORED (handled by register_activity, not reported by the audit):
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    default_schedule_to_close: Some(Duration::from_secs(5)),
+                    ..base_info()
+                }),
+                None,
+                "schedule_to_close is HONORED (persisted + enforced), not rejected",
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    default_retry_policy: Some(RetryPolicy::fixed(3, Duration::from_secs(1))),
+                    ..base_info()
+                }),
+                None,
+                "retry policy is honored (fallback attempt cap + per-dispatch command)",
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    default_start_to_close: Some(Duration::from_secs(2)),
+                    ..base_info()
+                }),
+                None,
+                "start_to_close is honored via the ScheduleActivity command",
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    default_queue: Some("email"),
+                    ..base_info()
+                }),
+                None,
+                "queue is recorded (single-writer routing is a no-op)",
+            );
+            // INERT: a lone concurrency_key groups a cap that is not set.
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    concurrency_key: Some("tenant"),
+                    ..base_info()
+                }),
+                None,
+                "a lone concurrency_key (no max_concurrent) is inert",
+            );
+        }
+
+        #[test]
+        fn every_unsupported_field_is_rejected_by_name() {
+            // Each dispatch-admission / cross-worker / cap-raiser field, flipped in
+            // isolation, is rejected and NAMED — never silently dropped.
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    is_local: true,
+                    ..base_info()
+                }),
+                Some("local = true"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    default_schedule_to_start: Some(Duration::from_secs(300)),
+                    ..base_info()
+                }),
+                Some("schedule_to_start"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    default_heartbeat_timeout: Some(Duration::from_secs(10)),
+                    ..base_info()
+                }),
+                Some("heartbeat_timeout"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    circuit_breaker: Some(CircuitBreakerPolicy::new(
+                        3,
+                        Duration::from_secs(30),
+                        Duration::from_secs(10),
+                    )),
+                    ..base_info()
+                }),
+                Some("circuit_breaker"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    rate_limit_rps: Some(10.0),
+                    ..base_info()
+                }),
+                Some("rate_limit"),
+            );
+            // A lone rate_limit_key (no rps) is still part of the rate-limit family.
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    rate_limit_key: Some("bucket"),
+                    ..base_info()
+                }),
+                Some("rate_limit"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    max_concurrent: Some(4),
+                    ..base_info()
+                }),
+                Some("max_concurrent"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    requires: Some("gpu=true"),
+                    ..base_info()
+                }),
+                Some("requires"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    max_input_bytes: Some(8 * 1024 * 1024),
+                    ..base_info()
+                }),
+                Some("max_input_bytes"),
+            );
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    max_result_bytes: Some(8 * 1024 * 1024),
+                    ..base_info()
+                }),
+                Some("max_result_bytes"),
+            );
+        }
     }
 
     // FIX B / AUDIT (Codex #1069 P2, runtime.rs:840): the previously-"Unknown"
@@ -1609,6 +2034,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -1635,6 +2061,7 @@ mod tests {
                 &serde_json::json!({}),
                 "default",
                 0,
+                None,
                 None,
                 None,
                 None,

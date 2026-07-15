@@ -172,7 +172,7 @@ async fn declared_retry_policy_raises_attempts_over_registered_spec() {
     let c = counter.clone();
     // Registered with max_attempts = 1 (no retry) — deliberately BELOW the
     // declared policy so the two diverge.
-    rt.register_activity(
+    rt.register_activity_raw(
         "declared_retry_up",
         ActivitySpec::new(1, move |input: serde_json::Value| {
             let prior = c.fetch_add(1, Ordering::SeqCst);
@@ -230,7 +230,7 @@ async fn declared_retry_policy_disables_retries_below_registered_spec() {
     let counter = Arc::new(AtomicU32::new(0));
     let c = counter.clone();
     // Registered with max_attempts = 5 — deliberately ABOVE the declared policy.
-    rt.register_activity(
+    rt.register_activity_raw(
         "declared_retry_down",
         ActivitySpec::new(5, move |_input: serde_json::Value| {
             c.fetch_add(1, Ordering::SeqCst);
@@ -275,7 +275,7 @@ async fn raw_path_without_override_uses_registered_spec_default() {
     rt.register_workflow(&calls_raw_info());
     let counter = Arc::new(AtomicU32::new(0));
     let c = counter.clone();
-    rt.register_activity(
+    rt.register_activity_raw(
         "raw_flaky",
         ActivitySpec::new(3, move |input: serde_json::Value| {
             let prior = c.fetch_add(1, Ordering::SeqCst);

@@ -56,7 +56,7 @@ async fn side_effect_then_activity(
 async fn run_to_completion_on_sqlite() -> Vec<WorkflowEvent> {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&single_activity_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "work",
         ActivitySpec::new(1, |input: serde_json::Value| {
             Ok(json!(input.as_i64().unwrap()))
@@ -190,7 +190,7 @@ async fn deterministic_side_effect_persists_and_replays_byte_identically() {
     let (exec, recorded_id) = {
         let mut rt = SqliteRuntime::open(&path).unwrap();
         rt.register_workflow(&side_effect_then_activity_info());
-        rt.register_activity(
+        rt.register_activity_raw(
             "work",
             ActivitySpec::new(1, |input: serde_json::Value| {
                 Ok(json!(input.as_i64().unwrap()))
@@ -260,7 +260,7 @@ async fn records_workflow_type(ctx: &WorkflowContext, _n: i64) -> Result<String,
 async fn workflow_type_reaches_ctx_info_and_replays_on_core() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&records_workflow_type_info());
-    rt.register_activity(
+    rt.register_activity_raw(
         "echo_str",
         ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
     );
@@ -493,7 +493,7 @@ async fn caught_activity_panic_records_handler_panic_error_type_and_replays() {
     rt.register_workflow(&catches_activity_panic_info());
     // `max_attempts = 1` → terminal on the first strike; the panic is the exhausting
     // (terminal) failure whose recorded `error_type` is under test.
-    rt.register_activity(
+    rt.register_activity_raw(
         "panicky",
         ActivitySpec::new(
             1,
@@ -604,7 +604,7 @@ async fn caught_activity_panic_honors_handler_panic_non_retryable_policy() {
     // The registered spec allows 3 attempts; only the policy's non-retryable
     // classification stops the retries — so pre-fix (no typed error_type) this body
     // ran 3 times.
-    rt.register_activity(
+    rt.register_activity_raw(
         "panicky_typed",
         ActivitySpec::new(3, move |_input: serde_json::Value| {
             body_calls.fetch_add(1, Ordering::SeqCst);
