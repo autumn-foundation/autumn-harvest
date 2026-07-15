@@ -1097,6 +1097,95 @@ fn dlq_bulk_replay_with_all_filters_maps_correctly() {
 }
 
 #[test]
+fn dlq_bulk_replay_with_cause_filters_maps_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-replay",
+        "--dlq-reason",
+        "poison_pill",
+        "--error-class",
+        "CircuitOpen",
+        "--failure-signature",
+        "connection refused",
+    ])
+    .expect("bulk-replay cause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/replay");
+    let body = request.body.expect("should have body");
+    assert_eq!(body["dlq_reason"], "poison_pill");
+    assert_eq!(body["error_class"], "CircuitOpen");
+    assert_eq!(body["failure_signature"], "connection refused");
+}
+
+#[test]
+fn dlq_bulk_discard_with_cause_filters_maps_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-discard",
+        "--dlq-reason",
+        "workflow_task_timeout",
+        "--error-class",
+        "WorkflowTaskTimeout",
+        "--failure-signature",
+        "task timed out",
+    ])
+    .expect("bulk-discard cause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/discard");
+    let body = request.body.expect("should have body");
+    assert_eq!(body["dlq_reason"], "workflow_task_timeout");
+    assert_eq!(body["error_class"], "WorkflowTaskTimeout");
+    assert_eq!(body["failure_signature"], "task timed out");
+}
+
+#[test]
+fn dlq_summary_alias_maps_like_aggregate() {
+    let summary = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "summary",
+        "--group-by",
+        "dlq_reason",
+    ])
+    .expect("dlq summary should parse")
+    .api_request()
+    .expect("summary request should build");
+
+    let aggregate = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "aggregate",
+        "--group-by",
+        "dlq_reason",
+    ])
+    .expect("dlq aggregate should parse")
+    .api_request()
+    .expect("aggregate request should build");
+
+    assert_eq!(summary.method, ApiMethod::Get);
+    assert_eq!(summary.method, aggregate.method);
+    assert_eq!(summary.path, aggregate.path);
+    assert!(
+        summary.path.starts_with("/dead-letters/aggregate?"),
+        "unexpected path: {}",
+        summary.path
+    );
+    assert!(
+        summary.path.contains("group_by=dlq_reason"),
+        "unexpected path: {}",
+        summary.path
+    );
+}
+
+#[test]
 fn workflow_update_maps_to_post_with_wait_query() {
     let cli = Cli::try_parse_from([
         "harvest",

@@ -811,6 +811,34 @@ fn dlq_bulk_discard_body_fields_are_documented() {
 }
 
 #[test]
+fn dlq_bulk_replay_cause_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dlq",
+        "bulk-replay",
+        "--error-class",
+        "CircuitOpen",
+        "--dlq-reason",
+        "poison_pill",
+        "--failure-signature",
+        "connection refused",
+    ]);
+}
+
+#[test]
+fn dlq_bulk_discard_cause_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dlq",
+        "bulk-discard",
+        "--error-class",
+        "CircuitOpen",
+        "--dlq-reason",
+        "poison_pill",
+        "--failure-signature",
+        "connection refused",
+    ]);
+}
+
+#[test]
 fn handoff_complete_body_fields_are_documented() {
     assert_body_fields_documented(&[
         "handoff",
