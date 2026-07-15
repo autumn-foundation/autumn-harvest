@@ -26,6 +26,23 @@ pub enum SqliteError {
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 
+    /// A signal was sent to an execution that is not accepting signals — it has
+    /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
+    /// engine's rejection of a signal to a terminal target
+    /// ([`send_signal`](crate::SqliteRuntime::send_signal)): staging it would
+    /// silently drop the wakeup, since no live `wait_for_signal` will ever consume
+    /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
+    /// variant is only for a *present but sealed* run.
+    #[error(
+        "workflow execution {execution_id} is not running (state: {state}); cannot accept a signal"
+    )]
+    WorkflowNotRunning {
+        /// The terminal execution the signal targeted.
+        execution_id: ExecutionId,
+        /// Its current (terminal) state — `COMPLETED`, `FAILED`, etc.
+        state: String,
+    },
+
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
     /// outside the single-writer backend's supported subset (child workflows,
     /// external signals/cancels, continue-as-new, local activities, …).

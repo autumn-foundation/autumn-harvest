@@ -16,6 +16,11 @@
 //!   activity (`tokio::join!`) records its schedule events in command order and
 //!   replays cleanly on the core `WorkflowReplayer` (the matcher tolerates the
 //!   interleaved sibling terminals).
+//! - **`send_signal` validation (Codex #1069 P2)** — `send_signal` rejects a signal
+//!   to an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal one
+//!   ([`SqliteError::WorkflowNotRunning`]) instead of staging a row no live
+//!   `wait_for_signal` could ever consume; a RUNNING target stages/consumes as
+//!   before.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the
@@ -595,4 +600,100 @@ async fn workflow_handler_panic_then_hotfix_resumes() {
         history[1],
         WorkflowEvent::WorkflowCompleted { .. }
     ));
+}
+
+// ── send_signal rejects unknown / terminal executions (Codex #1069 P2) ─────────
+//
+// `harvest_signals` has no FK/state check, so an unconditional stage returned
+// `Ok(())` for a typoed id or a sealed run and the wakeup was silently lost — no
+// live `wait_for_signal` will ever consume it. `send_signal` now mirrors the
+// Postgres rejections: an unknown id → `ExecutionNotFound`; a terminal execution →
+// `WorkflowNotRunning`; a RUNNING execution stages (and is consumed) as before.
+
+/// Blocks on a plain signal, then completes echoing the payload — proves a RUNNING
+/// target still stages and consumes a signal.
+#[workflow]
+async fn wait_go(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+    let payload = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    Ok(payload)
+}
+
+/// Completes immediately (no suspension) — used to reach a terminal state to
+/// signal against.
+#[workflow]
+async fn done_now(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+    let _ = ctx;
+    Ok(json!("done"))
+}
+
+/// Count staged `harvest_signals` rows for `exec` from a raw connection to the
+/// same file (the established inspection pattern in `signal_timeout.rs`).
+fn signal_row_count(path: &std::path::Path, exec: ExecutionId) -> i64 {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.query_row(
+        "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1",
+        [exec.to_string()],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn send_signal_rejects_unknown_and_terminal_targets() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&wait_go_info());
+    rt.register_workflow(&done_now_info());
+
+    // (1) Unknown execution id → ExecutionNotFound, nothing staged. Pre-fix this
+    // returned Ok(()) and silently inserted a signal row for a nonexistent run.
+    let bogus = ExecutionId::new();
+    let err = rt.send_signal(bogus, "go", json!("x")).unwrap_err();
+    assert!(
+        matches!(err, SqliteError::ExecutionNotFound(id) if id == bogus),
+        "an unknown execution id must be rejected, got {err}"
+    );
+    assert_eq!(
+        signal_row_count(&path, bogus),
+        0,
+        "no signal row may be staged for an unknown execution id"
+    );
+
+    // (2) Terminal (COMPLETED) execution → WorkflowNotRunning, nothing staged.
+    // Pre-fix this returned Ok(()) and staged a row no live wait could consume.
+    let done = rt.start_workflow("done_now", json!(0)).unwrap();
+    let state = rt.run_until_blocked(done).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "done_now must complete, got {state:?}"
+    );
+    let err = rt.send_signal(done, "go", json!("late")).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::WorkflowNotRunning { execution_id, ref state }
+                if execution_id == done && state == "COMPLETED"
+        ),
+        "a terminal execution must reject a signal, got {err}"
+    );
+    assert_eq!(
+        signal_row_count(&path, done),
+        0,
+        "a rejected signal must NOT be staged on a terminal execution"
+    );
+
+    // (3) RUNNING execution → Ok, and the signal is consumed to completion
+    // (unchanged behavior).
+    let running = rt.start_workflow("wait_go", json!(0)).unwrap();
+    let state = rt.run_until_blocked(running).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "go"),
+        "wait_go must block on the signal, got {state:?}"
+    );
+    rt.send_signal(running, "go", json!("payload")).unwrap();
+    let state = rt.run_until_blocked(running).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "payload"),
+        "a RUNNING execution consumes the signal to completion, got {state:?}"
+    );
 }

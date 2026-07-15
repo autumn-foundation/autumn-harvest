@@ -259,6 +259,27 @@ impl SqliteRuntime {
         payload: Value,
         received_at: DateTime<Utc>,
     ) -> SqliteResult<()> {
+        // Validate the target BEFORE staging (Codex #1069 P2). `harvest_signals`
+        // has no FK/state check, so an unconditional stage returns `Ok(())` for a
+        // typoed id or a sealed run and silently loses the wakeup — no live
+        // `wait_for_signal` will ever consume it. Mirror the Postgres `send_signal`
+        // rejections (and the [`outcome`](Self::outcome) not-found pattern): an
+        // unknown id → `ExecutionNotFound`; a terminal execution →
+        // `WorkflowNotRunning`. A RUNNING (non-terminal) execution stages as before.
+        //
+        // The single-writer runtime holds `SQLite`'s only write handle, so the
+        // state read and the stage cannot race a concurrent transition: no other
+        // writer exists to seal the execution between the check and the insert.
+        if !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        let state = store::execution_state(&self.conn, exec)?;
+        if autumn_harvest::erase::is_terminal_state(&state) {
+            return Err(SqliteError::WorkflowNotRunning {
+                execution_id: exec,
+                state,
+            });
+        }
         store::stage_signal(&self.conn, exec, name, &payload, received_at.timestamp())
     }
 

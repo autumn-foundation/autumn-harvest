@@ -114,6 +114,14 @@
 //!   terminal drain), so the run completes cleanly and no orphaned timer is left
 //!   behind.
 //!
+//! Signal ingress is validated at the boundary:
+//! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) rejects a signal
+//! aimed at an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal
+//! one ([`SqliteError::WorkflowNotRunning`]) instead of staging a row no live pull
+//! primitive could ever consume — mirroring the Postgres engine's rejection of a
+//! signal to an unknown/terminal target. A `RUNNING` execution stages (and later
+//! consumes) the signal exactly as before.
+//!
 //! The push-handler and non-blocking drain APIs — `register_signal_handler`
 //! (#546), `drain_signals` / `try_receive_signal` (#775) — depend on the Postgres
 //! task-preparation ingest that promotes *all* pending signals into history up
