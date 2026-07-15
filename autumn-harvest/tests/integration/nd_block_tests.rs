@@ -480,7 +480,10 @@ async fn wait_for_nd_block(
     exec_id: ExecutionId,
     count: i32,
 ) -> (bool, Option<String>, i32, Option<Value>) {
-    for _ in 0..400 {
+    // ~40s budget (800 × 50ms): belt-and-braces against a loaded runner. Only
+    // affects how long a *failing* wait tolerates before panicking — a satisfied
+    // wait still returns early, so no passing test's timing semantics change.
+    for _ in 0..800 {
         let row = get_nd_block_row(conn, exec_id).await;
         if row.2 >= count && row.0 {
             return row;
@@ -1263,6 +1266,15 @@ async fn nd_blocked_cycle_does_not_emit_signal_unhandled() {
     // Phase 2: v2 diverges (schedules an activity where v1 recorded a timer) —
     // the cycle ND-blocks and must never reach the terminal-emit site.
     fire_timer_now(&mut conn, exec_b).await;
+    // Backdating `harvest_timers.fires_at` alone is not enough: the parked
+    // workflow task's `scheduled_at` was set to the timer's original `fires_at`
+    // (now + 300s) by `reschedule_task` at suspension, so the divergent worker
+    // cannot re-claim it within the poll window — the test then races worker2's
+    // own timer-scan → append `TimerFired` → re-pend chain against the
+    // `wait_for_nd_block` budget and times out on loaded runners. Make the task
+    // claimable now so worker2 replays the recorded history and blocks promptly
+    // (mirrors `divergent_replay_blocks_instead_of_failing`).
+    make_task_claimable_now(&mut conn, exec_b).await;
     let (worker2, handle2) = spawn_worker(
         make_worker(
             vec![wf_info("nd_wf", divergent_v2_handler)],
