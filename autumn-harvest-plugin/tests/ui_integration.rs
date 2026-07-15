@@ -4005,7 +4005,7 @@ async fn ui_dag_run_graph_unknown_run_falls_back() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Set an event row's wall-clock timestamp so the derived timeline has
-/// meaningful, spread-out durations (events default to NOW() on insert).
+/// meaningful, spread-out durations (events default to `NOW()` on insert).
 async fn tl960_set_event_ts(
     database_url: &str,
     exec_id: ExecutionId,
@@ -4046,7 +4046,8 @@ async fn tl960_seed_run(
     nd_block_reason: Option<&str>,
     current_details: Option<&str>,
 ) -> ExecutionId {
-    let exec_id = insert_workflow_on_url(database_url, ShardId::new(0), "echo_workflow", workflow_id).await;
+    let exec_id =
+        insert_workflow_on_url(database_url, ShardId::new(0), "echo_workflow", workflow_id).await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("connect for tl960 seed");
@@ -4060,7 +4061,7 @@ async fn tl960_seed_run(
     // Anchor the WorkflowStarted (event 1) to `base` and spread the rest.
     tl960_set_event_ts(database_url, exec_id, 1, base).await;
     for offset in 0..count {
-        let ts = base + chrono::Duration::milliseconds((offset as i64 + 1) * step_ms);
+        let ts = base + chrono::Duration::milliseconds((i64::from(offset) + 1) * step_ms);
         tl960_set_event_ts(database_url, exec_id, start_event_id + offset, ts).await;
     }
 
@@ -4093,11 +4094,16 @@ async fn tl960_seed_run(
         sets.join(", "),
         exec_id.as_uuid(),
     );
-    conn.batch_execute(&sql).await.expect("apply tl960 row overrides");
+    conn.batch_execute(&sql)
+        .await
+        .expect("apply tl960 row overrides");
     exec_id
 }
 
-fn tl960_act_sched(name: &str, id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+fn tl960_act_sched(
+    name: &str,
+    id: autumn_harvest::ActivityExecId,
+) -> autumn_harvest::WorkflowEvent {
     autumn_harvest::WorkflowEvent::ActivityScheduled {
         activity_id: id,
         name: name.to_string(),
@@ -4117,7 +4123,10 @@ const fn tl960_act_completed(id: autumn_harvest::ActivityExecId) -> autumn_harve
         output: Value::Null,
     }
 }
-fn tl960_act_failed(id: autumn_harvest::ActivityExecId, attempt: u32) -> autumn_harvest::WorkflowEvent {
+fn tl960_act_failed(
+    id: autumn_harvest::ActivityExecId,
+    attempt: u32,
+) -> autumn_harvest::WorkflowEvent {
     autumn_harvest::WorkflowEvent::ActivityFailed {
         activity_id: id,
         error: "transient failure".to_string(),
@@ -4206,7 +4215,10 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     assert!(html.contains("oncall@corp"), "pause actor labelled");
     // ND marker + runbook link.
     assert!(html.contains("gantt-nd-marker"), "ND marker present");
-    assert!(html.contains("nondeterminism-block"), "runbook link present");
+    assert!(
+        html.contains("nondeterminism-block"),
+        "runbook link present"
+    );
 }
 
 // J-B
@@ -4248,11 +4260,21 @@ async fn ui_timeline_split_only_when_present() {
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK);
     // Started activity → wait + exec segments.
-    assert!(html.contains("gantt-seg-wait"), "wait segment present: {html}");
+    assert!(
+        html.contains("gantt-seg-wait"),
+        "wait segment present: {html}"
+    );
     assert!(html.contains("gantt-seg-exec"), "exec segment present");
     // Child → single undivided span.
-    assert!(html.contains("gantt-seg-whole"), "child renders one whole span");
-    assert!(html.contains("sub_flow") || html.contains("ChildWorkflow") || html.contains("Child workflow"));
+    assert!(
+        html.contains("gantt-seg-whole"),
+        "child renders one whole span"
+    );
+    assert!(
+        html.contains("sub_flow")
+            || html.contains("ChildWorkflow")
+            || html.contains("Child workflow")
+    );
 }
 
 // J-C
@@ -4293,16 +4315,28 @@ async fn ui_timeline_slowest_highlight_and_rollup() {
     )
     .await;
     // Push the slow activity's completion far out so it dominates.
-    tl960_set_event_ts(&database_url, exec_id, 5, base + chrono::Duration::seconds(20)).await;
+    tl960_set_event_ts(
+        &database_url,
+        exec_id,
+        5,
+        base + chrono::Duration::seconds(20),
+    )
+    .await;
 
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK);
     // Rollup header present.
-    assert!(html.contains("Total") || html.contains("wall-clock") || html.contains("Wall-clock"), "rollup header: {html}");
+    assert!(
+        html.contains("Total") || html.contains("wall-clock") || html.contains("Wall-clock"),
+        "rollup header: {html}"
+    );
     assert!(html.contains("slow_bottleneck"), "slowest step named");
     // Slowest span anchor + highlight.
     assert!(html.contains("id=\"slowest\""), "slowest anchor present");
-    assert!(html.contains("gantt-span-slowest"), "slowest highlight present");
+    assert!(
+        html.contains("gantt-span-slowest"),
+        "slowest highlight present"
+    );
 }
 
 // J-D
@@ -4316,7 +4350,10 @@ async fn ui_timeline_inflight_open_span_and_current_details() {
 
     // A running execution with a scheduled-but-not-completed activity.
     let a = autumn_harvest::ActivityExecId::new();
-    let events = vec![tl960_act_sched("in_flight_activity", a), tl960_act_started(a)];
+    let events = vec![
+        tl960_act_sched("in_flight_activity", a),
+        tl960_act_started(a),
+    ];
     let exec_id = tl960_seed_run(
         &database_url,
         "tl-d",
@@ -4336,8 +4373,14 @@ async fn ui_timeline_inflight_open_span_and_current_details() {
 
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("gantt-span-open"), "in-flight open span present: {html}");
-    assert!(html.contains("step 2/3: awaiting downstream"), "current_details shown in header");
+    assert!(
+        html.contains("gantt-span-open"),
+        "in-flight open span present: {html}"
+    );
+    assert!(
+        html.contains("step 2/3: awaiting downstream"),
+        "current_details shown in header"
+    );
 }
 
 // J-E

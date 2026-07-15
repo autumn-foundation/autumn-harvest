@@ -70,6 +70,9 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
+    StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
+};
+use autumn_harvest::{
     cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
     terminate_workflow_execution,
 };
@@ -204,6 +207,29 @@ footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-t
 .dag-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
 .dag-legend span{display:inline-flex;align-items:center;gap:4px}
 .dag-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
+.gantt-scroll{overflow:auto;max-width:100%;max-height:75vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
+.gantt-lane-label{fill:#cbd5e1;font:11px system-ui,-apple-system,sans-serif}
+.gantt-lane-group{fill:#93c5fd;font:600 11px system-ui,-apple-system,sans-serif}
+.gantt-axis-tick{stroke:#334155;stroke-width:1}
+.gantt-axis-label{fill:#64748b;font:10px system-ui,-apple-system,sans-serif}
+.gantt-span{stroke:#0f172a;stroke-width:1}
+.gantt-span-open{stroke-dasharray:4 3;stroke:#94a3b8;stroke-width:1.5}
+.gantt-span-slowest{stroke:#f8fafc;stroke-width:2}
+.gantt-seg-wait{opacity:.55}
+.gantt-seg-exec{opacity:1}
+.gantt-seg-whole{opacity:1}
+.gantt-badge{fill:#f8fafc;font:10px system-ui,-apple-system,sans-serif}
+.gantt-pause-band{fill:#78350f;opacity:.28}
+.gantt-pause-label{fill:#fbbf24;font:10px system-ui,-apple-system,sans-serif}
+.gantt-nd-marker{stroke:#f97316;stroke-width:2;stroke-dasharray:3 2}
+.gantt-nd-label{fill:#f97316;font:10px system-ui,-apple-system,sans-serif}
+.timeline-rollup{display:flex;flex-wrap:wrap;gap:16px;margin:8px 0;font-size:.85rem;color:#cbd5e1}
+.timeline-rollup .stat{display:flex;flex-direction:column;gap:2px}
+.timeline-rollup .stat .label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em}
+.timeline-rollup .stat .value{font-size:1rem;color:#e2e8f0}
+.timeline-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
+.timeline-legend span{display:inline-flex;align-items:center;gap:4px}
+.timeline-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -568,6 +594,9 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
+        // issue #960: standalone execution timeline / Gantt view (read-only,
+        // non-admin — parity with the #739 API and the detail page).
+        .route("/workflows/{id}/timeline", get(workflow_timeline_ui))
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
         .route(
             "/workflows/{id}/terminate",
@@ -4173,6 +4202,12 @@ fn render_workflow_detail(
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
             }
+            // issue #960: link to the standalone execution timeline (Gantt) —
+            // reads as a "Timeline" tab of the execution detail view. The
+            // #slowest fragment scroll-focuses the slowest span on load.
+            a.btn href={ (exec_id_str) "/timeline#slowest" } {
+                "Timeline"
+            }
             a.btn href={ "../../workflows/" (exec_id_str) "/history/export" } {
                 "Export history"
             }
@@ -5127,6 +5162,540 @@ fn dag_retry_success_flash(new_run: &str) -> String {
 /// Default, editable retry reason pre-filled into the confirm-page textarea.
 fn dag_retry_default_reason(from_node: &str) -> String {
     format!("retry from node {from_node} via Vantage")
+}
+
+// ── Issue #960: execution timeline / Gantt view ────────────────────────────
+//
+// A standalone, read-only page at `GET /workflows/{id}/timeline` that renders
+// the shipped `autumn_harvest::derive_timeline` output as a server-computed
+// inline SVG Gantt. Pause (#383) and ND-block (#603) bands come from the
+// execution-row columns the handler already loads — never from the step data,
+// which carries no such fields. Payload-free (no #608 decode, no audit).
+
+/// Left gutter width (px) reserved for lane/step labels.
+const TL_GUTTER: f64 = 230.0;
+/// Wall-clock axis width (px) — the drawable time span.
+const TL_AXIS_W: f64 = 900.0;
+/// Per-step row height (px).
+const TL_ROW_H: f64 = 26.0;
+/// Span bar height (px) within a row.
+const TL_SPAN_H: f64 = 14.0;
+/// Header band height (px) holding the axis ticks.
+const TL_HEADER_H: f64 = 44.0;
+/// Minimum rendered span width (px) so sub-second slivers stay visible.
+const TL_MIN_SPAN_W: f64 = 3.0;
+/// Bottom padding (px).
+const TL_PAD: f64 = 14.0;
+/// Upper bound on rendered step rows; beyond this the view truncates with a
+/// note (the rollup is still computed over the full set by `derive_timeline`).
+const MAX_RENDER_STEPS: usize = 500;
+
+/// Fixed lane order for the Gantt (one lane per `step_kind`). Activity-family
+/// lanes lead so the common queue-wait/exec story reads first.
+const TIMELINE_LANES: [StepKind; 6] = [
+    StepKind::Activity,
+    StepKind::LocalActivity,
+    StepKind::ChildWorkflow,
+    StepKind::Timer,
+    StepKind::SignalWait,
+    StepKind::SideEffect,
+];
+
+/// Fill colour keyed to a step's outcome (distinct per outcome; the label is
+/// the accessible, colour-independent cue).
+const fn step_outcome_fill(outcome: StepOutcome) -> &'static str {
+    match outcome {
+        StepOutcome::Completed => "#166534",
+        StepOutcome::Failed => "#991b1b",
+        StepOutcome::TimedOut => "#b45309",
+        StepOutcome::Cancelled => "#6b7280",
+        StepOutcome::Fired => "#0e7490",
+        StepOutcome::Pending => "#1d4ed8",
+    }
+}
+
+/// Human-readable outcome label (matches the #739 bounded enum).
+const fn step_outcome_label(outcome: StepOutcome) -> &'static str {
+    match outcome {
+        StepOutcome::Completed => "Completed",
+        StepOutcome::Failed => "Failed",
+        StepOutcome::TimedOut => "Timed out",
+        StepOutcome::Cancelled => "Cancelled",
+        StepOutcome::Fired => "Fired",
+        StepOutcome::Pending => "Pending",
+    }
+}
+
+/// Lane label per step kind.
+const fn step_kind_lane_label(kind: StepKind) -> &'static str {
+    match kind {
+        StepKind::Activity => "Activity",
+        StepKind::LocalActivity => "Local activity",
+        StepKind::Timer => "Timer",
+        StepKind::ChildWorkflow => "Child workflow",
+        StepKind::SignalWait => "Signal wait",
+        StepKind::SideEffect => "Side effect",
+    }
+}
+
+/// Map a millisecond offset onto an axis of `axis_width` px, guarding a
+/// zero/negative span (an instantaneous or zero-duration run) so there is no
+/// divide-by-zero / NaN, and clamping the result inside `[0, axis_width]`.
+fn x_scale(offset_ms: i64, span_ms: i64, axis_width: f64) -> f64 {
+    if span_ms <= 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let frac = offset_ms as f64 / span_ms as f64;
+    (frac * axis_width).clamp(0.0, axis_width)
+}
+
+/// A within-span segment: the queue-wait vs execution split (only when the API
+/// provides both), else one undivided whole span. Never fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegKind {
+    Wait,
+    Exec,
+    Whole,
+}
+
+/// Split a step into its rendered segments. Two segments (`Wait`, `Exec`) only
+/// when the timeline recorded both `wait_ms` and `exec_ms` (a started regular
+/// activity); otherwise a single undivided `Whole` span — the split is never
+/// fabricated (#739 contract).
+fn span_segments(step: &TimelineStep) -> Vec<(SegKind, i64)> {
+    match (step.wait_ms, step.exec_ms) {
+        (Some(wait), Some(exec)) => vec![(SegKind::Wait, wait), (SegKind::Exec, exec)],
+        _ => vec![(SegKind::Whole, step.total_ms)],
+    }
+}
+
+/// CSS class for a segment kind.
+const fn seg_class(seg: SegKind) -> &'static str {
+    match seg {
+        SegKind::Wait => "gantt-seg-wait",
+        SegKind::Exec => "gantt-seg-exec",
+        SegKind::Whole => "gantt-seg-whole",
+    }
+}
+
+/// The rect class for a span segment (base + segment + open/slowest modifiers).
+fn span_rect_class(seg: SegKind, open: bool, slowest: bool) -> String {
+    let mut class = format!("gantt-span {}", seg_class(seg));
+    if open {
+        class.push_str(" gantt-span-open");
+    }
+    if slowest {
+        class.push_str(" gantt-span-slowest");
+    }
+    class
+}
+
+/// Format a millisecond duration compactly (`ms` under 1 s, `Ns` under a
+/// minute, `Nm Ns` beyond).
+fn format_ms(ms: i64) -> String {
+    let ms = ms.max(0);
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        #[allow(clippy::cast_precision_loss)]
+        let secs = ms as f64 / 1000.0;
+        format!("{secs:.1}s")
+    } else {
+        let secs = ms / 1000;
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+/// Index into `timeline.steps` of the slowest step by `total_ms` (first on
+/// ties). `None` when there are no steps. Matches the rollup's `slowest_step`.
+fn slowest_step_index(timeline: &Timeline) -> Option<usize> {
+    let mut best: Option<(usize, i64)> = None;
+    for (idx, step) in timeline.steps.iter().enumerate() {
+        if best.is_none_or(|(_, best_ms)| step.total_ms > best_ms) {
+            best = Some((idx, step.total_ms));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
+/// The wall-clock axis geometry for the Gantt: `[start, end]` mapped onto
+/// `[gutter, gutter + width]`, with `height` the full SVG height (used by the
+/// full-height pause band and ND marker).
+#[derive(Debug, Clone, Copy)]
+struct GanttAxis {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    gutter: f64,
+    width: f64,
+    height: f64,
+}
+
+impl GanttAxis {
+    /// Build an axis, ensuring `end > start` so a zero-duration run still has a
+    /// usable (1 ms) span rather than a degenerate axis.
+    fn new(start: DateTime<Utc>, end: DateTime<Utc>, gutter: f64, width: f64, height: f64) -> Self {
+        let end = if end > start {
+            end
+        } else {
+            start + chrono::Duration::milliseconds(1)
+        };
+        Self {
+            start,
+            end,
+            gutter,
+            width,
+            height,
+        }
+    }
+
+    fn span_ms(&self) -> i64 {
+        (self.end - self.start).num_milliseconds().max(1)
+    }
+
+    /// The x coordinate (px, including the gutter offset) for an instant.
+    fn x_for(&self, t: DateTime<Utc>) -> f64 {
+        let offset = (t - self.start).num_milliseconds();
+        self.gutter + x_scale(offset, self.span_ms(), self.width)
+    }
+}
+
+/// The full-height pause band (#383), sourced from the execution row's active
+/// pause columns. `None` when the row is not currently paused. The row retains
+/// only the *active* pause (resume nulls `paused_at`), so historical/resolved
+/// pauses are not renderable — a documented limitation.
+fn pause_band_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup> {
+    let paused_at = exec.paused_at?;
+    let x1 = axis.x_for(paused_at);
+    // An active pause extends to the current clock end (the axis end).
+    let x2 = axis.gutter + axis.width;
+    let width = (x2 - x1).max(1.0);
+    let mut label = String::from("Paused");
+    if let Some(reason) = exec.pause_reason.as_deref() {
+        label.push_str(": ");
+        label.push_str(reason);
+    }
+    if let Some(actor) = exec.pause_actor.as_deref() {
+        label.push_str(" (by ");
+        label.push_str(actor);
+        label.push(')');
+    }
+    Some(html! {
+        rect class="gantt-pause-band" x=(dag_svg_coord(x1)) y="0"
+             width=(dag_svg_coord(width)) height=(dag_svg_coord(axis.height)) {}
+        text class="gantt-pause-label" x=(dag_svg_coord(x1 + 4.0))
+             y=(dag_svg_coord(axis.height - 6.0)) { (label) }
+    })
+}
+
+/// The vertical ND-block marker (#603), sourced from the execution row's
+/// `nd_blocked_at`/`nd_block_reason`. `None` when the row is not ND-blocked.
+/// Links to the `nondeterminism-block` runbook.
+fn nd_marker_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup> {
+    let nd_at = exec.nd_blocked_at?;
+    let x = axis.x_for(nd_at);
+    let reason = exec
+        .nd_block_reason
+        .as_deref()
+        .unwrap_or("non-determinism block");
+    Some(html! {
+        line class="gantt-nd-marker" x1=(dag_svg_coord(x)) y1="0"
+             x2=(dag_svg_coord(x)) y2=(dag_svg_coord(axis.height)) {}
+        a href="docs/runbooks/nondeterminism-block.md" {
+            text class="gantt-nd-label" x=(dag_svg_coord(x + 4.0)) y="14" {
+                "⚠ ND-block: " (reason) " — runbook"
+            }
+        }
+    })
+}
+
+/// The rollup header: total wall-clock, busy vs wait, and the slowest step.
+fn render_timeline_rollup(rollup: &TimelineRollup) -> Markup {
+    html! {
+        div class="timeline-rollup" {
+            div class="stat" {
+                span class="label" { "Total wall-clock" }
+                span class="value" { (format_ms(rollup.total_wall_clock_ms)) }
+            }
+            div class="stat" {
+                span class="label" { "Busy (exec)" }
+                span class="value" { (format_ms(rollup.busy_ms)) }
+            }
+            div class="stat" {
+                span class="label" { "Wait (queue/timer/signal)" }
+                span class="value" { (format_ms(rollup.wait_ms)) }
+            }
+            @if let Some(slow) = &rollup.slowest_step {
+                div class="stat" {
+                    span class="label" { "Slowest step" }
+                    span class="value" {
+                        (slow.name.as_deref().unwrap_or("(unnamed)"))
+                        " · " (step_kind_lane_label(slow.step_kind))
+                        " · " (format_ms(slow.total_ms))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A compact legend mapping outcome → colour + label.
+fn timeline_outcome_legend() -> Markup {
+    const OUTCOMES: [StepOutcome; 6] = [
+        StepOutcome::Completed,
+        StepOutcome::Failed,
+        StepOutcome::TimedOut,
+        StepOutcome::Cancelled,
+        StepOutcome::Fired,
+        StepOutcome::Pending,
+    ];
+    html! {
+        div class="timeline-legend" {
+            @for outcome in OUTCOMES {
+                span {
+                    span class="swatch" style=(format!("background:{}", step_outcome_fill(outcome))) {}
+                    (step_outcome_label(outcome))
+                }
+            }
+        }
+    }
+}
+
+/// Render one step row: the gutter labels (lane group label once per group,
+/// then the step name) plus the span segment rects grouped under an anchor
+/// `<g>` (carrying `id="slowest"` for the slowest step), and the retry badge
+/// for a genuine retry (`attempt > 1`). Segment x offsets are accumulated in
+/// plain Rust (maud cannot mutate inside a `@for`).
+fn render_timeline_row(
+    step: &TimelineStep,
+    kind: StepKind,
+    is_head: bool,
+    row: usize,
+    axis: &GanttAxis,
+    is_slowest: bool,
+) -> Markup {
+    let name = step.name.as_deref().unwrap_or("(unnamed)");
+    #[allow(clippy::cast_precision_loss)]
+    let y = TL_ROW_H.mul_add(row as f64, TL_HEADER_H);
+    let open = step.ended_at.is_none();
+
+    let x1 = axis.x_for(step.scheduled_at);
+    let step_end = step.ended_at.unwrap_or(axis.end);
+    let x2 = axis.x_for(step_end);
+    let span_w = (x2 - x1).max(TL_MIN_SPAN_W);
+    let span_y = y + (TL_ROW_H - TL_SPAN_H) / 2.0;
+
+    let segs = span_segments(step);
+    let seg_total = segs.iter().map(|(_, ms)| *ms).sum::<i64>().max(1);
+    let mut seg_markup: Vec<Markup> = Vec::with_capacity(segs.len());
+    let mut seg_x = x1;
+    for (seg, ms) in &segs {
+        #[allow(clippy::cast_precision_loss)]
+        let seg_w = (span_w * (*ms as f64 / seg_total as f64)).max(0.5);
+        seg_markup.push(html! {
+            rect x=(dag_svg_coord(seg_x)) y=(dag_svg_coord(span_y))
+                 width=(dag_svg_coord(seg_w)) height=(dag_svg_coord(TL_SPAN_H))
+                 rx="3" fill=(step_outcome_fill(step.outcome))
+                 class=(span_rect_class(*seg, open, is_slowest)) {
+                title {
+                    (name) " — " (step_outcome_label(step.outcome))
+                    " · " (format_ms(step.total_ms))
+                    @if let (Some(w), Some(e)) = (step.wait_ms, step.exec_ms) {
+                        " (wait " (format_ms(w)) " / exec " (format_ms(e)) ")"
+                    }
+                }
+            }
+        });
+        seg_x += seg_w;
+    }
+
+    html! {
+        // Gutter labels: lane group label once per group + step name.
+        @if is_head {
+            text class="gantt-lane-group" x="6" y=(dag_svg_coord(y + 10.0)) {
+                (step_kind_lane_label(kind))
+            }
+            text class="gantt-lane-label" x="16" y=(dag_svg_coord(y + 22.0)) { (name) }
+        } @else {
+            text class="gantt-lane-label" x="16" y=(dag_svg_coord(y + 16.0)) { (name) }
+        }
+        g id=[is_slowest.then_some("slowest")] {
+            @for m in &seg_markup { (m) }
+            @if let Some(att) = step.attempt {
+                @if att > 1 {
+                    text class="gantt-badge" x=(dag_svg_coord(x1 + span_w + 4.0))
+                         y=(dag_svg_coord(span_y + TL_SPAN_H - 2.0)) { "×" (att) }
+                }
+            }
+        }
+    }
+}
+
+/// Render the execution timeline as an inline, server-computed SVG Gantt.
+///
+/// Steps are lane-grouped by `step_kind` (in `TIMELINE_LANES` order), one row
+/// per step on a shared wall-clock axis `[started_at, completed_at|now]`. A
+/// started regular activity's `wait_ms`/`exec_ms` split renders as two
+/// segments; every other step renders as one undivided span (never fabricated).
+/// Open (in-flight) steps extend to the axis end and are dashed. The slowest
+/// step carries `id="slowest"` (for a no-JS fragment scroll) and a highlight
+/// outline. Pause and ND-block bands overlay the axis, sourced from the
+/// execution row. maud auto-escapes every text/attribute interpolation.
+#[allow(clippy::too_many_lines)]
+fn render_timeline_gantt(
+    timeline: &Timeline,
+    exec: &WorkflowExecution,
+    now: DateTime<Utc>,
+) -> Markup {
+    // Lane-group the steps (stable, in TIMELINE_LANES order), marking the first
+    // of each present lane so the lane label renders once per group.
+    let mut order: Vec<(StepKind, usize, bool)> = Vec::new();
+    for lane in TIMELINE_LANES {
+        let mut is_head = true;
+        for (idx, step) in timeline.steps.iter().enumerate() {
+            if step.step_kind == lane {
+                order.push((lane, idx, is_head));
+                is_head = false;
+            }
+        }
+    }
+    let total_steps = order.len();
+    let truncated = total_steps > MAX_RENDER_STEPS;
+    let render_order = &order[..total_steps.min(MAX_RENDER_STEPS)];
+
+    let slowest = slowest_step_index(timeline);
+    #[allow(clippy::cast_precision_loss)]
+    let height = TL_ROW_H.mul_add(render_order.len() as f64, TL_HEADER_H) + TL_PAD;
+    let svg_width = TL_GUTTER + TL_AXIS_W + TL_PAD;
+
+    let axis_end = exec.completed_at.unwrap_or(now);
+    let axis = GanttAxis::new(exec.started_at, axis_end, TL_GUTTER, TL_AXIS_W, height);
+    let span_ms = axis.span_ms();
+
+    // Axis tick labels at 0 / 50 / 100 % of the wall-clock span.
+    let ticks: Vec<(f64, String)> = [0.0_f64, 0.5, 1.0]
+        .iter()
+        .map(|frac| {
+            let x = axis.gutter + axis.width * frac;
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let off = (span_ms as f64 * frac) as i64;
+            (x, format!("+{}", format_ms(off)))
+        })
+        .collect();
+
+    html! {
+        (render_timeline_rollup(&timeline.rollup))
+
+        @if let Some(details) = exec.current_details.as_deref() {
+            div class="card" {
+                strong { "Now: " } (details)
+                " · "
+                a href={ "../" (timeline.exec_id) } { "what is it blocked on?" }
+            }
+        }
+
+        @if let Some(nd_at) = exec.nd_blocked_at {
+            div class="banner Warning" {
+                "This execution is non-determinism-blocked (since "
+                (format_timestamp(Some(nd_at))) ", "
+                (exec.nd_block_count) " occurrence(s)). "
+                @if let Some(reason) = exec.nd_block_reason.as_deref() { (reason) " · " }
+                a href="docs/runbooks/nondeterminism-block.md" { "nondeterminism-block runbook" }
+            }
+        }
+
+        (timeline_outcome_legend())
+
+        @if truncated {
+            div class="banner Warning" {
+                "Showing first " (MAX_RENDER_STEPS) " of " (total_steps)
+                " steps. The rollup above covers all steps."
+            }
+        }
+
+        @if timeline.steps.is_empty() {
+            div class="empty" { "No steps recorded for this execution yet." }
+        } @else {
+            div class="gantt-scroll" {
+                svg xmlns="http://www.w3.org/2000/svg"
+                    width=(dag_svg_coord(svg_width))
+                    height=(dag_svg_coord(height))
+                    role="img"
+                    aria-label="Execution timeline Gantt" {
+                    // Axis ticks (behind everything).
+                    @for (x, label) in &ticks {
+                        line class="gantt-axis-tick" x1=(dag_svg_coord(*x)) y1=(dag_svg_coord(TL_HEADER_H - 6.0))
+                             x2=(dag_svg_coord(*x)) y2=(dag_svg_coord(height)) {}
+                        text class="gantt-axis-label" x=(dag_svg_coord(*x + 2.0)) y=(dag_svg_coord(TL_HEADER_H - 10.0)) {
+                            (label)
+                        }
+                    }
+
+                    // Pause band (behind the spans).
+                    @if let Some(band) = pause_band_markup(exec, &axis) { (band) }
+
+                    // Step rows.
+                    @for (row, (kind, idx, is_head)) in render_order.iter().enumerate() {
+                        (render_timeline_row(
+                            &timeline.steps[*idx],
+                            *kind,
+                            *is_head,
+                            row,
+                            &axis,
+                            slowest == Some(*idx),
+                        ))
+                    }
+
+                    // ND-block marker (on top).
+                    @if let Some(marker) = nd_marker_markup(exec, &axis) { (marker) }
+                }
+            }
+        }
+    }
+}
+
+/// `GET /workflows/{id}/timeline` — the standalone execution timeline (Gantt).
+///
+/// Consumes the shipped `autumn_harvest::derive_timeline` in-process (exactly as
+/// the #739 API handler does): loads the execution row + timestamped history,
+/// derives the timeline, and renders the server-computed inline-SVG Gantt.
+/// Pause/ND-block bands come from the execution row's columns. Read-only, and
+/// payload-free by the API's design — no #608 read-path decode, no audit row.
+/// An unknown execution (including a classic DAG run, which is not on the
+/// execution path) surfaces `load_execution`'s `NotFound` as a 404.
+async fn workflow_timeline_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Markup, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let execution = load_execution(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    let rows = autumn_harvest::store::load_timestamped_history(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    let now = Utc::now();
+    let timeline = derive_timeline(
+        &rows,
+        execution.started_at,
+        now,
+        execution.completed_at,
+        exec_id.to_string(),
+        execution.workflow_id.clone(),
+        execution.workflow_name.clone(),
+        execution.state.clone(),
+    );
+    let title = format!("Timeline · {} · Vantage", execution.workflow_name);
+    let body = html! {
+        div.detail-row { a.back href={ "../" (exec_id) } { (PreEscaped("&larr;")) " Back to execution" } }
+        h2 {
+            "Timeline — " (execution.workflow_name) " "
+            (state_badge(&execution.state))
+        }
+        (render_timeline_gantt(&timeline, &execution, now))
+    };
+    Ok(layout(&title, &body, "../../"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9333,7 +9902,10 @@ mod tests {
     // Q1
     #[test]
     fn step_outcome_fill_and_label_all_variants() {
-        let fills: Vec<&str> = ALL_STEP_OUTCOMES.iter().map(|o| step_outcome_fill(*o)).collect();
+        let fills: Vec<&str> = ALL_STEP_OUTCOMES
+            .iter()
+            .map(|o| step_outcome_fill(*o))
+            .collect();
         for fill in &fills {
             assert!(
                 fill.starts_with('#') && fill.len() >= 4,
@@ -9341,7 +9913,11 @@ mod tests {
             );
         }
         let unique: std::collections::HashSet<&&str> = fills.iter().collect();
-        assert_eq!(unique.len(), 6, "each outcome has a distinct fill: {fills:?}");
+        assert_eq!(
+            unique.len(),
+            6,
+            "each outcome has a distinct fill: {fills:?}"
+        );
 
         let labels: Vec<&str> = ALL_STEP_OUTCOMES
             .iter()
@@ -9460,10 +10036,46 @@ mod tests {
     #[test]
     fn render_timeline_gantt_lanes_and_spans() {
         let steps = vec![
-            tl_step(StepKind::Activity, Some("charge"), 0, Some(1000), Some(300), Some(700), StepOutcome::Completed, Some(1)),
-            tl_step(StepKind::Timer, Some("wait_24h"), 1000, Some(2000), None, None, StepOutcome::Fired, None),
-            tl_step(StepKind::ChildWorkflow, Some("fulfill"), 2000, Some(3000), None, None, StepOutcome::Completed, None),
-            tl_step(StepKind::SignalWait, Some("approve"), 3000, Some(4000), None, None, StepOutcome::Completed, None),
+            tl_step(
+                StepKind::Activity,
+                Some("charge"),
+                0,
+                Some(1000),
+                Some(300),
+                Some(700),
+                StepOutcome::Completed,
+                Some(1),
+            ),
+            tl_step(
+                StepKind::Timer,
+                Some("wait_24h"),
+                1000,
+                Some(2000),
+                None,
+                None,
+                StepOutcome::Fired,
+                None,
+            ),
+            tl_step(
+                StepKind::ChildWorkflow,
+                Some("fulfill"),
+                2000,
+                Some(3000),
+                None,
+                None,
+                StepOutcome::Completed,
+                None,
+            ),
+            tl_step(
+                StepKind::SignalWait,
+                Some("approve"),
+                3000,
+                Some(4000),
+                None,
+                None,
+                StepOutcome::Completed,
+                None,
+            ),
         ];
         let mut exec = stub_execution();
         exec.started_at = tl_base();
@@ -9491,15 +10103,36 @@ mod tests {
     // Q8
     #[test]
     fn render_timeline_gantt_split_only_when_present() {
-        let split = tl_step(StepKind::Activity, Some("charge"), 0, Some(1000), Some(300), Some(700), StepOutcome::Completed, Some(1));
-        let whole = tl_step(StepKind::ChildWorkflow, Some("sub"), 1000, Some(1500), None, None, StepOutcome::Completed, None);
+        let split = tl_step(
+            StepKind::Activity,
+            Some("charge"),
+            0,
+            Some(1000),
+            Some(300),
+            Some(700),
+            StepOutcome::Completed,
+            Some(1),
+        );
+        let whole = tl_step(
+            StepKind::ChildWorkflow,
+            Some("sub"),
+            1000,
+            Some(1500),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
         exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1500));
         let timeline = tl_timeline(vec![split, whole], None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         // Split activity → both wait and exec segment classes.
-        assert!(html.contains("gantt-seg-wait"), "wait segment rendered: {html}");
+        assert!(
+            html.contains("gantt-seg-wait"),
+            "wait segment rendered: {html}"
+        );
         assert!(html.contains("gantt-seg-exec"), "exec segment rendered");
         // Un-split child → the undivided whole class.
         assert!(html.contains("gantt-seg-whole"), "whole span rendered");
@@ -9509,7 +10142,16 @@ mod tests {
     #[test]
     fn render_timeline_gantt_open_span_to_now() {
         // In-flight step: ended_at = None, outcome Pending → open-ended span.
-        let pending = tl_step(StepKind::Activity, Some("running"), 0, None, None, None, StepOutcome::Pending, Some(1));
+        let pending = tl_step(
+            StepKind::Activity,
+            Some("running"),
+            0,
+            None,
+            None,
+            None,
+            StepOutcome::Pending,
+            Some(1),
+        );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
         exec.completed_at = None;
@@ -9523,7 +10165,16 @@ mod tests {
     // Q10
     #[test]
     fn render_timeline_gantt_attempt_badge() {
-        let retried = tl_step(StepKind::Activity, Some("flaky"), 0, Some(1000), Some(100), Some(900), StepOutcome::Completed, Some(3));
+        let retried = tl_step(
+            StepKind::Activity,
+            Some("flaky"),
+            0,
+            Some(1000),
+            Some(100),
+            Some(900),
+            StepOutcome::Completed,
+            Some(3),
+        );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
         exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
@@ -9637,8 +10288,26 @@ mod tests {
     #[test]
     fn slowest_step_highlighted_with_id() {
         let steps = vec![
-            tl_step(StepKind::Activity, Some("quick"), 0, Some(100), Some(10), Some(90), StepOutcome::Completed, Some(1)),
-            tl_step(StepKind::Activity, Some("slow_one"), 100, Some(9100), Some(50), Some(9050), StepOutcome::Completed, Some(1)),
+            tl_step(
+                StepKind::Activity,
+                Some("quick"),
+                0,
+                Some(100),
+                Some(10),
+                Some(90),
+                StepOutcome::Completed,
+                Some(1),
+            ),
+            tl_step(
+                StepKind::Activity,
+                Some("slow_one"),
+                100,
+                Some(9100),
+                Some(50),
+                Some(9050),
+                StepOutcome::Completed,
+                Some(1),
+            ),
         ];
         // slowest_step_index picks the max total_ms step (index 1).
         let timeline = tl_timeline(
@@ -9654,14 +10323,29 @@ mod tests {
         exec.started_at = tl_base();
         exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(9100));
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
-        assert!(html.contains("id=\"slowest\""), "slowest anchor id present: {html}");
-        assert!(html.contains("gantt-span-slowest"), "slowest highlight class present");
+        assert!(
+            html.contains("id=\"slowest\""),
+            "slowest anchor id present: {html}"
+        );
+        assert!(
+            html.contains("gantt-span-slowest"),
+            "slowest highlight class present"
+        );
     }
 
     // Q15
     #[test]
     fn render_timeline_gantt_escapes_names() {
-        let step = tl_step(StepKind::Activity, Some("<b>evil</b>"), 0, Some(100), None, None, StepOutcome::Completed, None);
+        let step = tl_step(
+            StepKind::Activity,
+            Some("<b>evil</b>"),
+            0,
+            Some(100),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
         exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(100));
@@ -9695,7 +10379,8 @@ mod tests {
             .collect();
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10));
+        exec.completed_at =
+            Some(tl_base() + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10));
         let timeline = tl_timeline(steps, None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         // A "showing N of M" note when capped.
