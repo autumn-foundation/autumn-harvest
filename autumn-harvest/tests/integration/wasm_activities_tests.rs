@@ -985,6 +985,10 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     let (url, _c) = setup_db().await;
     let queue = "q-wasm-echo";
     let mut conn = connect(&url).await;
+    // Isolate the module table: startup-SEED (activate-only-if-absent) will not
+    // swap in this test's bytes if a prior test's `echo_wasm` is still active on
+    // a shared HARVEST_TEST_DATABASE_URL run (a no-op on CI's per-test DB).
+    scrub(&mut conn).await;
     let input = serde_json::json!({"hello": "wasm", "n": 7});
     let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
 
@@ -1034,6 +1038,8 @@ async fn worker_wasm_sandbox_denial_fails_workflow_terminally() {
     let (url, _c) = setup_db().await;
     let queue = "q-wasm-deny";
     let mut conn = connect(&url).await;
+    // Isolate the module table under startup-SEED semantics (see the echo test).
+    scrub(&mut conn).await;
     let exec_id = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
 
     let deny = assemble(DENY_WAT);
@@ -1138,6 +1144,8 @@ async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
     let (url, _c) = setup_db().await;
     let queue = "q-wasm-fuel";
     let mut conn = connect(&url).await;
+    // Isolate the module table under startup-SEED semantics (see the echo test).
+    scrub(&mut conn).await;
     let exec_id = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
 
     // Small fuel budget → the spin loop always exhausts it → ResourceExhausted
@@ -1333,6 +1341,8 @@ async fn runs_one_native_and_one_wasm_activity_to_completion() {
     let (url, _c) = setup_db().await;
     let queue = "q-native-and-wasm";
     let mut conn = connect(&url).await;
+    // Isolate the module table under startup-SEED semantics (see the echo test).
+    scrub(&mut conn).await;
     let input = serde_json::json!({ "n": 21 });
     let exec_id = seed_workflow(&mut conn, "wf_native_and_wasm", input.clone(), queue).await;
 
