@@ -291,6 +291,55 @@ async fn target_exec_count_named(conn: &mut AsyncPgConnection, workflow_name: &s
     .n
 }
 
+/// issue #1053 helper — read a rate-limit bucket's current token balance so the
+/// fire-time-gate tests can assert a BLOCKED deferred throttle fire REFUNDED the
+/// token it reserved before the start (nothing admitted → nothing spent).
+async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct TokensRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<Text, _>(key)
+        .get_result::<TokensRow>(conn)
+        .await
+        .expect("read bucket tokens")
+        .tokens
+}
+
+/// issue #1053 helper — count pending `harvest_start_throttle` rows for a
+/// specific `workflow_id`, so a test can assert a BLOCKED deferred fire LEFT the
+/// row (re-deferred, not deleted).
+async fn throttle_rows_for(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_id = $1")
+        .bind::<Text, _>(workflow_id)
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("count throttle rows")
+        .n
+}
+
+/// issue #1053 helper — directly seed a prior `ag_target_wf` execution row
+/// (shard 0 — the single-shard `ShardRouter::default()` used here) in a given
+/// terminal/active `state`. Mirrors the plugin suite's `seed_execution`; used by
+/// the (b) force-terminate residual test to plant a TERMINATED prior (a sealed
+/// state excluded by the active-uniqueness partial index, so a fresh CREATE with
+/// the same `workflow_id` is allowed and must therefore face the fire-time gate).
+async fn seed_target_execution_state(conn: &mut AsyncPgConnection, workflow_id: &str, state: &str) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'ag_target_wf', $2, 0, '{}'::jsonb, 'default', $3)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(workflow_id)
+    .bind::<Text, _>(state)
+    .execute(conn)
+    .await
+    .expect("seed prior target execution");
+}
+
 fn sched_noop_handler<'a>(
     _ctx: &'a autumn_harvest::WorkflowContext,
     input: serde_json::Value,
@@ -892,6 +941,274 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
     // Three targets started (debounce, throttle, event-batch); the CT relay was
     // blocked, so its target never started.
     assert_eq!(target_exec_count(&mut conn).await, 3);
+}
+
+/// issue #1053 (MONEY): the throttle scanner honours the admission gate at FIRE
+/// time. Under a CLOSED gate a deferred throttle start must BLOCK + RE-DEFER —
+/// leave the `harvest_start_throttle` row (do NOT delete), refund the token it
+/// reserved before the start, create NO execution, and count the block exactly
+/// once on the passed recorder. Once the gate OPENS, the held start FIRES
+/// exactly once (row deleted, execution created, a `throttle` bypass counted).
+///
+/// This is the falsifiable RED for the core mechanism: against unchanged code
+/// the throttle scanner is gate-exempt by construction (`_collect(.., None, None)`),
+/// so Phase A FIRES despite the gate (`n == 1`, row deleted, execution created,
+/// token spent, no block counted) and the `assert_eq!(n, 0)` fails.
+#[tokio::test]
+async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    // Clean baseline (a prior panicking RED test may have left a gate installed).
+    set_global_admission_gate_cache(None);
+
+    // Full bucket (10 tokens, no refill) + one due throttle row for `thr-redefer`.
+    let bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-thr");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets
+            (key, refill_rate, burst, tokens, last_refilled_at)
+         VALUES ($1, 0.0, 10.0, 10.0, NOW())",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_start_throttle
+            (workflow_name, throttle_key, bucket_key, workflow_id, queue_name,
+             input, start_options, deferred_at)
+         VALUES ('ag_target_wf', 'k-thr', $1, 'thr-redefer', 'default', '{}'::jsonb,
+                 '{}'::jsonb, NOW() - INTERVAL '1 second')",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
+
+    // ── Phase A: gate CLOSED — block + re-defer ──
+    set_global_admission_gate_cache(Some(fleet_cache("redefer-incident")));
+    let n = autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "throttle scanner blocks + re-defers under the gate");
+    assert_eq!(
+        throttle_rows_for(&mut conn, "thr-redefer").await,
+        1,
+        "the blocked row is LEFT (re-deferred), not deleted"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "no execution is created for a blocked fire"
+    );
+    assert!(
+        (bucket_tokens(&mut conn, &bucket).await - 10.0).abs() < 1e-9,
+        "the token reserved before the start is refunded on a block"
+    );
+    assert_eq!(
+        metrics.blocked().len(),
+        1,
+        "the block is counted exactly once on the passed recorder (metrics threading)"
+    );
+    assert_eq!(
+        metrics.blocked()[0].0,
+        "fleet",
+        "the block came from the Fleet gate"
+    );
+    assert!(
+        !metrics.bypassed().contains(&"throttle".to_string()),
+        "a blocked fire counts NO bypass"
+    );
+
+    // ── Phase B: gate OPEN — the held start fires ──
+    set_global_admission_gate_cache(None);
+    let n2 =
+        autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
+            .await
+            .unwrap();
+    assert_eq!(n2, 1, "the held start fires once the gate opens");
+    assert_eq!(
+        throttle_rows_for(&mut conn, "thr-redefer").await,
+        0,
+        "the row is deleted once the start fires"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "the execution is created once the gate opens"
+    );
+    assert!(
+        metrics.bypassed().contains(&"throttle".to_string()),
+        "an open-gate fire counts a throttle bypass"
+    );
+}
+
+/// issue #1053 — AC (a) "gate-armed-after-deferral looseness". A throttle start
+/// deferred while the gate was open/absent must be HELD (not fired gate-exempt)
+/// once the gate arms before its scanner fire. This is the pre-existing
+/// looseness #1053 closes; it is the general case of which (b) is a subset.
+///
+/// RED against unchanged code: the scanner fires despite the now-armed gate
+/// (`n == 1`), failing `assert_eq!(n, 0)`.
+#[tokio::test]
+async fn throttle_row_deferred_before_gate_is_held_when_gate_arms_before_fire() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    // Seed a full bucket + a due throttle row for `thr-late-gate` WHILE NO GATE
+    // is installed (a start deferred while the gate was open/absent).
+    let bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-late");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets
+            (key, refill_rate, burst, tokens, last_refilled_at)
+         VALUES ($1, 0.0, 10.0, 10.0, NOW())",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_start_throttle
+            (workflow_name, throttle_key, bucket_key, workflow_id, queue_name,
+             input, start_options, deferred_at)
+         VALUES ('ag_target_wf', 'k-late', $1, 'thr-late-gate', 'default', '{}'::jsonb,
+                 '{}'::jsonb, NOW() - INTERVAL '1 second')",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
+
+    // NOW arm the Fleet gate (it was armed AFTER the row was deferred), then fire.
+    set_global_admission_gate_cache(Some(fleet_cache("late-gate-incident")));
+    let n = autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "a start deferred while the gate was open is HELD once the gate arms before its fire"
+    );
+    assert_eq!(
+        throttle_rows_for(&mut conn, "thr-late-gate").await,
+        1,
+        "the row is re-deferred (left), not dropped"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "no execution is created under the gate"
+    );
+    assert!(
+        (bucket_tokens(&mut conn, &bucket).await - 10.0).abs() < 1e-9,
+        "the reserved token is refunded on a block"
+    );
+    assert_eq!(
+        metrics.blocked().len(),
+        1,
+        "the block is counted on the passed recorder"
+    );
+}
+
+/// issue #1053 — AC (b) "bypass + force-terminate residual" (the narrow PR-#1051
+/// residual). A bypass-eligible prior (was RUNNING → attach → the defer-time
+/// unlocked read bypassed the admission gate) is force-terminated to TERMINATED
+/// after the read. The deferred fire would now CREATE a fresh replacement
+/// (`start_will_create_new_execution(None-from-TERMINATED, AllowDuplicate) == true`);
+/// the fire-time `CheckCached` gate must catch it and re-defer. (b) ⊂ (a): any
+/// deferred fire faces the fire-time gate — force-terminate is merely what turns
+/// a would-be attach into a would-be CREATE.
+///
+/// RED against unchanged code: TERMINATED is excluded from the active-uniqueness
+/// partial index, so the gate-exempt scanner CREATEs a fresh replacement
+/// (`n == 1`, a 2nd `ag_target_wf` row), failing `assert_eq!(n, 0)`.
+#[tokio::test]
+async fn throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    // A prior for `thr-forceterm` that was force-terminated to TERMINATED after
+    // the defer-time unlocked read.
+    seed_target_execution_state(&mut conn, "thr-forceterm", "TERMINATED").await;
+
+    // Seed a full bucket + a due throttle row for the SAME workflow_id.
+    let bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-ft");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets
+            (key, refill_rate, burst, tokens, last_refilled_at)
+         VALUES ($1, 0.0, 10.0, 10.0, NOW())",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_start_throttle
+            (workflow_name, throttle_key, bucket_key, workflow_id, queue_name,
+             input, start_options, deferred_at)
+         VALUES ('ag_target_wf', 'k-ft', $1, 'thr-forceterm', 'default', '{}'::jsonb,
+                 '{}'::jsonb, NOW() - INTERVAL '1 second')",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
+
+    set_global_admission_gate_cache(Some(fleet_cache("forceterm-incident")));
+    let n = autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "the deferred fire would CREATE a fresh replacement over the TERMINATED \
+         prior; the fire-time gate catches it and re-defers"
+    );
+    assert_eq!(
+        throttle_rows_for(&mut conn, "thr-forceterm").await,
+        1,
+        "the row is re-deferred (left), not dropped"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "only the pre-seeded TERMINATED prior exists; no fresh replacement is created"
+    );
+    assert!(
+        (bucket_tokens(&mut conn, &bucket).await - 10.0).abs() < 1e-9,
+        "the reserved token is refunded on a block"
+    );
+    assert_eq!(
+        metrics.blocked().len(),
+        1,
+        "the block is counted on the passed recorder"
+    );
 }
 
 /// F-round17 (Finding A): the event-batch IMMEDIATE (max_size-reached) flush starts
