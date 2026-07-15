@@ -1814,7 +1814,7 @@ mod tests {
                 body_calls.fetch_add(1, Ordering::SeqCst);
                 Err("boom".to_string())
             });
-            s.schedule_to_close = Some(Duration::from_millis(1_000));
+            s.schedule_to_close = Some(Duration::from_secs(1));
             s
         };
         let mut activities = std::collections::HashMap::new();
