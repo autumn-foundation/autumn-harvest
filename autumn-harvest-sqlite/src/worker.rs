@@ -2231,4 +2231,97 @@ mod tests {
             "reclaim must NOT reset defaults_frozen (the frozen contract survives)",
         );
     }
+
+    /// FIX B (Codex #1080 P3): the atomic claim+freeze transaction RELEASES the
+    /// `BEGIN IMMEDIATE` write lock (and rolls the `RUNNING` flip back) when the
+    /// freeze errors mid-claim — the untested error path of the claim-tx refactor.
+    ///
+    /// Injection: a `BEFORE UPDATE OF defaults_frozen` trigger that `RAISE(ABORT)`s
+    /// the freeze `UPDATE` (the one that sets `defaults_frozen = 1`). The claim's own
+    /// state-only `UPDATE` (`SET state = 'RUNNING'`, which never touches
+    /// `defaults_frozen`) is left unaffected, so the claim opens and flips the row
+    /// inside the tx, and the SUBSEQUENT freeze is what fails — exactly the mid-claim
+    /// error the atomic refactor must survive. On the error the tx is DROPPED (what
+    /// `drain_ready`'s `?` does), so both the freeze and the `RUNNING` flip roll back.
+    ///
+    /// Asserts (a) the row is left `PENDING`+unfrozen (rollback — never a committed
+    /// `RUNNING`+unfrozen orphan the way a pre-atomic separate-commit flow would
+    /// leave) and (b) a SECOND connection with `busy_timeout = 0` immediately
+    /// acquires the `BEGIN IMMEDIATE` write lock — i.e. the error-path tx released
+    /// the lock (a leaked/held tx would surface `SQLITE_BUSY`). A temp FILE database
+    /// is used so a genuinely competing connection can contend for the lock (an
+    /// in-memory database is private to one connection).
+    #[test]
+    fn claim_tx_error_path_releases_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim.sqlite3");
+        let mut conn = Connection::open(&path).unwrap();
+        // Fail-fast on lock contention (busy_timeout = 0) so a held lock would surface
+        // immediately as SQLITE_BUSY rather than blocking; WAL mirrors the runtime.
+        conn.execute_batch("PRAGMA busy_timeout = 0;\nPRAGMA journal_mode = WAL;")
+            .unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+
+        let exec = ExecutionId::new();
+        seed_exec_with_pending_activity(&conn, exec, "act");
+
+        // Inject the freeze failure: ABORT any UPDATE that sets `defaults_frozen = 1`
+        // (the freeze), leaving the claim's state-only UPDATE untouched.
+        conn.execute_batch(
+            "CREATE TRIGGER block_freeze BEFORE UPDATE OF defaults_frozen ON harvest_tasks \
+             WHEN NEW.defaults_frozen = 1 \
+             BEGIN SELECT RAISE(ABORT, 'injected freeze failure'); END;",
+        )
+        .unwrap();
+
+        let spec = ActivitySpec::new(3, |_| Ok(serde_json::json!(null)));
+
+        // Claim (RUNNING flip lands inside the tx), then attempt the freeze — the
+        // trigger ABORTs it. On error, DROP the tx exactly as `drain_ready`'s `?`
+        // does, rolling back the freeze AND the RUNNING flip together.
+        {
+            let (tx, mut task) = queue::claim_next_ready_task_tx(&mut conn, exec, 0)
+                .unwrap()
+                .expect("a ready task");
+            let err = super::freeze_defaults_at_claim(&tx, &mut task, &spec).unwrap_err();
+            assert!(
+                matches!(err, crate::error::SqliteError::Sqlite(_)),
+                "the injected freeze failure surfaces as a Sqlite error, got {err:?}",
+            );
+            drop(tx); // rollback (mirrors drain_ready dropping the tx on `?`)
+        }
+
+        // (a) The claim's RUNNING flip rolled back WITH the failed freeze (atomic):
+        //     PENDING+unfrozen, never a committed RUNNING+unfrozen orphan.
+        let (state, frozen) = state_and_frozen(&conn, exec);
+        assert_eq!(
+            state, "PENDING",
+            "the RUNNING flip rolled back with the failed freeze",
+        );
+        assert_eq!(frozen, 0, "still unfrozen — the freeze never committed");
+
+        // (b) A SECOND connection (busy_timeout = 0) acquires the write lock at once,
+        //     proving the error-path tx was dropped and its write lock released — a
+        //     leaked/held tx would fail here with SQLITE_BUSY.
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        other.execute_batch("BEGIN IMMEDIATE; COMMIT;").expect(
+            "a competing connection must acquire the BEGIN IMMEDIATE write lock — no SQLITE_BUSY",
+        );
+
+        // Clean recovery on the original connection once the injected failure is gone:
+        // the still-PENDING row re-claims and freezes atomically.
+        conn.execute_batch("DROP TRIGGER block_freeze").unwrap();
+        let (tx, mut task) = queue::claim_next_ready_task_tx(&mut conn, exec, 0)
+            .unwrap()
+            .expect("re-claimable after the rolled-back error path");
+        super::freeze_defaults_at_claim(&tx, &mut task, &spec).unwrap();
+        tx.commit().unwrap();
+        let (state, frozen) = state_and_frozen(&conn, exec);
+        assert_eq!(
+            (state.as_str(), frozen),
+            ("RUNNING", 1),
+            "clean recovery: the row claims + freezes atomically",
+        );
+    }
 }

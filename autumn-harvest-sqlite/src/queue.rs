@@ -228,9 +228,13 @@ pub fn enqueue_activity(
 /// the registered spec, persists them here, and reads them verbatim thereafter — so
 /// a later claim (crash/reopen, or a re-registration under a changed spec) sees the
 /// SAME values rather than re-resolving against a mutated registry. A single
-/// autocommit `UPDATE` scoped to `task_id`. A `None` argument is written as SQL
-/// `NULL` (= "resolved to no value"), which the frozen claim path reads back as
-/// `None`.
+/// `UPDATE` scoped to `task_id`, run **inside the caller's open claim transaction**
+/// (issue #1068; Codex #1080 P2) — `conn` here is the still-open `BEGIN IMMEDIATE`
+/// claim transaction (a `&Transaction` deref-coerces to `&Connection`), NOT a fresh
+/// autocommit connection, so this freeze and the claim's `RUNNING` flip commit
+/// atomically (or roll back together if either fails). A `None` argument is written
+/// as SQL `NULL` (= "resolved to no value"), which the frozen claim path reads back
+/// as `None`.
 pub fn freeze_task_defaults(
     conn: &Connection,
     task_id: &str,

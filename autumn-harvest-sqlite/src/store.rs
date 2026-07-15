@@ -147,6 +147,23 @@ pub fn running_executions(conn: &Connection) -> SqliteResult<Vec<ExecutionId>> {
 /// landed; `ORDER BY rowid DESC LIMIT 1` is a defensive tie-break preferring the
 /// newest active row if a database created by the pre-#1068 always-fresh behavior
 /// already holds duplicate active rows for a reused id.
+///
+/// **Legacy-duplicate reconciliation (pre-#1068 data only).** Once the reuse
+/// matrix has landed, at most one active row per key is ever created, so the
+/// newest-only lookup is exact for every start. It matters only for a database
+/// created by the pre-#1068 always-fresh behavior, which could already hold
+/// MULTIPLE active rows for a reused id — and the four policies reconcile that
+/// legacy state differently:
+/// - **`TerminateIfRunning`** is the ONLY policy that fully reconciles it: it seals
+///   EVERY active row for the key (via [`find_active_executions_by_key`]), so no
+///   legacy duplicate survives (Codex #1080 P2). It does NOT use this
+///   newest-only accessor.
+/// - **`AllowDuplicateFailedOnly`** deliberately does not disturb a running run, so
+///   a legacy RUNNING duplicate persists under it — consistent with its "replace a
+///   FAILED run" contract (it only seals a FAILED prior).
+/// - **`AllowDuplicate` / `RejectDuplicate`** never replace, so any legacy
+///   duplicates simply persist (they attach to / reject against the newest active
+///   row this returns).
 pub fn find_active_execution_by_key(
     conn: &Connection,
     workflow_name: &str,
@@ -171,6 +188,46 @@ pub fn find_active_execution_by_key(
             Ok(Some((exec, state)))
         }
     }
+}
+
+/// EVERY ACTIVE (non-sealed) execution for a `(workflow_name, workflow_id)` key,
+/// newest-first — the `TerminateIfRunning` reconciliation lookup (Codex #1080 P2).
+///
+/// The single-row [`find_active_execution_by_key`] returns only the NEWEST active
+/// row, which is exact for every start once the reuse matrix has landed (at most
+/// one active row per key is ever created). But a database written by the pre-#1068
+/// always-fresh `start_workflow_with_id` can already hold MULTIPLE `RUNNING` rows
+/// for one key; `TerminateIfRunning` must seal/cancel EVERY one, or an older
+/// duplicate survives `RUNNING` and keeps being driven by `run_until_idle` after the
+/// key was "terminated and restarted" — defeating the guarantee for upgraded
+/// databases. This returns the full active set (same sealed-state exclusion as the
+/// single-row accessor) so the `TerminateIfRunning` arm can iterate it.
+///
+/// `ORDER BY rowid DESC` (newest-first) is a stable, deterministic order; the
+/// caller seals every returned row regardless, so the order is not load-bearing.
+pub fn find_active_executions_by_key(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> SqliteResult<Vec<(ExecutionId, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT exec_id, state FROM harvest_executions \
+         WHERE workflow_name = ?1 AND workflow_id = ?2 \
+           AND state NOT IN ('CONTINUED_AS_NEW','TERMINATED') \
+         ORDER BY rowid DESC",
+    )?;
+    let rows = stmt.query_map(params![workflow_name, workflow_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (exec_str, state) = r?;
+        let exec = exec_str
+            .parse()
+            .map_err(|_| SqliteError::corrupt("exec_id"))?;
+        out.push((exec, state));
+    }
+    Ok(out)
 }
 
 /// Transition an execution to a SEALED terminal state (issue #1068) — used by the

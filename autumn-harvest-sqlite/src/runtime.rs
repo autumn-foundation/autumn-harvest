@@ -684,26 +684,25 @@ impl SqliteRuntime {
                         }
                     }
 
-                    // Cancel a RUNNING prior (recording it + cleaning up orphans),
-                    // then seal and start fresh; an already-terminal prior is sealed
-                    // without a cancellation event.
-                    (
-                        WorkflowIdReusePolicy::TerminateIfRunning,
-                        Some((prior_exec, prior_state)),
-                    ) => {
-                        if prior_state == "RUNNING" {
-                            store::append_event(
-                                &tx,
-                                prior_exec,
-                                &WorkflowEvent::WorkflowCancelled {
-                                    reason: "superseded by a TerminateIfRunning start (#1068)"
-                                        .to_string(),
-                                },
-                            )?;
-                            queue::delete_pending_tasks_for_execution(&tx, prior_exec)?;
-                            queue::delete_unfired_timers_for_execution(&tx, prior_exec)?;
+                    // Cancel + seal EVERY active prior for the key, then start fresh.
+                    // A pre-#1068 database may already hold MULTIPLE RUNNING rows for
+                    // one key (the old always-fresh behavior), so sealing only the
+                    // newest (`Some(_)` here) would leave older RUNNING duplicates
+                    // active and still driven by `run_until_idle` — defeating the
+                    // terminate-and-restart guarantee (Codex #1080 P2). Re-query the
+                    // FULL active set and reconcile every row: a still-RUNNING prior
+                    // records a `WorkflowCancelled` event and has its PENDING tasks /
+                    // unfired timers cleaned up; an already-terminal prior is sealed
+                    // without a cancellation event. All happen in this one start
+                    // transaction, so the result is exactly one active row (the fresh
+                    // run) with no orphaned RUNNING prior. (When there is no active
+                    // prior at all the `(_, None)` arm above already handles it.)
+                    (WorkflowIdReusePolicy::TerminateIfRunning, Some(_)) => {
+                        for (prior_exec, prior_state) in
+                            store::find_active_executions_by_key(&tx, workflow_name, id)?
+                        {
+                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                         }
-                        store::seal_execution(&tx, prior_exec, SEALED_STATE)?;
                         insert_fresh_execution(&tx, workflow_name, Some(id), input)?
                     }
                 }
@@ -1730,6 +1729,38 @@ fn apply_schedule_activity(
 /// are excluded from the active-run reuse lookup
 /// ([`store::find_active_execution_by_key`]) so the fresh run takes the key.
 const SEALED_STATE: &str = "CONTINUED_AS_NEW";
+
+/// Cancel-and-seal ONE active prior for a `TerminateIfRunning` replace (issue
+/// #1068; Codex #1080 P2), inside the caller's start transaction.
+///
+/// If the prior is still `RUNNING`, append a `WorkflowCancelled` event recording the
+/// forced cancellation and clean up its PENDING task rows + unfired timers (so no
+/// orphan can be claimed / fire against a run that is never driven again); then seal
+/// it to [`SEALED_STATE`] so it leaves the active set. An already-terminal prior
+/// (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation event. Byte-identical to
+/// the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
+/// arm can loop it over EVERY active row for the key
+/// ([`store::find_active_executions_by_key`]), reconciling a pre-#1068 database that
+/// already holds multiple RUNNING duplicates.
+fn cancel_and_seal_prior(
+    conn: &Connection,
+    prior_exec: ExecutionId,
+    prior_state: &str,
+) -> SqliteResult<()> {
+    if prior_state == "RUNNING" {
+        store::append_event(
+            conn,
+            prior_exec,
+            &WorkflowEvent::WorkflowCancelled {
+                reason: "superseded by a TerminateIfRunning start (#1068)".to_string(),
+            },
+        )?;
+        queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
+        queue::delete_unfired_timers_for_execution(conn, prior_exec)?;
+    }
+    store::seal_execution(conn, prior_exec, SEALED_STATE)?;
+    Ok(())
+}
 
 /// Insert a fresh execution row + its `WorkflowStarted` event inside the caller's
 /// start transaction (issue #1068), returning a `created == true`

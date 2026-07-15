@@ -9,7 +9,7 @@
 //! `RetryPolicy::fixed(_, 0ms)` policy, or the raw/no-policy immediate-retry
 //! default) the requeue also lands at `run_at = now`, so the just-failed branch is
 //! *immediately re-claimable in the SAME drain pass* AND still holds the lowest
-//! `seq` — so `claim_next_ready_task` re-selects it before any ready SIBLING branch
+//! `seq` — so `claim_next_ready_task_tx` re-selects it before any ready SIBLING branch
 //! gets a turn. Under a `ctx.race()`, a low-index branch that fails-and-retries can
 //! therefore monopolize the drain, exhaust all its attempts, terminal-out (even by
 //! FAILING), and *settle the race first* — cancelling a ready sibling that would
@@ -21,7 +21,7 @@
 //!
 //! On an IMMEDIATE (zero-delay) retry requeue — `run_at <= now`, so the task would
 //! be re-claimable THIS pass — the task is moved to the BACK of the ready queue
-//! (assigned a fresh, highest `seq`), so `claim_next_ready_task(ORDER BY seq)`
+//! (assigned a fresh, highest `seq`), so `claim_next_ready_task_tx(ORDER BY seq)`
 //! yields to every other ready sibling before returning to the just-failed branch
 //! (round-robin fairness). A NON-immediate retry (a real positive backoff,
 //! `run_at > now`) already yields naturally — its future `run_at` makes it

@@ -98,6 +98,64 @@ fn unfired_timer_count(path: &std::path::Path, exec: ExecutionId) -> i64 {
     .unwrap()
 }
 
+/// Number of PENDING task rows for an execution.
+fn pending_task_count(path: &std::path::Path, exec: ExecutionId) -> i64 {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.query_row(
+        "SELECT COUNT(*) FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'",
+        rusqlite::params![exec.to_string()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// Directly seed a pre-#1068 RUNNING `harvest_executions` row (bypassing the reuse
+/// matrix, which the public start path now enforces) for `(name, id)` on the file
+/// at `path`, plus its `WorkflowStarted` event so a driver can replay/run it, plus
+/// one orphan PENDING task and one unfired timer so cleanup is observable. Returns
+/// the minted `exec_id`. Used to reconstruct the "multiple RUNNING duplicates for
+/// one key" state a database written by the pre-#1068 always-fresh
+/// `start_workflow_with_id` could already hold.
+fn seed_legacy_running_row(path: &std::path::Path, name: &str, id: &str) -> ExecutionId {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    let exec = ExecutionId::new();
+    raw.execute(
+        "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state) \
+         VALUES (?1, ?2, ?3, '{}', 'RUNNING')",
+        rusqlite::params![exec.to_string(), name, id],
+    )
+    .unwrap();
+    // A WorkflowStarted event so drive_one_cycle can replay/run the handler.
+    let started = WorkflowEvent::workflow_started(json!({}), chrono::Utc::now());
+    raw.execute(
+        "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, 0, ?2)",
+        rusqlite::params![exec.to_string(), serde_json::to_string(&started).unwrap()],
+    )
+    .unwrap();
+    // An orphan PENDING task + an unfired timer, so the TerminateIfRunning cleanup
+    // (`delete_pending_tasks_for_execution` / `delete_unfired_timers_for_execution`)
+    // is observable per prior.
+    raw.execute(
+        "INSERT INTO harvest_tasks \
+         (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
+          scheduled_at, defaults_frozen) \
+         VALUES (?1, ?2, ?3, 'orphan', '{}', 'default', 'PENDING', 0, 0, 0, 0, 0)",
+        rusqlite::params![
+            format!("orphan-task-{exec}"),
+            exec.to_string(),
+            ActivityExecId::new().to_string(),
+        ],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+         VALUES ('legacy-park', ?1, 9_999_999_999_999, 0, 0)",
+        rusqlite::params![exec.to_string()],
+    )
+    .unwrap();
+    exec
+}
+
 /// True iff the execution's history contains a `WorkflowCancelled` event.
 fn has_cancelled_event(rt: &SqliteRuntime, exec: ExecutionId) -> bool {
     rt.load_history(exec)
@@ -369,6 +427,110 @@ async fn terminate_if_running_cleans_up_orphan_timer() {
         unfired_timer_count(&path, prior),
         0,
         "the sealed prior's unfired timer must be cleaned up"
+    );
+}
+
+// ── FINDING (Codex #1080 P2): TerminateIfRunning seals ALL legacy active rows ─────
+//
+// A database written by the PRE-#1068 always-fresh `start_workflow_with_id` can
+// already hold MULTIPLE `RUNNING` rows for one `(workflow_name, workflow_id)` key.
+// `TerminateIfRunning` must seal/cancel EVERY active row for the key (not just the
+// newest, which `find_active_execution_by_key`'s `ORDER BY rowid DESC LIMIT 1`
+// returns), so no orphaned RUNNING prior survives to be driven by `run_until_idle`,
+// defeating the terminate-and-restart guarantee for upgraded databases.
+
+/// Seed THREE legacy RUNNING duplicates for one key (each with a WorkflowStarted
+/// event, an orphan pending task, and an unfired timer), then run
+/// `TerminateIfRunning`: EVERY prior must be sealed `CONTINUED_AS_NEW` with a
+/// `WorkflowCancelled` event and its orphan task/timer released, exactly ONE
+/// `RUNNING` row (the fresh run) must remain, and `run_until_idle` must drive ONLY
+/// the fresh run — never re-driving the sealed priors.
+///
+/// RED against the pre-fix code: it seals only the NEWEST prior, leaving the two
+/// older RUNNING duplicates active — so their state stays `RUNNING` (not
+/// `CONTINUED_AS_NEW`) and `run_until_idle` drives them to `COMPLETED`.
+#[tokio::test]
+async fn terminate_if_running_seals_all_legacy_active_duplicates() {
+    let (_dir, path) = temp_db();
+    // Open the runtime first so the schema (and WAL) is applied to the file before
+    // the raw seeding connections write to it.
+    let mut rt = runtime_at(&path);
+
+    // Reconstruct a pre-#1068 database holding THREE RUNNING rows for one key. The
+    // public start path now dedups, so it cannot create duplicates — seed them
+    // directly. Insertion order == rowid order, so `execs[2]` is the newest (the
+    // only one the pre-fix single-row lookup would seal). `echo_wf` COMPLETES when
+    // driven, so a prior left RUNNING is observably driven to COMPLETED by
+    // `run_until_idle` (a sealed prior is not driven at all).
+    let key_id = "legacy-dup";
+    let execs: Vec<ExecutionId> = (0..3)
+        .map(|_| seed_legacy_running_row(&path, "echo_wf", key_id))
+        .collect();
+    for &e in &execs {
+        assert_eq!(raw_state(&path, e), "RUNNING");
+        assert_eq!(pending_task_count(&path, e), 1);
+        assert_eq!(unfired_timer_count(&path, e), 1);
+    }
+    assert_eq!(
+        active_rows_for_key(&path, "echo_wf", key_id),
+        3,
+        "three legacy active duplicates exist for the key"
+    );
+
+    let out = rt
+        .start_workflow_with_reuse_policy(
+            "echo_wf",
+            key_id,
+            json!({}),
+            WorkflowIdReusePolicy::TerminateIfRunning,
+        )
+        .unwrap();
+    assert!(out.created, "TerminateIfRunning starts fresh");
+    assert!(!execs.contains(&out.exec_id), "a NEW exec is created");
+
+    // EVERY legacy duplicate is sealed, cancelled, and its orphans cleaned up.
+    for &e in &execs {
+        assert_eq!(
+            raw_state(&path, e),
+            "CONTINUED_AS_NEW",
+            "every legacy RUNNING duplicate must be sealed (not just the newest)"
+        );
+        assert!(
+            has_cancelled_event(&rt, e),
+            "each formerly-RUNNING prior records a WorkflowCancelled event"
+        );
+        assert_eq!(
+            pending_task_count(&path, e),
+            0,
+            "each prior's pending task is released"
+        );
+        assert_eq!(
+            unfired_timer_count(&path, e),
+            0,
+            "each prior's unfired timer is released"
+        );
+    }
+    assert_eq!(
+        active_rows_for_key(&path, "echo_wf", key_id),
+        1,
+        "exactly one ACTIVE run (the fresh one) remains"
+    );
+
+    // `run_until_idle` drives ONLY the fresh run: the sealed priors are filtered out
+    // of the running set and never re-driven (pre-fix, the two older RUNNING
+    // duplicates would be driven to COMPLETED here).
+    rt.run_until_idle().await.unwrap();
+    for &e in &execs {
+        assert_eq!(
+            raw_state(&path, e),
+            "CONTINUED_AS_NEW",
+            "a sealed prior must never be driven by run_until_idle"
+        );
+    }
+    assert_eq!(
+        raw_state(&path, out.exec_id),
+        "COMPLETED",
+        "only the fresh run is driven (echo_wf completes)"
     );
 }
 
