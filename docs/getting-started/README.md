@@ -49,6 +49,11 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Standalone runner.** [`examples/standalone-runner/`](../../examples/standalone-runner/)
   shows the engine without `HarvestPlugin` — useful when embedding in a
   non-Autumn service.
+- **Embedded SQLite backend.** [`sqlite-backend.md`](../sqlite-backend.md) is a
+  task-oriented guide to `autumn-harvest-sqlite`, a single-writer, no-server
+  persistence backend for edge / local-first / single-server deployments (its
+  runnable examples live in
+  [`autumn-harvest-sqlite/examples/`](../../autumn-harvest-sqlite/examples/)).
 - **Runbooks.**
   [`audit-trail.md`](../runbooks/audit-trail.md),
   [`external-activity-handoffs.md`](../runbooks/external-activity-handoffs.md),
