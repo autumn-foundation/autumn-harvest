@@ -460,9 +460,9 @@ pub use wasm_activities::{
 #[cfg(feature = "wasm-activities")]
 pub use wasm_store::{
     MAX_WASM_MODULE_BYTES, PreparedWasmActivity, WasmActivityRegistration, WasmBinding,
-    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules,
-    publish_registered_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
-    resolve_active_wasm_module, resolve_wasm_dispatch,
+    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module,
+    resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_wasm_module,
 };
 
 #[cfg(feature = "db")]

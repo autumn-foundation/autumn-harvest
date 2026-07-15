@@ -264,6 +264,16 @@ meet the spike's bar, recommended for GA.
   not on the exact-match allowlist **without touching the process environment**.
   Evidence: `ungranted_env_get_import_is_sandbox_denied`,
   `env_get_denies_non_allowlisted_key_in_band`.
+  - **Guest-controlled `key_len` is bounded before validation (Finding 26).** The
+    host never allocates a `key_len`-sized buffer (round 1: it slices guest memory
+    directly), **and** it rejects any `key_len` longer than the longest allowlisted
+    key **before** reading or `from_utf8`-validating the slice — a longer key can
+    never exact-match, so it is an in-band miss. This bounds host-side UTF-8
+    validation (which is **not** charged to wasmtime fuel), so a loop of `env_get`
+    calls with a huge in-bounds `key_len` cannot burn host CPU to the wall-clock
+    deadline. Evidence: `env_get_with_huge_key_len_is_a_miss_without_allocating`
+    (out-of-range) and `env_get_with_huge_inbounds_key_len_is_capped_before_validation`
+    (~16 MiB in-bounds).
 - **Content-hash integrity.** `get_or_compile` verifies the claimed SHA-256 against
   the bytes **before** compilation, so corruption or a mismatched lookup is
   rejected rather than silently compiling the wrong code
@@ -365,17 +375,21 @@ invariant).**
   deterministically (no wall-clock race) by
   `in_flight_dispatch_is_pinned_across_a_mid_flight_republish`.
 - **Startup-seed (not publish).** `Worker::run` **seeds** every builder-registered
-  WASM module to its shard database before polling
-  (`seed_registered_wasm_modules`), so an embedder gets a working WASM activity by
-  calling `HarvestBuilder::wasm_activity(...)` alone — no separate publish step.
-  Seeding is *activate-only-if-absent*: it makes the embedded bytes available
-  (fetchable-by-hash, so in-flight pinned attempts and this worker can run them)
-  and activates them **only when no active version already exists** for the name.
-  This is deliberately **not** a blind publish: in a rolling deploy where the DB is
-  already hot-swapped to v2, a restarted older worker embedding v1 must not flip
-  the shard back to v1. Proven by `seed_activates_only_when_no_active_version_exists`
-  and `seed_does_not_clobber_an_existing_active_version`. (The always-activate
-  `publish_wasm_module` remains the operator hot-swap primitive.)
+  WASM module to its shard database before polling through the **single** startup
+  batch helper `seed_registered_wasm_modules` (Finding 25 — there is no separate
+  clobbering `publish_registered_wasm_modules`), so an embedder gets a working WASM
+  activity by calling `HarvestBuilder::wasm_activity(...)` alone — no separate
+  publish step. Seeding is *activate-only-if-absent*: it makes the embedded bytes
+  available (fetchable-by-hash, so in-flight pinned attempts and this worker can run
+  them) and activates them **only when no active version already exists** for the
+  name. This is deliberately **not** a blind publish: in a rolling deploy where the
+  DB is already hot-swapped to v2, a restarted older worker embedding v1 must not
+  flip the shard back to v1. Proven by
+  `seed_activates_only_when_no_active_version_exists`,
+  `seed_does_not_clobber_an_existing_active_version`, and — through the batch entry
+  point — `seed_registered_batch_helper_does_not_clobber_an_active_version`. (The
+  always-activate single-module `publish_wasm_module` remains the operator hot-swap
+  primitive.)
 - **Module-size cap.** `MAX_WASM_MODULE_BYTES` (32 MiB) is enforced **before** any
   hashing or DB work (`oversized_module_is_rejected_before_insert`).
 - **Fail-closed startup seed.** If a worker cannot seed its advertised WASM modules

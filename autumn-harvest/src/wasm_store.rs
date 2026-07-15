@@ -440,23 +440,6 @@ pub async fn publish_wasm_module(
     Ok(hash)
 }
 
-/// Publish a batch of `(activity_name, bytes)` module registrations, idempotently
-/// (issue #965). Used at worker startup to auto-publish builder-registered WASM
-/// activities to the worker's shard database.
-///
-/// # Errors
-///
-/// Returns the first publish failure (oversized blob or database error).
-pub async fn publish_registered_wasm_modules(
-    conn: &mut diesel_async::AsyncPgConnection,
-    registrations: &[(String, Vec<u8>)],
-) -> HarvestResult<()> {
-    for (name, bytes) in registrations {
-        publish_wasm_module(conn, name, bytes).await?;
-    }
-    Ok(())
-}
-
 /// Seed `bytes` as a WASM module version for `activity_name` at worker startup
 /// (issue #965).
 ///

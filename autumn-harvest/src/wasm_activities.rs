@@ -535,6 +535,13 @@ fn link_host_functions(
 
     if caps.allows_env() {
         let allowed = caps.allow_env.clone();
+        // SECURITY (issue #965 review, Finding 26): the longest allowlisted key
+        // is the tightest cap on `key_len` — a key longer than every allowlisted
+        // entry can never exact-match, so it is a guaranteed miss and we reject
+        // it BEFORE reading or UTF-8-validating the guest slice. `allows_env()`
+        // guarantees a non-empty allowlist here, so `max()` is `Some`; `0` is a
+        // defensive floor.
+        let max_allowed_key_len = allowed.iter().map(String::len).max().unwrap_or(0);
         linker
             .func_wrap(
                 "env",
@@ -553,6 +560,19 @@ fn link_host_functions(
                     else {
                         return -1;
                     };
+                    // SECURITY (issue #965 review, Finding 26): reject an
+                    // over-long key BEFORE slicing/`from_utf8`-ing the guest
+                    // bytes. `from_utf8` over a guest-controlled multi-MiB slice
+                    // is host CPU that is NOT charged to wasmtime fuel, so a loop
+                    // of `env_get` calls with a huge in-bounds `key_len` could
+                    // burn host CPU to the wall-clock deadline. A key longer than
+                    // any allowlisted entry can never match, so bail with the
+                    // in-band miss (-1) without touching the slice. Round 1 only
+                    // avoided the `vec![0u8; key_len]` allocation; this also
+                    // bounds the validation scan.
+                    if key_len > max_allowed_key_len {
+                        return -1;
+                    }
                     // SECURITY (issue #965): NEVER allocate a host buffer sized
                     // to the guest-controlled `key_len`. A malicious/buggy guest
                     // can pass a huge positive `key_len` (e.g. i32::MAX ~2 GiB);
@@ -1283,6 +1303,63 @@ mod tests {
             out,
             serde_json::json!(true),
             "an out-of-range key_len must be an in-band miss (-1)"
+        );
+    }
+
+    /// SECURITY regression (issue #965 review, Finding 26): a guest that calls
+    /// the granted `env_get` with a huge but fully **in-bounds** `key_len`
+    /// (~16 MiB, pointing at valid guest memory) must be rejected by the
+    /// longest-allowlisted-key cap BEFORE the host reads/`from_utf8`-validates
+    /// the slice. This is the case the round-1 no-alloc fix left open: the
+    /// `i32::MAX` sibling test is *out of range* (the slice read yields `None`),
+    /// so it never reached `from_utf8` even pre-fix; here the slice IS in range,
+    /// so pre-cap the host would `from_utf8`-scan the whole ~16 MiB (host CPU
+    /// uncharged to fuel — a `DoS` in a tight loop). Post-fix the length cap makes
+    /// it an in-band miss (-1) with no scan, no OOM, and no panic.
+    const ENV_HUGE_INBOUNDS_KEYLEN_WAT: &str = r#"
+        (module
+          (import "env" "env_get" (func $e (param i32 i32 i32 i32) (result i32)))
+          ;; 255 pages = 16,711,680 bytes, within the 16 MiB memory limit.
+          (memory (export "memory") 255)
+          (data (i32.const 200) "true")
+          (data (i32.const 300) "false")
+          (func (export "alloc") (param i32) (result i32) (i32.const 8192))
+          (func (export "run") (param i32 i32) (result i64)
+            (local $r i32)
+            ;; key_ptr = 0, key_len = 16,000,000: a huge, positive, fully
+            ;; IN-BOUNDS length (0 + 16,000,000 < 16,711,680).
+            (local.set $r
+              (call $e (i32.const 0) (i32.const 16000000) (i32.const 1000000) (i32.const 64)))
+            (if (result i64) (i32.eq (local.get $r) (i32.const -1))
+              (then (i64.or (i64.shl (i64.const 200) (i64.const 32)) (i64.const 4)))
+              (else (i64.or (i64.shl (i64.const 300) (i64.const 32)) (i64.const 5))))))
+    "#;
+
+    #[test]
+    fn env_get_with_huge_inbounds_key_len_is_capped_before_validation() {
+        let store = WasmModuleStore::new();
+        let module = compile(&store, ENV_HUGE_INBOUNDS_KEYLEN_WAT);
+        // "K" IS on the allowlist (longest allowlisted key = 1 byte), so env_get
+        // is linked. The 16 MB key_len far exceeds that cap, so the host bails
+        // with -1 BEFORE reading/from_utf8-ing the 16 MB in-bounds slice.
+        let caps = WasmCapabilities {
+            allow_env: vec!["K".to_string()],
+            ..Default::default()
+        };
+        let out = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &caps,
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect("guest must run promptly without a CPU-burning scan, OOM, or panic");
+        assert_eq!(
+            out,
+            serde_json::json!(true),
+            "a key longer than any allowlisted entry is an in-band miss (-1), \
+             rejected before the guest slice is ever scanned"
         );
     }
 

@@ -45,10 +45,14 @@ cheaply and serves a compiled module from the in-process content-addressed cache
 fetching bytes **only** on a cache miss. Hot swap is atomic and restart-free — a new
 publish flips the active row; the next attempt sees it while an already-resolved
 in-flight attempt keeps running its pinned compiled module
-(`in_flight_dispatch_is_pinned_across_a_mid_flight_republish`). **Startup-publish is
-wired into `Worker::run`** (`publish_registered_wasm_modules`), so an embedder gets
-a working WASM activity by calling `HarvestBuilder::wasm_activity(WasmActivityRegistration::new(...))`
-alone. `MAX_WASM_MODULE_BYTES` (32 MiB) is enforced before any hashing or DB work.
+(`in_flight_dispatch_is_pinned_across_a_mid_flight_republish`). **Startup-seed is
+wired into `Worker::run`** (`seed_registered_wasm_modules`, the single startup batch
+helper — SEED not-clobber semantics: activate-only-if-no-active-version, so a
+restarted older worker cannot flip a hot-swapped shard back to its embedded version),
+so an embedder gets a working WASM activity by calling
+`HarvestBuilder::wasm_activity(WasmActivityRegistration::new(...))` alone. The
+always-activate `publish_wasm_module` remains the operator hot-swap primitive.
+`MAX_WASM_MODULE_BYTES` (32 MiB) is enforced before any hashing or DB work.
 
 **Typed failures, no new event surface (AC6).** Every guest-controlled failure maps
 to a typed `ActivityFailure` recorded as an **ordinary `ActivityFailed`**: sandbox

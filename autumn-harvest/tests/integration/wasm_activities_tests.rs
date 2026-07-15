@@ -36,9 +36,9 @@ use autumn_harvest::wasm_activities::{
 };
 use autumn_harvest::wasm_store::{
     MAX_WASM_MODULE_BYTES, WasmActivityRegistration, WasmBinding, WasmDispatch,
-    fetch_wasm_module_bytes, list_wasm_modules, publish_registered_wasm_modules,
-    publish_wasm_module, resolve_active_wasm_hash, resolve_active_wasm_module,
-    resolve_wasm_dispatch, seed_registered_wasm_modules, seed_wasm_module,
+    fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
+    resolve_active_wasm_module, resolve_wasm_dispatch, seed_registered_wasm_modules,
+    seed_wasm_module,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
@@ -348,10 +348,13 @@ async fn oversized_module_is_rejected_before_insert() {
     assert_eq!(total_rows_all(&mut conn).await, 0);
 }
 
-// ── storage: startup-publish helper resolves ────────────────────────────────
+// ── storage: startup-seed batch helper resolves ─────────────────────────────
 
 #[tokio::test]
-async fn publish_registered_modules_are_resolvable() {
+async fn seed_registered_modules_are_resolvable() {
+    // The single startup batch helper: on an empty shard it activates each
+    // seeded module (activate-only-if-absent → absent → activate), and is
+    // idempotent across a worker restart re-run.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
@@ -360,13 +363,13 @@ async fn publish_registered_modules_are_resolvable() {
         ("echo".to_string(), echo_bytes()),
         ("beta".to_string(), echo_bytes_v2()),
     ];
-    publish_registered_wasm_modules(&mut conn, &regs)
+    seed_registered_wasm_modules(&mut conn, &regs)
         .await
-        .expect("batch publish");
+        .expect("batch seed");
     // idempotent re-run
-    publish_registered_wasm_modules(&mut conn, &regs)
+    seed_registered_wasm_modules(&mut conn, &regs)
         .await
-        .expect("batch publish again");
+        .expect("batch seed again");
 
     assert!(
         resolve_active_wasm_hash(&mut conn, "echo")
@@ -386,6 +389,58 @@ async fn publish_registered_modules_are_resolvable() {
     let listed = list_wasm_modules(&mut conn).await.expect("list");
     assert_eq!(listed.len(), 2);
     assert!(listed.iter().all(|r| r.active));
+}
+
+#[tokio::test]
+async fn seed_registered_batch_helper_does_not_clobber_an_active_version() {
+    // Finding 25 (issue #965 review): the ONE documented/exported startup batch
+    // helper (`seed_registered_wasm_modules`, wired into `Worker::run`) must use
+    // SEED (not-clobber) semantics — the same rolling-deploy hazard the single
+    // `seed_wasm_module` closes, but exercised through the batch entry point.
+    // The DB is already hot-swapped to v2; a restarted OLDER worker whose builder
+    // registered v1 seeds it at startup. v2 must STAY active (no flip-back to v1),
+    // and v1 must be present + fetchable-by-hash but NOT activated.
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let v1 = echo_bytes();
+    let v2 = echo_bytes_v2();
+    let h1 = WasmModuleStore::compute_hash(&v1);
+    let h2 = WasmModuleStore::compute_hash(&v2);
+
+    // DB is hot-swapped to v2 (an operator publish).
+    publish_wasm_module(&mut conn, "echo", &v2)
+        .await
+        .expect("publish v2");
+
+    // Old worker restarts; its builder-registered v1 flows through the batch
+    // startup helper.
+    let regs = vec![("echo".to_string(), v1.clone())];
+    seed_registered_wasm_modules(&mut conn, &regs)
+        .await
+        .expect("batch seed v1");
+
+    // v2 stays the ACTIVE version — the batch helper did NOT flip the shard back.
+    assert_eq!(
+        resolve_active_wasm_hash(&mut conn, "echo")
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some(h2.as_str()),
+        "the batch startup helper must not clobber the already-active v2"
+    );
+    assert_eq!(active_count(&mut conn, "echo").await, 1);
+    // v1 row is present + fetchable by hash, just inactive.
+    assert_eq!(
+        fetch_wasm_module_bytes(&mut conn, &h1)
+            .await
+            .expect("fetch v1")
+            .as_deref(),
+        Some(v1.as_slice()),
+        "the seeded v1 bytes are still fetchable by hash"
+    );
+    assert_eq!(total_rows(&mut conn, "echo").await, 2);
 }
 
 // ── resolve_wasm_dispatch: unavailable / invalid / invoke ───────────────────
