@@ -42,8 +42,11 @@
 //!   before its true deadline (a `duration = 1s` timer armed at `…000.900` fires
 //!   at `…001.900`, not the floored `…001.001`). On any pass, timers whose deadline
 //!   has passed fire. There is no virtual clock to persist or reset, so timers are
-//!   naturally monotonic across restarts. The public drivers use [`chrono::Utc::now`];
-//!   the `*_as_of` variants inject an as-of time for deterministic, sleep-free tests.
+//!   naturally monotonic across restarts. The public drivers read
+//!   [`chrono::Utc::now`] **once per decision cycle** (issue #1069 P2), so a timer
+//!   armed after a real-time activity anchors to its true arm instant rather than
+//!   the start of the driver call; the `*_as_of` variants inject a single as-of
+//!   time for deterministic, sleep-free tests.
 //!   Timers that share the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
 //!   ctx.timer("b", 1))`) fire in `(fire_at, arm_seq)` order, so their `TimerFired`
 //!   events land in `TimerStarted`-append order — the core matcher requires it to

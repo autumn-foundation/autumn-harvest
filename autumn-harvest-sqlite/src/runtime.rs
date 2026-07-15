@@ -112,7 +112,24 @@ pub struct SqliteRuntime {
     /// cleared on any non-panic outcome, so only *consecutive* panics count
     /// against [`WORKFLOW_PANIC_MAX_ATTEMPTS`].
     workflow_panic_strikes: HashMap<ExecutionId, u32>,
+    /// Wall-clock source for the public drivers (issue #1069 P2). Read **once per
+    /// decision cycle** inside [`run_until_blocked`](Self::run_until_blocked) /
+    /// [`poll_once`](Self::poll_once) so a timer armed in a later cycle (e.g. after
+    /// a real-time activity) anchors its absolute deadline to its true arm time,
+    /// not to the start of the outer call. Defaults to [`Utc::now`]; tests install
+    /// a controllable clock via [`set_clock`](Self::set_clock). The `_as_of`
+    /// drivers bypass it entirely (they take a caller-fixed timestamp — the
+    /// deterministic-simulation seam).
+    now_fn: NowFn,
 }
+
+/// A wall-clock source for the public drivers — see [`SqliteRuntime::set_clock`].
+///
+/// `Fn`-based (not a stored timestamp) precisely so it can be re-read on every
+/// decision cycle; `Arc` + `Send`/`Sync` keeps [`SqliteRuntime`] cheaply cloneable
+/// in bound and usable across the async drivers (the closure is invoked
+/// synchronously, never held across an `.await`).
+type NowFn = std::sync::Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 impl SqliteRuntime {
     /// Open (creating if absent) the `SQLite` database at `path`, applying the
@@ -171,7 +188,21 @@ impl SqliteRuntime {
             workflows: HashMap::new(),
             activities: HashMap::new(),
             workflow_panic_strikes: HashMap::new(),
+            now_fn: std::sync::Arc::new(Utc::now),
         })
+    }
+
+    /// Install a controllable wall-clock source for the public drivers
+    /// ([`run_until_blocked`](Self::run_until_blocked) /
+    /// [`poll_once`](Self::poll_once) / [`run_until_idle`](Self::run_until_idle)),
+    /// which read it **once per decision cycle**. A deterministic-test seam only —
+    /// production uses the [`Utc::now`] default. Prefer the `_as_of` drivers for a
+    /// caller-fixed single timestamp; use this to assert the *public* path re-reads
+    /// the clock per cycle (e.g. an advancing clock proving a post-activity timer
+    /// arms at its true, later instant).
+    #[doc(hidden)]
+    pub fn set_clock(&mut self, now_fn: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) {
+        self.now_fn = std::sync::Arc::new(now_fn);
     }
 
     /// Register a workflow handler (by name) from its macro-generated
@@ -350,7 +381,11 @@ impl SqliteRuntime {
     // ── Drivers ──────────────────────────────────────────────────────────────
 
     /// Drive `exec` to a terminal state or an external-input block, using the
-    /// real wall clock ([`Utc::now`]) to decide which timers are due.
+    /// real wall clock (re-read once **per decision cycle**) to decide which
+    /// timers are due. Refreshing per cycle — rather than capturing one timestamp
+    /// for the whole call — anchors a timer armed after a real-time activity to
+    /// its true arm instant, so a `timer(1s)` following a 2s activity waits ~1s
+    /// from when it was armed instead of firing immediately (issue #1069 P2).
     ///
     /// # Errors
     ///
@@ -358,7 +393,22 @@ impl SqliteRuntime {
     /// classified, [`SqliteError::Unsupported`] for an unsupported command, or a
     /// persistence error.
     pub async fn run_until_blocked(&mut self, exec: ExecutionId) -> SqliteResult<RunState> {
-        self.run_until_blocked_as_of(exec, Utc::now()).await
+        // Re-read the wall clock at the START of EACH cycle (issue #1069 P2), NOT
+        // once for the whole call: a cycle can consume real time (e.g. a 2s
+        // activity body runs before the next cycle arms a timer), and a stale,
+        // call-start `now` would anchor that later timer's absolute deadline to the
+        // start of the call — arming a `timer(1s)` after a 2s activity already
+        // overdue, so it fires immediately instead of ~1s after it was armed. The
+        // `_as_of` seam keeps a caller-fixed `now` for deterministic tests; only
+        // this public wall-clock wrapper refreshes.
+        for _ in 0..MAX_ITERATIONS {
+            let now = (self.now_fn)().timestamp_millis();
+            match self.drive_one_cycle(exec, now).await? {
+                RunState::InProgress => {}
+                terminal_or_blocked => return Ok(terminal_or_blocked),
+            }
+        }
+        Err(SqliteError::Stuck(exec))
     }
 
     /// Like [`run_until_blocked`](Self::run_until_blocked) but with an injected
@@ -401,14 +451,26 @@ impl SqliteRuntime {
         Err(SqliteError::Stuck(exec))
     }
 
-    /// Drive every non-terminal execution one cycle, using the real wall clock.
-    /// Returns `true` if any execution made durable progress this pass.
+    /// Drive every non-terminal execution one cycle, using the real wall clock
+    /// (re-read per driven cycle, issue #1069 P2). Returns `true` if any execution
+    /// made durable progress this pass.
     ///
     /// # Errors
     ///
     /// See [`run_until_blocked`](Self::run_until_blocked).
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
-        self.poll_once_as_of(Utc::now()).await
+        // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
+        // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
+        // caller `now` for deterministic simulation.
+        let mut progress = false;
+        for exec in store::running_executions(&self.conn)? {
+            let now = (self.now_fn)().timestamp_millis();
+            match self.drive_one_cycle(exec, now).await? {
+                RunState::WaitingSignal(_) | RunState::WaitingTimer => {}
+                _ => progress = true,
+            }
+        }
+        Ok(progress)
     }
 
     /// Like [`poll_once`](Self::poll_once) but with an injected "as-of" time. A
