@@ -142,6 +142,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
 schemars = { version = "0.8" }
+# Assemble `.wat` text into `.wasm` bytes in the `wasm-activities` integration
+# tests. Already a (feature-gated) dependency of the crate; a plain dev-dep here
+# so the integration test binaries can build guest modules regardless of feature
+# resolution.
+wat = "1"
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out

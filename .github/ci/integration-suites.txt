@@ -64,6 +64,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    nd_block
 linux        autumn-harvest         integration                      testing                    worker_session_tests
+linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
 linux        autumn-harvest-plugin  build_ramp_integration           -                          -

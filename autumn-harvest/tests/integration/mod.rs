@@ -123,6 +123,8 @@ mod transactional_activity_tests;
 mod typed_stubs_tests;
 mod typed_workflow_failure_tests;
 mod updt_with_start_tests;
+#[cfg(feature = "wasm-activities")]
+mod wasm_activities_tests;
 mod webhook_trigger_tests;
 mod worker_session_tests;
 #[cfg(feature = "db")]
