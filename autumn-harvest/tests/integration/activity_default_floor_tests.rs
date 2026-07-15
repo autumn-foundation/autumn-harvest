@@ -175,7 +175,7 @@ fn wf_slower_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_
     })
 }
 
-/// Workflow: schedule one regular activity WITH a call-site START_TO_CLOSE
+/// Workflow: schedule one regular activity WITH a call-site `start_to_close`
 /// override (5s), no retry override. Used to prove the call-site STC wins over
 /// the builder-default STC on the regular dispatch path.
 fn wf_one_activity_stc_override(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {

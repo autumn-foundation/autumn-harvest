@@ -1050,6 +1050,7 @@ async fn stack_pending_local_activity_surfaces_last_failure() {
                 activity_id,
                 name: "compute_checksum".to_string(),
                 input: json!({"blob": "abc"}),
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -1107,6 +1108,7 @@ async fn stack_exhausted_local_activity_is_not_pending() {
                 activity_id,
                 name: "compute_checksum".to_string(),
                 input: json!({"blob": "abc"}),
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -1163,6 +1165,7 @@ async fn stack_removed_local_activity_failure_is_not_decoded_or_audited() {
                 activity_id,
                 name: "compute_checksum".to_string(),
                 input: json!({"blob": "abc"}),
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
