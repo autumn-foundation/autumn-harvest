@@ -897,7 +897,7 @@ mod tests {
     }
 
     /// SECURITY regression (issue #965): a guest that calls the granted
-    /// `env_get` with an enormous positive `key_len` (i32::MAX ~2 GiB) must NOT
+    /// `env_get` with an enormous positive `key_len` (`i32::MAX` ~2 GiB) must NOT
     /// cause the host to allocate a `key_len`-sized buffer. Pre-fix the host did
     /// `vec![0u8; key_len]` before the memory bounds check, so this call would
     /// try to allocate ~2 GiB and could OOM the worker. Post-fix the host slices
