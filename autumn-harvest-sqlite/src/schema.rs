@@ -160,6 +160,17 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- unresolved and gets frozen on its next claim.
 );
 
+-- Non-unique index on `harvest_tasks(seq)` so `MAX(seq)` (the next-`seq` allocation
+-- read in `queue`, used on every enqueue and every zero-delay requeue-to-back) is
+-- satisfied from the index instead of a full-table scan (issue #1068, hardening item
+-- 3). The new zero-delay requeue-to-back (which reassigns a fresh `MAX(seq) + 1` on
+-- each immediate race retry) makes that read hotter, so the index keeps a busy retry
+-- loop cheap. `CREATE INDEX IF NOT EXISTS` is idempotent and non-unique — it runs on
+-- every open (including a pre-existing file) and never fails, so no separate additive
+-- migration is needed.
+CREATE INDEX IF NOT EXISTS idx_harvest_tasks_seq
+    ON harvest_tasks (seq);
+
 CREATE TABLE IF NOT EXISTS harvest_timers (
     timer_id TEXT NOT NULL,
     exec_id  TEXT NOT NULL,

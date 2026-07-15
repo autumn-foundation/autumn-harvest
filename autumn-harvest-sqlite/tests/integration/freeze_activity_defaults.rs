@@ -36,7 +36,7 @@ use std::time::Duration;
 use autumn_harvest::HarvestError;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
-use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
+use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
@@ -553,4 +553,141 @@ async fn stable_registration_unchanged() {
         "the stable path completes unchanged; got {done:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2, "body ran twice (fail, ok)");
+}
+
+// ── CLAIM-time (first-claim) freeze: the frozen cap governs across re-registration ─
+//
+// Every test above registers the activity BEFORE `start_workflow`, exercising ONLY
+// the SCHEDULE-time freeze branch in `apply_schedule_activity`. This test drives the
+// CLAIM-time freeze branch in `worker::drain_ready`: the activity is scheduled
+// BEFORE it is registered, so the task row is enqueued UNFROZEN (`defaults_frozen =
+// 0`) and is frozen only at the FIRST claim, once the activity is registered. A
+// later re-registration under a hostile cap must NOT change the already-frozen cap.
+
+#[activity(retry = RetryPolicy::fixed(3, Duration::from_secs(60)))]
+async fn late_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+// Raw dispatch BY NAME — the ScheduleActivity command carries NO retry_policy_override,
+// so the frozen cap comes from the registered spec at first claim, not the command.
+#[workflow]
+async fn late_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let out = ctx
+        .execute_activity_raw("late_act", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out.as_i64().unwrap_or_default())
+}
+
+/// The `defaults_frozen` flag of the single task row for `exec` (a raw-connection
+/// probe on the file DB — the direct claim-time-freeze precondition assertion).
+fn defaults_frozen_flag(path: &std::path::Path, exec: ExecutionId) -> i64 {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.query_row(
+        "SELECT defaults_frozen FROM harvest_tasks WHERE exec_id = ?1",
+        [exec.to_string()],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+// RED without the claim-time freeze: the row stays UNFROZEN and re-resolves
+// `max_attempts` from the CURRENT registry at every claim, so re-registering
+// "late_act" with `max_attempts = 1` between attempts 1 and 2 caps the in-flight run
+// at attempt 2 (2 body calls) instead of honoring spec A's frozen `max_attempts = 3`
+// (3 body calls, terminal at attempt 3).
+#[tokio::test]
+async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    // (a) register the WORKFLOW but NOT the activity.
+    rt.register_workflow(&late_wf_info());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let t0 = fixed_now();
+    let exec = rt.start_workflow("late_wf", json!(9)).unwrap();
+
+    // (b) Drive with `late_act` UNREGISTERED. The workflow emits ScheduleActivity, so
+    // the PENDING task row is persisted UNFROZEN; `drain_ready` then claims it, finds
+    // no registered body, releases it back to PENDING, and surfaces the unregistered
+    // error out of the drive loop.
+    let err = rt.run_until_blocked_as_of(exec, t0).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::UnregisteredActivity(ref n) if n == "late_act"),
+        "an unregistered activity surfaces UnregisteredActivity; got {err:?}"
+    );
+    // PRECONDITION for the claim-time freeze branch: the row was enqueued UNFROZEN, so
+    // the freeze must happen at the first CLAIM (not at schedule time).
+    assert_eq!(
+        defaults_frozen_flag(&path, exec),
+        0,
+        "the task must be enqueued UNFROZEN at schedule time (the activity was not yet \
+         registered), proving the freeze is exercised at the first CLAIM"
+    );
+
+    // (c) Register `late_act` under spec A: max_attempts = 3, fixed 60s backoff.
+    rt.register_activity(&late_act_info(), failing_body(&calls));
+
+    // (d) Drive → the FIRST claim FREEZES spec A (max_attempts = 3, fixed(3, 60s))
+    // onto the row; attempt 1 fails retryably and backs off 60s.
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingTimer),
+        "attempt 1 backs off under the just-frozen spec-A policy; got {state:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "attempt 1 ran once");
+    // The claim-time freeze branch has now run and persisted the resolved defaults.
+    assert_eq!(
+        defaults_frozen_flag(&path, exec),
+        1,
+        "the FIRST claim freezes the resolved defaults onto the row (claim-time freeze)"
+    );
+
+    // (e) RE-REGISTER `late_act` under a hostile spec B: max_attempts = 1, no policy.
+    // WITHOUT the claim-time freeze this would cap the already-scheduled task at 1
+    // attempt at its next claim.
+    rt.register_activity_raw("late_act", ActivitySpec::new(1, failing_body(&calls)));
+
+    // (f) Drive to completion across the frozen 60s backoffs. Under the FROZEN cap of
+    // 3, attempt 2 backs off AGAIN (not terminal at the re-registered cap of 1) and
+    // attempt 3 fails terminally.
+    let state = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert!(
+        matches!(state, RunState::WaitingTimer),
+        "attempt 2 must back off under the FROZEN cap of 3, not go terminal at the \
+         re-registered cap of 1; got {state:?} (RED without claim-time freeze: \
+         terminal here at attempt 2)"
+    );
+    let done = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(122))
+        .await
+        .unwrap();
+    assert!(
+        matches!(done, RunState::Failed(_)),
+        "the run fails terminally after exhausting the FROZEN 3 attempts; got {done:?}"
+    );
+
+    // The falsifiable discriminators — the genuine proof this exercised the CLAIM-time
+    // freeze of spec A rather than a re-resolution against the hostile spec B: 3 body
+    // calls and a terminal ActivityFailed at attempt 3. WITHOUT the claim-time freeze
+    // the still-unfrozen row would re-resolve `max_attempts` from the re-registered
+    // spec B (= 1) at its next claim and go terminal at attempt 2 (only 2 calls).
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the FROZEN max_attempts = 3 (from spec A at first claim) must govern despite \
+         the re-registration to 1 (RED without claim-time freeze: only 2 calls)"
+    );
+    match only_activity_failed(&rt, exec) {
+        WorkflowEvent::ActivityFailed { attempt, .. } => assert_eq!(
+            attempt, 3,
+            "terminal at the frozen attempt cap of 3 (RED without claim-time freeze: \
+             attempt 2, the re-registered cap of 1)"
+        ),
+        other => panic!("expected ActivityFailed, got {other:?}"),
+    }
 }

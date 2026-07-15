@@ -179,6 +179,13 @@ pub fn find_active_execution_by_key(
 /// active set so the `(workflow_name, workflow_id)` slot is freed for the fresh
 /// run. `sealed_state` is `CONTINUED_AS_NEW` (mirroring core's `replace_execution`,
 /// which seals to `CONTINUED_AS_NEW`).
+///
+/// Sealing a *terminal* prior (e.g. a `COMPLETED` run replaced by
+/// `TerminateIfRunning`) moves it into a SEALED state that `erase::is_terminal_state`
+/// treats as terminal, so the prior's `exec_id` is no longer resumable via
+/// [`run_until_blocked`](crate::SqliteRuntime::run_until_blocked) (it short-circuits
+/// to a non-resumable terminal outcome) — consistent with core's `replace_execution`,
+/// which likewise seals the superseded run out of the active/resumable set.
 pub fn seal_execution(
     conn: &Connection,
     exec_id: ExecutionId,
