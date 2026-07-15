@@ -141,6 +141,11 @@ pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
 /// candidate floor), so pushing `deferred_at` into the future never hides an
 /// expired row from its drop — `expires_at` is left untouched, so a gated row
 /// still times out at its original deadline.
+// Gated to match its sole user (the db-only throttle scanner path,
+// `redefer_throttle_row`/`fire_claimed_throttle_row`): without this the const is
+// dead code under narrow feature sets (e.g. the CLI Lint job, which compiles
+// `autumn-harvest` without `db`), surfaced by clippy 1.97 `-D warnings`.
+#[cfg(feature = "db")]
 const GATE_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Maximum allowed byte length for a resolved throttle key.

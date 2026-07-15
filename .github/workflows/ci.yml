@@ -197,6 +197,13 @@ jobs:
       # guard that keeps the manifest honest. Per-step `if:` gating is preserved
       # exactly (NOT hoisted to a job-level `if:` — see the note on the `test`
       # job above); `shell: bash` resolves to Git Bash on Windows.
+      - name: Free runner disk before heavy plugin link (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
       - name: Compile plugin integration test suites (manifest, all OSes)
         if: needs.changes.outputs.code == 'true'
         shell: bash
