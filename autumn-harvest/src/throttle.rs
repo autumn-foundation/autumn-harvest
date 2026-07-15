@@ -820,16 +820,19 @@ async fn delete_throttle_row(
 /// Returns:
 /// - `Ok(Some(FiredThrottle))` when a run was started (caller spawns deferred
 ///   trigger-starts + records metrics after commit);
-/// - `Ok(None)` when the row was dropped without starting — either it timed out
-///   past its `schedule_to_start` deadline (issue #607 AC-c), the bucket had no
-///   token yet (left for a later tick — **not** deleted), or the start was a
-///   no-op under a reuse policy (deleted, token refunded).
+/// - `Ok(None)` when the row was dropped or held without starting — either it
+///   timed out past its `schedule_to_start` deadline (issue #607 AC-c), the
+///   bucket had no token yet (left for a later tick — **not** deleted), the
+///   start was a no-op under a reuse policy (deleted, token refunded), or the
+///   admission gate was closed on the workflow's real queue at fire time
+///   (left for a later tick — **not** deleted — token refunded; issue #1053).
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 async fn fire_claimed_throttle_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
     now: DateTime<Utc>,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<Option<FiredThrottle>> {
     // AC-c: a start deferred past its schedule_to_start deadline times out
     // rather than running stale.
@@ -955,8 +958,19 @@ async fn fire_claimed_throttle_row(
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
     // so follow-ups are collected and spawned only after commit.
+    // `Some(GateMode::CheckCached)` (issue #1053): honor the admission gate on
+    // this workflow's real queue at fire time — the throttle deferred-start
+    // `202` promise is "will run when tokens allow AND the gate is open at fire
+    // time", not merely "will run when tokens allow". `_collect` applies the
+    // gate iff the start will CREATE and records `harvest.admission.blocked` on
+    // the passed recorder when it blocks.
     match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None, None,
+        conn,
+        params,
+        true,
+        false,
+        Some(metrics),
+        Some(crate::admission_gate::GateMode::CheckCached),
     )
     .await
     {
@@ -997,6 +1011,30 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
+        // issue #1053: the admission gate is closed on this workflow's real
+        // queue at fire time. Halt-beats-pace — RE-DEFER: LEAVE the row (do NOT
+        // delete) so a later tick fires it once the gate opens, and refund the
+        // token reserved at the top (nothing was admitted). The block was
+        // already counted by `_collect` (`record_start_gate_block`). This
+        // deliberately DIFFERS from the completion-trigger cross-shard outbox
+        // relay (also `GatedAtRelay`), which DROPS its outbox row on block: a
+        // completion trigger has already fired its source-terminal decision, so
+        // a permanently-gated relay must not accumulate forever; a throttled
+        // start is a pending admission whose `202` promise is "nothing lost", so
+        // it is held (not dropped) until the gate opens or `expires_at` passes.
+        Err(crate::error::HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            crate::queue::refund_rate_limit_token(conn, &bucket).await?;
+            tracing::info!(
+                workflow_name = %workflow_name,
+                throttle_key = %throttle_key,
+                workflow_id = %workflow_id,
+                gate_id = %gate_id,
+                reason = %reason,
+                "throttled start blocked by an admission gate at fire time; \
+                 re-deferred (row left, token refunded)",
+            );
+            Ok(None)
+        }
         Err(e) => Err(e),
     }
 }
@@ -1005,6 +1043,7 @@ async fn fire_claimed_throttle_row(
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<Vec<FiredThrottle>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -1121,7 +1160,7 @@ async fn fire_due_on_conn(
 
                 let mut results = Vec::with_capacity(due_rows.len());
                 for row in due_rows {
-                    if let Some(item) = fire_claimed_throttle_row(conn, row, now).await? {
+                    if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics).await? {
                         results.push(item);
                     }
                 }
@@ -1191,9 +1230,16 @@ pub async fn fire_due_throttled_starts(
             if is_scheduled_run {
                 metrics.record_schedule_run("workflow", &workflow_name);
             }
-            // issue #618, F1: the throttle scanner relays a start already
-            // admitted through the gate at HTTP time; count the deferred fire as
-            // an exempt bypass so it never slips a gate silently. See
+            // issue #1053: `spawn_fired` only ever iterates the `fired` list —
+            // rows that genuinely started (the gate was OPEN at fire time, the
+            // relay proceeded). A fire BLOCKED by the admission gate returns
+            // `Ok(None)` from `fire_claimed_throttle_row` (row re-deferred,
+            // token refunded) and is therefore NOT in `fired`, so it counts a
+            // `harvest.admission.blocked` (recorded by `_collect`) and NEVER a
+            // bypass here — block-vs-bypass can never double-count for one fire.
+            // The Throttle producer is now `GatedAtRelay` (was `GatedAtAdmission`
+            // per #618-F1): a genuinely-fired start counts an exempt bypass so an
+            // open-gate relay never slips a gate silently. See
             // `admission_gate::producer_contract`.
             metrics
                 .record_admission_bypassed(crate::admission_gate::StartProducer::Throttle.as_str());
@@ -1218,12 +1264,12 @@ pub async fn fire_due_throttled_starts(
                         continue;
                     }
                 };
-                let fired = fire_due_on_conn(&mut shard_conn).await?;
+                let fired = fire_due_on_conn(&mut shard_conn, metrics).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         _ => {
-            let fired = fire_due_on_conn(conn).await?;
+            let fired = fire_due_on_conn(conn, metrics).await?;
             fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }

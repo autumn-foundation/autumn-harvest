@@ -11,8 +11,8 @@ admissions — it deliberately does not halt in-flight continuation (see
 
 The contract is discoverable at runtime: `GET /admin/gates` returns a
 `producers` block (in addition to the active `gates`) enumerating each producer
-and whether it is **gated**, **gated-at-admission**, or **exempt-by-design**
-with a one-line rationale.
+and whether it is **gated**, **gated-at-admission**, **gated-at-relay**, or
+**exempt-by-design** with a one-line rationale.
 
 ## Contract
 
@@ -24,16 +24,16 @@ with a one-line rationale.
 | `webhook_delegate` | gated | Inbound webhooks (issue #344) delegate to the gated HTTP start / signal-with-start route. |
 | `scheduler` | gated | Each due schedule slot checks the gate before firing. |
 | `debounce` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
-| `throttle` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
+| `throttle` | gated-at-relay | Gated **authoritatively at fire time** (issue #1053): the scanner re-checks the gate on the workflow's real queue immediately before firing a deferred start; a matching gate blocks + counts `harvest.admission.blocked` and **re-defers** the row (nothing dropped — it fires once the gate opens or its `schedule_to_start` deadline passes); no gate → fires + counts `harvest.admission.bypassed`. |
 | `event_batch` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
 | `completion_trigger_outbox` | gated-at-relay | Cross-shard completion-trigger relay, gated authoritatively at relay time on the target shard's real queue: a matching gate blocks + drops the row + counts `harvest.admission.blocked`; when no gate matches the relay starts + counts `harvest.admission.bypassed`. |
 | `outbox` | exempt-by-design | Relays workflow-start requests durably committed before the gate was raised. |
 
 ### `gated-at-admission` (deferred-fire producers)
 
-`debounce`, `throttle`, and `event_batch` defer a start to a background scanner.
-They are **gated at HTTP admission** — a start whose scope is gated is refused at
-the `POST /workflows/{name}/start` (or batch) request and never deferred. Once a
+`debounce` and `event_batch` defer a start to a background scanner. They are
+**gated at HTTP admission** — a start whose scope is gated is refused at the
+`POST /workflows/{name}/start` (or batch) request and never deferred. Once a
 start *is* admitted (no gate at admission time) and durably deferred, the later
 scanner fire relays that already-accepted work even if a gate was raised in the
 meantime, and counts it on `harvest.admission.bypassed{producer=…}`. So the gate
@@ -41,9 +41,38 @@ still stops *new* admissions immediately; only starts already accepted before th
 gate was raised drain past it, and every one is observable.
 
 There is a bounded TOCTOU window between the in-memory gate pre-check and the
-deferred-row upsert (shared by all deferred-fire producers). A start that slips
+deferred-row upsert (shared by these deferred-fire producers). A start that slips
 that window is durably deferred and its scanner fire is counted as a bypass, so
 it never produces an **un-counted** admission.
+
+### `gated-at-relay` (throttle — fire-time gate, re-defer)
+
+Since issue #1053 `throttle` is **gated authoritatively at fire time**, not at
+HTTP admission. The HTTP admission check is only a best-effort fast path; the
+throttle scanner (`fire_claimed_throttle_row`) re-checks the gate on the
+workflow's **real** queue via `check_cached` immediately before firing each
+deferred start — the same authoritative relay-time mechanism the
+completion-trigger cross-shard outbox uses. This is the correct halt-beats-pace
+semantics: an operator arming a gate mid-incident now stops throttled deferred
+starts too, closing the last deferred-fire leak (the pre-existing looseness where
+a start deferred *before* a gate was armed would otherwise fire gate-exempt once
+tokens refill).
+
+- **A gate matches the real queue → BLOCK + RE-DEFER:** the scanner counts
+  `harvest.admission.blocked` and **leaves** the `harvest_start_throttle` row
+  (refunding the token it reserved) so the held start fires the instant the gate
+  opens (or is dropped only if its `schedule_to_start` deadline passes first).
+  **Nothing is lost** — the throttle deferred-start `202` promise becomes "will
+  run when tokens allow **and** the gate is open at fire time".
+- **No gate matches → fire + count the bypass** on
+  `harvest.admission.bypassed{producer="throttle"}`.
+
+This shares the `check_cached` relay-time mechanism with the completion-trigger
+outbox but **differs in disposition**: the completion-trigger outbox **drops** its
+row on block (its source terminal decision has already fired, so a permanently
+gated relay must not accumulate); the throttle scanner **re-defers** its row
+(nothing lost). Block-vs-bypass never double-counts: a blocked fire returns
+without starting, so it is never in the "fired" set that counts a bypass.
 
 ### Fail-closed handling (completion triggers)
 

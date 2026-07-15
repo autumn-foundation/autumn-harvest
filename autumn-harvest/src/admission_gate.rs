@@ -611,15 +611,22 @@ pub enum ProducerGateStatus {
     /// relayed start increments [`crate::telemetry::METRIC_ADMISSION_BYPASSED`]
     /// so the exemption is observable.
     ExemptByDesign,
-    /// **Gated authoritatively at relay time** on the target shard, where the
-    /// real target queue is always known. The cross-shard completion-trigger
-    /// relay re-checks the gate on the resolved queue immediately before starting
-    /// (`check_cached`): a matching gate blocks + drops the outbox row +
-    /// increments [`crate::telemetry::METRIC_ADMISSION_BLOCKED`]; when no gate
-    /// matches the relay starts and increments
-    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] (relay of pre-committed
-    /// in-flight-continuation work). The source-side inline check is only a
-    /// best-effort fast path — the relay-time check is authoritative.
+    /// **Gated authoritatively at relay/fire time** on the target shard, where
+    /// the real target queue is always known. The producer re-checks the gate on
+    /// the resolved queue immediately before starting a deferred/relayed start
+    /// (`check_cached`): a matching gate blocks + increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BLOCKED`], and the producer then
+    /// disposes of the blocked start **per its own contract** — the
+    /// completion-trigger cross-shard outbox **drops** the row (its source
+    /// terminal decision has already fired, so a permanently-gated relay must not
+    /// accumulate), while the throttle scanner **re-defers** the row (its `202`
+    /// promise is "nothing lost", so the held start fires once the gate opens or
+    /// its `schedule_to_start` deadline passes; issue #1053). When no gate matches
+    /// the relay/fire starts and increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] (relay of pre-committed /
+    /// already-accepted work). The source-side/HTTP inline check is only a
+    /// best-effort fast path — the relay/fire-time check is authoritative
+    /// (halt-beats-pace). See each producer's `rationale` for its disposition.
     GatedAtRelay,
 }
 
@@ -687,10 +694,18 @@ pub fn producer_contract() -> Vec<ProducerContractEntry> {
         },
         ProducerContractEntry {
             producer: StartProducer::Throttle.as_str(),
-            status: GatedAtAdmission,
-            rationale: "Gated at HTTP admission; the deferred scanner fire relays a \
-                        start already admitted through the gate and is exempt-with-\
-                        bypass-counter (harvest.admission.bypassed{producer=\"throttle\"}).",
+            status: GatedAtRelay,
+            rationale: "Gated AUTHORITATIVELY at fire time (issue #1053). The throttle \
+                        scanner re-checks the gate on the workflow's real queue immediately \
+                        before firing a deferred start (check_cached): a matching gate BLOCKS \
+                        + counts harvest.admission.blocked and RE-DEFERS the row (nothing \
+                        dropped — the held start fires once the gate opens or its \
+                        schedule_to_start deadline passes); when no gate matches the start \
+                        fires and counts harvest.admission.bypassed{producer=\"throttle\"}. \
+                        Unlike the completion-trigger outbox relay (also GatedAtRelay, which \
+                        DROPS on block), the throttle contract is \"nothing lost\". The HTTP \
+                        admission pre-check is only a best-effort fast path — the fire-time \
+                        check is authoritative (halt-beats-pace).",
         },
         ProducerContractEntry {
             producer: StartProducer::EventBatch.as_str(),
@@ -1378,9 +1393,12 @@ mod tests {
             .find(|e| e.producer == "completion_trigger")
             .expect("completion_trigger entry");
         assert_eq!(ct.status, ProducerGateStatus::Gated);
-        // Deferred-fire producers are split: gated at HTTP admission, scanner fire
-        // exempt-with-bypass-counter (issue #618, F2).
-        for split in ["debounce", "throttle", "event_batch"] {
+        // Deferred-fire producers gated at HTTP admission, scanner fire
+        // exempt-with-bypass-counter (issue #618, F2). Throttle is NO LONGER in
+        // this set — it flipped to GatedAtRelay (fire-time gate, re-defer) in
+        // issue #1053; debounce + event_batch remain GatedAtAdmission (#1053
+        // scopes only throttle).
+        for split in ["debounce", "event_batch"] {
             let e = contract
                 .iter()
                 .find(|e| e.producer == split)
@@ -1400,6 +1418,14 @@ mod tests {
             .expect("completion_trigger_outbox entry");
         assert_eq!(cto.status, ProducerGateStatus::GatedAtRelay);
         assert!(!cto.rationale.is_empty());
+        // Throttle is gated authoritatively at fire time (issue #1053): a closed
+        // gate blocks the deferred fire and RE-DEFERS the row (nothing dropped).
+        let throttle = contract
+            .iter()
+            .find(|e| e.producer == "throttle")
+            .expect("throttle entry");
+        assert_eq!(throttle.status, ProducerGateStatus::GatedAtRelay);
+        assert!(!throttle.rationale.is_empty());
     }
 
     #[test]
