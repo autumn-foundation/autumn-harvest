@@ -156,8 +156,8 @@ on the shipped Postgres path).
   `other_activity`-named imported schedule vs. the handler's `work` diverges →
   recoverable ND, no `WorkflowFailed`, no bookkeeping, re-drive re-detects; fails
   pre-fix, which sealed FAILED).
-- **A 19-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (19/19 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+- **A 20-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (20/20 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays
@@ -211,7 +211,16 @@ on the shipped Postgres path).
   DB write while a representable sealed import still succeeds afterward
   (`scenario_import_sealed_unrepresentable_terminal_is_rejected`; fails pre-fix —
   the unrepresentable seal falls through to the in-flight branch and is seeded
-  `RUNNING`).
+  `RUNNING`) — **plus one round-9 regression test (Codex P2, AC4 fidelity)**: the
+  SQLite runtime now threads the stored `workflow_name` into the full executor
+  entry point (`run_workflow_with_state_history_policy_and_caps`) instead of the
+  thin `run_workflow_with_state` (which hardcoded an empty name), so
+  `ctx.info().workflow_type` / `ctx.workflow_type()` observe the real registered
+  handler name and stay **cross-backend-consistent** with the engine's own
+  `WorkflowReplayer` (which threads `workflow_name` from the history snapshot)
+  (`scenario_ctx_info_workflow_type_is_cross_backend_faithful`; fails pre-fix —
+  the SQLite backend observed `""` and recorded `""` into the activity input, so a
+  PG-shaped import would diverge against the engine's recomputed real name).
 
 **Honest fidelity caveat (disclosed in report §5.3):** the prototype records
 *retryable* activity failures in an audit table + the task-row `attempt`

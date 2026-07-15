@@ -67,7 +67,7 @@ use serde_json::Value;
 
 use crate::context::{WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow_with_state};
+use crate::executor::{WorkflowOutcome, run_workflow_with_state_history_policy_and_caps};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::ExecutionId;
 
@@ -563,22 +563,52 @@ impl SqliteRuntime {
             .get(&workflow_name)
             .ok_or_else(|| SpikeError::UnknownWorkflow(workflow_name.clone()))?;
 
-        // The reused, backend-neutral determinism core. `run_workflow_with_state`
-        // (unlike the bare `run_workflow`) surfaces the terminal cycle's PENDING
-        // bookkeeping commands — the `RecordSideEffect`/`RecordMarker` a workflow
-        // emits when it records a deterministic value (`ctx.new_uuid()`/
-        // `system_now()`/`random_*`/`side_effect()`) and then returns WITHOUT
-        // suspending. `run_workflow` drops that vector, so those events never reach
-        // history and a replay re-mints / diverges before the terminal seal (Codex
-        // P2). We persist them BEFORE the terminal event, in the same transaction,
-        // mirroring the engine's `worker::persist_terminal_outcome_commands`.
-        let (outcome, pending, _span) = run_workflow_with_state(
+        // The reused, backend-neutral determinism core. We call the FULL executor
+        // entry point (`run_workflow_with_state_history_policy_and_caps`) rather
+        // than the thin `run_workflow_with_state` for ONE reason beyond surfacing
+        // pending commands: it accepts an explicit `workflow_name: &str` that it
+        // threads into the reconstructed `WorkflowContext` via
+        // `.with_workflow_name(...)`. The thin wrapper hardcodes `""` there, which
+        // left `ctx.workflow_type()` / `ctx.info().workflow_type` EMPTY under the
+        // SQLite runtime (Codex P2, AC4 cross-backend fidelity) — a workflow using
+        // the replay-safe `ctx.info().workflow_type` in an activity input /
+        // idempotency key / branch would record `""` here while the engine's own
+        // `WorkflowReplayer` (which threads `workflow_name` from the history
+        // snapshot) recomputes the real handler name, diverging a cross-backend
+        // import. Passing the stored `workflow_name` makes the two backends agree.
+        //
+        // The entry point also (unlike the bare `run_workflow`) surfaces the
+        // terminal cycle's PENDING bookkeeping commands — the `RecordSideEffect`/
+        // `RecordMarker` a workflow emits when it records a deterministic value
+        // (`ctx.new_uuid()`/`system_now()`/`random_*`/`side_effect()`) and then
+        // returns WITHOUT suspending. `run_workflow` drops that vector, so those
+        // events never reach history and a replay re-mints / diverges before the
+        // terminal seal (Codex P2). We persist them BEFORE the terminal event, in
+        // the same transaction, mirroring `worker::persist_terminal_outcome_commands`.
+        //
+        // All remaining arguments are the engine defaults (mirroring
+        // `run_workflow_with_state_and_history_policy`): default history policy, no
+        // span meta, no declarative query/update handlers, the default payload
+        // caps, no context headers, no payload offloading, and a no-op metrics
+        // recorder — none of which the throwaway spike exercises.
+        let (outcome, pending, _span) = run_workflow_with_state_history_policy_and_caps(
             exec,
             history.clone(),
             handler,
             input,
             empty_shared_state(),
+            crate::context::WorkflowHistoryPolicy::default(),
             None,
+            &[],
+            &[],
+            &workflow_name,
+            crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            std::collections::HashMap::new(),
+            None,
+            std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         )
         .await;
 

@@ -119,6 +119,25 @@ async fn timeout_then_timer(ctx: &WorkflowContext, n: i64) -> Result<String, Str
     Ok("recovered".to_string())
 }
 
+/// Reads its OWN workflow type via the replay-safe `ctx.info()` and both returns
+/// it AND feeds it as the activity input, so the recorded `ActivityScheduled.input`
+/// captures the observed workflow-type name in the durable history. Used by the
+/// AC4 cross-backend fidelity regression (`ctx.info().workflow_type` must be the
+/// REAL registered handler name under the `SQLite` runtime, not `""`, and must match
+/// what the engine's own `WorkflowReplayer` threads from the history snapshot).
+#[workflow]
+async fn echo_workflow_type(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    let wt = ctx.info().workflow_type;
+    // Embed the observed type in the recorded activity input, so a wrong (empty)
+    // value under the SQLite backend would DIVERGE against the engine's replay
+    // (which recomputes the real name) — a cross-backend consistency assertion.
+    let echoed = ctx
+        .execute_activity_raw("echo", json!(wt), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(echoed.as_str().ok_or("bad echo output")?.to_string())
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, String) {
@@ -1611,5 +1630,85 @@ async fn scenario_nondeterministic_import_is_recoverable_not_sealed() {
         matches!(err2, SpikeError::NonDeterministic { .. }),
         "a held (non-sealed) execution re-detects the divergence on re-drive, \
          proving it was left recoverable: {err2:?}"
+    );
+}
+
+// ── AC4: `ctx.info().workflow_type` is faithful under the SQLite runtime ──────
+//
+// Regression for a Codex P2: `drive_one_cycle` reconstructed the `WorkflowContext`
+// via the executor's thin `run_workflow_with_state`, which hardcodes an EMPTY
+// `workflow_name`. A workflow reading the replay-safe `ctx.info().workflow_type`
+// (an idempotency key, an activity input, a branch) therefore observed `""` under
+// the SQLite backend — and a PG-shaped import diverges, because the engine's own
+// worker/`WorkflowReplayer` thread the real handler name from the execution row /
+// history snapshot. The fix threads the stored `workflow_name` into the executor
+// so both backends observe the same name. This test asserts BOTH halves:
+//
+//   (a) the SQLite runtime observes the REAL registered name (not `""`), and
+//   (b) the resulting history replays cleanly on the engine's `WorkflowReplayer`,
+//       which threads `workflow_name` from the snapshot — a mismatch (the pre-fix
+//       `""` recorded into `ActivityScheduled.input`) would DIVERGE against the
+//       engine's recomputed real-name input.
+#[tokio::test]
+async fn scenario_ctx_info_workflow_type_is_cross_backend_faithful() {
+    use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
+
+    let (_dir, path) = temp_db();
+
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&echo_workflow_type_info());
+    // The activity echoes its input straight back, so the workflow's output IS the
+    // workflow-type name the context observed.
+    rt.register_activity(
+        "echo",
+        ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
+    );
+
+    let exec = rt.start_workflow("echo_workflow_type", json!(0)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    // (a) The SQLite runtime observed the REAL registered handler name, not `""`.
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("echo_workflow_type")),
+        "ctx.info().workflow_type must be the real registered name under the SQLite \
+         runtime, not empty; state = {state:?}"
+    );
+
+    // The recorded activity input captured the same faithful name.
+    let events = rt.load_history(exec).unwrap();
+    let recorded_input = events.iter().find_map(|e| match e {
+        WorkflowEvent::ActivityScheduled { input, .. } => Some(input.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        recorded_input,
+        Some(json!("echo_workflow_type")),
+        "the observed workflow_type frozen into ActivityScheduled.input must be the \
+         real name (pre-fix bug recorded \"\"): {events:?}"
+    );
+
+    // (b) The SQLite-written history replays cleanly on the engine's own path,
+    //     which threads `workflow_name` from the snapshot. Pre-fix, the recorded
+    //     `""` input would diverge against the engine's recomputed real-name input.
+    let snapshot = HistorySnapshot {
+        workflow_name: "echo_workflow_type".to_string(),
+        execution_id: exec,
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+    };
+    let jsn = serde_json::to_string(&snapshot).unwrap();
+    let report = WorkflowReplayer::new()
+        .register_fn("echo_workflow_type", echo_workflow_type_info().handler)
+        .replay_from_json(&jsn)
+        .await
+        .expect("snapshot must parse");
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the SQLite history's recorded workflow_type must match the engine's \
+         replay-recomputed value (cross-backend fidelity):\n{report}"
     );
 }
