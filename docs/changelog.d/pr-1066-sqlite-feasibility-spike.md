@@ -123,7 +123,14 @@ on the shipped Postgres path).
   bookkeeping, timer-id reuse) are documented in report §5.1/§5.2 as *evidence for*
   the go/no-go: they are exactly the deep coordination/matcher-coupling surface that
   motivates the "separate companion crate reusing the core, not a trivial port"
-  recommendation.
+  recommendation. **Two further prototype edges surfaced by a later review round —
+  activity-body panic containment (`worker.rs:156`) and timer-vs-activity
+  drain-order replay divergence (`worker.rs:108`) — are likewise documented in
+  report §5.1 and deliberately declined (not fixed) per the spike's timebox: both
+  are inherent to the minimal single-process prototype, are unexercised by the four
+  required scenarios, do not touch the default Postgres build, and are handled
+  natively by the productized engine (issue #782 panic containment; command-order
+  persistence + interleave-tolerant `HistoryMatcher`).**
 - **An 18-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
   (18/18 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay

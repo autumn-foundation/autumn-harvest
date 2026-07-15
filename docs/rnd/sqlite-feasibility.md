@@ -447,6 +447,44 @@ trivial port** (§9, option ii) — the right shape: the core (which already han
 all three) is reused unchanged, and only the persistence layer, where these edges
 live, is rebuilt.
 
+**Two further prototype edges surfaced by a later review round are documented and
+deliberately declined (not fixed) per this spike's timebox** — each is inherent to
+the minimal single-process prototype, is unexercised by the four required scenarios
+(§5.2), does not touch the default Postgres build (AC4), and is handled natively by
+the productized engine. Like the three above, they are further evidence *for* the
+recommendation, not against it: the coupling they expose lives entirely in the
+from-scratch persistence/worker layer, exactly the layer a companion crate rebuilds
+while reusing the core unchanged.
+
+- **Activity-body panic containment (`worker.rs:156`).** If a registered activity
+  body **panics** (rather than returning `Err`), the panic unwinds past
+  `drain_ready`'s `Err` branch *after* the task was committed `RUNNING`, so
+  `mark_pending` is never called and the task stays wedged `RUNNING` — later claims
+  select only `PENDING` rows, so it is never reclaimed in-process. The real harvest
+  engine **contains** handler panics at the dispatch boundary (issue #782, via
+  `catch_unwind` on both construction and poll) and converts them to the ordinary
+  retryable-failure path, so the worker process survives and the task leaves
+  `RUNNING` within a poll interval. The minimal single-process spike deliberately
+  reproduces only the clean `Err` path; it has no other worker and so no
+  heartbeat-timeout / poison-pill reclaimer to recover a panicked-and-wedged task,
+  the same single-process residual as the hard-crash window above.
+- **Timer-vs-activity drain-order replay divergence (`worker.rs:108`).** The
+  prototype fires due timers only **after** the activity-drain loop, so a single
+  suspension batch that records `TimerStarted` before `ActivityScheduled` can
+  persist as `TimerStarted → ActivityScheduled → ActivityCompleted → TimerFired`
+  when the activity completes before the timer fires. On replay
+  `match_timer_strict` stops at the unconsumed `ActivityScheduled` before it reaches
+  `TimerFired`, `apply_commands` skips re-arming (the `TimerStarted` is already in
+  history), and the run wedges at `SpikeError::Stuck`. The real engine persists in
+  **command order** and its `HistoryMatcher` **tolerates interleaved sibling
+  events** (activities, timers, signals, markers compete at their recorded history
+  positions), so the same history replays cleanly. None of the spike's four
+  required scenarios mix a timer and an activity in one suspension batch, so this
+  is a **latent divergence unexercised by the tested scenarios** — the spike's
+  "faithful replay" claim holds for the four tested scenarios plus cross-backend
+  replay, and this untested edge shape is a documented limitation, not a regression
+  in what was proven.
+
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
