@@ -65,6 +65,20 @@ pub const DEFAULT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 /// Default CPU fuel budget for a single guest invocation.
 pub const DEFAULT_FUEL: u64 = 100_000_000;
 
+/// Maximum number of elements in any single guest table (issue #965 review).
+///
+/// The store limiter caps linear-memory bytes, but a `funcref`/`externref` table
+/// is host-side storage *outside* that byte ceiling — an untrusted module could
+/// otherwise declare or `table.grow` a huge table and consume host memory beyond
+/// the 16 MiB sandbox. This bounds any single table's element count; combined
+/// with `trap_on_grow_failure`, an over-limit declared or grown table traps
+/// (classified as a retryable `ResourceExhausted`) rather than allocating.
+pub const WASM_MAX_TABLE_ELEMENTS: usize = 100_000;
+
+/// Maximum number of table instances a single guest may create
+/// (issue #965 review).
+pub const WASM_MAX_TABLES: usize = 16;
+
 /// Default hard wall-clock ceiling for a single guest invocation: 5 minutes.
 ///
 /// This is the *mandatory* upper bound — even a caller that passes no
@@ -583,18 +597,10 @@ pub fn invoke_wasm_activity_cancellable(
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
-    cancel: Option<CancellationToken>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_wasm_activity_inner(
-            store,
-            module,
-            input,
-            caps,
-            limits,
-            deadline,
-            cancel.as_ref(),
-        )
+        invoke_wasm_activity_inner(store, module, input, caps, limits, deadline, cancel)
     }));
     match result {
         Ok(inner) => inner,
@@ -627,6 +633,10 @@ fn invoke_wasm_activity_inner(
     let host = HostState {
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
+            // Bound table resources too, not just linear memory: a table lives in
+            // host storage outside the byte ceiling (issue #965 review).
+            .table_elements(WASM_MAX_TABLE_ELEMENTS)
+            .tables(WASM_MAX_TABLES)
             .trap_on_grow_failure(true)
             .build(),
         rng: seed,
@@ -1249,6 +1259,71 @@ mod tests {
     }
 
     #[test]
+    fn huge_table_declaration_is_bounded_resource_exhausted() {
+        // A module that DECLARES a funcref table far larger than
+        // WASM_MAX_TABLE_ELEMENTS must be bounded at instantiation (the store's
+        // table limiter denies it) — a table is host storage OUTSIDE the linear-
+        // memory byte ceiling, so an unbounded one would let a guest consume host
+        // memory past its 16 MiB sandbox. It fails as a retryable
+        // ResourceExhausted (composing with the Finding-3 instantiate
+        // reclassification — a table-limit failure is NOT a SandboxDenied), with
+        // no host OOM or panic.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (table 200000 funcref)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32 i32) (result i64) (i64.const 0)))
+        "#;
+        let module = compile(&store, wat);
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect_err("an over-cap table declaration must be bounded");
+        assert_eq!(
+            err.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED,
+            "an over-cap declared table is retryable ResourceExhausted, not SandboxDenied"
+        );
+        assert!(!err.non_retryable);
+    }
+
+    #[test]
+    fn table_grow_past_cap_is_bounded_resource_exhausted() {
+        // A module that `table.grow`s a funcref table past WASM_MAX_TABLE_ELEMENTS
+        // must trap (trap_on_grow_failure) rather than silently returning -1 and
+        // allocating host memory. Mirrors `memory_limit_is_resource_exhausted` for
+        // tables.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (table 1 funcref)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32 i32) (result i64)
+                (drop (table.grow 0 (ref.null func) (i32.const 200000)))
+                (i64.const 0)))
+        "#;
+        let module = compile(&store, wat);
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect_err("an over-cap table.grow must be bounded");
+        assert_eq!(err.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED);
+        assert!(!err.non_retryable);
+    }
+
+    #[test]
     fn wall_clock_deadline_is_resource_exhausted() {
         let store = WasmModuleStore::new();
         let module = compile(&store, INFINITE_LOOP_WAT);
@@ -1586,7 +1661,7 @@ mod tests {
                     max_wall_clock: Duration::from_secs(30),
                 },
                 None,
-                Some(cancel),
+                Some(&cancel),
             )
             .expect_err("a cancelled guest must be interrupted");
             let elapsed = start.elapsed();
@@ -1617,7 +1692,7 @@ mod tests {
             &WasmCapabilities::default(),
             &fast_limits(DEFAULT_FUEL),
             None,
-            Some(cancel),
+            Some(&cancel),
         )
         .expect("an uncancelled guest completes normally");
         assert_eq!(out, input);
@@ -1655,7 +1730,7 @@ mod tests {
         // Compile CAP distinct modules; hashes[0] is the least-recently-used.
         let mut versions = Vec::new();
         for i in 0..CAP {
-            let bytes = wat::parse_str(&unique_echo_guest(i)).expect("assemble");
+            let bytes = wat::parse_str(unique_echo_guest(i)).expect("assemble");
             let hash = WasmModuleStore::compute_hash(&bytes);
             store.get_or_compile(&hash, &bytes).expect("compile");
             versions.push((hash, bytes));
@@ -1672,7 +1747,7 @@ mod tests {
         }
 
         // Compiling one more distinct module must evict, not grow the cache.
-        let extra = wat::parse_str(&unique_echo_guest(CAP)).expect("assemble");
+        let extra = wat::parse_str(unique_echo_guest(CAP)).expect("assemble");
         let extra_hash = WasmModuleStore::compute_hash(&extra);
         store.get_or_compile(&extra_hash, &extra).expect("compile");
         assert_eq!(

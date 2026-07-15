@@ -235,7 +235,7 @@ impl PreparedWasmActivity {
             &self.caps,
             &self.limits,
             self.deadline,
-            self.cancel.clone(),
+            self.cancel.as_ref(),
         )
     }
 }

@@ -117,51 +117,60 @@ free-form payloads (the common webhook/ETL case) needn't define a schema.
 
 ---
 
-## 4. Heartbeat / cancellation delivery into the guest — **partial in the spike**
+## 4. Heartbeat / cancellation delivery into the guest — **cancellation lands; heartbeat remains the gap**
 
-This is the most honest gap. The spike delivers **timeouts** into the guest but
-**not** cooperative heartbeat/cancellation.
+The spike delivers **timeouts** and **cancellation** into the guest, but **not**
+cooperative heartbeat.
 
 What the spike does:
 
 - **`start_to_close` → epoch wall-clock deadline.** The worker passes the
   activity's effective deadline; `invoke_wasm_activity` clamps it by the mandatory
-  `limits.max_wall_clock` ceiling and sets `Store::set_epoch_deadline`. A guest
-  that overruns is interrupted and the attempt fails as a retryable
-  `ResourceExhausted("wall-clock deadline exceeded")`.
+  `limits.max_wall_clock` ceiling. A guest that overruns is interrupted and the
+  attempt fails as a retryable `ResourceExhausted("wall-clock deadline exceeded")`.
 - **Fuel → CPU bound.** A runaway-CPU guest exhausts fuel and fails as a retryable
   `ResourceExhausted("cpu fuel exhausted")`.
+- **Cooperative cancellation via a per-invocation epoch-deadline callback.** The
+  worker threads the task's `CancellationToken` into the invocation. Rather than
+  arming a one-shot deadline, the store installs an `epoch_deadline_callback` that
+  fires roughly every `EPOCH_TICK_INTERVAL` (1 ms) while the guest runs: each tick
+  it polls the token and decrements the remaining wall-clock budget, trapping the
+  guest at the next safe point when **either** the token fires **or** the ceiling
+  is reached. So a cancelled WASM guest is interrupted within ~1 tick and returns
+  a retryable `ResourceExhausted("wasm activity cancelled before completion")` —
+  it no longer holds a blocking-pool thread until its wall-clock ceiling. The
+  callback is per-`Store`, so one invocation's cancellation never affects
+  another's, and the ceiling remains the hard backstop for a guest that could
+  ignore a cooperative signal (there is no way for core-WASM guest code to "ignore"
+  an epoch trap, so the interrupt is unconditional). Exercised by
+  `cancellation_interrupts_a_long_running_guest_promptly`.
 - **Per-invocation deadline isolation via a single global epoch ticker.** One
   named background thread (`harvest-wasm-epoch`) advances the engine's epoch every
-  `EPOCH_TICK_INTERVAL` (1 ms) for the store's whole lifetime. Each store expresses
-  its own deadline as a number of ticks beyond the current epoch
-  (`set_epoch_deadline(deadline_ticks(effective))`), so N concurrent invocations
-  each get an **independent** wall-clock deadline driven by the **same** monotonic
-  clock — one guest's expiry never trips another's. This is a single-global-ticker
-  model (the ticker only ever calls `increment_epoch()`; it never reads or bumps
-  per-invocation state), and it is exercised directly by
+  `EPOCH_TICK_INTERVAL` for the store's whole lifetime. Each store drives its own
+  countdown from its own callback, so N concurrent invocations each get an
+  **independent** wall-clock deadline (and independent cancellation) off the
+  **same** monotonic clock — one guest's expiry never trips another's. Exercised by
   `concurrent_deadlines_are_independent`.
 
 What it does **not** do — and the honest limitation:
 
-- There is **no** `harvest_heartbeat` host import and **no** cooperative
-  cancel-check import, so a guest cannot report progress mid-run, and an operator
-  cancel/heartbeat-timeout cannot interrupt a guest **before** its wall-clock
-  ceiling. The guest runs to completion on the calling thread (the worker invokes
-  `PreparedWasmActivity::invoke` inside `spawn_blocking`), and **it cannot be torn
-  down before `limits.max_wall_clock`** — which is exactly why that ceiling is
-  *mandatory* (defaulting to 300 s) rather than optional. A "cancelled" WASM
-  activity keeps consuming a blocking-pool thread until its deadline fires.
+- There is **no** `harvest_heartbeat` host import, so a guest cannot report
+  progress mid-run, and there is no *cooperative* cancel-check import the guest can
+  poll to unwind its own resources gracefully before the epoch trap fires. The
+  guest still runs on the calling thread (the worker invokes
+  `PreparedWasmActivity::invoke` inside `spawn_blocking`); it is now interrupted
+  promptly on cancellation, but it is interrupted by a *trap*, not by returning
+  from `run` — so a guest that needs to run cleanup (flush, release an external
+  handle) on cancellation cannot yet do so.
 
-What a full implementation needs:
+What a full implementation still needs:
 
 - A `harvest_heartbeat(ptr, len)` host import the guest calls periodically,
   wired to the existing activity heartbeat channel, so progress and
   liveness flow through the same path as native activities.
 - A cooperative cancel-check host import (or a host-set flag the guest polls) so a
-  well-behaved guest can observe a cancel request and return early — the epoch
-  deadline stays as the hard backstop for a guest that ignores the cooperative
-  signal.
+  well-behaved guest can observe a cancel request and return early with cleanup —
+  the epoch-trap interrupt stays as the hard backstop for a guest that ignores it.
 
 The component model (§2) is the right vehicle for both, as typed WIT imports.
 
@@ -258,20 +267,40 @@ invariant).**
   (`concurrent_publishes_leave_exactly_one_active_row`). The publish is one
   transaction: deactivate every active row for the name, then upsert the requested
   `(hash, name)` as active.
-- **Fetch-and-cache-by-hash, resolve-hash-first.** The dispatch seam
-  (`resolve_wasm_dispatch`) cheaply resolves the active **hash** (selecting only the
-  hash column), then serves a compiled module from the in-process cache **without
-  ever fetching bytes on a cache hit**. Only a cache miss loads the bytes and
-  compiles. This is the module-granularity analogue of build-routing (#171).
+- **Fetch-and-cache-by-hash, resolve-hash-first, compile-off-the-async-path.**
+  The dispatch seam (`resolve_wasm_dispatch`) cheaply resolves the active **hash**
+  (selecting only the hash column), then serves a compiled module from the
+  in-process cache **without ever fetching bytes on a cache hit**. Only a cache
+  miss loads the bytes — and even then the CPU-bound wasmtime **compile is
+  deferred** to `PreparedWasmActivity::invoke`, which the worker runs on the
+  blocking pool, so wasmtime compilation of a large module never stalls an async
+  worker thread (and its polling / heartbeats / cancellation handling). The async
+  resolve only ever does the hash resolve, the cache probe, and (on a miss) the
+  byte fetch. This is the module-granularity analogue of build-routing (#171).
+- **Bounded compiled-module cache.** The in-process cache is an LRU capped at
+  `WASM_MODULE_CACHE_CAP` (64) versions, so repeated operator hot-swaps do not
+  accumulate compiled code for every historical version until worker restart (old
+  versions stay fetchable in Postgres, so an evicted hash simply recompiles on the
+  next miss). Evicting a cached `Arc<Module>` is safe while an in-flight invocation
+  still holds a clone — the invocation keeps its module alive. Proven by
+  `compiled_module_cache_is_bounded_and_evicts_lru`.
 - **Atomic hot-swap without worker restart.** Publishing a new version flips the
   active row; the **next** attempt resolves the new hash while an **already-resolved
   in-flight attempt keeps running its pinned compiled module** — proven
   deterministically (no wall-clock race) by
   `in_flight_dispatch_is_pinned_across_a_mid_flight_republish`.
-- **Startup-publish is wired.** `Worker::run` publishes every builder-registered
+- **Startup-seed (not publish).** `Worker::run` **seeds** every builder-registered
   WASM module to its shard database before polling
-  (`publish_registered_wasm_modules`), so an embedder gets a working WASM activity
-  by calling `HarvestBuilder::wasm_activity(...)` alone — no separate publish step.
+  (`seed_registered_wasm_modules`), so an embedder gets a working WASM activity by
+  calling `HarvestBuilder::wasm_activity(...)` alone — no separate publish step.
+  Seeding is *activate-only-if-absent*: it makes the embedded bytes available
+  (fetchable-by-hash, so in-flight pinned attempts and this worker can run them)
+  and activates them **only when no active version already exists** for the name.
+  This is deliberately **not** a blind publish: in a rolling deploy where the DB is
+  already hot-swapped to v2, a restarted older worker embedding v1 must not flip
+  the shard back to v1. Proven by `seed_activates_only_when_no_active_version_exists`
+  and `seed_does_not_clobber_an_existing_active_version`. (The always-activate
+  `publish_wasm_module` remains the operator hot-swap primitive.)
 - **Module-size cap.** `MAX_WASM_MODULE_BYTES` (32 MiB) is enforced **before** any
   hashing or DB work (`oversized_module_is_rejected_before_insert`).
 
@@ -296,12 +325,23 @@ as an ordinary `ActivityFailed`, honouring the activity's retry policy:
 
 | condition | `error_type` | retryable? |
 |-----------|--------------|-----------|
-| ungranted capability / unsatisfied import | `SandboxDenied` | no |
-| fuel / wall-clock / memory-growth overrun | `ResourceExhausted` | yes |
-| guest trap, ABI violation, non-JSON output, contained host-glue panic | `WasmTrap` | yes |
+| ungranted capability / unsatisfied import (a genuine link failure) | `SandboxDenied` | no |
+| fuel / wall-clock / memory-growth overrun, **or a fuel/epoch/memory failure in the module start section** | `ResourceExhausted` | yes |
+| guest trap (incl. **a trap in the module start section**), ABI violation, non-JSON output, contained host-glue panic | `WasmTrap` | yes |
+| cooperative cancellation (token fired mid-run) | `ResourceExhausted` | yes |
 | no active module published | `WasmModuleUnavailable` | no |
-| bytes fail integrity/compile | `WasmModuleInvalid` | no |
+| bytes fail integrity/compile (surfaces from `invoke`, since compile is deferred to the blocking pool) | `WasmModuleInvalid` | no |
 | DB error resolving hash / fetching bytes | `WasmModuleLookupFailed` | yes |
+
+A subtlety the classification is careful about (issue #965 review): wasmtime runs
+a module's **start section** during `instantiate`, so an `instantiate` failure is
+**not** unconditionally a capability denial. A fuel/epoch/memory/trap failure in
+the start section is classified as the matching retryable `ResourceExhausted` /
+`WasmTrap`, exactly like `alloc`/`run`; `SandboxDenied` is reserved for a genuine
+unsatisfied-import link failure. Proven by
+`start_section_trap_is_retryable_wasm_trap_not_sandbox_denied`,
+`start_section_fuel_exhaustion_is_retryable_resource_exhausted`, and the
+regression `ungranted_import_is_still_sandbox_denied_regression`.
 
 A panic in the host glue is caught (`catch_unwind`) and mapped to `WasmTrap`, so a
 guest can **never crash the worker process** and a runaway module **never trips the
@@ -324,9 +364,12 @@ unchanged task queue, and every failure mode surfacing as an ordinary
 The dispatch overhead bar is met with ~24× headroom. The three things standing
 between the spike and GA are, in priority order:
 
-1. **Cooperative heartbeat + cancellation host imports** (§4) — the biggest
-   functional gap; without them a "cancelled" WASM activity holds a blocking thread
-   until its wall-clock ceiling.
+1. **Cooperative heartbeat + graceful-cancel host imports** (§4) — the remaining
+   functional gap. Cancellation now *interrupts* a running guest promptly (via the
+   epoch-deadline callback), so a cancelled WASM activity no longer holds a
+   blocking thread until its ceiling; what is still missing is a `harvest_heartbeat`
+   import for mid-run progress and a *cooperative* cancel-check the guest can poll
+   to run cleanup before the trap fires.
 2. **Component-model + WIT ABI** (§2/§3) — typed, versioned guest contracts and a
    real per-language bindings story, replacing the JSON-over-`i64`-packing
    convention.
@@ -357,10 +400,16 @@ real SDK (the issue scopes SDK ergonomics beyond one demo language as follow-up)
 
 ## 10. Known limitations (spike)
 
-- **Mandatory 300 s wall-clock ceiling + `spawn_blocking` uncancellability.** A
-  guest runs to completion on a blocking-pool thread and cannot be torn down before
-  `limits.max_wall_clock` (default 300 s); there is no pre-ceiling cooperative
-  interrupt (§4).
+- **Mandatory 300 s wall-clock ceiling (as the hard backstop).** A guest runs on a
+  blocking-pool thread; the mandatory `limits.max_wall_clock` (default 300 s) is the
+  hard termination guarantee for a guest that neither completes, exhausts fuel, nor
+  is cancelled. Cancellation itself is now delivered promptly (within ~1 epoch tick)
+  via the epoch-deadline callback (§4), so it no longer takes the ceiling to reclaim
+  a cancelled guest — but the interrupt is a *trap*, so a guest still cannot run its
+  own cleanup on cancel, and there is no mid-run heartbeat import.
+- **No mid-run heartbeat / graceful cancel.** There is no `harvest_heartbeat` host
+  import for progress reporting, and no cooperative cancel-check the guest can poll
+  to unwind gracefully before the epoch trap (§4).
 - **Local WASM activities are out of scope.** `ActivityInfo::wasm` builds a normal
   (non-local) registered activity dispatched through the worker's task-queue WASM
   seam; a `local = true` WASM activity (inline on the workflow task) is not
@@ -379,21 +428,32 @@ real SDK (the issue scopes SDK ergonomics beyond one demo language as follow-up)
 
 Recounted precisely (do not extrapolate):
 
-- **`src/wasm_activities.rs`** (runtime unit tests): **24** `#[test]` fns —
+- **`src/wasm_activities.rs`** (runtime unit tests): **34** `#[test]` fns —
   `deadline_ticks` rounding/clamping/saturation, hash/cache, echo round-trip, the
   three sandbox-deny categories (fs/net/env), the three capability grant paths
-  (clock/random/env) + in-band env denial, fuel/memory/wall-clock/mandatory-ceiling
-  resource exhaustion, the concurrent-deadline-isolation test, and the containment
-  suite (unreachable-trap / OOB-output / missing-export / non-JSON-output /
-  deny-all-default / limits-default).
+  (clock/random/env) + in-band env denial + the huge-`key_len` and value-length
+  `env_get` cases, fuel/memory/wall-clock/mandatory-ceiling resource exhaustion,
+  the concurrent-deadline-isolation test, and the containment suite (unreachable-
+  trap / OOB-output / missing-export / non-JSON-output / deny-all-default /
+  limits-default). Plus the round-2 review additions: **start-section
+  retryability** (`start_section_trap_is_retryable_wasm_trap_not_sandbox_denied`,
+  `start_section_fuel_exhaustion_is_retryable_resource_exhausted`,
+  `ungranted_import_is_still_sandbox_denied_regression`), **cooperative
+  cancellation** (`cancellation_interrupts_a_long_running_guest_promptly`,
+  `an_uncancelled_token_does_not_interrupt_a_normal_guest`), the **LRU-bounded
+  cache** (`compiled_module_cache_is_bounded_and_evicts_lru`), and **table resource
+  bounding** (`huge_table_declaration_is_bounded_resource_exhausted`,
+  `table_grow_past_cap_is_bounded_resource_exhausted`).
 - **`src/wasm_store.rs`** (storage unit tests): **4** `#[test]` fns — registration
   defaults, fluent setters, binding projection, module-size-cap constant.
 - **`tests/integration/wasm_activities_tests.rs`** (DB + worker-seam integration):
-  **17** tests — **16 run in CI** via the `linux  autumn-harvest  integration
+  **20** tests — **19 run in CI** via the `linux  autumn-harvest  integration
   wasm-activities  wasm_activities_tests` manifest row (storage round-trips,
   hot-swap + single-active + composite-PK independence, the concurrent-publish
-  race, oversized-module reject, startup-publish, `resolve_wasm_dispatch`
-  unavailable/invalid/invoke, the worker-e2e echo, the sandbox-denial terminal, the
+  race, oversized-module reject, startup-seed, `resolve_wasm_dispatch`
+  unavailable/invoke, the **deferred-compile-on-miss** and
+  **invalid-surfaces-at-invoke** cases, the two **startup-seed activate-only-if-
+  absent** cases, the worker-e2e echo, the sandbox-denial terminal, the
   in-flight-pin, the fuel-retry, and the **1-native + 1-WASM success-metric e2e**),
   plus **1 `#[ignore]`d** dispatch-overhead microbenchmark (`--ignored`, not a CI
   gate).
@@ -483,7 +543,7 @@ encumbered by BUSL-1.1.
 |---|-------------|------------------------------------------|-------------------|--------------|
 | 1 | **Deny-by-default sandbox** | Fresh empty `Linker::new(engine)`; an ungranted import is unsatisfied → instantiate error → non-retryable `SandboxDenied`. No WASI, no ambient FS/net/env. | Empty `Imports` (formerly `ImportObject`); an unsatisfied import fails instantiation with a `LinkError`. Headless/no-WASI by simply not adding WASI imports. | **Parity.** Deny-by-default is standard core-WASM linking; both make an ungranted import fail at instantiation. |
 | 2 | **Per-invocation CPU/fuel metering** | `Config::consume_fuel(true)` + `Store::set_fuel(...)` per call; deterministic, per-`Store`, resettable; bounds a pure-compute loop. | `wasmer-middlewares` **Metering** (points/gas): `get_remaining_points`/`set_remaining_points`, `MeteringPoints`. Per-run budget, resettable per invocation via `set_remaining_points`. | **Near-parity with a caveat.** Metering is **applied at module compile time** (instrumentation baked into the compiled artifact), so the cost function is fixed per *cached* module — you reset the *counter* per invocation, but you cannot change the cost model without recompiling. Interacts with the content-hash compiled-module cache: the metering config becomes part of what the cached artifact encodes. |
-| 3 | **Memory limits** | `StoreLimitsBuilder::new().memory_size(...).trap_on_grow_failure(true)` + `Store::limiter`; over-ceiling `memory.grow` becomes a classifiable trap. | `Tunables` / `BaseTunables` memory bounds; exceeding the limit raises a `MemoryError` at the failing `memory.grow`. | **Parity, different surface.** Both cap linear-memory growth; wasmer surfaces a `MemoryError` rather than a `StoreLimits` trap, so the error-classification glue (`classify_wasmtime_err`, §8) would be rewritten (and the §8 "memory-growth is a string match" caveat changes shape). |
+| 3 | **Memory limits** | `StoreLimitsBuilder::new().memory_size(...).trap_on_grow_failure(true)` + `Store::limiter`; over-ceiling `memory.grow` becomes a classifiable trap. | `Tunables` / `BaseTunables` memory bounds; exceeding the limit raises a `MemoryError` at the failing `memory.grow`. | **Parity, different surface.** Both cap linear-memory growth; wasmer surfaces a `MemoryError` rather than a `StoreLimits` trap, so the error-classification glue (`classify_wasmtime_err_phase`, §8) would be rewritten (and the §8 "memory-growth is a string match" caveat changes shape). |
 | 4 | **Wall-clock deadline with true per-invocation isolation** | `Config::epoch_interruption(true)` + `Store::set_epoch_deadline(...)` off a single global `increment_epoch()` ticker; traps a spinning/host-blocked guest at a safe point; per-`Store` independent deadlines. | **No built-in equivalent.** No epoch-style interrupt; CPU is bounded only by Metering *points*, which do not fire for a guest that spins on host-blocked work or otherwise executes few counted operators. The maintainer-documented path is an external watchdog thread and/or points-as-a-CPU-proxy. | **NO CLEAN WASMER EQUIVALENT — the deciding gap.** Our *mandatory* 300 s hard-termination ceiling (§4/§10) cannot be reproduced cleanly: an external watchdog cannot interrupt a running wasmer instance at a safe point the way epoch interruption does. This is a *weaker security guarantee*, not just a different API. |
 | 5 | **Content-hash hot-swap** | `Module::new(engine, bytes)`, cache by SHA-256, swap active module for the next attempt; Cranelift native-speed cached modules. | `Module::new` + serialize/deserialize; cache by hash identically. Singlepass compiles much faster than Cranelift. | **Parity (runtime-agnostic).** The swap logic lives in our storage layer, not the runtime. Singlepass's fast compile is neutralized by our compile-once cache (compile is one-time per hash) and is BUSL-1.1 (requirement 8). |
 | 6 | **MSRV 1.88 compat** | wasmtime supports the latest three stable Rust releases (~3 months); the feature is `wasm-activities`-gated so the default `cargo check --workspace` (MSRV 1.88.0 job) never compiles the runtime. | wasmer tracks recent stable Rust (exact current MSRV *unverified*). | **No blocker either way.** The runtime is feature-gated out of the MSRV job, so neither runtime's own MSRV constrains the default build. Adopting either only matters for a consumer who enables the feature. |
@@ -502,7 +562,7 @@ and `info.rs` are runtime-agnostic (they dispatch through the seam and use our o
   surface: `Config`/`Engine`/`Store`/`Linker`/`Module`/`Caller`/`Extern`/`Trap`,
   `consume_fuel`+`set_fuel`, `epoch_interruption`+`set_epoch_deadline`+
   `increment_epoch`, `StoreLimits`/`StoreLimitsBuilder`, and
-  `classify_wasmtime_err`.
+  `classify_wasmtime_err_phase`.
 - **`src/wasm_store.rs`** — only the cached-module type (`wasmtime::Module`). Trivial.
 
 Per-mechanism rewrite cost:
@@ -510,9 +570,9 @@ Per-mechanism rewrite cost:
 | Mechanism | Port difficulty | Notes |
 |-----------|-----------------|-------|
 | `Engine`/`Config`, deny-all `Linker` → `Imports`, `Module` cache | **Low** (mechanical) | 1:1 API shape. |
-| `StoreLimits` memory ceiling → `Tunables`/`BaseTunables` | **Moderate** | New error surface (`MemoryError`); rewrites part of `classify_wasmtime_err`. |
+| `StoreLimits` memory ceiling → `Tunables`/`BaseTunables` | **Moderate** | New error surface (`MemoryError`); rewrites part of `classify_wasmtime_err_phase`. |
 | Fuel → Metering middleware | **Moderate** | Compile-time instrumentation → must be baked into the *cached* artifact; per-invocation reset via `set_remaining_points`; cost function fixed per module hash. |
-| Error classification (`classify_wasmtime_err`) | **Moderate** | Rewrite against wasmer error/trap types; the §8 memory-growth string-match caveat changes. |
+| Error classification (`classify_wasmtime_err_phase`) | **Moderate** | Rewrite against wasmer error/trap types; the §8 memory-growth string-match caveat changes. |
 | **Epoch wall-clock deadline → ???** | **High — a redesign, not a port** | No drop-in. Requires an external watchdog thread plus a cooperative points-check, or running each guest on a dedicated killable OS thread — a change to the execution model that **degrades** the hard-termination guarantee the spike depends on. This one item is why "switch" is expensive *and* risky. |
 
 ### Why not "offer both behind the flag"
