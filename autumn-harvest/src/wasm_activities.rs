@@ -386,17 +386,35 @@ fn link_host_functions(
                     else {
                         return -1;
                     };
-                    let mut key_buf = vec![0u8; key_len];
-                    if memory.read(&caller, key_ptr, &mut key_buf).is_err() {
-                        return -1;
-                    }
-                    let Ok(key) = std::str::from_utf8(&key_buf) else {
-                        return -1;
+                    // SECURITY (issue #965): NEVER allocate a host buffer sized
+                    // to the guest-controlled `key_len`. A malicious/buggy guest
+                    // can pass a huge positive `key_len` (e.g. i32::MAX ~2 GiB);
+                    // a `vec![0u8; key_len]` allocation would bypass the wasm
+                    // memory limit and OOM the worker process. Instead we SLICE
+                    // guest memory directly: an out-of-range `(key_ptr, key_len)`
+                    // yields `None` -> in-band miss (-1) with zero allocation.
+                    // The only owned copy is `key.to_owned()`, taken solely after
+                    // the exact-match allowlist passes, so it is bounded by the
+                    // length of an allowlisted key (tiny). The immutable borrow
+                    // of guest memory is scoped inside this block so the later
+                    // `memory.write` can re-borrow the caller mutably.
+                    let key_owned = {
+                        let mem = memory.data(&caller);
+                        let Some(key_bytes) = key_ptr
+                            .checked_add(key_len)
+                            .and_then(|end| mem.get(key_ptr..end))
+                        else {
+                            return -1;
+                        };
+                        let Ok(key) = std::str::from_utf8(key_bytes) else {
+                            return -1;
+                        };
+                        if !allowed.iter().any(|k| k == key) {
+                            return -1;
+                        }
+                        key.to_owned()
                     };
-                    if !allowed.iter().any(|k| k == key) {
-                        return -1;
-                    }
-                    let Ok(value) = std::env::var(key) else {
+                    let Ok(value) = std::env::var(&key_owned) else {
                         return -1;
                     };
                     let bytes = value.as_bytes();
@@ -875,6 +893,118 @@ mod tests {
             out,
             serde_json::json!(true),
             "denied key returns -1 in band"
+        );
+    }
+
+    /// SECURITY regression (issue #965): a guest that calls the granted
+    /// `env_get` with an enormous positive `key_len` (i32::MAX ~2 GiB) must NOT
+    /// cause the host to allocate a `key_len`-sized buffer. Pre-fix the host did
+    /// `vec![0u8; key_len]` before the memory bounds check, so this call would
+    /// try to allocate ~2 GiB and could OOM the worker. Post-fix the host slices
+    /// guest memory directly: the out-of-range range yields a miss (-1) with zero
+    /// allocation, the guest reports `true`, and no panic/OOM occurs.
+    const ENV_HUGE_KEYLEN_WAT: &str = r#"
+        (module
+          (import "env" "env_get" (func $e (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 100) "ALLOWED_KEY")
+          (data (i32.const 200) "true")
+          (data (i32.const 300) "false")
+          (func (export "alloc") (param i32) (result i32) (i32.const 8192))
+          (func (export "run") (param i32 i32) (result i64)
+            (local $r i32)
+            ;; key_len = i32::MAX: a huge, positive, out-of-range length.
+            (local.set $r
+              (call $e (i32.const 100) (i32.const 2147483647) (i32.const 1000) (i32.const 64)))
+            (if (result i64) (i32.eq (local.get $r) (i32.const -1))
+              (then (i64.or (i64.shl (i64.const 200) (i64.const 32)) (i64.const 4)))
+              (else (i64.or (i64.shl (i64.const 300) (i64.const 32)) (i64.const 5))))))
+    "#;
+
+    #[test]
+    fn env_get_with_huge_key_len_is_a_miss_without_allocating() {
+        let store = WasmModuleStore::new();
+        let module = compile(&store, ENV_HUGE_KEYLEN_WAT);
+        // "ALLOWED_KEY" IS on the allowlist, so env_get is linked and the key
+        // WOULD match — but the absurd key_len makes the slice out-of-range, so
+        // the host returns -1 before ever touching the allowlist, with no
+        // allocation and no panic.
+        let caps = WasmCapabilities {
+            allow_env: vec!["ALLOWED_KEY".to_string()],
+            ..Default::default()
+        };
+        let out = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &caps,
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect("guest must run without OOM or panic despite the huge key_len");
+        assert_eq!(
+            out,
+            serde_json::json!(true),
+            "an out-of-range key_len must be an in-band miss (-1)"
+        );
+    }
+
+    /// Regression: a normal granted `env_get` for an allowlisted key whose value
+    /// exists in the process environment still writes the value and returns its
+    /// full length. The guest echoes the written bytes back as its JSON output,
+    /// proving both the returned length and the correct in-bounds write survive
+    /// the slice-not-allocate rewrite.
+    const ENV_HIT_ECHO_WAT: &str = r#"
+        (module
+          (import "env" "env_get" (func $e (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 100) "HARVEST_WASM_ENVGET_TEST")
+          (func (export "alloc") (param i32) (result i32) (i32.const 8192))
+          (func (export "run") (param i32 i32) (result i64)
+            (local $r i32)
+            ;; key at 100, len 24; write the value at 1000 (cap 64).
+            (local.set $r
+              (call $e (i32.const 100) (i32.const 24) (i32.const 1000) (i32.const 64)))
+            ;; Return packed(out_ptr=1000, out_len=$r): the host reads back the
+            ;; written value as the JSON output, so the returned length must be
+            ;; exactly the value's byte length.
+            (i64.or
+              (i64.shl (i64.const 1000) (i64.const 32))
+              (i64.extend_i32_u (local.get $r)))))
+    "#;
+
+    #[test]
+    fn env_get_allowlisted_key_returns_value_length() {
+        // Value is the JSON string literal `"hi"` (4 bytes incl. quotes) so the
+        // guest's echoed output parses as json!("hi"). A unique key name avoids
+        // clashing with any other test's process-env usage.
+        // SAFETY (edition 2024): no other test reads this uniquely-named var; we
+        // remove it after the invocation.
+        unsafe {
+            std::env::set_var("HARVEST_WASM_ENVGET_TEST", "\"hi\"");
+        }
+        let store = WasmModuleStore::new();
+        let module = compile(&store, ENV_HIT_ECHO_WAT);
+        let caps = WasmCapabilities {
+            allow_env: vec!["HARVEST_WASM_ENVGET_TEST".to_string()],
+            ..Default::default()
+        };
+        let out = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &caps,
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        );
+        unsafe {
+            std::env::remove_var("HARVEST_WASM_ENVGET_TEST");
+        }
+        let out = out.expect("granted env_get for an existing allowlisted key must run");
+        assert_eq!(
+            out,
+            serde_json::json!("hi"),
+            "env_get must write the value and return its full length"
         );
     }
 

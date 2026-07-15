@@ -2503,6 +2503,26 @@ fn chrono_duration_from_std(
     })
 }
 
+/// Resolve the effective start-to-close deadline for a WASM activity dispatch
+/// (issue #965, AC1).
+///
+/// Mirrors the native dispatch path: a per-call `start_to_close` override
+/// persisted on the task row (used by DAG / race activity calls) takes priority
+/// over the activity's registration default, exactly as native scheduling
+/// resolves `start_to_close_override.or(default_start_to_close)`. When the task
+/// row carries no override (NULL column) we fall back to the registration
+/// default; when both are absent the deadline is `None` and the runtime's
+/// mandatory `max_wall_clock` ceiling (M2) still bounds the guest.
+#[cfg(feature = "wasm-activities")]
+fn wasm_effective_deadline(
+    task_start_to_close: Option<chrono::Duration>,
+    default_start_to_close: Option<Duration>,
+) -> Option<Duration> {
+    task_start_to_close
+        .and_then(|d| d.to_std().ok())
+        .or(default_start_to_close)
+}
+
 fn configured_retry_policy(task: &TaskQueueItem) -> HarvestResult<Option<RetryPolicy>> {
     task.retry_policy
         .clone()
@@ -7564,7 +7584,10 @@ async fn process_activity_task(
                         store,
                         binding,
                         activity_name,
-                        activity.default_start_to_close,
+                        wasm_effective_deadline(
+                            task.start_to_close,
+                            activity.default_start_to_close,
+                        ),
                     )
                     .await
                     // `conn` is dropped at the end of this arm, before the guest runs.
@@ -15116,6 +15139,53 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── WASM effective start-to-close resolution (issue #965, AC1) ───────────
+    //
+    // Proves the WASM dispatch seam honors a per-task `start_to_close` override
+    // (DAG / race calls) exactly like native dispatch, falling back to the
+    // registration default only when the task row carries no override.
+    //
+    // Note: a full end-to-end assertion of the deadline the guest actually runs
+    // under is a wall-clock race (the deadline only fires if the guest outlives
+    // it), so we unit-test the exact resolution function the seam calls instead
+    // — `resolve_wasm_dispatch` threads its `deadline` argument straight through
+    // to `invoke_wasm_activity`, so proving the seam computes the right value is
+    // proving the guest runs under it.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_effective_deadline_prefers_per_task_override() {
+        // Per-call override present (e.g. a DAG-supplied 5m) beats the 30s
+        // registration default — the override wins.
+        assert_eq!(
+            wasm_effective_deadline(
+                Some(chrono::Duration::seconds(300)),
+                Some(Duration::from_secs(30)),
+            ),
+            Some(Duration::from_secs(300)),
+        );
+        // A shorter override also wins over a longer default.
+        assert_eq!(
+            wasm_effective_deadline(
+                Some(chrono::Duration::seconds(5)),
+                Some(Duration::from_secs(30)),
+            ),
+            Some(Duration::from_secs(5)),
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_effective_deadline_falls_back_to_default() {
+        // No per-task override (NULL column) -> registration default applies.
+        assert_eq!(
+            wasm_effective_deadline(None, Some(Duration::from_secs(30))),
+            Some(Duration::from_secs(30)),
+        );
+        // Neither present -> None, so the runtime max_wall_clock ceiling (M2)
+        // is the only bound.
+        assert_eq!(wasm_effective_deadline(None, None), None);
+    }
 
     // ── Adaptive overdue sampler interval (issue #696, Codex round 4) ─────────
 
