@@ -425,6 +425,74 @@ async fn caller_supplied_workflow_id_is_observed_exactly_and_replays() {
     );
 }
 
+// ── FIX (Codex #1069 P2, runtime.rs:522): a NON-BLANK workflow_id is stored VERBATIM ──
+//
+// The rustdoc promises the workflow observes EXACTLY the caller-supplied id, and the
+// Postgres start path carries `workflow_id` verbatim. Pre-fix, the SQLite start path
+// TRIMMED a non-blank id before persisting it, so `"  tenant  "` was observed as
+// `"tenant"` — diverging from Postgres AND collapsing distinct external ids like
+// `"tenant"` and `"  tenant  "` onto one value. Trimming must be used ONLY for the
+// is-blank check; a blank/whitespace-only id still defaults to the exec-id string.
+#[tokio::test]
+async fn nonblank_workflow_id_is_stored_verbatim_not_trimmed() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&records_workflow_id_info());
+    rt.register_activity_raw(
+        "echo_str",
+        ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
+    );
+
+    // A non-blank id with surrounding whitespace must be observed VERBATIM — RED
+    // pre-fix (was trimmed to `"tenant"`).
+    let padded = rt
+        .start_workflow_with_id("records_workflow_id", "  tenant  ", json!(0))
+        .unwrap();
+    let padded_state = rt.run_until_blocked(padded).await.unwrap();
+    let RunState::Completed(padded_v) = padded_state else {
+        panic!("padded run did not complete: {padded_state:?}");
+    };
+    assert_eq!(
+        padded_v.as_str(),
+        Some("  tenant  "),
+        "a non-blank workflow_id must be observed verbatim, spaces preserved"
+    );
+
+    // The padded id must NOT collapse onto the trimmed id — distinct external ids
+    // stay distinct.
+    let trimmed = rt
+        .start_workflow_with_id("records_workflow_id", "tenant", json!(0))
+        .unwrap();
+    let trimmed_state = rt.run_until_blocked(trimmed).await.unwrap();
+    let RunState::Completed(trimmed_v) = trimmed_state else {
+        panic!("trimmed run did not complete: {trimmed_state:?}");
+    };
+    assert_ne!(
+        padded_v.as_str(),
+        trimmed_v.as_str(),
+        "a padded workflow_id must not collapse onto its trimmed form"
+    );
+
+    // A whitespace-only id still defaults to the exec-id string form (blank-default
+    // behavior preserved).
+    let blank = rt
+        .start_workflow_with_id("records_workflow_id", "   ", json!(0))
+        .unwrap();
+    let blank_state = rt.run_until_blocked(blank).await.unwrap();
+    let RunState::Completed(blank_v) = blank_state else {
+        panic!("blank run did not complete: {blank_state:?}");
+    };
+    let blank_id = blank_v.as_str().unwrap_or_default().to_string();
+    assert!(
+        !blank_id.is_empty(),
+        "a whitespace-only workflow_id must default to a non-empty value"
+    );
+    assert_eq!(
+        blank_id,
+        blank.to_string(),
+        "a whitespace-only workflow_id must default to the exec id's string form"
+    );
+}
+
 // ── FIX 1 (Codex #1069 P2, runtime.rs:660): typed workflow failures preserve
 //    metadata and stay byte-equivalent to the Postgres path ─────────────────────
 //

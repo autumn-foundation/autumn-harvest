@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/madmax983/autumn-harvest"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["workflow", "sqlite", "edge", "local-first", "autumn"]
 categories = ["asynchronous", "database", "embedded"]
 

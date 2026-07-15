@@ -517,8 +517,7 @@ impl SqliteRuntime {
         // non-empty `StartWorkflowParams.workflow_id`). A non-blank caller id is used
         // verbatim, so the workflow observes exactly what it was started with.
         let workflow_id = workflow_id
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
+            .filter(|id| !id.trim().is_empty())
             .map_or_else(|| exec.to_string(), str::to_string);
         let tx = self.conn.transaction()?;
         store::insert_execution(&tx, exec, workflow_name, &workflow_id, &input)?;
