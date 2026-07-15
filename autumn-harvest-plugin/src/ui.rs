@@ -5482,13 +5482,22 @@ fn render_timeline_row(
     let span_w = (x2 - x1).max(TL_MIN_SPAN_W);
     let span_y = y + (TL_ROW_H - TL_SPAN_H) / 2.0;
 
+    // The span's pixel width comes from the axis geometry (`span_w`), never from
+    // `total_ms`. A single `Whole` segment fills the whole geometric extent — so
+    // an open/in-flight step (whose `total_ms` may be 0) still renders visibly.
+    // Only a wait/exec split proportions `span_w` by the two segments' ms ratio.
     let segs = span_segments(step);
     let seg_total = segs.iter().map(|(_, ms)| *ms).sum::<i64>().max(1);
+    let single = segs.len() == 1;
     let mut seg_markup: Vec<Markup> = Vec::with_capacity(segs.len());
     let mut seg_x = x1;
     for (seg, ms) in &segs {
         #[allow(clippy::cast_precision_loss)]
-        let seg_w = (span_w * (*ms as f64 / seg_total as f64)).max(0.5);
+        let seg_w = if single {
+            span_w
+        } else {
+            (span_w * (*ms as f64 / seg_total as f64)).max(0.5)
+        };
         seg_markup.push(html! {
             rect x=(dag_svg_coord(seg_x)) y=(dag_svg_coord(span_y))
                  width=(dag_svg_coord(seg_w)) height=(dag_svg_coord(TL_SPAN_H))
@@ -10157,6 +10166,13 @@ mod tests {
         let now = tl_base() + chrono::Duration::milliseconds(5000);
         let html = render_timeline_gantt(&timeline, &exec, now).into_string();
         assert!(html.contains("gantt-span-open"), "open span styled: {html}");
+        // Regression: an open step (total_ms == 0 in the fixture) must still render
+        // at its axis-derived width, not collapse to width="0". Scheduled at the
+        // axis start and open to `now` == full TL_AXIS_W (900px).
+        assert!(
+            html.contains("width=\"900\""),
+            "open span fills its geometric extent, not the (zero) total_ms: {html}"
+        );
     }
 
     // Q10
