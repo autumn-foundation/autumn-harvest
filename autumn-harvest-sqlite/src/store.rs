@@ -134,6 +134,63 @@ pub fn running_executions(conn: &Connection) -> SqliteResult<Vec<ExecutionId>> {
     Ok(out)
 }
 
+/// The single ACTIVE (non-sealed, non-terminal-sealed) execution for a
+/// `(workflow_name, workflow_id)` key, if one exists — the reuse-policy lookup
+/// (issue #1068). Returns `(exec_id, state)` where `state` is `RUNNING`,
+/// `COMPLETED`, or `FAILED`.
+///
+/// A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is EXCLUDED, so it
+/// is invisible to the reuse decision — a replaced/superseded run leaves the
+/// active set and the key becomes available to a new start, mirroring the Postgres
+/// core's uniqueness index (which excludes those sealed states). The single-writer
+/// contract guarantees at most one active row per key once this feature has
+/// landed; `ORDER BY rowid DESC LIMIT 1` is a defensive tie-break preferring the
+/// newest active row if a database created by the pre-#1068 always-fresh behavior
+/// already holds duplicate active rows for a reused id.
+pub fn find_active_execution_by_key(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> SqliteResult<Option<(ExecutionId, String)>> {
+    let row = conn
+        .query_row(
+            "SELECT exec_id, state FROM harvest_executions \
+             WHERE workflow_name = ?1 AND workflow_id = ?2 \
+               AND state NOT IN ('CONTINUED_AS_NEW','TERMINATED') \
+             ORDER BY rowid DESC LIMIT 1",
+            params![workflow_name, workflow_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((exec_str, state)) => {
+            let exec = exec_str
+                .parse()
+                .map_err(|_| SqliteError::corrupt("exec_id"))?;
+            Ok(Some((exec, state)))
+        }
+    }
+}
+
+/// Transition an execution to a SEALED terminal state (issue #1068) — used by the
+/// reuse-policy "replace" cases (`AllowDuplicateFailedOnly` over a FAILED prior;
+/// `TerminateIfRunning` over any prior) to move the superseded run out of the
+/// active set so the `(workflow_name, workflow_id)` slot is freed for the fresh
+/// run. `sealed_state` is `CONTINUED_AS_NEW` (mirroring core's `replace_execution`,
+/// which seals to `CONTINUED_AS_NEW`).
+pub fn seal_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    sealed_state: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET state = ?2 WHERE exec_id = ?1",
+        params![exec_id.to_string(), sealed_state],
+    )?;
+    Ok(())
+}
+
 pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2 WHERE exec_id = ?1",

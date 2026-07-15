@@ -573,6 +573,38 @@ pub fn delete_pending_timer(
     Ok(n > 0)
 }
 
+/// Delete every PENDING task row for an execution (issue #1068) — used by the
+/// reuse-policy `TerminateIfRunning` case when it seals a still-RUNNING prior, so
+/// no orphan task can be claimed against a run that will never be driven again.
+/// Returns the number of rows deleted. DONE/RUNNING rows are left untouched: in
+/// the single-writer runtime no drive is in flight during a start call (a crashed
+/// mid-claim RUNNING row is reset to PENDING by the orphan reclaim on open), so
+/// PENDING is exactly the set of claimable orphans.
+pub fn delete_pending_tasks_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'",
+        params![exec_id.to_string()],
+    )?)
+}
+
+/// Delete every unfired timer row for an execution (issue #1068) — companion to
+/// [`delete_pending_tasks_for_execution`] for the `TerminateIfRunning` seal, so a
+/// durable timer armed by the sealed prior cannot fire against a run that will
+/// never be driven again. Returns the number of rows deleted. Fired timer rows are
+/// left untouched (they are inert audit history).
+pub fn delete_unfired_timers_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
+        params![exec_id.to_string()],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};

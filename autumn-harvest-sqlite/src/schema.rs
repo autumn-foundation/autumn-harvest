@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
     error         TEXT
 );
 
+-- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
+-- (issue #1068, `store::find_active_execution_by_key`). Deliberately NON-unique: a
+-- unique index would FAIL to build on reopen of any database file already holding
+-- duplicate active ids from the pre-#1068 always-fresh start behavior, breaking
+-- durability. The reuse matrix is instead enforced in the single-writer start
+-- transaction (there are no concurrent writers, so a lookup-then-decide is atomic).
+-- `CREATE INDEX IF NOT EXISTS` is idempotent and never fails on duplicate keys, so
+-- it is applied by the base SCHEMA on every open — including pre-existing files —
+-- needing no separate additive migration.
+CREATE INDEX IF NOT EXISTS idx_harvest_executions_key
+    ON harvest_executions (workflow_name, workflow_id);
+
 CREATE TABLE IF NOT EXISTS harvest_events (
     exec_id    TEXT NOT NULL,
     seq        INTEGER NOT NULL,

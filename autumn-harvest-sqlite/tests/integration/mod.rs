@@ -18,6 +18,7 @@ mod payload_caps;
 mod race_activities;
 mod reopen_consistency;
 mod retry_policy_and_failure_fidelity;
+mod reuse_policy;
 mod review_fixes;
 mod review_fixes_48d54b2;
 mod runtime_robustness;
