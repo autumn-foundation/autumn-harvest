@@ -447,7 +447,7 @@ trivial port** (§9, option ii) — the right shape: the core (which already han
 all three) is reused unchanged, and only the persistence layer, where these edges
 live, is rebuilt.
 
-**Two further prototype edges surfaced by a later review round are documented and
+**Three further prototype edges surfaced by later review rounds are documented and
 deliberately declined (not fixed) per this spike's timebox** — each is inherent to
 the minimal single-process prototype, is unexercised by the four required scenarios
 (§5.2), does not touch the default Postgres build (AC4), and is handled natively by
@@ -456,18 +456,31 @@ recommendation, not against it: the coupling they expose lives entirely in the
 from-scratch persistence/worker layer, exactly the layer a companion crate rebuilds
 while reusing the core unchanged.
 
-- **Activity-body panic containment (`worker.rs:156`).** If a registered activity
-  body **panics** (rather than returning `Err`), the panic unwinds past
-  `drain_ready`'s `Err` branch *after* the task was committed `RUNNING`, so
-  `mark_pending` is never called and the task stays wedged `RUNNING` — later claims
-  select only `PENDING` rows, so it is never reclaimed in-process. The real harvest
-  engine **contains** handler panics at the dispatch boundary (issue #782, via
-  `catch_unwind` on both construction and poll) and converts them to the ordinary
-  retryable-failure path, so the worker process survives and the task leaves
-  `RUNNING` within a poll interval. The minimal single-process spike deliberately
-  reproduces only the clean `Err` path; it has no other worker and so no
-  heartbeat-timeout / poison-pill reclaimer to recover a panicked-and-wedged task,
-  the same single-process residual as the hard-crash window above.
+- **Handler panic containment — activity body *and* workflow handler
+  (`worker.rs:156`, `mod.rs:642`).** The spike deliberately holds the
+  *replay-safety* invariant — an engine-detected non-determinism is non-sealing and
+  recoverable (§5.1, issue #603; fixed) — but does **not** implement
+  *panic-containment* recoverability (issue #782): a **panic** at either handler
+  site seals the run terminally rather than being caught and retried/held. Two
+  sites. (1) *Activity body* — if a registered activity body panics (rather than
+  returning `Err`), the panic unwinds past `drain_ready`'s `Err` branch *after* the
+  task was committed `RUNNING`, so `mark_pending` is never called and the task stays
+  wedged `RUNNING` (later claims select only `PENDING` rows, so it is never
+  reclaimed in-process). (2) *Workflow handler* — `run_workflow_with_state` returns
+  `WorkflowOutcome::Failed { handler_panic: true }` when the workflow handler itself
+  panics, and the prototype's terminal `Failed` arm — which now correctly *holds*
+  engine-detected non-determinism recoverably — still **seals** a durable
+  `WorkflowFailed` for a contained handler panic. This is a coherent scope line, not
+  an oversight: replay-safety (a determinism / append-only correctness property) is
+  in-scope and honored — the ND-divergence *hold* above proves it — whereas
+  fault-tolerant panic *recovery* is the documented simplification the productized
+  engine provides, containing handler panics at the dispatch boundary (issue #782,
+  via `catch_unwind` on both future construction and poll) and converting them to
+  the ordinary retryable-failure / hold path so the worker process survives and the
+  execution is never sealed. The minimal single-process spike reproduces only the
+  clean `Err` path at both sites; it has no other worker and so no heartbeat-timeout
+  / poison-pill reclaimer to recover a panicked-and-wedged task, the same
+  single-process residual as the hard-crash window above.
 - **Timer-vs-activity drain-order replay divergence (`worker.rs:108`).** The
   prototype fires due timers only **after** the activity-drain loop, so a single
   suspension batch that records `TimerStarted` before `ActivityScheduled` can
@@ -505,6 +518,22 @@ while reusing the core unchanged.
     faithful multi-timer ordering is native to the engine's matcher + real
     `harvest_timers` schema and is exactly the coordination the from-scratch
     persistence layer would have to rebuild.
+
+- **Redrive-reopened histories mis-sealed on import (`mod.rs:365`).** The
+  sealed-import reverse seal-scan (§5.1) correctly skips trailing bookkeeping
+  (`WorkflowRetryScheduled` / `ChildWorkflowCascadeApplied`) to find the effective
+  terminal lifecycle event, but it treats a `WorkflowFailed` as the seal **even
+  when a later `WorkflowRedriven` (issue #510) reopens the execution** and new
+  in-flight work follows it in history. On such an import the prototype stores
+  `FAILED` and `run_until_blocked` short-circuits on the terminal state, so the
+  post-redrive work is never drained. The real engine derives an execution's state
+  from its **effective tail lifecycle** — a `WorkflowRedriven` recorded *after* a
+  `WorkflowFailed` un-seals the run, so the effective state is RUNNING, not FAILED —
+  and resumes the post-redrive work. Redrive/reopen is an advanced import shape
+  unexercised by the spike's four required scenarios (§5.2) and untouched by the
+  default Postgres build (AC4); like the panic edge above it lives entirely in the
+  from-scratch import/persistence layer the companion crate rebuilds, reinforcing
+  the separate-crate recommendation (§9) over a trivial port.
 
 **Non-determinism is DETECTED-AND-HELD (non-sealing, recoverable), not sealed
 FAILED (Codex P1).** The reused determinism core surfaces a replay divergence — a

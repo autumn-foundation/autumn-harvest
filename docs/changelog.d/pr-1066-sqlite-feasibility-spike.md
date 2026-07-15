@@ -136,7 +136,16 @@ on the shipped Postgres path).
   arms them sequentially), do not touch the default Postgres build, and are handled
   natively by the productized engine (issue #782 panic containment; command-order
   persistence + a `HistoryMatcher` that tolerates an interleaved `TimerFired` for a
-  *different* timer id).**
+  *different* timer id).** **Two more prototype edges surfaced by a later review
+  round are likewise documented in report §5.1 and deliberately declined (not
+  fixed) per the timebox — the *workflow-handler* panic seal (`mod.rs:642`; a
+  contained handler panic seals `WorkflowFailed` rather than being caught/held,
+  the same panic-containment simplification as the activity-body site, handled by
+  issue #782) and redrive-reopened histories mis-sealed on import (`mod.rs:365`; a
+  `WorkflowFailed` followed by a `WorkflowRedriven` (issue #510) is read as sealed
+  FAILED rather than the effective-tail RUNNING state) — both unexercised by the
+  four required scenarios, untouched on the default Postgres build, and handled
+  natively by the productized engine.**
 - **One further review edge FIXED (Codex P1) — engine-detected non-determinism is
   now DETECT-AND-HELD (non-sealing, recoverable), not sealed FAILED.** After
   round-5 switched `drive_one_cycle` to `run_workflow_with_state`, whose `Failed`
