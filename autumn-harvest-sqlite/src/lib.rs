@@ -58,16 +58,30 @@
 //!   policy (`retry_policy_json` on the task row) and the worker honors all of it
 //!   (issue #1069 P2): `max_attempts` in preference to the registered
 //!   [`ActivitySpec`] cap; **backoff timing** — a retryable failure is requeued at
-//!   `now + compute_retry_delay(initial_interval, backoff_coefficient, max_interval,
-//!   attempt)` (the shared core helper), so the workflow BLOCKS on the backing-off
-//!   activity until the driver advances the clock past the deadline rather than
-//!   busy-retrying; and **non-retryable classification** — a typed `non_retryable`
-//!   failure OR one matching the policy's `non_retryable_errors` list (incl. legacy
-//!   `Err(String)`, via the core's `is_non_retryable` rule) fails terminally on the
-//!   first attempt regardless of `max_attempts`, so a non-retryable error never
-//!   repeats side effects. The raw `execute_activity_raw` path carries no override
-//!   and still falls back to the registered default (immediate requeue, no policy
-//!   non-retryable list), byte-for-byte.
+//!   `failure_now + compute_retry_delay(initial_interval, backoff_coefficient,
+//!   max_interval, attempt)` (the shared core helper), so the workflow BLOCKS on the
+//!   backing-off activity until the driver advances the clock past the deadline
+//!   rather than busy-retrying; and **non-retryable classification** — a typed
+//!   `non_retryable` failure OR one matching the policy's `non_retryable_errors` list
+//!   (incl. legacy `Err(String)`, via the core's `is_non_retryable` rule) fails
+//!   terminally on the first attempt regardless of `max_attempts`, so a non-retryable
+//!   error never repeats side effects. The backoff anchors to `failure_now` — the
+//!   instant the body actually returned, re-read from the clock seam at *finalize*
+//!   time — NOT the pre-body cycle-start `now` (Codex #1069 P2, `worker.rs:328`), so a
+//!   body that ran for real time before failing schedules its next attempt `delay`
+//!   after the failure, matching the Postgres path (which computes the delay AFTER
+//!   handling the result). A **zero** computed delay is an IMMEDIATE retry requeued at
+//!   the cycle-start `now`, so it re-claims in the same drain pass and the retry
+//!   sequence converges in one call — this covers both the raw `execute_activity_raw`
+//!   path (no override, no policy non-retryable list) AND a zero-interval policy like
+//!   `RetryPolicy::fixed(n, 0ms)`; only a POSITIVE backoff anchors to `failure_now`.
+//!   **Retry jitter is an accepted v0.1 simplification** — a `RetryPolicy` with
+//!   `JitterPolicy::Full`/`Equal`/`Decorrelated` is retried at the deterministic base
+//!   delay (`compute_retry_delay`), not the seeded jitter helper. Jitter exists to
+//!   de-synchronize a FLEET of concurrent workers; this backend is single-writer /
+//!   single-server (no fleet to de-synchronize), and retry timing (`run_at`) is not
+//!   recorded in `harvest_events`, so the base delay is behaviorally equivalent with
+//!   ZERO replay / byte-identity impact (Codex #1069 P2, `worker.rs:325`).
 //! - **Activity `start_to_close` timeouts are honored.** The declared/per-call
 //!   `start_to_close` (from `#[activity(start_to_close = "…")]` /
 //!   `execute_activity_with_opts`) flows through the scheduling command's
@@ -143,16 +157,45 @@
 //!
 //! Out of scope for this backend: distributed / multi-writer workers, `LISTEN`/
 //! `NOTIFY` push wake-ups, multi-server crash recovery, schedules, the management
-//! API, retention, worker sessions, sharding, and DAGs. In the supported
-//! workflow subset, `continue_as_new`, child workflows, external signals/cancels,
-//! local activities, updates, search attributes, and **worker sessions**
-//! (`ctx.create_session(...)`, issue #606 — a session dispatch carries the
-//! `session_id` / `schedule_to_start_override` `ScheduleActivity` fields this
-//! single-writer backend cannot honor) are unsupported and surface as
-//! [`SqliteError::Unsupported`]. Two benign bookkeeping commands are instead
-//! silently **no-ops** (they append no `WorkflowEvent` and gate no control flow):
-//! `ctx.set_current_details(...)` (the operator status breadcrumb, issue #593) and
-//! a re-park `WaitForActivity`.
+//! API, retention, worker sessions, sharding, and DAGs.
+//!
+//! ## Unsupported workflow primitives — rejected LOUDLY, by name
+//!
+//! Only the *fire-once* durable timer `ctx.timer(...)` is a supported timer. Every
+//! other out-of-subset primitive a workflow can reach surfaces as
+//! [`SqliteError::Unsupported`] whose message NAMES the specific
+//! `WorkflowCommand` (never an opaque `"Unknown"`, Codex #1069 P2) — a workflow
+//! author gets an actionable failure, not a silent gap. The full v0.1 non-goal set,
+//! and the command each emits:
+//!
+//! - **Child workflows** — `ctx.spawn_child_workflow(...)` (`StartChildWorkflow`),
+//!   `ctx.spawn_child_workflow_detached(...)` (`SpawnDetachedChildWorkflow`).
+//! - **External signals / cancels** — `ctx.signal_external_workflow(...)`
+//!   (`SignalExternalWorkflow`), `ctx.request_cancel_external_workflow(...)`
+//!   (`RequestCancelExternalWorkflow`).
+//! - **Local activities** — `ctx.execute_local_activity(...)` (`RunLocalActivity`).
+//! - **External activities** — task-token activities (`ScheduleExternalActivity`).
+//! - **Updates** — admitted-update results (`RecordUpdateResult`).
+//! - **Search attributes** — `ctx.upsert_search_attributes(...)`
+//!   (`UpsertSearchAttributes`).
+//! - **`continue_as_new`** (`ContinueAsNew`, surfaced from the terminal path).
+//! - **Worker sessions** — `ctx.create_session(...)` (issue #606; a session dispatch
+//!   carries the `session_id` / `schedule_to_start_override` `ScheduleActivity`
+//!   fields this single-writer backend cannot honor).
+//! - **Cancellable durable timers** — `ctx.start_timer(...)` and
+//!   `TimerHandle::await_fire`/`cancel`/`reset` (issue #768;
+//!   `ArmTimer`/`CancelTimer`). Use the fire-once `ctx.timer(...)` instead. These
+//!   were previously the opaque `Unsupported("Unknown")` (absent from the
+//!   command-name table); they are now named with a message pointing at the
+//!   supported alternative (Codex #1069 P2, `runtime.rs:840`).
+//!
+//! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
+//! `WorkflowCommand` variant is a compile error in this backend, forcing an
+//! explicit supported / unsupported decision rather than a silent `"Unknown"`.
+//!
+//! Two benign bookkeeping commands are instead silently **no-ops** (they append no
+//! `WorkflowEvent` and gate no control flow): `ctx.set_current_details(...)` (the
+//! operator status breadcrumb, issue #593) and a re-park `WaitForActivity`.
 //!
 //! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
 //! author-declared field on the core `ScheduleActivity` command is either HONORED

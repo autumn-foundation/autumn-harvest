@@ -270,6 +270,85 @@ async fn retry_policy_backoff_delays_the_requeue() {
     );
 }
 
+// ── FIX A (worker.rs:328): the backoff anchors to the FAILURE time ─────────────
+
+// Wall-clock companion to `retry_policy_backoff_delays_the_requeue` above. That
+// test drives via `_as_of` (a fixed clock), so `failure_now == cycle-start now`
+// and the failure-time anchor is indistinguishable from the cycle-start one. This
+// installs an ADVANCING clock via `set_clock` so the body appears to consume real
+// time (45s) before failing: the retry's 60s backoff must anchor to the FAILURE
+// instant (t0+45s), NOT the cycle start (t0) — matching Postgres, which computes
+// the delay AFTER handling the result.
+//
+// The clock returns t0 on the FIRST read (cycle-1 start) and t0+45s on every
+// subsequent read (the finalize-time `failure_now`, and later cycle starts).
+//
+// RED pre-fix (Codex #1069 P2, worker.rs:328): `run_at = cycle_start_now + delay`,
+// so the retry was anchored to t0 + 60s regardless of how long the body ran.
+#[tokio::test]
+async fn retry_policy_backoff_anchors_to_failure_time() {
+    let (_dir, path) = temp_db();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body_calls = calls.clone();
+
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&flaky_wf_info());
+    rt.register_activity(
+        "flaky",
+        ActivitySpec::new(3, move |input: serde_json::Value| {
+            // Attempt 1 fails (retryable); the run then blocks on the backoff.
+            if body_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("transient".to_string())
+            } else {
+                Ok(json!(input.as_i64().unwrap()))
+            }
+        }),
+    );
+
+    let t0 = fixed_now();
+    let t_fail = t0 + chrono::Duration::seconds(45);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reads_clock = reads.clone();
+    rt.set_clock(move || {
+        // First read = cycle-1 start (t0); the body then "runs" 45s and fails, so
+        // the finalize-time `failure_now` (and every later read) is t0+45s.
+        if reads_clock.fetch_add(1, Ordering::SeqCst) == 0 {
+            t0
+        } else {
+            t_fail
+        }
+    });
+
+    let exec = rt.start_workflow("flaky_wf", json!(21)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingTimer),
+        "a backing-off retry must block (WaitingTimer); got {state:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the body ran once (the failing attempt); the backoff blocks the retry"
+    );
+
+    let run_at = pending_task_run_at(&path, exec).expect("a pending backing-off task");
+    let t_fail_ms = t_fail.timestamp_millis();
+    assert_eq!(
+        run_at,
+        t_fail_ms + 60_000,
+        "the retry must anchor its 60s backoff to the FAILURE instant (t0+45s), not the cycle start"
+    );
+    assert_ne!(
+        run_at,
+        t0.timestamp_millis() + 60_000,
+        "pre-fix: run_at was anchored to the cycle-start t0"
+    );
+    assert!(
+        run_at > t_fail_ms,
+        "the retry must be in the future relative to the failure instant, not immediately ready"
+    );
+}
+
 // ── FIX 2(b): a non-retryable failure is NOT retried ───────────────────────────
 
 // Typed non-retryable: an exponential(3) policy would otherwise retry, but a typed

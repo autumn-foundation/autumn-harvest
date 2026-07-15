@@ -44,12 +44,27 @@ use crate::store;
 /// Run all currently-ready work for `exec_id` at logical time `now`: drain ready
 /// activity tasks (running bodies + honouring retries) and fire due timers.
 ///
+/// `failure_now` reads the crate clock seam at *finalize* time — the instant a
+/// body actually returns — so a policy retry's backoff anchors to the failure
+/// time, not the pre-body cycle-start `now` (Codex #1069 P2, `worker.rs:328`). A
+/// body that consumes real time before failing would otherwise schedule its next
+/// attempt `delay` after the *stale* cycle start, making the retry ready too early
+/// (or immediately, if the body ran longer than the delay) — unlike the Postgres
+/// path, which computes the delay AFTER handling the result. Read PER activity
+/// (each body has its own runtime) inside the drain loop. In `_as_of` simulation
+/// the seam returns the caller-fixed epoch, so `failure_now() == now` and behavior
+/// is byte-identical to a wall-clock cycle with an instant body.
+///
 /// Returns `true` if any terminal event was appended (i.e. the workflow may have
 /// made progress and should be re-run).
 pub fn drain_ready(
     conn: &mut Connection,
     exec_id: ExecutionId,
     now: i64,
+    // `+ Send + Sync` keeps the enclosing async `drive_one_cycle` future `Send`
+    // (clippy `future_not_send`); the drivers' closures capture only a `Send + Sync`
+    // `NowFn` `Arc` (wall-clock) or a `Copy` `i64` (`_as_of`), so both satisfy it.
+    failure_now: &(dyn Fn() -> i64 + Send + Sync),
     activities: &HashMap<String, ActivitySpec>,
 ) -> SqliteResult<bool> {
     let mut produced = false;
@@ -132,7 +147,19 @@ pub fn drain_ready(
         // `ActivitySpec` default; a raw-path task (`None`) falls back to the spec.
         // Clamp to `>= 1` to mirror `ActivitySpec::new` (a body always runs once).
         let max_attempts = task.max_attempts.unwrap_or(spec.max_attempts).max(1);
-        if finalize_activity_result(conn, exec_id, &task, max_attempts, now, result)? {
+        // Read the clock seam NOW — after the body has run and returned (Codex
+        // #1069 P2, `worker.rs:328`). A policy retry's backoff is measured from
+        // THIS instant, not the pre-body cycle `now`.
+        let finalize_now = failure_now();
+        if finalize_activity_result(
+            conn,
+            exec_id,
+            &task,
+            max_attempts,
+            now,
+            finalize_now,
+            result,
+        )? {
             produced = true;
         }
     }
@@ -240,10 +267,11 @@ pub fn finalize_activity_result(
     task: &ClaimedTask,
     max_attempts: u32,
     now: i64,
+    failure_now: i64,
     result: Result<serde_json::Value, String>,
 ) -> SqliteResult<bool> {
     let tx = conn.transaction()?;
-    let produced = finalize_within_tx(&tx, exec_id, task, max_attempts, now, result)?;
+    let produced = finalize_within_tx(&tx, exec_id, task, max_attempts, now, failure_now, result)?;
     tx.commit()?;
     Ok(produced)
 }
@@ -259,6 +287,7 @@ pub fn finalize_within_tx(
     task: &ClaimedTask,
     max_attempts: u32,
     now: i64,
+    failure_now: i64,
     result: Result<serde_json::Value, String>,
 ) -> SqliteResult<bool> {
     let attempt_num = task.attempt + 1;
@@ -300,32 +329,55 @@ pub fn finalize_within_tx(
             let non_retryable = payload_non_retryable || policy_non_retryable;
 
             if attempt_num < max_attempts && !non_retryable {
-                // Retryable: bump the attempt counter and requeue at
-                // `now + backoff_delay`, honoring the WHOLE persisted retry policy
-                // (`initial_interval`, `backoff_coefficient`, `max_interval`) via
-                // the shared core helper `policy::compute_retry_delay` — NOT an
-                // immediate requeue at `now` (issue #1069 P2, Codex
-                // `runtime.rs:985`). A raw-path task (`retry_policy == None`) keeps
-                // the immediate-requeue behavior (`delay = 0`), so its whole retry
-                // sequence still converges in one drain pass. A delayed requeue
-                // sets `run_at` in the future, so `claim_next_ready_task`
+                // Retryable: bump the attempt counter and requeue, honoring the
+                // WHOLE persisted retry policy (`initial_interval`,
+                // `backoff_coefficient`, `max_interval`) via the shared core helper
+                // `policy::compute_retry_delay` — NOT an immediate requeue at `now`
+                // (issue #1069 P2, Codex `runtime.rs:985`). `attempt_num` is 1-based
+                // (1 after the first failure), matching `compute_retry_delay`'s
+                // `attempt` (exp = attempt - 1), so the first retry waits
+                // `initial_interval`. NOT recorded in the replayable event log (see
+                // module docs).
+                //
+                // ANCHOR: the backoff is measured from `failure_now` — the instant
+                // the body actually failed — NOT the pre-body cycle-start `now`
+                // (Codex #1069 P2, `worker.rs:328`). A body that ran for real time
+                // before failing schedules its next attempt `delay` after it failed,
+                // matching Postgres (which computes the delay AFTER handling the
+                // result); the old cycle-`now` anchor made a retry ready too early
+                // (or immediately, if the body ran longer than the delay). A delayed
+                // requeue sets `run_at` in the future, so `claim_next_ready_task`
                 // (`run_at <= now`) will NOT re-claim it until the driver advances
                 // the clock past the deadline — the workflow blocks on the
                 // backing-off activity (see `classify_block`) rather than
-                // busy-retrying. `attempt_num` is 1-based (1 after the first
-                // failure), matching `compute_retry_delay`'s `attempt` (exp =
-                // attempt - 1), so the first retry waits `initial_interval`.
-                // NOT recorded in the replayable event log (see module docs).
-                let delay_ms = task.retry_policy.as_ref().map_or(0, |p| {
+                // busy-retrying.
+                //
+                // A ZERO computed delay is an IMMEDIATE retry and MUST requeue at
+                // the CYCLE-START `now`, so `claim_next_ready_task(now)` re-claims it
+                // in THIS same drain pass and the retry sequence converges in one
+                // call. This covers both the raw/no-policy path (`retry_policy ==
+                // None`) AND a zero-delay policy (e.g. `RetryPolicy::fixed(n, 0ms)`,
+                // "retry n times with no backoff"). Anchoring an immediate retry to
+                // `failure_now` instead (which is `>= now` under the wall clock)
+                // would push `run_at` past `now`, so the loop would NOT re-claim it
+                // this pass, `classify_block` would report `WaitingTimer`, and
+                // `run_until_blocked` would return early — regressing the
+                // converge-in-one-call contract. `failure_now` therefore anchors
+                // ONLY a genuine, POSITIVE backoff delay (FIX A).
+                let run_at = task.retry_policy.as_ref().map_or(now, |p| {
                     let delay = autumn_harvest::policy::compute_retry_delay(
                         p.initial_interval,
                         p.backoff_coefficient,
                         p.max_interval,
                         attempt_num,
                     );
-                    i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)
+                    let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+                    if delay_ms == 0 {
+                        now
+                    } else {
+                        failure_now.saturating_add(delay_ms)
+                    }
                 });
-                let run_at = now.saturating_add(delay_ms);
                 queue::requeue_task(conn, &task.task_id, attempt_num, run_at)?;
                 Ok(false)
             } else {
@@ -466,6 +518,7 @@ pub fn fire_timer_within_tx(
 #[cfg(test)]
 mod tests {
     use autumn_harvest::ActivityExecId;
+    use autumn_harvest::policy::RetryPolicy;
     use rusqlite::Connection;
 
     use autumn_harvest::ExecutionId;
@@ -478,6 +531,28 @@ mod tests {
     };
     use crate::queue::{self, ClaimedTask};
     use crate::{schema, store};
+
+    /// Requeue `run_at` (epoch-ms) of the single task after one retryable failure,
+    /// finalized with a distinct cycle-start `now` and failure-time `failure_now`
+    /// and the given retry `policy`. Asserts the failure was a (non-terminal) retry.
+    fn requeued_run_at(policy: Option<RetryPolicy>, now: i64, failure_now: i64) -> i64 {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        let mut task = seed_running_task(&conn, exec, "act");
+        task.retry_policy = policy;
+        let tx = conn.transaction().unwrap();
+        let produced =
+            finalize_within_tx(&tx, exec, &task, 3, now, failure_now, Err("boom".into())).unwrap();
+        tx.commit().unwrap();
+        assert!(!produced, "a retryable failure requeues (not terminal)");
+        conn.query_row(
+            "SELECT run_at FROM harvest_tasks WHERE task_id = ?1",
+            [&task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -529,7 +604,7 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            finalize_within_tx(&tx, exec, &task, 1, 0, Ok(serde_json::json!("done"))).unwrap();
+            finalize_within_tx(&tx, exec, &task, 1, 0, 0, Ok(serde_json::json!("done"))).unwrap();
             // Drop `tx` WITHOUT commit → rollback.
         }
 
@@ -555,7 +630,7 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            finalize_within_tx(&tx, exec, &task, 1, 0, Ok(serde_json::json!("done"))).unwrap();
+            finalize_within_tx(&tx, exec, &task, 1, 0, 0, Ok(serde_json::json!("done"))).unwrap();
             tx.commit().unwrap();
         }
 
@@ -581,7 +656,7 @@ mod tests {
         let task = seed_running_task(&conn, exec, "act");
 
         let produced =
-            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, Err("boom".into()))
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Err("boom".into()))
                 .unwrap();
 
         assert!(!produced, "a retry is not workflow-visible progress");
@@ -787,6 +862,92 @@ mod tests {
         assert_eq!(
             t_fired, 0,
             "the unrelated timer `t` must remain unfired after ingest"
+        );
+    }
+
+    // FIX A (Codex #1069 P2, worker.rs:328): a POLICY retry's backoff anchors to the
+    // FAILURE time (`failure_now`) — the instant the body actually returned — NOT the
+    // pre-body cycle-start `now`. A body that consumed real time before failing must
+    // schedule its next attempt `delay` after the FAILURE, matching Postgres (which
+    // computes the delay AFTER handling the result), never after the stale cycle
+    // start.
+    //
+    // RED pre-fix: `run_at = now + delay` used the cycle-start `now`, so the retry
+    // became ready `delay` after cycle start regardless of how long the body ran.
+    #[test]
+    fn retry_backoff_anchors_to_failure_time_not_cycle_start() {
+        // Cycle starts at 1s; the body runs and fails 45s later (failure_now = 46s).
+        // fixed(60s) → the retry is armed 60s after the FAILURE (106s), not after the
+        // cycle start (61s).
+        let run_at = requeued_run_at(
+            Some(RetryPolicy::fixed(3, Duration::from_secs(60))),
+            1_000,
+            46_000,
+        );
+        assert_eq!(
+            run_at,
+            46_000 + 60_000,
+            "backoff must anchor to failure_now (46s) + 60s, not cycle-start (1s) + 60s"
+        );
+        assert_ne!(
+            run_at,
+            1_000 + 60_000,
+            "must NOT anchor to the cycle-start now"
+        );
+
+        // A body that ran LONGER than the delay (fixed 10s, but the body failed 45s
+        // after cycle start) must NOT be immediately ready: run_at = failure_now + 10s
+        // = 56s, strictly AFTER the failure instant (46s). Pre-fix run_at = 1s + 10s =
+        // 11s, which is already <= failure_now (46s) — i.e. "ready" the moment the
+        // body failed (Postgres never does this).
+        let run_at = requeued_run_at(
+            Some(RetryPolicy::fixed(3, Duration::from_secs(10))),
+            1_000,
+            46_000,
+        );
+        assert_eq!(run_at, 46_000 + 10_000);
+        assert!(
+            run_at > 46_000,
+            "a retry whose delay is shorter than the body runtime must still be in the \
+             future relative to the failure instant, not immediately ready"
+        );
+    }
+
+    // FIX A invariant preserved: the RAW/no-policy path still requeues at the
+    // CYCLE-START `now` (delay 0, ignoring `failure_now`), so `claim_next_ready_task`
+    // re-claims it in the SAME drain pass and the retry sequence converges in one
+    // cycle. Anchoring it to `failure_now` (>= now under the wall clock) would push
+    // `run_at` past `now`, break the converge-in-one-pass contract, and make
+    // `run_until_blocked` return `WaitingTimer` early.
+    #[test]
+    fn raw_path_retry_requeues_at_cycle_now_ignoring_failure_now() {
+        // failure_now (99_999) is far ahead of the cycle-start now (1_000). The raw
+        // path must IGNORE it and requeue at the cycle-start now.
+        let run_at = requeued_run_at(None, 1_000, 99_999);
+        assert_eq!(
+            run_at, 1_000,
+            "raw/no-policy path requeues at cycle-start now, never at failure_now"
+        );
+    }
+
+    // FIX A refinement: a ZERO-delay POLICY (`fixed(n, 0ms)`, "retry n times with no
+    // backoff") is an IMMEDIATE retry and must requeue at the CYCLE-START `now`, not
+    // `failure_now`. Anchoring a 0-delay retry to `failure_now` (> now under the wall
+    // clock) would defer the immediate retry past the drain pass and make
+    // `run_until_blocked` return `WaitingTimer` instead of converging in one call —
+    // the regression `declared_retry_policy_raises_attempts_over_registered_spec`
+    // (a wall-clock, 0ms-policy convergence test) catches end-to-end.
+    #[test]
+    fn zero_delay_policy_retry_requeues_at_cycle_now_not_failure_now() {
+        let run_at = requeued_run_at(
+            Some(RetryPolicy::fixed(4, Duration::from_millis(0))),
+            1_000,
+            99_999,
+        );
+        assert_eq!(
+            run_at, 1_000,
+            "a zero-delay policy retry is immediate: requeue at cycle-start now so it \
+             re-claims this drain pass, never at failure_now"
         );
     }
 }

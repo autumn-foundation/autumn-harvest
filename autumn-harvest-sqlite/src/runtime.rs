@@ -401,9 +401,15 @@ impl SqliteRuntime {
         // overdue, so it fires immediately instead of ~1s after it was armed. The
         // `_as_of` seam keeps a caller-fixed `now` for deterministic tests; only
         // this public wall-clock wrapper refreshes.
+        // The activity-finalize clock seam (Codex #1069 P2, `worker.rs:328`): a
+        // retry's backoff anchors to the instant the body actually failed. The
+        // wall-clock driver re-reads `now_fn` (a cheap `Arc` clone captured once, so
+        // it does not borrow `self` across the `&mut self` cycle call).
+        let now_fn = self.now_fn.clone();
+        let failure_now = move || now_fn().timestamp_millis();
         for _ in 0..MAX_ITERATIONS {
             let now = (self.now_fn)().timestamp_millis();
-            match self.drive_one_cycle(exec, now).await? {
+            match self.drive_one_cycle(exec, now, &failure_now).await? {
                 RunState::InProgress => {}
                 terminal_or_blocked => return Ok(terminal_or_blocked),
             }
@@ -442,8 +448,12 @@ impl SqliteRuntime {
         // comparison stays self-consistent — no DDL change (the columns are
         // `INTEGER`).
         let now = now.timestamp_millis();
+        // `_as_of` simulation keeps `failure_now() == now` (the caller-fixed epoch),
+        // so a policy retry's backoff anchor is byte-identical to a wall-clock cycle
+        // with an instant body — deterministic, sleep-free (Codex #1069 P2).
+        let failure_now = move || now;
         for _ in 0..MAX_ITERATIONS {
-            match self.drive_one_cycle(exec, now).await? {
+            match self.drive_one_cycle(exec, now, &failure_now).await? {
                 RunState::InProgress => {}
                 terminal_or_blocked => return Ok(terminal_or_blocked),
             }
@@ -462,10 +472,14 @@ impl SqliteRuntime {
         // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
         // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
         // caller `now` for deterministic simulation.
+        // Activity-finalize clock seam (Codex #1069 P2, `worker.rs:328`) — re-reads
+        // `now_fn` per finalize; cloned once so it does not borrow `self`.
+        let now_fn = self.now_fn.clone();
+        let failure_now = move || now_fn().timestamp_millis();
         let mut progress = false;
         for exec in store::running_executions(&self.conn)? {
             let now = (self.now_fn)().timestamp_millis();
-            match self.drive_one_cycle(exec, now).await? {
+            match self.drive_one_cycle(exec, now, &failure_now).await? {
                 RunState::WaitingSignal(_) | RunState::WaitingTimer => {}
                 _ => progress = true,
             }
@@ -485,9 +499,11 @@ impl SqliteRuntime {
     pub async fn poll_once_as_of(&mut self, now: DateTime<Utc>) -> SqliteResult<bool> {
         // Millisecond precision — see `run_until_blocked_as_of` (issue #1069 P2).
         let now = now.timestamp_millis();
+        // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
+        let failure_now = move || now;
         let mut progress = false;
         for exec in store::running_executions(&self.conn)? {
-            match self.drive_one_cycle(exec, now).await? {
+            match self.drive_one_cycle(exec, now, &failure_now).await? {
                 RunState::WaitingSignal(_) | RunState::WaitingTimer => {}
                 _ => progress = true,
             }
@@ -519,7 +535,21 @@ impl SqliteRuntime {
     /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
     /// replay/execute the workflow once, persist the resulting side effects, and
     /// run one worker pass.
-    async fn drive_one_cycle(&mut self, exec: ExecutionId, now: i64) -> SqliteResult<RunState> {
+    ///
+    /// `failure_now` is the clock seam read at activity-*finalize* time (after a
+    /// body returns) so a policy retry's backoff anchors to the real failure
+    /// instant, not the pre-body cycle-start `now` (Codex #1069 P2, `worker.rs:328`).
+    /// The wall-clock drivers pass a closure that re-reads [`Self::now_fn`]; the
+    /// `_as_of` drivers pass one that returns the caller-fixed epoch, so simulation
+    /// stays deterministic (`failure_now() == now`).
+    async fn drive_one_cycle(
+        &mut self,
+        exec: ExecutionId,
+        now: i64,
+        // `+ Send + Sync` keeps this async fn's future `Send` (clippy
+        // `future_not_send`) — the drivers' closures satisfy it.
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
         // Already terminal? Return the stored outcome without re-running.
         match store::execution_state(&self.conn, exec)?.as_str() {
             "COMPLETED" => {
@@ -680,7 +710,8 @@ impl SqliteRuntime {
             }
             WorkflowOutcome::Suspended { commands } => {
                 let applied = self.apply_commands(exec, &history, &commands, now)?;
-                let drained = worker::drain_ready(&mut self.conn, exec, now, &self.activities)?;
+                let drained =
+                    worker::drain_ready(&mut self.conn, exec, now, failure_now, &self.activities)?;
                 if applied || drained {
                     Ok(RunState::InProgress)
                 } else {
@@ -834,9 +865,23 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
-                // Dropping `tx` here (un-committed) rolls back the whole batch — an
-                // unsupported command after a supported one leaves NEITHER the
-                // supported command's event NOR its queue/timer row persisted.
+                // Cancellable durable timers (issue #768) — a v0.1 non-goal.
+                // Reject LOUDLY and by NAME with an actionable message pointing at
+                // the supported fire-once `ctx.timer(...)`, rather than letting them
+                // fall through to the generic catch-all (Codex #1069 P2,
+                // `runtime.rs:840`). `?`-dropping the uncommitted `tx` rolls the
+                // whole batch back.
+                cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
+                    return Err(cancellable_timer_unsupported(cmd));
+                }
+                // Every OTHER unsupported command (child workflows, external
+                // activities/signals/cancels, local activities, updates, search
+                // attributes, detached children) is rejected BY NAME via
+                // `command_name` — no opaque `"Unknown"` for any current variant
+                // (Codex #1069 P2, `runtime.rs:840`). Dropping `tx` here
+                // (un-committed) rolls back the whole batch — an unsupported command
+                // after a supported one leaves NEITHER the supported command's event
+                // NOR its queue/timer row persisted.
                 other => return Err(SqliteError::Unsupported(command_name(other).to_string())),
             }
         }
@@ -1165,6 +1210,17 @@ fn persist_terminal_pending_commands(
             // Benign bookkeeping — appends no event, gates no control flow.
             WorkflowCommand::WaitForActivity { .. } | WorkflowCommand::SetCurrentDetails { .. } => {
             }
+            // Cancellable durable timers (issue #768) — a v0.1 non-goal — can also
+            // be drained in the terminal cycle (e.g. `ctx.start_timer(...)` right
+            // before `Ok(..)`). Reject by NAME with the same actionable message as
+            // the suspend path (Codex #1069 P2, `runtime.rs:840`); `?` drops the
+            // caller's uncommitted terminal transaction.
+            cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
+                return Err(cancellable_timer_unsupported(cmd));
+            }
+            // Any OTHER out-of-subset command in a terminal drain is rejected BY
+            // NAME via `command_name` — no opaque `"Unknown"` for any current
+            // variant (Codex #1069 P2, `runtime.rs:840`).
             other => return Err(SqliteError::Unsupported(command_name(other).to_string())),
         }
     }
@@ -1246,18 +1302,26 @@ fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// Human name for an unsupported command (for error messages). The `_` arm keeps
-/// this total against future [`WorkflowCommand`] variants.
+/// Human name for a command (for error messages). EVERY current
+/// [`WorkflowCommand`] variant is named explicitly, so an unsupported command is
+/// always rejected BY NAME rather than as an opaque `"Unknown"` (issue #1069 P2,
+/// Codex `runtime.rs:840`). The match is deliberately EXHAUSTIVE (no `_` arm): a
+/// future core `WorkflowCommand` variant becomes a compile error here, forcing
+/// this backend to make an explicit supported/unsupported decision for it rather
+/// than silently mislabelling it `"Unknown"`.
 const fn command_name(cmd: &WorkflowCommand) -> &'static str {
     match cmd {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
         WorkflowCommand::WaitForActivity { .. } => "WaitForActivity",
         WorkflowCommand::StartTimer { .. } => "StartTimer",
         WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
+        WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
         WorkflowCommand::RecordMarker { .. } => "RecordMarker",
         WorkflowCommand::RecordSideEffect { .. } => "RecordSideEffect",
         WorkflowCommand::ScheduleExternalActivity { .. } => "ScheduleExternalActivity",
         WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
+        WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
+        WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
         WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",
@@ -1265,22 +1329,88 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
-        _ => "Unknown",
+        WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
+        WorkflowCommand::ArmTimer { .. } => "ArmTimer",
+        WorkflowCommand::CancelTimer { .. } => "CancelTimer",
     }
+}
+
+/// The clear, actionable [`SqliteError::Unsupported`] message for a cancellable
+/// durable-timer command (issue #768) — `WorkflowCommand::ArmTimer` /
+/// `CancelTimer`, emitted by `ctx.start_timer(...)` and
+/// `TimerHandle::await_fire`/`cancel`/`reset`. These are a v0.1 non-goal for this
+/// single-writer backend (only fire-once `ctx.timer(...)` durable timers are
+/// supported), so name the command AND point at the supported alternative rather
+/// than letting it surface as an opaque error (Codex #1069 P2, `runtime.rs:840`).
+fn cancellable_timer_unsupported(cmd: &WorkflowCommand) -> SqliteError {
+    SqliteError::Unsupported(format!(
+        "{} — cancellable timers (ctx.start_timer / TimerHandle await_fire·cancel·reset, \
+         issue #768) are a v0.1 non-goal for the sqlite backend; use ctx.timer(...) for \
+         fire-once durable timers",
+        command_name(cmd),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use autumn_harvest::{ActivityExecId, ExecutionId, TimerId};
+    use autumn_harvest::{ActivityExecId, ExecutionId, TimerId, WorkflowCommand};
     use rusqlite::Connection;
 
-    use super::{persist_scheduled_activity, persist_started_timer};
+    use super::{
+        cancellable_timer_unsupported, command_name, persist_scheduled_activity,
+        persist_started_timer,
+    };
+    use crate::error::SqliteError;
     use crate::{queue, schema, store};
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema::SCHEMA).unwrap();
         conn
+    }
+
+    // FIX B / AUDIT (Codex #1069 P2, runtime.rs:840): the previously-"Unknown"
+    // cancellable-timer commands are named by `command_name`, and
+    // `cancellable_timer_unsupported` produces a CLEAR, actionable message that
+    // names the command AND points at the supported fire-once `ctx.timer(...)`. The
+    // `command_name` match is EXHAUSTIVE (no `_ => "Unknown"` arm), so every other
+    // current variant is likewise named by construction — a future core variant is
+    // a compile error here rather than a silent "Unknown".
+    #[test]
+    fn cancellable_timer_commands_are_named_and_rejected_actionably() {
+        let arm = WorkflowCommand::ArmTimer {
+            timer_id: TimerId::new("t".to_string()),
+            duration_secs: 1,
+            for_await: false,
+        };
+        let cancel = WorkflowCommand::CancelTimer {
+            timer_id: TimerId::new("t".to_string()),
+        };
+        assert_eq!(command_name(&arm), "ArmTimer");
+        assert_eq!(command_name(&cancel), "CancelTimer");
+        assert_ne!(command_name(&arm), "Unknown");
+
+        for cmd in [&arm, &cancel] {
+            let SqliteError::Unsupported(msg) = cancellable_timer_unsupported(cmd) else {
+                panic!("must be Unsupported");
+            };
+            assert!(
+                msg.contains(command_name(cmd)),
+                "must name the command: {msg}"
+            );
+            assert!(
+                !msg.contains("Unknown"),
+                "must not be the opaque Unknown: {msg}"
+            );
+            assert!(
+                msg.contains("ctx.timer"),
+                "must point at the supported fire-once alternative: {msg}"
+            );
+            assert!(
+                msg.contains("#768"),
+                "must reference the primitive's issue: {msg}"
+            );
+        }
     }
 
     fn scheduled_count(conn: &Connection, exec: ExecutionId) -> usize {
