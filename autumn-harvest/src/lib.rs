@@ -196,7 +196,6 @@ pub mod testing;
 pub mod throttle;
 /// Per-execution timeline read model (issue #739).
 pub mod timeline;
-#[cfg(any(test, feature = "testing"))]
 pub mod trace_export;
 pub mod types;
 pub mod update;
@@ -431,6 +430,7 @@ pub use timeline::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use trace_export::export_chrome_trace;
+pub use trace_export::export_timeline_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
     ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, TimerId, UpdateId, WorkerId,
