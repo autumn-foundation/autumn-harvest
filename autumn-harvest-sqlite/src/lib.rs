@@ -208,6 +208,47 @@
 //! never silently ignored, so a workflow's declared setting can never take
 //! silently-wrong effect.
 //!
+//! ## Unsupported `WorkflowInfo`-level features — rejected at registration
+//!
+//! [`SqliteRuntime::register_workflow`](crate::SqliteRuntime::register_workflow)
+//! retains ONLY the workflow's `name` + `handler`. Every OTHER `WorkflowInfo` field
+//! (populated by `#[workflow(...)]` attributes or the fluent builder) would
+//! otherwise be **silently dropped**. To close that class the SAME way the command
+//! layer already closes its own (above), `register_workflow` audits the incoming
+//! [`WorkflowInfo`](autumn_harvest::WorkflowInfo) and **PANICS at registration**
+//! (setup-time — mirroring the Postgres `HarvestPlugin::build()` panic on
+//! registration misconfiguration) if it declares an execution- or
+//! admission-affecting feature this v0.1 backend cannot honor, naming the specific
+//! feature and pointing at the supported alternative (Codex #1069 P2,
+//! `runtime.rs:602` `execution_timeout`, `:686` `retry_policy`). The partition:
+//!
+//! - **REJECTED (would change lifecycle / admission / retry semantics if ignored):**
+//!   - `execution_timeout` (#243) — no execution-timeout scanner exists here, so a
+//!     declared hard deadline would never fire. Enforce a deadline inside the
+//!     workflow body with `ctx.timer(...)` / `ctx.sleep_until(...)` instead.
+//!   - workflow-level `retry_policy` — `#[workflow(retry(...))]` (#523) — no
+//!     workflow-level auto-retry orchestration here. Use per-activity retry
+//!     (`#[activity(retry = ...)]`, honored in full) or handle failure in the body.
+//!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —
+//!     pre-start admission-gate features with no single-writer analog.
+//!   - a raised `max_input_bytes` (#252) — a per-workflow raised input cap is not
+//!     threaded into this backend's replay caps, so the global default would apply
+//!     and silently REJECT an input the workflow declared acceptable; rejected so
+//!     the divergence surfaces at setup, not as a surprising runtime `PayloadTooLarge`.
+//! - **ACCEPTED, inert (pure metadata / observability — execution never consults
+//!   them here, so ignoring them is harmless, NOT silently-wrong):** `sla` (#487 —
+//!   no scanner, so no `harvest.workflow.sla_breached` metric; the run's lifecycle
+//!   is unaffected either way), `owner` / `runbook_url` / `severity` (#372),
+//!   `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
+//!   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597
+//!   — HTTP-edge MCP tool exposure), and `module` (diagnostics).
+//! - **HONORED:** `name` (the registration key) and `handler` (the dispatch fn).
+//!
+//! Honoring the rejected features (execution-timeout enforcement, workflow-level
+//! retry orchestration, the admission gates) is real, out-of-v0.1-scope work tracked
+//! as issue #1068 follow-ups — hence rejection rather than a partial, silently-wrong
+//! implementation.
+//!
 //! **Signals are pull-only.** A staged signal is appended to history (as
 //! `SignalReceived`) only when a workflow reaches a pull primitive that consumes
 //! it. The supported pull surface is:

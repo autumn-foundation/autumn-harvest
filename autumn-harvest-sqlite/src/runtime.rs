@@ -207,7 +207,35 @@ impl SqliteRuntime {
 
     /// Register a workflow handler (by name) from its macro-generated
     /// [`WorkflowInfo`].
+    ///
+    /// Only `name` + `handler` are retained; every other `WorkflowInfo` field is
+    /// either pure metadata / observability (accepted and inert) or an
+    /// execution/admission-affecting feature this v0.1 backend does not implement.
+    /// The latter are **rejected LOUDLY at registration** rather than silently
+    /// dropped — see [`unsupported_workflow_feature`] and the crate-level
+    /// "Unsupported `WorkflowInfo`-level features" section for the full audit.
+    ///
+    /// # Panics
+    ///
+    /// Panics (setup-time, mirroring the Postgres `HarvestPlugin::build()` panic on
+    /// registration misconfiguration) if `info` declares an execution- or
+    /// admission-affecting feature this backend cannot honor — `execution_timeout`,
+    /// a workflow-level `retry_policy` (`#[workflow(retry(...))]`), `concurrency`,
+    /// `debounce`, `batch`, `throttle`, or a raised `max_input_bytes`. The panic
+    /// message names the specific feature and points at the supported alternative;
+    /// running the workflow with the feature silently missing would diverge from the
+    /// declared `#[workflow(...)]` contract (Codex #1069 P2, `runtime.rs:602`/`:686`).
     pub fn register_workflow(&mut self, info: &WorkflowInfo) {
+        if let Some((feature, hint)) = unsupported_workflow_feature(info) {
+            panic!(
+                "autumn-harvest-sqlite (v0.1): workflow `{}` declares the unsupported \
+                 `{feature}` feature. This embedded single-writer backend retains only \
+                 the handler at registration, so honoring it is a v0.1 non-goal (issue \
+                 #1068 follow-ups) — registering it anyway would silently drop the \
+                 setting and diverge from the #[workflow(...)] contract. {hint}",
+                info.name,
+            );
+        }
         self.workflows.insert(info.name.to_string(), info.handler);
     }
 
@@ -1351,6 +1379,95 @@ fn cancellable_timer_unsupported(cmd: &WorkflowCommand) -> SqliteError {
     ))
 }
 
+/// Audit a [`WorkflowInfo`] at [`register_workflow`](SqliteRuntime::register_workflow)
+/// for a declared feature this v0.1 backend does not implement — returning the first
+/// such `(feature, hint)` found, or `None` if the workflow is registrable.
+///
+/// [`register_workflow`](SqliteRuntime::register_workflow) retains ONLY `name` +
+/// `handler`, so every other `WorkflowInfo` field would otherwise be silently
+/// dropped. This closes the "silently-dropped `WorkflowInfo`-level feature" class
+/// (Codex #1069 P2, `runtime.rs:602` `execution_timeout`, `:686` `retry_policy`) at the
+/// single registration choke point: an execution- or admission-affecting field that
+/// is `Some(_)` (or a raised cap) is REJECTED so it can never take silently-wrong
+/// effect, mirroring how the command layer already rejects out-of-subset
+/// `WorkflowCommand`s ([`cancellable_timer_unsupported`]) and `ScheduleActivity`
+/// fields ([`apply_schedule_activity`]).
+///
+/// The partition (see the crate-level "Unsupported `WorkflowInfo`-level features"
+/// section for the full audit):
+///
+/// - **REJECTED** — changes lifecycle / admission / retry semantics if ignored:
+///   `execution_timeout` (#243), workflow-level `retry_policy` (#523), `concurrency`
+///   (#247), `debounce` (#499), `batch` (#518), `throttle` (#607), and a raised
+///   `max_input_bytes` (#252, which lowers the effective input cap vs. the declared
+///   contract if dropped).
+/// - **ACCEPTED, inert** — pure metadata / observability, harmless to ignore because
+///   execution never consults them here: `sla` (#487 — no scanner, so no
+///   `sla_breached` metric; NO wrong execution), `owner` / `runbook_url` / `severity`
+///   (#372), `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
+///   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597 —
+///   HTTP-edge tool exposure), and `module` (diagnostics).
+/// - **HONORED**: `name` (registration key) and `handler` (dispatch fn).
+const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static str, &'static str)> {
+    // Ordered most-impactful first; the first match is reported. Each hint points at
+    // the supported alternative (or states none exists) so an author gets an
+    // actionable failure at setup, not a silent runtime divergence.
+    if info.execution_timeout.is_some() {
+        return Some((
+            "execution_timeout",
+            "There is no execution-timeout scanner on this single-writer backend, so a \
+             declared hard deadline would never fire. Enforce a deadline inside the \
+             workflow body with a `ctx.timer(...)` branch (or `ctx.sleep_until`) instead.",
+        ));
+    }
+    if info.retry_policy.is_some() {
+        return Some((
+            "retry_policy (#[workflow(retry(...))])",
+            "Workflow-level auto-retry (a fresh retry successor after an author failure) \
+             is not orchestrated here. Use per-activity retry (`#[activity(retry = ...)]`, \
+             which this backend honors in full) or handle the failure in the workflow body.",
+        ));
+    }
+    if info.concurrency.is_some() {
+        return Some((
+            "concurrency",
+            "Per-key concurrency limits require the shared Postgres task queue's \
+             claim-time advisory lock, which the single-writer backend has no analog for.",
+        ));
+    }
+    if info.debounce.is_some() {
+        return Some((
+            "debounce",
+            "Trigger-burst debounce is a pre-start admission-gate feature with no \
+             equivalent on this backend.",
+        ));
+    }
+    if info.batch.is_some() {
+        return Some((
+            "batch",
+            "Trigger batching is a pre-start admission-gate feature with no equivalent \
+             on this backend.",
+        ));
+    }
+    if info.throttle.is_some() {
+        return Some((
+            "throttle",
+            "Start-throttle pacing is a pre-start admission-gate feature with no \
+             equivalent on this backend.",
+        ));
+    }
+    if info.max_input_bytes.is_some() {
+        return Some((
+            "max_input_bytes",
+            "A per-workflow raised input cap is not threaded into this backend's replay \
+             caps, so the global default cap would apply — silently REJECTING an input \
+             the workflow declared as acceptable. Rejected so the divergence surfaces at \
+             setup rather than as a surprising runtime PayloadTooLarge.",
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use autumn_harvest::{ActivityExecId, ExecutionId, TimerId, WorkflowCommand};
@@ -1501,5 +1618,133 @@ mod tests {
 
         assert!(store::load_history(&conn, exec).unwrap().is_empty());
         assert!(!queue::has_unfired_timer(&conn, exec).unwrap());
+    }
+}
+
+/// Pure-function coverage for [`unsupported_workflow_feature`] — the registration
+/// audit closing the "silently-dropped `WorkflowInfo`-level feature" class (Codex
+/// #1069 P2). Isolated from the `tests` module above because it pulls the macro
+/// prelude and several policy types the other tests do not need.
+#[cfg(test)]
+// The `#[workflow]` macro references the input param and holds no `.await`, so a
+// deliberately-minimal base workflow reads as an unused-underscore-binding /
+// unused-async through the expansion — matching the integration test files' allows.
+#[allow(clippy::used_underscore_binding, clippy::unused_async)]
+mod feature_gate_tests {
+    use std::time::Duration;
+
+    use autumn_harvest::concurrency::ConcurrencyPolicy;
+    use autumn_harvest::debounce::DebouncePolicy;
+    use autumn_harvest::event_batch::BatchPolicy;
+    use autumn_harvest::policy::RetryPolicy;
+    use autumn_harvest::prelude::*;
+    use autumn_harvest::throttle::ThrottlePolicy;
+
+    use super::unsupported_workflow_feature;
+
+    // A minimal, registrable workflow: no execution/admission-affecting feature set.
+    // Its macro-generated `WorkflowInfo` is the clean base each case mutates.
+    #[workflow]
+    async fn base_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+        let _ = ctx;
+        Ok(0)
+    }
+
+    fn rejected(feature_substr: &str, info: &WorkflowInfo) {
+        let (feature, hint) = unsupported_workflow_feature(info)
+            .unwrap_or_else(|| panic!("`{feature_substr}` must be rejected"));
+        assert!(
+            feature.contains(feature_substr),
+            "reported feature `{feature}` must name `{feature_substr}`",
+        );
+        assert!(
+            !hint.is_empty(),
+            "a rejected feature must carry an actionable hint"
+        );
+    }
+
+    #[test]
+    fn plain_workflow_is_registrable() {
+        assert!(
+            unsupported_workflow_feature(&base_wf_info()).is_none(),
+            "a plain workflow (name + handler only) must register",
+        );
+    }
+
+    #[test]
+    fn every_execution_affecting_field_is_rejected() {
+        let mut info = base_wf_info();
+        info.execution_timeout = Some(Duration::from_secs(30));
+        rejected("execution_timeout", &info);
+
+        let mut info = base_wf_info();
+        info.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
+        rejected("retry_policy", &info);
+
+        let mut info = base_wf_info();
+        info.concurrency = Some(ConcurrencyPolicy {
+            key_expr: "input.tenant_id",
+            limit: 10,
+        });
+        rejected("concurrency", &info);
+
+        let mut info = base_wf_info();
+        info.debounce = Some(DebouncePolicy {
+            key_expr: "input.k",
+            window: Duration::from_secs(30),
+            max_wait: None,
+        });
+        rejected("debounce", &info);
+
+        let mut info = base_wf_info();
+        info.batch = Some(BatchPolicy {
+            key_expr: "input.k".to_string(),
+            max_size: 10,
+            max_wait: Duration::from_secs(30),
+        });
+        rejected("batch", &info);
+
+        let mut info = base_wf_info();
+        info.throttle = Some(
+            ThrottlePolicy::from_rate_str("100/m", Some(20.0), Some("input.k"), None)
+                .expect("valid rate"),
+        );
+        rejected("throttle", &info);
+
+        let mut info = base_wf_info();
+        info.max_input_bytes = Some(8 * 1024 * 1024);
+        rejected("max_input_bytes", &info);
+    }
+
+    #[test]
+    fn pure_metadata_and_observability_are_accepted_inert() {
+        // sla (observability-only), owner/runbook/severity, description, schemas,
+        // and mcp all change NO execution semantics here, so they never block
+        // registration.
+        let mut info = base_wf_info();
+        info.sla = Some(Duration::from_secs(3600));
+        info.owner = Some("payments-team");
+        info.runbook_url = Some("https://runbook.example/x");
+        info.severity = Some("high");
+        info.description = Some("does a thing");
+        info.input_schema = Some(|| serde_json::json!({"type": "integer"}));
+        info.output_schema = Some(|| serde_json::json!({"type": "integer"}));
+        info.error_schema = Some(|| serde_json::json!({"type": "string"}));
+        info.mcp = true;
+        assert!(
+            unsupported_workflow_feature(&info).is_none(),
+            "metadata/observability-only fields must be accepted (inert)",
+        );
+    }
+
+    #[test]
+    fn execution_timeout_is_reported_before_retry_policy() {
+        // Deterministic first-match ordering: when several are set, the most
+        // impactful (execution_timeout) is surfaced first.
+        let mut info = base_wf_info();
+        info.execution_timeout = Some(Duration::from_secs(30));
+        info.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
+        let (feature, _) = unsupported_workflow_feature(&info).expect("rejected");
+        assert!(feature.contains("execution_timeout"), "got `{feature}`");
     }
 }
