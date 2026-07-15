@@ -54,7 +54,6 @@ use autumn_harvest::models::{
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
-use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
 };
@@ -76,12 +75,13 @@ use autumn_harvest::{
 };
 
 use crate::api::{
-    HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
-    audit_decoded_read, db_conn_for_execution, db_conn_for_shard, decode_error_field,
-    decode_workflow_execution_fields, extension_session, load_execution, load_workflows,
-    load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
-    require_harvest_admin,
+    DagRetryFailure, DagRetryResponse, HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES,
+    WorkflowFilters, acquire_conn, audit_decoded_read, db_conn_for_execution, db_conn_for_shard,
+    decode_error_field, decode_workflow_execution_fields, extension_session, load_execution,
+    load_workflows, load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
+    require_harvest_admin, retry_dag_run_inner,
 };
+use crate::dag_graph::{DagNodeStatus, DagRunNode, build_run_graph};
 use crate::shard_fanout::UnavailableShard;
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -196,6 +196,14 @@ footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-t
 .operator-actions button:hover,.operator-actions a.btn:hover{background:#2563eb;color:#fff}
 .operator-actions button.danger{background:#450a0a;color:#fca5a5;border-color:#991b1b}
 .operator-actions button.danger:hover{background:#991b1b;color:#fff}
+.dag-graph-scroll{overflow:auto;max-width:100%;max-height:70vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
+.dag-node{stroke:#0f172a;stroke-width:1}
+.dag-node.selected{stroke:#f8fafc;stroke-width:2}
+.dag-node-label{fill:#f8fafc;font:12px system-ui,-apple-system,sans-serif}
+.dag-edge{stroke:#64748b;stroke-width:1.5}
+.dag-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
+.dag-legend span{display:inline-flex;align-items:center;gap:4px}
+.dag-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -548,6 +556,16 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/", get(index))
         .route("/dags", get(list_dags_ui))
         .route("/dags/{dag_name}", get(dag_detail_ui))
+        // issue #957: DAG-run-graph retry flow (dry-run confirm → admin commit).
+        // Both surface a single audited mutation via the extracted
+        // `retry_dag_run_inner`, so the UI introduces no unaudited path; both
+        // are admin-gated to match the API's admin-auth posture.
+        .route(
+            "/dags/{dag_name}/runs/{run_exec_id}/retry",
+            get(dag_retry_confirm_ui)
+                .post(dag_retry_commit_ui)
+                .route_layer(require_admin.clone()),
+        )
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
@@ -621,6 +639,8 @@ struct DagDetailParams {
     node: Option<usize>,
     #[serde(default)]
     refresh: Option<u64>,
+    #[serde(default)]
+    flash: Option<String>,
 }
 
 async fn list_dags_ui(
@@ -694,81 +714,41 @@ async fn dag_detail_ui(
         requested_run_is_valid_for_dag,
         runs.as_slice().first().map(|r| r.id),
     );
-    let node_states = if let Some(exec_id) = selected_run {
-        let mut conn = db_conn_for_execution(
-            &api_state,
-            autumn_harvest::types::ExecutionId::from_uuid(exec_id),
-        )
-        .await?;
-        let task_rows = harvest_task_queue::table
-            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id)))
-            .select(TaskQueueItem::as_select())
-            .load(&mut conn)
-            .await
-            .map_err(database_error)
-            .map_err(map_error)?;
 
-        // Load dag_skip: markers to distinguish condition-skipped nodes (issue #482).
-        let marker_events: Vec<HarvestEvent> = harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq(exec_id))
-            .filter(harvest_events::event_type.eq("MarkerRecorded"))
-            .select(HarvestEvent::as_select())
-            .load(&mut conn)
+    // Issue #957: render the node topology straight from
+    // `dag_graph::build_run_graph` — the same in-process derivation the #690 API
+    // handler uses — rather than a UI-side status fork. For a unified DAG with a
+    // selected run, this loads the run's timestamped history and annotates the
+    // registered `DagDefinition`; classic (non-unified) DAGs have no unified
+    // topology and render the degraded message (matching #690's 400).
+    let graph_data: Option<(Vec<DagRunNode>, String)> = if !dag.is_unified {
+        None
+    } else if let Some(run_uuid) = selected_run {
+        let exec_id = autumn_harvest::types::ExecutionId::from_uuid(run_uuid);
+        let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+        let execution = load_execution(&mut conn, exec_id)
             .await
-            .map_err(database_error)
             .map_err(map_error)?;
-        let condition_skipped: std::collections::HashSet<usize> = marker_events
-            .iter()
-            .filter_map(|e| {
-                // event_data is adjacently-tagged: {"type":"MarkerRecorded","data":{...}}
-                let data = e.event_data.get("data")?;
-                let name = data["name"].as_str()?;
-                let idx = parse_dag_skip_marker_index(name)?;
-                let current_task = dag.definition.tasks().get(idx)?;
-                // Guard against task rename/reorder across deploys: only mark
-                // the node as condition-skipped when the recorded activity name
-                // still matches the task at that index in the current definition.
-                // MarkerRecorded serializes as {"type":…,"data":{"name":…,"details":{…}}},
-                // so the task field lives under data.details.task.
-                //
-                // `details` is a payload field, so on a non-identity PayloadCodec
-                // (or large-payload offload) deployment it is stored as an opaque
-                // envelope and `details.task` is not readable here — this read
-                // path does not codec-decode. When the fingerprint is unreadable,
-                // fall back to the (always-clear) marker name/index so a
-                // condition-skipped node is still shown skipped rather than
-                // pending, mirroring `dag_graph::has_skip_marker` (issue #690
-                // review). Reorder-safety is not available in that opaque case.
-                let Some(recorded_task) = data.get("details").and_then(|d| d["task"].as_str())
-                else {
-                    return Some(idx);
-                };
-                if recorded_task != current_task.activity_name.as_str() {
-                    return None;
-                }
-                // Also validate upstream fingerprint when present (new-format markers).
-                // Old markers without "upstreams" pass through for backward compat.
-                if let Some(arr) = data
-                    .get("details")
-                    .and_then(|d| d.get("upstreams"))
-                    .and_then(|v| v.as_array())
-                {
-                    let recorded: Vec<usize> = arr
-                        .iter()
-                        .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
-                        .collect();
-                    if recorded != current_task.upstreams {
-                        return None;
-                    }
-                }
-                Some(idx)
-            })
-            .collect();
-
-        map_node_states(&dag.definition, &task_rows, &condition_skipped)
+        let timestamped = autumn_harvest::store::load_history_with_timestamps(&mut conn, exec_id)
+            .await
+            .map_err(map_error)?;
+        let nodes = build_run_graph(&dag.definition, &timestamped, &execution.state);
+        Some((nodes, execution.state))
     } else {
-        HashMap::<usize, DagNodeState>::new()
+        None
     };
+
+    let view = if !dag.is_unified {
+        DagGraphView::Classic
+    } else if let Some((nodes, run_state)) = graph_data.as_ref() {
+        DagGraphView::Run {
+            nodes: nodes.as_slice(),
+            run_state: run_state.as_str(),
+        }
+    } else {
+        DagGraphView::NoRun
+    };
+
     Ok(render_dag_detail(
         &dag_name,
         &dag,
@@ -776,7 +756,8 @@ async fn dag_detail_ui(
         selected_run,
         params.node,
         params.refresh,
-        &node_states,
+        params.flash.as_deref(),
+        view,
     ))
 }
 
@@ -825,6 +806,171 @@ async fn dag_run_exists_for_dag(
         .map(|row| row.is_some())
         .map_err(database_error)
         .map_err(map_error)
+}
+
+// ── Issue #957 — DAG retry flow (dry-run confirm → admin commit) ─────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct DagRetryConfirmParams {
+    #[serde(default)]
+    from_node: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DagRetryCommitForm {
+    #[serde(default)]
+    from_node: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// GET the retry confirm page: run a **dry-run** retry through the shared,
+/// audited `retry_dag_run_inner` so the operator sees the authoritative widened
+/// node list (`nodes_to_re_execute`) before committing. On any endpoint error
+/// (400/404/409) the panel renders a human-readable message rather than raw
+/// JSON. Admin-gated at the router.
+async fn dag_retry_confirm_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+    Query(params): Query<DagRetryConfirmParams>,
+) -> Result<Markup, AutumnError> {
+    let from_node = params.from_node.unwrap_or_default();
+    let actor = api_state.extract_actor(&headers);
+    let reason = dag_retry_default_reason(&from_node);
+    let outcome = retry_dag_run_inner(
+        &api_state,
+        &dag_name,
+        &run_exec_id,
+        &headers,
+        vec![from_node.clone()],
+        reason.clone(),
+        actor,
+        true,
+        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(SOURCE_UI),
+    )
+    .await;
+    Ok(render_dag_retry_confirm(
+        &dag_name,
+        &run_exec_id,
+        &from_node,
+        &reason,
+        outcome,
+    ))
+}
+
+/// POST the retry commit: run the fork through `retry_dag_run_inner`
+/// (`dry_run = false`), which writes the `OP_DAG_RETRY` audit row with
+/// `source = ui`. Redirects back to the DAG page with a success flash naming
+/// the new run, or a human-readable failure flash. Admin-gated at the router.
+async fn dag_retry_commit_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+    Form(form): Form<DagRetryCommitForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let actor = api_state.extract_actor(&headers);
+    let reason = if form.reason.trim().is_empty() {
+        dag_retry_default_reason(&form.from_node)
+    } else {
+        form.reason.clone()
+    };
+    let outcome = retry_dag_run_inner(
+        &api_state,
+        &dag_name,
+        &run_exec_id,
+        &headers,
+        vec![form.from_node.clone()],
+        reason,
+        actor,
+        false,
+        "POST /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(SOURCE_UI),
+    )
+    .await;
+    let (target_run, flash) = match outcome {
+        Ok(plan) => {
+            let new_run = plan.new_run_exec_id.unwrap_or_else(|| run_exec_id.clone());
+            let flash = url_encode(&dag_retry_success_flash(&new_run));
+            (new_run, flash)
+        }
+        Err(failure) => (
+            run_exec_id.clone(),
+            url_encode(&format!("Retry failed: {}", failure.human_message())),
+        ),
+    };
+    // From `/dags/{dag}/runs/{run}/retry`, `../../../{dag}` reaches `/dags/{dag}`.
+    let redirect_url = format!(
+        "../../../{}?run={}&flash={}",
+        url_encode(&dag_name),
+        target_run,
+        flash
+    );
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+}
+
+/// Render the retry confirm page from a dry-run outcome: on success, the
+/// widened re-execute list + carried-over list + an editable required reason and
+/// a Confirm form (`POSTing` to the same URL); on failure, the human message.
+fn render_dag_retry_confirm(
+    dag_name: &str,
+    run_exec_id: &str,
+    from_node: &str,
+    default_reason: &str,
+    outcome: Result<DagRetryResponse, DagRetryFailure>,
+) -> Markup {
+    let body = match outcome {
+        Ok(plan) => html! {
+            h2 { "Confirm retry of DAG " code { (dag_name) } }
+            p { "Source run: " code { (run_exec_id) } }
+            p { "Retry from node: " code { (from_node) } }
+            div class="card" {
+                h3 { "Nodes that will re-execute" }
+                p class="detail-row" {
+                    "The retry auto-widens to the node's full execution level plus its \
+                     downstream closure. These nodes will re-run:"
+                }
+                ul {
+                    @for node in &plan.nodes_to_re_execute {
+                        li { code { (node) } }
+                    }
+                }
+                @if !plan.nodes_carried_over.is_empty() {
+                    h3 { "Nodes carried over" }
+                    ul {
+                        @for node in &plan.nodes_carried_over {
+                            li { code { (node) } }
+                        }
+                    }
+                }
+            }
+            form method="post" {
+                input type="hidden" name="from_node" value=(from_node);
+                p {
+                    label {
+                        "Reason (required) "
+                        textarea name="reason" required[true] rows="2" cols="60" { (default_reason) }
+                    }
+                }
+                button type="submit" class="btn reset" { "Confirm retry" }
+            }
+        },
+        Err(failure) => html! {
+            div class="banner Warning" { (failure.human_message()) }
+            p {
+                a class="back" href=(format!("../../../{}?run={}", url_encode(dag_name), run_exec_id)) {
+                    "← Back to run"
+                }
+            }
+        },
+    };
+    layout_dag_detail(
+        &format!("Retry DAG {dag_name} · Vantage"),
+        &body,
+        "../../../../",
+        None,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4698,41 +4844,285 @@ fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DagNodeState {
-    Succeeded,
-    Failed,
-    Cancelled,
-    Running,
-    Queued,
-    /// Skipped because a trigger rule evaluated to false over upstream statuses.
-    Skipped,
-    /// Skipped because a data-dependent condition predicate evaluated to false
-    /// (issue #482).  Distinct from [`Skipped`] so the UI can show a different
-    /// label ("Skipped (condition)").
-    SkippedByCondition,
-    Unknown,
+// ── Issue #957 — DAG run graph rendering ─────────────────────────────────────
+//
+// Node statuses are NOT re-derived here: they come straight from
+// `dag_graph::build_run_graph` (the same in-process call the #690 API handler
+// makes), so the graph can never disagree with the API or the #366 retry
+// resolver. The helpers below turn that `Vec<DagRunNode>` into an inline,
+// server-rendered SVG laid out level-by-level, plus a click-through node detail
+// panel and a retry action.
+
+/// Node graph state for the DAG detail page, resolved by `dag_detail_ui`.
+/// `Copy` (all fields are shared references) so it can be passed by value into
+/// `render_dag_detail` without tripping `needless_pass_by_value`.
+#[derive(Clone, Copy)]
+enum DagGraphView<'a> {
+    /// A unified DAG with a selected run: annotated node graph.
+    Run {
+        nodes: &'a [DagRunNode],
+        run_state: &'a str,
+    },
+    /// A classic (non-unified) DAG: #690 rejects these with `400`, so there is
+    /// no unified topology to render.
+    Classic,
+    /// A unified DAG with no run selected.
+    NoRun,
 }
 
-/// Human-readable label for a [`DagNodeState`] used in the timeline table.
-const fn dag_node_state_label(state: DagNodeState) -> &'static str {
-    match state {
-        DagNodeState::Succeeded => "Succeeded",
-        DagNodeState::Failed => "Failed",
-        DagNodeState::Cancelled => "Cancelled",
-        DagNodeState::Running => "Running",
-        DagNodeState::Queued => "Queued",
-        DagNodeState::Skipped => "Skipped (upstream)",
-        DagNodeState::SkippedByCondition => "Skipped (condition)",
-        DagNodeState::Unknown => "Unknown",
+/// Node counts at or above this threshold render inside a scrollable container
+/// with an explicit note rather than being disabled (issue #957 AC).
+const DAG_GRAPH_LARGE_THRESHOLD: usize = 200;
+
+/// SVG geometry constants (px).
+const DAG_NODE_W: f64 = 160.0;
+const DAG_NODE_H: f64 = 40.0;
+const DAG_COL_W: f64 = 210.0;
+const DAG_ROW_H: f64 = 64.0;
+const DAG_PAD: f64 = 20.0;
+
+/// Fill colour keyed to node status. Distinct per status (colour is a secondary
+/// cue only; `dag_node_status_icon` carries the accessible, colour-independent
+/// distinction).
+const fn dag_node_status_fill(status: DagNodeStatus) -> &'static str {
+    match status {
+        DagNodeStatus::Succeeded => "#166534",
+        DagNodeStatus::Failed => "#991b1b",
+        DagNodeStatus::TimedOut => "#b45309",
+        DagNodeStatus::Cancelled => "#6b7280",
+        DagNodeStatus::Running => "#1d4ed8",
+        DagNodeStatus::Pending => "#334155",
+        DagNodeStatus::Skipped => "#475569",
+        DagNodeStatus::Waiting => "#7c3aed",
     }
 }
 
-/// Parse `dag_skip:{idx}` from a marker event name; returns `Some(idx)` on match.
-fn parse_dag_skip_marker_index(name: &str) -> Option<usize> {
-    name.strip_prefix("dag_skip:").and_then(|s| s.parse().ok())
+/// A distinct glyph per status so the graph is legible without colour (a11y).
+const fn dag_node_status_icon(status: DagNodeStatus) -> &'static str {
+    match status {
+        DagNodeStatus::Succeeded => "✓",
+        DagNodeStatus::Failed => "✗",
+        DagNodeStatus::TimedOut => "⏱",
+        DagNodeStatus::Cancelled => "⊘",
+        DagNodeStatus::Running => "●",
+        DagNodeStatus::Pending => "○",
+        DagNodeStatus::Skipped => "↳",
+        DagNodeStatus::Waiting => "⧗",
+    }
 }
 
+/// Human-readable label per status (matches the #690 bounded enum).
+const fn dag_node_status_label(status: DagNodeStatus) -> &'static str {
+    match status {
+        DagNodeStatus::Succeeded => "Succeeded",
+        DagNodeStatus::Failed => "Failed",
+        DagNodeStatus::TimedOut => "Timed out",
+        DagNodeStatus::Cancelled => "Cancelled",
+        DagNodeStatus::Running => "Running",
+        DagNodeStatus::Pending => "Pending",
+        DagNodeStatus::Skipped => "Skipped",
+        DagNodeStatus::Waiting => "Waiting",
+    }
+}
+
+/// Whether a "Retry from this node" action should be offered: the run must be
+/// terminally retryable (matching #366's accepted source states) and the node
+/// must be an attempted-but-not-succeeded node (so the #366 resolver won't
+/// reject it as never-attempted / already-succeeded).
+fn node_retry_offered(run_state: &str, status: DagNodeStatus) -> bool {
+    matches!(run_state, "FAILED" | "CANCELLED" | "TIMED_OUT")
+        && matches!(
+            status,
+            DagNodeStatus::Failed | DagNodeStatus::TimedOut | DagNodeStatus::Cancelled
+        )
+}
+
+/// Computed SVG geometry for a run graph: one `(x, y)` per node index, plus the
+/// overall canvas size. Deterministic (pure function of the level structure).
+#[derive(Debug, Clone, PartialEq)]
+struct GraphLayout {
+    pos: Vec<(f64, f64)>,
+    width: f64,
+    height: f64,
+}
+
+/// Lay nodes out level-by-level: each execution level is a column (x by level
+/// index), each node within a level is a row (y by position). Matches the
+/// executor's level semantics (#256/#366). Deterministic.
+fn build_graph_layout(levels: &[Vec<usize>], node_count: usize) -> GraphLayout {
+    let mut pos = vec![(0.0_f64, 0.0_f64); node_count];
+    let mut max_rows = 0usize;
+    for (col, level) in levels.iter().enumerate() {
+        for (row, &idx) in level.iter().enumerate() {
+            if idx < node_count {
+                #[allow(clippy::cast_precision_loss)]
+                let x = (col as f64).mul_add(DAG_COL_W, DAG_PAD);
+                #[allow(clippy::cast_precision_loss)]
+                let y = (row as f64).mul_add(DAG_ROW_H, DAG_PAD);
+                pos[idx] = (x, y);
+            }
+        }
+        max_rows = max_rows.max(level.len());
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let width =
+        DAG_PAD.mul_add(2.0, levels.len().max(1) as f64 * DAG_COL_W) - (DAG_COL_W - DAG_NODE_W);
+    #[allow(clippy::cast_precision_loss)]
+    let height =
+        DAG_PAD.mul_add(2.0, max_rows.max(1) as f64 * DAG_ROW_H) - (DAG_ROW_H - DAG_NODE_H);
+    GraphLayout { pos, width, height }
+}
+
+/// Format an SVG coordinate (whole px).
+fn dag_svg_coord(value: f64) -> String {
+    format!("{value:.0}")
+}
+
+/// Render the run graph as an inline, server-computed SVG. `upstreams[i]` holds
+/// the task-index upstreams of node `i` (used for edges); `selected` highlights
+/// the clicked node. Wrapped in a scrollable container so a large DAG stays
+/// navigable rather than being disabled. maud auto-escapes every text/attribute
+/// interpolation (node names, tooltips), so untrusted node names cannot inject
+/// markup.
+fn render_dag_run_graph_svg(
+    nodes: &[DagRunNode],
+    levels: &[Vec<usize>],
+    upstreams: &[Vec<usize>],
+    selected: Option<usize>,
+    run_id: uuid::Uuid,
+) -> Markup {
+    let layout = build_graph_layout(levels, nodes.len());
+    // Precompute edge endpoints so the maud macro stays declarative.
+    let mut edges: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for (idx, ups) in upstreams.iter().enumerate() {
+        let Some(&(nx, ny)) = layout.pos.get(idx) else {
+            continue;
+        };
+        for &u in ups {
+            if let Some(&(ux, uy)) = layout.pos.get(u) {
+                edges.push((
+                    ux + DAG_NODE_W,
+                    uy + DAG_NODE_H / 2.0,
+                    nx,
+                    ny + DAG_NODE_H / 2.0,
+                ));
+            }
+        }
+    }
+    html! {
+        div class="dag-graph-scroll" {
+            svg xmlns="http://www.w3.org/2000/svg"
+                width=(dag_svg_coord(layout.width))
+                height=(dag_svg_coord(layout.height))
+                role="img"
+                aria-label="DAG run graph" {
+                @for (x1, y1, x2, y2) in &edges {
+                    line x1=(dag_svg_coord(*x1)) y1=(dag_svg_coord(*y1))
+                         x2=(dag_svg_coord(*x2)) y2=(dag_svg_coord(*y2))
+                         class="dag-edge" {}
+                }
+                @for (idx, node) in nodes.iter().enumerate() {
+                    @let (x, y) = layout.pos.get(idx).copied().unwrap_or((0.0, 0.0));
+                    @let selected_class = if selected == Some(idx) { "dag-node selected" } else { "dag-node" };
+                    a href=(format!("?run={run_id}&node={idx}")) aria-label=(format!("{} — {}", node.node_name, dag_node_status_label(node.status))) {
+                        rect x=(dag_svg_coord(x)) y=(dag_svg_coord(y))
+                             width=(dag_svg_coord(DAG_NODE_W)) height=(dag_svg_coord(DAG_NODE_H))
+                             rx="6" fill=(dag_node_status_fill(node.status))
+                             class=(selected_class) {}
+                        text x=(dag_svg_coord(x + 8.0)) y=(dag_svg_coord(y + 25.0)) class="dag-node-label" {
+                            (dag_node_status_icon(node.status)) " " (node.node_name)
+                        }
+                        title { (node.node_name) " — " (dag_node_status_label(node.status)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A compact status legend for the graph (colour + icon + label per status).
+fn dag_status_legend() -> Markup {
+    const LEGEND: [DagNodeStatus; 8] = [
+        DagNodeStatus::Succeeded,
+        DagNodeStatus::Failed,
+        DagNodeStatus::TimedOut,
+        DagNodeStatus::Cancelled,
+        DagNodeStatus::Running,
+        DagNodeStatus::Pending,
+        DagNodeStatus::Skipped,
+        DagNodeStatus::Waiting,
+    ];
+    html! {
+        div class="dag-legend" {
+            @for status in LEGEND {
+                span {
+                    span class="swatch" style=(format!("background:{}", dag_node_status_fill(status))) {}
+                    (dag_node_status_icon(status)) " " (dag_node_status_label(status))
+                }
+            }
+        }
+    }
+}
+
+/// The click-through detail panel for a selected node: status, timing,
+/// attempts, dependencies, error (when failed), and — for an
+/// attempted-but-not-succeeded node on a terminally-failed run — the
+/// "Retry from this node" link into the dry-run confirm page.
+fn render_dag_node_panel(
+    node: &DagRunNode,
+    idx: usize,
+    run_state: &str,
+    dag_name: &str,
+    run_id: uuid::Uuid,
+) -> Markup {
+    html! {
+        div class="card" {
+            h3 { "Node " (idx) " · " code { (node.node_name) } }
+            p { "Status: " (dag_node_status_icon(node.status)) " " (dag_node_status_label(node.status)) }
+            @if let Some(started) = node.started_at {
+                p { "Started: " (format_timestamp(Some(started))) }
+            }
+            @if let Some(finished) = node.finished_at {
+                p { "Finished: " (format_timestamp(Some(finished))) }
+            }
+            p { "Attempts: " (node.attempts) }
+            @if !node.depends_on.is_empty() {
+                p { "Depends on: " (node.depends_on.join(", ")) }
+            }
+            @if let Some(error_type) = &node.error_type {
+                p { "Error type: " code { (error_type) } }
+            }
+            @if let Some(error) = &node.error {
+                p { "Error: " (error) }
+            }
+            @if node_retry_offered(run_state, node.status) {
+                p {
+                    a class="btn reset"
+                      href=(format!(
+                          "{}/runs/{}/retry?from_node={}",
+                          url_encode(dag_name),
+                          run_id,
+                          url_encode(&node.node_name)
+                      )) {
+                        "Retry from this node"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Success-flash text naming the new (forked) run id (issue #957).
+fn dag_retry_success_flash(new_run: &str) -> String {
+    format!("Retry started — new run {new_run}")
+}
+
+/// Default, editable retry reason pre-filled into the confirm-page textarea.
+fn dag_retry_default_reason(from_node: &str) -> String {
+    format!("retry from node {from_node} via Vantage")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_dag_detail(
     dag_name: &str,
     dag: &RegisteredDag,
@@ -4740,52 +5130,28 @@ fn render_dag_detail(
     selected_run: Option<uuid::Uuid>,
     selected_node: Option<usize>,
     refresh: Option<u64>,
-    node_states: &HashMap<usize, DagNodeState>,
+    flash: Option<&str>,
+    view: DagGraphView<'_>,
 ) -> Markup {
-    let too_large = dag.definition.tasks().len() > 200;
-    let selected_task = selected_node.and_then(|idx| dag.definition.tasks().get(idx));
-    let selected_node_state = selected_node
-        .and_then(|idx| node_states.get(&idx).copied())
-        .unwrap_or(DagNodeState::Unknown);
     let body = html! {
+        @if let Some(message) = flash {
+            div class="flash" { (message) }
+        }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
             p { "Selected run: " code { (run_id) } }
         }
-        @if too_large {
-            div class="banner Warning" { "Topology has " (dag.definition.tasks().len()) " nodes; graph disabled." }
-        } @else {
-            h3 { "Topology" }
-            table {
-                thead { tr { th { "Node" } th { "Activity" } th { "Trigger Rule" } th { "State" } th { "Upstreams" } } }
-                tbody {
-                    @for (idx, task) in dag.definition.tasks().iter().enumerate() {
-                        tr {
-                            td {
-                                @if let Some(run_id) = selected_run {
-                                    a href={ "?run=" (run_id) "&node=" (idx) } { (idx) }
-                                } @else {
-                                    a href={ "?node=" (idx) } { (idx) }
-                                }
-                            }
-                            td { (task.activity_name.as_str()) }
-                            td { (format!("{:?}", task.trigger_rule)) }
-                            td { (dag_node_state_label(node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
-                            td {
-                                @for (n, upstream) in task.upstreams.iter().enumerate() {
-                                    @if n > 0 { ", " }
-                                    (upstream)
-                                }
-                            }
-                        }
-                    }
+        @match view {
+            DagGraphView::Classic => {
+                div class="banner Warning" {
+                    "No topology available for classic DAG runs — classic DAGs are being retired."
                 }
             }
-            @if let Some(task) = selected_task {
-                h3 { "Node panel" }
-                p { "Activity: " code { (task.activity_name.as_str()) } }
-                p { "Trigger rule: " (format!("{:?}", task.trigger_rule)) }
-                p { "Current state: " (dag_node_state_label(selected_node_state)) }
+            DagGraphView::NoRun => {
+                p class="empty" { "Select a run below to view its node graph." }
+            }
+            DagGraphView::Run { nodes, run_state } => {
+                (render_dag_run_graph_section(dag, nodes, run_state, selected_run, selected_node, dag_name))
             }
         }
         table {
@@ -4810,6 +5176,42 @@ fn render_dag_detail(
         }
     };
     layout_dag_detail(&format!("DAG {dag_name} · Vantage"), &body, "../", refresh)
+}
+
+/// Render the graph SVG + legend + optional large-DAG note + selected-node
+/// panel for a unified DAG run.
+fn render_dag_run_graph_section(
+    dag: &RegisteredDag,
+    nodes: &[DagRunNode],
+    run_state: &str,
+    selected_run: Option<uuid::Uuid>,
+    selected_node: Option<usize>,
+    dag_name: &str,
+) -> Markup {
+    let levels = dag.definition.execution_levels();
+    let upstreams: Vec<Vec<usize>> = dag
+        .definition
+        .tasks()
+        .iter()
+        .map(|task| task.upstreams.clone())
+        .collect();
+    let run_id = selected_run.unwrap_or_else(uuid::Uuid::nil);
+    let large = nodes.len() >= DAG_GRAPH_LARGE_THRESHOLD;
+    html! {
+        h3 { "Run graph" }
+        (dag_status_legend())
+        @if large {
+            p class="banner Warning" {
+                "Large DAG (" (nodes.len()) " nodes) — scroll to explore the graph below."
+            }
+        }
+        (render_dag_run_graph_svg(nodes, levels, &upstreams, selected_node, run_id))
+        @if let Some(idx) = selected_node {
+            @if let Some(node) = nodes.get(idx) {
+                (render_dag_node_panel(node, idx, run_state, dag_name, run_id))
+            }
+        }
+    }
 }
 
 fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Option<u64>) -> Markup {
@@ -4839,99 +5241,6 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
                 footer { "Read-only dashboard — autumn-harvest" }
             }
         }
-    }
-}
-
-fn map_node_states(
-    dag: &autumn_harvest::dag::DagDefinition,
-    tasks: &[TaskQueueItem],
-    condition_skipped: &std::collections::HashSet<usize>,
-) -> HashMap<usize, DagNodeState> {
-    let mut out = HashMap::new();
-    let mut has_task_row = vec![false; dag.tasks().len()];
-
-    // Seed condition-skipped nodes first (highest-priority: they have a recorded
-    // marker telling us *why* they were skipped).
-    for &idx in condition_skipped {
-        out.insert(idx, DagNodeState::SkippedByCondition);
-    }
-
-    for (idx, node) in dag.tasks().iter().enumerate() {
-        let mut state = out.get(&idx).copied().unwrap_or(DagNodeState::Unknown);
-        for task in tasks
-            .iter()
-            .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
-        {
-            has_task_row[idx] = true;
-            state = merge_dag_task_state(state, task.state.as_str());
-        }
-        out.insert(idx, state);
-    }
-
-    for level in dag.execution_levels() {
-        for idx in level {
-            // Only infer trigger-rule skips for nodes that aren't already
-            // identified as condition-skipped or have task queue rows.
-            if !has_task_row[*idx]
-                && out.get(idx).copied() == Some(DagNodeState::Unknown)
-                && let Some(state) = infer_skipped_node_state(dag, *idx, &out)
-            {
-                out.insert(*idx, state);
-            }
-        }
-    }
-
-    out
-}
-
-fn merge_dag_task_state(current: DagNodeState, task_state: &str) -> DagNodeState {
-    // A condition-skip is backed by a recorded marker; task-row inference must
-    // never overwrite it, even when a same-named node at a different index has
-    // a FAILED/RUNNING/etc row (duplicate-activity-name scenario).
-    if current == DagNodeState::SkippedByCondition {
-        return current;
-    }
-    match task_state {
-        "FAILED" => DagNodeState::Failed,
-        "CANCELLED" if !matches!(current, DagNodeState::Failed) => DagNodeState::Cancelled,
-        "RUNNING" if !matches!(current, DagNodeState::Failed | DagNodeState::Cancelled) => {
-            DagNodeState::Running
-        }
-        "PENDING" | "QUEUED" if current == DagNodeState::Unknown => DagNodeState::Queued,
-        "COMPLETED" if current == DagNodeState::Unknown => DagNodeState::Succeeded,
-        "SKIPPED" if current == DagNodeState::Unknown => DagNodeState::Skipped,
-        _ => current,
-    }
-}
-
-fn infer_skipped_node_state(
-    dag: &autumn_harvest::dag::DagDefinition,
-    node_idx: usize,
-    node_states: &HashMap<usize, DagNodeState>,
-) -> Option<DagNodeState> {
-    let node = dag.tasks().get(node_idx)?;
-    let upstream_statuses = node
-        .upstreams
-        .iter()
-        .map(|upstream_idx| {
-            node_states
-                .get(upstream_idx)
-                .copied()
-                .and_then(dag_node_terminal_status)
-        })
-        .collect::<Option<Vec<_>>>()?;
-
-    (!node.trigger_rule.should_run(upstream_statuses.iter())).then_some(DagNodeState::Skipped)
-}
-
-const fn dag_node_terminal_status(state: DagNodeState) -> Option<TaskStatus> {
-    match state {
-        DagNodeState::Succeeded => Some(TaskStatus::Succeeded),
-        DagNodeState::Failed | DagNodeState::Cancelled => Some(TaskStatus::Failed),
-        // Both skip variants count as Skipped for trigger-rule propagation so
-        // downstream AllDone/AllSuccess rules see the correct upstream status.
-        DagNodeState::Skipped | DagNodeState::SkippedByCondition => Some(TaskStatus::Skipped),
-        DagNodeState::Running | DagNodeState::Queued | DagNodeState::Unknown => None,
     }
 }
 
@@ -8021,48 +8330,6 @@ mod tests {
         );
     }
 
-    fn two_node_dag_with_downstream_rule(
-        rule: autumn_harvest::policy::TriggerRule,
-    ) -> (autumn_harvest::dag::DagDefinition, usize, usize) {
-        fn upstream_for_ui_state_test() {}
-        fn downstream_for_ui_state_test() {}
-
-        let mut builder = autumn_harvest::dag::DagBuilder::new();
-        let upstream = builder.activity(upstream_for_ui_state_test);
-        let upstream_idx = upstream.index();
-        let downstream = builder
-            .activity(downstream_for_ui_state_test)
-            .upstream(&upstream)
-            .trigger_rule(rule);
-        let downstream_idx = downstream.index();
-
-        (
-            builder.build().expect("test dag should compile"),
-            upstream_idx,
-            downstream_idx,
-        )
-    }
-
-    fn out_of_order_two_node_dag() -> (autumn_harvest::dag::DagDefinition, usize, usize) {
-        fn out_of_order_downstream_for_ui_state_test() {}
-        fn out_of_order_upstream_for_ui_state_test() {}
-
-        let mut builder = autumn_harvest::dag::DagBuilder::new();
-        let downstream = builder
-            .activity(out_of_order_downstream_for_ui_state_test)
-            .trigger_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
-        let downstream_idx = downstream.index();
-        let upstream = builder.activity(out_of_order_upstream_for_ui_state_test);
-        let upstream_idx = upstream.index();
-        let _downstream = downstream.upstream(&upstream);
-
-        (
-            builder.build().expect("test dag should compile"),
-            upstream_idx,
-            downstream_idx,
-        )
-    }
-
     fn task_queue_item_for_activity(activity_name: &str, state: &str) -> TaskQueueItem {
         let now = Utc::now();
         TaskQueueItem {
@@ -8105,54 +8372,6 @@ mod tests {
             wake_requested: false,
             session_id: None,
         }
-    }
-
-    #[test]
-    fn dag_node_state_infers_skipped_when_trigger_rule_blocks_unscheduled_node() {
-        let (dag, upstream_idx, downstream_idx) =
-            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
-        let known_states = HashMap::from([(upstream_idx, DagNodeState::Failed)]);
-
-        assert_eq!(
-            infer_skipped_node_state(&dag, downstream_idx, &known_states),
-            Some(DagNodeState::Skipped)
-        );
-    }
-
-    #[test]
-    fn dag_node_state_infers_skipped_when_upstream_declared_after_downstream() {
-        let (dag, upstream_idx, downstream_idx) = out_of_order_two_node_dag();
-        assert_eq!(
-            dag.execution_levels(),
-            &[vec![upstream_idx], vec![downstream_idx]]
-        );
-
-        let task_rows = vec![task_queue_item_for_activity(
-            dag.tasks()[upstream_idx].activity_name.as_str(),
-            "FAILED",
-        )];
-        let states = map_node_states(&dag, &task_rows, &std::collections::HashSet::new());
-
-        assert_eq!(states.get(&downstream_idx), Some(&DagNodeState::Skipped));
-    }
-
-    #[test]
-    fn dag_node_state_stays_unknown_until_upstreams_are_terminal() {
-        let (dag, _, downstream_idx) =
-            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
-
-        assert_eq!(
-            infer_skipped_node_state(&dag, downstream_idx, &HashMap::new()),
-            None
-        );
-    }
-
-    #[test]
-    fn dag_task_state_cancelled_is_terminal() {
-        assert_eq!(
-            merge_dag_task_state(DagNodeState::Unknown, "CANCELLED"),
-            DagNodeState::Cancelled
-        );
     }
 
     #[test]
@@ -8764,77 +8983,12 @@ mod tests {
         );
     }
 
-    // ── Issue #482 — DagNodeState label and condition-skip inference ──────────
-
-    #[test]
-    fn dag_node_state_label_distinguishes_skip_variants() {
-        assert_eq!(
-            dag_node_state_label(DagNodeState::Skipped),
-            "Skipped (upstream)"
-        );
-        assert_eq!(
-            dag_node_state_label(DagNodeState::SkippedByCondition),
-            "Skipped (condition)"
-        );
-        assert_eq!(dag_node_state_label(DagNodeState::Succeeded), "Succeeded");
-        assert_eq!(dag_node_state_label(DagNodeState::Unknown), "Unknown");
-    }
-
-    #[test]
-    fn parse_dag_skip_marker_index_matches_prefix() {
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:3"), Some(3));
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:0"), Some(0));
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:42"), Some(42));
-        assert_eq!(parse_dag_skip_marker_index("fan_out:3"), None);
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:"), None);
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:abc"), None);
-    }
-
-    #[test]
-    fn dag_node_terminal_status_treats_both_skip_variants_as_skipped() {
-        assert_eq!(
-            dag_node_terminal_status(DagNodeState::Skipped),
-            Some(autumn_harvest::policy::TaskStatus::Skipped),
-        );
-        assert_eq!(
-            dag_node_terminal_status(DagNodeState::SkippedByCondition),
-            Some(autumn_harvest::policy::TaskStatus::Skipped),
-        );
-    }
-
-    #[test]
-    fn map_node_states_seeds_condition_skipped_nodes() {
-        use autumn_harvest::DagBuilder;
-
-        fn dummy() {}
-        fn dummy2() {}
-
-        let mut builder = DagBuilder::new();
-        let a = builder.activity(dummy);
-        let _b = builder.activity(dummy2).upstream(&a);
-        let dag = builder.build().unwrap();
-
-        let mut condition_skipped = std::collections::HashSet::new();
-        condition_skipped.insert(1usize); // task idx 1 condition-skipped
-
-        let states = map_node_states(&dag, &[], &condition_skipped);
-        assert_eq!(
-            states.get(&1),
-            Some(&DagNodeState::SkippedByCondition),
-            "condition-skipped node must be SkippedByCondition"
-        );
-        // SkippedByCondition is still Skipped for terminal status → AllSuccess
-        // downstream stays Skipped (trigger-rule inference), not SkippedByCondition.
-        assert_eq!(
-            states.get(&0),
-            Some(&DagNodeState::Unknown),
-            "root with no task rows should remain Unknown"
-        );
-    }
-
     // ── Issue #957 — DAG run graph rendering (consumes dag_graph::build_run_graph) ──
+    // `DagNodeStatus`/`DagRunNode`/`build_run_graph` come in via `super::*`
+    // (the module-level `use crate::dag_graph::…`); only `DagNodeKind` is
+    // test-only.
 
-    use crate::dag_graph::{DagNodeKind, DagNodeStatus, DagRunNode};
+    use crate::dag_graph::DagNodeKind;
 
     const ALL_DAG_NODE_STATUSES: [DagNodeStatus; 8] = [
         DagNodeStatus::Succeeded,
@@ -8875,7 +9029,11 @@ mod tests {
             );
         }
         let unique: std::collections::HashSet<&&str> = fills.iter().collect();
-        assert_eq!(unique.len(), 8, "each status must have a distinct fill: {fills:?}");
+        assert_eq!(
+            unique.len(),
+            8,
+            "each status must have a distinct fill: {fills:?}"
+        );
     }
 
     // P2
@@ -8889,7 +9047,11 @@ mod tests {
             assert!(!icon.is_empty(), "icon must be non-empty");
         }
         let unique: std::collections::HashSet<&&str> = icons.iter().collect();
-        assert_eq!(unique.len(), 8, "each status must have a distinct glyph: {icons:?}");
+        assert_eq!(
+            unique.len(),
+            8,
+            "each status must have a distinct glyph: {icons:?}"
+        );
     }
 
     // P3
@@ -8907,7 +9069,11 @@ mod tests {
             assert!(!label.is_empty(), "label must be non-empty");
         }
         let unique: std::collections::HashSet<&&str> = labels.iter().collect();
-        assert_eq!(unique.len(), 8, "each status must have a distinct label: {labels:?}");
+        assert_eq!(
+            unique.len(),
+            8,
+            "each status must have a distinct label: {labels:?}"
+        );
     }
 
     // P4
@@ -8989,11 +9155,7 @@ mod tests {
     // P8
     #[test]
     fn render_dag_run_graph_svg_escapes_node_names() {
-        let nodes = vec![dag_run_node(
-            "<b>evil</b>",
-            DagNodeStatus::Failed,
-            vec![],
-        )];
+        let nodes = vec![dag_run_node("<b>evil</b>", DagNodeStatus::Failed, vec![])];
         let svg = render_dag_run_graph_svg(&nodes, &[vec![0]], &[vec![]], None, uuid::Uuid::nil())
             .into_string();
         assert!(

@@ -2141,26 +2141,31 @@ struct DagRetryRequest {
 }
 
 /// Response body for a committed or dry-run DAG retry.
+///
+/// `pub(crate)` (with `pub(crate)` fields) so the Vantage UI retry flow
+/// (`crate::ui`) can consume the same value the extracted `retry_dag_run_inner`
+/// returns, rendering `nodes_to_re_execute` in the confirmation dialog and
+/// `new_run_exec_id` in the success flash.
 #[derive(Debug, Serialize)]
-struct DagRetryResponse {
+pub(crate) struct DagRetryResponse {
     /// `true` when this was a dry run (no write performed).
-    dry_run: bool,
+    pub(crate) dry_run: bool,
     /// The DAG name.
-    dag_name: String,
+    pub(crate) dag_name: String,
     /// The source DAG run execution id.
-    source_run_exec_id: String,
+    pub(crate) source_run_exec_id: String,
     /// The resolved 0-based reset event id passed to the #148 reset primitive.
-    reset_to_event_id: i64,
+    pub(crate) reset_to_event_id: i64,
     /// Nodes that will (re-)execute on the new run, sorted.
-    nodes_to_re_execute: Vec<String>,
+    pub(crate) nodes_to_re_execute: Vec<String>,
     /// Nodes whose recorded results are carried over, sorted.
-    nodes_carried_over: Vec<String>,
+    pub(crate) nodes_carried_over: Vec<String>,
     /// The new (forked) DAG run execution id. `None` for a dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    new_run_exec_id: Option<String>,
+    pub(crate) new_run_exec_id: Option<String>,
     /// Number of carried-over events on the new run. `None` for a dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    events_carried_over: Option<usize>,
+    pub(crate) events_carried_over: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16260,7 +16265,103 @@ fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// A DAG-retry failure, shared by the HTTP handler (which maps it back to the
+/// exact #366 rich response bodies, byte-for-byte, via [`into_http_response`])
+/// and the Vantage UI (which renders [`human_message`] as an operator flash).
+/// The mutation flow — state gating, resolve, dry-run preview, commit, and
+/// audit — lives once in [`retry_dag_run_inner`]; both surfaces call it.
+///
+/// [`into_http_response`]: DagRetryFailure::into_http_response
+/// [`human_message`]: DagRetryFailure::human_message
+#[derive(Debug)]
+pub(crate) enum DagRetryFailure {
+    /// A `400` with a plain `{message}` body (empty `reason`/`operator_id`; classic DAG).
+    BadRequest(String),
+    /// A `404` (unknown DAG; run not a run of this DAG).
+    NotFound(String),
+    /// A `409` with a plain `{message}` body (COMPLETED/RUNNING/SUSPENDED/other).
+    StateConflict(String),
+    /// The resolver rejected the node request (rich `400`).
+    Resolve(crate::dag_retry::DagRetryResolveError),
+    /// The reset primitive rejected the fork (rich `409`/`400`).
+    Reset(WorkflowResetError),
+    /// The fork committed but the audit insert failed (`503`).
+    AuditFailed(String),
+    /// A pass-through `AutumnError` (runtime not started, malformed id, DB conn,
+    /// load failure) — already mapped to its HTTP form by the inner fn.
+    Other(AutumnError),
+}
+
+impl DagRetryFailure {
+    /// A human-readable, non-empty message for operator surfaces (the Vantage UI
+    /// flash). Never raw JSON.
+    pub(crate) fn human_message(&self) -> String {
+        use crate::dag_retry::DagRetryResolveError as R;
+        match self {
+            Self::BadRequest(m)
+            | Self::NotFound(m)
+            | Self::StateConflict(m)
+            | Self::AuditFailed(m) => m.clone(),
+            Self::Resolve(e) => match e {
+                R::EmptyFromNodes => {
+                    "from_nodes must be a non-empty array of declared DAG node names".to_string()
+                }
+                R::UnknownNodes { unknown, declared } => {
+                    format!("unknown node(s) {unknown:?}; the DAG declares: {declared:?}")
+                }
+                R::AmbiguousNodes { nodes } => format!(
+                    "node name(s) {nodes:?} map to more than one task (the DAG reuses the \
+                     activity); retry-from-node cannot disambiguate them in v1"
+                ),
+                R::NotAttempted { nodes } => {
+                    format!("node(s) {nodes:?} were never attempted on this run; nothing to retry")
+                }
+                R::AlreadySucceeded { nodes } => {
+                    format!("node(s) {nodes:?} already succeeded; use DAG re-run for a fresh run")
+                }
+                R::NoSchedulePoint => {
+                    "could not resolve a reset point for the requested nodes".to_string()
+                }
+            },
+            Self::Reset(e) => match e {
+                WorkflowResetError::InvalidPoint(invalid) => format!(
+                    "reset boundary at event {} falls inside an unresolved side effect \
+                     ({} open); wait for it to settle or cancel the run first, then retry",
+                    invalid.reset_to_event_id,
+                    invalid.unresolved_side_effects.len()
+                ),
+                other => other.to_string(),
+            },
+            Self::Other(e) => e.to_string(),
+        }
+    }
+
+    /// Map back to the exact #366 HTTP response bodies (preserving the shipped
+    /// wire contract byte-for-byte).
+    fn into_http_response(self) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        match self {
+            Self::BadRequest(message) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ResetErrorResponse { message }),
+            )
+                .into_response(),
+            Self::NotFound(message) => AutumnError::not_found_msg(message).into_response(),
+            Self::StateConflict(message) => (
+                axum::http::StatusCode::CONFLICT,
+                Json(ResetErrorResponse { message }),
+            )
+                .into_response(),
+            Self::Resolve(e) => dag_retry_resolve_error_response(e),
+            Self::Reset(e) => dag_retry_reset_error_response(e),
+            Self::AuditFailed(message) => {
+                AutumnError::service_unavailable_msg(message).into_response()
+            }
+            Self::Other(e) => e.into_response(),
+        }
+    }
+}
+
 async fn retry_dag_run(
     Extension(api_state): Extension<HarvestApiState>,
     Path((dag_name, run_exec_id)): Path<(String, String)>,
@@ -16269,18 +16370,60 @@ async fn retry_dag_run(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dags/{dag_name}/runs/{run_exec_id}/retry";
+    match retry_dag_run_inner(
+        &api_state,
+        &dag_name,
+        &run_exec_id,
+        &headers,
+        request.from_nodes,
+        request.reason,
+        request.operator_id,
+        request.dry_run,
+        route,
+        None,
+    )
+    .await
+    {
+        Ok(resp) => {
+            let status = if resp.dry_run {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::CREATED
+            };
+            (status, Json(resp)).into_response()
+        }
+        Err(failure) => failure.into_http_response(),
+    }
+}
+
+/// Shared implementation behind the classic HTTP retry route (`retry_dag_run`,
+/// passing `source_override = None` so the audit `source` is header-derived) and
+/// the Vantage UI retry flow (`crate::ui`, passing `Some(SOURCE_UI)` plus a
+/// distinct `route` label). The state gate, resolve, dry-run preview, commit,
+/// and audit all live here so the two surfaces can never drift, mirroring the
+/// `trigger_dag_run` -> `trigger_dag_run_inner` precedent.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn retry_dag_run_inner(
+    api_state: &HarvestApiState,
+    dag_name: &str,
+    run_exec_id: &str,
+    headers: &axum::http::HeaderMap,
+    from_nodes: Vec<String>,
+    reason: String,
+    operator_id: String,
+    dry_run: bool,
+    route: &'static str,
+    source_override: Option<&str>,
+) -> Result<DagRetryResponse, DagRetryFailure> {
+    let (actor, header_source, request_id) = audit_context(headers, api_state);
+    let source = source_override.map_or(header_source, ToString::to_string);
 
     // Required audit fields.
-    if request.reason.trim().is_empty() || request.operator_id.trim().is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ResetErrorResponse {
-                message: "`reason` and `operator_id` are required".to_string(),
-            }),
-        )
-            .into_response();
+    if reason.trim().is_empty() || operator_id.trim().is_empty() {
+        return Err(DagRetryFailure::BadRequest(
+            "`reason` and `operator_id` are required".to_string(),
+        ));
     }
 
     // `operator_id` is the mandatory, authoritative "who" for this endpoint, so
@@ -16289,54 +16432,41 @@ async fn retry_dag_run(
     // default). This keeps committed retries attributable instead of recording
     // `anonymous` when the runbook curl / CLI only sets `operator_id`.
     let actor = if actor == "anonymous" {
-        request.operator_id.trim().to_string()
+        operator_id.trim().to_string()
     } else {
         actor
     };
 
-    let runtime = match api_state.runtime() {
-        Ok(rt) => rt,
-        Err(e) => return map_error(e).into_response(),
-    };
+    let runtime = api_state
+        .runtime()
+        .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
 
     // Resolve the DAG by name; reject classic (non-unified) DAGs.
-    let Some(dag) = runtime.dags().get(&dag_name).cloned() else {
-        return AutumnError::not_found_msg(format!("DAG '{dag_name}' is not registered"))
-            .into_response();
+    let Some(dag) = runtime.dags().get(dag_name).cloned() else {
+        return Err(DagRetryFailure::NotFound(format!(
+            "DAG '{dag_name}' is not registered"
+        )));
     };
     if !dag.is_unified {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ResetErrorResponse {
-                message: format!(
-                    "DAG '{dag_name}' is a classic (non-unified) DAG; retry-from-node is only \
-                     supported for unified DAGs (see issue #256 step 5). Classic DAGs are being retired."
-                ),
-            }),
-        )
-            .into_response();
+        return Err(DagRetryFailure::BadRequest(format!(
+            "DAG '{dag_name}' is a classic (non-unified) DAG; retry-from-node is only \
+             supported for unified DAGs (see issue #256 step 5). Classic DAGs are being retired."
+        )));
     }
 
-    let exec_id = match parse_execution_id(&run_exec_id) {
-        Ok(eid) => eid,
-        Err(e) => return e.into_response(),
-    };
-
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
-        Ok(conn) => conn,
-        Err(e) => return e.into_response(),
-    };
+    let exec_id = parse_execution_id(run_exec_id).map_err(DagRetryFailure::Other)?;
+    let mut conn = db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(DagRetryFailure::Other)?;
 
     // Load the source run and verify it belongs to this DAG.
-    let execution = match load_execution(&mut conn, exec_id).await {
-        Ok(ex) => ex,
-        Err(e) => return map_error(e).into_response(),
-    };
+    let execution = load_execution(&mut conn, exec_id)
+        .await
+        .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
     if execution.workflow_name != dag_name {
-        return AutumnError::not_found_msg(format!(
+        return Err(DagRetryFailure::NotFound(format!(
             "execution {exec_id} is not a run of DAG '{dag_name}'"
-        ))
-        .into_response();
+        )));
     }
 
     // Source-state gating (issue #366):
@@ -16347,33 +16477,20 @@ async fn retry_dag_run(
     match execution.state.as_str() {
         "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
         "COMPLETED" => {
-            return (
-                axum::http::StatusCode::CONFLICT,
-                Json(ResetErrorResponse {
-                    message: "DAG run succeeded; use the schedule trigger-now / start endpoint \
-                              for a fresh run"
-                        .to_string(),
-                }),
-            )
-                .into_response();
+            return Err(DagRetryFailure::StateConflict(
+                "DAG run succeeded; use the schedule trigger-now / start endpoint for a fresh run"
+                    .to_string(),
+            ));
         }
         "RUNNING" | "SUSPENDED" => {
-            return (
-                axum::http::StatusCode::CONFLICT,
-                Json(ResetErrorResponse {
-                    message: "DAG run is still running; cancel it first, then retry".to_string(),
-                }),
-            )
-                .into_response();
+            return Err(DagRetryFailure::StateConflict(
+                "DAG run is still running; cancel it first, then retry".to_string(),
+            ));
         }
         other => {
-            return (
-                axum::http::StatusCode::CONFLICT,
-                Json(ResetErrorResponse {
-                    message: format!("DAG run is in state {other}; cannot retry"),
-                }),
-            )
-                .into_response();
+            return Err(DagRetryFailure::StateConflict(format!(
+                "DAG run is in state {other}; cannot retry"
+            )));
         }
     }
 
@@ -16386,53 +16503,42 @@ async fn retry_dag_run(
     // an incompatible deploy, the worker that replays the fork may run a
     // different definition than the one used to pick the cut. v1 does not gate on
     // build compatibility; see docs/runbooks/dag-retry-from-failed-node.md.
-    let history = match store::load_history(&mut conn, exec_id).await {
-        Ok(h) => h,
-        Err(e) => return map_error(e).into_response(),
-    };
-    let plan = match crate::dag_retry::resolve_retry_plan(
-        &dag.definition,
-        &history.events,
-        &request.from_nodes,
-    ) {
-        Ok(plan) => plan,
-        Err(e) => return dag_retry_resolve_error_response(e),
-    };
+    let history = store::load_history(&mut conn, exec_id)
+        .await
+        .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
+    let plan = crate::dag_retry::resolve_retry_plan(&dag.definition, &history.events, &from_nodes)
+        .map_err(DagRetryFailure::Resolve)?;
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
     let augmented_reason = format!(
         "{} | dag_retry: nodes=[{}]",
-        request.reason.trim(),
-        request.from_nodes.join(",")
+        reason.trim(),
+        from_nodes.join(",")
     );
     let reset_request = WorkflowResetRequest {
         reset_to_event_id: Some(plan.reset_to_event_id),
         reset_point: None,
         reason: augmented_reason,
-        operator_id: request.operator_id.trim().to_string(),
+        operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
-    if request.dry_run {
+    if dry_run {
         return match preview_workflow_reset(&mut conn, exec_id, reset_request).await {
-            Ok(_reset_plan) => (
-                axum::http::StatusCode::OK,
-                Json(DagRetryResponse {
-                    dry_run: true,
-                    dag_name: dag_name.clone(),
-                    source_run_exec_id: exec_id.to_string(),
-                    reset_to_event_id: plan.reset_to_event_id,
-                    nodes_to_re_execute: plan.nodes_to_re_execute,
-                    nodes_carried_over: plan.nodes_carried_over,
-                    new_run_exec_id: None,
-                    events_carried_over: None,
-                }),
-            )
-                .into_response(),
-            Err(error) => dag_retry_reset_error_response(error),
+            Ok(_reset_plan) => Ok(DagRetryResponse {
+                dry_run: true,
+                dag_name: dag_name.to_string(),
+                source_run_exec_id: exec_id.to_string(),
+                reset_to_event_id: plan.reset_to_event_id,
+                nodes_to_re_execute: plan.nodes_to_re_execute,
+                nodes_carried_over: plan.nodes_carried_over,
+                new_run_exec_id: None,
+                events_carried_over: None,
+            }),
+            Err(error) => Err(DagRetryFailure::Reset(error)),
         };
     }
 
@@ -16446,7 +16552,7 @@ async fn retry_dag_run(
                 actor: &actor,
                 operation: OP_DAG_RETRY,
                 target_type: TARGET_DAG,
-                target_id: Some(dag_name.as_str()),
+                target_id: Some(dag_name),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -16457,25 +16563,20 @@ async fn retry_dag_run(
             };
             if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
                 tracing::error!(error = %audit_err, new_exec_id = %new_exec_id_str, "audit insert failed for dag.retry");
-                return AutumnError::service_unavailable_msg(format!(
+                return Err(DagRetryFailure::AuditFailed(format!(
                     "audit insert failed: {audit_err}"
-                ))
-                .into_response();
+                )));
             }
-            (
-                axum::http::StatusCode::CREATED,
-                Json(DagRetryResponse {
-                    dry_run: false,
-                    dag_name: dag_name.clone(),
-                    source_run_exec_id: exec_id_str,
-                    reset_to_event_id: result.reset_to_event_id,
-                    nodes_to_re_execute: plan.nodes_to_re_execute,
-                    nodes_carried_over: plan.nodes_carried_over,
-                    new_run_exec_id: Some(new_exec_id_str),
-                    events_carried_over: Some(result.events_carried_over),
-                }),
-            )
-                .into_response()
+            Ok(DagRetryResponse {
+                dry_run: false,
+                dag_name: dag_name.to_string(),
+                source_run_exec_id: exec_id_str,
+                reset_to_event_id: result.reset_to_event_id,
+                nodes_to_re_execute: plan.nodes_to_re_execute,
+                nodes_carried_over: plan.nodes_carried_over,
+                new_run_exec_id: Some(new_exec_id_str),
+                events_carried_over: Some(result.events_carried_over),
+            })
         }
         Err(error) => {
             let err_str = format!("{error:?}");
@@ -16483,7 +16584,7 @@ async fn retry_dag_run(
                 actor: &actor,
                 operation: OP_DAG_RETRY,
                 target_type: TARGET_DAG,
-                target_id: Some(dag_name.as_str()),
+                target_id: Some(dag_name),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -16493,7 +16594,7 @@ async fn retry_dag_run(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            dag_retry_reset_error_response(error)
+            Err(DagRetryFailure::Reset(error))
         }
     }
 }

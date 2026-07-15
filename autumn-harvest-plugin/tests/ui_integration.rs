@@ -10,12 +10,12 @@ use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::prelude::{ActivityContext, activities, activity, dag, dags, workflows};
 use autumn_harvest::scheduler::{RegisteredDag, SchedulerMonitor, compile_dag_catalog};
-use autumn_harvest::store;
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_task_queue, harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::shard::ShardedDbPool;
+use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -3507,7 +3507,7 @@ async fn dag957_step_d(_ctx: &ActivityContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Linear: dag957_step_a -> dag957_step_b -> dag957_step_c
+/// Linear: `dag957_step_a` -> `dag957_step_b` -> `dag957_step_c`
 #[dag(default_queue = "default")]
 fn dag957_linear(dag: &mut DagBuilder) {
     let a = dag.activity(dag957_step_a);
@@ -3625,7 +3625,7 @@ fn dag957_started(id: autumn_harvest::ActivityExecId) -> autumn_harvest::Workflo
         worker_id: autumn_harvest::types::WorkerId::new("worker-1"),
     }
 }
-fn dag957_completed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+const fn dag957_completed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
     autumn_harvest::WorkflowEvent::ActivityCompleted {
         activity_id: id,
         output: Value::Null,
@@ -3780,7 +3780,10 @@ async fn ui_dag_run_graph_node_panel_shows_failure_detail() {
     assert_eq!(status, StatusCode::OK, "body: {html}");
     assert!(html.contains("S3Error"), "error_type shown: {html}");
     assert!(html.contains("transient S3 500"), "first-line error shown");
-    assert!(html.contains("/retry"), "retry link offered for the failed node");
+    assert!(
+        html.contains("/retry"),
+        "retry link offered for the failed node"
+    );
     assert!(html.contains("from_node=dag957_step_b"));
 }
 
@@ -3812,8 +3815,14 @@ async fn ui_dag_retry_confirm_lists_widened_nodes() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {html}");
     // Retrying from b widens to b + its downstream closure (c).
-    assert!(html.contains("dag957_step_b"), "widened list names the source node");
-    assert!(html.contains("dag957_step_c"), "widened list names the downstream node");
+    assert!(
+        html.contains("dag957_step_b"),
+        "widened list names the source node"
+    );
+    assert!(
+        html.contains("dag957_step_c"),
+        "widened list names the downstream node"
+    );
     assert!(html.contains("reason"), "reason field present");
     assert!(
         html.to_lowercase().contains("confirm"),
@@ -3853,7 +3862,10 @@ async fn ui_dag_retry_commit_starts_new_run_and_audits() {
         .get("location")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    assert!(location.contains("flash="), "redirect carries a flash: {location}");
+    assert!(
+        location.contains("flash="),
+        "redirect carries a flash: {location}"
+    );
 
     // Audit row written under OP_DAG_RETRY with source=ui.
     let count = dag957_audit_rows(
@@ -3877,7 +3889,9 @@ async fn ui_dag_retry_error_renders_human_message() {
         dag957_sched("dag957_step_a", ia),
         dag957_started(ia),
         dag957_completed(ia),
-        autumn_harvest::WorkflowEvent::WorkflowCompleted { output: Value::Null },
+        autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
     ];
     let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-done", events, "COMPLETED").await;
 
@@ -3958,7 +3972,11 @@ async fn ui_dag_run_graph_unknown_run_falls_back() {
         &url,
         "dag957_linear",
         "graph-fallback",
-        vec![dag957_sched("dag957_step_a", ia), dag957_started(ia), dag957_completed(ia)],
+        vec![
+            dag957_sched("dag957_step_a", ia),
+            dag957_started(ia),
+            dag957_completed(ia),
+        ],
         "RUNNING",
     )
     .await;
