@@ -162,6 +162,105 @@ async fn a_successful_body_under_a_generous_deadline_completes_normally() {
     );
 }
 
+// ── FINALIZE-TIME recheck: a SUCCESSFUL body finalized past the total deadline ──────
+//
+// The pre-body claim check enforces `schedule_to_close` against the cycle-start clock,
+// but the total (cross-retry) deadline can elapse WHILE the body runs. A body that
+// starts just before its cap and returns `Ok` after it must NOT be finalized as
+// `ActivityCompleted` past the declared cap. The Postgres backend enforces this via its
+// background timeout scanner (a RUNNING activity past its cap is timed out and its late
+// completion loses the race); this scanner-less backend must recheck the deadline inline
+// at finalize time. Codex #1069 P2, `worker.rs:211`.
+//
+// Driven deterministically (no real sleeping) via an injectable clock the body advances:
+// the runtime's clock and the activity body share an `AtomicI64`. The body advances it
+// 5s past the 1s deadline BEFORE returning `Ok`, so the cycle-start read (t0 < t0+1s)
+// lets the body run while the post-body finalize read (t0+5s) is past the total cap.
+#[activity(schedule_to_close = "1s")]
+async fn slow_but_succeeds(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[workflow]
+async fn slow_success_wf(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    match ctx
+        .execute_activity::<_, i64>(&slow_but_succeeds_info(), n)
+        .await
+    {
+        Ok(_) => Ok("completed".to_string()),
+        // A schedule-to-close timeout surfaces (like start-to-close) as
+        // HarvestError::Timeout — the workflow drives its own timeout branch.
+        Err(HarvestError::Timeout { .. }) => Ok("sched_timed_out".to_string()),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+// RED pre-fix: `drain_ready` had no finalize-time recheck, so a body that succeeded past
+// its total deadline recorded `ActivityCompleted` and the workflow completed "completed".
+#[tokio::test]
+async fn a_successful_body_finalized_past_the_total_deadline_records_timed_out_not_completed() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&slow_success_wf_info());
+
+    // A shared, injectable clock (epoch-millis). Both the runtime driver and the
+    // activity body read/advance it, so the deadline elapses WHILE the body runs with
+    // no real-time sleeping.
+    let t0: i64 = 5_000_000_000;
+    let clock = Arc::new(AtomicI64::new(t0));
+    let clock_for_rt = Arc::clone(&clock);
+    rt.set_clock(move || {
+        DateTime::from_timestamp_millis(clock_for_rt.load(Ordering::SeqCst)).unwrap()
+    });
+
+    // The body SUCCEEDS but advances the shared clock 5s past the 1s deadline BEFORE
+    // returning: the pre-body claim check (cycle now = t0 < t0+1s) lets it run, yet the
+    // post-body finalize clock (t0+5s) has passed the total cap.
+    let clock_for_body = Arc::clone(&clock);
+    rt.register_activity(&slow_but_succeeds_info(), move |input| {
+        clock_for_body.store(t0 + 5_000, Ordering::SeqCst);
+        Ok(input)
+    });
+
+    let exec = rt.start_workflow("slow_success_wf", json!(7)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "sched_timed_out"),
+        "the workflow must observe the finalize-time schedule-to-close timeout, got {state:?}"
+    );
+
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: TimeoutType::ScheduleToClose,
+                ..
+            }
+        )),
+        "a SUCCESSFUL body finalized past its total deadline must record a terminal \
+         ActivityTimedOut {{ ScheduleToClose }}:\n{history:?}"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        "the late success must NOT record ActivityCompleted (RED pre-fix):\n{history:?}"
+    );
+
+    // The timed-out history replays byte-identically on the core engine.
+    let report = WorkflowReplayer::new()
+        .register_fn("slow_success_wf", slow_success_wf_info().handler)
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a finalize-time ScheduleToClose history must replay cleanly on the core:\n{report}"
+    );
+}
+
 // ── REJECTED at registration (setup-time panic, naming the feature) ────────────────
 
 #[activity(heartbeat_timeout = "10s")]

@@ -208,6 +208,37 @@ pub fn drain_ready(
         // #1069 P2, `worker.rs:328`). A policy retry's backoff is measured from
         // THIS instant, not the pre-body cycle `now`.
         let finalize_now = failure_now();
+
+        // Recheck the TOTAL (cross-retry) schedule-to-close deadline at FINALIZE
+        // time, for a body that SUCCEEDED (issue #378, Codex #1069 P2
+        // `worker.rs:211`). The pre-body check above used the cycle-start `now`; the
+        // absolute deadline may have ELAPSED WHILE the body ran — a body that started
+        // just before its cap and returned `Ok` after it, or whose deadline expired
+        // mid-run. Left only to the normal finalize path, such a success would record
+        // `ActivityCompleted` PAST the declared total cap. This scanner-less backend
+        // enforces `schedule_to_close` entirely inline, so the pre-body check is not
+        // enough — nothing else re-checks the deadline once the body returns. The
+        // Postgres backend enforces it on a RUNNING activity via its background
+        // timeout scanner (`find_timed_out_tasks` with `TimeoutReason::ScheduleToClose`
+        // over RUNNING/PENDING), so a body that runs past the cap is timed out there
+        // and its late completion LOSES the race against `complete` (which finds the
+        // task no longer RUNNING and no-ops). Mirror that here: when the POST-BODY
+        // `finalize_now` (NOT the cycle-start `now`) has reached the absolute deadline,
+        // seal terminal `ActivityTimedOut { ScheduleToClose }` through the SAME
+        // `finalize_activity_timeout` path the pre-body check uses — byte-equivalent to
+        // the Postgres scanner's `ActivityTimedOut` + `fail_task` (terminal, NOT
+        // retried; the workflow observes `HistoryMatch::TimedOut` and drives its own
+        // branch). Scoped to a SUCCESS: a FAILED body is left to the retry path in
+        // `finalize_within_tx`, which already enforces the deadline against the next
+        // attempt's `run_at`. The body already ran (at-least-once, side effect done
+        // once) — we only CHOOSE which terminal event to record, exactly as the
+        // Postgres scanner does when it wins the race against a completing activity.
+        if result.is_ok() && schedule_to_close_exceeded(finalize_now, task.schedule_to_close_at) {
+            finalize_activity_timeout(conn, exec_id, &task, TimeoutType::ScheduleToClose)?;
+            produced = true;
+            continue;
+        }
+
         if finalize_activity_result(
             conn,
             exec_id,
@@ -711,12 +742,48 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        finalize_within_tx, fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
-        ingest_awaited_signal, is_signal_timeout_deadline_timer,
+        drain_ready, finalize_within_tx, fire_timer, fire_timer_within_tx,
+        handler_panic_activity_envelope, ingest_awaited_signal, is_signal_timeout_deadline_timer,
         payload_too_large_activity_envelope, schedule_to_close_exceeded, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
+    use crate::runtime::ActivitySpec;
     use crate::{schema, store};
+
+    /// A `PENDING`, immediately-claimable activity task enqueued at
+    /// `scheduled_at == run_at == 0` — the raw seed for [`drain_ready`] tests (unlike
+    /// [`seed_running_task`], which pre-flips the row to `RUNNING` and hand-builds a
+    /// `ClaimedTask`). `drain_ready` claims it, resolves `schedule_to_close_at` from
+    /// the registered spec, runs the body, and finalizes — so a finalize-time recheck
+    /// exercises the real path end to end.
+    fn seed_pending_activity(conn: &Connection, exec: ExecutionId, name: &str) {
+        queue::enqueue_activity(
+            conn,
+            exec,
+            ActivityExecId::new(),
+            name,
+            &serde_json::json!({}),
+            "default",
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// An `ActivitySpec` with a declared total (cross-retry) `schedule_to_close` of
+    /// `deadline_ms` and a body running `body`. Sets the `pub(crate)` field the
+    /// info-based `register_activity` would otherwise populate (the hand-made
+    /// [`ActivitySpec::new`] leaves it `None`).
+    fn spec_with_schedule_to_close(
+        deadline_ms: u64,
+        body: impl Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
+    ) -> ActivitySpec {
+        let mut spec = ActivitySpec::new(1, body);
+        spec.schedule_to_close = Some(Duration::from_millis(deadline_ms));
+        spec
+    }
 
     /// Requeue `run_at` (epoch-ms) of the single task after one retryable failure,
     /// finalized with a distinct cycle-start `now` and failure-time `failure_now`
@@ -1311,6 +1378,93 @@ mod tests {
                 autumn_harvest::WorkflowEvent::ActivityCompleted { .. }
             ),
             "an under-cap result completes normally"
+        );
+    }
+
+    // Codex #1069 P2 (`worker.rs:211`): a body that SUCCEEDS but whose FINALIZE clock
+    // has reached the total schedule-to-close deadline is sealed terminal
+    // `ActivityTimedOut { ScheduleToClose }` — NOT `ActivityCompleted`. The pre-body
+    // check passed (cycle `now = 0 < deadline = 1000`, so the body ran) but the
+    // post-body `failure_now` (1500) is at/past the absolute deadline. This is the
+    // scanner-less backend's inline analog of the Postgres timeout scanner catching a
+    // RUNNING activity past its `schedule_to_close` cap: the late completion loses the
+    // race (`complete` finds the row no longer RUNNING and no-ops). The two-valued
+    // clock seam is exactly what a real wall-clock cycle observes when the deadline
+    // elapses WHILE the body runs.
+    //
+    // RED pre-fix: `drain_ready` had no finalize-time recheck, so the successful result
+    // was finalized as `ActivityCompleted` past the declared total cap.
+    #[test]
+    fn drain_ready_seals_schedule_to_close_when_deadline_elapses_during_a_successful_body() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        // scheduled_at == run_at == 0 → resolved absolute deadline = 0 + 1000ms = 1000.
+        seed_pending_activity(&conn, exec, "act");
+
+        let mut activities = std::collections::HashMap::new();
+        activities.insert("act".to_string(), spec_with_schedule_to_close(1_000, Ok));
+
+        // Cycle-start now = 0 (< deadline 1000 → pre-body check passes, body runs);
+        // post-body finalize clock = 1500 (>= deadline → finalize recheck seals the
+        // timeout).
+        let failure_now = || 1_500_i64;
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        assert!(produced, "a terminal timeout event was appended");
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert!(
+            history.iter().any(|e| matches!(
+                e,
+                autumn_harvest::WorkflowEvent::ActivityTimedOut {
+                    timeout_type: autumn_harvest::TimeoutType::ScheduleToClose,
+                    ..
+                }
+            )),
+            "a body finalized past its total deadline must seal ActivityTimedOut \
+             {{ ScheduleToClose }}:\n{history:?}"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|e| matches!(e, autumn_harvest::WorkflowEvent::ActivityCompleted { .. })),
+            "the late success must NOT record ActivityCompleted (RED pre-fix):\n{history:?}"
+        );
+        let task_state: String = conn
+            .query_row("SELECT state FROM harvest_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            task_state, "DONE",
+            "the timed-out task is terminal (not requeued)"
+        );
+    }
+
+    // Control: a body that SUCCEEDS whose finalize clock is still BEFORE the total
+    // deadline completes normally. The finalize-time recheck only diverts a LATE
+    // success; an on-time one keeps the common path byte-identical.
+    #[test]
+    fn drain_ready_completes_a_successful_body_finalized_before_the_deadline() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        seed_pending_activity(&conn, exec, "act");
+
+        let mut activities = std::collections::HashMap::new();
+        activities.insert("act".to_string(), spec_with_schedule_to_close(1_000, Ok));
+
+        // finalize clock = 500 < deadline 1000 → normal completion.
+        let failure_now = || 500_i64;
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        assert!(produced);
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1, "exactly one terminal event");
+        assert!(
+            matches!(
+                history[0],
+                autumn_harvest::WorkflowEvent::ActivityCompleted { .. }
+            ),
+            "an under-deadline success completes normally:\n{history:?}"
         );
     }
 }
