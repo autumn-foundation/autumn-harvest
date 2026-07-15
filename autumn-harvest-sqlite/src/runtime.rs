@@ -408,6 +408,13 @@ impl SqliteRuntime {
     /// Postgres `StartWorkflowParams.workflow_id`), use
     /// [`start_workflow_with_id`](Self::start_workflow_with_id).
     ///
+    /// Every call starts a new, independent execution. Because the default
+    /// `workflow_id` is derived from a fresh [`ExecutionId`], id reuse cannot even
+    /// arise here; the v0.1 non-idempotent start contract (no
+    /// `(workflow_name, workflow_id)` uniqueness / no reuse-policy matrix) is
+    /// documented in full on
+    /// [`start_workflow_with_id`](Self::start_workflow_with_id).
+    ///
     /// # Errors
     ///
     /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
@@ -431,6 +438,28 @@ impl SqliteRuntime {
     /// An empty/whitespace-only `workflow_id` falls back to the generated
     /// [`ExecutionId`]'s string form (guaranteeing `ctx.info().workflow_id` is
     /// never empty), matching the [`start_workflow`](Self::start_workflow) default.
+    ///
+    /// # v0.1 start semantics — NOT idempotent
+    ///
+    /// This backend does **not** enforce `(workflow_name, workflow_id)` uniqueness
+    /// and does **not** apply the core Postgres start path's `WorkflowIdReusePolicy`
+    /// matrix. **Every call creates a new, independent execution** with a fresh
+    /// [`ExecutionId`], even when the supplied `workflow_id` matches a prior run —
+    /// so a duplicate delivery (for example a retried webhook) starts a second run
+    /// and repeats its side effects.
+    ///
+    /// The `workflow_id` here is provided for **observability and idempotency-key
+    /// material**: it is surfaced faithfully through `ctx.info().workflow_id`
+    /// (matching the Postgres backend, so a workflow deriving an idempotency key
+    /// from it behaves identically across backends), but it is **not** an enforced
+    /// uniqueness / reuse key at the START boundary in v0.1. This is a deliberate,
+    /// documented divergence from the Postgres core start path, which DOES default
+    /// to applying the `(workflow_name, workflow_id)` reuse-policy matrix.
+    ///
+    /// Callers that need idempotent starts (for example, deduplicating retried
+    /// webhook deliveries) must deduplicate upstream in v0.1, or wait for the
+    /// reuse-policy follow-up. The configurable `WorkflowIdReusePolicy` matrix is a
+    /// tracked follow-up — see the crate-level "Non-goals" docs and issue #1068.
     ///
     /// # Errors
     ///

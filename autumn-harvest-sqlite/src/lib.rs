@@ -191,6 +191,25 @@
 //! `NOTIFY` push wake-ups, multi-server crash recovery, schedules, the management
 //! API, retention, worker sessions, sharding, and DAGs.
 //!
+//! ## Start-boundary reuse policy — NOT enforced in v0.1 (non-idempotent starts)
+//!
+//! This backend does **not** enforce `(workflow_name, workflow_id)` uniqueness and
+//! does **not** apply the core Postgres start path's `WorkflowIdReusePolicy` matrix.
+//! Every
+//! [`start_workflow`](crate::SqliteRuntime::start_workflow) /
+//! [`start_workflow_with_id`](crate::SqliteRuntime::start_workflow_with_id) call
+//! creates a NEW, independent execution — even when the supplied `workflow_id`
+//! matches a prior run — so a duplicate delivery repeats its side effects. The
+//! `workflow_id` is observability + idempotency-key *material* (surfaced faithfully
+//! via `ctx.info().workflow_id`, cross-backend-identical), NOT an enforced
+//! start-boundary uniqueness key. Callers needing idempotent starts must dedupe
+//! upstream in v0.1. Faithfully mirroring the core reuse-policy matrix (the sealed
+//! `TERMINATED` state, `AllowDuplicateFailedOnly`, the uniqueness-index-excludes-
+//! terminal nuance) is real, out-of-v0.1-scope work tracked as an issue #1068
+//! follow-up — a partial reuse impl would itself be a new cross-backend parity bug,
+//! so it is rejected here rather than implemented halfway. See the per-method
+//! rustdoc on `start_workflow_with_id` for the full contract.
+//!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!
 //! Only the *fire-once* durable timer `ctx.timer(...)` is a supported timer. Every
