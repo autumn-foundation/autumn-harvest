@@ -41,6 +41,18 @@ pub struct BulkDlqFilter {
     pub failed_after: Option<chrono::DateTime<chrono::Utc>>,
     /// Exclusive upper bound on `failed_at`.
     pub failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Exact match on the derived [`error_class`] of the entry's error text
+    /// (issue #613). Applied as a compute-on-read post-filter.
+    #[serde(default)]
+    pub error_class: Option<String>,
+    /// Exact match on the derived [`dlq_reason`] class (issue #613). Applied
+    /// as a compute-on-read post-filter.
+    #[serde(default)]
+    pub dlq_reason: Option<String>,
+    /// Exact match on the derived [`failure_signature`] (issue #613). Applied
+    /// as a compute-on-read post-filter.
+    #[serde(default)]
+    pub failure_signature: Option<String>,
     /// Cap on rows acted on per call. Defaults to 100, hard-capped at 1000.
     pub limit: Option<u32>,
     /// When `true`, return matching rows and count without writing.
@@ -58,6 +70,35 @@ impl BulkDlqFilter {
             && self.workflow_name.is_none()
             && self.failed_after.is_none()
             && self.failed_before.is_none()
+            && self.error_class.is_none()
+            && self.dlq_reason.is_none()
+            && self.failure_signature.is_none()
+    }
+
+    /// Returns `true` if any compute-on-read *cause* dimension is set
+    /// (issue #613). When set, the SQL predicate cannot express the filter, so
+    /// callers must load rows and post-filter via [`Self::cause_matches`].
+    #[must_use]
+    pub const fn has_cause_filter(&self) -> bool {
+        self.error_class.is_some() || self.dlq_reason.is_some() || self.failure_signature.is_some()
+    }
+
+    /// Returns `true` if `error` satisfies every set cause dimension
+    /// (issue #613). Unset dimensions never exclude, so a filter with no cause
+    /// dimension matches every row.
+    #[must_use]
+    pub fn cause_matches(&self, error: &str) -> bool {
+        self.error_class
+            .as_ref()
+            .is_none_or(|v| error_class(error) == *v)
+            && self
+                .dlq_reason
+                .as_ref()
+                .is_none_or(|v| dlq_reason(error) == *v)
+            && self
+                .failure_signature
+                .as_ref()
+                .is_none_or(|v| failure_signature(error) == *v)
     }
 
     /// Effective row limit: uses the provided value clamped to [1, 1000],
@@ -256,6 +297,33 @@ impl std::fmt::Display for DeadLetterReason {
         match serde_json::to_string(self) {
             Ok(json) => f.write_str(&json),
             Err(_) => f.write_str("DeadLetterReasonSerializationFailed"),
+        }
+    }
+}
+
+impl DeadLetterReason {
+    /// Stable, low-cardinality snake_case class name for this quarantine
+    /// reason (issue #613). This is the value the `dlq_reason` aggregation
+    /// dimension and bulk-filter dimension key on.
+    #[must_use]
+    pub const fn reason_class(&self) -> &'static str {
+        match self {
+            Self::HistoryCapExceeded { .. } => "history_cap_exceeded",
+            Self::PoisonPill { .. } => "poison_pill",
+            Self::WorkflowTaskTimeout { .. } => "workflow_task_timeout",
+            Self::CallbackDeliveryExhausted { .. } => "callback_delivery_exhausted",
+        }
+    }
+
+    /// PascalCase serde `"type"` tag for this reason, used as the derived
+    /// `error_class` for an engine-authored quarantine entry (issue #613).
+    #[must_use]
+    pub const fn type_tag(&self) -> &'static str {
+        match self {
+            Self::HistoryCapExceeded { .. } => "HistoryCapExceeded",
+            Self::PoisonPill { .. } => "PoisonPill",
+            Self::WorkflowTaskTimeout { .. } => "WorkflowTaskTimeout",
+            Self::CallbackDeliveryExhausted { .. } => "CallbackDeliveryExhausted",
         }
     }
 }
@@ -600,6 +668,18 @@ pub async fn count_bulk_filter_matches(
         query = query.filter(dsl::failed_at.lt(before));
     }
 
+    // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
+    // `error` strings and count the ones that pass the cause post-filter.
+    if filter.has_cause_filter() {
+        let errors: Vec<String> = query
+            .select(dsl::error)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        let matched = errors.iter().filter(|e| filter.cause_matches(e)).count();
+        return Ok(i64::try_from(matched).unwrap_or(i64::MAX));
+    }
+
     query
         .count()
         .get_result(conn)
@@ -617,10 +697,17 @@ async fn query_dead_letters_for_bulk(
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Text};
 
+    // Cause dimensions (issue #613) are compute-on-read, so the SQL row limit
+    // cannot be applied before the post-filter (it would clip pre-filter rows).
+    // Drop the SQL limit, order oldest-first, then post-filter and `take` the
+    // effective limit — so the cause filter precedes the limit.
+    let cause = filter.has_cause_filter();
     let mut query = dsl::harvest_dead_letters
         .into_boxed()
-        .order(dsl::failed_at.asc())
-        .limit(filter.effective_limit());
+        .order(dsl::failed_at.asc());
+    if !cause {
+        query = query.limit(filter.effective_limit());
+    }
 
     if let Some(ref name) = filter.activity_name {
         query = query.filter(dsl::activity_name.eq(name.clone()));
@@ -639,11 +726,22 @@ async fn query_dead_letters_for_bulk(
         query = query.filter(dsl::failed_at.lt(before));
     }
 
-    query
+    let rows = query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+
+    if cause {
+        let limit = usize::try_from(filter.effective_limit()).unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .filter(|r| filter.cause_matches(&r.error))
+            .take(limit)
+            .collect())
+    } else {
+        Ok(rows)
+    }
 }
 
 /// Bulk replay dead-letter entries matching `filter`.
@@ -1130,6 +1228,53 @@ pub fn failure_signature(error: &str) -> String {
     truncate_chars(normalized.trim(), SIGNATURE_MAX_LEN)
 }
 
+/// Maximum length of a derived `error_class`, in characters.
+pub const ERROR_CLASS_MAX_LEN: usize = 80;
+
+/// Classify a DLQ `error` string into a low-cardinality *reason* class
+/// (issue #613).
+///
+/// Engine-authored quarantine entries serialize a tagged [`DeadLetterReason`]
+/// as their `error` (see `dead_letter`'s callers); those map to the reason's
+/// stable snake_case [`DeadLetterReason::reason_class`]. Every other error —
+/// a plain `Err(String)` or a typed activity-failure envelope — is retry
+/// exhaustion (there is no production path that dead-letters a plain
+/// retry-exhausted activity, but tests and embedders can), so it maps to
+/// `"retry_exhaustion"`. Pure and deterministic: identical across queries and
+/// shards for the same input.
+#[must_use]
+pub fn dlq_reason(error: &str) -> String {
+    match serde_json::from_str::<DeadLetterReason>(error) {
+        Ok(reason) => reason.reason_class().to_string(),
+        Err(_) => "retry_exhaustion".to_string(),
+    }
+}
+
+/// Classify a DLQ `error` string into a low-cardinality *error class*
+/// (issue #613).
+///
+/// Resolution order:
+/// 1. A typed activity-failure envelope → its stable `error_type` (e.g.
+///    `"CircuitOpen"`, `"HandlerPanic"`).
+/// 2. A tagged [`DeadLetterReason`] → its PascalCase [`DeadLetterReason::type_tag`].
+/// 3. Otherwise → the normalized leading token of the first line (dynamic
+///    runs collapsed to placeholders).
+///
+/// The result is truncated to [`ERROR_CLASS_MAX_LEN`] characters. Pure and
+/// deterministic: identical across queries and shards for the same input.
+#[must_use]
+pub fn error_class(error: &str) -> String {
+    if let Some(failure) = crate::failure::parse_typed_payload(error) {
+        return truncate_chars(&failure.error_type, ERROR_CLASS_MAX_LEN);
+    }
+    if let Ok(reason) = serde_json::from_str::<DeadLetterReason>(error) {
+        return reason.type_tag().to_string();
+    }
+    let first_line = error.lines().next().unwrap_or("").trim();
+    let token = first_line.split_whitespace().next().unwrap_or("");
+    truncate_chars(&normalize_token(token), ERROR_CLASS_MAX_LEN)
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1236,6 +1381,10 @@ pub enum DlqGroupDimension {
     TimeBucket,
     /// Derived [`failure_signature`] of the error text.
     FailureSignature,
+    /// Derived [`dlq_reason`] class of the error text (issue #613).
+    DlqReason,
+    /// Derived [`error_class`] of the error text (issue #613).
+    ErrorClass,
 }
 
 impl DlqGroupDimension {
@@ -1249,6 +1398,8 @@ impl DlqGroupDimension {
             Self::TaskType => "task_type",
             Self::TimeBucket => "time_bucket",
             Self::FailureSignature => "failure_signature",
+            Self::DlqReason => "dlq_reason",
+            Self::ErrorClass => "error_class",
         }
     }
 
@@ -1262,6 +1413,8 @@ impl DlqGroupDimension {
             "task_type" => Self::TaskType,
             "time_bucket" => Self::TimeBucket,
             "failure_signature" => Self::FailureSignature,
+            "dlq_reason" => Self::DlqReason,
+            "error_class" => Self::ErrorClass,
             _ => return None,
         })
     }
@@ -1359,7 +1512,7 @@ impl DlqAggregateParams {
                         format!(
                             "unknown group_by dimension '{value}'; expected one of: \
                              workflow_name, activity_name, queue_name, task_type, \
-                             time_bucket, failure_signature"
+                             time_bucket, failure_signature, dlq_reason, error_class"
                         )
                     })?;
                     if !params.group_by.contains(&dim) {
@@ -1777,6 +1930,8 @@ pub async fn aggregate_dead_letters(
                 DlqGroupDimension::TaskType => Some(task_type.clone()),
                 DlqGroupDimension::TimeBucket => Some(params.time_bucket.format(failed_at)),
                 DlqGroupDimension::FailureSignature => Some(failure_signature(&error)),
+                DlqGroupDimension::DlqReason => Some(dlq_reason(&error)),
+                DlqGroupDimension::ErrorClass => Some(error_class(&error)),
             })
             .collect();
 
@@ -2170,6 +2325,9 @@ mod tests {
             workflow_name: Some("billing".into()),
             failed_after: None,
             failed_before: None,
+            error_class: None,
+            dlq_reason: None,
+            failure_signature: None,
             limit: Some(200),
             dry_run: true,
         };
@@ -2245,6 +2403,249 @@ mod tests {
         // Same root cause with different dynamic ids collapses identically.
         let c = failure_signature("stripe charge ch_3Abc declined for user 9999");
         assert_eq!(a, c);
+    }
+
+    // ----- Cause classifiers: dlq_reason / error_class (issue #613) -----
+
+    fn poison_pill_json() -> String {
+        DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: Some("worker-7".to_string()),
+        }
+        .to_string()
+    }
+
+    fn history_cap_json() -> String {
+        DeadLetterReason::HistoryCapExceeded {
+            count: 10_001,
+            cap: 10_000,
+            workflow_type: "big_wf".to_string(),
+        }
+        .to_string()
+    }
+
+    fn task_timeout_json() -> String {
+        DeadLetterReason::WorkflowTaskTimeout {
+            task_timeout_strikes: 3,
+            timeout_secs: 30,
+        }
+        .to_string()
+    }
+
+    fn callback_exhausted_json() -> String {
+        DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id: Uuid::new_v4(),
+            attempts: 10,
+            last_status: Some(503),
+            target: "https://hooks.example.com/x".to_string(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn dlq_reason_maps_every_typed_variant_to_snake_case() {
+        assert_eq!(dlq_reason(&poison_pill_json()), "poison_pill");
+        assert_eq!(dlq_reason(&history_cap_json()), "history_cap_exceeded");
+        assert_eq!(dlq_reason(&task_timeout_json()), "workflow_task_timeout");
+        assert_eq!(
+            dlq_reason(&callback_exhausted_json()),
+            "callback_delivery_exhausted"
+        );
+    }
+
+    #[test]
+    fn dlq_reason_plain_string_is_retry_exhaustion() {
+        assert_eq!(dlq_reason("connection refused"), "retry_exhaustion");
+        assert_eq!(dlq_reason(""), "retry_exhaustion");
+    }
+
+    #[test]
+    fn dlq_reason_typed_activity_envelope_is_retry_exhaustion() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let envelope = ActivityFailure::retryable("RateLimitExceeded", "429").into_error_payload();
+        // An activity-failure envelope is NOT a DeadLetterReason, so it is not
+        // an engine-authored quarantine — it is retry exhaustion.
+        assert_eq!(dlq_reason(&envelope), "retry_exhaustion");
+    }
+
+    #[test]
+    fn error_class_typed_envelope_uses_error_type() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let circuit = ActivityFailure::non_retryable("CircuitOpen", "open").into_error_payload();
+        assert_eq!(error_class(&circuit), "CircuitOpen");
+        let panic = ActivityFailure::retryable("HandlerPanic", "boom").into_error_payload();
+        assert_eq!(error_class(&panic), "HandlerPanic");
+    }
+
+    #[test]
+    fn error_class_dead_letter_reason_uses_pascal_case_tag() {
+        assert_eq!(error_class(&poison_pill_json()), "PoisonPill");
+        assert_eq!(error_class(&history_cap_json()), "HistoryCapExceeded");
+        assert_eq!(error_class(&task_timeout_json()), "WorkflowTaskTimeout");
+        assert_eq!(
+            error_class(&callback_exhausted_json()),
+            "CallbackDeliveryExhausted"
+        );
+    }
+
+    #[test]
+    fn error_class_plain_string_uses_normalized_leading_token() {
+        assert_eq!(error_class("connection refused"), "connection");
+        assert_eq!(error_class("timeout while dialing host"), "timeout");
+        // Leading token normalization collapses dynamic runs.
+        assert_eq!(error_class("user_1234 not found"), "user_<NUM>");
+        assert_eq!(error_class(""), "");
+    }
+
+    #[test]
+    fn error_class_is_bounded_and_deterministic() {
+        let long = "x".repeat(500);
+        let class = error_class(&long);
+        assert!(class.chars().count() <= ERROR_CLASS_MAX_LEN);
+        assert_eq!(error_class(&long), class);
+    }
+
+    #[test]
+    fn cause_classifiers_are_deterministic() {
+        let e = poison_pill_json();
+        assert_eq!(dlq_reason(&e), dlq_reason(&e));
+        assert_eq!(error_class(&e), error_class(&e));
+        assert_eq!(failure_signature(&e), failure_signature(&e));
+    }
+
+    #[test]
+    fn bulk_filter_is_not_empty_when_only_a_cause_is_set() {
+        let f = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            ..Default::default()
+        };
+        assert!(!f.is_empty());
+        assert!(f.has_cause_filter());
+
+        let ec = BulkDlqFilter {
+            error_class: Some("CircuitOpen".to_string()),
+            ..Default::default()
+        };
+        assert!(!ec.is_empty());
+
+        let fs = BulkDlqFilter {
+            failure_signature: Some("boom".to_string()),
+            ..Default::default()
+        };
+        assert!(!fs.is_empty());
+    }
+
+    #[test]
+    fn bulk_filter_empty_and_has_cause_helpers() {
+        let empty = BulkDlqFilter::default();
+        assert!(empty.is_empty());
+        assert!(!empty.has_cause_filter());
+
+        let structural = BulkDlqFilter {
+            activity_name: Some("send_email".to_string()),
+            ..Default::default()
+        };
+        assert!(!structural.is_empty());
+        assert!(!structural.has_cause_filter());
+    }
+
+    #[test]
+    fn cause_matches_uses_exact_equality() {
+        let f = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            ..Default::default()
+        };
+        assert!(f.cause_matches(&poison_pill_json()));
+        assert!(!f.cause_matches(&task_timeout_json()));
+        assert!(!f.cause_matches("connection refused"));
+
+        // No cause filter matches everything.
+        let none = BulkDlqFilter::default();
+        assert!(none.cause_matches("anything"));
+
+        // error_class is exact, not case-folded.
+        let ec = BulkDlqFilter {
+            error_class: Some("poisonpill".to_string()),
+            ..Default::default()
+        };
+        assert!(!ec.cause_matches(&poison_pill_json()));
+    }
+
+    #[test]
+    fn cause_matches_ands_multiple_cause_dimensions() {
+        let both = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            error_class: Some("PoisonPill".to_string()),
+            ..Default::default()
+        };
+        assert!(both.cause_matches(&poison_pill_json()));
+
+        let mismatch = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            error_class: Some("WorkflowTaskTimeout".to_string()),
+            ..Default::default()
+        };
+        assert!(!mismatch.cause_matches(&poison_pill_json()));
+    }
+
+    #[test]
+    fn group_dimension_wire_round_trips_cause_dims() {
+        assert_eq!(DlqGroupDimension::DlqReason.as_wire(), "dlq_reason");
+        assert_eq!(DlqGroupDimension::ErrorClass.as_wire(), "error_class");
+        assert_eq!(
+            DlqGroupDimension::from_wire("dlq_reason"),
+            Some(DlqGroupDimension::DlqReason)
+        );
+        assert_eq!(
+            DlqGroupDimension::from_wire("error_class"),
+            Some(DlqGroupDimension::ErrorClass)
+        );
+        assert_eq!(DlqGroupDimension::from_wire("nope"), None);
+    }
+
+    #[test]
+    fn params_parse_cause_group_by_and_still_reject_unknown() {
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "dlq_reason"), ("group_by", "error_class")]),
+            Utc::now(),
+        )
+        .expect("valid");
+        assert_eq!(
+            p.group_by,
+            vec![DlqGroupDimension::DlqReason, DlqGroupDimension::ErrorClass]
+        );
+
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "bogus_dim")]),
+            Utc::now(),
+        )
+        .expect_err("unknown dim must still error");
+        assert!(err.contains("dlq_reason"), "message should list new dims: {err}");
+        assert!(err.contains("error_class"), "message should list new dims: {err}");
+    }
+
+    #[test]
+    fn merge_groups_by_dlq_reason() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::DlqReason],
+            ..Default::default()
+        };
+        let partials = vec![
+            DlqAggregatePartial {
+                total: 5,
+                filtered_total: 4,
+                groups: vec![raw_group(&[Some("poison_pill")], 4, &["a"])],
+            },
+            DlqAggregatePartial {
+                total: 3,
+                filtered_total: 2,
+                groups: vec![raw_group(&[Some("poison_pill")], 2, &["b"])],
+            },
+        ];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert_eq!(resp.groups.len(), 1);
+        assert_eq!(resp.groups[0].count, 6);
+        assert_eq!(resp.groups[0].key["dlq_reason"], "poison_pill");
     }
 
     // ----- Parameter parsing & validation (issue #385) -----
