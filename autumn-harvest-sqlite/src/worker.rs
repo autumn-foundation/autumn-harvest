@@ -58,12 +58,46 @@ pub fn drain_ready(
     // immediately ready again and this loop re-claims it — the whole retry
     // sequence converges in one drain pass under the polling model.
     while let Some(task) = queue::claim_next_ready_task(conn, exec_id, now)? {
-        let spec = activities
-            .get(&task.name)
-            .ok_or_else(|| crate::error::SqliteError::unregistered(&task.name))?;
+        // `claim_next_ready_task` has already committed this row to `RUNNING`. If
+        // the activity name has no registered body, RELEASE the claim back to
+        // `PENDING` before surfacing the error (Codex #1069 P2) — otherwise the
+        // row is stranded `RUNNING`, invisible to later drains (which only
+        // re-claim `PENDING`), until a full DB close+reopen runs the orphan
+        // reclaim. Releasing it lets a later drain re-claim it once the caller
+        // registers the activity in the SAME runtime, with no reopen. The error
+        // is still returned loudly; the release only leaves the task
+        // re-claimable. The error propagates out of the drive loop, so the
+        // caller is not spun (mirrors the non-determinism gate).
+        let Some(spec) = activities.get(&task.name) else {
+            queue::release_claim(conn, &task.task_id)?;
+            return Err(crate::error::SqliteError::unregistered(&task.name));
+        };
 
         // Body runs OUTSIDE any transaction — at-least-once (see module docs).
-        let result = (spec.body)(task.input.clone());
+        //
+        // Contain a PANICKING body (issue #782 analog; Codex round 8). A body
+        // that `panic!()`s (rather than returning `Err`) would otherwise unwind
+        // past the finalize/requeue branch AFTER the row is already `RUNNING`, so
+        // no failure/requeue ever commits and the run wedges permanently (the
+        // claim query only re-selects `PENDING`, and a single-process design has
+        // no live-peer poison-pill net). Catch the unwind and convert it to the
+        // crate's NORMAL retryable-activity-failure path — treat it exactly like
+        // the body returned `Err(msg)`: `finalize_activity_result` records the
+        // attempt and follows the retry policy (requeue if attempts remain, else
+        // terminal `ActivityFailed`). `AssertUnwindSafe` is sound: `spec.body`
+        // and `task.input` are only read, and on a caught panic the closure's
+        // result is discarded (no observable state was left half-mutated — the
+        // body ran outside any transaction). Mirrors the Postgres worker's
+        // handler-panic containment (`catch_unwind` → retryable typed failure).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (spec.body)(task.input.clone())
+        }))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "activity panicked: {}",
+                autumn_harvest::error::panic_message(payload)
+            ))
+        });
 
         if finalize_activity_result(conn, exec_id, &task, spec.max_attempts, now, result)? {
             produced = true;

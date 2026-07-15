@@ -153,6 +153,26 @@ pub fn claim_next_ready_task(
     }))
 }
 
+/// Release a just-claimed (`RUNNING`) task back to `PENDING` **without** consuming
+/// an attempt or advancing `run_at` — the body never ran.
+///
+/// The claim-release primitive for the unregistered-activity path (Codex #1069
+/// P2). [`claim_next_ready_task`] commits a task to `RUNNING` *before* the caller
+/// resolves the handler; if the activity name has no registered body, leaving the
+/// row `RUNNING` would strand it (invisible to a later drain, which only re-claims
+/// `PENDING` rows) until a full DB close+reopen ran [`reclaim_orphaned_running`].
+/// Releasing it here lets a later drain re-claim it once the body is registered,
+/// with no reopen. Scoped to one task and guarded on `state = 'RUNNING'` so it is a
+/// no-op against an already-finalized row; mirrors the shape of
+/// [`reclaim_orphaned_running`].
+pub fn release_claim(conn: &Connection, task_id: &str) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING' WHERE task_id = ?1 AND state = 'RUNNING'",
+        params![task_id],
+    )?;
+    Ok(())
+}
+
 /// Mark a task terminally done (success or exhausted retries).
 pub fn finish_task(conn: &Connection, task_id: &str) -> SqliteResult<()> {
     conn.execute(

@@ -122,6 +122,46 @@
 //! open scheduled work (or reject such histories) so a run isn't wedged — that is
 //! a follow-up.
 //!
+//! # Robustness — healthy-run-killer containment (Codex #1069 / round 8)
+//!
+//! Four failure modes that would otherwise WEDGE a healthy run are contained:
+//!
+//! - **Engine replay non-determinism is NON-TERMINAL.** If a workflow's code
+//!   drifts from its recorded history (a bad deploy), the determinism core
+//!   returns a non-determinism divergence. Rather than sealing the run `FAILED`
+//!   and poisoning history with a terminal event from the bad build, the backend
+//!   **discards** the divergent decision cycle (appends nothing, persists no
+//!   bookkeeping command), leaves the execution `RUNNING` / resumable, and
+//!   surfaces [`SqliteError::NonDeterministic`]. A fixed or rolled-back build then
+//!   re-drives the UNCHANGED history to completion. This mirrors the Postgres
+//!   engine's issue #603 semantics ("a workflow-task failure must never fail the
+//!   workflow"); the full automatic block-with-backoff is a documented follow-up.
+//!   A genuine author `Err(...)` still fails terminally, unchanged.
+//! - **An unregistered activity leaves its task re-claimable.** A workflow that
+//!   schedules an activity whose body is not registered has the just-claimed task
+//!   RELEASED back to `PENDING` (not stranded `RUNNING`) before the
+//!   [`SqliteError::UnregisteredActivity`] error is surfaced, so a later drain
+//!   re-claims it once the body is registered in the SAME runtime — no DB reopen.
+//! - **A panicking activity body is contained.** A body that `panic!()`s (rather
+//!   than returning `Err`) is caught at the dispatch boundary and routed through
+//!   the NORMAL retryable-failure path (record the attempt, requeue if attempts
+//!   remain, else terminal `ActivityFailed`), so it never unwinds past the
+//!   finalize and strands the task `RUNNING`. Mirrors the Postgres worker's
+//!   handler-panic containment (issue #782). Write bodies to be idempotent
+//!   regardless — a caught panic is a retry, and (as with any failure) the body
+//!   may have run partially.
+//! - **Mixed timer + activity batch.** A single decision cycle emitting BOTH a
+//!   timer and an activity (`tokio::join!`) records its schedule events in COMMAND
+//!   order and drives to completion + replays cleanly on the core
+//!   `WorkflowReplayer` — **when the activity branch is polled first**
+//!   (`join!(activity, timer)`). The reverse order (`join!(timer, activity)`) is a
+//!   pre-existing limitation of the *core* determinism engine, NOT this backend:
+//!   `HistoryMatcher::match_timer_strict` breaks its forward `TimerFired` scan at
+//!   an unconsumed `ActivityScheduled`, so the core `WorkflowReplayer` rejects even
+//!   an ideal timer-first history (`NonDeterminismDetected(EarlyCompletion)`) —
+//!   shared with the Postgres engine. Put the activity branch first in a mixed
+//!   `join!`.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`

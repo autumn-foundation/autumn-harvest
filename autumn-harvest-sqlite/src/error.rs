@@ -36,6 +36,32 @@ pub enum SqliteError {
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
 
+    /// The engine detected a replay **non-determinism** divergence: the current
+    /// workflow code produced a command stream that disagrees with the recorded
+    /// history (workflow-code drift across a deploy). This is **non-terminal**
+    /// (mirroring the Postgres engine's issue-#603 semantics): the divergent
+    /// decision cycle is **discarded** — nothing is appended to history, no
+    /// bookkeeping command is persisted, and the execution stays `RUNNING` /
+    /// resumable. A fixed or rolled-back workflow build can then re-drive the
+    /// **unchanged** history to completion; the run is never sealed `FAILED` and
+    /// its history is never poisoned by the bad build.
+    ///
+    /// This backend surfaces the divergence to the caller instead of sealing it,
+    /// so the operator fixes/rolls back the code and re-drives. The full
+    /// automatic block-with-backoff of the Postgres engine (issue #603) is a
+    /// documented follow-up; a discard-and-surface is the minimal correct
+    /// behavior for the single-writer runtime.
+    #[error(
+        "execution {execution_id} hit a replay non-determinism divergence \
+         (discarded; resumable after a workflow code fix/rollback): {details}"
+    )]
+    NonDeterministic {
+        /// The diverging execution (still `RUNNING`, resumable).
+        execution_id: ExecutionId,
+        /// The engine's human-readable divergence description (expected vs. actual).
+        details: String,
+    },
+
     /// A driven execution made no durable progress and could not be classified
     /// as waiting on a timer or a signal — surfaced honestly instead of looping.
     /// The most common cause is a task stranded `RUNNING` by a crash that the

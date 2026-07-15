@@ -230,9 +230,12 @@ async fn orphaned_running_task_is_reclaimed_and_body_reruns() {
     {
         // First process: register the workflow but NOT the activity. The cycle
         // persists `ActivityScheduled` + the task row (committed) and the drain
-        // CLAIMS the task (flips it to RUNNING, committed) — then fails to run the
-        // body because the activity is unregistered. This is exactly the
-        // crash-BEFORE-finalize state: task RUNNING, no terminal event.
+        // CLAIMS the task, then misses the (unregistered) body — which now RELEASES
+        // the claim back to PENDING (Codex #1069 P2), leaving the task re-claimable
+        // rather than stranded. That release is a *different* recovery path from the
+        // one under test here, so we fabricate the genuine crash-BEFORE-finalize
+        // state (a task left RUNNING by a process that claimed it and died mid-body)
+        // directly below.
         let mut rt = SqliteRuntime::open(&path).unwrap();
         rt.register_workflow(&single_activity_info());
         exec = rt.start_workflow("single_activity", json!(7)).unwrap();
@@ -243,9 +246,25 @@ async fn orphaned_running_task_is_reclaimed_and_body_reruns() {
         );
     } // crash.
 
-    // The task is stranded RUNNING with no terminal event.
+    // Fabricate the crash-BEFORE-finalize orphan: a process claimed the (now
+    // PENDING) task, began running its body, and died before the finalize commit —
+    // i.e. the row is left RUNNING with no terminal event. Flip it via a raw
+    // connection to simulate exactly that stranded state.
     {
         let raw = rusqlite::Connection::open(&path).unwrap();
+        let pending: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM harvest_tasks WHERE state = 'PENDING'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 1,
+            "the unregistered-activity claim must have been released to PENDING (FIX 2)"
+        );
+        raw.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
+            .unwrap();
         let running: i64 = raw
             .query_row(
                 "SELECT COUNT(*) FROM harvest_tasks WHERE state = 'RUNNING'",

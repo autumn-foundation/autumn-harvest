@@ -426,6 +426,33 @@ impl SqliteRuntime {
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
+            // Engine-detected replay non-determinism is NON-TERMINAL (Codex
+            // #1069 P1; mirrors the Postgres engine's issue #603 gate). When the
+            // core returns `Failed { non_deterministic_details: Some(_) }` the
+            // current workflow code drifted from the recorded history — a
+            // recoverable code-deploy bug, NOT an author failure. DISCARD the
+            // whole divergent decision cycle: append NO terminal event, persist
+            // NONE of the cycle's pending bookkeeping commands (a marker from the
+            // bad build would poison history against the rolled-back code), and
+            // do NOT transition state. Leave the execution RUNNING/resumable and
+            // surface the divergence to the caller (`SqliteError::NonDeterministic`)
+            // rather than sealing it FAILED. `?` never runs, so `harvest_events`
+            // for this execution is byte-identical to before the drive; a later
+            // drive with a corrected (compatible) handler resumes from the same
+            // unchanged history and completes normally. Propagating the error out
+            // of the drive also terminates the decision loop, so
+            // `run_until_blocked` / `poll_once` / `run_until_idle` cannot spin on
+            // it — the operator fixes/rolls back the code and re-drives.
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details: Some(_),
+                ..
+            } => Err(SqliteError::NonDeterministic {
+                execution_id: exec,
+                details: error,
+            }),
+            // A genuine author `Err(...)` carries `non_deterministic_details:
+            // None` and fails terminally, exactly as before.
             WorkflowOutcome::Failed { error, .. } => {
                 let tx = self.conn.transaction()?;
                 persist_terminal_pending_commands(&tx, exec, &pending)?;
