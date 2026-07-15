@@ -2315,6 +2315,24 @@ mod tests {
     }
 
     #[test]
+    fn bulk_dlq_filter_is_empty_false_for_queue_only() {
+        let filter = BulkDlqFilter {
+            queue_name: Some("low-pri".into()),
+            ..BulkDlqFilter::default()
+        };
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn bulk_dlq_filter_is_empty_false_for_min_attempts_only() {
+        let filter = BulkDlqFilter {
+            min_attempts: Some(3),
+            ..BulkDlqFilter::default()
+        };
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
     fn bulk_filter_is_not_empty_when_failed_before_set() {
         let filter = BulkDlqFilter {
             failed_before: Some(chrono::Utc::now()),
@@ -2367,6 +2385,8 @@ mod tests {
         let filter = BulkDlqFilter {
             activity_name: Some("charge_card".into()),
             workflow_name: Some("billing".into()),
+            queue_name: Some("low-pri".into()),
+            min_attempts: Some(3),
             failed_after: None,
             failed_before: None,
             error_class: None,
@@ -2379,6 +2399,8 @@ mod tests {
         let back: BulkDlqFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(back.activity_name.as_deref(), Some("charge_card"));
         assert_eq!(back.workflow_name.as_deref(), Some("billing"));
+        assert_eq!(back.queue_name.as_deref(), Some("low-pri"));
+        assert_eq!(back.min_attempts, Some(3));
         assert_eq!(back.limit, Some(200));
         assert!(back.dry_run);
     }
@@ -2547,6 +2569,16 @@ mod tests {
         let class = error_class(&long);
         assert!(class.chars().count() <= ERROR_CLASS_MAX_LEN);
         assert_eq!(error_class(&long), class);
+    }
+
+    #[test]
+    fn error_class_trims_padded_error_type_for_round_trip() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        // A typed envelope whose error_type carries surrounding whitespace must
+        // classify to the trimmed class so the facet key round-trips through the
+        // (trimming) bulk-filter validator (issue #613, P3-1).
+        let padded = ActivityFailure::non_retryable("  CircuitOpen  ", "open").into_error_payload();
+        assert_eq!(error_class(&padded), "CircuitOpen");
     }
 
     #[test]

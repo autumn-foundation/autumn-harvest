@@ -745,3 +745,147 @@ async fn bulk_cause_across_shards_honors_global_limit() {
     let remaining = count_dlq_rows(&shard0_url).await + count_dlq_rows(&shard1_url).await;
     assert_eq!(remaining, 3, "8 matched - 5 acted = 3 remain");
 }
+
+/// Insert a dead-letter row on a specific `queue_name` with a specific
+/// `attempts` count (issue #613, P2-1: exercise the SQL-expressible bulk filter
+/// dimensions).
+async fn insert_dlq_row_full(
+    database_url: &str,
+    activity_name: &str,
+    queue_name: &str,
+    attempts: i32,
+    error: &str,
+) -> uuid::Uuid {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for dead-letter insert");
+    autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: queue_name.to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: None,
+            activity_name: Some(activity_name.to_string()),
+            input: json!({ "test": true }),
+            error: error.to_string(),
+            attempts,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed")
+}
+
+async fn count_dlq_rows_by_queue(database_url: &str, queue_name: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for dead-letter count");
+    harvest_dead_letters::table
+        .filter(harvest_dead_letters::queue_name.eq(queue_name))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count dead letters by queue")
+}
+
+/// The AC5 over-action superset money test (issue #613, P2-1): a cause facet
+/// read scoped to one queue must re-select EXACTLY that queue's rows in a bulk
+/// operation — never every queue's. Before the bulk filter learned
+/// `queue_name`, an operator feeding a `?queue_name=qa` facet into a discard
+/// would silently act across ALL queues.
+#[tokio::test]
+async fn bulk_cause_plus_queue_round_trips_exactly() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    // Same cause (poison_pill) split across two queues.
+    for _ in 0..3 {
+        insert_dlq_row_full(&database_url, "pp", "qa", 3, &poison_pill_error()).await;
+    }
+    for _ in 0..2 {
+        insert_dlq_row_full(&database_url, "pp", "qb", 3, &poison_pill_error()).await;
+    }
+
+    // Aggregate facet scoped to qa reports 3 poison_pill rows.
+    let (agg_status, agg_body) = get_json_bulk(
+        &app,
+        "/dead-letters/aggregate?queue_name=qa&group_by=dlq_reason",
+    )
+    .await;
+    assert_eq!(agg_status, StatusCode::OK, "agg body: {agg_body}");
+    let facet = agg_body["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .find(|g| g["key"]["dlq_reason"] == "poison_pill")
+        .expect("poison_pill facet")["count"]
+        .as_i64()
+        .expect("count");
+    assert_eq!(facet, 3, "aggregate facet scoped to qa sees only qa's rows");
+
+    // Discard dry-run with the SAME scope must match exactly 3 (NOT 5).
+    let (dstatus, dbody) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "poison_pill", "queue_name": "qa", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(dstatus, StatusCode::OK, "body: {dbody}");
+    assert_eq!(
+        dbody["matched"], 3,
+        "scoped discard must match only qa's cohort, not all queues"
+    );
+
+    // Execute it: only qa's 3 removed, qb's 2 survive.
+    let (estatus, ebody) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "poison_pill", "queue_name": "qa" }),
+    )
+    .await;
+    assert_eq!(estatus, StatusCode::OK, "body: {ebody}");
+    assert_eq!(ebody["matched"], 3);
+    assert_eq!(ebody["acted_on"], 3);
+
+    assert_eq!(
+        count_dlq_rows_by_queue(&database_url, "qa").await,
+        0,
+        "qa's cohort must be fully discarded"
+    );
+    assert_eq!(
+        count_dlq_rows_by_queue(&database_url, "qb").await,
+        2,
+        "qb's rows must survive — the over-action gap is closed"
+    );
+}
+
+/// `min_attempts` narrows a bulk operation to entries at or above the bound
+/// (issue #613, P2-1).
+#[tokio::test]
+async fn bulk_min_attempts_filter_narrows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    insert_dlq_row_full(&database_url, "flaky", "default", 1, "connection refused").await;
+    insert_dlq_row_full(&database_url, "flaky", "default", 3, "connection refused").await;
+    insert_dlq_row_full(&database_url, "flaky", "default", 5, "connection refused").await;
+
+    // min_attempts=3 acts only on the attempts>=3 rows (the 3 and the 5).
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "activity_name": "flaky", "min_attempts": 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["matched"], 2, "only attempts>=3 rows match");
+    assert_eq!(body["acted_on"], 2);
+
+    assert_eq!(
+        count_dlq_rows(&database_url).await,
+        1,
+        "the attempts=1 row must survive"
+    );
+}

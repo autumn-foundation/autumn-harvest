@@ -839,6 +839,30 @@ fn dlq_bulk_discard_cause_body_fields_are_documented() {
 }
 
 #[test]
+fn dlq_bulk_replay_queue_and_min_attempts_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dlq",
+        "bulk-replay",
+        "--queue-name",
+        "low-pri",
+        "--min-attempts",
+        "3",
+    ]);
+}
+
+#[test]
+fn dlq_bulk_discard_queue_and_min_attempts_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dlq",
+        "bulk-discard",
+        "--queue-name",
+        "low-pri",
+        "--min-attempts",
+        "3",
+    ]);
+}
+
+#[test]
 fn handoff_complete_body_fields_are_documented() {
     assert_body_fields_documented(&[
         "handoff",

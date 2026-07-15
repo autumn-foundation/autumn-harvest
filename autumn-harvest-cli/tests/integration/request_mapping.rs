@@ -1122,6 +1122,50 @@ fn dlq_bulk_replay_with_cause_filters_maps_to_body() {
 }
 
 #[test]
+fn dlq_bulk_replay_with_queue_and_min_attempts_maps_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-replay",
+        "--queue-name",
+        "low-pri",
+        "--min-attempts",
+        "3",
+    ])
+    .expect("bulk-replay queue/min-attempts args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/replay");
+    let body = request.body.expect("should have body");
+    assert_eq!(body["queue_name"], "low-pri");
+    assert_eq!(body["min_attempts"], 3);
+}
+
+#[test]
+fn dlq_bulk_discard_with_queue_and_min_attempts_maps_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-discard",
+        "--queue-name",
+        "low-pri",
+        "--min-attempts",
+        "5",
+    ])
+    .expect("bulk-discard queue/min-attempts args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/discard");
+    let body = request.body.expect("should have body");
+    assert_eq!(body["queue_name"], "low-pri");
+    assert_eq!(body["min_attempts"], 5);
+}
+
+#[test]
 fn dlq_bulk_discard_with_cause_filters_maps_to_body() {
     let cli = Cli::try_parse_from([
         "harvest",
