@@ -325,9 +325,12 @@ async fn admin_gates_exposes_producer_contract() {
         by_name("api").get("status").and_then(Value::as_str),
         Some("gated")
     );
-    // Deferred-fire producers are split: gated at HTTP admission, scanner fire
-    // exempt-with-bypass-counter (issue #618, F2).
-    for split in ["debounce", "throttle", "event_batch"] {
+    // Deferred-fire producers gated at HTTP admission, scanner fire
+    // exempt-with-bypass-counter (issue #618, F2). Throttle is NO LONGER here —
+    // it flipped to gated_at_relay (fire-time gate, re-defer) in issue #1053;
+    // debounce + event_batch remain gated_at_admission (#1053 scopes only
+    // throttle).
+    for split in ["debounce", "event_batch"] {
         assert_eq!(
             by_name(split).get("status").and_then(Value::as_str),
             Some("gated_at_admission"),
@@ -341,6 +344,14 @@ async fn admin_gates_exposes_producer_contract() {
             .get("status")
             .and_then(Value::as_str),
         Some("gated_at_relay")
+    );
+    // Throttle is gated authoritatively at fire time (issue #1053): the deferred
+    // scanner fire re-checks the gate on the workflow's real queue and, when a
+    // gate matches, BLOCKS + RE-DEFERS the row (nothing dropped).
+    assert_eq!(
+        by_name("throttle").get("status").and_then(Value::as_str),
+        Some("gated_at_relay"),
+        "throttle must be gated_at_relay (issue #1053)"
     );
 }
 
@@ -785,8 +796,10 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             .unwrap();
     assert_eq!(deb, 1, "debounce scanner fires despite the gate");
 
-    // ── Producer 6: throttle scanner — EXEMPT + counted. ──
-    // Seed a token so the scanner debits + fires (else it re-defers).
+    // ── Producer 6: throttle scanner — GatedAtRelay, BLOCKED + counted. ──
+    // Since issue #1053 throttle honors the gate at fire time: even with a token
+    // available, under the Fleet gate the deferred fire BLOCKS + RE-DEFERS the
+    // row (nothing dropped, token refunded) and counts a block, not a bypass.
     let bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-thr");
     diesel::sql_query(
         "INSERT INTO harvest_rate_limit_buckets
@@ -812,7 +825,7 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
         autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
             .await
             .unwrap();
-    assert_eq!(thr, 1, "throttle scanner fires despite the gate");
+    assert_eq!(thr, 0, "throttle scanner blocks + re-defers under the gate");
 
     // ── Producer 7: event-batch scanner — EXEMPT + counted. ──
     diesel::sql_query(
@@ -837,35 +850,37 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     let blocked = metrics.blocked();
     let mut bypassed = metrics.bypassed();
     bypassed.sort();
-    // Three producers were blocked-and-counted: the API start, the completion
-    // trigger (evaluate-time), and the completion-trigger cross-shard relay
-    // (relay-time, Finding B). Block-vs-bypass never double-counts: each of these
-    // rows was dropped, so it is counted as a block exactly once and never bypassed.
+    // Four producers were blocked-and-counted: the API start, the completion
+    // trigger (evaluate-time), the completion-trigger cross-shard relay
+    // (relay-time, Finding B), and — since issue #1053 — the throttle scanner
+    // (fire-time, GatedAtRelay; re-defers its row). Block-vs-bypass never
+    // double-counts: each of these was counted as a block exactly once and never
+    // bypassed.
     assert!(
-        blocked.len() >= 3,
-        "API start + completion trigger + CT cross-shard relay must all be counted as blocks: {blocked:?}"
+        blocked.len() >= 4,
+        "API start + completion trigger + CT cross-shard relay + throttle (fire-time) must all be counted as blocks: {blocked:?}"
     );
     assert!(blocked.iter().all(|(scope, _)| scope == "fleet"));
-    // Every exempt / deferred-scanner producer that fired under the gate counted
-    // its bypass — zero un-counted admissions. The CT cross-shard relay is NOT
-    // here: it is gated at relay time and blocked.
+    // Every GatedAtAdmission / exempt deferred-scanner producer that fired under
+    // the gate counted its bypass — zero un-counted admissions. Throttle and the
+    // CT cross-shard relay are NOT here: both are GatedAtRelay and blocked.
     let mut expected = vec![
         "debounce".to_string(),
         "event_batch".to_string(),
         "outbox".to_string(),
-        "throttle".to_string(),
     ];
     expected.sort();
     assert_eq!(
         bypassed, expected,
         "every exempt producer that started a target under an active gate must count a bypass"
     );
-    // Four exempt producers each started their own target; the API start, the
-    // completion trigger, and the CT cross-shard relay were all blocked.
+    // Three exempt producers each started their own target; the API start, the
+    // completion trigger, the CT cross-shard relay, and the throttle scanner
+    // (issue #1053) were all blocked.
     assert_eq!(
         target_exec_count(&mut conn).await,
-        4,
-        "only the exempt producers started targets; nothing gated slipped the gate"
+        3,
+        "throttle target no longer starts under the gate; only the exempt producers started targets"
     );
 }
 

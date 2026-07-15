@@ -116,6 +116,38 @@ pub const THROTTLE_FIRE_BATCH_SIZE: i64 = 100;
 /// keys are never starved by an unbounded single-key backlog.
 pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
 
+/// Backoff applied to a throttle row's `deferred_at` when its fire is blocked by
+/// an admission gate (issue #1053, review finding B-G1).
+///
+/// A gate is **queue-scoped**, so the SQL candidate pre-filter cannot see it (it
+/// only knows token levels + `expires_at`). Without bumping `deferred_at`, a
+/// gate-blocked-but-tokened row keeps its original (older) `deferred_at`, so it
+/// stays at the front of the `ORDER BY deferred_at ASC` fire ordering and keeps
+/// being re-selected every tick. If ≥[`THROTTLE_FIRE_BATCH_SIZE`] such rows are
+/// gated together (a queue-wide incident gate over many tenant keys), they
+/// monopolize the fixed-size fire batch and **starve newer un-gated throttle
+/// keys on other queues indefinitely** — reopening exactly the cross-key
+/// fairness pathology the per-key cap + token pre-filter above closed.
+///
+/// Bumping `deferred_at` forward on re-defer rotates a gated row *behind* every
+/// un-gated row (whose `deferred_at` is its real, earlier deferral time) in the
+/// fire ordering, so un-gated keys are selected and fire first, and a gated row
+/// is re-attempted less often (fewer per-tick block-metric increments + log
+/// lines). It is a modest fixed tuning value, not a config knob.
+///
+/// This is safe against the `schedule_to_start` staleness drop (AC-c, issue
+/// #607): the candidate SELECT surfaces expired rows via an OR-`expires_at`
+/// clause that is independent of `deferred_at` (there is no `deferred_at <= NOW()`
+/// candidate floor), so pushing `deferred_at` into the future never hides an
+/// expired row from its drop — `expires_at` is left untouched, so a gated row
+/// still times out at its original deadline.
+// Gated to match its sole user (the db-only throttle scanner path,
+// `redefer_throttle_row`/`fire_claimed_throttle_row`): without this the const is
+// dead code under narrow feature sets (e.g. the CLI Lint job, which compiles
+// `autumn-harvest` without `db`), surfaced by clippy 1.97 `-D warnings`.
+#[cfg(feature = "db")]
+const GATE_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Maximum allowed byte length for a resolved throttle key.
 ///
 /// Keys longer than this are rejected at admission with
@@ -813,6 +845,31 @@ async fn delete_throttle_row(
     Ok(())
 }
 
+/// Push a gate-blocked throttle row's `deferred_at` forward by
+/// [`GATE_REDEFER_BACKOFF`] (issue #1053, review finding B-G1) so it yields the
+/// oldest-candidate fire slot to un-gated keys and is re-attempted less often.
+///
+/// `expires_at` is deliberately left untouched: the row still times out at its
+/// original `schedule_to_start` deadline (AC-c). Runs inside the caller's fire
+/// transaction so the row-level `FOR UPDATE` lock is held through the update.
+/// Mirrors [`delete_throttle_row`]'s parameterized `sql_query` style (the
+/// file-wide convention for row mutations).
+#[cfg(feature = "db")]
+async fn redefer_throttle_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    row_id: uuid::Uuid,
+    new_deferred_at: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query("UPDATE harvest_start_throttle SET deferred_at = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(row_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_deferred_at)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 /// Fire one already-claimed (row-locked) throttle row: reserve a token, start
 /// the execution, and delete the record. Must run inside the caller's
 /// transaction so the `FOR UPDATE` lock is held through the delete.
@@ -820,16 +877,19 @@ async fn delete_throttle_row(
 /// Returns:
 /// - `Ok(Some(FiredThrottle))` when a run was started (caller spawns deferred
 ///   trigger-starts + records metrics after commit);
-/// - `Ok(None)` when the row was dropped without starting — either it timed out
-///   past its `schedule_to_start` deadline (issue #607 AC-c), the bucket had no
-///   token yet (left for a later tick — **not** deleted), or the start was a
-///   no-op under a reuse policy (deleted, token refunded).
+/// - `Ok(None)` when the row was dropped or held without starting — either it
+///   timed out past its `schedule_to_start` deadline (issue #607 AC-c), the
+///   bucket had no token yet (left for a later tick — **not** deleted), the
+///   start was a no-op under a reuse policy (deleted, token refunded), or the
+///   admission gate was closed on the workflow's real queue at fire time
+///   (left for a later tick — **not** deleted — token refunded; issue #1053).
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 async fn fire_claimed_throttle_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
     now: DateTime<Utc>,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<Option<FiredThrottle>> {
     // AC-c: a start deferred past its schedule_to_start deadline times out
     // rather than running stale.
@@ -955,8 +1015,19 @@ async fn fire_claimed_throttle_row(
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
     // so follow-ups are collected and spawned only after commit.
+    // `Some(GateMode::CheckCached)` (issue #1053): honor the admission gate on
+    // this workflow's real queue at fire time — the throttle deferred-start
+    // `202` promise is "will run when tokens allow AND the gate is open at fire
+    // time", not merely "will run when tokens allow". `_collect` applies the
+    // gate iff the start will CREATE and records `harvest.admission.blocked` on
+    // the passed recorder when it blocks.
     match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None, None,
+        conn,
+        params,
+        true,
+        false,
+        Some(metrics),
+        Some(crate::admission_gate::GateMode::CheckCached),
     )
     .await
     {
@@ -997,6 +1068,49 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
+        // issue #1053: the admission gate is closed on this workflow's real
+        // queue at fire time. Halt-beats-pace — RE-DEFER: LEAVE the row (do NOT
+        // delete) so a later tick fires it once the gate opens, and refund the
+        // token reserved at the top (nothing was admitted). The block was
+        // already counted by `_collect` (`record_start_gate_block`). This
+        // deliberately DIFFERS from the completion-trigger cross-shard outbox
+        // relay (also `GatedAtRelay`), which DROPS its outbox row on block: a
+        // completion trigger has already fired its source-terminal decision, so
+        // a permanently-gated relay must not accumulate forever; a throttled
+        // start is a pending admission whose `202` promise is "nothing lost", so
+        // it is held (not dropped) until the gate opens or `expires_at` passes.
+        Err(crate::error::HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            crate::queue::refund_rate_limit_token(conn, &bucket).await?;
+            // Cross-key fairness (issue #1053, review finding B-G1): bump
+            // `deferred_at` forward by `GATE_REDEFER_BACKOFF` so this gated row
+            // rotates behind un-gated rows in the `ORDER BY deferred_at ASC` fire
+            // ordering. A queue-scoped gate is invisible to the SQL candidate
+            // pre-filter, so without this a gated-but-tokened row keeps its
+            // original (older) `deferred_at`, stays the oldest candidate, and is
+            // re-selected every tick — ≥100 such rows would monopolize the
+            // fixed-size fire batch and starve newer un-gated keys on other
+            // queues indefinitely. `expires_at` is untouched, so the row still
+            // times out at its original `schedule_to_start` deadline (AC-c), and
+            // the candidate SELECT surfaces expired rows independent of
+            // `deferred_at`, so the bump never hides the drop. Runs in the same
+            // fire transaction as the refund (the `FOR UPDATE` lock is held).
+            redefer_throttle_row(conn, row_id, now + GATE_REDEFER_BACKOFF).await?;
+            // `debug!`, not `info!`: this arm re-fires per gated row per scanner
+            // tick (the block metric is intentionally per-attempt, backed off by
+            // the bump above), so an `info!` here would flood logs during exactly
+            // the high-load incident window operators are reading — matching the
+            // silent no-token re-defer twin above.
+            tracing::debug!(
+                workflow_name = %workflow_name,
+                throttle_key = %throttle_key,
+                workflow_id = %workflow_id,
+                gate_id = %gate_id,
+                reason = %reason,
+                "throttled start blocked by an admission gate at fire time; \
+                 re-deferred with backoff (row left, token refunded)",
+            );
+            Ok(None)
+        }
         Err(e) => Err(e),
     }
 }
@@ -1005,6 +1119,7 @@ async fn fire_claimed_throttle_row(
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<Vec<FiredThrottle>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -1121,7 +1236,7 @@ async fn fire_due_on_conn(
 
                 let mut results = Vec::with_capacity(due_rows.len());
                 for row in due_rows {
-                    if let Some(item) = fire_claimed_throttle_row(conn, row, now).await? {
+                    if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics).await? {
                         results.push(item);
                     }
                 }
@@ -1191,9 +1306,16 @@ pub async fn fire_due_throttled_starts(
             if is_scheduled_run {
                 metrics.record_schedule_run("workflow", &workflow_name);
             }
-            // issue #618, F1: the throttle scanner relays a start already
-            // admitted through the gate at HTTP time; count the deferred fire as
-            // an exempt bypass so it never slips a gate silently. See
+            // issue #1053: `spawn_fired` only ever iterates the `fired` list —
+            // rows that genuinely started (the gate was OPEN at fire time, the
+            // relay proceeded). A fire BLOCKED by the admission gate returns
+            // `Ok(None)` from `fire_claimed_throttle_row` (row re-deferred,
+            // token refunded) and is therefore NOT in `fired`, so it counts a
+            // `harvest.admission.blocked` (recorded by `_collect`) and NEVER a
+            // bypass here — block-vs-bypass can never double-count for one fire.
+            // The Throttle producer is now `GatedAtRelay` (was `GatedAtAdmission`
+            // per #618-F1): a genuinely-fired start counts an exempt bypass so an
+            // open-gate relay never slips a gate silently. See
             // `admission_gate::producer_contract`.
             metrics
                 .record_admission_bypassed(crate::admission_gate::StartProducer::Throttle.as_str());
@@ -1218,12 +1340,12 @@ pub async fn fire_due_throttled_starts(
                         continue;
                     }
                 };
-                let fired = fire_due_on_conn(&mut shard_conn).await?;
+                let fired = fire_due_on_conn(&mut shard_conn, metrics).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         _ => {
-            let fired = fire_due_on_conn(conn).await?;
+            let fired = fire_due_on_conn(conn, metrics).await?;
             fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }
