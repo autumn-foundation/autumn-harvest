@@ -7723,3 +7723,290 @@ async fn execution_id_diverges_on_raw_events_path_without_the_builder() {
         ),
     }
 }
+
+// ===========================================================================
+// Issue #1071 — interleaved-sibling terminal tolerance (RED phase).
+//
+// Four forward-scan matchers (`match_timer_strict`, `scan_activity_terminal`,
+// `match_signal`) falsely report `NonDeterminismDetected` when a *sibling*
+// terminal/command is interleaved at its recorded history position — even for an
+// IDEAL (correctly-ordered) history — because each scan `break`s at the sibling
+// event instead of tolerating it the way `match_signal_or_timer` (issue #476)
+// already does.
+//
+// Each test below feeds the replayer a correct, producible history and asserts
+// `ReplaySucceeded`. They are RED against current code: each currently fails
+// (the run wedges → `NonDeterminismDetected` / `EarlyCompletion`). The later
+// GREEN phase makes each scan tolerate the interleaved sibling.
+// ===========================================================================
+
+/// Manifestation #1 — a mixed suspension batch that emits the **timer command
+/// before the activity command** (`tokio::join!(ctx.timer(...), activity)`, the
+/// timer polled first). Its natural, ideal history has `TimerStarted` first and
+/// the activity draining to `ActivityCompleted` before the timer's `TimerFired`
+/// at the tail. `match_timer_strict`'s forward `TimerFired` scan currently
+/// **breaks at the unconsumed `ActivityScheduled`** (replay.rs:2966) → wedge.
+fn interleaved_timer_first_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // `tokio::join!` polls in listed order — the timer command is emitted
+        // FIRST, then the activity. Both must resolve for the workflow to return.
+        let (timer_res, activity_res) = tokio::join!(
+            ctx.timer("wait", 5),
+            ctx.execute_activity_raw("work", Value::Null, "default"),
+        );
+        timer_res.map_err(|e| e.to_string())?;
+        let out = activity_res.map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Manifestation #2 — an **activity-first** mixed batch
+/// (`tokio::join!(activity, ctx.timer(...))`) whose sibling timer fires BEFORE
+/// the activity completes, so the recorded terminal order is
+/// `…, TimerFired, ActivityCompleted`. `scan_activity_terminal`'s forward scan
+/// currently **breaks at the unconsumed `TimerFired`** (replay.rs:1204) → the
+/// activity wedges `ActivityInProgress`.
+fn interleaved_activity_first_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Activity command emitted FIRST, then the timer.
+        let (activity_res, timer_res) = tokio::join!(
+            ctx.execute_activity_raw("work", Value::Null, "default"),
+            ctx.timer("wait", 5),
+        );
+        let out = activity_res.map_err(|e| e.to_string())?;
+        timer_res.map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Manifestation #4 — two timers armed in one batch
+/// (`tokio::join!(ctx.timer("timer_a", …), ctx.timer("timer_b", …))`, timer_a
+/// polled/matched first) firing in REVERSED order: the sibling (foreign-id)
+/// `TimerFired(timer_b)` is recorded before the polled timer's own
+/// `TimerFired(timer_a)`. `match_timer_strict`'s scan for `TimerFired(timer_a)`
+/// currently **breaks at the unconsumed foreign `TimerFired(timer_b)`** → wedge.
+fn interleaved_two_timers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (ra, rb) = tokio::join!(ctx.timer("timer_a", 5), ctx.timer("timer_b", 5));
+        ra.map_err(|e| e.to_string())?;
+        rb.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn interleaved_started() -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+/// #1 fixture: timer-first schedule order; the activity drains and completes
+/// before the timer fires. Ideal, producible, correctly-ordered history.
+fn interleaved_timer_first_history() -> Vec<WorkflowEvent> {
+    let work_id = ActivityExecId::new();
+    let timer_id = TimerId::new("wait");
+    vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: work_id,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: work_id,
+            output: serde_json::json!("done"),
+        },
+        WorkflowEvent::TimerFired { timer_id },
+    ]
+}
+
+/// #2 fixture: activity-first schedule order; the sibling timer FIRES before
+/// the activity's terminal (`TimerFired` recorded before `ActivityCompleted`).
+fn interleaved_timer_before_activity_terminal_history() -> Vec<WorkflowEvent> {
+    let work_id = ActivityExecId::new();
+    let timer_id = TimerId::new("wait");
+    vec![
+        interleaved_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: work_id,
+            name: "work".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: work_id,
+            output: serde_json::json!("done"),
+        },
+    ]
+}
+
+/// #4 fixture: two timers armed in arm order (timer_a then timer_b) but firing
+/// in REVERSED order (TimerFired(timer_b) before TimerFired(timer_a)).
+fn interleaved_two_timers_reversed_fire_history() -> Vec<WorkflowEvent> {
+    let a = TimerId::new("timer_a");
+    let b = TimerId::new("timer_b");
+    vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: a.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: b.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerFired { timer_id: b },
+        WorkflowEvent::TimerFired { timer_id: a },
+    ]
+}
+
+/// #3 fixture: a plain `wait_for_signal("go")` whose recorded history carries a
+/// sibling deadline timer that fired before the signal
+/// (`TimerStarted(__signal_timeout:0:go), TimerFired(__signal_timeout:0:go),
+/// SignalReceived(go)`). `match_signal`'s scan currently **stops at the
+/// unconsumed `TimerFired`** → `NonDeterminismDetected(EarlyCompletion,
+/// event_index=1)`, though the "go" signal WAS delivered. Empirically-proven
+/// case from issue #1071 comment 3.
+fn interleaved_signal_after_deadline_history() -> Vec<WorkflowEvent> {
+    let timer_id = TimerId::new("__signal_timeout:0:go");
+    vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 300,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".into(),
+            payload: serde_json::json!({"ok": true}),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn interleaved_sibling_timer_first_mixed_batch_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn("interleaved_timer_first", interleaved_timer_first_workflow)
+        .replay_from_events(interleaved_timer_first_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071 manifestation #1: an IDEAL timer-first mixed batch \
+         (TimerStarted, ActivityScheduled, ActivityCompleted, TimerFired) must \
+         replay — match_timer_strict's TimerFired scan must tolerate the \
+         interleaved ActivityScheduled instead of breaking:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_sibling_timer_fires_before_activity_terminal_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "interleaved_activity_first",
+            interleaved_activity_first_workflow,
+        )
+        .replay_from_events(interleaved_timer_before_activity_terminal_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071 manifestation #2: a sibling timer firing before the \
+         activity's terminal (…, TimerFired, ActivityCompleted) must replay — \
+         scan_activity_terminal must tolerate the interleaved TimerFired \
+         instead of breaking:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_sibling_signal_after_deadline_timer_fired_replays_succeeded() {
+    // Plain `wait_for_signal("go")` (signal_wait_workflow) with a sibling
+    // deadline timer's TimerFired recorded before the delivered signal.
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_wait_workflow", signal_wait_workflow)
+        .replay_from_events(interleaved_signal_after_deadline_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071 manifestation #3: a plain wait_for_signal whose history \
+         carries an already-fired sibling deadline timer before the delivered \
+         signal must replay — match_signal's SignalReceived scan must cross the \
+         interleaved TimerFired instead of stopping:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded() {
+    let report = WorkflowReplayer::new()
+        .register_fn("interleaved_two_timers", interleaved_two_timers_workflow)
+        .replay_from_events(interleaved_two_timers_reversed_fire_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071 manifestation #4: two timers armed in one batch firing in \
+         reversed order (TimerFired(b) before TimerFired(a), matching a first) \
+         must replay — match_timer_strict must cross the foreign TimerFired \
+         non-consumingly instead of breaking:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Genuine-divergence regression guards (must PASS on current code; the #1071
+// fix must NOT over-swallow these). Paired with the pre-existing
+// `replay_activity_history_for_timer_workflow_detects_timer_mismatch`
+// (timer positional-anchor mismatch), which likewise stays green.
+// ---------------------------------------------------------------------------
+
+/// Signal-site park-forever guard (issue #768 round 13, preserved by #1071):
+/// a plain `wait_for_signal("go")` whose history ends in a STRAY unconsumed
+/// `TimerStarted` with NO matching `TimerFired` and NO signal must still be a
+/// divergence — pushing a `WaitForSignal` command here would park the run
+/// forever on a signal that will never arrive. The #1071 TimerFired-tolerance
+/// fix must not suppress this (there is no TimerFired to cross here).
+#[tokio::test]
+async fn interleaved_sibling_signal_stray_timer_started_still_diverges() {
+    let events = vec![
+        interleaved_started(),
+        // Stray, unconsumed: no matching TimerFired, no SignalReceived follows.
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("orphan"),
+            duration_secs: 5,
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_wait_workflow", signal_wait_workflow)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a stray unconsumed TimerStarted where a signal was expected must still \
+         diverge (park-forever guard); the #1071 fix must not over-swallow \
+         it:\n{report}"
+    );
+}
