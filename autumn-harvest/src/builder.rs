@@ -3723,6 +3723,45 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ── Builder-level activity default floor (issue #620) ─────────────────
+    //
+    // RED PHASE: the `default_activity_retry_policy` / `default_activity_start_to_close`
+    // fields and their `with_*` builder methods do not exist yet — this test
+    // fails to COMPILE against the missing `WorkerConfig` symbols until the
+    // green phase adds them. Both default to `None` so an unset config is
+    // byte-for-byte identical to today (opt-in, AC1/AC6).
+
+    #[test]
+    fn worker_config_activity_defaults_default_to_none() {
+        use crate::policy::RetryPolicy;
+
+        let config = WorkerConfig::default();
+        assert!(
+            config.default_activity_retry_policy.is_none(),
+            "default activity retry policy must be unset by default (opt-in)"
+        );
+        assert!(
+            config.default_activity_start_to_close.is_none(),
+            "default activity start_to_close must be unset by default (opt-in)"
+        );
+
+        // The two builder methods set the floors and are chainable.
+        let configured = WorkerConfig::default()
+            .with_default_activity_retry_policy(RetryPolicy::fixed(4, Duration::from_millis(50)))
+            .with_default_activity_start_to_close(Duration::from_secs(300));
+        assert_eq!(
+            configured
+                .default_activity_retry_policy
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(4),
+        );
+        assert_eq!(
+            configured.default_activity_start_to_close,
+            Some(Duration::from_secs(300)),
+        );
+    }
+
     // ── Local activity cap tests ──────────────────────────────────────────
 
     #[test]

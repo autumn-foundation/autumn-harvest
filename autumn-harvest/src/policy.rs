@@ -1279,6 +1279,78 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // ── Builder-level activity default floor (issue #620) ─────────────────────
+    //
+    // RED PHASE: `resolve_effective_retry` / `resolve_effective_start_to_close`
+    // do not exist yet — these tests fail to COMPILE against the missing
+    // `crate::policy` symbols until the green phase adds them. The precedence
+    // the green phase must implement is:
+    //   call-site override  →  activity default  →  builder default  →  None
+    // i.e. `call.or(activity).or(builder)`.
+
+    #[test]
+    fn resolve_effective_retry_precedence() {
+        // Distinct policies so the returned identity is unambiguous.
+        let call = RetryPolicy::fixed(5, Duration::from_millis(10));
+        let activity = RetryPolicy::fixed(2, Duration::from_millis(10));
+        let builder = RetryPolicy::fixed(9, Duration::from_millis(10));
+
+        // All three present → call-site wins.
+        assert_eq!(
+            resolve_effective_retry(
+                Some(call.clone()),
+                Some(activity.clone()),
+                Some(builder.clone()),
+            )
+            .map(|p| p.max_attempts),
+            Some(5),
+        );
+
+        // No call-site → activity default wins over builder default.
+        assert_eq!(
+            resolve_effective_retry(None, Some(activity.clone()), Some(builder.clone()))
+                .map(|p| p.max_attempts),
+            Some(2),
+        );
+
+        // No call-site, no activity default → builder default applies.
+        assert_eq!(
+            resolve_effective_retry(None, None, Some(builder.clone())).map(|p| p.max_attempts),
+            Some(9),
+        );
+
+        // Nothing set anywhere → None (implicit fallback handled downstream).
+        assert!(resolve_effective_retry(None, None, None).is_none());
+    }
+
+    #[test]
+    fn resolve_effective_start_to_close_precedence() {
+        let call = Duration::from_secs(5);
+        let activity = Duration::from_secs(30);
+        let builder = Duration::from_secs(300);
+
+        // All three present → call-site wins.
+        assert_eq!(
+            resolve_effective_start_to_close(Some(call), Some(activity), Some(builder)),
+            Some(call),
+        );
+
+        // No call-site → activity default wins over builder default.
+        assert_eq!(
+            resolve_effective_start_to_close(None, Some(activity), Some(builder)),
+            Some(activity),
+        );
+
+        // No call-site, no activity default → builder default applies.
+        assert_eq!(
+            resolve_effective_start_to_close(None, None, Some(builder)),
+            Some(builder),
+        );
+
+        // Nothing set anywhere → None (no timeout enforced).
+        assert_eq!(resolve_effective_start_to_close(None, None, None), None);
+    }
+
     // ── Schedule jitter ───────────────────────────────────────────────────────
 
     #[test]
