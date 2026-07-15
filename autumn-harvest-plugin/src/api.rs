@@ -5005,6 +5005,8 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
                 "error_class",
@@ -5020,6 +5022,8 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
                 "error_class",
@@ -22751,6 +22755,10 @@ struct BulkDlqApiBody {
     activity_name: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
+    #[serde(default)]
+    queue_name: Option<String>,
+    #[serde(default)]
+    min_attempts: Option<i32>,
     #[serde(default, alias = "task_kind")]
     task_type: Option<String>,
     #[serde(default)]
@@ -22782,6 +22790,13 @@ impl BulkDlqApiBody {
             filter: dlq::BulkDlqFilter {
                 activity_name: self.activity_name,
                 workflow_name: self.workflow_name,
+                // `queue_name` is a plain positive-equality filter — treat empty
+                // exactly like `activity_name`/`workflow_name` (a harmless
+                // matches-nothing predicate), not like the strict-reject cause
+                // dimensions (whose empty value would dangerously skip the
+                // filter and widen the cohort).
+                queue_name: self.queue_name,
+                min_attempts: self.min_attempts,
                 failed_after: self.failed_after,
                 failed_before: self.failed_before,
                 error_class: normalize_cause_filter(self.error_class)?,
@@ -22928,6 +22943,10 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
             }
             "activity_name" => selector.filter.activity_name = Some(value.to_string()),
             "workflow_name" => selector.filter.workflow_name = Some(value.to_string()),
+            "queue_name" => selector.filter.queue_name = Some(value.to_string()),
+            "min_attempts" => {
+                selector.filter.min_attempts = Some(parse_i32_field(value, "min_attempts")?);
+            }
             "task_kind" | "task_type" => {
                 selector.task_type = Some(parse_dlq_task_type_filter(value)?);
             }
@@ -23729,6 +23748,12 @@ fn apply_api_bulk_filters<'a>(
                 .bind::<diesel::sql_types::Text, _>(task_type.clone())
                 .sql(")"),
         );
+    }
+    if let Some(ref queue) = selector.filter.queue_name {
+        query = query.filter(harvest_dead_letters::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = selector.filter.min_attempts {
+        query = query.filter(harvest_dead_letters::attempts.ge(min));
     }
     if let Some(after) = selector.filter.failed_after {
         query = query.filter(harvest_dead_letters::failed_at.ge(after));

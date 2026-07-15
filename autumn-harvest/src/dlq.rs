@@ -28,15 +28,27 @@ pub const MAX_BULK_LIMIT: u32 = 1000;
 
 /// Filter for bulk DLQ operations.
 ///
-/// At least one of `activity_name`, `workflow_name`, `failed_after`, or
-/// `failed_before` must be set. A filter with only `limit` or `dry_run` is
-/// considered empty and rejected with 400 at the API layer.
+/// At least one substantive criterion (any of `activity_name`, `workflow_name`,
+/// `queue_name`, `min_attempts`, `failed_after`, `failed_before`, or a cause
+/// dimension) must be set. A filter with only `limit` or `dry_run` is considered
+/// empty and rejected with 400 at the API layer.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BulkDlqFilter {
     /// Exact match on `activity_name`.
     pub activity_name: Option<String>,
     /// Exact match on the workflow name of the parent execution.
     pub workflow_name: Option<String>,
+    /// Exact match on `queue_name` (issue #613). SQL-expressible (real column),
+    /// so it carries no compute-on-read cost. Lets an operator reproduce a
+    /// `queue_name`-scoped aggregate facet exactly (AC5).
+    #[serde(default)]
+    pub queue_name: Option<String>,
+    /// Inclusive lower bound on `attempts` (issue #613). SQL-expressible (real
+    /// column), so it carries no compute-on-read cost. Mirrors the aggregate
+    /// endpoint's `min_attempts` filter so a facet read there re-selects the
+    /// same rows here (AC5).
+    #[serde(default)]
+    pub min_attempts: Option<i32>,
     /// Inclusive lower bound on `failed_at`.
     pub failed_after: Option<chrono::DateTime<chrono::Utc>>,
     /// Exclusive upper bound on `failed_at`.
@@ -68,6 +80,8 @@ impl BulkDlqFilter {
     pub const fn is_empty(&self) -> bool {
         self.activity_name.is_none()
             && self.workflow_name.is_none()
+            && self.queue_name.is_none()
+            && self.min_attempts.is_none()
             && self.failed_after.is_none()
             && self.failed_before.is_none()
             && self.error_class.is_none()
@@ -638,6 +652,16 @@ pub async fn replay_dead_letter(
 /// already exhausted, so that `matched` in the aggregated response always
 /// reflects the true pre-limit total across all shards.
 ///
+/// This is part of the external-embedder surface (issue #613): the live HTTP
+/// path uses the `_api_bulk` variants in the plugin's `api.rs`, which apply the
+/// same predicate set. Keep the two in sync when adding a filter dimension.
+///
+/// A cause filter is compute-on-read — it loads all SQL-prefiltered rows and
+/// classifies each in Rust (symmetric with the aggregate endpoint's accepted
+/// cost). `BulkDlqFilter::effective_limit` caps rows *acted on*, not rows
+/// *scanned*; narrow with the SQL-expressible filters (queue/activity/workflow/
+/// time window/`min_attempts`) on large DLQs.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on query failure.
@@ -660,6 +684,12 @@ pub async fn count_bulk_filter_matches(
                 .bind::<Text, _>(wf_name.clone())
                 .sql(")"),
         );
+    }
+    if let Some(ref queue) = filter.queue_name {
+        query = query.filter(dsl::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = filter.min_attempts {
+        query = query.filter(dsl::attempts.ge(min));
     }
     if let Some(after) = filter.failed_after {
         query = query.filter(dsl::failed_at.ge(after));
@@ -718,6 +748,12 @@ async fn query_dead_letters_for_bulk(
                 .bind::<Text, _>(wf_name.clone())
                 .sql(")"),
         );
+    }
+    if let Some(ref queue) = filter.queue_name {
+        query = query.filter(dsl::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = filter.min_attempts {
+        query = query.filter(dsl::attempts.ge(min));
     }
     if let Some(after) = filter.failed_after {
         query = query.filter(dsl::failed_at.ge(after));
@@ -1262,10 +1298,18 @@ pub fn dlq_reason(error: &str) -> String {
 ///
 /// The result is truncated to [`ERROR_CLASS_MAX_LEN`] characters. Pure and
 /// deterministic: identical across queries and shards for the same input.
+///
+/// An empty `error` yields an empty-string class, which the bulk-filter
+/// validator rejects with `400` (a degenerate input: production `error` is NOT
+/// NULL and carries a tagged reason or a non-empty message).
 #[must_use]
 pub fn error_class(error: &str) -> String {
+    // Every branch returns a trimmed value so a padded `error_type` facet key
+    // round-trips through the (trimming) bulk-filter validator (issue #613): a
+    // facet key read from this classifier and fed back as a `BulkDlqFilter`
+    // cause dimension must re-select the same rows.
     if let Some(failure) = crate::failure::parse_typed_payload(error) {
-        return truncate_chars(&failure.error_type, ERROR_CLASS_MAX_LEN);
+        return truncate_chars(failure.error_type.trim(), ERROR_CLASS_MAX_LEN);
     }
     if let Ok(reason) = serde_json::from_str::<DeadLetterReason>(error) {
         return reason.type_tag().to_string();

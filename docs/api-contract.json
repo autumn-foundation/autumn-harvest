@@ -2485,6 +2485,16 @@
             "description": "Filter by workflow name."
           },
           {
+            "name": "queue_name",
+            "required": false,
+            "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
+          },
+          {
+            "name": "min_attempts",
+            "required": false,
+            "description": "Only replay entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
             "name": "failed_after",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only replay entries failed after this time."
@@ -2564,6 +2574,16 @@
             "name": "workflow_name",
             "required": false,
             "description": "Filter by workflow name."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
+          },
+          {
+            "name": "min_attempts",
+            "required": false,
+            "description": "Only discard entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
           },
           {
             "name": "failed_after",
