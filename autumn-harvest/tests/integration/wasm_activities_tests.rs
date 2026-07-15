@@ -30,7 +30,9 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
-use autumn_harvest::wasm_activities::{WasmCapabilities, WasmLimits, WasmModuleStore};
+use autumn_harvest::wasm_activities::{
+    WasmCapabilities, WasmLimits, WasmModuleStore, invoke_wasm_activity,
+};
 use autumn_harvest::wasm_store::{
     MAX_WASM_MODULE_BYTES, WasmBinding, WasmDispatch, fetch_wasm_module_bytes, list_wasm_modules,
     publish_registered_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
@@ -1053,5 +1055,312 @@ async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
     assert!(
         !metrics.retried.lock().unwrap().is_empty(),
         "a retryable resource exhaustion must be retried"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUCCESS METRIC (AC1 headline): a single workflow runs 1 NATIVE + 1 WASM
+// activity to completion, through the standard dispatch path, and the recorded
+// history is indistinguishable from an all-native run (AC6: ordinary
+// ActivityScheduled/ActivityCompleted events only, no wasm-specific variant).
+// ═══════════════════════════════════════════════════════════════════════════
+
+type ActFut<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+>;
+
+/// Native `#[activity]`-shaped handler: doubles the input's `"n"` field. Proves
+/// a plain Rust activity and a WASM activity coexist on the same worker/queue.
+fn native_double(
+    _ctx: &autumn_harvest::context::ActivityContext,
+    input: serde_json::Value,
+) -> ActFut<'_> {
+    Box::pin(async move {
+        let n = input
+            .get("n")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        Ok(serde_json::json!({ "doubled": n * 2 }))
+    })
+}
+
+/// Workflow: run the native activity `native_double` AND the WASM activity
+/// `echo_wasm`, then return both outputs combined.
+fn wf_native_and_wasm(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        let native = ctx
+            .execute_activity_raw("native_double", input.clone(), &queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        let wasm = ctx
+            .execute_activity_raw("echo_wasm", input, &queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "native": native, "wasm": wasm }))
+    })
+}
+
+/// A native `ActivityInfo` literal (mirrors the `act_info` helper in
+/// `activity_interceptor_tests.rs`) so a real Rust handler is registered.
+fn native_act_info(
+    name: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "wasm_activities_tests",
+        default_retry_policy: None,
+        default_start_to_close: Some(Duration::from_secs(5)),
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler,
+    }
+}
+
+/// Build a registry wiring BOTH native `ActivityInfo`s (with real handlers) and
+/// WASM activities (bindings + shared store + startup-publish registrations),
+/// so `worker.run()` publishes the WASM modules before polling and dispatches
+/// native and WASM activities side by side.
+fn build_mixed_registry(
+    workflows: Vec<WorkflowInfo>,
+    native: Vec<ActivityInfo>,
+    wasm: Vec<WasmActivitySpec>,
+    metrics: Arc<dyn MetricsRecorder>,
+) -> Arc<HandlerRegistry> {
+    let mut activities = native;
+    let mut bindings = HashMap::new();
+    let mut registrations = Vec::new();
+    for spec in wasm {
+        activities.push(ActivityInfo::wasm(
+            spec.name,
+            None,
+            spec.retry.clone(),
+            Some(Duration::from_secs(5)),
+        ));
+        bindings.insert(
+            spec.name.to_string(),
+            WasmBinding {
+                capabilities: spec.caps,
+                limits: spec.limits,
+            },
+        );
+        registrations.push((spec.name.to_string(), spec.bytes));
+    }
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
+    let store = Arc::new(WasmModuleStore::new());
+    Arc::new(
+        HandlerRegistry::with_state_and_telemetry(
+            workflows,
+            activities,
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
+        )
+        .with_wasm_activities(store, bindings, registrations),
+    )
+}
+
+/// Correlate `ActivityScheduled { name }` → its `ActivityCompleted { output }`
+/// via the shared `activity_id`, so a caller can read a named activity's output.
+fn completed_output_for(
+    history: &[WorkflowEvent],
+    activity_name: &str,
+) -> Option<serde_json::Value> {
+    let id = history.iter().find_map(|e| match e {
+        WorkflowEvent::ActivityScheduled {
+            activity_id, name, ..
+        } if name == activity_name => Some(*activity_id),
+        _ => None,
+    })?;
+    history.iter().find_map(|e| match e {
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output,
+        } if *activity_id == id => Some(output.clone()),
+        _ => None,
+    })
+}
+
+fn workflow_completed_output(history: &[WorkflowEvent]) -> Option<serde_json::Value> {
+    history.iter().find_map(|e| match e {
+        WorkflowEvent::WorkflowCompleted { output, .. } => Some(output.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runs_one_native_and_one_wasm_activity_to_completion() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-native-and-wasm";
+    let mut conn = connect(&url).await;
+    let input = serde_json::json!({ "n": 21 });
+    let exec_id = seed_workflow(&mut conn, "wf_native_and_wasm", input.clone(), queue).await;
+
+    // One native activity (real Rust handler) + one WASM activity (deny-all
+    // caps, startup-published). Both bound to the same worker/queue.
+    let registry = build_mixed_registry(
+        vec![wf_info("wf_native_and_wasm", wf_native_and_wasm)],
+        vec![native_act_info("native_double", native_double)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: assemble(ECHO_WAT),
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    let worker = build_worker("w-native-and-wasm", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+
+    // BOTH activities produced the correct output.
+    assert_eq!(
+        completed_output_for(&history, "native_double"),
+        Some(serde_json::json!({ "doubled": 42 })),
+        "the native activity must double n=21 to 42"
+    );
+    assert_eq!(
+        completed_output_for(&history, "echo_wasm"),
+        Some(input.clone()),
+        "the WASM activity must echo its input"
+    );
+    // The workflow's terminal output combines both — proving both ran to
+    // completion through the standard dispatch path.
+    assert_eq!(
+        workflow_completed_output(&history),
+        Some(serde_json::json!({
+            "native": { "doubled": 42 },
+            "wasm": input,
+        })),
+        "the workflow output combines the native and WASM results"
+    );
+
+    // AC6: the WASM activity is INDISTINGUISHABLE from the native one in
+    // history — exactly two ordinary ActivityScheduled + two ActivityCompleted,
+    // and NO wasm-specific event variant of any kind.
+    let types: Vec<&str> = history.iter().map(WorkflowEvent::type_name).collect();
+    assert_eq!(
+        types.iter().filter(|t| **t == "ActivityScheduled").count(),
+        2,
+        "exactly two ActivityScheduled (one native, one WASM): {types:?}"
+    );
+    assert_eq!(
+        types.iter().filter(|t| **t == "ActivityCompleted").count(),
+        2,
+        "exactly two ActivityCompleted (one native, one WASM): {types:?}"
+    );
+    assert!(
+        !types.iter().any(|t| t.to_lowercase().contains("wasm")),
+        "no wasm-specific event variant may appear in history: {types:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dispatch-overhead measurement (Success Metric: "< 10 ms p99 vs native").
+//
+// #[ignore]d — a percentile-timing microbenchmark is inherently flaky under CI
+// scheduling and is NOT a gate. Run explicitly with:
+//   cargo test -p autumn-harvest --features wasm-activities --test integration \
+//     -- --ignored dispatch_overhead --nocapture
+//
+// Measures the PER-INVOCATION overhead of a trivial cached WASM echo
+// (instantiate + call — the module is compiled/cached ONCE up front, so
+// compilation is excluded) against a native Rust closure baseline. This is
+// deliberately the pure invocation primitive (`invoke_wasm_activity`), not the
+// full worker round-trip, so the number isolates WASM instantiation cost from
+// task-queue and DB latency (which native and WASM activities share equally).
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "percentile microbenchmark; run with --ignored --nocapture, not a CI gate"]
+fn dispatch_overhead_wasm_echo_vs_native() {
+    use std::time::Instant;
+
+    const N: usize = 500;
+    const WARMUP: usize = 50;
+
+    let store = WasmModuleStore::new();
+    let bytes = echo_bytes();
+    let hash = WasmModuleStore::compute_hash(&bytes);
+    // Compile + cache ONCE up front so the measured loop excludes compilation.
+    let module = store.get_or_compile(&hash, &bytes).expect("compile echo");
+    let caps = WasmCapabilities::default();
+    let limits = WasmLimits::default();
+    let input = serde_json::json!({ "hello": "world", "n": 42 });
+
+    // Native baseline: a trivial echo closure returning the same JSON.
+    let native = |v: &serde_json::Value| -> serde_json::Value { v.clone() };
+
+    let pct = |sorted: &[Duration], p: f64| -> Duration {
+        if sorted.is_empty() {
+            return Duration::ZERO;
+        }
+        let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    };
+
+    // Warm up both paths (JIT/page faults/allocator).
+    for _ in 0..WARMUP {
+        let _ = invoke_wasm_activity(&store, &module, &input, &caps, &limits, None).unwrap();
+        std::hint::black_box(native(&input));
+    }
+
+    let mut wasm_samples = Vec::with_capacity(N);
+    let mut native_samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = Instant::now();
+        let out = invoke_wasm_activity(&store, &module, &input, &caps, &limits, None).unwrap();
+        wasm_samples.push(t0.elapsed());
+        assert_eq!(out, input);
+
+        let t1 = Instant::now();
+        std::hint::black_box(native(&input));
+        native_samples.push(t1.elapsed());
+    }
+
+    wasm_samples.sort_unstable();
+    native_samples.sort_unstable();
+
+    let w50 = pct(&wasm_samples, 50.0);
+    let w99 = pct(&wasm_samples, 99.0);
+    let n50 = pct(&native_samples, 50.0);
+    let n99 = pct(&native_samples, 99.0);
+    let d50 = w50.saturating_sub(n50);
+    let d99 = w99.saturating_sub(n99);
+
+    println!("\n=== WASM cached-echo dispatch overhead (N={N}) ===");
+    println!("  wasm   p50={w50:?}  p99={w99:?}");
+    println!("  native p50={n50:?}  p99={n99:?}");
+    println!("  overhead (wasm - native)  p50={d50:?}  p99={d99:?}");
+    println!(
+        "  success-metric target: p99 overhead < 10ms  →  {}",
+        if d99 < Duration::from_millis(10) {
+            "MET"
+        } else {
+            "NOT MET (per-invocation instantiation cost; mitigation: instance pooling)"
+        }
     );
 }
