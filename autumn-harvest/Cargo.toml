@@ -29,6 +29,12 @@ metrics-rs = ["dep:metrics"]
 schema = ["dep:schemars"]
 # Sandboxed WebAssembly activities (issue #965). Pulls wasmtime + wat only when
 # explicitly enabled; requires the `db` feature (activity events are persisted).
+#
+# EFFECTIVE MSRV: this feature requires Rust >= 1.94 (wasmtime 46's own minimum).
+# The crate's core/default MSRV is 1.88 and is UNAFFECTED: this optional R&D-spike
+# feature is out of the default build and the MSRV CI check (`cargo check
+# --workspace`, default features, never compiles wasmtime). See
+# docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 
 [dependencies]
@@ -61,6 +67,8 @@ scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 metrics = { version = "0.24", optional = true }
 schemars = { version = "0.8", optional = true }
+# wasmtime 46's own minimum Rust is 1.94, so the `wasm-activities` feature that
+# enables these has an effective MSRV of 1.94 (the crate's core MSRV stays 1.88).
 wasmtime = { version = "46", optional = true }
 wat = { version = "1", optional = true }
 

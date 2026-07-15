@@ -107,4 +107,9 @@ echo, the sandbox-denial terminal, the in-flight pin, the fuel-retry, and the
 All integration tests **ran green against a local Postgres 16** during development
 (via `HARVEST_TEST_DATABASE_URL`); CI executes them Docker-backed via the manifest
 row. The `wasm-activities` feature is out of the default build, so the default build
-and `cargo tree -i wasmtime` (default features) are unchanged / empty.
+and `cargo tree -i wasmtime` (default features) are unchanged / empty. **MSRV note:**
+the feature has an effective MSRV of **1.94** (wasmtime 46.0.1's own minimum),
+distinct from the crate's core MSRV of **1.88** — the default build and the CI MSRV
+job (`cargo check --workspace`, default features) never compile wasmtime and are
+unaffected, so the crate continues to advertise `rust-version = 1.88.0` for every
+non-`wasm` consumer.
