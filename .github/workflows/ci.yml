@@ -112,6 +112,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
+      - name: Clippy autumn-harvest-sqlite
+        run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -174,6 +176,9 @@ jobs:
       - name: Run CLI tests (issue #753)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-cli
+      - name: Run autumn-harvest-sqlite tests (issue #1068)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-sqlite
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics

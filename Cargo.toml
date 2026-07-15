@@ -5,6 +5,7 @@ members = [
     "autumn-harvest-macros",
     "autumn-harvest-cli",
     "autumn-harvest-redis",
+    "autumn-harvest-sqlite",
     "examples/billing-autumn-web",
     "examples/quickstart",
     "examples/saga-choreography",
@@ -49,6 +50,10 @@ proc-macro2 = "1"
 
 # Redis
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script"] }
+
+# SQLite (embedded, single-writer edge backend — bundled builds SQLite from
+# source so no system libsqlite3 and no Docker are required for tests).
+rusqlite = { version = "0.38", features = ["bundled"] }
 
 # Dev / test
 testcontainers = "0.27"
