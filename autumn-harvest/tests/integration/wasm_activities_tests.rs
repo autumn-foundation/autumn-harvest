@@ -36,7 +36,7 @@ use autumn_harvest::wasm_activities::{
 use autumn_harvest::wasm_store::{
     MAX_WASM_MODULE_BYTES, WasmBinding, WasmDispatch, fetch_wasm_module_bytes, list_wasm_modules,
     publish_registered_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
-    resolve_active_wasm_module, resolve_wasm_dispatch,
+    resolve_active_wasm_module, resolve_wasm_dispatch, seed_wasm_module,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
@@ -399,7 +399,7 @@ async fn resolve_dispatch_unavailable_when_nothing_published() {
         capabilities: WasmCapabilities::default(),
         limits: WasmLimits::default(),
     };
-    let dispatch = resolve_wasm_dispatch(&mut conn, &store, &binding, "echo", None).await;
+    let dispatch = resolve_wasm_dispatch(&mut conn, &store, &binding, "echo", None, None).await;
     match dispatch {
         WasmDispatch::Fail(payload) => {
             assert!(
@@ -432,6 +432,7 @@ async fn resolve_dispatch_invokes_a_published_echo() {
         &binding,
         "echo",
         Some(Duration::from_secs(5)),
+        None,
     )
     .await;
     let prepared = match dispatch {
@@ -451,12 +452,15 @@ async fn resolve_dispatch_invokes_a_published_echo() {
 }
 
 #[tokio::test]
-async fn resolve_dispatch_invalid_when_bytes_do_not_compile() {
+async fn resolve_dispatch_invalid_surfaces_at_invoke_not_resolve() {
+    // Finding 6 (issue #965 review): compilation is deferred off the async
+    // resolve path, so garbage bytes resolve to `Invoke` and the integrity/
+    // compile failure surfaces (still non-retryable `WasmModuleInvalid`) only
+    // from `invoke`, which the worker runs on the blocking pool.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
 
-    // Publish garbage bytes: the store's integrity/compile step must reject them.
     publish_wasm_module(&mut conn, "bad", b"not a wasm module")
         .await
         .expect("publish garbage");
@@ -466,16 +470,139 @@ async fn resolve_dispatch_invalid_when_bytes_do_not_compile() {
         capabilities: WasmCapabilities::default(),
         limits: WasmLimits::default(),
     };
-    let dispatch = resolve_wasm_dispatch(&mut conn, &store, &binding, "bad", None).await;
-    match dispatch {
+    // Resolve does NOT compile — garbage still yields a dispatchable Invoke.
+    let dispatch = resolve_wasm_dispatch(&mut conn, &store, &binding, "bad", None, None).await;
+    let prepared = match dispatch {
+        WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(payload) => {
-            assert!(
-                payload.contains(ERROR_TYPE_WASM_MODULE_INVALID),
-                "expected invalid, got: {payload}"
-            );
+            panic!("resolve must defer the compile, got Fail: {payload}")
         }
-        WasmDispatch::Invoke(_) => panic!("garbage bytes must be invalid"),
-    }
+    };
+    // The invalid-bytes failure surfaces from the (blocking-pool) invoke.
+    let failure = prepared
+        .invoke(&serde_json::json!(null))
+        .expect_err("garbage bytes must fail to compile at invoke");
+    assert_eq!(failure.error_type, ERROR_TYPE_WASM_MODULE_INVALID);
+    assert!(
+        failure.non_retryable,
+        "a compile/integrity failure is non-retryable"
+    );
+}
+
+// ── Finding 6: cache-miss compilation is deferred off the async path ─────────
+
+#[tokio::test]
+async fn resolve_dispatch_defers_compile_to_invoke_on_cache_miss() {
+    // The async resolve must NOT call `get_or_compile` on a miss: it returns an
+    // Invoke carrying the raw bytes, and compilation happens inside `invoke`
+    // (which the worker runs on the blocking pool). Observable via the store
+    // cache: empty right after resolve, populated only after invoke.
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let bytes = echo_bytes();
+    let hash = WasmModuleStore::compute_hash(&bytes);
+    publish_wasm_module(&mut conn, "echo", &bytes)
+        .await
+        .expect("publish");
+
+    let store = Arc::new(WasmModuleStore::new());
+    let binding = WasmBinding {
+        capabilities: WasmCapabilities::default(),
+        limits: WasmLimits::default(),
+    };
+    let prepared =
+        match resolve_wasm_dispatch(&mut conn, &store, &binding, "echo", None, None).await {
+            WasmDispatch::Invoke(prepared) => prepared,
+            WasmDispatch::Fail(payload) => panic!("expected invoke, got: {payload}"),
+        };
+    // A cache miss must not have compiled during the async resolve.
+    assert!(
+        store.cached(&hash).is_none(),
+        "resolve must defer compilation off the async path (cache still empty)"
+    );
+    // The (blocking-pool) invoke compiles + caches, and runs correctly.
+    let input = serde_json::json!({"deferred": true});
+    let out = prepared
+        .invoke(&input)
+        .expect("deferred-compile invoke runs");
+    assert_eq!(out, input);
+    assert!(
+        store.cached(&hash).is_some(),
+        "invoke compiled and cached the module"
+    );
+}
+
+// ── Finding 5: startup seed activates only when no active version exists ──────
+
+#[tokio::test]
+async fn seed_activates_only_when_no_active_version_exists() {
+    // (a) Empty table: seeding activates the seeded module.
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let v1 = echo_bytes();
+    let h1 = WasmModuleStore::compute_hash(&v1);
+    seed_wasm_module(&mut conn, "echo", &v1)
+        .await
+        .expect("seed v1 into empty table");
+    assert_eq!(
+        resolve_active_wasm_hash(&mut conn, "echo")
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some(h1.as_str()),
+        "seeding into an empty table activates the seeded version"
+    );
+    assert_eq!(active_count(&mut conn, "echo").await, 1);
+}
+
+#[tokio::test]
+async fn seed_does_not_clobber_an_existing_active_version() {
+    // (b) The rolling-deploy hazard: the DB is already on v2 (active); a
+    // restarted OLDER worker that embeds v1 seeds it. v2 must STAY active, and
+    // v1 must be present + fetchable-by-hash (so in-flight pinned v1 attempts
+    // and this worker can still run v1) but NOT activated — no flip-back.
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let v1 = echo_bytes();
+    let v2 = echo_bytes_v2();
+    let h1 = WasmModuleStore::compute_hash(&v1);
+    let h2 = WasmModuleStore::compute_hash(&v2);
+
+    // DB is hot-swapped to v2 (an operator publish).
+    publish_wasm_module(&mut conn, "echo", &v2)
+        .await
+        .expect("publish v2");
+    // Old worker restarts and seeds its embedded v1.
+    seed_wasm_module(&mut conn, "echo", &v1)
+        .await
+        .expect("seed v1");
+
+    // v2 stays the active version — the shard is NOT flipped back to v1.
+    assert_eq!(
+        resolve_active_wasm_hash(&mut conn, "echo")
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some(h2.as_str()),
+        "seeding must not clobber the already-active v2"
+    );
+    assert_eq!(active_count(&mut conn, "echo").await, 1);
+    // v1 row is present + fetchable by hash, just inactive.
+    assert_eq!(
+        fetch_wasm_module_bytes(&mut conn, &h1)
+            .await
+            .expect("fetch v1")
+            .as_deref(),
+        Some(v1.as_slice()),
+        "the seeded v1 bytes are still fetchable by hash"
+    );
+    assert_eq!(total_rows(&mut conn, "echo").await, 2);
 }
 
 // ── small query helpers ─────────────────────────────────────────────────────
@@ -972,7 +1099,8 @@ async fn in_flight_dispatch_is_pinned_across_a_mid_flight_republish() {
         limits: WasmLimits::default(),
     };
     // Resolve while v1 is active → prepared is pinned to v1's compiled module.
-    let prepared = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None).await {
+    let prepared = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None, None).await
+    {
         WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(p) => panic!("expected invoke: {p}"),
     };
@@ -991,7 +1119,7 @@ async fn in_flight_dispatch_is_pinned_across_a_mid_flight_republish() {
     );
 
     // A FRESH resolution now sees v2.
-    let fresh = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None).await {
+    let fresh = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None, None).await {
         WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(p) => panic!("expected invoke: {p}"),
     };

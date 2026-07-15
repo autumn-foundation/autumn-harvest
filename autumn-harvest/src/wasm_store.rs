@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::{ExpressionMethods, QueryDsl};
+use tokio_util::sync::CancellationToken;
 use wasmtime::Module;
 
 use crate::error::{HarvestResult, database_error};
@@ -157,16 +158,32 @@ pub struct WasmModuleRow {
     pub published_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// A resolved, compiled WASM activity ready to invoke against a JSON input.
+/// Where a prepared activity's compiled module comes from.
 ///
-/// Holds shared handles (the engine store and the compiled module) plus the
-/// caller's capability/limit/deadline policy, so [`invoke`](Self::invoke) is a
-/// thin wrapper over [`crate::wasm_activities::invoke_wasm_activity`].
+/// A cache hit at resolve time carries the already-compiled module
+/// ([`Self::Compiled`]); a cache miss defers the CPU-bound wasmtime compile to
+/// [`PreparedWasmActivity::invoke`] (which the worker runs on the blocking
+/// pool), carrying only the raw bytes ([`Self::Deferred`]) so no compilation
+/// ever runs on the async dispatch path (issue #965 review).
+enum WasmModuleSource {
+    /// Cache hit: the module was already compiled and is served directly.
+    Compiled(Arc<Module>),
+    /// Cache miss: compile-then-cache these bytes on the blocking pool inside
+    /// `invoke`. The content-integrity check (hash vs bytes) runs there too.
+    Deferred { hash: String, bytes: Vec<u8> },
+}
+
+/// A resolved WASM activity ready to invoke against a JSON input.
+///
+/// Holds the shared engine store plus the caller's capability/limit/deadline
+/// policy. The compiled module is either already cached (a resolve-time hit) or
+/// compiled lazily on first [`invoke`](Self::invoke) (a resolve-time miss), so
+/// the async dispatch path never runs wasmtime compilation.
 pub struct PreparedWasmActivity {
     /// The shared engine + compiled-module cache (one per worker).
     pub store: Arc<WasmModuleStore>,
-    /// The compiled module for this activity's active version.
-    pub module: Arc<Module>,
+    /// The compiled module, or the bytes to compile on the blocking pool.
+    source: WasmModuleSource,
     /// Host capabilities granted to the guest.
     pub caps: WasmCapabilities,
     /// Per-invocation resource budget.
@@ -174,6 +191,10 @@ pub struct PreparedWasmActivity {
     /// Effective wall-clock deadline for the invocation (typically the
     /// activity's start-to-close), clamped by `limits.max_wall_clock`.
     pub deadline: Option<Duration>,
+    /// Optional cancellation token: when set, a cancelled guest is
+    /// cooperatively interrupted within ~1 epoch tick instead of running to the
+    /// wall-clock ceiling (issue #965 review).
+    pub cancel: Option<CancellationToken>,
 }
 
 impl PreparedWasmActivity {
@@ -181,21 +202,40 @@ impl PreparedWasmActivity {
     /// [`ActivityFailure`].
     ///
     /// This is CPU-bound and blocking (it drives the guest to completion on the
-    /// calling thread), so the worker calls it inside `spawn_blocking`.
+    /// calling thread), so the worker calls it inside `spawn_blocking`. On a
+    /// resolve-time cache miss it also compiles the module here (on that same
+    /// blocking thread), verifying content integrity before compiling — so
+    /// wasmtime compilation never occupies an async worker thread.
     ///
     /// # Errors
     ///
     /// Returns the typed [`ActivityFailure`] classifying any sandbox denial,
-    /// resource exhaustion, guest trap, ABI violation, or contained host-glue
-    /// panic — see [`crate::wasm_activities::invoke_wasm_activity`].
+    /// resource exhaustion, guest trap, ABI violation, cooperative
+    /// cancellation, contained host-glue panic, or (on a deferred-compile miss)
+    /// a `WasmModuleInvalid` integrity/compile failure.
     pub fn invoke(&self, input: &serde_json::Value) -> Result<serde_json::Value, ActivityFailure> {
-        crate::wasm_activities::invoke_wasm_activity(
+        let module = match &self.source {
+            WasmModuleSource::Compiled(module) => Arc::clone(module),
+            WasmModuleSource::Deferred { hash, bytes } => {
+                // Compile (and integrity-check) here, on the blocking pool. A
+                // concurrent dispatch may have compiled the same hash already;
+                // `get_or_compile` serves the cached `Arc` if so, otherwise
+                // compiles and caches it.
+                self.store.get_or_compile(hash, bytes).map_err(|e| {
+                    ActivityFailure::wasm_module_invalid(format!(
+                        "wasm module {hash} is invalid: {e}"
+                    ))
+                })?
+            }
+        };
+        crate::wasm_activities::invoke_wasm_activity_cancellable(
             &self.store,
-            &self.module,
+            &module,
             input,
             &self.caps,
             &self.limits,
             self.deadline,
+            self.cancel.clone(),
         )
     }
 }
@@ -316,6 +356,129 @@ pub async fn publish_registered_wasm_modules(
     Ok(())
 }
 
+/// Seed `bytes` as a WASM module version for `activity_name` at worker startup
+/// (issue #965).
+///
+/// **Seed, not publish.** Unlike [`publish_wasm_module`] — which always
+/// activates the given bytes (operator hot-swap intent) — seeding is
+/// *activate-only-if-absent*: it ensures the `(hash, activity_name)` row exists
+/// (so the bytes are fetchable by hash for in-flight pinned attempts and for
+/// this worker to run its own embedded version), but it activates the embedded
+/// version **only when no active version already exists** for the name.
+///
+/// This is the fix for a rolling-deploy hazard: if the database has already been
+/// hot-swapped to v2 and an *older* worker embedding v1 restarts, a blind
+/// publish would flip the shard back to v1 (running stale code until another
+/// publisher wins). Seeding leaves the existing active v2 untouched while still
+/// making v1's bytes available.
+///
+/// Idempotent, and serialised against concurrent publishes/seeds for the same
+/// name with the same transaction-scoped advisory lock `publish_wasm_module`
+/// uses. Rejects an oversized blob (> [`MAX_WASM_MODULE_BYTES`]) **before** any
+/// hashing or database work. Returns the content hash.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Config`] for an oversized blob, or
+/// `HarvestError::Database` on any transaction failure.
+pub async fn seed_wasm_module(
+    conn: &mut diesel_async::AsyncPgConnection,
+    activity_name: &str,
+    bytes: &[u8],
+) -> HarvestResult<String> {
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use scoped_futures::ScopedFutureExt as _;
+
+    if bytes.len() > MAX_WASM_MODULE_BYTES {
+        return Err(crate::error::HarvestError::Config(format!(
+            "wasm module for activity '{activity_name}' is {} bytes, exceeding the maximum \
+             of {MAX_WASM_MODULE_BYTES} bytes",
+            bytes.len()
+        )));
+    }
+
+    let hash = WasmModuleStore::compute_hash(bytes);
+    let hash_for_txn = hash.clone();
+    let name = activity_name.to_owned();
+
+    conn.transaction::<(), crate::error::HarvestError, _>(|conn| {
+        async move {
+            use crate::schema::harvest_wasm_modules::dsl as m;
+
+            // Serialise against a concurrent publish/seed for the SAME name so
+            // the "is there an active version?" check and the conditional
+            // activate are atomic. Same lock key as `publish_wasm_module`.
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind::<diesel::sql_types::Text, _>(&name)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+            // 1. Ensure the row exists (inactive if new, unchanged if already
+            //    present) so its bytes are always fetchable by hash. DO NOTHING
+            //    on conflict so an already-active row is never demoted.
+            let new_row = crate::models::NewHarvestWasmModule {
+                hash: &hash_for_txn,
+                activity_name: &name,
+                wasm_bytes: bytes,
+                active: false,
+            };
+            diesel::insert_into(m::harvest_wasm_modules)
+                .values(&new_row)
+                .on_conflict((m::hash, m::activity_name))
+                .do_nothing()
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+            // 2. Activate the seeded version ONLY when no active version exists
+            //    for this name. Under the advisory lock the `NOT EXISTS` guard
+            //    cannot race a concurrent activation, so the partial unique
+            //    index (`WHERE active`) can never see two active rows. $2 is
+            //    referenced twice; Postgres binds it once.
+            diesel::sql_query(
+                "UPDATE harvest_wasm_modules SET active = true, published_at = now() \
+                 WHERE hash = $1 AND activity_name = $2 \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM harvest_wasm_modules \
+                     WHERE activity_name = $2 AND active \
+                 )",
+            )
+            .bind::<diesel::sql_types::Text, _>(&hash_for_txn)
+            .bind::<diesel::sql_types::Text, _>(&name)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
+    Ok(hash)
+}
+
+/// Seed a batch of `(activity_name, bytes)` module registrations (issue #965).
+///
+/// Used at worker startup to make builder-registered WASM activities available
+/// on the worker's shard without clobbering a version the shard was already
+/// hot-swapped to. See [`seed_wasm_module`] for the activate-only-if-absent
+/// semantics and why a blind publish at startup would be wrong.
+///
+/// # Errors
+///
+/// Returns the first seed failure (oversized blob or database error).
+pub async fn seed_registered_wasm_modules(
+    conn: &mut diesel_async::AsyncPgConnection,
+    registrations: &[(String, Vec<u8>)],
+) -> HarvestResult<()> {
+    for (name, bytes) in registrations {
+        seed_wasm_module(conn, name, bytes).await?;
+    }
+    Ok(())
+}
+
 /// Resolve the active module **hash** for `activity_name`, if any (issue #965).
 ///
 /// Cheap: selects only the hash column, never the bytes. Returns `None` when no
@@ -431,23 +594,35 @@ pub async fn list_wasm_modules(
 /// Resolve a WASM activity into a dispatchable form for the worker seam
 /// (issue #965).
 ///
-/// **Resolve-hash-first**: cheaply resolve the active hash, then serve a
-/// compiled module from the store's in-process cache without ever fetching
-/// bytes on a cache hit. Only a cache miss loads the bytes and compiles.
+/// **Resolve-hash-first, compile-off-the-async-path**: cheaply resolve the
+/// active hash, then serve a compiled module from the store's in-process cache
+/// on a hit (no bytes fetch). On a miss, load the bytes but **defer** the
+/// CPU-bound wasmtime compile to [`PreparedWasmActivity::invoke`] (which the
+/// worker runs on the blocking pool), so the async dispatch thread never runs
+/// compilation, which could otherwise stall unrelated polling/heartbeats/
+/// cancellation (issue #965 review). So the async path only ever does the hash
+/// resolve, the cache probe, and (on a miss) the byte fetch.
+///
+/// `cancel`, when set, is carried onto the prepared activity so a cancelled
+/// guest is cooperatively interrupted rather than running to its wall-clock
+/// ceiling.
 ///
 /// Failure classification (via typed [`ActivityFailure`] → [`WasmDispatch::Fail`]):
 /// - no active module → non-retryable `WasmModuleUnavailable`
 /// - DB error resolving the hash / fetching bytes → retryable `WasmModuleLookupFailed`
-/// - integrity or compile failure → non-retryable `WasmModuleInvalid`
 ///
-/// Never returns an `Err`: every failure is folded into a typed `Fail` payload
-/// the worker records as an ordinary `ActivityFailed`.
+/// An integrity or compile failure on a deferred miss surfaces later, from
+/// `invoke`, as a non-retryable `WasmModuleInvalid`.
+///
+/// Never returns an `Err`: every resolution failure is folded into a typed
+/// `Fail` payload the worker records as an ordinary `ActivityFailed`.
 pub async fn resolve_wasm_dispatch(
     conn: &mut diesel_async::AsyncPgConnection,
     store: &Arc<WasmModuleStore>,
     binding: &WasmBinding,
     name: &str,
     deadline: Option<Duration>,
+    cancel: Option<CancellationToken>,
 ) -> WasmDispatch {
     let hash = match resolve_active_wasm_hash(conn, name).await {
         Ok(Some(hash)) => hash,
@@ -469,9 +644,11 @@ pub async fn resolve_wasm_dispatch(
         }
     };
 
-    // Cache hit: serve the compiled module without touching the bytes.
-    let module = if let Some(module) = store.cached(&hash) {
-        module
+    // Cache hit: serve the compiled module without touching the bytes. Cache
+    // miss: fetch the bytes (async) but defer the compile to `invoke` on the
+    // blocking pool.
+    let source = if let Some(module) = store.cached(&hash) {
+        WasmModuleSource::Compiled(module)
     } else {
         let bytes = match fetch_wasm_module_bytes(conn, &hash).await {
             Ok(Some(bytes)) => bytes,
@@ -496,25 +673,16 @@ pub async fn resolve_wasm_dispatch(
                 );
             }
         };
-        match store.get_or_compile(&hash, &bytes) {
-            Ok(module) => module,
-            Err(e) => {
-                return WasmDispatch::Fail(
-                    ActivityFailure::wasm_module_invalid(format!(
-                        "wasm module {hash} for activity '{name}' is invalid: {e}"
-                    ))
-                    .into_error_payload(),
-                );
-            }
-        }
+        WasmModuleSource::Deferred { hash, bytes }
     };
 
     WasmDispatch::Invoke(PreparedWasmActivity {
         store: Arc::clone(store),
-        module,
+        source,
         caps: binding.capabilities.clone(),
         limits: binding.limits,
         deadline,
+        cancel,
     })
 }
 

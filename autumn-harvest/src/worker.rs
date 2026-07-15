@@ -7588,6 +7588,11 @@ async fn process_activity_task(
                             task.start_to_close,
                             activity.default_start_to_close,
                         ),
+                        // Thread the task cancellation token so a cancelled guest
+                        // is cooperatively interrupted (issue #965 review) within
+                        // ~1 epoch tick, instead of holding a blocking-pool thread
+                        // until its wall-clock ceiling.
+                        Some(cancel.clone()),
                     )
                     .await
                     // `conn` is dropped at the end of this arm, before the guest runs.
@@ -12882,15 +12887,19 @@ impl Worker {
             .map(|shard| (*shard, pool.clone()))
             .collect();
 
-        // Issue #965: startup-publish. Publish every builder-registered WASM
-        // activity module to each shard's database before the poll loop begins,
+        // Issue #965: startup-seed. Make every builder-registered WASM activity
+        // module available on each shard's database before the poll loop begins,
         // so an embedder who only calls `HarvestBuilder::wasm_activity(...)` and
         // starts the worker gets a working WASM activity with no manual publish.
-        // Idempotent (a re-run re-activates the same content-addressed rows), and
-        // per-shard so each shard's `harvest_wasm_modules` is seeded. A failure
-        // is logged but does not abort startup: the module is simply unavailable
-        // on that shard until a later (re)publish, and a dispatch there fails
-        // with a typed `WasmModuleUnavailable`.
+        // This SEEDS (activate-only-if-absent), it does NOT publish: a restarted
+        // older worker embedding v1 must not flip a shard the DB has already
+        // hot-swapped to v2 back to v1 (issue #965 review). The embedded bytes
+        // are always made fetchable-by-hash (so in-flight pinned attempts and
+        // this worker can run them); they only become *active* when no active
+        // version exists yet. Idempotent, and per-shard. A failure is logged but
+        // does not abort startup: the module is simply unavailable on that shard
+        // until a later publish, and a dispatch there fails with a typed
+        // `WasmModuleUnavailable`.
         #[cfg(feature = "wasm-activities")]
         {
             let registrations = self.registry.wasm_module_registrations();
@@ -12898,7 +12907,7 @@ impl Worker {
                 for (shard, shard_pool) in &shard_targets {
                     match shard_pool.get().await {
                         Ok(mut conn) => {
-                            if let Err(e) = crate::wasm_store::publish_registered_wasm_modules(
+                            if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(
                                 &mut conn,
                                 registrations,
                             )
@@ -12908,7 +12917,7 @@ impl Worker {
                                     worker_id = %self.config.worker_id,
                                     shard = ?shard,
                                     error = %e,
-                                    "failed to publish registered wasm modules; wasm activities \
+                                    "failed to seed registered wasm modules; wasm activities \
                                      may be unavailable on this shard until published"
                                 );
                             }
@@ -12918,7 +12927,7 @@ impl Worker {
                                 worker_id = %self.config.worker_id,
                                 shard = ?shard,
                                 error = %e,
-                                "failed to acquire a connection to publish registered wasm modules"
+                                "failed to acquire a connection to seed registered wasm modules"
                             );
                         }
                     }

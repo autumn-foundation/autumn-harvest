@@ -43,14 +43,17 @@
 //! Randomness (`env::random_u64`) is a non-cryptographic xorshift generator and
 //! must not be used for security-sensitive draws.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use lru::LruCache;
+use tokio_util::sync::CancellationToken;
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    UpdateDeadline,
 };
 
 use crate::error::HarvestError;
@@ -75,6 +78,18 @@ pub const DEFAULT_MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
 /// beyond the current epoch, so the resolution of the wall-clock bound is one
 /// tick interval.
 pub const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Default maximum number of distinct compiled module versions held in the
+/// in-process content-hash cache (issue #965 review).
+///
+/// Old module versions are deliberately kept fetchable in Postgres, so without
+/// a bound a long-lived worker that is hot-swapped many times would accumulate
+/// compiled code for every historical version it ever invoked. The cache is an
+/// LRU: at capacity, the least-recently-used compiled module is evicted.
+/// Evicting an `Arc<Module>` is safe even while an in-flight invocation still
+/// holds a clone — the invocation keeps its module alive, and a future miss for
+/// that hash simply recompiles.
+pub const WASM_MODULE_CACHE_CAP: usize = 64;
 
 /// Host capabilities granted to a single WASM activity invocation.
 ///
@@ -183,13 +198,17 @@ pub fn deadline_ticks(d: Duration) -> u64 {
 /// clock without one guest's expiry affecting another.
 pub struct WasmModuleStore {
     engine: Engine,
-    modules: RwLock<HashMap<String, Arc<Module>>>,
+    modules: RwLock<LruCache<String, Arc<Module>>>,
     ticker_stop: Arc<AtomicBool>,
     ticker: Option<JoinHandle<()>>,
 }
 
 impl WasmModuleStore {
     /// Construct a store: configure the engine, start the epoch ticker thread.
+    ///
+    /// Uses the default compiled-module cache capacity
+    /// ([`WASM_MODULE_CACHE_CAP`]); call [`WasmModuleStore::with_cache_capacity`]
+    /// to override it.
     ///
     /// # Panics
     ///
@@ -199,6 +218,19 @@ impl WasmModuleStore {
     /// not guest-controlled conditions.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_cache_capacity(WASM_MODULE_CACHE_CAP)
+    }
+
+    /// Construct a store with an explicit compiled-module cache capacity.
+    ///
+    /// A `cap` of 0 is floored to 1 (the LRU always holds at least one entry).
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same fixed-config / thread-spawn faults as
+    /// [`WasmModuleStore::new`].
+    #[must_use]
+    pub fn with_cache_capacity(cap: usize) -> Self {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
@@ -221,9 +253,12 @@ impl WasmModuleStore {
             })
             .expect("failed to spawn the harvest-wasm-epoch ticker thread");
 
+        // Floor at 1 so the LRU is always non-empty; `NonZeroUsize::new(1)` is
+        // infallible so the fallback branch is never taken.
+        let cap = NonZeroUsize::new(cap.max(1)).unwrap_or(NonZeroUsize::MIN);
         Self {
             engine,
-            modules: RwLock::new(HashMap::new()),
+            modules: RwLock::new(LruCache::new(cap)),
             ticker_stop,
             ticker: Some(ticker),
         }
@@ -249,13 +284,30 @@ impl WasmModuleStore {
     }
 
     /// Return a cached compiled module by content hash, if present.
+    ///
+    /// A hit marks the entry most-recently-used (LRU recency), so the modules a
+    /// worker actually dispatches stay resident and idle historical versions age
+    /// out first. Takes the write lock because the LRU recency bump mutates the
+    /// map.
     #[must_use]
     pub fn cached(&self, hash: &str) -> Option<Arc<Module>> {
         self.modules
-            .read()
+            .write()
             .unwrap_or_else(PoisonError::into_inner)
             .get(hash)
             .cloned()
+    }
+
+    /// Number of compiled module versions currently resident in the LRU cache.
+    ///
+    /// Bounded by the store's cache capacity ([`WASM_MODULE_CACHE_CAP`] by
+    /// default); primarily an observability/test accessor.
+    #[must_use]
+    pub fn cache_len(&self) -> usize {
+        self.modules
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Resolve `hash` to a compiled [`Module`], compiling and caching on first
@@ -284,10 +336,11 @@ impl WasmModuleStore {
             HarvestError::Config(format!("failed to compile wasm module {hash}: {e}"))
         })?;
         let module = Arc::new(module);
+        // `put` inserts and, at capacity, evicts the least-recently-used entry.
         self.modules
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(hash.to_string(), Arc::clone(&module));
+            .put(hash.to_string(), Arc::clone(&module));
         Ok(module)
     }
 }
@@ -307,27 +360,52 @@ impl Drop for WasmModuleStore {
     }
 }
 
-/// Classify a wasmtime execution error into a typed [`ActivityFailure`].
+/// Which phase produced a wasmtime error, deciding how a non-trap,
+/// non-resource-exhaustion error is classified.
+#[derive(Clone, Copy)]
+enum WasmErrPhase {
+    /// An error from a guest `alloc`/`run` call, or from the store's epoch
+    /// callback: a residual (non-trap, non-resource) error is a guest trap.
+    Runtime,
+    /// An error from `Linker::instantiate`: a residual error is an unsatisfied
+    /// import / link failure — a non-retryable [`ActivityFailure::sandbox_denied`].
+    /// Wasmtime also runs the module's **start section** during `instantiate`,
+    /// so a start-time fuel/epoch/memory/trap failure is classified as the
+    /// matching retryable failure below, exactly like `alloc`/`run`.
+    Instantiate,
+}
+
+/// Classify a wasmtime execution error into a typed [`ActivityFailure`],
+/// phase-aware.
 ///
-/// Fuel exhaustion and epoch (wall-clock) interruption map to a retryable
-/// [`ActivityFailure::resource_exhausted`]; a memory-growth trap (surfaced by
-/// the store limiter, not as a `Trap` variant) is likewise resource exhaustion;
-/// any other guest trap becomes a retryable [`ActivityFailure::wasm_trap`].
-fn classify_wasmtime_err(err: &wasmtime::Error) -> ActivityFailure {
+/// Traps and resource-exhaustion errors are classified identically regardless
+/// of phase; only a residual error (neither a trap nor a memory-growth failure)
+/// differs — a `Runtime` residual is a `WasmTrap`, an `Instantiate` residual is
+/// a `SandboxDenied` (unsatisfied import). This is why a start-section trap is
+/// never misreported as a permanent capability denial (issue #965 review).
+fn classify_wasmtime_err_phase(err: &wasmtime::Error, phase: WasmErrPhase) -> ActivityFailure {
     if let Some(trap) = err.downcast_ref::<Trap>() {
         match trap {
             Trap::OutOfFuel => return ActivityFailure::resource_exhausted("cpu fuel exhausted"),
             Trap::Interrupt => {
                 return ActivityFailure::resource_exhausted("wall-clock deadline exceeded");
             }
-            _ => {}
+            // A memory-grow failure never surfaces as a `Trap` variant (it comes
+            // from the store limiter), so any other trap here is a genuine guest
+            // trap regardless of phase.
+            _ => return ActivityFailure::wasm_trap(format!("wasm guest trapped: {err}")),
         }
     }
     let debug = format!("{err:?}");
     if debug.contains("growing memory") || debug.contains("growing table") {
         return ActivityFailure::resource_exhausted("memory limit exceeded");
     }
-    ActivityFailure::wasm_trap(format!("wasm guest trapped: {err}"))
+    match phase {
+        WasmErrPhase::Runtime => ActivityFailure::wasm_trap(format!("wasm guest trapped: {err}")),
+        WasmErrPhase::Instantiate => {
+            ActivityFailure::sandbox_denied(format!("wasm instantiation denied: {err}"))
+        }
+    }
 }
 
 /// Link the granted host functions into `linker` for one invocation.
@@ -454,10 +532,24 @@ fn link_host_functions(
 /// output is a retryable [`ActivityFailure::wasm_trap`]. A panic in the host
 /// glue is caught and mapped to `wasm_trap` so the worker can never crash.
 ///
+/// # Cooperative cancellation
+///
+/// When `cancel` is `Some`, the store installs a per-invocation epoch-deadline
+/// callback that polls the token roughly every [`EPOCH_TICK_INTERVAL`]. If the
+/// token is cancelled while the guest is running, the guest is trapped at the
+/// next safe point (within ~1 tick) and the call returns a retryable
+/// [`ActivityFailure::resource_exhausted`] instead of running to the wall-clock
+/// ceiling. The callback is per-`Store`, so one invocation's cancellation never
+/// affects another's, and it still enforces the mandatory
+/// `limits.max_wall_clock` ceiling as the hard backstop.
+///
 /// # Errors
 ///
 /// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
 /// exhaustion, guest trap, ABI violation, or contained host-glue panic.
+///
+/// This is the non-cancellable convenience form; the worker dispatch seam uses
+/// [`invoke_wasm_activity_cancellable`] to thread a cancellation token in.
 pub fn invoke_wasm_activity(
     store: &WasmModuleStore,
     module: &Module,
@@ -466,8 +558,43 @@ pub fn invoke_wasm_activity(
     limits: &WasmLimits,
     deadline: Option<Duration>,
 ) -> Result<serde_json::Value, ActivityFailure> {
+    invoke_wasm_activity_cancellable(store, module, input, caps, limits, deadline, None)
+}
+
+/// Cancellable form of [`invoke_wasm_activity`].
+///
+/// Identical, but when `cancel` is `Some` the guest is cooperatively
+/// interrupted (within ~1 [`EPOCH_TICK_INTERVAL`]) if the token fires while it
+/// is running — instead of running to the mandatory `limits.max_wall_clock`
+/// ceiling — returning a retryable
+/// [`ActivityFailure::resource_exhausted`]. The interrupt is per-`Store`, so
+/// one invocation's cancellation never affects another's, and the ceiling
+/// remains the hard backstop for a guest that ignores the (implicit) signal.
+///
+/// # Errors
+///
+/// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
+/// exhaustion, guest trap, ABI violation, cooperative cancellation, or
+/// contained host-glue panic.
+pub fn invoke_wasm_activity_cancellable(
+    store: &WasmModuleStore,
+    module: &Module,
+    input: &serde_json::Value,
+    caps: &WasmCapabilities,
+    limits: &WasmLimits,
+    deadline: Option<Duration>,
+    cancel: Option<CancellationToken>,
+) -> Result<serde_json::Value, ActivityFailure> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_wasm_activity_inner(store, module, input, caps, limits, deadline)
+        invoke_wasm_activity_inner(
+            store,
+            module,
+            input,
+            caps,
+            limits,
+            deadline,
+            cancel.as_ref(),
+        )
     }));
     match result {
         Ok(inner) => inner,
@@ -486,6 +613,7 @@ fn invoke_wasm_activity_inner(
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
     let engine = store.engine();
 
@@ -509,16 +637,70 @@ fn invoke_wasm_activity_inner(
         .set_fuel(limits.fuel)
         .map_err(|e| ActivityFailure::wasm_trap(format!("failed to set wasm fuel: {e}")))?;
     let effective = deadline.map_or(limits.max_wall_clock, |d| d.min(limits.max_wall_clock));
-    wasm_store.set_epoch_deadline(deadline_ticks(effective));
+
+    // Wall-clock bound + cooperative cancellation via a per-invocation
+    // epoch-deadline callback (issue #965 review). Arm the first deadline one
+    // tick out, then drive the countdown from the callback: each tick it polls
+    // the cancellation token and decrements the remaining budget, trapping (as
+    // an epoch interrupt → retryable `ResourceExhausted`) when either the token
+    // fires or the `effective` ceiling is reached. This is per-`Store`, so N
+    // concurrent invocations keep independent deadlines off the single shared
+    // ticker, and a cancelled guest is interrupted within ~1 tick instead of
+    // running to the ceiling. A guest that completes before the first tick never
+    // invokes the callback, so the fast path pays nothing.
+    wasm_store.set_epoch_deadline(1);
+    let mut remaining_ticks = deadline_ticks(effective);
+    let cancel_for_cb = cancel.cloned();
+    // Set by the callback when the wall-clock ceiling is reached, so the
+    // post-call classifier reports "wall-clock deadline exceeded" without
+    // depending on how wasmtime wraps the callback's returned error.
+    let deadline_hit = Arc::new(AtomicBool::new(false));
+    let deadline_hit_cb = Arc::clone(&deadline_hit);
+    wasm_store.epoch_deadline_callback(move |_ctx| {
+        if cancel_for_cb
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            // Trap at a safe point; the post-call cancellation check reclassifies
+            // this into a "cancelled" `ResourceExhausted`.
+            return Err(wasmtime::Error::from(Trap::Interrupt));
+        }
+        remaining_ticks = remaining_ticks.saturating_sub(1);
+        if remaining_ticks == 0 {
+            // Hard wall-clock ceiling reached → epoch interrupt.
+            deadline_hit_cb.store(true, Ordering::Relaxed);
+            return Err(wasmtime::Error::from(Trap::Interrupt));
+        }
+        Ok(UpdateDeadline::Continue(1))
+    });
+
+    // Classify an `instantiate`/`alloc`/`run` error, phase-aware. The epoch
+    // callback's trap is token-agnostic, so reclassify here: a fired cancel
+    // token → a retryable "cancelled" `ResourceExhausted` (the worker's own
+    // cancellation handling supersedes it); a reached wall-clock ceiling →
+    // `ResourceExhausted` (robust to error wrapping via the `deadline_hit`
+    // flag); otherwise defer to `classify_wasmtime_err_phase` (fuel/memory/trap,
+    // and — for `instantiate` — an unsatisfied import → `SandboxDenied`).
+    let classify = |e: &wasmtime::Error, phase: WasmErrPhase| -> ActivityFailure {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            ActivityFailure::resource_exhausted("wasm activity cancelled before completion")
+        } else if deadline_hit.load(Ordering::Relaxed) {
+            ActivityFailure::resource_exhausted("wall-clock deadline exceeded")
+        } else {
+            classify_wasmtime_err_phase(e, phase)
+        }
+    };
 
     // Deny-all linker; only granted capabilities are linked.
     let mut linker: Linker<HostState> = Linker::new(engine);
     link_host_functions(&mut linker, caps)?;
 
-    // An unsatisfied import (an ungranted host function) fails here.
+    // An unsatisfied import (an ungranted host function) is denied here; a trap
+    // or resource overrun in the module's start section is classified as the
+    // matching retryable failure, NOT a permanent capability denial.
     let instance = linker
         .instantiate(&mut wasm_store, module)
-        .map_err(|e| ActivityFailure::sandbox_denied(format!("wasm instantiation denied: {e}")))?;
+        .map_err(|e| classify(&e, WasmErrPhase::Instantiate))?;
 
     let memory = instance
         .get_memory(&mut wasm_store, "memory")
@@ -540,7 +722,7 @@ fn invoke_wasm_activity_inner(
     })?;
     let in_ptr = alloc
         .call(&mut wasm_store, in_len)
-        .map_err(|e| classify_wasmtime_err(&e))?;
+        .map_err(|e| classify(&e, WasmErrPhase::Runtime))?;
     let in_ptr_usize = usize::try_from(in_ptr)
         .map_err(|_| ActivityFailure::wasm_trap("alloc returned a negative pointer"))?;
     // memory.write is itself bounds-checked against live guest memory.
@@ -552,7 +734,7 @@ fn invoke_wasm_activity_inner(
 
     let packed = run
         .call(&mut wasm_store, (in_ptr, in_len))
-        .map_err(|e| classify_wasmtime_err(&e))?;
+        .map_err(|e| classify(&e, WasmErrPhase::Runtime))?;
 
     // Reinterpret as unsigned BEFORE shifting so a high bit never sign-extends.
     let bits = packed.cast_unsigned();
@@ -1285,5 +1467,241 @@ mod tests {
         assert_eq!(limits.memory_bytes, DEFAULT_MEMORY_BYTES);
         assert_eq!(limits.fuel, DEFAULT_FUEL);
         assert_eq!(limits.max_wall_clock, DEFAULT_MAX_WALL_CLOCK);
+    }
+
+    // ---- Finding 3: start-section traps are retryable, not SandboxDenied ----
+
+    /// A guest whose module **start section** hits `unreachable`: the trap fires
+    /// during `instantiate`, before `run`. It must classify as a retryable
+    /// `WasmTrap`, NOT a permanent `SandboxDenied` capability denial.
+    const START_TRAP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func $init (unreachable))
+          (start $init)
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "run") (param i32 i32) (result i64) (i64.const 0)))
+    "#;
+
+    /// A guest whose start section spins forever: it must exhaust CPU fuel
+    /// during `instantiate` and classify as a retryable `ResourceExhausted`.
+    const START_FUEL_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func $init (loop $l (br $l)))
+          (start $init)
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "run") (param i32 i32) (result i64) (i64.const 0)))
+    "#;
+
+    #[test]
+    fn start_section_trap_is_retryable_wasm_trap_not_sandbox_denied() {
+        let store = WasmModuleStore::new();
+        let module = compile(&store, START_TRAP_WAT);
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect_err("a start-section trap must fail the attempt");
+        assert_eq!(
+            err.error_type, ERROR_TYPE_WASM_TRAP,
+            "a start-section trap is a retryable WasmTrap, not SandboxDenied"
+        );
+        assert!(
+            !err.non_retryable,
+            "a start-section trap must remain retryable"
+        );
+    }
+
+    #[test]
+    fn start_section_fuel_exhaustion_is_retryable_resource_exhausted() {
+        let store = WasmModuleStore::new();
+        let module = compile(&store, START_FUEL_WAT);
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(10_000),
+            None,
+        )
+        .expect_err("a start-section fuel overrun must fail the attempt");
+        assert_eq!(
+            err.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED,
+            "a start-section fuel overrun is retryable ResourceExhausted, not SandboxDenied"
+        );
+        assert!(!err.non_retryable);
+    }
+
+    #[test]
+    fn ungranted_import_is_still_sandbox_denied_regression() {
+        // The Finding-3 fix must NOT weaken the genuine unsatisfied-import case:
+        // an ungranted host import is still a non-retryable SandboxDenied.
+        let store = WasmModuleStore::new();
+        let module = compile(&store, &deny_guest_importing("fs_read"));
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect_err("ungranted import must be denied");
+        assert_eq!(err.error_type, ERROR_TYPE_SANDBOX_DENIED);
+        assert!(err.non_retryable);
+    }
+
+    // ---- Finding 4: cooperative cancellation of a running guest -------------
+
+    #[test]
+    fn cancellation_interrupts_a_long_running_guest_promptly() {
+        // A guest with a LONG wall-clock ceiling (30s) + infinite fuel would,
+        // without cooperative cancellation, hold the calling thread until the
+        // ceiling. With the epoch-callback cancel signal, firing the token
+        // interrupts it within ~1 tick, well before the ceiling.
+        let store = WasmModuleStore::new();
+        let module = compile(&store, INFINITE_LOOP_WAT);
+        let cancel = CancellationToken::new();
+        let cancel_for_thread = cancel.clone();
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            // Fire the cancel shortly after the guest starts spinning.
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel_for_thread.cancel();
+            });
+            let err = invoke_wasm_activity_cancellable(
+                &store,
+                &module,
+                &serde_json::json!(null),
+                &WasmCapabilities::default(),
+                &WasmLimits {
+                    memory_bytes: DEFAULT_MEMORY_BYTES,
+                    fuel: u64::MAX,
+                    max_wall_clock: Duration::from_secs(30),
+                },
+                None,
+                Some(cancel),
+            )
+            .expect_err("a cancelled guest must be interrupted");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "cancellation must interrupt promptly (took {elapsed:?}), not run to the ceiling"
+            );
+            assert_eq!(
+                err.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED,
+                "a cancelled guest surfaces as retryable ResourceExhausted"
+            );
+            assert!(!err.non_retryable);
+        });
+    }
+
+    #[test]
+    fn an_uncancelled_token_does_not_interrupt_a_normal_guest() {
+        // With a live (never-fired) token, a well-behaved guest still completes
+        // normally — the cancel plumbing has no effect on the happy path.
+        let store = WasmModuleStore::new();
+        let module = compile(&store, ECHO_WAT);
+        let cancel = CancellationToken::new();
+        let input = serde_json::json!({"ok": 1});
+        let out = invoke_wasm_activity_cancellable(
+            &store,
+            &module,
+            &input,
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+            Some(cancel),
+        )
+        .expect("an uncancelled guest completes normally");
+        assert_eq!(out, input);
+    }
+
+    // ---- Finding 7: the compiled-module cache is LRU-bounded ----------------
+
+    /// A byte-distinct echo guest per index (unique scratch global), so each has
+    /// a unique content hash to occupy its own cache slot while echoing input.
+    fn unique_echo_guest(i: usize) -> String {
+        format!(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (global $bump (mut i32) (i32.const 1024))
+              (global $tag (mut i32) (i32.const {i}))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                (local.set $ptr (global.get $bump))
+                (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+                (local.get $ptr))
+              (func (export "run") (param $in_ptr i32) (param $in_len i32) (result i64)
+                (i64.or
+                  (i64.shl (i64.extend_i32_u (local.get $in_ptr)) (i64.const 32))
+                  (i64.extend_i32_u (local.get $in_len)))))
+            "#
+        )
+    }
+
+    #[test]
+    fn compiled_module_cache_is_bounded_and_evicts_lru() {
+        const CAP: usize = 4;
+        let store = WasmModuleStore::with_cache_capacity(CAP);
+
+        // Compile CAP distinct modules; hashes[0] is the least-recently-used.
+        let mut versions = Vec::new();
+        for i in 0..CAP {
+            let bytes = wat::parse_str(&unique_echo_guest(i)).expect("assemble");
+            let hash = WasmModuleStore::compute_hash(&bytes);
+            store.get_or_compile(&hash, &bytes).expect("compile");
+            versions.push((hash, bytes));
+        }
+        assert_eq!(store.cache_len(), CAP, "cache filled to capacity");
+
+        // Hand out an Arc for the soon-to-be-evicted (LRU) module BEFORE it is
+        // evicted, to prove an in-flight invocation is unaffected by eviction.
+        let (lru_hash, lru_bytes) = versions[0].clone();
+        let held = store.cached(&lru_hash).expect("lru cached");
+        // `cached` bumps recency, so touch the others to keep hashes[0] LRU.
+        for (hash, _) in &versions[1..] {
+            let _ = store.cached(hash);
+        }
+
+        // Compiling one more distinct module must evict, not grow the cache.
+        let extra = wat::parse_str(&unique_echo_guest(CAP)).expect("assemble");
+        let extra_hash = WasmModuleStore::compute_hash(&extra);
+        store.get_or_compile(&extra_hash, &extra).expect("compile");
+        assert_eq!(
+            store.cache_len(),
+            CAP,
+            "cache stays bounded at capacity after an over-cap insert"
+        );
+        assert!(
+            store.cached(&lru_hash).is_none(),
+            "the least-recently-used entry was evicted"
+        );
+
+        // The Arc handed out before eviction is still alive and invokable.
+        let input = serde_json::json!({"held": true});
+        let out = invoke_wasm_activity(
+            &store,
+            &held,
+            &input,
+            &WasmCapabilities::default(),
+            &fast_limits(DEFAULT_FUEL),
+            None,
+        )
+        .expect("a module Arc handed out before eviction is still usable");
+        assert_eq!(out, input);
+
+        // Re-inserting the evicted hash recompiles cleanly.
+        store
+            .get_or_compile(&lru_hash, &lru_bytes)
+            .expect("re-inserting an evicted hash recompiles");
+        assert!(store.cached(&lru_hash).is_some());
     }
 }
