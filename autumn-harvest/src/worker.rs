@@ -12918,7 +12918,26 @@ impl Worker {
         {
             let registrations = self.registry.wasm_module_registrations();
             if !registrations.is_empty() {
-                for (shard, shard_pool) in &shard_targets {
+                // Mirror the poll loop's `[] => pool` shape (see `claim_pool`
+                // below): when no shard is explicitly assigned — the default,
+                // legacy single-shard worker — `shard_targets` is empty, so the
+                // worker polls and resolves against the caller's default `pool`.
+                // Seed that same pool here. Otherwise a builder-registered WASM
+                // module is never inserted and every WASM activity resolves to a
+                // non-retryable `WasmModuleUnavailable` in the common single-shard
+                // config (issue #965 review, Finding 24). With explicit shard
+                // assignments, seed each shard's pool as before. Normalizing to
+                // one list keeps seeding and polling in agreement.
+                let seed_targets: Vec<(Option<crate::types::ShardId>, &DbPool)> =
+                    if shard_targets.is_empty() {
+                        vec![(None, pool)]
+                    } else {
+                        shard_targets
+                            .iter()
+                            .map(|(shard, shard_pool)| (Some(*shard), shard_pool))
+                            .collect()
+                    };
+                for (shard, shard_pool) in seed_targets {
                     match shard_pool.get().await {
                         Ok(mut conn) => {
                             if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(

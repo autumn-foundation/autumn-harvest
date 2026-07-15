@@ -849,6 +849,15 @@ fn build_wasm_registry(
 }
 
 fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
+    build_worker_with_shards(worker_id, queue, registry, vec![ShardId::new(0)])
+}
+
+fn build_worker_with_shards(
+    worker_id: &str,
+    queue: &str,
+    registry: Arc<HandlerRegistry>,
+    shard_assignments: Vec<ShardId>,
+) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -862,7 +871,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![ShardId::new(0)],
+                shard_assignments,
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
@@ -1108,6 +1117,81 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     assert!(
         !types.iter().any(|t| t.to_lowercase().contains("wasm")),
         "no wasm-specific event variant may appear: {types:?}"
+    );
+}
+
+// ── Finding 24: default single-shard worker (empty shard_assignments) seeds ─
+//    builder-registered WASM modules on the default pool ──────────────────────
+
+/// A worker started with EMPTY `shard_assignments` — the supported default,
+/// legacy single-shard shape, where the poll loop treats `[] => pool` (the
+/// caller's default pool). The startup-seeding loop must handle that same shape
+/// and seed the default pool; otherwise the embedded module bytes are never
+/// inserted and the WASM activity resolves to a non-retryable
+/// `WasmModuleUnavailable` forever (issue #965 review, Finding 24).
+///
+/// This test FAILS against the pre-fix code (the seeding loop iterates an empty
+/// `shard_targets` and seeds nothing, so the workflow reaches FAILED with a
+/// `WasmModuleUnavailable` `ActivityFailed` instead of COMPLETED) and PASSES
+/// once seeding mirrors the poll loop's `[] => pool` normalization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_with_empty_shard_assignments_seeds_wasm_on_default_pool() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-default-shard";
+    let mut conn = connect(&url).await;
+    // Isolate the module table: startup-SEED (activate-only-if-absent) would not
+    // swap in this test's bytes if a prior test's `echo_wasm` is still active on
+    // a shared HARVEST_TEST_DATABASE_URL run — but here that would MASK the bug,
+    // so scrubbing first guarantees the module is absent unless *this* worker
+    // seeds it (a no-op on CI's per-test DB).
+    scrub(&mut conn).await;
+    let input = serde_json::json!({"hello": "default-shard", "n": 24});
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
+
+    let echo = assemble(ECHO_WAT);
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: echo,
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    // The one load-bearing difference from the passing echo test: EMPTY
+    // shard_assignments (the default single-shard shape).
+    let worker =
+        build_worker_with_shards("w-wasm-default-shard", queue, Arc::clone(&registry), vec![]);
+    let pool = build_pool(&url);
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    // The module was seeded on the default pool and resolved: the activity
+    // COMPLETED with the echoed output — NOT a WasmModuleUnavailable failure.
+    assert_eq!(
+        find_activity_completed(&history),
+        Some(input),
+        "empty-shard worker must seed WASM on the default pool and complete; \
+         history: {:?}",
+        history
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        find_activity_failed(&history).is_none(),
+        "no ActivityFailed (e.g. WasmModuleUnavailable) may appear: {:?}",
+        find_activity_failed(&history)
     );
 }
 
